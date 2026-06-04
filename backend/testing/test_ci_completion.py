@@ -19,6 +19,21 @@ from app.ci_completion import _normalize_merge_error
 from app.models import Alert, Project, Task, TaskStatus
 
 
+@pytest.fixture(autouse=True)
+def _default_no_migration_pr(mocker):
+    """Default the pre-merge Alembic dual-head guard to a no-op for merge tests.
+
+    ``_attempt_merge_with_retry_and_escalation`` now runs
+    ``enforce_premerge_migration_guard`` before merging, which calls
+    ``github.get_pr_files``. Existing merge tests only mock
+    ``merge_pull_request``; without this, an unmocked ``get_pr_files`` would make
+    the guard ``defer`` and HOLD every merge. Returning an empty (no-migration)
+    file list short-circuits the guard to ``ok``. Tests exercising the guard
+    itself re-patch ``app.github.get_pr_files`` to override this default.
+    """
+    mocker.patch("app.github.get_pr_files", AsyncMock(return_value=[{"filename": "README.md"}]))
+
+
 # ---------------------------------------------------------------------------
 # _normalize_merge_error — unit tests
 # ---------------------------------------------------------------------------
@@ -2076,6 +2091,47 @@ async def test_merge_success_without_orig_id(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_merge_success_without_orig_id_triggers_build_config_refresh(
+    db_session, mocker
+):
+    """A CI-driven merge onto the integration branch refreshes empty
+    build_config even when no original_task_id linkage exists."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.github.merge_pull_request", return_value={"merged": True})
+    refresh_mock = mocker.patch(
+        "app.ci_completion._refresh_empty_build_config_after_integration_landing",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    project = Project(
+        name="No orig id refresh",
+        user_id="test-user",
+        github_owner="acme",
+        github_repo="direct-merge",
+        integration_branch="main",
+        build_config={"repo_is_empty": True},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    refresh_mock.assert_awaited_once_with(project.id, "main")
+
+
+@pytest.mark.asyncio
 async def test_orig_pr_merged_write_failure_does_not_poison_caller_session(
     db_session, mocker
 ):
@@ -3256,3 +3312,151 @@ async def test_in_progress_reset_increments_under_cap(db_session, mocker):
     review_loop = (task.context or {}).get("review_loop", {})
     assert review_loop.get("merge_in_progress_resets") == 2
     assert review_loop.get("ci_wait_started") != stale_ts
+
+
+# ---------------------------------------------------------------------------
+# Pre-merge Alembic dual-head guard
+# ---------------------------------------------------------------------------
+
+# A diff that adds a migration file whose revision id ("0002") collides with an
+# existing revision already on the target branch — the dual-head vector.
+_DUAL_HEAD_DIFF = (
+    "diff --git a/backend/alembic/versions/0002_dup.py "
+    "b/backend/alembic/versions/0002_dup.py\n"
+    "new file mode 100644\n"
+    "--- /dev/null\n"
+    "+++ b/backend/alembic/versions/0002_dup.py\n"
+    '+"""dup migration"""\n'
+    '+revision = "0002"\n'
+    '+down_revision = "0001"\n'
+)
+
+
+@pytest.mark.asyncio
+async def test_merge_held_on_dual_head_migration(db_session, mocker):
+    """A PR adding a colliding revision id is HELD: merge not called, returns False."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    # Guard sees a touched migration file, a colliding diff, and an existing
+    # chain that already owns revision "0002".
+    mocker.patch(
+        "app.github.get_pr_files",
+        AsyncMock(return_value=[{"filename": "backend/alembic/versions/0002_dup.py"}]),
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        AsyncMock(return_value=_DUAL_HEAD_DIFF),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        AsyncMock(return_value=["0001_init.py", "0002_existing.py"]),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        AsyncMock(return_value={"merged": True}),
+    )
+
+    project = Project(name="dual-head hold", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is False, "Guard must hold the merge on a dual-head collision"
+    merge_mock.assert_not_called()
+    assert task.status == TaskStatus.EVALUATING, "Held merge leaves task EVALUATING"
+    assert "dual-head" in (task.latest_status_message or "").lower()
+    assert "0002" in (task.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_merge_held_on_migration_fetch_failure(db_session, mocker):
+    """A GitHub fetch failure during the guard DEFERS — fail-safe, no merge."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.get_pr_files",
+        AsyncMock(side_effect=RuntimeError("github 503")),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        AsyncMock(return_value={"merged": True}),
+    )
+
+    project = Project(name="guard defer", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is False, "A failed safety fetch must hold the merge (defer)"
+    merge_mock.assert_not_called()
+    assert task.status == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_clean_migration_pr_merges(db_session, mocker):
+    """A migration PR that extends the chain cleanly merges normally."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    clean_diff = (
+        "diff --git a/backend/alembic/versions/0003_next.py "
+        "b/backend/alembic/versions/0003_next.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/backend/alembic/versions/0003_next.py\n"
+        '+"""next migration"""\n'
+        '+revision = "0003"\n'
+        '+down_revision = "0002"\n'
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        AsyncMock(return_value=[{"filename": "backend/alembic/versions/0003_next.py"}]),
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        AsyncMock(return_value=clean_diff),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        AsyncMock(return_value=["0001_init.py", "0002_existing.py"]),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        AsyncMock(return_value={"merged": True}),
+    )
+
+    project = Project(name="clean migration merge", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True, "A clean chain extension must merge"
+    merge_mock.assert_called_once()
+    assert task.status == TaskStatus.COMPLETED

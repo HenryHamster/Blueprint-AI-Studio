@@ -12,7 +12,7 @@ Threshold and window are configurable via runtime_config:
 This module owns failure-signature extraction and the
 ``_maybe_auto_playbook`` writer.  Entry archival/suppression helpers live in
 ``app.playbook_capacity`` (``maybe_archive_for_capacity``) and
-``app.playbook_lifecycle`` (``_get_prior_archive_entry``,
+``app.playbook_storage`` (``_get_prior_archive_entry``,
 ``_is_auto_playbook_suppressed``); both are pure leaves of the import graph,
 so they are imported eagerly here.
 ``app.playbook_learning`` re-exports the public names from this module for
@@ -36,7 +36,7 @@ from sqlmodel import select
 from app.database import resolve_dialect_name
 from app.models import Task, TaskStatus, _utcnow
 from app.playbook_capacity import maybe_archive_for_capacity
-from app.playbook_lifecycle import (
+from app.playbook_storage import (
     _get_prior_archive_entry,
     _is_auto_playbook_suppressed,
 )

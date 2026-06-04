@@ -1,6 +1,6 @@
 import type { TaskType } from '../taskCapabilities';
 
-export type TaskStatus = 'QUEUED' | 'PROVISIONING' | 'IN_PROGRESS' | 'EVALUATING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+export type TaskStatus = 'QUEUED' | 'PROVISIONING' | 'IN_PROGRESS' | 'EVALUATING' | 'BLOCKED' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 export type { TaskType };
 
 export interface ResearchFinding {
@@ -37,6 +37,14 @@ export interface Task {
   started_at?: string;
   last_heartbeat?: string;
   attempt_count?: number;
+  // Durable blocker metadata for the non-terminal BLOCKED state (backend
+  // alembic 0137 / models.py). All four are nullable — older task payloads
+  // (and any non-BLOCKED task) carry null/undefined, so every consumer must
+  // treat these as optional and guard on presence before rendering.
+  blocker_kind?: string | null;
+  blocked_reason?: string | null;
+  blocked_at?: string | null;
+  recheck_after?: string | null;
   // R3-W2 (H1): heartbeat-hot fields promoted from Task.context to dedicated
   // columns in Round 2 (B2 / F). The frontend reads from the columns; the
   // legacy `task.context.last_metrics` mirror was retired and reading it
@@ -50,6 +58,12 @@ export interface Task {
     cgroup_limit_mb?: number;
   } | null;
   last_tool_use_at?: string | null;
+  // Slim, read-only mirror of the no-CI merge gate's UNVERIFIED-merge reason
+  // (backend admin.py mirrors review_loop["unverified_merge_reason"]). Null /
+  // absent for CI-verified, tests-gated, or otherwise normal merges. The Task
+  // Detail drawer's Merge Test Gate section reads this to render the UNVERIFIED
+  // verdict + human-readable reason when no MERGE_TEST_RESULT artifact exists.
+  unverified_merge_reason?: string | null;
   payloads?: Record<string, unknown>[];
   artifacts?: Array<{artifact_type: string; pr_url?: string; commit_hash?: string; repo_url?: string; logs?: string; iteration: number; created_at?: string}>;
   pr_url?: string;

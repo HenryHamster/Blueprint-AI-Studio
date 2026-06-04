@@ -47,7 +47,7 @@ Agent VMs          Background workers
 
 ## Quick Start (Local Mode)
 
-Local mode runs agents as subprocesses instead of GCP VMs. You still need the backend, database, and frontends running locally.
+Local mode runs agents as subprocesses instead of GCP VMs. You still need PostgreSQL, the backend API, and both frontend apps running locally.
 
 ```bash
 # 1. Copy and fill in environment variables
@@ -60,7 +60,8 @@ docker compose up -d db
 # 3. Apply backend migrations
 cd backend && bash run_migrations.sh
 
-# If you prefer containerized backend instead of uvicorn, `docker compose up -d` starts both `db` and `app`.
+# If you prefer the containerized backend instead of uvicorn, `docker compose up -d`
+# starts both `db` and `app`.
 
 # 4. Install backend dependencies and run the API (separate terminal)
 cd backend
@@ -178,10 +179,11 @@ Configure autonomous mode in the admin UI under Settings > Autonomous.
 ## Backend Entry Points
 
 - `backend/app/main.py` wires the FastAPI app, middleware, router registration, startup/shutdown hooks, and schema revision checks.
-- `backend/app/routers/projects.py` owns the public task/project launch surface under `/api/*`.
-- `backend/app/routers/agent.py` and `backend/app/routers/agent_warm_continuity.py` own the agent lifecycle and warm handoff endpoints under `/api/agent/*`.
-- `backend/app/routers/admin_*.py` provide the admin dashboard, analytics, settings, diagnostics, and project configuration endpoints under `/api/admin/*` plus a few related internal paths.
-- `backend/app/orchestrator.py`, `backend/app/reaper.py`, and `backend/app/services.py` host the long-running background loops.
+- `backend/app/routers/projects.py` owns task/project launch, project listing, and the project WebSocket/status surface under `/api/deploy`, `/api/projects`, and related paths.
+- `backend/app/routers/deploy.py` owns admin deploy-state operations under `/api/admin/deploy-state/*`.
+- `backend/app/routers/agent.py`, `backend/app/routers/agent_status.py`, `backend/app/routers/agent_credentials.py`, `backend/app/routers/agent_github.py`, `backend/app/routers/agent_strategic_fetch.py`, and `backend/app/routers/agent_warm_continuity.py` own agent lifecycle, auth, and handoff endpoints.
+- `backend/app/routers/admin_*.py` provide the admin dashboard, analytics, settings, diagnostics, warm-pool, and project configuration endpoints under `/api/admin/*`.
+- `backend/app/orchestrator.py`, `backend/app/reaper.py`, `backend/app/warm_pool_maintainer.py`, and `backend/app/services.py` host the long-running background loops.
 
 ## Documentation
 

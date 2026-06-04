@@ -58,7 +58,9 @@ _RETRY_DELAYS: tuple[int, ...] = (30, 120, 600)
 
 # System-emitted NOTE event types classified as high_signal in event_type_snapshot.json.
 # These must always survive paging regardless of routine message volume (see
-# admin_notifications.list_messages guaranteed-query logic). Escalation types
+# admin_notifications.list_messages guaranteed-query logic). This includes the
+# operator-steering receipt/confirmation pair so the interim queued receipt is
+# visible while it waits behind an active cycle. Escalation types
 # (auto_fix_escalated, residual_fix_escalated, etc.) are already safe because they emit
 # as BLOCKER messages — not NOTE — so they don't belong here.
 # Source of truth: backend/testing/event_type_snapshot.json (classification=high_signal).
@@ -74,6 +76,8 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset[str] = frozenset(
         "release_stabilize_stalled",  # post_version_stabilize_stalled_message
         "release_ci_unresolved_stall",  # post_version_ci_unresolved_stall_message
         "release_auto_merge_stalled",  # post_version_auto_merge_stall_message
+        "strategic_steering_deferred",  # post_strategic_steering_deferred_message
+        "strategic_steering_acted",  # post_strategic_steering_acted_message
     }
 )
 
@@ -500,6 +504,54 @@ async def post_event_message(
     )
     session.add(msg)
     return msg
+
+
+async def post_strategic_steering_deferred_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    reason: str,
+) -> ProjectMessage:
+    """Post a visible system message when an operator steering request is deferred.
+
+    An operator steering message routes through the coalesced strategic-refresh
+    marker. When it cannot schedule the strategist immediately (a strategic
+    cycle is already running, or a residual gate holds it), the operator must be
+    told *why* rather than left with silence. ``reason`` is a short
+    human-readable explanation (e.g. "queued behind an active strategic cycle").
+    """
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="strategic_steering_deferred",
+        summary=f"Strategic steering request deferred — {reason}",
+        context={"reason": reason},
+    )
+
+
+async def post_strategic_steering_acted_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    reason: str = "the strategist is now acting on your steering",
+) -> ProjectMessage:
+    """Post a HIGH-SIGNAL system message when operator steering reaches the strategist.
+
+    The symmetric success counterpart to
+    ``post_strategic_steering_deferred_message``. An operator steering message
+    routes through the coalesced strategic-refresh marker; when the autonomous
+    loop actually consumes an operator-origin marker and spawns the strategist,
+    the operator must be told their steering landed rather than left to guess
+    from silence. Classified ``high_signal`` (NOT critical/escalation) so it
+    surfaces in the high-signal feed and fires an info-severity toast — higher
+    signal than the routine deferral notice, without the error styling reserved
+    for failures.
+    """
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="strategic_steering_acted",
+        summary=f"Strategic steering reached the strategist — {reason}",
+        context={"reason": reason},
+    )
 
 
 async def post_pr_merged_message(

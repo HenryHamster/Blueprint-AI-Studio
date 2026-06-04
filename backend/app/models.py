@@ -98,6 +98,22 @@ class TaskStatus(str, Enum):
     PROVISIONING = "PROVISIONING"
     IN_PROGRESS = "IN_PROGRESS"
     EVALUATING = "EVALUATING"
+    # BLOCKED is wanted-but-not-runnable work: a precondition is absent (an
+    # upstream dependency/rollup hasn't landed, a base branch or referenced file
+    # doesn't exist yet, or the agent surfaced a ``BLOCKER:``). It is a durable
+    # holding state — the task is parked until a recheck sweep re-evaluates it
+    # at/after ``recheck_after`` (see Task.blocker_kind/blocked_reason). BLOCKED
+    # is a first-class state distinct from FAILED — it does NOT count as a
+    # code/infra failure and does NOT burn the retry budget. It is
+    # terminal-for-now (the VM is released and the agent JWT revoked) but
+    # recoverable: the auto-unblock sweep rechecks the precondition and returns
+    # the task to QUEUED once its blocker clears, or escalates once a deadline
+    # passes. Durable blocker metadata lives under ``Task.context['blocker']``
+    # (see app.task_blocked); historical rows that terminated FAILED with the
+    # BLOCKED_PRECONDITION failure class remain valid and are unaffected.
+    # ``status`` is a plain VARCHAR column (not a Postgres ENUM type) and has no
+    # CHECK constraint, so admitting this new value requires no DDL on the column.
+    BLOCKED = "BLOCKED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
@@ -342,6 +358,21 @@ class Project(SQLModel, table=True):
     remediation_tracking: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
+    # Runtime-backed readiness of the no-CI merge gate. Unlike the read-only
+    # ``compute_merge_verification_verdict`` advisory (derived purely from stored
+    # ``build_config``), this records what the gate ACTUALLY did the last time it
+    # ran on a PR — so an operator can tell a config that *claims* tests are gated
+    # from one where the live no-CI path fell open to an UNVERIFIED merge.
+    # Written best-effort by ``ci_resolution.record_no_ci_gate_runtime`` at every
+    # terminal gate outcome. Shape:
+    #   {"last_run_at": iso, "executed_real_tests": bool,
+    #    "last_unverified_at": iso | absent,
+    #    "last_unverified_reason": str | absent}
+    # Nullable/additive: existing rows and create_all test DBs read it as None,
+    # and a fresh migration (separate task) adds the column to live DBs.
+    merge_gate_runtime: Dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSONB, nullable=True)
+    )
     # Regression-class trip markers used to persist first-tripped timestamps
     # across dispatcher ticks when a signal has no durable historical record.
     regression_signal_state: Dict[str, Any] = Field(
@@ -524,9 +555,21 @@ class Project(SQLModel, table=True):
         Canonical home for this logic — callers (notification_dispatch, admin_notifications,
         strategic_completion) mutate running_update through this method so the format stays
         consistent. Does NOT commit — caller is responsible for session.add(project).
+
+        The entry is ALWAYS a single physical line. Routine-event summaries come
+        from free-text message content and may contain newlines; any line-breaking
+        whitespace is collapsed to single spaces BEFORE truncation so the emitted
+        line matches the canonical single-line digest shape consumed by
+        ``running_update_merge._DIGEST_LINE_RE``. If a multi-line summary spanned
+        several physical lines, the reconciliation classifier would misread the
+        append as an operator body edit and silently discard the agent's refreshed
+        running_update.
         """
         now_str = _utcnow().strftime("%Y-%m-%d %H:%M")
-        line = f"- [{now_str}] **{event_type}**: {summary[:200]}"
+        # Collapse every newline form (\r\n, \r, \n) and any resulting runs of
+        # whitespace into single spaces so the digest entry is one physical line.
+        flattened = " ".join((summary or "").split())
+        line = f"- [{now_str}] **{event_type}**: {flattened[:200]}"
         current = (self.running_update or "").rstrip()
         self.running_update = f"{current}\n{line}" if current else line
 
@@ -907,6 +950,36 @@ class Task(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
+
+    # Durable blocker metadata for the non-terminal ``BLOCKED`` state (alembic
+    # 0138). When the orchestrator parks a task on a precondition blocker it
+    # records WHY here so the recheck sweep — and operators — can reason about
+    # the hold without replaying log scrollback. All nullable with no server
+    # default: existing QUEUED/FAILED rows read NULL (never BLOCKED), so the
+    # rollout is a pure additive no-op for them.
+    #   blocker_kind   — short categorical code (e.g. "file_conflict",
+    #                     "pending_rollup", "upstream_dependency"); mirrors the
+    #                     ``blocker_kind`` strings already used by
+    #                     orchestrator_filters / task_lifecycle_requeue.
+    #   blocked_reason — human-readable detail string for admin surfaces.
+    #   blocked_at     — when the task entered BLOCKED (for stall/age metrics).
+    #   recheck_after  — earliest time the recheck sweep should re-evaluate the
+    #                     blocker; the partial index ix_task_blocked_recheck
+    #                     keeps that scan tight to due-and-blocked rows only.
+    blocker_kind: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    blocked_reason: str | None = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    blocked_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    recheck_after: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     previous_error_fingerprint: str | None = Field(default=None)
     auto_remediation: bool = Field(
         default=False,
@@ -975,17 +1048,23 @@ class Task(SQLModel, table=True):
         # narrower prefix.
         Index("ix_task_status_priority_created", "status", "priority", "created_at"),
         Index("ix_task_project_status_created", "project_id", "status", "created_at"),
+        # BLOCKED joins the active-status set here (alembic 0138): a blocked
+        # task is non-terminal and still owns its idempotency slot, so a
+        # duplicate insert with the same key while the original is parked must
+        # still be deduped. Widening the predicate is rollout-safe — no row is
+        # BLOCKED at migration time, QUEUED is already covered, and FAILED stays
+        # excluded — so existing QUEUED/FAILED rows are unaffected.
         Index(
             "ux_task_active_idempotency_key",
             "idempotency_key",
             unique=True,
             postgresql_where=text(
                 "idempotency_key IS NOT NULL AND status IN "
-                "('QUEUED','PROVISIONING','IN_PROGRESS','EVALUATING')"
+                "('QUEUED','PROVISIONING','IN_PROGRESS','EVALUATING','BLOCKED')"
             ),
             sqlite_where=text(
                 "idempotency_key IS NOT NULL AND status IN "
-                "('QUEUED','PROVISIONING','IN_PROGRESS','EVALUATING')"
+                "('QUEUED','PROVISIONING','IN_PROGRESS','EVALUATING','BLOCKED')"
             ),
         ),
         Index("ix_task_context_gin", "context", postgresql_using="gin"),
@@ -1073,6 +1152,18 @@ class Task(SQLModel, table=True):
                 "status = 'QUEUED' AND retry_after_until IS NOT NULL"
             ),
             sqlite_where=text("status = 'QUEUED' AND retry_after_until IS NOT NULL"),
+        ),
+        # Partial index on recheck_after so the blocked-task recheck sweep
+        # (status = 'BLOCKED' AND recheck_after <= now()) hits a tight index
+        # range scan instead of seq-scanning the whole table for the small set
+        # of parked rows. Postgres-only via alembic 0138 CONCURRENTLY DDL; the
+        # metadata Index registers the name + column for
+        # test_model_indexes_covered_by_migrations. See the BLOCKED state.
+        Index(
+            "ix_task_blocked_recheck",
+            "recheck_after",
+            postgresql_where=text("status = 'BLOCKED'"),
+            sqlite_where=text("status = 'BLOCKED'"),
         ),
         # Defense-in-depth size cap on payloads JSONB (audit 2026-04-29 D4 /
         # finding M-S5). The Python layer's ``pack_under_budget`` already caps
@@ -1640,7 +1731,17 @@ def _emit_jwt_revocation_on_terminal(session, flush_context, instances):
             emit_task_terminated_notify,
         )
 
-        terminal = (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
+        # BLOCKED is terminal-for-now: entering it releases the VM and must
+        # revoke the agent JWT (emit_task_terminated_notify), and the
+        # BLOCKED->QUEUED unblock must fire the revive branch so peer instances
+        # evict the stale deny-list entry. Keep this in lockstep with the
+        # terminal set used by _on_status_set's callbacks below.
+        terminal = (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+            TaskStatus.BLOCKED,
+        )
         for instance in session.dirty:
             if not isinstance(instance, Task):
                 continue
@@ -1677,8 +1778,16 @@ def _on_status_set(target: Task, value, oldvalue, initiator):
                 e,
             )
         task_id = str(target.id)
-        # Notify JWT revocation when task reaches terminal state
-        if value in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+        # Notify JWT revocation when task reaches terminal state. BLOCKED is
+        # terminal-for-now: the VM is released and must stop, so revoke its JWT
+        # exactly as for FAILED/CANCELLED. Recovery requeues the task to QUEUED,
+        # which falls into the revive branch below and clears the deny-list entry.
+        if value in (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+            TaskStatus.BLOCKED,
+        ):
             for cb in _on_task_terminal_callbacks:
                 try:
                     cb(task_id)
@@ -1900,6 +2009,12 @@ class OrchestratorErrorAck(SQLModel, table=True):
     acknowledged_by: str = Field(default="")
 
 
+# Maximum stored length for operator/user-authored message content and
+# resolution notes. Shared by the admin-notifications and project-directions
+# message endpoints so their over-limit rejection cannot drift apart.
+MESSAGE_CONTENT_MAX = 5000
+
+
 class DigestCacheEntry(SQLModel, table=True):
     """Cross-instance shared L2 cache for precomputed digest / health payloads.
 
@@ -1916,7 +2031,8 @@ class DigestCacheEntry(SQLModel, table=True):
     {digest, health}). ``payload`` is the byte-identical compute output; readers
     serve it only while ``computed_at`` is within
     ``PRECOMPUTE_STALE_FALLBACK_SECONDS`` and otherwise fall back to the existing
-    on-demand path. The table is created on Postgres by alembic 0138 and on the
+    on-demand path. The table is created on Postgres by alembic 0140 (renumbered
+    from its original 0138 by the main -> automain back-merge) and on the
     SQLite test fixture by ``SQLModel.metadata.create_all``.
     """
 

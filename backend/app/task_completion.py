@@ -1180,18 +1180,56 @@ async def _maybe_release_safeguard_gate(
                     f"— skipping post-gate merge (orig {safeguard_for_id[:8]})"
                 )
             else:
-                _res = await merge_pull_request(gh_token, owner, repo, int(pr_num))
-                if _res.get("merged"):
-                    logger.info(
-                        f"[SAFEGUARD] Fired held merge for COMPLETED orig "
-                        f"{safeguard_for_id[:8]} PR #{pr_num} after gate release"
+                # Pre-merge Alembic dual-head guard (parity with the CI-completion
+                # and inline task-completion merge paths). The held merge can target
+                # the integration or promotion branch; without this check a PR that
+                # added 'the next' migration while the safeguard ran could land a
+                # duplicate revision / dual head. Only guard integration/promotion
+                # targets; on a block-or-defer verdict skip the merge and leave the
+                # PR open so the guarded retry/resolver flow can handle it.
+                from app.shared_state import (  # noqa: PLC0415
+                    get_project_promotion_target,
+                )
+
+                _sg_project = (
+                    await session.get(Project, orig.project_id)
+                    if orig.project_id
+                    else None
+                )
+                _sg_base = (_pr.get("base") or {}).get("ref", "")
+                _sg_gated = _sg_base in (
+                    get_project_integration_branch(_sg_project),
+                    get_project_promotion_target(_sg_project),
+                )
+                _sg_ok = True
+                if _sg_gated:
+                    from app.rollup_migration_validation import (  # noqa: PLC0415
+                        enforce_premerge_migration_guard,
+                    )
+
+                    _sg_ok, _sg_reason = await enforce_premerge_migration_guard(
+                        gh_token, owner, repo, int(pr_num), _sg_base
+                    )
+                if not _sg_ok:
+                    logger.warning(
+                        f"[SAFEGUARD] Post-gate merge of PR #{pr_num} held — "
+                        f"Alembic dual-head guard: {_sg_reason} (orig "
+                        f"{safeguard_for_id[:8]}) — leaving PR open for the "
+                        f"guarded retry/resolver flow"
                     )
                 else:
-                    logger.warning(
-                        f"[SAFEGUARD] Post-gate merge of PR #{pr_num} (orig "
-                        f"{safeguard_for_id[:8]}) did not merge: "
-                        f"{_res.get('message', 'unknown')}"
-                    )
+                    _res = await merge_pull_request(gh_token, owner, repo, int(pr_num))
+                    if _res.get("merged"):
+                        logger.info(
+                            f"[SAFEGUARD] Fired held merge for COMPLETED orig "
+                            f"{safeguard_for_id[:8]} PR #{pr_num} after gate release"
+                        )
+                    else:
+                        logger.warning(
+                            f"[SAFEGUARD] Post-gate merge of PR #{pr_num} (orig "
+                            f"{safeguard_for_id[:8]}) did not merge: "
+                            f"{_res.get('message', 'unknown')}"
+                        )
         except Exception as _merge_exc:  # noqa: BLE001
             logger.warning(
                 f"[SAFEGUARD] Post-gate merge attempt for PR #{pr_num} (orig "
@@ -1465,6 +1503,7 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
         child_tasks.append(new_task)
 
     await session.flush()
+    pending_broadcasts: list[tuple[str, str, dict]] = []
     for ct in child_tasks:
         history = TaskHistory(
             task_id=ct.id,
@@ -1472,10 +1511,12 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
             details={"spawned_by": "PERF_AUDIT", "parent_perf_id": str(task.id)},
         )
         session.add(history)
-        await broadcast_to_project(
-            str(task.project_id),
-            "task_updated",
-            {"task_id": str(ct.id), "status": TaskStatus.QUEUED},
+        pending_broadcasts.append(
+            (
+                str(task.project_id),
+                "task_updated",
+                {"task_id": str(ct.id), "status": TaskStatus.QUEUED},
+            )
         )
 
     # Post a summary comment on open PRs for medium/low findings
@@ -1536,11 +1577,22 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
     session.add(task)
     await session.commit()
 
-    await broadcast_to_project(
-        str(task.project_id),
-        "autonomous_activity",
-        {"perf_task_id": str(task.id), "tasks_created": len(child_tasks)},
-    )
+    for project_id, event_name, payload in pending_broadcasts:
+        try:
+            await broadcast_to_project(project_id, event_name, payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"[PERF] Failed to broadcast {event_name} for {payload.get('task_id')}: {exc}"
+            )
+
+    try:
+        await broadcast_to_project(
+            str(task.project_id),
+            "autonomous_activity",
+            {"perf_task_id": str(task.id), "tasks_created": len(child_tasks)},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[PERF] Failed to broadcast autonomous activity: {exc}")
     logger.info(
         f"[PERF] Created 1 bundled fix task from perf analysis {task.id} "
         f"(findings={len(actionable)})"
@@ -1954,6 +2006,14 @@ async def _handle_design_doc_completion(
     from app.strategic_spawning import _spawn_strategic_review  # noqa: PLC0415
     from app.alert_dispatch import _create_strategic_alert  # noqa: PLC0415
     from app.task_locking import lock_project_for_strategic_transition  # noqa: PLC0415
+    from app.strategic_events import emit_strategic_cycle_completed  # noqa: PLC0415
+
+    # Phase 1 emitted strategic_cycle_started at spawn time. Every path out of
+    # this handler that does NOT chain to Phase 2 must pair it with a
+    # strategic_cycle_completed so the frontend "Strategist working…" indicator
+    # never sticks on. Only a successful _spawn_strategic_review (which emits its
+    # own Phase-2 started) is exempt — that keeps the cycle visibly active.
+    phase2_spawned = False
 
     if project is None:
         # Legacy / direct-caller path: acquire the lock here. Post-commit
@@ -1980,6 +2040,8 @@ async def _handle_design_doc_completion(
                 session,
                 f"Design doc update failed: project not found (task {str(task.id)[:8]})",
             )
+            # Phase 1 ended without chaining — close the cycle for the UI.
+            await emit_strategic_cycle_completed(task.project_id, task.id, 1)
             return
         logger.warning(
             f"[DESIGN DOC] Task {task.id}: project {task.project_id} held under contention "
@@ -1990,6 +2052,8 @@ async def _handle_design_doc_completion(
             session,
             f"Design doc update: project row contended (task {str(task.id)[:8]}) — strategic chain deferred",
         )
+        # Phase 1 ended without chaining — close the cycle for the UI.
+        await emit_strategic_cycle_completed(task.project_id, task.id, 1)
         return
 
     doc = project.design_doc or {}
@@ -2008,6 +2072,17 @@ async def _handle_design_doc_completion(
     # Do this BEFORE committing task status so a failed spawn doesn't leave
     # the task as COMPLETED with no Phase 2 follow-up.
     cycle_id = (task.context or {}).get("strategic_cycle_id")
+    # Architecture-cycle operator steering: the pending refresh marker was
+    # consumed when Phase 1 (this design_doc task) was spawned, so it no longer
+    # reads as operator-origin in vision. The flag was stamped on the task
+    # context at spawn time — thread it into Phase 2 so the operator steering
+    # directive still reaches the strategist.
+    operator_steered = bool((task.context or {}).get("operator_steered"))
+    # The operator steering text was persisted on the Phase 1 task context (the
+    # refresh marker — and its excerpt — was consumed at Phase 1 spawn). Thread
+    # it into Phase 2 so the steering directive survives even when the operator
+    # message has aged out of the live conversation-thread snapshot.
+    steering_excerpt = (task.context or {}).get("steering_excerpt")
     spawned = None
     try:
         # Wave F4 H9: removed `await session.refresh(project)`. The caller
@@ -2016,8 +2091,15 @@ async def _handle_design_doc_completion(
         # the row is fresh-read at lock time, so a refresh here is a redundant
         # round-trip that defeats the lock-share optimization between
         # strategic-completion handlers.
-        spawned = await _spawn_strategic_review(project, session, cycle_id=cycle_id)
+        spawned = await _spawn_strategic_review(
+            project,
+            session,
+            cycle_id=cycle_id,
+            operator_steered=operator_steered,
+            steering_excerpt=steering_excerpt,
+        )
         if spawned:
+            phase2_spawned = True
             task.latest_status_message = (
                 f"Design doc: {page_count} pages, rev {rev} — strategic review spawned"
             )
@@ -2034,6 +2116,8 @@ async def _handle_design_doc_completion(
                     "failed_at": _utcnow().isoformat(),
                     "error": "skipped: active strategic task exists",
                     "cycle_id": cycle_id,
+                    "operator_steered": operator_steered,
+                    "steering_excerpt": steering_excerpt,
                 },
             }
             flag_modified(project, "vision")
@@ -2059,6 +2143,8 @@ async def _handle_design_doc_completion(
                 "failed_at": _utcnow().isoformat(),
                 "error": str(chain_exc)[:200],
                 "cycle_id": cycle_id,
+                "operator_steered": operator_steered,
+                "steering_excerpt": steering_excerpt,
             },
         }
         if cycle_id:
@@ -2081,6 +2167,12 @@ async def _handle_design_doc_completion(
     # eventual strategic cycle_summary carries the user-facing narrative.
     session.add(task)
     await session.commit()
+    # Post-commit: when Phase 2 was NOT spawned (deferred because an active
+    # strategic task exists, or the spawn raised), the Phase-1 started event is
+    # otherwise never paired. Emit completed so the indicator clears. A
+    # successful spawn already emitted a Phase-2 started, so it is skipped.
+    if not phase2_spawned:
+        await emit_strategic_cycle_completed(task.project_id, task.id, 1)
 
 
 async def confirm_applied_playbook_entries(task: Task, session: AsyncSession) -> None:

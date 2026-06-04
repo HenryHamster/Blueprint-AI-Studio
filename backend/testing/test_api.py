@@ -509,6 +509,61 @@ async def test_admin_tasks_include_estimated_cost_usd(client: AsyncClient, db_se
 
 
 @pytest.mark.asyncio
+async def test_admin_tasks_expose_unverified_merge_reason(
+    client: AsyncClient, db_session
+):
+    """Both the list and detail admin task endpoints expose a slim
+    unverified_merge_reason mirrored from context.review_loop. A task whose merge
+    proceeded UNVERIFIED returns the persisted reason key; a normal task returns
+    None (so the drawer's Merge Test Gate section stays hidden)."""
+    project = await _make_project_with_member(db_session)
+
+    unverified_task = Task(
+        project_id=project.id,
+        title="UNVERIFIED merge task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "x"}],
+        context={
+            "review_loop": {
+                "iteration": 2,
+                "unverified_merge_reason": "no_detectable_test_command",
+            }
+        },
+    )
+    normal_task = Task(
+        project_id=project.id,
+        title="Normal merge task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "y"}],
+        context={"review_loop": {"iteration": 1}},
+    )
+    db_session.add_all([unverified_task, normal_task])
+    await db_session.commit()
+    for t in (unverified_task, normal_task):
+        await db_session.refresh(t)
+
+    list_resp = await client.get("/api/admin/tasks", params={"limit": 100})
+    assert list_resp.status_code == 200
+    by_id = {t["id"]: t for t in list_resp.json()["tasks"]}
+    assert (
+        by_id[str(unverified_task.id)]["unverified_merge_reason"]
+        == "no_detectable_test_command"
+    )
+    assert by_id[str(normal_task.id)]["unverified_merge_reason"] is None
+
+    detail_resp = await client.get(f"/api/admin/tasks/{unverified_task.id}")
+    assert detail_resp.status_code == 200
+    assert (
+        detail_resp.json()["unverified_merge_reason"]
+        == "no_detectable_test_command"
+    )
+
+    detail_normal = await client.get(f"/api/admin/tasks/{normal_task.id}")
+    assert detail_normal.status_code == 200
+    assert detail_normal.json()["unverified_merge_reason"] is None
+
+
+@pytest.mark.asyncio
 async def test_admin_tasks_filter_by_direction_and_type(
     client: AsyncClient, db_session
 ):

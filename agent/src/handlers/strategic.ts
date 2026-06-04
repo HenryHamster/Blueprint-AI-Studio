@@ -29,6 +29,8 @@ import {
   buildStrategicCompletionLogs,
   readProgressArtifact,
   buildRejectedProposalsSection,
+  buildOperatorOverridesSection,
+  buildRunningUpdateSupersededSection,
   buildUserPausedSection,
   buildVersionPhaseSection,
   buildMemoCitationsSection,
@@ -193,6 +195,23 @@ export async function handleStrategic(
       ? JSON.stringify(problemModel, null, 2)
       : '';
 
+    // ── Per-gap memory pre-trim signal ──
+    // The backend's `_agent_view_problem_model` (strategic_spawning.py) trims
+    // each active gap's append-only history/past_moves/evidence to a recent
+    // window BEFORE the byte-budget packer runs, so this trim never lands in
+    // `_packer_meta` and the model still ships as 'present'. It surfaces the
+    // trim inline on the problem_model as `_gap_memory_trimmed` — a list of
+    // {gap_id, fields} entries. Extract the affected gap_ids and hand them to
+    // the thinker prompt so it steers the agent to `./fetch` full gap history
+    // before reasoning about a long-lived gap's arc, instead of mistaking the
+    // shortened tail for the gap's entire lifetime.
+    const gapMemoryTrimmedMarker = problemModel?._gap_memory_trimmed;
+    const gapMemoryTrimmedGapIds = Array.isArray(gapMemoryTrimmedMarker)
+      ? (gapMemoryTrimmedMarker as Array<Record<string, unknown>>)
+          .map(g => strVal(g.gap_id))
+          .filter(Boolean)
+      : [];
+
     const runningUpdateDoc = typeof payload.running_update === 'string'
       ? payload.running_update
       : '';
@@ -284,6 +303,7 @@ export async function handleStrategic(
       lines.push(
         '',
         'To pull full detail when you need it:',
+        '  - `./fetch problem-model` — full durable problem_model for this project (use when the section was trimmed or dropped)',
         '  - `./fetch direction <id>` — full direction record (research_history capped at 20 cycles)',
         '  - `./fetch playbook <key>` — single playbook entry (e.g. `./fetch playbook frontend-build`)',
         '  - `./fetch gap <id>` — single gap with full history/past_moves/evidence',
@@ -293,9 +313,39 @@ export async function handleStrategic(
     };
     const packerMetaSection = renderPackerMeta(packerMeta);
 
-    const problemModelSection = problemModelJson
-      ? `## Your current understanding (problem_model)\n\`\`\`json\n${problemModelJson}\n\`\`\``
-      : `## Your current understanding (problem_model)\n_(empty — this is the first cycle. Bootstrap from the other sections below.)_`;
+    // ── Distinguish "dropped/trimmed by the packer" from "genuinely first cycle" ──
+    // The packer (see backend/app/payload_schemas.py) records every section it
+    // dropped wholesale or summarized under the byte budget in
+    // `_packer_meta.{dropped,trimmed}` with a `key`. When `problem_model` is in
+    // either list, a durable model EXISTS but was not shipped in full — the agent
+    // must `./fetch problem-model` and EDIT it, NOT bootstrap a cold-start model
+    // (which the executor would submit as a full replacement, wiping real state).
+    // A `trimmed` (summarized) model ships partial JSON; that partial view must
+    // still steer to fetch, because submitting it as a replacement loses detail.
+    const droppedList = packerMeta && Array.isArray(packerMeta.dropped)
+      ? packerMeta.dropped as Array<Record<string, unknown>> : [];
+    const trimmedList = packerMeta && Array.isArray(packerMeta.trimmed)
+      ? packerMeta.trimmed as Array<Record<string, unknown>> : [];
+    const problemModelDropped = droppedList.some(d => strVal(d.key) === 'problem_model');
+    const problemModelTrimmed = trimmedList.some(t => strVal(t.key) === 'problem_model');
+
+    const problemModelRecovery: 'present' | 'fetch' | 'empty' =
+      problemModelTrimmed ? 'fetch'
+      : problemModelJson ? 'present'
+      : problemModelDropped ? 'fetch'
+      : 'empty';
+
+    let problemModelSection: string;
+    if (problemModelRecovery === 'present') {
+      problemModelSection = `## Your current understanding (problem_model)\n\`\`\`json\n${problemModelJson}\n\`\`\``;
+    } else if (problemModelRecovery === 'fetch') {
+      const partialView = problemModelJson
+        ? `\n\nA partial/summarized view was shipped below, but it is NOT the full model — do not treat it as complete or submit it as a replacement:\n\`\`\`json\n${problemModelJson}\n\`\`\``
+        : '';
+      problemModelSection = `## Your current understanding (problem_model)\n_**Your durable problem_model EXISTS but was not shipped in full this cycle** — the packer dropped or summarized it under the byte budget (see "Context not shipped this cycle" above). This is NOT the first cycle. Before you submit ANY problem_model update you MUST run \`./fetch problem-model\` to retrieve the full current model, then EDIT it — never replace it from scratch, or you will wipe real durable capabilities, gaps, and friction._${partialView}`;
+    } else {
+      problemModelSection = `## Your current understanding (problem_model)\n_(empty — this is the first cycle. Bootstrap from the other sections below.)_`;
+    }
     const verificationFailuresSection = buildCapabilityVerificationSection(problemModel);
 
     const runningUpdateSection = `## Running update (living document — rewrite, don't append)\n${renderRunningUpdateDoc(runningUpdateDoc)}\n\n_This is the document the user currently sees. Refine it this cycle — remove stale content, integrate what's new, keep it coherent and short. It's a current snapshot, not a log._`;
@@ -335,10 +385,17 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       packerMetaSection,
       strategicContext,
       problemModelSection,
+      problemModelRecovery,
+      gapMemoryTrimmedGapIds,
       verificationFailuresSection,
       reflectionSection,
       selfImprovementBlock,
       runningUpdateSection,
+      runningUpdateSupersededSection: buildRunningUpdateSupersededSection(
+        payload.running_update_superseded && typeof payload.running_update_superseded === 'object'
+          ? payload.running_update_superseded as Record<string, unknown>
+          : null
+      ),
       designDocJson,
       visionJson,
       outcomeSection,
@@ -349,6 +406,7 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       dirHealthSummary,
       userPausedSection: buildUserPausedSection(directionsSummary),
       rejectedProposalsSection: buildRejectedProposalsSection(Array.isArray(payload.rejected_proposals) ? payload.rejected_proposals as Array<Record<string, unknown>> : []),
+      operatorOverridesSection: buildOperatorOverridesSection(Array.isArray(payload.operator_overrides) ? payload.operator_overrides as Array<Record<string, unknown>> : []),
       portfolioCompositionText,
       systemMaturitySection,
       driftSection,
@@ -402,6 +460,13 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
     // the managed project. When CLAUDE.md was stripped to a bare "Executor
     // Agent" role blurb, the executor hallucinated problem_model content
     // describing its own role instead of the project.
+
+    // When the durable model was dropped/trimmed by the packer, the executor's
+    // "if file missing, construct" fallback must NOT cold-start a bootstrap —
+    // it must fetch-then-edit, or it wipes the real model on full replacement.
+    const executorFetchRecoveryNote = problemModelRecovery === 'fetch'
+      ? ` IMPORTANT — your durable problem_model was NOT shipped in full this cycle (the packer dropped or summarized it) but it EXISTS. If the file is missing or malformed, you MUST first run \`./fetch problem-model\` to retrieve the full current model and EDIT it — NEVER construct a cold-start bootstrap from scratch, which would wipe real durable capabilities/gaps/friction.`
+      : '';
 
     const executorPrompt = `# This task's scope
 
@@ -473,6 +538,7 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # Pull full detail for items the strategic packer trimmed (see "Context not
 # shipped this cycle" section in your prompt). Use only when you actually
 # need the detail — extra context hurts reasoning quality.
+./fetch problem-model              # full durable problem_model for this project
 ./fetch direction <direction_id>   # full direction record
 ./fetch playbook <key>             # single playbook entry
 ./fetch gap <gap_id>               # single problem_model gap
@@ -494,7 +560,7 @@ ${analysisText.slice(0, 50_000)}
 
 1. **Problem model (REQUIRED).** First do step 5 below: if the Thinker emitted \`version_phase_decision\` and/or \`qualify_request\`, edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add those top-level sibling fields. Then pass \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\` — the \`cat\` re-reads the file, so the sibling fields you added in step 5 are included. Don't summarize or re-emit the model's own content — read-and-pass; the only edit permitted is step 5's sibling fields.
 
-   Fallback (use judgment): if the file is missing, empty, or the JSON is malformed, you may construct a corrected problem_model yourself — but ground it STRICTLY in the thinker's analysis below (Sections 1-6) and in the project described by CLAUDE.md. Verify findings against the analysis before writing. If even the analysis is insufficient, call \`./strategic pending-confirm\` with type "major_decision" to surface the gap rather than ship bad state. NEVER describe this execution environment, this prompt, your role, or the ./strategic / ./design-doc commands — the problem_model describes the managed project from CLAUDE.md.
+   Fallback (use judgment): if the file is missing, empty, or the JSON is malformed, you may construct a corrected problem_model yourself — but ground it STRICTLY in the thinker's analysis below (Sections 1-6) and in the project described by CLAUDE.md. Verify findings against the analysis before writing. If even the analysis is insufficient, call \`./strategic pending-confirm\` with type "major_decision" to surface the gap rather than ship bad state. NEVER describe this execution environment, this prompt, your role, or the ./strategic / ./design-doc commands — the problem_model describes the managed project from CLAUDE.md.${executorFetchRecoveryNote}
 
    This is the canonical source of truth — EVERY cycle must emit it so the revision bumps and the cycle is auditable.
 
@@ -580,7 +646,7 @@ ${analysisText.slice(0, 50_000)}
           `Missing: ${missing.join(', ')}`,
           '',
           'Run these NOW using data from the analysis:',
-          !problemModelSetInOutput ? `- ./strategic set-problem-model "$(cat /tmp/problem_model_${taskId}.json)"  (if file missing: construct from analysis grounded in the managed project — NEVER self-describe)` : '',
+          !problemModelSetInOutput ? `- ./strategic set-problem-model "$(cat /tmp/problem_model_${taskId}.json)"  (if file missing: ${problemModelRecovery === 'fetch' ? 'run `./fetch problem-model` and edit the full model — NEVER construct a cold-start bootstrap, it wipes durable state' : 'construct from analysis grounded in the managed project — NEVER self-describe'})` : '',
           !runningUpdateSetInOutput ? `- ./strategic set-running-update /tmp/running_update_${taskId}.md  (if file missing: write a single clean markdown doc to that path first — describe the managed project's current state, NEVER self-describe)` : '',
           !retirementCritiquesSetInOutput ? `- ./strategic set-retirement-critiques '[{"direction_id":"d-xxx","what_it_addressed":"...","pattern_that_produced_it":"...","lesson":"..."}]'  OR  ./strategic set-retirement-critiques '{"no_eligible_retirements": true}'  (one of these two payloads, depending on whether there are retired directions to critique)` : '',
           '',

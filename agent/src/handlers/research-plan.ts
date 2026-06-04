@@ -431,6 +431,39 @@ export function buildRejectedProposalsSection(
   return `\n## Recently Rejected Proposals (last 30 days)\nThe user explicitly rejected these direction proposals. Do NOT re-propose similar work — find a different angle or move on.\n${lines.join('\n')}\n`;
 }
 
+export function buildOperatorOverridesSection(
+  overrides: Array<Record<string, unknown>>
+): string {
+  if (!Array.isArray(overrides) || overrides.length === 0) return '';
+  const lines = overrides.slice(0, 8).map(o => {
+    const document = strVal(o.document) || 'document';
+    const field = strVal(o.field);
+    const when = strVal(o.at).slice(0, 10) || '?';
+    const agentValue = strVal(o.agent_value).slice(0, 240);
+    const operatorValue = strVal(o.operator_value).slice(0, 240);
+    const fieldTail = field ? ` \`${field}\`` : '';
+    const head = `- (${when}) ${document}${fieldTail}`;
+    if (document === 'running_update') {
+      // Running-update overrides carry no scalar operator value — the operator's
+      // winning version IS the current running_update body in this payload.
+      return `${head}: you proposed "${agentValue}"; the operator kept their own running_update edit (see the Running update above).`;
+    }
+    return `${head}: you proposed "${agentValue}"; the operator kept "${operatorValue}".`;
+  });
+  return `\n## Operator Overrides Since Last Cycle\nThe operator edited these documents mid-cycle and their value won the reconciliation — your previous proposal was overridden. Reconcile with the operator's intent: do NOT simply re-propose the overridden value. If you still believe a change is warranted, route it as a new proposal that respects what the operator chose.\n${lines.join('\n')}\n`;
+}
+
+export function buildRunningUpdateSupersededSection(
+  signal: Record<string, unknown> | null | undefined
+): string {
+  if (!signal || typeof signal !== 'object') return '';
+  const count = Number(signal.count) || 0;
+  if (count <= 0) return '';
+  const when = strVal(signal.most_recent_at).slice(0, 10);
+  const whenTail = when ? ` (most recent: ${when})` : '';
+  return `\n_Last cycle the operator preserved their own running_update over your proposed rewrite${whenTail}. The operator is actively editing this document — treat it as operator-authoritative. Refine it; do NOT rewrite it from a blank slate or re-impose your superseded version._\n`;
+}
+
 export function buildUserPausedSection(
   directionsSummary: Array<Record<string, unknown>>
 ): string {

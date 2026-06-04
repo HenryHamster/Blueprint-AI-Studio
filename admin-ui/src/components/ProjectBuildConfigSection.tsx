@@ -1,14 +1,15 @@
 import { useState, useEffect, useRef } from 'react';
-import { Plus, Trash2, RefreshCw, AlertTriangle } from 'lucide-react';
+import { Plus, Trash2, RefreshCw, AlertTriangle, CheckCircle } from 'lucide-react';
 
 function isRecognizedLintCmd(cmd: string): boolean {
   if (!cmd.trim()) return true;
   const base = cmd.replace(/^(python3?\s+-m\s+|npx\s+|pnpm\s+exec\s+)/, '');
   return /^(ruff|eslint|mypy|flake8|pyright)\b/.test(base);
 }
-import type { BuildConfig, BuildConfigDirectory } from '../types/project';
+import type { BuildConfig, BuildConfigDirectory, MergeGateRuntime, MergeVerificationVerdict } from '../types/project';
 import { apiFetch } from '../api';
 import { SR_CANONICAL_CATEGORIES } from './SrRetrospectiveShared';
+import { MergeVerificationBanner } from './MergeVerificationBanner';
 
 interface ProjectBuildConfigSectionProps {
   githubOwner: string | null;
@@ -19,6 +20,15 @@ interface ProjectBuildConfigSectionProps {
   onDetect: () => Promise<void>;
   detectAvailable: boolean;
   projectId?: string | null;
+  /**
+   * Backend-computed merge-gate verdict. When provided, it is rendered directly;
+   * when omitted, the component derives it from the project list it already fetches
+   * (the same single source as the backend list endpoint), so the settings panel
+   * needs no extra app-state wiring. Pass `null` to explicitly suppress.
+   */
+  mergeVerificationVerdict?: MergeVerificationVerdict | null;
+  /** Optional live no-CI gate runtime evidence. When omitted, the component derives it from the project list. */
+  mergeGateRuntime?: MergeGateRuntime | null;
 }
 
 const EMPTY_DIR: BuildConfigDirectory = {
@@ -42,6 +52,8 @@ export function ProjectBuildConfigSection({
   onDetect,
   detectAvailable,
   projectId,
+  mergeVerificationVerdict,
+  mergeGateRuntime,
 }: ProjectBuildConfigSectionProps) {
   const hasConfig = buildConfig && (
     (buildConfig.directories?.length ?? 0) > 0 ||
@@ -67,6 +79,9 @@ export function ProjectBuildConfigSection({
   const [enableParallelFix, setEnableParallelFix] = useState(
     buildConfig?.enable_parallel_fix ?? false
   );
+  const [requiresCiChecks, setRequiresCiChecks] = useState(
+    buildConfig?.requires_ci_checks ?? true
+  );
   const [taskBranchNamespace, setTaskBranchNamespace] = useState(
     buildConfig?.task_branch_namespace ?? ''
   );
@@ -82,6 +97,12 @@ export function ProjectBuildConfigSection({
   const [saving, setSaving] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [srTargets, setSrTargets] = useState<Record<string, number>>({});
+  // Verdict derived from the project list when the parent doesn't pass one
+  // explicitly. The prop, when supplied (incl. null), takes precedence.
+  const [fetchedVerdict, setFetchedVerdict] = useState<MergeVerificationVerdict | null>(null);
+  const [fetchedRuntime, setFetchedRuntime] = useState<MergeGateRuntime | null>(null);
+  const effectiveVerdict = mergeVerificationVerdict !== undefined ? mergeVerificationVerdict : fetchedVerdict;
+  const effectiveRuntime = mergeGateRuntime !== undefined ? mergeGateRuntime : fetchedRuntime;
   const preservedBranchOnDetect = useRef<{ namespace: string; prefix: string; prTitlePrefix: string } | null>(null);
 
   // Sync state when buildConfig prop changes (e.g. after detect or project switch)
@@ -92,6 +113,7 @@ export function ProjectBuildConfigSection({
     setEnableFreshReviewer(buildConfig?.enable_fresh_reviewer ?? false);
     setEnableParallelReview(buildConfig?.enable_parallel_review ?? false);
     setEnableParallelFix(buildConfig?.enable_parallel_fix ?? false);
+    setRequiresCiChecks(buildConfig?.requires_ci_checks ?? true);
     const preserved = preservedBranchOnDetect.current;
     setTaskBranchNamespace(buildConfig?.task_branch_namespace ?? preserved?.namespace ?? '');
     setTaskBranchPrefix(buildConfig?.task_branch_prefix ?? preserved?.prefix ?? '');
@@ -123,6 +145,27 @@ export function ProjectBuildConfigSection({
       .catch(() => {});
   }, [projectId]);
 
+  // Derive the merge-verification verdict from the project list (the backend's
+  // single source of truth) unless the parent supplies it as a prop. Re-runs when
+  // buildConfig changes (after detect/save) so the banner reflects persisted state.
+  // apiFetch dedups this concurrent GET with the SR-targets fetch above.
+  useEffect(() => {
+    if (!projectId) { setFetchedVerdict(null); setFetchedRuntime(null); return; }
+    let cancelled = false;
+    apiFetch('/api/admin/projects')
+      .then(r => r.json())
+      .then((resp: { items?: { id: string; merge_verification_verdict?: MergeVerificationVerdict; merge_gate_runtime?: MergeGateRuntime }[] }) => {
+        if (cancelled) return;
+        const p = (resp.items ?? []).find(p => p.id === projectId);
+        setFetchedRuntime(p?.merge_gate_runtime ?? null);
+        if (mergeVerificationVerdict === undefined) {
+          setFetchedVerdict(p?.merge_verification_verdict ?? null);
+        }
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [projectId, buildConfig, mergeVerificationVerdict]);
+
   const handleSave = async () => {
     setSaving(true);
     try {
@@ -134,6 +177,7 @@ export function ProjectBuildConfigSection({
         enable_fresh_reviewer: enableFreshReviewer,
         enable_parallel_review: enableParallelReview,
         enable_parallel_fix: enableParallelFix,
+        requires_ci_checks: requiresCiChecks,
         task_branch_namespace: taskBranchNamespace.trim() || undefined,
         task_branch_prefix: taskBranchPrefix.trim() || undefined,
         pr_title_prefix: prTitlePrefix.trim() || undefined,
@@ -480,6 +524,70 @@ export function ProjectBuildConfigSection({
               </p>
             </div>
           </label>
+          <label className="flex items-start gap-3 cursor-pointer group">
+            <div className="mt-0.5 shrink-0">
+              <input
+                type="checkbox"
+                checked={requiresCiChecks}
+                onChange={e => setRequiresCiChecks(e.target.checked)}
+                className="sr-only peer"
+                id="requires-ci-checks-toggle"
+              />
+              <div
+                onClick={() => setRequiresCiChecks(v => !v)}
+                className={`w-8 h-4 rounded-full transition-colors cursor-pointer ${requiresCiChecks ? 'bg-blue-600' : 'bg-neutral-700'} relative`}
+              >
+                <div className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${requiresCiChecks ? 'translate-x-4' : 'translate-x-0'}`} />
+              </div>
+            </div>
+            <div>
+              <span className="text-xs text-neutral-200 font-medium">Repository has required CI checks</span>
+              <p className="text-[11px] text-neutral-500 mt-0.5">
+                On by default — Blueprint waits for the repository's required CI checks to pass before merging a PR.
+                Turn this off for repos without required checks: Blueprint then runs the repository's detected test suite
+                as the merge gate—passing tests merge, failing tests block. If no test command is detected, Blueprint proceeds unverified.
+              </p>
+            </div>
+          </label>
+          {/* Backend-computed verdict for what the merge gate will actually do. */}
+          <MergeVerificationBanner verdict={effectiveVerdict} runtime={effectiveRuntime} />
+
+          {/* CI-presence pre-flight: detection + guidance only (never auto-flips the toggle). */}
+          {buildConfig?.has_ci === true && (
+            <div
+              data-testid="ci-status-banner"
+              className="ml-11 -mt-2 flex items-start gap-2 text-[11px] text-emerald-400 bg-emerald-950/30 border border-emerald-900/50 rounded-lg px-3 py-2"
+            >
+              <CheckCircle className="w-3.5 h-3.5 shrink-0 mt-px" />
+              <span>
+                CI detected (GitHub Actions workflows present) — with "required CI checks" on, merges
+                will be gated on the repository's CI.
+              </span>
+            </div>
+          )}
+          {buildConfig?.has_ci === false && (
+            <div
+              data-testid="ci-status-banner"
+              className="ml-11 -mt-2 flex items-start gap-2 text-[11px] text-amber-400 bg-amber-950/30 border border-amber-900/50 rounded-lg px-3 py-2"
+            >
+              <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px" />
+              <span>
+                No CI detected (no GitHub Actions workflows). Leaving "required CI checks" on will make
+                every PR poll for checks that never arrive until the merge backstop times out. Turn it
+                off so Blueprint gates merges on this repo's own detected test suite instead.
+                {dirs.some(d => d.test_cmd?.trim()) ? (
+                  <span className="block mt-1 text-emerald-400">
+                    A test command is configured, so the no-CI gate will run tests as the merge verdict.
+                  </span>
+                ) : (
+                  <span className="block mt-1 text-amber-300">
+                    No test command is configured — with CI checks off, PRs would merge UNVERIFIED. Add a
+                    test command below before relying on the gate.
+                  </span>
+                )}
+              </span>
+            </div>
+          )}
         </div>
       )}
 

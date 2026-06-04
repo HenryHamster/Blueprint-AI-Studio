@@ -22,6 +22,12 @@ from sqlmodel import select
 
 from app.broadcast import broadcast_to_project
 from app.database import get_session
+from app.strategic_events import (
+    STRATEGIC_KIND_DIRECTIONS,
+    STRATEGIC_KIND_PROBLEM_MODEL,
+    STRATEGIC_KIND_RUNNING_UPDATE,
+    emit_strategic_updated,
+)
 from app.direction_lifecycle import _reset_outcome_detection_state
 from app.models import MessageType, Project, ProjectMessage, Task, TaskStatus
 from app.payload_schemas import (
@@ -43,6 +49,7 @@ from app.shared_state import (
     limiter,
     runtime_config as _runtime_config,
 )
+from app.size_limit_policy import bump_size_limit as _bump_size_limit_policy
 from app.strategic_completion import (
     _find_matching_direction,
     _normalize_recommended_mode,
@@ -430,13 +437,12 @@ _ANNOTATION_TYPE_MAP = {
 def _bump_size_limit(current_size: int) -> int:
     """Server-side policy for how much to bump a size limit on breach.
 
-    Picks the larger of "current_size + 200" and "current + 15%" so a
-    small overrun gets a reasonable floor and a big overrun doesn't
-    leave tiny headroom. Rounded to the nearest 50 lines for stability."""
-    floor = current_size + 200
-    proportional = int(current_size * 1.15)
-    raw = max(floor, proportional)
-    return ((raw + 49) // 50) * 50
+    Delegates to the shared, dependency-free policy in
+    ``app.size_limit_policy`` so the server endpoint and the standalone
+    ``check_size_limits.py`` checker produce identical bumps. Kept as a thin
+    wrapper here (and re-exported from ``app.main``) so existing call sites
+    and test patches (test_agent_annotate.py) keep working unchanged."""
+    return _bump_size_limit_policy(current_size)
 
 
 @router.post("/api/agent/annotate")
@@ -603,17 +609,65 @@ async def strategic_operation(
             body["warnings"] = list(warnings)
         return body
 
+    async def _emit_updated(kind: str) -> None:
+        """Post-commit refetch signal for a strategist output change.
+
+        Must be awaited only AFTER the op's ``session.commit()``; the lock is
+        already released by then, mirroring the established broadcast pattern.
+        """
+        await emit_strategic_updated(project.id, kind)
+
     if payload.op == "set_vision":
         if not isinstance(data, dict) or not data.get("purpose"):
             raise HTTPException(
                 status_code=400, detail="Vision must have a 'purpose' field"
             )
+        from app import strategic_cycle as _strategic_cycle
+        from app.vision_merge import append_rejected_edits, merge_vision
+
         current = dict(project.vision or {})
-        new_vision = {
-            **dict(data),
-            "revision": (current.get("revision", 0) or 0) + 1,
-            "last_updated": _utcnow().isoformat(),
-        }
+        # Operator-wins reconciliation, mirroring set_problem_model /
+        # set_running_update: resolve the cycle's vision merge ancestor and run
+        # the shared 3-way merge so a concurrent operator edit (purpose, systems,
+        # priorities, context) is preserved (operator wins) and the agent's
+        # superseded value is recorded to the rejected-edits ledger for next
+        # cycle. On the FIRST write the ancestor is the cycle-start
+        # baseline_vision snapshot; on a SECOND same-cycle write it is the
+        # agent's own prior proposal (stored below) so the agent advances its
+        # own field instead of being misread as an operator edit. Degrades to a
+        # blind assign onto ``current`` when no cycle/baseline resolves (legacy
+        # task), preserving today's behavior.
+        vision_cycle_row = None
+        vision_cycle_id = task.strategic_cycle_id or (task.context or {}).get(
+            "strategic_cycle_id"
+        )
+        merge_ancestor: dict | None = None
+        if vision_cycle_id:
+            vision_cycle_row = await _strategic_cycle.get(session, vision_cycle_id)
+            if vision_cycle_row is not None:
+                prior = _strategic_cycle.agent_vision_proposal(vision_cycle_row)
+                if prior is not None:
+                    merge_ancestor = prior
+                else:
+                    snap = _strategic_cycle.baseline_vision(vision_cycle_row)
+                    if snap:
+                        merge_ancestor = snap
+        if merge_ancestor is not None:
+            merged, rejected_edits = merge_vision(
+                baseline=merge_ancestor, agent=dict(data), current=current
+            )
+            if rejected_edits:
+                append_rejected_edits(merged, rejected_edits)
+                logger.info(
+                    f"[STRATEGIC API] Vision merge rejected {len(rejected_edits)} "
+                    f"agent edit(s) in favor of concurrent operator changes for "
+                    f"project {project.id}"
+                )
+            new_vision = merged
+        else:
+            new_vision = dict(data)
+        new_vision["revision"] = (current.get("revision", 0) or 0) + 1
+        new_vision["last_updated"] = _utcnow().isoformat()
         # Preserve internal tracking fields; reset failure counters on success
         new_vision.update(
             {
@@ -627,6 +681,11 @@ async def strategic_operation(
         project.vision = new_vision
         flag_modified(project, "vision")
         session.add(project)
+        # Remember the agent's pre-merge proposed vision so a subsequent
+        # same-cycle write reconciles against it (see ancestor resolution above).
+        if vision_cycle_row is not None:
+            _strategic_cycle.set_agent_vision_proposal(vision_cycle_row, dict(data))
+            session.add(vision_cycle_row)
         # Stamp task so the completion handler knows a real vision update occurred
         task.context = {**(task.context or {}), "_strategic_vision_set": True}
         flag_modified(task, "context")
@@ -770,6 +829,7 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
+        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
         logger.info(
             f"[STRATEGIC API] Created direction '{text[:60]}' for project {project.id}"
         )
@@ -924,6 +984,7 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
+        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
         logger.info(f"[STRATEGIC API] Updated direction {dir_id}")
         return _resp({"status": "ok", "op": "update_direction", "direction_id": dir_id})
 
@@ -966,6 +1027,7 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
+        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
         logger.info(f"[STRATEGIC API] Retired direction {dir_id}")
         # Advisory (non-blocking): each active direction is one parallel work-lane
         # the fleet fans out across, so retiring below the healthy floor caps max
@@ -1051,6 +1113,7 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
+        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
         logger.info(
             f"[STRATEGIC API] Approved proposal {dir_id} for project {project.id}"
         )
@@ -1132,6 +1195,7 @@ async def strategic_operation(
             # router, and _ensure_vm_deleted is defined in main.py.
             from app.vm_lifecycle import _ensure_vm_deleted as _main_ensure_vm_deleted
             await _main_ensure_vm_deleted(vm_id, reason="proposal_rejected")
+        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
         logger.info(
             f"[STRATEGIC API] Rejected proposal {dir_id} for project {project.id} (cancelled {len(cancelled_tasks)} tasks)"
         )
@@ -1148,9 +1212,13 @@ async def strategic_operation(
         raw_content = str(data.get("content", "")).strip()
         if not raw_content:
             raise HTTPException(status_code=400, detail="Message content required")
-        content = _cap_str(
-            raw_content, STRATEGIC_MESSAGE_CONTENT_MAX, "content", warnings
-        )
+        if len(raw_content) > STRATEGIC_MESSAGE_CONTENT_MAX:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Message content exceeds {STRATEGIC_MESSAGE_CONTENT_MAX} character limit "
+                f"({len(raw_content)} chars provided). Please resubmit with shorter content.",
+            )
+        content = raw_content
         try:
             msg_type = MessageType(str(data.get("type", "NOTE")).upper())
         except ValueError:
@@ -1365,7 +1433,7 @@ async def strategic_operation(
         from pydantic import ValidationError as _PmValidationError
 
         from app import strategic_cycle as _strategic_cycle
-        from app.problem_model import apply_agent_update
+        from app.problem_model import apply_agent_update, operator_owned_subset
         from app.strategic_completion import (
             QUALIFY_REQUEST_CONTEXT_KEY,
             VERSION_PHASE_DECISION_CONTEXT_KEY,
@@ -1397,16 +1465,27 @@ async def strategic_operation(
         # operator-wins rather than silently clobbered. Mirrors the vision
         # baseline resolution in strategic_completion; degrade to None (today's
         # blank-preservation-only behavior) when no cycle/baseline is available.
+        # On the FIRST write the ancestor is the cycle-start snapshot; on a
+        # SECOND same-cycle write it is the agent's own prior proposed
+        # operator-owned subset (stored below after each successful write). This
+        # lets a 2nd agent write advance its own context/constraints instead of
+        # being misread as a mid-cycle operator edit, while a genuine operator
+        # edit still moves ``current`` away from the stored proposal and wins.
         baseline_pm: dict | None = None
+        pm_cycle_row = None
         pm_cycle_id = task.strategic_cycle_id or (task.context or {}).get(
             "strategic_cycle_id"
         )
         if pm_cycle_id:
             pm_cycle_row = await _strategic_cycle.get(session, pm_cycle_id)
             if pm_cycle_row is not None:
-                snap = _strategic_cycle.baseline_problem_model(pm_cycle_row)
-                if snap:
-                    baseline_pm = snap
+                prior = _strategic_cycle.agent_problem_model_proposal(pm_cycle_row)
+                if prior is not None:
+                    baseline_pm = prior
+                else:
+                    snap = _strategic_cycle.baseline_problem_model(pm_cycle_row)
+                    if snap:
+                        baseline_pm = snap
         try:
             new_pm_raw, pm_diff = apply_agent_update(
                 current_raw=project.problem_model,
@@ -1421,6 +1500,13 @@ async def strategic_operation(
         project.problem_model = new_pm_raw
         flag_modified(project, "problem_model")
         session.add(project)
+        # Remember the agent's pre-merge operator-owned proposal so a subsequent
+        # same-cycle write reconciles against it (see baseline resolution above).
+        if pm_cycle_row is not None:
+            _strategic_cycle.set_agent_problem_model_proposal(
+                pm_cycle_row, operator_owned_subset(pm_data)
+            )
+            session.add(pm_cycle_row)
         ctx = task.context or {}
         new_ctx = {
             **ctx,
@@ -1435,6 +1521,7 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
+        await _emit_updated(STRATEGIC_KIND_PROBLEM_MODEL)
         logger.info(
             f"[STRATEGIC API] problem_model updated for project {project.id} "
             f"to revision {new_pm_raw.get('revision')} ({pm_diff or 'no diff'})"
@@ -1476,8 +1563,41 @@ async def strategic_operation(
                 status_code=400,
                 detail="set_running_update requires data={'markdown': '<string>'}",
             )
-        project.running_update = doc
+        if len(doc) > 100_000:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Running update exceeds 100KB character limit "
+                f"({len(doc)} chars provided). Please resubmit with shorter content.",
+            )
+        # Operator-wins reconciliation, mirroring set_problem_model: resolve the
+        # cycle's baseline running_update (snapshot at spawn) and reconcile the
+        # agent's document against the current DB document via the single shared
+        # helper used by both this live op and the strategic-completion
+        # fallback. A concurrent operator body edit is preserved (operator wins)
+        # and the agent's superseded document is recorded for next cycle; a
+        # mid-cycle routine-event digest append is re-integrated rather than
+        # discarded. Degrades to today's blind-assign when no cycle/baseline is
+        # resolvable (legacy task).
+        from app import strategic_cycle as _strategic_cycle
+        from app.running_update_merge import apply_reconciled_running_update
+
+        ru_baseline: str | None = None
+        ru_cycle_row = None
+        ru_cycle_id = task.strategic_cycle_id or (task.context or {}).get(
+            "strategic_cycle_id"
+        )
+        if ru_cycle_id:
+            ru_cycle_row = await _strategic_cycle.get(session, ru_cycle_id)
+            if ru_cycle_row is not None:
+                ru_baseline = _strategic_cycle.baseline_running_update(ru_cycle_row)
+        ru_rejected = apply_reconciled_running_update(
+            project, baseline=ru_baseline, agent=doc, cycle=ru_cycle_row
+        )
         session.add(project)
+        if ru_cycle_row is not None:
+            # Persist the advanced baseline alongside the project write so the
+            # next same-cycle agent write reconciles against this document.
+            session.add(ru_cycle_row)
         ctx = task.context or {}
         task.context = {
             **ctx,
@@ -1487,10 +1607,18 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
-        logger.info(
-            f"[STRATEGIC API] Set running_update for project {project.id} "
-            f"(length: {len(doc)} chars)"
-        )
+        await _emit_updated(STRATEGIC_KIND_RUNNING_UPDATE)
+        if ru_rejected is not None:
+            logger.info(
+                f"[STRATEGIC API] running_update: concurrent operator edit "
+                f"preserved for project {project.id}; agent's document "
+                f"({len(doc)} chars) recorded as a rejected edit"
+            )
+        else:
+            logger.info(
+                f"[STRATEGIC API] Set running_update for project {project.id} "
+                f"(length: {len(doc)} chars)"
+            )
         return _resp(
             {
                 "status": "ok",

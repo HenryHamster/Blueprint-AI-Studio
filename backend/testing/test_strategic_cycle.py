@@ -88,6 +88,48 @@ async def test_baseline_problem_model_defaults_empty(db_session):
     assert strategic_cycle.baseline_problem_model(fetched) == {}
 
 
+@pytest.mark.asyncio
+async def test_create_snapshots_baseline_running_update(db_session):
+    """The running_update snapshot is captured at cycle start so the
+    operator-wins reconciliation can compare the agent's write against it."""
+    project = await _make_project(db_session)
+    cycle = await strategic_cycle.create(
+        db_session,
+        project_id=project.id,
+        baseline_running_update="## Current state\nShipping v4.",
+    )
+    await db_session.commit()
+    fetched = await strategic_cycle.get(db_session, cycle.id)
+    assert (
+        strategic_cycle.baseline_running_update(fetched)
+        == "## Current state\nShipping v4."
+    )
+
+
+@pytest.mark.asyncio
+async def test_baseline_running_update_empty_when_none_at_spawn(db_session):
+    """A cycle whose running_update was empty at spawn reads back as ``""``
+    (a captured-but-empty baseline), distinct from a legacy cycle's ``None``."""
+    project = await _make_project(db_session)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+    fetched = await strategic_cycle.get(db_session, cycle.id)
+    assert strategic_cycle.baseline_running_update(fetched) == ""
+
+
+def test_baseline_running_update_none_for_legacy_cycle():
+    """A legacy cycle row predating the snapshot (no key in cycle_metadata)
+    reports ``None`` so the reconciliation degrades to blind-assign."""
+    cycle = StrategicCycle(
+        id="sc-legacy-ru",
+        project_id="p-1",
+        outcome=strategic_cycle.OUTCOME_COMPLETED,
+        phase1_started_at=_utcnow(),
+        cycle_metadata={"baseline_vision": {"purpose": "x"}},
+    )
+    assert strategic_cycle.baseline_running_update(cycle) is None
+
+
 def test_to_legacy_dict_omits_baseline_problem_model():
     """The problem-model snapshot must never leak into the agent-facing
     cycle-history shape, exactly as baseline_vision is hidden."""
@@ -99,14 +141,146 @@ def test_to_legacy_dict_omits_baseline_problem_model():
         cycle_metadata={
             "baseline_vision": {"purpose": "secret"},
             "baseline_problem_model": {"intent": {"purpose": "also secret"}},
+            "baseline_running_update": "secret running update doc",
             "memos_cited": 2,
         },
     )
     out = strategic_cycle._to_legacy_dict(cycle)
     assert "baseline_vision" not in out
     assert "baseline_problem_model" not in out
+    assert "baseline_running_update" not in out
     # Non-baseline metadata is still spread back in.
     assert out["memos_cited"] == 2
+
+
+@pytest.mark.asyncio
+async def test_agent_problem_model_proposal_roundtrip(db_session):
+    """The agent's per-cycle pre-merge proposal stores and reads back; absent
+    until the first write (so callers fall back to the cycle-start snapshot)."""
+    project = await _make_project(db_session)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+    fetched = await strategic_cycle.get(db_session, cycle.id)
+    # No write yet → None (callers fall back to baseline_problem_model snapshot).
+    assert strategic_cycle.agent_problem_model_proposal(fetched) is None
+
+    subset = {
+        "intent": {"purpose": "P"},
+        "context": {"project_type": "startup"},
+        "constraints": ["c1"],
+    }
+    strategic_cycle.set_agent_problem_model_proposal(fetched, subset)
+    db_session.add(fetched)
+    await db_session.commit()
+    refetched = await strategic_cycle.get(db_session, cycle.id)
+    assert strategic_cycle.agent_problem_model_proposal(refetched) == subset
+
+
+@pytest.mark.asyncio
+async def test_agent_vision_proposal_roundtrip(db_session):
+    """The agent's per-cycle pre-merge vision proposal stores and reads back;
+    absent until the first write (so callers fall back to baseline_vision)."""
+    project = await _make_project(db_session)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+    fetched = await strategic_cycle.get(db_session, cycle.id)
+    # No write yet → None (callers fall back to baseline_vision snapshot).
+    assert strategic_cycle.agent_vision_proposal(fetched) is None
+
+    vision = {"purpose": "P", "systems": [{"id": "s1", "name": "Core"}]}
+    strategic_cycle.set_agent_vision_proposal(fetched, vision)
+    db_session.add(fetched)
+    await db_session.commit()
+    refetched = await strategic_cycle.get(db_session, cycle.id)
+    assert strategic_cycle.agent_vision_proposal(refetched) == vision
+
+
+def test_to_legacy_dict_omits_agent_vision_proposal():
+    """The per-cycle agent vision proposal must never leak into the agent-facing
+    cycle-history shape, exactly as the baseline snapshots are hidden."""
+    cycle = StrategicCycle(
+        id="sc-test-vprop",
+        project_id="p-1",
+        outcome=strategic_cycle.OUTCOME_COMPLETED,
+        phase1_started_at=_utcnow(),
+        cycle_metadata={
+            strategic_cycle.AGENT_VISION_PROPOSAL_KEY: {"purpose": "secret"},
+            "memos_cited": 1,
+        },
+    )
+    out = strategic_cycle._to_legacy_dict(cycle)
+    assert strategic_cycle.AGENT_VISION_PROPOSAL_KEY not in out
+    assert out["memos_cited"] == 1
+
+
+def test_to_legacy_dict_omits_agent_problem_model_proposal():
+    """The per-cycle agent proposal must never leak into the agent-facing
+    cycle-history shape, exactly as the baseline snapshots are hidden."""
+    cycle = StrategicCycle(
+        id="sc-test-prop",
+        project_id="p-1",
+        outcome=strategic_cycle.OUTCOME_COMPLETED,
+        phase1_started_at=_utcnow(),
+        cycle_metadata={
+            strategic_cycle.AGENT_PM_PROPOSAL_KEY: {"intent": {"purpose": "secret"}},
+            "memos_cited": 1,
+        },
+    )
+    out = strategic_cycle._to_legacy_dict(cycle)
+    assert strategic_cycle.AGENT_PM_PROPOSAL_KEY not in out
+    assert out["memos_cited"] == 1
+
+
+@pytest.mark.asyncio
+async def test_advance_running_update_baseline_updates_snapshot(db_session):
+    """After an agent write the baseline advances to the persisted document so
+    a subsequent same-cycle write reconciles against it, not the cycle-start
+    snapshot."""
+    project = await _make_project(db_session)
+    cycle = await strategic_cycle.create(
+        db_session,
+        project_id=project.id,
+        baseline_running_update="## v1",
+    )
+    await db_session.commit()
+    strategic_cycle.advance_running_update_baseline(cycle, "## v2 (agent doc A)")
+    db_session.add(cycle)
+    await db_session.commit()
+    fetched = await strategic_cycle.get(db_session, cycle.id)
+    assert (
+        strategic_cycle.baseline_running_update(fetched) == "## v2 (agent doc A)"
+    )
+
+
+def test_advance_running_update_baseline_noop_for_legacy_cycle():
+    """A legacy cycle (no baseline_running_update key) is left untouched — the
+    advance must not silently flip it onto the reconciliation path mid-cycle."""
+    cycle = StrategicCycle(
+        id="sc-legacy-adv",
+        project_id="p-1",
+        outcome=strategic_cycle.OUTCOME_PHASE2_RUNNING,
+        phase1_started_at=_utcnow(),
+        cycle_metadata={"baseline_vision": {"purpose": "x"}},
+    )
+    strategic_cycle.advance_running_update_baseline(cycle, "ignored doc")
+    assert "baseline_running_update" not in (cycle.cycle_metadata or {})
+    assert strategic_cycle.baseline_running_update(cycle) is None
+
+
+def test_advance_running_update_baseline_handles_empty_baseline():
+    """A captured-but-empty baseline (``""``) is a real snapshot, so it advances
+    to the agent's document on the first write."""
+    cycle = StrategicCycle(
+        id="sc-empty-adv",
+        project_id="p-1",
+        outcome=strategic_cycle.OUTCOME_PHASE2_RUNNING,
+        phase1_started_at=_utcnow(),
+        cycle_metadata={"baseline_running_update": ""},
+    )
+    strategic_cycle.advance_running_update_baseline(cycle, "## first agent doc")
+    assert (
+        strategic_cycle.baseline_running_update(cycle) == "## first agent doc"
+    )
 
 
 @pytest.mark.asyncio

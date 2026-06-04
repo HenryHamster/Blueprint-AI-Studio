@@ -28,6 +28,7 @@ from app.compute_manifest import (
 )
 from app.models import PoolVmState, Project, Task, TaskStatus
 from app.warm_pool import (
+    count_idle_state_pool_vms,
     get_pool_vm,
     lease_idle_pool_vm,
     list_pool_vms,
@@ -1101,3 +1102,44 @@ def test_retarget_manifest_materializes_resolved_account_secret():
     )
     # The resolved secret reaches the agent env (anthropic api_key → ANTHROPIC_API_KEY).
     assert "sk-ant-RESOLVED" in manifest["env"].values()
+
+
+# ---------------------------------------------------------------------------
+# count_idle_state_pool_vms — IDLE-state-only inventory probe (miss-path use)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_count_idle_state_pool_vms_zero_when_no_idle(db_session):
+    """Returns 0 when the project has no IDLE members, and counts only IDLE —
+    not PROVISIONING or LEASED."""
+    project = await _make_project(db_session, name="Idle State Count")
+
+    # No members yet.
+    assert await count_idle_state_pool_vms(db_session, project_id=project.id) == 0
+
+    # A PROVISIONING member does NOT count (it is not leasable idle inventory).
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="vm-prov",
+        project_id=project.id,
+        account_id="acct-1",
+        provider="anthropic",
+        model="claude-opus-4-8",
+        state=PoolVmState.PROVISIONING,
+    )
+    await db_session.commit()
+    assert await count_idle_state_pool_vms(db_session, project_id=project.id) == 0
+
+    # An IDLE member counts.
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="vm-idle",
+        project_id=project.id,
+        account_id="acct-1",
+        provider="anthropic",
+        model="claude-opus-4-8",
+        state=PoolVmState.IDLE,
+    )
+    await db_session.commit()
+    assert await count_idle_state_pool_vms(db_session, project_id=project.id) == 1

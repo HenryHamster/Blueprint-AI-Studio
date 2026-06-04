@@ -7,7 +7,7 @@ from typing import Dict, Any, List
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import text
+from sqlalchemy import func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -764,19 +764,24 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
 
     # Audit R3-W2 (M8): push the warm_target_vm_id existence filter into SQL
     # so we don't pull 1000-row pages of QUEUED tasks just to Python-filter
-    # to a handful of warm-pinned ones. ``context['warm_target_vm_id']``
-    # compiles to ``context -> 'warm_target_vm_id'`` (Postgres JSONB) /
-    # ``json_extract(context, '$.warm_target_vm_id')`` (SQLite); both
-    # return NULL when the key is absent, so the IS NOT NULL predicate is
-    # dialect-agnostic. SQLite has no GIN — the index_safe variant matters
-    # only on Postgres but the predicate evaluates correctly either way.
+    # to a handful of warm-pinned ones.
     # R4-W2 (M3): use ``has_key`` (compiles to JSONB ``?`` operator) so the
     # ``ix_task_context_gin`` GIN index can satisfy the predicate. The prior
     # ``as_string().is_not(None)`` form casts to text and never matches the
-    # GIN index, forcing a SeqScan.
+    # GIN index, forcing a SeqScan. The ``?`` operator is Postgres-only and is
+    # NOT dialect-agnostic — it raises ``sqlite3.OperationalError`` on the
+    # SQLite smoke gate — so branch on the resolved dialect and fall back to
+    # the portable ``json_extract`` IS NOT NULL form on SQLite (which returns
+    # NULL when the key is absent).
+    if resolve_dialect_name(session) == "postgresql":
+        _warm_target_present = Task.context.has_key("warm_target_vm_id")
+    else:
+        _warm_target_present = func.json_extract(
+            Task.context, "$.warm_target_vm_id"
+        ).isnot(None)
     pinned_where = [
         Task.status == TaskStatus.QUEUED,
-        Task.context.has_key("warm_target_vm_id"),
+        _warm_target_present,
     ]
     pinned_stmt = (
         select(Task)
@@ -1033,6 +1038,24 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
         "warm_backlog_reuse_enabled": bool(
             _shared_state.runtime_config.get("warm_backlog_reuse_enabled", False)
         ),
+        # Warm-pool retarget controls, surfaced so the operator panel can reflect
+        # each flag's current enabled state (and offer a confirm-and-PATCH toggle).
+        # account_retarget lets an idle member serve a dispatch whose ACCOUNT
+        # differs; cross_provider_retarget further relaxes the PROVIDER match.
+        "warm_pool_account_retarget_enabled": bool(
+            _shared_state.runtime_config.get(
+                "warm_pool_account_retarget_enabled", False
+            )
+        ),
+        "warm_pool_cross_provider_retarget_enabled": bool(
+            _shared_state.runtime_config.get(
+                "warm_pool_cross_provider_retarget_enabled", False
+            )
+        ),
+        # Backward-compatible alias for the account-retarget hint/callout path.
+        "account_retarget_enabled": bool(
+            _shared_state.runtime_config.get("warm_pool_account_retarget_enabled", False)
+        ),
         "next_role_poll_timeout_secs": int(
             _shared_state.runtime_config.get("next_role_poll_timeout_secs", 180)
         ),
@@ -1071,6 +1094,20 @@ async def _get_pool_metrics(session: AsyncSession) -> dict:
         cost = await compute_pool_idle_cost(session)
         funnel = get_pool_funnel_snapshot()
         idle_by_account = cost.get("by_account") or {}
+        # Cost-aware auto-drain guard diagnostic (engaged flag, reason, hit-rate
+        # vs floor, idle-spend vs floor). Surfaced so the panel can show WHY an
+        # enabled pool is dark when the guard has paused leasing/draining. Best-
+        # effort within this already-guarded block — a failure leaves cost_guard
+        # absent and the panel renders no banner (older-backend-tolerant).
+        cost_guard = None
+        try:
+            from app.warm_pool_maintainer import evaluate_pool_cost_guard
+
+            cost_guard = await evaluate_pool_cost_guard(
+                session, runtime_config=_shared_state.runtime_config
+            )
+        except Exception:  # noqa: BLE001 — best-effort diagnostic, never blank panel
+            cost_guard = None
         return {
             "enabled": bool(
                 _shared_state.runtime_config.get("warm_pool_enabled", False)
@@ -1096,6 +1133,7 @@ async def _get_pool_metrics(session: AsyncSession) -> dict:
             "cost_amortization_by_account": compute_pool_cost_amortization_by_account(
                 idle_by_account, funnel
             ),
+            "cost_guard": cost_guard,
         }
     except Exception:  # noqa: BLE001 — best-effort metric, never blank the panel
         return {}

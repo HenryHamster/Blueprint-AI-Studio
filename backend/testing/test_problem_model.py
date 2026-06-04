@@ -11,6 +11,8 @@ import pytest
 from pydantic import ValidationError
 
 from app.problem_model import (
+    GAP_HISTORY_DURABLE_MAX,
+    GAP_PAST_MOVES_DURABLE_MAX,
     REVISION_LOG_MAX,
     SELF_REFLECTION_LOG_MAX,
     Capability,
@@ -493,6 +495,111 @@ def test_apply_agent_update_no_changes_still_logs():
 
 
 # ---------------------------------------------------------------------------
+# apply_agent_update — mature model is never wiped (non-destructive merge)
+#
+# The former ColdStartWipeError guard hard-rejected a bootstrap-over-mature
+# write. With agent-owned collections now merging non-destructively (main
+# #7449), a trimmed/dropped payload can no longer wipe by omission — the prior
+# entries are simply preserved — so these cases now assert preservation via
+# merge rather than a raised error.
+# ---------------------------------------------------------------------------
+
+
+def _mature_current() -> dict:
+    """A non-empty durable model with content in all three agent-owned
+    collections — the kind a blind cold-start bootstrap must NOT erase."""
+    return {
+        "revision": 7,
+        "capabilities": [
+            {"name": "Billing", "status": "working"},
+            {"name": "Metering", "status": "partial"},
+        ],
+        "gaps": [{"id": "g-1", "name": "invoicing", "status": "active"}],
+        "friction": [{"id": "f-1", "name": "flaky CI", "status": "active"}],
+    }
+
+
+def test_apply_agent_update_genuine_empty_current_first_cycle_passes():
+    """A genuine first cycle (current is empty) bootstrapping an empty model
+    must succeed — nothing to preserve, so the collections stay empty."""
+    new_raw, _ = apply_agent_update(
+        None,
+        {"intent": {"purpose": "Bootstrap the project."}},
+        "2026-04-21T12:00:00",
+    )
+    assert new_raw["revision"] == 1
+    assert new_raw["capabilities"] == []
+    assert new_raw["gaps"] == []
+    assert new_raw["friction"] == []
+
+
+def test_apply_agent_update_bootstrap_over_mature_preserves_collections():
+    """A cold-start proposed model (only intent, no agent-owned collections)
+    over a mature model must NOT wipe it: merge preserves every existing
+    capability, gap, and friction entry the agent never echoed back."""
+    current = _mature_current()
+    proposed = {"intent": {"purpose": "Fresh start.", "current_focus": "begin"}}
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert {c["name"] for c in new_raw["capabilities"]} == {"Billing", "Metering"}
+    assert {g["id"] for g in new_raw["gaps"]} == {"g-1"}
+    assert {f["id"] for f in new_raw["friction"]} == {"f-1"}
+
+
+def test_apply_agent_update_explicit_empty_collections_preserve_via_merge():
+    """Explicitly submitting empty arrays for all three collections over a
+    mature model still preserves them — an empty list is no upserts, not a
+    wipe. Removal is only via the explicit ``_deletions`` directive."""
+    current = _mature_current()
+    proposed = {"capabilities": [], "gaps": [], "friction": []}
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert {c["name"] for c in new_raw["capabilities"]} == {"Billing", "Metering"}
+    assert {g["id"] for g in new_raw["gaps"]} == {"g-1"}
+    assert {f["id"] for f in new_raw["friction"]} == {"f-1"}
+
+
+def test_apply_agent_update_close_by_status_edit_passes():
+    """Retiring a gap by marking it closed keeps the gap in the submission, so
+    not all collections are empty — a normal edit that must still apply."""
+    current = _mature_current()
+    proposed = {
+        "capabilities": [{"name": "Billing", "status": "working"}],
+        # The retired gap is still present (status=closed) → gaps non-empty.
+        "gaps": [{"id": "g-1", "name": "invoicing", "status": "closed"}],
+        "friction": [{"id": "f-1", "name": "flaky CI", "status": "active"}],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["revision"] == 8
+    # Closed gap was archived, not wiped.
+    assert {g["id"] for g in new_raw["archived_gaps"]} == {"g-1"}
+    assert diff["gaps_closed"] == ["g-1"]
+
+
+def test_apply_agent_update_partial_proposed_merges_not_replaces():
+    """A partial proposal touching only one collection merges into the durable
+    model: the named capability upserts and the unmentioned capability, gaps,
+    and friction are preserved (omission never deletes)."""
+    current = _mature_current()
+    proposed = {"capabilities": [{"name": "Billing", "status": "working"}]}
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert {c["name"] for c in new_raw["capabilities"]} == {"Billing", "Metering"}
+    assert {g["id"] for g in new_raw["gaps"]} == {"g-1"}
+    assert {f["id"] for f in new_raw["friction"]} == {"f-1"}
+
+
+def test_apply_agent_update_archived_only_current_not_treated_as_mature():
+    """A model holding only archived_gaps (all gaps already closed) is not a
+    wipe target — archived history is carried forward regardless."""
+    current = {
+        "revision": 4,
+        "archived_gaps": [{"id": "g-old", "name": "done", "status": "closed"}],
+    }
+    proposed: dict = {"intent": {"purpose": "Next phase."}}
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["revision"] == 5
+    assert {g["id"] for g in new_raw["archived_gaps"]} == {"g-old"}
+
+
+# ---------------------------------------------------------------------------
 # apply_agent_update — operator-seeded intent preservation
 # ---------------------------------------------------------------------------
 
@@ -599,6 +706,180 @@ def test_apply_agent_update_does_not_preserve_agent_authored_intent():
     proposed = {"intent": {"purpose": "", "current_focus": "next"}}
     new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
     assert new_raw["intent"]["purpose"] == ""
+
+
+# ---------------------------------------------------------------------------
+# apply_agent_update — append-only gap-memory restore after payload trim
+# ---------------------------------------------------------------------------
+
+
+def _gap_with_memory(
+    history_events: list[str],
+    past_moves: list[str],
+    *,
+    status: str = "active",
+) -> dict:
+    """A single durable gap carrying append-only history + past_moves memory."""
+    # ``ts`` is stable per event tag so a trimmed view (the same events the
+    # agent saw, re-submitted) compares equal to the durable entries — exactly
+    # how the real payload trim preserves each event's original timestamp.
+    return {
+        "id": "g-mem",
+        "name": "Cross-cycle memory gap",
+        "status": status,
+        "history": [
+            {"ts": f"2026-04-21T00:00:00-{ev}", "event": ev}
+            for ev in history_events
+        ],
+        "past_moves": list(past_moves),
+    }
+
+
+def test_apply_agent_update_restores_trimmed_gap_history_on_round_trip():
+    """The bug this guards: the payload trims each gap's history to the most
+    recent few entries before the agent sees it, the agent round-trips the
+    trimmed view back as a full replacement, and without restore the older
+    durable entries are silently lost. The durable older events must survive."""
+    current = {
+        "revision": 5,
+        "gaps": [
+            _gap_with_memory(
+                ["opened", "priority_raised", "move_attached", "move_failed", "retried"],
+                ["d-1", "d-2", "d-3"],
+            )
+        ],
+    }
+    # Simulate the upstream payload trim: agent only ever saw the last 2 entries
+    # and submits exactly that trimmed view back, unchanged.
+    proposed = {
+        "gaps": [
+            _gap_with_memory(["move_failed", "retried"], ["d-3"]),
+        ]
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    gap = new_raw["gaps"][0]
+    events = [e["event"] for e in gap["history"]]
+    # All five durable events survive in order — the trim cannot truncate them.
+    assert events == [
+        "opened",
+        "priority_raised",
+        "move_attached",
+        "move_failed",
+        "retried",
+    ]
+    # past_moves likewise restored to the full durable union.
+    assert gap["past_moves"] == ["d-1", "d-2", "d-3"]
+
+
+def test_apply_agent_update_records_genuine_gap_history_append():
+    """The agent can still extend the log: a genuinely new event it adds to the
+    trimmed view is appended after the restored durable head."""
+    current = {
+        "revision": 5,
+        "gaps": [
+            _gap_with_memory(
+                ["opened", "priority_raised", "move_attached", "move_failed"],
+                ["d-1", "d-2"],
+            )
+        ],
+    }
+    # Agent saw the trimmed tail and appended one new event + one new past move.
+    proposed = {
+        "gaps": [_gap_with_memory(["move_failed", "move_succeeded"], ["d-2", "d-3"])],
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    gap = new_raw["gaps"][0]
+    events = [e["event"] for e in gap["history"]]
+    # Restored durable head + the genuinely new event, no duplication.
+    assert events == [
+        "opened",
+        "priority_raised",
+        "move_attached",
+        "move_failed",
+        "move_succeeded",
+    ]
+    assert gap["past_moves"] == ["d-1", "d-2", "d-3"]
+
+
+def test_apply_agent_update_new_gap_memory_taken_as_is():
+    """A brand-new gap (no prior durable record) is taken verbatim — there is
+    nothing to restore, and the restore must not invent history for it."""
+    current = {
+        "revision": 5,
+        "gaps": [_gap_with_memory(["opened"], ["d-1"])],
+    }
+    proposed = {
+        "gaps": [
+            _gap_with_memory(["opened"], ["d-1"]),  # surviving gap
+            {
+                "id": "g-fresh",
+                "name": "Brand new gap",
+                "status": "active",
+                "history": [{"ts": "2026-04-21T00:00:00", "event": "opened"}],
+                "past_moves": [],
+            },
+        ],
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    fresh = next(g for g in new_raw["gaps"] if g["id"] == "g-fresh")
+    assert [e["event"] for e in fresh["history"]] == ["opened"]
+    assert fresh["past_moves"] == []
+
+
+def test_apply_agent_update_closed_gap_keeps_full_memory_into_archive():
+    """A gap the agent legitimately closes keeps its FULL durable memory as it
+    moves to the archive — the trimmed round-trip must not truncate the record
+    that gets preserved for posterity."""
+    current = {
+        "revision": 5,
+        "gaps": [
+            _gap_with_memory(
+                ["opened", "priority_raised", "move_attached", "shipped"],
+                ["d-1", "d-2"],
+            )
+        ],
+    }
+    # Agent closes the gap, having only seen the trimmed tail.
+    proposed = {
+        "gaps": [_gap_with_memory(["shipped"], ["d-2"], status="closed")],
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["gaps"] == []  # archived, not active
+    archived = next(g for g in new_raw["archived_gaps"] if g["id"] == "g-mem")
+    assert [e["event"] for e in archived["history"]] == [
+        "opened",
+        "priority_raised",
+        "move_attached",
+        "shipped",
+    ]
+    assert archived["past_moves"] == ["d-1", "d-2"]
+
+
+def test_apply_agent_update_restored_gap_memory_is_capped():
+    """The restored append-only logs stay bounded by the durable caps so the
+    JSONB column cannot grow without limit — oldest entries roll off."""
+    over = GAP_HISTORY_DURABLE_MAX + 25
+    current = {
+        "revision": 5,
+        "gaps": [
+            _gap_with_memory(
+                [f"e{i}" for i in range(over)],
+                [f"d-{i}" for i in range(GAP_PAST_MOVES_DURABLE_MAX + 25)],
+            )
+        ],
+    }
+    proposed = {"gaps": [_gap_with_memory(["e-tail"], ["d-tail"])]}
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    gap = new_raw["gaps"][0]
+    assert len(gap["history"]) == GAP_HISTORY_DURABLE_MAX
+    assert len(gap["past_moves"]) == GAP_PAST_MOVES_DURABLE_MAX
+    # Newest entry (the agent's appended tail) is retained at the end.
+    assert gap["history"][-1]["event"] == "e-tail"
+    assert gap["past_moves"][-1] == "d-tail"
+    # Oldest durable entries rolled off the front: 225 durable + 1 appended
+    # tail = 226, capped to 200 drops the first 26 (indices 0..25).
+    assert gap["history"][0]["event"] == "e26"
+    assert gap["past_moves"][0] == "d-26"
 
 
 # ---------------------------------------------------------------------------
@@ -798,6 +1079,132 @@ def test_apply_agent_update_ledger_carried_forward_and_capped():
 
 
 # ---------------------------------------------------------------------------
+# Second same-cycle agent write — ancestor is the agent's own prior proposal
+# (the bug this PR fixes: the callers now pass the agent's last proposal, not
+# the cycle-start snapshot, as baseline on writes after the first).
+# ---------------------------------------------------------------------------
+
+
+def test_operator_owned_subset_extracts_only_editable_fields():
+    """operator_owned_subset pulls intent.purpose / context / constraints and
+    tolerates extra agent-owned keys (so it accepts a raw pre-merge proposal)."""
+    from app.problem_model import operator_owned_subset
+
+    subset = operator_owned_subset(
+        {
+            "intent": {"purpose": "P", "current_focus": "ignored"},
+            "context": {"project_type": "startup"},
+            "constraints": ["c1"],
+            "gaps": [{"id": "g", "name": "n", "status": "active"}],
+            "_deletions": {"gaps": ["g"]},
+        }
+    )
+    assert subset == {
+        "intent": {"purpose": "P"},
+        "context": {"project_type": "startup"},
+        "constraints": ["c1"],
+    }
+    # Tolerates None / missing.
+    assert operator_owned_subset(None) == {
+        "intent": {"purpose": ""},
+        "context": {},
+        "constraints": [],
+    }
+
+
+def test_apply_agent_update_second_write_against_own_prior_proposal_no_false_conflict():
+    """The core fix contract: when the merge ancestor is the agent's OWN prior
+    proposal (what the callers now store + pass on a 2nd same-cycle write), a
+    different 2nd context/constraints applies cleanly with NO fabricated
+    operator-conflict — even though current != cycle-start baseline."""
+    from app.problem_model import operator_owned_subset
+
+    # Write 1: agent advances context/constraints from the cycle-start snapshot.
+    snapshot = _operator_seeded_current()
+    proposed1 = {
+        "intent": {"purpose": "Ship a reliable billing system.", "current_focus": "x"},
+        "context": {"project_type": "scale-up", "users": "SMBs"},
+        "constraints": ["No PII in logs", "GDPR compliant", "SOC2"],
+    }
+    new_raw1, _ = apply_agent_update(
+        _operator_seeded_current(),
+        dict(proposed1),
+        "2026-04-21T12:00:00",
+        baseline_raw=snapshot,
+    )
+    assert new_raw1["context"]["project_type"] == "scale-up"
+    assert "rejected_agent_edits" not in new_raw1
+
+    # Write 2: ancestor is the agent's prior proposal (not the snapshot), current
+    # is the agent's own first write. A genuinely different 2nd value persists.
+    proposed2 = {
+        "intent": {"purpose": "Ship a reliable billing system.", "current_focus": "y"},
+        "context": {"project_type": "enterprise", "users": "Fortune 500"},
+        "constraints": ["No PII in logs", "GDPR compliant", "SOC2", "HIPAA"],
+    }
+    new_raw2, _ = apply_agent_update(
+        new_raw1,
+        dict(proposed2),
+        "2026-04-21T12:05:00",
+        baseline_raw=operator_owned_subset(proposed1),
+    )
+    # The 2nd write's distinct context/constraints persist — NOT dropped.
+    assert new_raw2["context"]["project_type"] == "enterprise"
+    assert new_raw2["constraints"] == [
+        "No PII in logs",
+        "GDPR compliant",
+        "SOC2",
+        "HIPAA",
+    ]
+    # And NO false operator-conflict was fabricated.
+    assert "rejected_agent_edits" not in new_raw2
+
+
+def test_apply_agent_update_operator_edit_between_two_writes_still_wins():
+    """Case 3: an operator edits between the agent's two writes. With the
+    ancestor = the agent's prior proposal, the operator's mid-cycle value still
+    wins on the 2nd write (current moved away from the agent's proposal)."""
+    from app.problem_model import operator_owned_subset
+
+    snapshot = _operator_seeded_current()
+    proposed1 = {
+        "intent": {"purpose": "Ship a reliable billing system.", "current_focus": "x"},
+        "context": {"project_type": "scale-up", "users": "SMBs"},
+        "constraints": ["No PII in logs"],
+    }
+    new_raw1, _ = apply_agent_update(
+        _operator_seeded_current(),
+        dict(proposed1),
+        "2026-04-21T12:00:00",
+        baseline_raw=snapshot,
+    )
+    # Operator edits problem_model mid-cycle (admin patch stamps user + new vals).
+    after_operator = dict(new_raw1)
+    after_operator["context"] = {"project_type": "regulated-fintech"}
+    after_operator["constraints"] = ["No PII in logs", "PCI-DSS"]
+    after_operator["last_updated_by"] = "user"
+
+    # Write 2: agent proposes its own divergent values against its prior proposal.
+    proposed2 = {
+        "intent": {"purpose": "Ship a reliable billing system.", "current_focus": "y"},
+        "context": {"project_type": "enterprise"},
+        "constraints": ["Move fast"],
+    }
+    new_raw2, _ = apply_agent_update(
+        after_operator,
+        dict(proposed2),
+        "2026-04-21T12:05:00",
+        baseline_raw=operator_owned_subset(proposed1),
+    )
+    # Operator's mid-cycle edit survives; the agent's divergent values are
+    # rejected and recorded.
+    assert new_raw2["context"]["project_type"] == "regulated-fintech"
+    assert new_raw2["constraints"] == ["No PII in logs", "PCI-DSS"]
+    fields = {e["field"] for e in new_raw2["rejected_agent_edits"]}
+    assert fields == {"context", "constraints"}
+
+
+# ---------------------------------------------------------------------------
 # apply_user_intent_patch — the user-facing write path (onboarding + PATCH)
 # ---------------------------------------------------------------------------
 
@@ -866,6 +1273,110 @@ def test_apply_user_intent_patch_rejects_malformed_subset():
             {"intent": {"purpose": 123}},  # purpose must be a str
             "2026-06-02T12:00:00",
         )
+
+
+def test_apply_user_intent_patch_intent_edit_stamps_operator_source():
+    """Editing intent.purpose through the user-facing path re-stamps the
+    operator (user_message) provenance the shallow merge would otherwise drop —
+    so the operator-wins protection keeps guarding the edited purpose."""
+    model = apply_user_intent_patch(
+        {"revision": 3, "intent": {"purpose": "old", "current_focus": "f"}},
+        {"intent": {"purpose": "Operator-edited purpose", "current_focus": "f"}},
+        "2026-06-02T12:00:00",
+    )
+    assert model.intent.purpose == "Operator-edited purpose"
+    assert model.intent.source is not None
+    assert model.intent.source.type == "user_message"
+    assert model.intent.source.excerpt == "Operator-edited purpose"
+
+
+def test_apply_user_intent_patch_blanking_purpose_clears_source():
+    """Blanking the purpose through the editor clears the source so an empty
+    operator intent is not spuriously treated as protected."""
+    model = apply_user_intent_patch(
+        {
+            "revision": 1,
+            "intent": {
+                "purpose": "had a purpose",
+                "source": {"type": "user_message", "message_id": "m-1"},
+            },
+        },
+        {"intent": {"purpose": "   "}},
+        "2026-06-02T12:00:00",
+    )
+    assert model.intent.purpose.strip() == ""
+    assert model.intent.source is None
+
+
+def test_apply_user_intent_patch_without_intent_preserves_existing_source():
+    """A patch that omits intent (onboarding's context/constraints-only
+    steering) leaves the existing message_id-bearing source untouched."""
+    model = apply_user_intent_patch(
+        {
+            "revision": 1,
+            "intent": {
+                "purpose": "seeded goal",
+                "source": {
+                    "type": "user_message",
+                    "message_id": "m-42",
+                    "excerpt": "seeded goal",
+                },
+            },
+        },
+        {"context": {"project_type": "startup"}},
+        "2026-06-02T12:00:00",
+    )
+    assert model.intent.purpose == "seeded goal"
+    assert model.intent.source is not None
+    assert model.intent.source.type == "user_message"
+    assert model.intent.source.message_id == "m-42"
+    assert model.context.project_type == "startup"
+
+
+def test_editor_purpose_edit_survives_divergent_agent_cycle():
+    """End-to-end protection: an operator edits the purpose via the user-facing
+    patch path, then a strategic cycle proposes a different purpose. The
+    operator's value must win and the agent's discarded value must be recorded
+    in the rejected-edits ledger — exactly as an onboarded purpose is guarded."""
+    # The model the agent saw at cycle spawn (onboarded purpose).
+    baseline_raw = {
+        "revision": 5,
+        "intent": {
+            "purpose": "Onboarded purpose",
+            "current_focus": "phase 1",
+            "source": {"type": "user_message", "message_id": "m-seed"},
+        },
+    }
+    # Operator edits the purpose mid-cycle through the official editor path.
+    edited = apply_user_intent_patch(
+        baseline_raw,
+        {"intent": {"purpose": "Operator-edited purpose", "current_focus": "phase 1"}},
+        "2026-06-02T12:00:00",
+    )
+    assert edited.intent.source is not None
+    assert edited.intent.source.type == "user_message"
+
+    # Agent's next cycle proposes a divergent purpose.
+    proposed = {
+        "revision": 5,
+        "intent": {"purpose": "Agent-proposed purpose", "current_focus": "phase 2"},
+    }
+    new_raw, _diff = apply_agent_update(
+        edited.model_dump(),
+        proposed,
+        "2026-06-02T13:00:00",
+        baseline_raw=baseline_raw,
+    )
+
+    # Operator's purpose wins; agent's discarded value is in the ledger.
+    assert new_raw["intent"]["purpose"] == "Operator-edited purpose"
+    ledger = new_raw["rejected_agent_edits"]
+    assert any(
+        entry["field"] == "intent.purpose"
+        and entry["operator_value"] == "Operator-edited purpose"
+        and entry["agent_value"] == "Agent-proposed purpose"
+        for entry in ledger
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1266,6 +1777,42 @@ def test_project_append_routine_digest_appends_additional_lines():
     assert len(lines) == 2
     assert "pr_merged" in lines[0]
     assert "auto_fix_result" in lines[1]
+
+
+def test_append_routine_digest_collapses_multiline_summary():
+    """A multi-line summary collapses to a single physical line matching the
+    canonical digest shape, so the reconciliation classifier never misreads the
+    append as an operator body edit."""
+    from app.models import Project
+    from app.running_update_merge import _DIGEST_LINE_RE
+
+    p = Project(name="test", user_id="u1")
+    multiline = "Line one\r\nLine two\nLine three\rLine four\n\n  extra  spaces"
+    p.append_routine_digest("operator_message", multiline)
+
+    lines = p.running_update.splitlines()
+    assert len(lines) == 1
+    assert _DIGEST_LINE_RE.match(lines[0])
+    # All newline-separated fragments survive on the single collapsed line.
+    assert "Line one Line two Line three Line four extra spaces" in lines[0]
+    assert "\n" not in p.running_update
+    assert "\r" not in p.running_update
+
+
+def test_append_routine_digest_truncates_after_collapse():
+    """Truncation to 200 chars applies after whitespace collapse, and the result
+    remains a single line."""
+    from app.models import Project
+
+    p = Project(name="test", user_id="u1")
+    summary = "word\n" * 200  # 1000 chars of newline-separated tokens
+    p.append_routine_digest("auto_fix_result", summary)
+
+    lines = p.running_update.splitlines()
+    assert len(lines) == 1
+    # The summary portion after the "**: " prefix is capped at 200 chars.
+    body = lines[0].split("**: ", 1)[1]
+    assert len(body) <= 200
 
 
 def test_source_is_reusable_across_model_elements():

@@ -14,7 +14,7 @@ from sqlmodel import select
 from app.models import Task, TaskStatus
 from app.orchestrator import ACTIVE_TASKS_LIGHT_COLUMNS
 from app.orchestrator_filters import filter_file_conflicts
-from testing.factories import make_project, make_task
+from testing.factories import make_alert, make_project, make_task
 
 
 def _queued(project_id, files, scope="small", ttype="fix", parent=None):
@@ -270,6 +270,7 @@ class TestFilterFileConflicts:
         c = _queued(pid, ["a.py", "b.py"], scope="large")
         ip = _in_progress(pid, ["a.py"])
         session = MagicMock()
+        session.commit = AsyncMock()
         broadcast_fn = AsyncMock()
 
         # Defer across several dispatch cycles on the SAME blocker identity.
@@ -303,6 +304,242 @@ class TestFilterFileConflicts:
         await filter_file_conflicts([c.id], [c], [ip_b], session, broadcast_fn)
         assert c.context["_precondition_defer"]["key"] == "file conflict on b.py"
         assert c.context["_precondition_defer"]["count"] == 1
+        # Counter never reached the threshold, so no escalation fired.
+        esc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_persistent_conflict_parks_task_in_blocked(self, mocker):
+        """At the escalation threshold the candidate is parked in BLOCKED with
+        durable blocker metadata so the queue path stops re-judging it."""
+        mocker.patch(
+            "app.alert_dispatch._maybe_create_precondition_blocker_alert",
+            new_callable=AsyncMock,
+        )
+        pid = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py"], scope="large")
+        ip = _in_progress(pid, ["a.py"])
+        session = MagicMock()
+        session.commit = AsyncMock()
+        broadcast_fn = AsyncMock()
+
+        # Below the threshold the task stays QUEUED (just deferred this cycle).
+        await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert c.status == TaskStatus.QUEUED
+        assert c.blocker_kind is None
+
+        # Cross the threshold (default 3) → parked in BLOCKED with metadata.
+        await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert c.status == TaskStatus.BLOCKED
+        assert c.blocker_kind == "file_conflict"
+        assert c.blocked_reason and "file conflict" in c.blocked_reason
+        assert c.blocked_at is not None
+        assert c.recheck_after is not None and c.recheck_after > c.blocked_at
+        assert (c.latest_status_message or "").startswith("Blocked:")
+
+    @pytest.mark.asyncio
+    async def test_broadcast_emitted_on_blocked_transition(self, mocker):
+        """When parking a candidate into BLOCKED on the escalation threshold,
+        emit a task_updated broadcast carrying BLOCKED status so the UI reflects
+        the committed state immediately."""
+        mocker.patch(
+            "app.alert_dispatch._maybe_create_precondition_blocker_alert",
+            new_callable=AsyncMock,
+        )
+        pid = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py"], scope="large")
+        ip = _in_progress(pid, ["a.py"])
+        session = MagicMock()
+        session.commit = AsyncMock()
+        broadcast_fn = AsyncMock()
+
+        # First deferral: broadcasts QUEUED
+        await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert c.status == TaskStatus.QUEUED
+        broadcast_fn.assert_called_once()
+        args, _ = broadcast_fn.call_args
+        assert args[2]["status"] == "QUEUED"
+        broadcast_fn.reset_mock()
+
+        # Second deferral: message unchanged, so no QUEUED broadcast (line 406 guard).
+        await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert c.status == TaskStatus.QUEUED  # Still QUEUED at count=2
+        broadcast_fn.assert_not_called()
+
+        # Third deferral crosses the threshold — now parked in BLOCKED.
+        # Broadcasts BLOCKED on the transition.
+        await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert c.status == TaskStatus.BLOCKED
+        broadcast_fn.assert_called_once()
+        args, _ = broadcast_fn.call_args
+        assert args[0] == str(pid)
+        assert args[1] == "task_updated"
+        assert args[2]["task_id"] == str(c.id)
+        assert args[2]["status"] == "BLOCKED"
+        assert "Blocked:" in args[2]["message"]
+
+    @pytest.mark.asyncio
+    async def test_blocked_at_onset_preserved_across_reblock(self, mocker):
+        """When a same-identity onset stamp survives an optimistic requeue, a
+        re-block measures blocked_at from the original onset — not a fresh now —
+        so the 6h deadline escalation can actually fire for a stuck conflict."""
+        from datetime import datetime, timedelta
+
+        mocker.patch(
+            "app.alert_dispatch._maybe_create_precondition_blocker_alert",
+            new_callable=AsyncMock,
+        )
+        pid = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py"], scope="large")
+        # Simulate the state after an optimistic requeue of a long-standing
+        # conflict: _precondition_defer wiped, but the onset stamp preserved.
+        onset = datetime.fromisoformat(
+            (datetime.now().astimezone() - timedelta(hours=7)).isoformat()
+        )
+        c.context["_blocked_first_at"] = {
+            "key": "file conflict on a.py",
+            "at": onset.isoformat(),
+        }
+        ip = _in_progress(pid, ["a.py"])
+        session = MagicMock()
+        session.commit = AsyncMock()
+        broadcast_fn = AsyncMock()
+
+        # Three deferrals cross the threshold and re-block the task.
+        for _ in range(3):
+            await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+
+        assert c.status == TaskStatus.BLOCKED
+        # blocked_at reflects the preserved onset (~7h ago), not a fresh now,
+        # so now - blocked_at exceeds the escalation deadline.
+        assert c.blocked_at == onset
+
+    @pytest.mark.asyncio
+    async def test_reblock_with_existing_alert_broadcasts_after_commit(
+        self, db_session, mocker
+    ):
+        """When the same blocker reoccurs after its alert already exists, the
+        helper must commit the parked task and then broadcast BLOCKED."""
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+        pid = uuid.uuid4()
+        project = make_project(id=pid)
+        db_session.add(project)
+        await db_session.commit()
+
+        c = _queued(pid, ["a.py", "b.py"], scope="large")
+        ip = _in_progress(pid, ["a.py"])
+        db_session.add(c)
+        db_session.add(ip)
+        await db_session.commit()
+        await db_session.refresh(c)
+        await db_session.refresh(ip)
+
+        existing = make_alert(
+            project_id=pid,
+            task_id=c.id,
+            severity="WARNING",
+            title="Precondition blocker: file conflict on a.py",
+            message="Waiting: file conflict on a.py",
+        )
+        db_session.add(existing)
+        await db_session.commit()
+
+        broadcast_fn = AsyncMock()
+
+        await filter_file_conflicts([c.id], [c], [ip], db_session, broadcast_fn)
+        assert broadcast_fn.call_count == 1
+        args, _ = broadcast_fn.call_args
+        assert args[2]["status"] == "QUEUED"
+        broadcast_fn.reset_mock()
+
+        await filter_file_conflicts([c.id], [c], [ip], db_session, broadcast_fn)
+        await filter_file_conflicts([c.id], [c], [ip], db_session, broadcast_fn)
+
+        await db_session.refresh(c)
+        assert c.status == TaskStatus.BLOCKED
+        broadcast_fn.assert_called_once()
+        args, _ = broadcast_fn.call_args
+        assert args[0] == str(pid)
+        assert args[1] == "task_updated"
+        assert args[2]["task_id"] == str(c.id)
+        assert args[2]["status"] == "BLOCKED"
+        assert "Blocked:" in args[2]["message"]
+
+    @pytest.mark.asyncio
+    async def test_new_alert_path_caller_commits_then_broadcasts_blocked(
+        self, mocker
+    ):
+        """Newly-created-alert path: the CALLER commits the parked task itself
+        (it no longer relies on the alert helper's side-effect commit) and then
+        broadcasts BLOCKED. The mocked helper returns True (alert created); under
+        the OLD contract a truthy return meant the caller skipped session.commit
+        entirely, so asserting commit was awaited pins the new explicit contract."""
+        esc = mocker.patch(
+            "app.alert_dispatch._maybe_create_precondition_blocker_alert",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        pid = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py"], scope="large")
+        ip = _in_progress(pid, ["a.py"])
+        session = MagicMock()
+        session.commit = AsyncMock()
+        broadcast_fn = AsyncMock()
+
+        # Three deferrals cross the threshold and park the task in BLOCKED.
+        for _ in range(3):
+            await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+
+        assert c.status == TaskStatus.BLOCKED
+        # Caller owns the commit (exactly once, on the escalation cycle).
+        session.commit.assert_awaited_once()
+        # Operator alert still raised, after the durable commit.
+        esc.assert_awaited_once()
+        blocked_calls = [
+            cc
+            for cc in broadcast_fn.call_args_list
+            if cc.args[2].get("status") == "BLOCKED"
+        ]
+        assert len(blocked_calls) == 1
+        assert "Blocked:" in blocked_calls[0].args[2]["message"]
+
+    @pytest.mark.asyncio
+    async def test_failed_commit_suppresses_blocked_broadcast(self, mocker):
+        """Failed-commit path: when the BLOCKED parking commit raises, the
+        transition did not persist, so NO task_updated BLOCKED event may escape
+        the aborted transaction — the UI must never show a phantom BLOCKED. The
+        operator alert is gated behind the (failed) commit too."""
+        esc = mocker.patch(
+            "app.alert_dispatch._maybe_create_precondition_blocker_alert",
+            new_callable=AsyncMock,
+        )
+        pid = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py"], scope="large")
+        ip = _in_progress(pid, ["a.py"])
+        session = MagicMock()
+        session.commit = AsyncMock(side_effect=RuntimeError("db down"))
+        broadcast_fn = AsyncMock()
+
+        # First two cycles stay QUEUED (count < threshold → no commit attempted).
+        await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert c.status == TaskStatus.QUEUED
+        broadcast_fn.reset_mock()
+
+        # Third cycle crosses the threshold: status flips to BLOCKED in memory,
+        # the commit raises, and the exception propagates — the BLOCKED broadcast
+        # is never reached.
+        with pytest.raises(RuntimeError):
+            await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+
+        assert c.status == TaskStatus.BLOCKED  # mutated in memory only
+        session.commit.assert_awaited_once()  # commit was attempted...
+        # ...but no BLOCKED task_updated event was emitted (txn did not persist).
+        assert all(
+            cc.args[2].get("status") != "BLOCKED"
+            for cc in broadcast_fn.call_args_list
+        )
+        # Alert helper sits AFTER the commit, so a failed commit never alerts.
         esc.assert_not_called()
 
     @pytest.mark.asyncio

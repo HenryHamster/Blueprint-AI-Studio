@@ -15,6 +15,7 @@ const STATUS_COLORS: Record<string, string> = {
   FAILED: 'bg-red-500',
   CANCELLED: 'bg-neutral-600',
   QUEUED: 'bg-neutral-500',
+  BLOCKED: 'bg-amber-500',
 };
 
 interface TreeNode {
@@ -37,7 +38,9 @@ const FILTER_CHIPS: { label: FilterType }[] = [
 function taskMatchesFilter(task: Task, filter: FilterType): boolean {
   if (filter === 'All') return true;
   if (filter === 'Active') return ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING'].includes(task.status);
-  if (filter === 'Blocked') return task.status === 'QUEUED' && !!task.depends_on && task.depends_on.length > 0;
+  // First-class BLOCKED status, with the legacy QUEUED+depends_on inference
+  // kept as a fallback for payloads predating the status.
+  if (filter === 'Blocked') return task.status === 'BLOCKED' || (task.status === 'QUEUED' && !!task.depends_on && task.depends_on.length > 0);
   if (filter === 'Failed') return task.status === 'FAILED';
   if (filter === 'Needs Review') return task.requires_approval === true;
   return true;
@@ -465,6 +468,9 @@ function RootGroup({
   const cancelledInGroup = isSynthetic
     ? root.children.reduce((sum, c) => sum + countByStatus(c, 'CANCELLED'), 0)
     : countByStatus(root, 'CANCELLED');
+  const blockedInGroup = isSynthetic
+    ? root.children.reduce((sum, c) => sum + countByStatus(c, 'BLOCKED'), 0)
+    : countByStatus(root, 'BLOCKED');
 
   return (
     <div
@@ -518,6 +524,12 @@ function RootGroup({
               {runningInGroup}
             </span>
           )}
+          {blockedInGroup > 0 && (
+            <span className="flex items-center gap-1 text-[10px] bg-amber-500/10 text-amber-400 px-2 py-0.5 rounded-full font-medium border border-amber-500/30" title={`${blockedInGroup} blocked`}>
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
+              {blockedInGroup}
+            </span>
+          )}
           {failedInGroup > 0 && (
             <span className="flex items-center gap-1 text-[10px] bg-red-500/10 text-red-400 px-2 py-0.5 rounded-full font-medium border border-red-500/30">
               <span className="w-1.5 h-1.5 rounded-full bg-red-400 shrink-0" />
@@ -532,9 +544,10 @@ function RootGroup({
 
       {/* Progress bar */}
       {(() => {
-        const queuedInGroup = totalInGroup - completedInGroup - runningInGroup - failedInGroup - cancelledInGroup;
+        const queuedInGroup = totalInGroup - completedInGroup - runningInGroup - failedInGroup - cancelledInGroup - blockedInGroup;
         const segments = [
           { count: queuedInGroup, color: 'bg-neutral-700' },
+          { count: blockedInGroup, color: 'bg-amber-500' },
           { count: provisioningInGroup, color: 'bg-sky-700/50' },
           { count: inProgressInGroup, color: 'bg-yellow-500' },
           { count: evaluatingInGroup, color: 'bg-indigo-600/50' },

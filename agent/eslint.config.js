@@ -20,6 +20,15 @@ export default tseslint.config(
     },
   },
   {
+    // Vitest asymmetric matchers (expect.any(), expect.objectContaining(), etc.)
+    // legitimately return `any` — passing them to typed parameters in
+    // expectCalledWith() would otherwise trigger no-unsafe-argument.
+    files: ['src/**/*.test.ts'],
+    rules: {
+      '@typescript-eslint/no-unsafe-argument': 'off',
+    },
+  },
+  {
     ignores: ['node_modules/', 'dist/', 'eslint.config.js', 'sr-pr-section.js'],
   }
 )

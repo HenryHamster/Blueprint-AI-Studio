@@ -156,6 +156,22 @@ export interface PoolMetrics {
   // with the per-account dispatch funnel for per-account hit rate + $/warm.
   idle_cost_by_account?: Record<string, PoolIdleCostAccountBreakdown>;
   cost_amortization_by_account?: Record<string, PoolAccountAmortization>;
+  // Cost-aware auto-drain guard diagnostic, as built by
+  // warm_pool_maintainer.evaluate_pool_cost_guard and surfaced through
+  // admin_health._get_pool_metrics. When `engaged`, the maintainer is draining
+  // idle members and pausing provisioning because the pool's hit rate sits below
+  // `min_hit_rate` while idle spend exceeds `min_idle_cost_usd`. `reason` is the
+  // human-readable explanation. Optional/nullable: omitted by older backends and
+  // null when the diagnostic could not be computed — the panel renders no banner.
+  cost_guard?: {
+    engaged: boolean;
+    reason: string | null;
+    hit_rate: number | null;
+    total_dispatches: number;
+    idle_cost_usd: number;
+    min_hit_rate: number;
+    min_idle_cost_usd: number;
+  } | null;
 }
 
 // Per-account slice of the offline pool hit-rate estimate, as built by
@@ -218,6 +234,10 @@ export interface WarmPoolTargetSetResponse {
 
 export interface WarmVmStateResponse {
   active_vms: WarmVmRow[];
+  // Whether warm_pool_account_retarget_enabled is on (any idle member serves
+  // any account in the tenant). Optional for backward compatibility with older
+  // backends that predate the field; panel treats absent as false.
+  account_retarget_enabled?: boolean;
   warm_pin_metrics: {
     clears_last_hour: number;
     clears_last_24h: number;
@@ -234,9 +254,37 @@ export interface WarmVmStateResponse {
     active_pool_origin_claims?: number;
     pool_origin_share?: number | null;
     active_chain_continuity_claims: number;
+    // Warm-subsystem circuit-breaker suppression state. All optional for
+    // backward compatibility with older backends (and existing test fixtures)
+    // that predate the breaker telemetry — when absent the panel renders no
+    // callout. The backend emits these from admin_health._compute_warm_vm_state:
+    // a *_circuit_breaker_suppressed boolean, the *_suppressed_until reset
+    // timestamp (naive UTC ISO, or null), the recent-failure count in the last
+    // hour, and the failure-rate threshold that trips the breaker.
+    // Chain continuity (warm-pin clear breaker):
+    circuit_breaker_suppressed?: boolean;
+    suppressed_until?: string | null;
+    clear_rate_threshold?: number;
+    // Backlog reuse claim breaker:
+    backlog_reuse_circuit_breaker_suppressed?: boolean;
+    backlog_reuse_suppressed_until?: string | null;
+    backlog_reuse_failures_last_hour?: number;
+    backlog_reuse_failure_rate_threshold?: number;
+    // Warm-pool claim breaker:
+    pool_circuit_breaker_suppressed?: boolean;
+    pool_suppressed_until?: string | null;
+    pool_claim_failures_last_hour?: number;
+    pool_failure_rate_threshold?: number;
   };
   warm_continuity_enabled: boolean;
   warm_backlog_reuse_enabled: boolean;
+  // Warm-pool retarget controls. Optional for backward compatibility with an
+  // older backend that predates surfacing them in the warm-vm-state payload —
+  // the panel defaults each to false when absent. account_retarget lets an idle
+  // pool member serve a dispatch whose account differs; cross_provider_retarget
+  // further relaxes the provider match.
+  warm_pool_account_retarget_enabled?: boolean;
+  warm_pool_cross_provider_retarget_enabled?: boolean;
   next_role_poll_timeout_secs: number;
   chain_continuity_funnel?: ChainContinuityFunnelSnapshot;
   spawn_pin_funnel?: SpawnPinFunnelSnapshot;

@@ -539,6 +539,531 @@ async def test_refresh_marker_parks_when_breaker_tripped(db_session, mocker):
     assert (project.vision or {}).get("_strategic_refresh") is not None
 
 
+def _active_strategic_task(project_id) -> Task:
+    """A non-terminal strategic task (an active cycle in flight)."""
+    return Task(
+        project_id=project_id,
+        title="Active strategic cycle",
+        payloads=[{"type": "strategic_review", "base_branch": "main"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        created_at=datetime.utcnow(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_operator_refresh_fires_despite_tripped_breaker(db_session, mocker):
+    """An operator steering request must NOT be silently held by the failure
+    breaker — it is exactly when the strategist has been failing that an operator
+    needs to intervene. With _strategic_failures tripped (>= 3, not decayed), an
+    operator-origin refresh still bypasses the cooldown and fires."""
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    project = Project(
+        name="Operator bypasses breaker",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],
+        vision={
+            "purpose": "test",
+            "_strategic_failures": 3,
+            "_strategic_failures_at": datetime.utcnow().isoformat(),  # recent → no decay
+            "_strategic_refresh": {
+                "requested_at": datetime.utcnow().isoformat(),
+                "reason": "operator_steering",
+                "count": 1,
+                "origin": "operator",
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(_recent_strategic_task(project.id, minutes_ago=5))
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert strategic_review_mock.called, (
+        "an operator-origin refresh must bypass the breaker and fire"
+    )
+    await db_session.refresh(project)
+    # Consumed on spawn — marker gone.
+    assert (project.vision or {}).get("_strategic_refresh") is None
+
+
+@pytest.mark.asyncio
+async def test_operator_refresh_deferred_behind_active_cycle_posts_once(
+    db_session, mocker
+):
+    """When an operator steering request lands while a strategic cycle is already
+    running, the operator must be told it is queued — exactly one system message,
+    with the marker stamped ``notified`` so later ticks stay quiet."""
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    design_doc_mock = mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    project = Project(
+        name="Operator deferred behind active cycle",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],
+        vision={
+            "purpose": "test",
+            "_strategic_refresh": {
+                "requested_at": datetime.utcnow().isoformat(),
+                "reason": "operator_steering",
+                "count": 1,
+                "origin": "operator",
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    # An active strategic cycle blocks the spawn this tick.
+    db_session.add(_active_strategic_task(project.id))
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    # Deferred (active cycle) — not spawned, marker preserved for the next tick.
+    assert not strategic_review_mock.called and not design_doc_mock.called
+    await db_session.refresh(project)
+    marker = (project.vision or {}).get("_strategic_refresh")
+    assert marker is not None and marker.get("notified") is True
+
+    msgs = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.from_type == "system",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    steering = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "strategic_steering_deferred"
+    ]
+    assert len(steering) == 1, "operator must get exactly one deferral notice"
+
+    # A second tick must stay quiet (notified flag suppresses re-emission).
+    await _spawn_research_task(project, db_session)
+    msgs2 = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.from_type == "system",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    steering2 = [
+        m
+        for m in msgs2
+        if (m.context or {}).get("event_type") == "strategic_steering_deferred"
+    ]
+    assert len(steering2) == 1, "deferral notice must not re-emit every tick"
+
+
+@pytest.mark.asyncio
+async def test_qualification_refresh_deferred_behind_active_cycle_stays_silent(
+    db_session, mocker
+):
+    """A qualification-origin refresh deferred behind an active cycle must NOT post
+    an operator-facing steering message — that visibility is reserved for operator
+    intent (automated refreshes park silently as before)."""
+    mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    project = Project(
+        name="Qualification deferred silently",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],
+        vision={
+            "purpose": "test",
+            "_strategic_refresh": {
+                "requested_at": datetime.utcnow().isoformat(),
+                "reason": "post_qualification:promoted",
+                "count": 1,
+                # no origin → legacy qualification
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(_active_strategic_task(project.id))
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    msgs = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    steering = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "strategic_steering_deferred"
+    ]
+    assert steering == [], "qualification refresh must not post operator steering notice"
+
+
+@pytest.mark.asyncio
+async def test_operator_steering_consumed_posts_acted_confirmation(db_session, mocker):
+    """When a strategic spawn actually consumes an operator-origin refresh marker,
+    the operator gets exactly one high-signal ``strategic_steering_acted`` message —
+    the symmetric success counterpart to the deferral notice."""
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    project = Project(
+        name="Operator steering acted",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],
+        vision={
+            "purpose": "test",
+            "_strategic_refresh": {
+                "requested_at": datetime.utcnow().isoformat(),
+                "reason": "operator_steering",
+                "count": 1,
+                "origin": "operator",
+                # Genuine operator steering carries the message text; the
+                # confirmation fires only when an excerpt was preserved.
+                "excerpt": "Please refocus on the auth bug.",
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    # A recent (terminal) strategic task puts us on the cooldown branch; the
+    # operator marker is due (no prior fire), so the spawn fires and consumes it.
+    db_session.add(_recent_strategic_task(project.id, minutes_ago=5))
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert strategic_review_mock.called, "operator-origin refresh must fire the spawn"
+    await db_session.refresh(project)
+    # Consumed on spawn — marker gone.
+    assert (project.vision or {}).get("_strategic_refresh") is None
+
+    msgs = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.from_type == "system",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    acted = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "strategic_steering_acted"
+    ]
+    assert len(acted) == 1, "operator must get exactly one steering confirmation"
+    assert acted[0].message_type == MessageType.NOTE
+
+
+@pytest.mark.asyncio
+async def test_operator_marker_without_excerpt_posts_no_acted_confirmation(
+    db_session, mocker
+):
+    """An operator-origin marker carrying NO excerpt must NOT post the steering
+    confirmation: with no preserved message text the woken cycle has no
+    directive to act on, so promising the operator that steering reached the
+    strategist would be untruthful."""
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    project = Project(
+        name="Operator steering no excerpt",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],
+        vision={
+            "purpose": "test",
+            "_strategic_refresh": {
+                "requested_at": datetime.utcnow().isoformat(),
+                "reason": "operator_steering",
+                "count": 1,
+                "origin": "operator",
+                # no excerpt — no message text was preserved
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(_recent_strategic_task(project.id, minutes_ago=5))
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert strategic_review_mock.called, "operator-origin refresh must still fire the spawn"
+    await db_session.refresh(project)
+    assert (project.vision or {}).get("_strategic_refresh") is None
+
+    msgs = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    acted = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "strategic_steering_acted"
+    ]
+    assert acted == [], "no excerpt → no steering confirmation"
+
+
+@pytest.mark.asyncio
+async def test_qualification_consumed_posts_no_acted_confirmation(db_session, mocker):
+    """A strategic spawn that consumes a qualification-origin marker must NOT post
+    a steering confirmation — that visibility is reserved for operator intent."""
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    project = Project(
+        name="Qualification consumed silently",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],
+        vision={
+            "purpose": "test",
+            "_strategic_refresh": {
+                "requested_at": datetime.utcnow().isoformat(),
+                "reason": "post_qualification:promoted",
+                "count": 1,
+                # no origin → legacy qualification
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(_recent_strategic_task(project.id, minutes_ago=5))
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert strategic_review_mock.called, "qualification refresh that is due should fire"
+    await db_session.refresh(project)
+    assert (project.vision or {}).get("_strategic_refresh") is None
+
+    msgs = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    acted = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "strategic_steering_acted"
+    ]
+    assert acted == [], "qualification consume must not post a steering confirmation"
+
+
+@pytest.mark.asyncio
+async def test_operator_refresh_deferred_on_cooldown_not_due_posts_once(
+    db_session, mocker
+):
+    """An operator marker pending behind the min-interval / spawn-cooldown floor
+    (not yet due) must surface a deferral notice — the broadened coverage beyond
+    the active-cycle branch."""
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    design_doc_mock = mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    project = Project(
+        name="Operator deferred on cooldown",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],
+        vision={
+            "purpose": "test",
+            # A very recent refresh fire keeps the min-interval floor closed, so
+            # the pending marker is pending-but-not-due this tick.
+            "_strategic_refresh_last_fired_at": datetime.utcnow().isoformat(),
+            "_strategic_refresh": {
+                "requested_at": datetime.utcnow().isoformat(),
+                "reason": "operator_steering",
+                "count": 1,
+                "origin": "operator",
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    # Recent terminal strategic task → cooldown branch (no active cycle).
+    db_session.add(_recent_strategic_task(project.id, minutes_ago=5))
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    # Not yet due → no spawn, marker preserved + stamped notified.
+    assert not strategic_review_mock.called and not design_doc_mock.called
+    await db_session.refresh(project)
+    marker = (project.vision or {}).get("_strategic_refresh")
+    assert marker is not None and marker.get("notified") is True
+
+    msgs = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.from_type == "system",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    steering = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "strategic_steering_deferred"
+    ]
+    assert len(steering) == 1, "cooldown-not-due deferral must post exactly one notice"
+
+
+@pytest.mark.asyncio
+async def test_operator_refresh_deferred_on_payload_too_large_posts_once(
+    db_session, mocker
+):
+    """An operator marker that survives a PayloadTooLargeError skip (the spawn
+    never happens, so the marker is not consumed) must surface a deferral notice."""
+    from app.payload_schemas import PayloadTooLargeError
+
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(side_effect=PayloadTooLargeError(300_000, 262_144, [("design_doc", 200_000)])),
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    project = Project(
+        name="Operator deferred on payload bloat",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],
+        vision={
+            "purpose": "test",
+            "_strategic_refresh": {
+                "requested_at": datetime.utcnow().isoformat(),
+                "reason": "operator_steering",
+                "count": 1,
+                "origin": "operator",
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    # Recent terminal strategic task + due operator marker → reaches the spawn
+    # block, where the patched spawn raises PayloadTooLargeError.
+    db_session.add(_recent_strategic_task(project.id, minutes_ago=5))
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert strategic_review_mock.called, "spawn must be attempted to hit the bloat skip"
+    await db_session.refresh(project)
+    # Spawn skipped — marker NOT consumed, but stamped notified by the deferral.
+    marker = (project.vision or {}).get("_strategic_refresh")
+    assert marker is not None and marker.get("notified") is True
+
+    msgs = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.from_type == "system",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    steering = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "strategic_steering_deferred"
+    ]
+    assert len(steering) == 1, "payload-too-large skip must post exactly one deferral notice"
+
+
 @pytest.mark.asyncio
 async def test_all_paused_skip_log_distinguishes_cooling_from_wedge(db_session, mocker):
     """The all-paused skip log must not read as a starvation wedge when a non-paused
@@ -10712,3 +11237,205 @@ async def test_post_merge_research_skips_paused_project(db_session, mocker):
     spawned_ids = {call.args[0].id for call in spawn_spy.call_args_list}
     assert active.id in spawned_ids, "Non-paused project should spawn research"
     assert paused.id not in spawned_ids, "Paused project must be skipped"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Operator steering deferral at HALT early-returns (not just spawn-decision skips)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _deferred_steering_messages(msgs):
+    """Filter helper: system messages carrying the deferral event_type."""
+    return [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "strategic_steering_deferred"
+    ]
+
+
+async def _system_messages(db_session, project_id):
+    return (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.from_type == "system",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+@pytest.mark.asyncio
+async def test_operator_refresh_deferred_on_circuit_breaker_open_posts_once(db_session):
+    """An operator steering marker pending while the research circuit breaker is
+    OPEN (still cooling down) must surface a one-time deferral notice — the breaker
+    halt early-returns BEFORE the strategic block, but operator steering must never
+    be a silent swallow. The marker must be preserved (only the spawn returns) so
+    the steering still lands once the breaker clears, and a second tick must stay
+    quiet via the notified flag."""
+    project = Project(
+        name="Operator deferred on CB open",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-cbdef01")],
+        vision={
+            "purpose": "test",
+            "_strategic_refresh": {
+                "requested_at": datetime.utcnow().isoformat(),
+                "reason": "operator_steering",
+                "count": 1,
+                "origin": "operator",
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Trip breaker — opened just now, 30-min cooldown has NOT elapsed.
+    _shared_state.circuit_breakers[str(project.id)] = {
+        "state": "OPEN",
+        "failure_count": 3,
+        "success_count": 0,
+        "opened_at": datetime.utcnow(),
+        "cooldown_seconds": 1800,
+        "base_cooldown": 1800,
+        "half_open_task_id": None,
+    }
+    try:
+        await _spawn_research_task(project, db_session)
+
+        # No task spawned — the breaker halt aborts before the strategic block.
+        tasks = (
+            await db_session.execute(select(Task).where(Task.project_id == project.id))
+        ).scalars().all()
+        assert len(tasks) == 0, "No task spawned while circuit breaker OPEN"
+
+        # Marker preserved (steering not lost) and stamped notified.
+        await db_session.refresh(project)
+        marker = (project.vision or {}).get("_strategic_refresh")
+        assert marker is not None, "operator marker must persist across the halt"
+        assert marker.get("notified") is True
+
+        steering = _deferred_steering_messages(
+            await _system_messages(db_session, project.id)
+        )
+        assert len(steering) == 1, "breaker-open halt must post exactly one notice"
+
+        # Second tick (still OPEN) must stay quiet — notified flag suppresses it.
+        await _spawn_research_task(project, db_session)
+        steering2 = _deferred_steering_messages(
+            await _system_messages(db_session, project.id)
+        )
+        assert len(steering2) == 1, "deferral notice must not re-emit every tick"
+    finally:
+        _shared_state.circuit_breakers.pop(str(project.id), None)
+
+
+@pytest.mark.asyncio
+async def test_operator_refresh_deferred_on_no_accounts_posts_once(
+    db_session, monkeypatch
+):
+    """An operator steering marker pending when the user has NO available model
+    accounts must surface a one-time deferral notice — the no-accounts guard is the
+    earliest halt early-return, well before the strategic block. Marker preserved,
+    second tick quiet."""
+    project = Project(
+        name="Operator deferred on no accounts",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-nodef01")],
+        vision={
+            "purpose": "test",
+            "_strategic_refresh": {
+                "requested_at": datetime.utcnow().isoformat(),
+                "reason": "operator_steering",
+                "count": 1,
+                "origin": "operator",
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Empty the user's account pool and clear the env fallback so has_available
+    # is False (mirrors the no-accounts halt). The autouse fixture seeds an
+    # account; drop it for the duration of this test.
+    uid = "test-user-123"
+    saved_pool = list(_max_plan_pools.get(uid, []))
+    _max_plan_pools[uid] = []
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    try:
+        await _spawn_research_task(project, db_session)
+
+        tasks = (
+            await db_session.execute(select(Task).where(Task.project_id == project.id))
+        ).scalars().all()
+        assert len(tasks) == 0, "No task spawned when no accounts available"
+
+        await db_session.refresh(project)
+        marker = (project.vision or {}).get("_strategic_refresh")
+        assert marker is not None, "operator marker must persist across the halt"
+        assert marker.get("notified") is True
+
+        steering = _deferred_steering_messages(
+            await _system_messages(db_session, project.id)
+        )
+        assert len(steering) == 1, "no-accounts halt must post exactly one notice"
+
+        # Second tick (still no accounts) must stay quiet.
+        await _spawn_research_task(project, db_session)
+        steering2 = _deferred_steering_messages(
+            await _system_messages(db_session, project.id)
+        )
+        assert len(steering2) == 1, "deferral notice must not re-emit every tick"
+    finally:
+        _max_plan_pools[uid] = saved_pool
+
+
+@pytest.mark.asyncio
+async def test_qualification_refresh_on_circuit_breaker_open_stays_silent(db_session):
+    """A QUALIFICATION-origin refresh marker pending while the breaker is OPEN must
+    NOT post an operator-facing notice — the deferral visibility is reserved for
+    operator intent (automated refreshes park silently)."""
+    project = Project(
+        name="Qualification silent on CB open",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-cbqual1")],
+        vision={
+            "purpose": "test",
+            "_strategic_refresh": {
+                "requested_at": datetime.utcnow().isoformat(),
+                "reason": "post_qualification",
+                "count": 1,
+                "origin": "qualification",
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _shared_state.circuit_breakers[str(project.id)] = {
+        "state": "OPEN",
+        "failure_count": 3,
+        "success_count": 0,
+        "opened_at": datetime.utcnow(),
+        "cooldown_seconds": 1800,
+        "base_cooldown": 1800,
+        "half_open_task_id": None,
+    }
+    try:
+        await _spawn_research_task(project, db_session)
+
+        steering = _deferred_steering_messages(
+            await _system_messages(db_session, project.id)
+        )
+        assert len(steering) == 0, "qualification-origin marker must stay silent"
+    finally:
+        _shared_state.circuit_breakers.pop(str(project.id), None)

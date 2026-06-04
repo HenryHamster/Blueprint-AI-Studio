@@ -35,6 +35,7 @@ vi.mock('fs', () => {
 import { augmentSelfReview, runCodeChangeTask } from './code-change.js';
 import { git, persistAndPostStatus, runClaudeCode } from '../index.js';
 import { writeCodeChangeHelpers } from '../prompt.js';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 import * as fs from 'fs';
 
 describe('augmentSelfReview', () => {
@@ -186,7 +187,7 @@ describe('runCodeChangeTask SCOPE_EMPTY guard', () => {
       siblingTasks: [{ status: 'COMPLETED', files: ['agent/src/handlers/code-change.ts'], title: 'cluster 1/5' }],
     });
     expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
-    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+    expectCalledWith(persistAndPostStatus,
       'task-scope-guard',
       expect.objectContaining({ failure_category: 'SCOPE_EMPTY', status: 'BLOCKED_PRECONDITION' }),
     );
@@ -263,14 +264,14 @@ describe('runCodeChangeTask promotionTarget forwarding', () => {
 
   it('forwards promotionTarget to writeCodeChangeHelpers when provided', async () => {
     await runCodeChangeTask({ ...baseOpts, promotionTarget: 'production' });
-    expect(vi.mocked(writeCodeChangeHelpers)).toHaveBeenCalledWith(
+    expectCalledWith(writeCodeChangeHelpers,
       expect.objectContaining({ promotionTarget: 'production' }),
     );
   });
 
   it('forwards undefined promotionTarget when not provided', async () => {
     await runCodeChangeTask({ ...baseOpts });
-    expect(vi.mocked(writeCodeChangeHelpers)).toHaveBeenCalledWith(
+    expectCalledWith(writeCodeChangeHelpers,
       expect.objectContaining({ promotionTarget: undefined }),
     );
   });

@@ -22,13 +22,16 @@ on-demand ``DigestCache`` fallback. The table is tiny (bounded by the hot-key
 set: 1 global + <=25 active projects per kind) and churned by UPSERT; stale rows
 for no-longer-hot keys are pruned by the worker tick.
 
-Per CLAUDE.md this migration is chained from the latest head (0137,
-``cascade_project_fks_messages_anomaly``) and ``EXPECTED_SCHEMA_REVISION`` is
-bumped to 0138 to match. On SQLite (local test fixture) the table is created
+Per CLAUDE.md this migration is chained from the latest head and
+``EXPECTED_SCHEMA_REVISION`` is bumped to match. It was originally authored on
+``main`` as revision 0138; the ``main -> automain`` back-merge renumbered it onto
+automain's tail (0138 ``task_blocked_state_fields`` -> 0139
+``project_merge_gate_runtime``) to keep a single, monotonic head, so it now
+chains from 0139 as 0140. On SQLite (local test fixture) the table is created
 from ``SQLModel.metadata.create_all``; this migration is the Postgres path.
 
-Revision ID: 0138
-Revises: 0137
+Revision ID: 0140
+Revises: 0139
 Create Date: 2026-06-03 09:00:00.000000
 
 """
@@ -38,8 +41,8 @@ import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
 
 
-revision = "0138"
-down_revision = "0137"
+revision = "0140"
+down_revision = "0139"
 branch_labels = None
 depends_on = None
 

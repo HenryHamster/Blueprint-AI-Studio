@@ -7,12 +7,256 @@ modified by agents. If an agent changes a safety value, CI catches it.
 Run with: pytest testing/test_invariants.py -v --noconftest
 """
 
+import ast
 import os
 import re
 import subprocess
 from pathlib import Path
 
 import pytest
+
+
+def _assert_backmerge_modules_do_not_import_rollup_management(
+    source: str, *, filename: str
+) -> None:
+    """Reject back-merge-module escape hatches into the push-capable rollup path."""
+    import ast
+
+    tree = ast.parse(source, filename=filename)
+    forbidden_imports: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module == "app.rollup_management":
+                forbidden_imports.append(
+                    "from app.rollup_management import "
+                    + ", ".join(alias.name for alias in node.names)
+                )
+            elif module == "app" and any(
+                alias.name == "rollup_management" for alias in node.names
+            ):
+                forbidden_imports.append("from app import rollup_management")
+        elif isinstance(node, ast.Import):
+            if any(alias.name == "app.rollup_management" for alias in node.names):
+                forbidden_imports.append("import app.rollup_management")
+
+    forbidden_helpers = []
+    if re.search(r"\b_attempt_alembic_autoreconcile\b", source):
+        forbidden_helpers.append("_attempt_alembic_autoreconcile")
+
+    assert not forbidden_imports and not forbidden_helpers, (
+        f"{filename} must not import or reference app.rollup_management's "
+        "push-capable Alembic autoreconcile helper. The back-merge block path "
+        "and its planner must stay read-only; if you genuinely need a new helper, "
+        "keep it out of the back-merge modules and update this invariant with a "
+        "clear justification."
+    )
+
+
+def _ast_called_name(call: ast.Call) -> str | None:
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _ast_refs_names(node: ast.AST, names: set[str]) -> bool:
+    return any(isinstance(n, ast.Name) and n.id in names for n in ast.walk(node))
+
+
+def _ast_assign_targets_for_predicated_call(
+    stmt: ast.stmt,
+    *,
+    call_predicate,
+) -> set[str]:
+    value = getattr(stmt, "value", None)
+    if value is None or not any(
+        isinstance(n, ast.Call) and call_predicate(n) for n in ast.walk(value)
+    ):
+        return set()
+
+    if isinstance(stmt, ast.Assign):
+        targets = stmt.targets
+    elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+        targets = [stmt.target]
+    else:
+        return set()
+
+    names: set[str] = set()
+    for tgt in targets:
+        for n in ast.walk(tgt):
+            if isinstance(n, ast.Name):
+                names.add(n.id)
+    return names
+
+
+def _ast_branch_early_exits(stmts: list[ast.stmt]) -> bool:
+    return any(
+        isinstance(s, (ast.Return, ast.Raise, ast.Continue, ast.Break))
+        for s in stmts
+    )
+
+
+def _ast_branch_implies_verdict(
+    node: ast.AST,
+    *,
+    branch_truth: bool,
+    desired_truth: bool,
+    atom_predicate,
+) -> bool:
+    """Return True only when this branch outcome forces the desired verdict.
+
+    This is intentionally conservative. For composite boolean expressions we
+    only treat a branch as covered when reaching that branch necessarily proves
+    a guard/exclusion atom has the polarity the merge path needs.
+    """
+
+    if atom_predicate(node):
+        return branch_truth == desired_truth
+
+    if isinstance(node, ast.Await):
+        return _ast_branch_implies_verdict(
+            node.value,
+            branch_truth=branch_truth,
+            desired_truth=desired_truth,
+            atom_predicate=atom_predicate,
+        )
+
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return _ast_branch_implies_verdict(
+            node.operand,
+            branch_truth=not branch_truth,
+            desired_truth=desired_truth,
+            atom_predicate=atom_predicate,
+        )
+
+    if isinstance(node, ast.BoolOp):
+        values = list(node.values)
+        if isinstance(node.op, ast.And):
+            if branch_truth:
+                return any(
+                    _ast_branch_implies_verdict(
+                        value,
+                        branch_truth=True,
+                        desired_truth=desired_truth,
+                        atom_predicate=atom_predicate,
+                    )
+                    for value in values
+                )
+            return all(
+                _ast_branch_implies_verdict(
+                    value,
+                    branch_truth=False,
+                    desired_truth=desired_truth,
+                    atom_predicate=atom_predicate,
+                )
+                for value in values
+            )
+
+        if isinstance(node.op, ast.Or):
+            if branch_truth:
+                return all(
+                    _ast_branch_implies_verdict(
+                        value,
+                        branch_truth=True,
+                        desired_truth=desired_truth,
+                        atom_predicate=atom_predicate,
+                    )
+                    for value in values
+                )
+            return any(
+                _ast_branch_implies_verdict(
+                    value,
+                    branch_truth=False,
+                    desired_truth=desired_truth,
+                    atom_predicate=atom_predicate,
+                )
+                for value in values
+            )
+
+    if isinstance(node, ast.Compare) and len(node.ops) == 1 and len(node.comparators) == 1:
+        op = node.ops[0]
+        left = node.left
+        right = node.comparators[0]
+        bool_side = None
+        expr_side = None
+        if isinstance(left, ast.Constant) and isinstance(left.value, bool):
+            bool_side = left.value
+            expr_side = right
+        elif isinstance(right, ast.Constant) and isinstance(right.value, bool):
+            bool_side = right.value
+            expr_side = left
+        if expr_side is not None and bool_side is not None:
+            if isinstance(op, (ast.Is, ast.Eq)):
+                expr_truth = bool_side if branch_truth else not bool_side
+                return _ast_branch_implies_verdict(
+                    expr_side,
+                    branch_truth=expr_truth,
+                    desired_truth=desired_truth,
+                    atom_predicate=atom_predicate,
+                )
+            if isinstance(op, (ast.IsNot, ast.NotEq)):
+                expr_truth = (not bool_side) if branch_truth else bool_side
+                return _ast_branch_implies_verdict(
+                    expr_side,
+                    branch_truth=expr_truth,
+                    desired_truth=desired_truth,
+                    atom_predicate=atom_predicate,
+                )
+
+    return False
+
+
+def _ast_branch_implies_named_str_compare(
+    node: ast.AST,
+    *,
+    branch_truth: bool,
+    names: set[str],
+    truthy_literals: set[str],
+) -> bool:
+    """Conservatively match direct ``name == "literal"`` style status checks.
+
+    This is intentionally narrower than ``_ast_branch_implies_verdict``. It is
+    only used for the sibling-after-if propagation path where we want to keep
+    honoring the `_validate_rollup_migration_chain(...)` string-status idiom
+    (`"defer"` / `"block"`) without letting arbitrary guard-shaped `if`
+    statements mark later merges as covered.
+    """
+
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return _ast_branch_implies_named_str_compare(
+            node.operand,
+            branch_truth=not branch_truth,
+            names=names,
+            truthy_literals=truthy_literals,
+        )
+
+    if isinstance(node, ast.Compare) and len(node.ops) == 1 and len(node.comparators) == 1:
+        op = node.ops[0]
+        left = node.left
+        right = node.comparators[0]
+        name_node = None
+        literal_node = None
+        if isinstance(left, ast.Name) and left.id in names and isinstance(right, ast.Constant):
+            name_node = left
+            literal_node = right
+        elif isinstance(right, ast.Name) and right.id in names and isinstance(left, ast.Constant):
+            name_node = right
+            literal_node = left
+
+        if (
+            name_node is not None
+            and isinstance(literal_node.value, str)
+            and literal_node.value in truthy_literals
+        ):
+            if isinstance(op, (ast.Eq, ast.Is)):
+                return branch_truth
+            if isinstance(op, (ast.NotEq, ast.IsNot)):
+                return not branch_truth
+
+    return False
 
 
 # ── Safety Constants ────────────────────────────────────────────────────────
@@ -231,6 +475,212 @@ class TestSchemaRevisionSync:
             mismatches
         )
 
+    def test_rollup_guard_uses_combined_chain_check(self):
+        """The rollup auto-merge guard must pass target_branch to _validate_rollup_migration_chain.
+
+        Regression guard: dropping target_branch silently reverts the guard to the
+        in-isolation check, which is blind to parallel-development collisions where
+        two branches each add the same revision id or anchor to a stale head.
+        """
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "app", "rollup_management.py"
+        )
+        with open(path) as f:
+            content = f.read()
+        assert re.search(
+            r"_validate_rollup_migration_chain\s*\([^)]*target_branch\b",
+            content,
+            re.DOTALL,
+        ), (
+            "_validate_rollup_migration_chain must be called with target_branch in "
+            "rollup_management.py. Without it the guard is blind to parallel-development "
+            "migration collisions (two branches each adding the same revision id)."
+        )
+
+    def test_backmerge_guard_uses_combined_chain_check(self):
+        """The hotfix back-merge path must pass integration_branch to _validate_rollup_migration_chain.
+
+        Regression guard mirroring test_rollup_guard_uses_combined_chain_check: the
+        main->automain back-merge merges a hotfix migration on the promotion target
+        into the integration branch, which can collide with a feature migration added
+        on the integration branch since the last promotion (same-revision dual head /
+        duplicate revision id). The back-merge must reuse the same combined-chain
+        validator as the rollup guard, with the integration branch passed as the
+        target_branch — dropping it reverts to the in-isolation check that is blind to
+        exactly this cross-branch collision, letting an unvalidated merge wedge the
+        integration branch's `alembic upgrade head`.
+        """
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "app", "hotfix_backmerge.py"
+        )
+        with open(path) as f:
+            content = f.read()
+        _assert_backmerge_modules_do_not_import_rollup_management(
+            content, filename="hotfix_backmerge.py"
+        )
+        assert re.search(
+            r"_validate_rollup_migration_chain\s*\([^)]*\bintegration_branch\b",
+            content,
+            re.DOTALL,
+        ), (
+            "_validate_rollup_migration_chain must be called with integration_branch in "
+            "hotfix_backmerge.py. Without it the back-merge guard is blind to a hotfix "
+            "migration on the promotion target colliding with a feature migration on the "
+            "integration branch (same-revision dual head), and the immediate merge wedges "
+            "the integration branch's `alembic upgrade head`."
+        )
+
+    def test_backmerge_block_path_pushes_nothing(self):
+        """The hotfix back-merge module must never inline-push migration files to a branch.
+
+        Static belt-and-suspenders guard for the core invariant of direction
+        d-18cc6131 (the "block-path-pushes-nothing" property). On an Alembic
+        dual-head ``block`` verdict, the back-merge resolver ALWAYS routes to a
+        spawned resolution task (``_spawn_migration_resolution_task``) that does
+        the renumber + merge on a fresh branch through the normal PR gate, and
+        embeds a precomputed renumber plan in that task's prompt. It must NEVER
+        reconcile the dual head by pushing the renumber directly to the live
+        integration branch (e.g. ``automain``).
+
+        Why this is forbidden: pushing the renumber to the live integration
+        branch before the back-merge lands leaves a dangling second Alembic head,
+        wedging ``alembic upgrade head`` for every concurrent task for as long as
+        the merge is held off by branch protection, a CI gate, or an unrelated
+        conflict — the exact failure this design prevents.
+
+        The property is also enforced (a) structurally — this test scans the
+        module's direct ``github.<helper>`` usage and asserts it is a SUBSET of an
+        explicit read/merge allowlist (``create_pull_request``,
+        ``merge_pull_request``, ``get_pull_request``, ``get_check_runs_cached``),
+        so ANY branch-write helper — regardless of its name — fails CI; and (b) by
+        per-scenario runtime assertions in test_hotfix_backmerge.py
+        (``commit_mock.assert_not_called()`` and the call-args scan for
+        ``automain``). This static scan locks it as a single invariant so a future
+        change (e.g. "restoring" an inline auto-reconcile/push) cannot reintroduce
+        the wedge through a new code path the scenario tests do not cover. A future
+        author who genuinely needs to change this must update this invariant
+        deliberately.
+
+        Allowlist (not denylist) rationale: a denylist of specific write-helper
+        names cannot see a NEWLY-introduced or differently-named branch-write
+        primitive, which is the single most likely way an inline reconcile gets
+        restored. The allowlist inverts the burden — every github helper the
+        block path touches must be a known, justified read/merge call, or the
+        guard trips.
+        """
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "app", "hotfix_backmerge.py"
+        )
+        with open(path) as f:
+            content = f.read()
+
+        # Every github helper the back-merge module is allowed to call directly.
+        # All four are read/merge-only — none writes to a branch:
+        #   create_pull_request  — open (or reuse) the back-merge PR (idempotent)
+        #   merge_pull_request   — land the back-merge through the normal merge API
+        #   get_pull_request     — read PR state / mergeability
+        #   get_check_runs_cached — read CI status before attempting the merge
+        # A branch-write helper (e.g. github.commit_file_changes, create_branch,
+        # merge_branch, update_branch, delete_branch — all real symbols in the
+        # app.github namespace) is deliberately absent: inlining the dual-head
+        # renumber onto the live integration branch is the wedge this invariant
+        # forbids. To add a helper here you MUST justify that it cannot push a
+        # renumber to the integration branch before the back-merge lands.
+        ALLOWED_BACKMERGE_GITHUB_HELPERS = {
+            "create_pull_request",
+            "merge_pull_request",
+            "get_pull_request",
+            "get_check_runs_cached",
+        }
+        used = set(re.findall(r"\bgithub\.(\w+)\b", content))
+        unexpected = sorted(used - ALLOWED_BACKMERGE_GITHUB_HELPERS)
+        assert not unexpected, (
+            "hotfix_backmerge.py uses github helper(s) not on the read/merge "
+            f"allowlist: {unexpected}. On an Alembic dual-head `block` verdict the "
+            "back-merge must route to a spawned resolution task (the renumber + merge "
+            "happens on a fresh branch through the normal PR gate), NEVER push the "
+            "renumber to the live integration branch. An inline push leaves a dangling "
+            "second Alembic head that wedges `alembic upgrade head` for every concurrent "
+            "task until the held-off merge lands (the block-path-pushes-nothing invariant "
+            "of direction d-18cc6131). If you genuinely need a new helper, add it to "
+            "ALLOWED_BACKMERGE_GITHUB_HELPERS deliberately, with a justification that it "
+            "cannot push a renumber to the live integration branch, and preserve the "
+            "runtime guards in test_hotfix_backmerge.py."
+        )
+
+        # Guard the guard: an accidental "allow everything" (empty-set) regression
+        # would make the subset check vacuous. The allowlist must stay exactly the
+        # four documented read/merge helpers.
+        assert ALLOWED_BACKMERGE_GITHUB_HELPERS == {
+            "create_pull_request",
+            "merge_pull_request",
+            "get_pull_request",
+            "get_check_runs_cached",
+        }, "The back-merge github-helper allowlist must stay the four read/merge helpers."
+
+        # The block path must still route to the spawned resolver — if this
+        # disappears the renumber has to be happening somewhere, and the only
+        # safe somewhere is a fresh-branch resolution task.
+        assert "_spawn_migration_resolution_task" in content, (
+            "hotfix_backmerge.py must route a dual-head `block` verdict to "
+            "_spawn_migration_resolution_task. If the spawn route is removed, the "
+            "renumber+merge can only be happening via a forbidden inline branch push "
+            "(see the block-path-pushes-nothing invariant of direction d-18cc6131)."
+        )
+
+    def test_backmerge_migration_planner_is_read_only(self):
+        """The back-merge migration planner must never push to a branch either.
+
+        ``rollup_migration_validation.py`` holds the back-merge renumber planner
+        (``plan_integration_side_renumber`` etc.) that the dual-head block path
+        depends on to compute the renumber it embeds in the spawned resolution
+        task's prompt. Like ``hotfix_backmerge.py``, this module must only READ
+        from GitHub — it inspects PR diffs and migration sources at refs; it must
+        never call a branch-write helper. The ONLY legitimate inline migration
+        push in the system is the ROLLUP path's staging-branch reconcile
+        (``rollup_management`` -> ``github.commit_file_changes``), which lives in a
+        different module and must stay there.
+
+        Same allowlist-subset pattern as
+        ``test_backmerge_block_path_pushes_nothing``: every ``github.<helper>``
+        token used here must be a known read helper, so a future branch-write
+        primitive — regardless of name — fails CI.
+        """
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "app", "rollup_migration_validation.py"
+        )
+        with open(path) as f:
+            content = f.read()
+        _assert_backmerge_modules_do_not_import_rollup_management(
+            content, filename="rollup_migration_validation.py"
+        )
+
+        # Read-only GitHub helpers the planner legitimately needs to reconstruct
+        # and validate the migration chain across the two heads:
+        #   get_pr_files / get_pull_request_diff — read the rollup/back-merge diff
+        #   list_versions_at_ref — list alembic/versions filenames at a ref
+        #   get_file_text_at_ref — fetch a single migration file's source at a ref
+        # No branch-write helper may appear: the planner computes a renumber plan,
+        # it never applies one to a live branch.
+        ALLOWED_PLANNER_GITHUB_HELPERS = {
+            "get_pr_files",
+            "get_pull_request_diff",
+            "list_versions_at_ref",
+            "get_file_text_at_ref",
+        }
+        used = set(re.findall(r"\bgithub\.(\w+)\b", content))
+        unexpected = sorted(used - ALLOWED_PLANNER_GITHUB_HELPERS)
+        assert not unexpected, (
+            "rollup_migration_validation.py uses github helper(s) not on the "
+            f"read-only allowlist: {unexpected}. The back-merge migration planner must "
+            "only READ from GitHub (PR diffs, migration sources at refs); it must NEVER "
+            "push a renumber to a branch — that is the block-path-pushes-nothing invariant "
+            "of direction d-18cc6131. The only legitimate inline migration push is the "
+            "ROLLUP staging-branch reconcile in rollup_management, which must stay there. "
+            "If you genuinely need a new helper, add it to ALLOWED_PLANNER_GITHUB_HELPERS "
+            "deliberately, with a justification that it cannot push to a branch."
+        )
+
     def test_migration_chain_is_linear(self):
         """The alembic migration chain must be a single linear sequence —
         no gaps, no branches, no dangling down_revision references, and no
@@ -289,6 +739,77 @@ class TestSchemaRevisionSync:
         heads = find_heads(chain)
         assert len(heads) == 1, (
             f"Expected exactly 1 head migration, found {len(heads)}: {heads}"
+        )
+
+    def test_migration_chain_is_monotonic(self):
+        """The on-disk migration chain must be monotonic: the migration with the
+        numeric-maximum revision id must be the single structural head of the
+        chain, and every migration's revision number must be greater than its
+        down_revision's number.
+
+        The combined-chain dual-head guard identifies the head by taking the
+        numeric maximum of the revision ids (it works from filenames alone).
+        This assumes the chain is monotonic — that the highest-numbered
+        migration is the true head. When a chain is non-monotonic (e.g. a
+        colliding migration's renumber produces a backward step), numeric-max
+        head detection fails and the app wedges on the next schema upgrade.
+
+        Reuses the same migration-chain parsing helpers (:func:`build_migration_chain`,
+        :func:`find_heads`) that the rollup auto-merge guard consumes, so the
+        invariant test and the runtime guard assert against identical chain
+        structure.
+        """
+        import glob as globmod
+
+        from app.migration_chain import build_migration_chain, find_heads
+
+        migrations_dir = os.path.join(
+            os.path.dirname(__file__), "..", "alembic", "versions"
+        )
+        files = globmod.glob(os.path.join(migrations_dir, "[0-9]*.py"))
+        assert files, "No migration files found"
+
+        sources: dict[str, str] = {}
+        for path in files:
+            with open(path) as f:
+                sources[os.path.basename(path)] = f.read()
+
+        chain, _duplicates, _unparseable = build_migration_chain(sources)
+        heads = find_heads(chain)
+
+        # Exactly one head (verified by test_migration_chain_is_linear)
+        assert len(heads) == 1, f"Expected 1 head, got {len(heads)}: {heads}"
+
+        head = heads[0]
+        max_revision = max(chain, key=int)
+
+        # Every revision number must be greater than its down_revision's number
+        # (for revisions that are part of the chain).
+        violations: list[str] = []
+        for rev, down_rev in chain.items():
+            if down_rev is not None and down_rev in chain:
+                if int(rev) <= int(down_rev):
+                    violations.append(
+                        f"  {rev} (numeric {int(rev)}) → down_revision {down_rev} "
+                        f"(numeric {int(down_rev)}) — revision must be numerically "
+                        f"greater than its down_revision"
+                    )
+
+        # The numeric-maximum revision must be the structural head
+        if max_revision != head:
+            violations.append(
+                f"  numeric-maximum revision '{max_revision}' is not the "
+                f"structural head '{head}' — numeric-max head detection will fail"
+            )
+
+        assert not violations, (
+            "Migration chain is not monotonic. The combined-chain dual-head guard "
+            "relies on numeric-max head detection to identify the head, which breaks "
+            "on non-monotonic chains where the highest-numbered migration is not the "
+            "structural head or when migrations are numbered out of chain order.\n"
+            "Violations:\n" + "\n".join(violations) + "\n\n"
+            "Ensure every revision is numerically greater than its down_revision, "
+            "and the numeric-maximum revision is the true structural head."
         )
 
     def test_model_columns_covered_by_migrations(self):
@@ -695,6 +1216,2065 @@ class TestSchemaRevisionSync:
         )
 
 
+# ── Pre-merge dual-head guard coverage (whole-package) ─────────────────────
+
+
+class TestPreMergeDualHeadGuardCoverage:
+    """Whole-package invariant: EVERY PR-merge site under backend/app/ that can
+    target an integration/promotion branch must be covered by the pre-merge
+    combined-chain dual-head guard.
+
+    WHY: merging a PR that creates two Alembic heads / a duplicate revision id
+    wedges ``alembic upgrade head`` on the integration branch. The backend merges
+    PRs from many sites — the CI-completion handler, the autonomous rollup
+    auto-merge, the hotfix back-merge, the qualify->promote release merge,
+    operator-approval merges, and the normal task-PR completion handler. Each
+    must first run one of the two shared guard entrypoints, both defined in
+    ``app/rollup_migration_validation.py``:
+      - ``enforce_premerge_migration_guard(...)``
+      - ``_validate_rollup_migration_chain(...)``
+
+    The two narrow tests ``test_rollup_guard_uses_combined_chain_check`` and
+    ``test_backmerge_guard_uses_combined_chain_check`` assert that two *specific*
+    files call the guard with the right target/integration-branch argument. This
+    test is complementary: it enumerates the FULL set of merge SITES so a new (or
+    existing) merge path cannot silently skip the guard without a test noticing.
+
+    Modeled on the os.walk whole-package invariants in this module
+    (``TestNoRawBindDialectIdiom`` / ``TestBaseBranchFallback``): walk
+    backend/app/ (recursing routers/), flag each offending file:function, and
+    carry an allowlist of legitimate exceptions, each documenting WHY.
+
+    The scan is source-level only (AST) and NEVER executes a merge path.
+
+    Coverage note: because this test is AST-only and function-scoped, removing
+    the guard reference from any of ``_process_post_commit``,
+    ``_check_and_trigger_rollup``, or ``promote`` would create a new offender
+    and fail this invariant. That is deliberate: the invariant catches missing
+    call-site coverage, not the later GitHub merge-time race where
+    ``enable_auto_merge`` may complete after a second migration PR lands.
+    Track that TOCTOU window separately.
+    """
+
+    # The two shared combined-chain guard entrypoints (app/rollup_migration_validation.py).
+    _GUARD_NAMES = frozenset(
+        {"_validate_rollup_migration_chain", "enforce_premerge_migration_guard"}
+    )
+
+    # Merge symbols the scan treats as a merge SITE: the direct primitive
+    # (``merge_pull_request`` / ``github.merge_pull_request``), the
+    # exponential-backoff wrapper (``_merge_with_retry``, which is always handed
+    # ``merge_pull_request`` as its first argument), and the GitHub
+    # auto-merge primitive (``enable_auto_merge``).
+    _MERGE_NAMES = frozenset(
+        {"merge_pull_request", "_merge_with_retry", "enable_auto_merge"}
+    )
+
+    # Whole files that define/re-export the merge primitive or the generic retry
+    # wrapper. These make NO integration/promotion-branch merge *decision* (the
+    # target branch is chosen by their callers, which carry the guard), so they
+    # are exempt. Mirrors how the dialect/base-branch guards allowlist the files
+    # that *define* the thing they otherwise forbid.
+    _EXEMPT_FILES = {
+        "github_pulls.py": (
+            "defines the low-level merge_pull_request primitive (raw GitHub merge "
+            "API); chooses no integration/promotion branch"
+        ),
+        "github.py": (
+            "re-exports merge_pull_request for callers; makes no merge decision"
+        ),
+        "task_lifecycle_github_helpers.py": (
+            "defines the generic _merge_with_retry wrapper; the merging caller "
+            "picks the target branch and carries the guard"
+        ),
+    }
+
+    # Whole-FUNCTION merge-site exemptions, keyed by (file, function). Each entry
+    # MUST document WHY. A string value exempts EVERY merge call in that function
+    # (used for thin shared-helper functions whose guard is enforced by their
+    # upstream caller). These are coarse and used sparingly — the granular,
+    # per-call mechanism below is preferred for any function that mixes guarded
+    # and exempt merges.
+    #
+    # NOTE: do NOT key exemptions by absolute line number. An edit above a merge
+    # site shifts the numbers and breaks the invariant on unrelated PRs; worse,
+    # under code motion a genuinely-new unguarded merge can come to occupy an
+    # exempt line and silently inherit an exemption it never declared. That is the
+    # exact silent regression this invariant exists to prevent (same class as the
+    # column-offset brittleness fixed elsewhere). For functions that mix guarded
+    # and exempt merges (e.g. ``_process_post_commit``), exempt the SPECIFIC merge
+    # call with the inline ``# premerge-guard-exempt: <reason>`` marker (see
+    # _EXEMPT_MARKER below) so the exemption travels with the code.
+    _EXEMPT_SITES: dict = {
+    }
+
+    # Narrow call-site allowances for helpers that are structurally guarded by
+    # upstream flow and dedicated runtime tests. These are intentionally kept as
+    # exact call ordinals rather than whole-function trust zones; the shape test
+    # below pins the function structure so a future extra merge call still trips
+    # the invariant.
+    _NARROWLY_ALLOWED_MERGE_CALLS: dict = {
+        (
+            "ci_completion.py",
+            "_attempt_merge_with_retry_and_escalation",
+        ): frozenset({1, 2}),
+        (
+            "task_completion.py",
+            "_maybe_release_safeguard_gate",
+        ): frozenset({1}),
+    }
+
+    # Inline per-call exemption marker. A merge call is exempt iff this sentinel,
+    # FOLLOWED BY A NON-EMPTY HUMAN-READABLE REASON, appears anywhere within the
+    # call's own source span (call.lineno..call.end_lineno). Because the marker
+    # lives on the call itself, a brand-new or relocated merge cannot inherit an
+    # exemption it did not declare: removing or moving the marked call removes or
+    # moves its exemption automatically, and an unmarked sibling merge is still
+    # flagged. A bare marker with no reason is rejected (see
+    # test_premerge_exempt_marker_requires_reason).
+    _EXEMPT_MARKER = "# premerge-guard-exempt:"
+
+    @staticmethod
+    def _collect_offenders(
+        source: str,
+        *,
+        filename: str,
+        rel: str,
+        guard_names: frozenset[str],
+        merge_names: frozenset[str],
+    ) -> list[str]:
+        def _called_name(call: "ast.Call") -> str | None:
+            return _ast_called_name(call)
+
+        def _calls_guard(node) -> bool:
+            # A guard/verdict-producing CALL anywhere in the subtree — the
+            # ``enforce_premerge_migration_guard(...)`` on an assignment RHS or
+            # directly as an ``if`` test. A mere reference to a guard NAME (e.g.
+            # an import, or the captured verdict left unused) is deliberately NOT
+            # enough: only an actual call produces a verdict to gate on. This is
+            # the crux of the fail-closed ratchet — "guard symbol present" no
+            # longer counts as "merge covered".
+            return any(
+                isinstance(n, ast.Call) and _called_name(n) in guard_names
+                for n in ast.walk(node)
+            )
+
+        def _assign_verdict_targets(stmt) -> set:
+            # When an assignment's value is (or contains) a guard call, the
+            # assigned name(s) become "verdict variables" that a later ``if`` can
+            # test to gate the merge. Tuple-unpacking (``ok, reason = await
+            # guard(...)``) yields every bound name.
+            return _ast_assign_targets_for_predicated_call(
+                stmt,
+                call_predicate=lambda call: _called_name(call) in guard_names,
+            )
+
+        def _stmt_merge_calls(stmt):
+            calls = [
+                node
+                for node in ast.walk(stmt)
+                if isinstance(node, ast.Call) and _called_name(node) in merge_names
+            ]
+            yield from sorted(
+                calls,
+                key=lambda node: (
+                    getattr(node, "lineno", 0),
+                    getattr(node, "col_offset", 0),
+                ),
+            )
+
+        source_lines = source.splitlines()
+        marker = TestPreMergeDualHeadGuardCoverage._EXEMPT_MARKER
+
+        def _call_has_exempt_marker(call: "ast.Call") -> bool:
+            # Slice the call's own source span; the marker is bound to THIS call,
+            # not to a position in the file, so it travels with the code under
+            # any edit or code motion. A reason after the sentinel is mandatory.
+            end = getattr(call, "end_lineno", None) or call.lineno
+            for line in source_lines[call.lineno - 1 : end]:
+                idx = line.find(marker)
+                if idx != -1 and line[idx + len(marker):].strip():
+                    return True
+            return False
+
+        def _flag_merges(stmt, covered: bool, func_name: str) -> None:
+            nonlocal merge_call_index
+            for call in _stmt_merge_calls(stmt):
+                merge_call_index += 1
+                if (
+                    os.path.basename(rel),
+                    func_name,
+                ) in TestPreMergeDualHeadGuardCoverage._NARROWLY_ALLOWED_MERGE_CALLS and (
+                    merge_call_index
+                    in TestPreMergeDualHeadGuardCoverage._NARROWLY_ALLOWED_MERGE_CALLS[
+                        (os.path.basename(rel), func_name)
+                    ]
+                ):
+                    continue
+                # Coarse whole-function exemption (string-keyed) ...
+                if TestPreMergeDualHeadGuardCoverage._EXEMPT_SITES.get(
+                    (os.path.basename(rel), func_name)
+                ):
+                    continue
+                # ... or a granular per-call inline marker that travels with
+                # the specific merge call.
+                if _call_has_exempt_marker(call):
+                    continue
+                if not covered:
+                    offenders.append(
+                        f"  {rel}:{call.lineno} in {func_name}() — PR-merge "
+                        "site not covered by the pre-merge dual-head guard"
+                    )
+
+        def _scan_body(
+            stmts, covered: bool, verdict_vars: set, func_name: str
+        ) -> None:
+            cur = covered
+            vvars = set(verdict_vars)
+            for stmt in stmts:
+                if isinstance(
+                    stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
+                    continue
+
+                if isinstance(stmt, ast.If):
+                    # A merge inside either branch of an ``if`` that TESTS the
+                    # verdict (the guard call directly, or a verdict variable
+                    # captured above) is covered only when THAT branch outcome
+                    # proves the merge-safe verdict (`ok_to_merge=True`). Mixed
+                    # predicates like `if ok and feature_flag` therefore cover
+                    # only the body, not the else branch where `ok` may be
+                    # false. A sibling merge AFTER such an ``if`` is covered
+                    # only when a blocking-verdict branch early-exits —
+                    # fail-closed gating, not symbol presence.
+                    branch_body_cov = cur or _ast_branch_implies_verdict(
+                        stmt.test,
+                        branch_truth=True,
+                        desired_truth=True,
+                        atom_predicate=lambda node: (
+                            isinstance(node, ast.Call)
+                            and _called_name(node) in guard_names
+                        )
+                        or (
+                            isinstance(node, ast.Name) and node.id in vvars
+                        ),
+                    )
+                    branch_else_cov = cur or _ast_branch_implies_verdict(
+                        stmt.test,
+                        branch_truth=False,
+                        desired_truth=True,
+                        atom_predicate=lambda node: (
+                            isinstance(node, ast.Call)
+                            and _called_name(node) in guard_names
+                        )
+                        or (
+                            isinstance(node, ast.Name) and node.id in vvars
+                        ),
+                    )
+                    _scan_body(stmt.body, branch_body_cov, vvars, func_name)
+                    _scan_body(stmt.orelse, branch_else_cov, vvars, func_name)
+                    if _ast_branch_implies_verdict(
+                        stmt.test,
+                        branch_truth=True,
+                        desired_truth=False,
+                        atom_predicate=lambda node: (
+                            isinstance(node, ast.Call)
+                            and _called_name(node) in guard_names
+                        )
+                        or (
+                            isinstance(node, ast.Name) and node.id in vvars
+                        ),
+                    ) and _ast_branch_early_exits(stmt.body):
+                        cur = True
+                    elif _ast_branch_implies_verdict(
+                        stmt.test,
+                        branch_truth=False,
+                        desired_truth=False,
+                        atom_predicate=lambda node: (
+                            isinstance(node, ast.Call)
+                            and _called_name(node) in guard_names
+                        )
+                        or (
+                            isinstance(node, ast.Name) and node.id in vvars
+                        ),
+                    ) and _ast_branch_early_exits(stmt.orelse):
+                        cur = True
+                    elif cur and (
+                        _ast_branch_early_exits(stmt.body)
+                        or _ast_branch_early_exits(stmt.orelse)
+                    ):
+                        cur = True
+                    elif _ast_branch_implies_named_str_compare(
+                        stmt.test,
+                        branch_truth=True,
+                        names=vvars,
+                        truthy_literals={"defer", "block"},
+                    ) and _ast_branch_early_exits(stmt.body):
+                        # `_validate_rollup_migration_chain(...)` yields a
+                        # multi-state string verdict (`ok` / `defer` / `block`)
+                        # that existing callers fail-close with successive
+                        # early-return branches like `if status == "defer":
+                        # return` then `if status == "block": return`. Keep
+                        # treating those sibling-after-if sites as covered,
+                        # but only for explicit non-ok literal comparisons.
+                        cur = True
+                    elif _ast_branch_implies_named_str_compare(
+                        stmt.test,
+                        branch_truth=False,
+                        names=vvars,
+                        truthy_literals={"defer", "block"},
+                    ) and _ast_branch_early_exits(stmt.orelse):
+                        cur = True
+                    continue
+
+                if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+                    _scan_body(stmt.body, cur, vvars, func_name)
+                    _scan_body(stmt.orelse, cur, vvars, func_name)
+                    continue
+
+                if isinstance(stmt, (ast.With, ast.AsyncWith)):
+                    _scan_body(stmt.body, cur, vvars, func_name)
+                    continue
+
+                if isinstance(stmt, ast.Try):
+                    _scan_body(stmt.body, cur, vvars, func_name)
+                    for handler in stmt.handlers:
+                        _scan_body(handler.body, cur, vvars, func_name)
+                    _scan_body(stmt.orelse, cur, vvars, func_name)
+                    _scan_body(stmt.finalbody, cur, vvars, func_name)
+                    continue
+
+                if hasattr(ast, "Match") and isinstance(stmt, ast.Match):
+                    for case in stmt.cases:
+                        _scan_body(case.body, cur, vvars, func_name)
+                    continue
+
+                _flag_merges(stmt, cur, func_name)
+                vvars |= _assign_verdict_targets(stmt)
+
+        offenders: list[str] = []
+        tree = ast.parse(source, filename=filename)
+        funcs = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        for func in funcs:
+            merge_call_index = 0
+            _scan_body(func.body, False, set(), func.name)
+        return offenders
+
+    def test_all_pr_merge_sites_guarded(self):
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        guard_names = self._GUARD_NAMES
+        merge_names = self._MERGE_NAMES
+        offenders: list[str] = []
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in sorted(files):
+                if not fname.endswith(".py"):
+                    continue
+                if fname in self._EXEMPT_FILES:
+                    continue
+                fpath = os.path.join(root, fname)
+                with open(fpath, encoding="utf-8") as f:
+                    source = f.read()
+                rel = os.path.relpath(fpath, app_dir)
+                offenders.extend(
+                    self._collect_offenders(
+                        source,
+                        filename=fpath,
+                        rel=rel,
+                        guard_names=guard_names,
+                        merge_names=merge_names,
+                    )
+                )
+
+        assert not offenders, (
+            "Found PR-merge site(s) under backend/app/ that can target an "
+            "integration/promotion branch but are NOT covered by the pre-merge "
+            "combined-chain dual-head guard "
+            "(enforce_premerge_migration_guard / _validate_rollup_migration_chain, "
+            "both in app/rollup_migration_validation.py).\n"
+            "Merging a PR that creates two Alembic heads / a duplicate revision id "
+            "wedges `alembic upgrade head` on the integration branch.\n"
+            "Fix each site by calling one of the guard entrypoints in the merging "
+            "function, OR — if the site can never carry a migration onto the "
+            "integration/promotion branch — add its (file, function) to "
+            "TestPreMergeDualHeadGuardCoverage._EXEMPT_SITES with a documented "
+            "reason.\n"
+            "Offenders:\n" + "\n".join(offenders)
+        )
+
+    def test_premerge_helper_whole_function_exemptions_are_not_blanket_trust_zones(
+        self,
+    ):
+        """Regression: the two real merge helpers must not be blanket-exempt.
+
+        The helpers themselves are still covered by the AST scan, so the
+        exemption table should stay empty for them. This catches any future
+        reintroduction of a whole-function trust zone that would bypass the
+        dual-head ratchet.
+        """
+
+        exempt_sites = self._EXEMPT_SITES
+        assert (
+            "ci_completion.py",
+            "_attempt_merge_with_retry_and_escalation",
+        ) not in exempt_sites
+        assert (
+            "task_completion.py",
+            "_maybe_release_safeguard_gate",
+        ) not in exempt_sites
+
+    def test_premerge_helpers_keep_expected_guarded_merge_shapes(self):
+        """The narrow allowances stay narrow by pinning each helper's shape."""
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+
+        with open(os.path.join(app_dir, "ci_completion.py"), encoding="utf-8") as f:
+            ci_source = f.read()
+        with open(os.path.join(app_dir, "task_completion.py"), encoding="utf-8") as f:
+            task_source = f.read()
+
+        ci_tree = ast.parse(ci_source, filename="ci_completion.py")
+        task_tree = ast.parse(task_source, filename="task_completion.py")
+
+        ci_func = next(
+            node
+            for node in ast.walk(ci_tree)
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "_attempt_merge_with_retry_and_escalation"
+        )
+        task_func = next(
+            node
+            for node in ast.walk(task_tree)
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "_maybe_release_safeguard_gate"
+        )
+
+        def _merge_calls(func):
+            calls = []
+            for node in ast.walk(func):
+                if (
+                    isinstance(node, ast.Call)
+                    and _ast_called_name(node) == "merge_pull_request"
+                ):
+                    calls.append(node)
+            return sorted(calls, key=lambda node: (node.lineno, node.col_offset))
+
+        def _guard_assignments(func):
+            assigns = []
+            for node in ast.walk(func):
+                if not isinstance(node, ast.stmt):
+                    continue
+                verdict_vars = _ast_assign_targets_for_predicated_call(
+                    node,
+                    call_predicate=lambda call: _ast_called_name(call)
+                    == "enforce_premerge_migration_guard",
+                )
+                if verdict_vars:
+                    assigns.append((node, verdict_vars))
+            return sorted(
+                assigns,
+                key=lambda item: (
+                    getattr(item[0], "lineno", 0),
+                    getattr(item[0], "col_offset", 0),
+                ),
+            )
+
+        def _assigned_names(stmt):
+            if isinstance(stmt, ast.Assign):
+                targets = stmt.targets
+            elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+                targets = [stmt.target]
+            else:
+                return set()
+
+            names = set()
+            for target in targets:
+                for node in ast.walk(target):
+                    if isinstance(node, ast.Name):
+                        names.add(node.id)
+            return names
+
+        def _name_assignments_after(func, name, lineno):
+            offenders = []
+            for node in ast.walk(func):
+                if not isinstance(node, ast.stmt):
+                    continue
+                if getattr(node, "lineno", 0) <= lineno:
+                    continue
+                if name in _assigned_names(node):
+                    offenders.append(node)
+            return sorted(
+                offenders,
+                key=lambda node: (
+                    getattr(node, "lineno", 0),
+                    getattr(node, "col_offset", 0),
+                ),
+            )
+
+        ci_calls = _merge_calls(ci_func)
+        task_calls = _merge_calls(task_func)
+
+        assert len(ci_calls) == 2
+        ci_guard_assignments = _guard_assignments(ci_func)
+        assert len(ci_guard_assignments) == 1
+        ci_guard_stmt, ci_verdict_vars = ci_guard_assignments[0]
+        assert ci_verdict_vars == {"_ok_to_merge", "_hold_reason"}
+        ci_fail_closed = next(
+            stmt
+            for stmt in ast.walk(ci_func)
+            if isinstance(stmt, ast.If)
+            and _ast_branch_implies_verdict(
+                stmt.test,
+                branch_truth=True,
+                desired_truth=False,
+                atom_predicate=lambda node: (
+                    isinstance(node, ast.Name) and node.id == "_ok_to_merge"
+                ),
+            )
+        )
+        assert _ast_branch_early_exits(ci_fail_closed.body)
+        assert min(call.lineno for call in ci_calls) > getattr(
+            ci_fail_closed, "end_lineno", ci_fail_closed.lineno
+        )
+        assert not _name_assignments_after(
+            ci_func,
+            "_ok_to_merge",
+            getattr(ci_guard_stmt, "lineno", 0),
+        )
+
+        assert len(task_calls) == 1
+        task_guard_assignments = _guard_assignments(task_func)
+        assert len(task_guard_assignments) == 1
+        task_guard_stmt, task_verdict_vars = task_guard_assignments[0]
+        assert task_verdict_vars == {"_sg_ok", "_sg_reason"}
+        task_guard_gate = next(
+            stmt
+            for stmt in ast.walk(task_func)
+            if isinstance(stmt, ast.If)
+            and _ast_branch_implies_verdict(
+                stmt.test,
+                branch_truth=True,
+                desired_truth=False,
+                atom_predicate=lambda node: (
+                    isinstance(node, ast.Name) and node.id == "_sg_ok"
+                ),
+            )
+        )
+        guarded_else_calls = sorted(
+            [
+                node
+                for node in ast.walk(ast.Module(body=task_guard_gate.orelse, type_ignores=[]))
+                if isinstance(node, ast.Call)
+                and _ast_called_name(node) == "merge_pull_request"
+            ],
+            key=lambda node: (node.lineno, node.col_offset),
+        )
+        assert [call.lineno for call in guarded_else_calls] == [
+            call.lineno for call in task_calls
+        ]
+        assert not _name_assignments_after(
+            task_func,
+            "_sg_ok",
+            getattr(task_guard_stmt, "lineno", 0),
+        )
+
+    def test_branch_local_guard_scan_catches_sibling_unguarded_branch(self):
+        """A guarded sibling branch must not mask an unguarded merge branch.
+
+        Regression fixture for the old function-scoped scan:
+        one branch calls the guard and merges, while an `else` branch in the
+        same function merges without any guard. The stricter scan must flag only
+        the unguarded branch.
+        """
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def demo():
+                if ready:
+                    ok, reason = await enforce_premerge_migration_guard(
+                        token, owner, repo, pr_number, target_branch
+                    )
+                    if not ok:
+                        return reason
+                    await merge_pull_request(
+                        token, owner, repo, pr_number, project_id=project_id
+                    )
+                else:
+                    await merge_pull_request(
+                        token, owner, repo, pr_number, project_id=project_id
+                    )
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_merge_fixture.py",
+            rel="synthetic_merge_fixture.py",
+            guard_names=self._GUARD_NAMES,
+            merge_names=self._MERGE_NAMES,
+        )
+
+        assert offenders == [
+            "  synthetic_merge_fixture.py:13 in demo() — PR-merge site not covered by the pre-merge dual-head guard"
+        ]
+
+    def test_premerge_guard_verdict_ignored_is_flagged(self):
+        """Fail-closed ratchet: capturing the guard verdict is NOT enough — the
+        verdict must actually GATE the merge.
+
+        This is the documented false-negative the older scan permitted: the
+        guard is called and its verdict assigned, but the result is never tested
+        and the merge proceeds unconditionally. "Guard symbol referenced ⇒
+        covered" would mark this safe; the hardened scan flags it because no
+        branch early-exits on the blocking verdict before the merge.
+        """
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def demo():
+                ok, reason = await enforce_premerge_migration_guard(
+                    token, owner, repo, pr_number, target_branch
+                )
+                # verdict captured but NEVER tested — merge proceeds regardless
+                await merge_pull_request(
+                    token, owner, repo, pr_number, project_id=project_id
+                )
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_merge_fixture.py",
+            rel="synthetic_merge_fixture.py",
+            guard_names=self._GUARD_NAMES,
+            merge_names=self._MERGE_NAMES,
+        )
+
+        assert offenders == [
+            "  synthetic_merge_fixture.py:7 in demo() — PR-merge site not covered by the pre-merge dual-head guard"
+        ], (
+            "A guard verdict that is captured but ignored (never gates an "
+            "early-exit before the merge) must be flagged — referencing the "
+            "guard symbol is not the same as fail-closing on its verdict."
+        )
+
+    def test_mixed_condition_only_covers_the_guarded_premerge_branch(self):
+        """A mixed predicate like `if ok and feature_flag` covers only the body.
+
+        The else branch is reachable both when the feature flag is false and
+        when the guard blocks (`ok=False`), so a merge there must still be
+        flagged.
+        """
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def demo():
+                ok, reason = await enforce_premerge_migration_guard(
+                    token, owner, repo, pr_number, target_branch
+                )
+                if ok and feature_flag:
+                    await merge_pull_request(
+                        token, owner, repo, pr_number, project_id=project_id
+                    )
+                else:
+                    await merge_pull_request(
+                        token, owner, repo, pr_number, project_id=project_id
+                    )
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_merge_fixture.py",
+            rel="synthetic_merge_fixture.py",
+            guard_names=self._GUARD_NAMES,
+            merge_names=self._MERGE_NAMES,
+        )
+
+        assert offenders == [
+            "  synthetic_merge_fixture.py:11 in demo() — PR-merge site not covered by the pre-merge dual-head guard"
+        ]
+
+    def test_mixed_condition_sibling_early_return_does_not_cover_later_merge(self):
+        """An early return on `if ok and feature_flag` must not cover a sibling
+        merge that remains reachable when the guard blocks (`ok=False`)."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def demo():
+                ok, reason = await enforce_premerge_migration_guard(
+                    token, owner, repo, pr_number, target_branch
+                )
+                if ok and feature_flag:
+                    return reason
+                await merge_pull_request(
+                    token, owner, repo, pr_number, project_id=project_id
+                )
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_merge_fixture.py",
+            rel="synthetic_merge_fixture.py",
+            guard_names=self._GUARD_NAMES,
+            merge_names=self._MERGE_NAMES,
+        )
+
+        assert offenders == [
+            "  synthetic_merge_fixture.py:8 in demo() — PR-merge site not covered by the pre-merge dual-head guard"
+        ]
+
+    def test_multistate_rollup_status_early_returns_cover_later_merge(self):
+        """The `_validate_rollup_migration_chain` status idiom remains covered."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def demo():
+                status, reason = await _validate_rollup_migration_chain(
+                    token, owner, repo, pr_number, target_branch=target_branch
+                )
+                if status == "defer":
+                    return reason
+                if status == "block":
+                    return reason
+                await merge_pull_request(
+                    token, owner, repo, pr_number, project_id=project_id
+                )
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_merge_fixture.py",
+            rel="synthetic_merge_fixture.py",
+            guard_names=self._GUARD_NAMES,
+            merge_names=self._MERGE_NAMES,
+        )
+
+        assert offenders == []
+
+    def test_exempt_marker_exempts_only_the_marked_call(self):
+        """The inline marker exempts the SPECIFIC call it sits on — not its
+        siblings, and not a line number.
+
+        Two unguarded merges live in the same function. One carries the inline
+        ``# premerge-guard-exempt: <reason>`` marker; the other does not. The
+        scan must exempt exactly the marked call and flag the unmarked sibling.
+        This proves the marker — not a position in the file — drives exemption.
+        """
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def _process_post_commit():
+                if staging_only:
+                    await _merge_with_retry(  # premerge-guard-exempt: staging-only branch never carries a migration onto the trunk
+                        token, owner, repo, pr_number
+                    )
+                else:
+                    await merge_pull_request(
+                        token, owner, repo, pr_number
+                    )
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="task_lifecycle.py",
+            rel="task_lifecycle.py",
+            guard_names=self._GUARD_NAMES,
+            merge_names=self._MERGE_NAMES,
+        )
+
+        # Only the unmarked ``merge_pull_request`` (line 8 of the dedented body)
+        # is flagged; the marked ``_merge_with_retry`` is exempt.
+        assert offenders == [
+            "  task_lifecycle.py:8 in _process_post_commit() — PR-merge site not covered by the pre-merge dual-head guard"
+        ]
+
+    def test_new_unmarked_merge_in_previously_exempt_function_is_flagged(self):
+        """Regression: a brand-new, unmarked merge added to a function that
+        already has marked-exempt merges is STILL flagged.
+
+        This is the silent-regression the old absolute-line-number scheme could
+        not catch: under code motion a new unguarded merge could come to occupy
+        an exempt line number and inherit an exemption it never declared. With
+        per-call markers, the new merge declares no exemption, so it is flagged
+        even though it sits in the same (previously line-exempt) function in the
+        same file.
+        """
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def _process_post_commit():
+                if staging_a:
+                    await _merge_with_retry(  # premerge-guard-exempt: staging-only A branch never reaches the integration trunk
+                        token, owner, repo, pr_number
+                    )
+                if staging_b:
+                    await _merge_with_retry(  # premerge-guard-exempt: staging-only B branch never reaches the integration trunk
+                        token, owner, repo, pr_number
+                    )
+                # A genuinely-new, unguarded, UNMARKED merge slipped in here.
+                await merge_pull_request(
+                    token, owner, repo, pr_number
+                )
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="task_lifecycle.py",
+            rel="task_lifecycle.py",
+            guard_names=self._GUARD_NAMES,
+            merge_names=self._MERGE_NAMES,
+        )
+
+        assert offenders == [
+            "  task_lifecycle.py:12 in _process_post_commit() — PR-merge site not covered by the pre-merge dual-head guard"
+        ], (
+            "A new unmarked merge in a function that has marked-exempt siblings "
+            "must still be flagged — it declared no exemption of its own."
+        )
+
+    def test_exempt_marker_requires_a_nonempty_reason(self):
+        """Guard-the-guard: a bare marker with no human-readable reason does NOT
+        exempt the call.
+
+        Mirrors the documented-reason requirement on the string-keyed
+        exemptions: every exemption must carry a reason a reviewer can read.
+        A reason-less marker must be treated as no marker at all.
+        """
+        from textwrap import dedent
+
+        for trailer in ("", "   "):
+            source = dedent(
+                """
+                async def _process_post_commit():
+                    await merge_pull_request(  {marker}{trailer}
+                        token, owner, repo, pr_number
+                    )
+                """
+            ).format(marker=self._EXEMPT_MARKER, trailer=trailer)
+
+            offenders = self._collect_offenders(
+                source,
+                filename="task_lifecycle.py",
+                rel="task_lifecycle.py",
+                guard_names=self._GUARD_NAMES,
+                merge_names=self._MERGE_NAMES,
+            )
+
+            assert offenders == [
+                "  task_lifecycle.py:3 in _process_post_commit() — PR-merge site not covered by the pre-merge dual-head guard"
+            ], (
+                "A bare marker with no reason must NOT exempt the call "
+                f"(trailer={trailer!r})."
+            )
+
+    def test_marker_only_applies_within_the_calls_own_span(self):
+        """The marker exempts a call only when it lies within that call's own
+        source span — a marker on a *neighbouring* statement must not leak onto
+        an unmarked merge below it.
+        """
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def _process_post_commit():
+                x = compute()  # premerge-guard-exempt: this marker is on the wrong statement
+                await merge_pull_request(
+                    token, owner, repo, pr_number
+                )
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="task_lifecycle.py",
+            rel="task_lifecycle.py",
+            guard_names=self._GUARD_NAMES,
+            merge_names=self._MERGE_NAMES,
+        )
+
+        assert offenders == [
+            "  task_lifecycle.py:4 in _process_post_commit() — PR-merge site not covered by the pre-merge dual-head guard"
+        ], "A marker on an adjacent statement must not exempt the merge below it."
+
+    def test_process_post_commit_exempt_sites_carry_marker(self):
+        """The three intentionally-exempt merge sites in the real
+        ``task_lifecycle.py:_process_post_commit`` must each carry the inline
+        marker.
+
+        If a marker is removed (or a fourth, unmarked merge is added) this test
+        — together with ``test_all_pr_merge_sites_guarded`` — fails, so the
+        exemption cannot be silently dropped or silently widened.
+        """
+        import ast
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        fpath = os.path.join(app_dir, "task_lifecycle.py")
+        with open(fpath, encoding="utf-8") as f:
+            source = f.read()
+        source_lines = source.splitlines()
+        tree = ast.parse(source, filename=fpath)
+
+        marked = 0
+        total_merges = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name != "_process_post_commit":
+                continue
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                func = call.func
+                name = (
+                    func.id
+                    if isinstance(func, ast.Name)
+                    else func.attr
+                    if isinstance(func, ast.Attribute)
+                    else None
+                )
+                if name not in self._MERGE_NAMES:
+                    continue
+                total_merges += 1
+                end = getattr(call, "end_lineno", None) or call.lineno
+                span = source_lines[call.lineno - 1 : end]
+                has_marker = any(
+                    (idx := line.find(self._EXEMPT_MARKER)) != -1
+                    and line[idx + len(self._EXEMPT_MARKER):].strip()
+                    for line in span
+                )
+                if has_marker:
+                    marked += 1
+
+        assert total_merges == 3, (
+            f"Expected exactly 3 merge sites in _process_post_commit, found "
+            f"{total_merges}. If the function's merge sites changed, update this "
+            "test and the inline markers accordingly."
+        )
+        assert marked == 3, (
+            f"Expected all 3 _process_post_commit merge sites to carry the "
+            f"'{self._EXEMPT_MARKER} <reason>' inline marker; only {marked} do. "
+            "Each staging-only / non-migration auto-merge must declare its "
+            "exemption inline so the coverage invariant stays green."
+        )
+
+
+# ── Merge-primitive enumeration lock (complementary to call-site coverage) ────
+
+
+class TestMergePrimitiveLock:
+    """Complementary invariant: lock the set of merge primitives themselves.
+
+    The TestPreMergeDualHeadGuardCoverage test locks every CALL SITE so a
+    missing guard cannot slip through unnoticed. But that test's scan depends
+    on a hand-maintained set of merge function names (_MERGE_NAMES). If the
+    set itself drifts — e.g. a new merge helper is added but not registered,
+    or the raw GitHub merge endpoint is called directly from somewhere else —
+    the coverage scan treats those sites as non-merge and misses them completely.
+
+    This test closes the complementary hole by enforcing:
+      1. Every function in github_pulls.py that actually issues a GitHub merge
+         (REST PUT /pulls/{n}/merge or GraphQL enablePullRequestAutoMerge) must
+         be in TestPreMergeDualHeadGuardCoverage._MERGE_NAMES.
+      2. The raw GitHub merge endpoint / GraphQL auto-merge mutation may be
+         issued ONLY from inside github_pulls.py (the helper layer).
+         No other backend/app file may call these endpoints directly.
+
+    Today both conditions already hold: github_pulls.py defines exactly
+    merge_pull_request and enable_auto_merge, both already registered, and
+    nothing else calls the endpoints. This invariant purely ratchets that
+    clean state and prevents future regressions.
+    """
+
+    # Patterns that identify a call to the GitHub merge REST endpoint. These
+    # match the concrete merge-endpoint URL path (.../pulls/{n}/merge) ONLY —
+    # deliberately NOT loose prose like "merge endpoint", which appears in
+    # docstrings of non-merging helpers (e.g. get_pull_request_merge_state
+    # documents the merge endpoint's 405 behaviour but only issues a GET).
+    _MERGE_REST_PATTERNS = [
+        re.compile(r"/pulls/[^\"']*/merge"),
+    ]
+
+    # Patterns that identify a call to the GraphQL auto-merge mutation. Match
+    # the concrete mutation name only, not prose mentioning "GraphQL" + "merge".
+    _MERGE_GRAPHQL_PATTERNS = [
+        re.compile(r"enablePullRequestAutoMerge"),
+    ]
+
+    # ── Transport-level raw-merge scanner ─────────────────────────────────
+    #
+    # The helper-layer lock must catch a raw merge issued via ANY transport,
+    # not just ``_github_request``. A future direct ``httpx.AsyncClient().put(
+    # .../pulls/N/merge)`` or ``client.post(graphql, …enablePullRequestAutoMerge
+    # …)`` from outside ``github_pulls.py`` would otherwise bypass a scan keyed
+    # solely on ``_github_request``. The endpoint SIGNATURE (REST merge path +
+    # PUT, or the GraphQL mutation name) is what classifies a call; the transport
+    # openers below merely anchor where to look.
+    _TRANSPORT_OPENERS = re.compile(
+        r"(?:_github_request|httpx\.[A-Za-z_]+|\.(?:put|post|patch|request))\s*\(",
+        re.DOTALL,
+    )
+    _RAW_MERGE_PATH_RE = re.compile(r"/pulls[^\"']*?/merge")
+    _PUT_METHOD_LITERAL_RE = re.compile(r"""["']PUT["']""")
+    # The opener's own HTTP verb is PUT (e.g. ``client.put(...)`` /
+    # ``httpx.put(...)``) — "put" not preceded by an identifier character.
+    _PUT_VERB_OPENER_RE = re.compile(r"(?<![A-Za-z_])put\s*\(")
+    _RAW_AUTOMERGE_MUTATION_RE = re.compile(r"enablePullRequestAutoMerge")
+
+    @staticmethod
+    def _scan_raw_merge_endpoint_offenders(content: str, *, rel: str) -> list:
+        """Flag raw GitHub merge-endpoint / GraphQL auto-merge calls issued via
+        ANY transport, not only ``_github_request``.
+
+        Two endpoint signatures classify a transport-call window as a raw merge:
+          * REST — the ``/pulls/{n}/merge`` path with a PUT method, whether PUT
+            is an explicit ``"PUT"`` argument (the ``_github_request`` shape) or
+            the transport verb itself (a lower-level ``client.put(.../merge)``).
+          * GraphQL — the ``enablePullRequestAutoMerge`` mutation in the body.
+
+        Returns one offender line per (line, kind). Whole-content scanning makes
+        it immune to ``# noqa`` and to multi-line call construction (it searches
+        a window past each opener rather than a single line).
+        """
+        cls = TestMergePrimitiveLock
+        found: set = set()
+        for m in cls._TRANSPORT_OPENERS.finditer(content):
+            opener = m.group(0)
+            start = m.start()
+            window = content[start : min(start + 1500, len(content))]
+            line_num = content[:start].count("\n") + 1
+            if cls._RAW_MERGE_PATH_RE.search(window) and (
+                cls._PUT_METHOD_LITERAL_RE.search(window)
+                or cls._PUT_VERB_OPENER_RE.search(opener)
+            ):
+                found.add((line_num, "rest"))
+            if cls._RAW_AUTOMERGE_MUTATION_RE.search(window):
+                found.add((line_num, "graphql"))
+
+        offenders = []
+        for line_num, kind in sorted(found):
+            if kind == "rest":
+                offenders.append(
+                    f"  {rel}:{line_num}: raw PUT /pulls/.../merge endpoint call "
+                    "detected outside the helper layer"
+                )
+            else:
+                offenders.append(
+                    f"  {rel}:{line_num}: raw enablePullRequestAutoMerge "
+                    "mutation call detected outside the helper layer"
+                )
+        return offenders
+
+    def test_all_merge_issuing_functions_are_registered(self):
+        """Every function in github_pulls.py that calls the GitHub merge endpoint
+        or GraphQL mutation must be in TestPreMergeDualHeadGuardCoverage._MERGE_NAMES.
+
+        If this fails, a new merge primitive was added to github_pulls.py but not
+        registered in the coverage scan's _MERGE_NAMES set. Register it so that
+        all call sites to the new primitive receive guard-coverage checking.
+        """
+        import ast
+
+        gh_pulls_path = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "app", "github_pulls.py")
+        )
+        with open(gh_pulls_path, encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source, filename=gh_pulls_path)
+
+        # Find all function definitions in the module.
+        funcs = {
+            n.name: n
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+
+        # Get the canonical set of registered merge functions from the
+        # guard-coverage test.
+        registered_merge_names = TestPreMergeDualHeadGuardCoverage._MERGE_NAMES
+
+        # Identify which functions actually call the GitHub merge endpoint or
+        # GraphQL mutation by scanning their source text.
+        unregistered_merge_issuers = []
+        for func_name, func_node in funcs.items():
+            # Extract the source text of this function. ast.get_source_segment
+            # uses line/column spans to slice the exact function body; a naive
+            # source[col_offset:end_col_offset] would mix column offsets (which
+            # are per-line, not whole-file byte indices) and slice garbage.
+            func_source = ast.get_source_segment(source, func_node) or ""
+
+            # Check if it issues a merge: a PUT to the REST merge endpoint or an
+            # invocation of the GraphQL auto-merge mutation. Both pattern sets
+            # match concrete code signals only, so docstring prose mentioning
+            # "merge" does not produce false positives.
+            is_merge_issuer = any(
+                pattern.search(func_source)
+                for pattern in (*self._MERGE_REST_PATTERNS, *self._MERGE_GRAPHQL_PATTERNS)
+            )
+
+            if is_merge_issuer and func_name not in registered_merge_names:
+                unregistered_merge_issuers.append(func_name)
+
+        assert not unregistered_merge_issuers, (
+            f"Functions in github_pulls.py that issue GitHub merges but are NOT "
+            f"registered in TestPreMergeDualHeadGuardCoverage._MERGE_NAMES: "
+            f"{', '.join(sorted(unregistered_merge_issuers))}.\n"
+            f"Add each function name to _MERGE_NAMES so that all its call sites "
+            f"receive guard-coverage checking. Without registration, call sites "
+            f"escape the coverage scan and can slip through unguarded."
+        )
+
+    def test_no_raw_merge_endpoint_calls_outside_helper_layer(self):
+        """The raw GitHub merge endpoint and GraphQL mutation may be issued ONLY
+        from inside the github_pulls.py helper layer. No other backend/app file
+        may call /pulls/.../merge or enablePullRequestAutoMerge directly.
+
+        If this fails, a file outside the helper layer is calling the merge
+        endpoint directly instead of going through the registered primitives
+        (merge_pull_request / enable_auto_merge). This bypasses both the
+        guard-coverage scan and the dual-head guard checks themselves.
+
+        Fix by calling the appropriate primitive from github_pulls.py instead of
+        issuing the endpoint directly.
+
+        This scan detects (via the shared _scan_raw_merge_endpoint_offenders):
+        - REST endpoint calls: a PUT to .../pulls/.../merge across any transport
+          (_github_request OR a lower-level httpx/client call), multi-line,
+          immune to # noqa
+        - GraphQL mutation calls: any transport call whose body carries the
+          enablePullRequestAutoMerge mutation, multi-line, immune to # noqa
+
+        False-positives from docstrings are avoided by anchoring on an actual
+        transport call and requiring the concrete endpoint signature, not prose
+        mentioning the endpoint.
+        """
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+
+        # Only github_pulls.py may issue the raw merge endpoint.
+        exempt_files = {
+            "github_pulls.py",
+        }
+
+        offenders: list[str] = []
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in sorted(files):
+                if not fname.endswith(".py"):
+                    continue
+                if fname in exempt_files:
+                    continue
+
+                fpath = os.path.join(root, fname)
+                with open(fpath, encoding="utf-8") as f:
+                    content = f.read()
+
+                rel = os.path.relpath(fpath, app_dir)
+                offenders.extend(
+                    self._scan_raw_merge_endpoint_offenders(content, rel=rel)
+                )
+
+        assert not offenders, (
+            "Found backend/app file(s) that call the raw GitHub merge endpoint or "
+            "GraphQL mutation directly (bypassing the helper layer and guard coverage):\n"
+            + "\n".join(offenders)
+            + "\n\nAll PR merges must go through the registered primitives "
+            "(merge_pull_request / enable_auto_merge from github_pulls.py). "
+            "Calling the endpoint directly bypasses guard coverage and can slip "
+            "through unguarded.\n"
+            "Fix by importing and calling the appropriate primitive instead."
+        )
+
+    def test_scan_detects_multiline_raw_merge_rest_endpoint(self):
+        """Verify the shared scanner detects multi-line-constructed raw merge
+        REST endpoint calls.
+
+        Regression test: a raw merge call must be detected even when the
+        ``_github_request`` call itself spans multiple lines.
+        """
+        # Synthetic pattern: a direct _github_request call with the merge
+        # endpoint, spanning multiple lines, which a line-by-line scan misses.
+        test_pattern = '''
+async def malicious_merge(token: str, owner: str, repo: str, pr_number: int):
+    response = await _github_request(
+        "PUT",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/merge",
+        headers,
+        json={"merge_method": "squash"},
+    )
+'''
+        offenders = self._scan_raw_merge_endpoint_offenders(
+            test_pattern, rel="synthetic.py"
+        )
+        assert any("/pulls/.../merge" in o for o in offenders), (
+            "Regression test: the hardened scan must detect multi-line-constructed "
+            f"raw merge REST endpoint calls. Offenders: {offenders}"
+        )
+
+    def test_scan_detects_multiline_raw_merge_graphql_mutation(self):
+        """Verify the shared scanner detects multi-line-constructed raw GraphQL
+        auto-merge mutations.
+
+        Regression test: a raw GraphQL auto-merge call must be detected when the
+        ``_github_request`` call spans multiple lines and the
+        ``enablePullRequestAutoMerge`` mutation is in the body.
+        """
+        # Synthetic pattern: _github_request POST to graphql endpoint with
+        # enablePullRequestAutoMerge in the JSON body, spanning multiple lines.
+        test_pattern = '''
+async def malicious_auto_merge(token: str, pr_node_id: str, merge_method: str):
+    response = await _github_request(
+        "POST",
+        "https://api.github.com/graphql",
+        headers,
+        json={
+            "query": "mutation($prId: ID!, $method: PullRequestMergeMethod!) {"
+                     "enablePullRequestAutoMerge(input: {pullRequestId: $prId, mergeMethod: $method}) {"
+                     "pullRequest { autoMergeRequest { enabledAt } } } }",
+            "variables": {"prId": pr_node_id, "method": merge_method},
+        },
+    )
+'''
+        offenders = self._scan_raw_merge_endpoint_offenders(
+            test_pattern, rel="synthetic.py"
+        )
+        assert any("enablePullRequestAutoMerge" in o for o in offenders), (
+            "Regression test: the hardened scan must detect multi-line GraphQL "
+            f"auto-merge mutations. Offenders: {offenders}"
+        )
+
+    def test_scan_flags_noqa_tagged_raw_merge_calls(self):
+        """Verify the shared scanner flags raw merge calls even when tagged with
+        ``# noqa``.
+
+        Regression test: a line-by-line scan can be defeated by a trailing
+        ``# noqa`` comment. The whole-content scanner detects the call
+        regardless, since the noqa bypass is itself the vulnerability.
+        """
+        test_pattern = '''
+async def sneaky_merge(token: str, owner: str, repo: str, pr_number: int):
+    response = await _github_request(  # noqa
+        "PUT",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/merge",
+        headers,
+        json={"merge_method": "squash"},
+    )
+'''
+        offenders = self._scan_raw_merge_endpoint_offenders(
+            test_pattern, rel="synthetic.py"
+        )
+        assert any("/pulls/.../merge" in o for o in offenders), (
+            "Regression test: the scan must flag raw merge calls even when they "
+            f"carry a '# noqa' comment. Offenders: {offenders}"
+        )
+
+    def test_scan_detects_raw_merge_via_lower_level_http_client(self):
+        """The broadened scanner must catch a raw REST merge issued WITHOUT
+        ``_github_request`` — a direct lower-level HTTP client call.
+
+        This is the transport-evasion false-negative the old ``_github_request``-
+        only scan missed entirely: the merge endpoint is hit via
+        ``client.put(.../pulls/N/merge)``, where the HTTP verb is the call itself
+        (no explicit ``"PUT"`` argument). The scanner recognizes the opener verb
+        as the method.
+        """
+        test_pattern = '''
+async def evade_via_client(token: str, owner: str, repo: str, pr_number: int):
+    async with httpx.AsyncClient() as client:
+        response = await client.put(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/merge",
+            json={"merge_method": "squash"},
+            headers=headers,
+        )
+'''
+        offenders = self._scan_raw_merge_endpoint_offenders(
+            test_pattern, rel="evil.py"
+        )
+        assert any("/pulls/.../merge" in o for o in offenders), (
+            "The hardened scan must detect a raw REST merge issued via a "
+            "lower-level HTTP client (client.put), not only _github_request. "
+            f"Offenders: {offenders}"
+        )
+
+    def test_scan_detects_graphql_auto_merge_via_lower_level_http_client(self):
+        """The broadened scanner must catch a raw GraphQL auto-merge mutation
+        issued WITHOUT ``_github_request`` — a direct lower-level HTTP client
+        POST whose body carries ``enablePullRequestAutoMerge``.
+        """
+        test_pattern = '''
+async def evade_auto_merge(token: str, pr_node_id: str):
+    response = await client.post(
+        "https://api.github.com/graphql",
+        json={"query": "mutation { enablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }"},
+        headers=headers,
+    )
+'''
+        offenders = self._scan_raw_merge_endpoint_offenders(
+            test_pattern, rel="evil.py"
+        )
+        assert any("enablePullRequestAutoMerge" in o for o in offenders), (
+            "The hardened scan must detect a raw GraphQL auto-merge mutation "
+            "issued via a lower-level HTTP client (client.post), not only "
+            f"_github_request. Offenders: {offenders}"
+        )
+
+
+# ── Native-auto-merge migration-exclusion coverage (whole-package) ────────
+
+
+class TestNativeAutoMergeMigrationExclusionCoverage:
+    """Whole-package invariant: EVERY ``enable_auto_merge`` call site under
+    backend/app/ must be guarded by a ``pr_touches_migrations`` exclusion so a
+    migration-carrying PR is never delegated to GitHub native auto-merge.
+
+    WHY (distinct from TestPreMergeDualHeadGuardCoverage): the pre-merge
+    combined-chain guard runs synchronously immediately before a merge and fully
+    protects the DIRECT merge primitive. But GitHub native auto-merge
+    (``enable_auto_merge``) completes the merge ASYNCHRONOUSLY at some later time
+    once required checks pass. That reopens a time-of-check-to-time-of-use
+    window: the target branch can advance between Blueprint's guard check and the
+    eventual native merge, so the merge can land against a DIFFERENT Alembic
+    chain than the one Blueprint validated — re-introducing the dual-head wedge
+    the guard exists to prevent.
+
+    TestPreMergeDualHeadGuardCoverage deliberately scopes this async window out
+    (see its "Coverage note": it catches missing call-site guard coverage, NOT
+    the later merge-time race "where ``enable_auto_merge`` may complete after a
+    second migration PR lands. Track that TOCTOU window separately."). This test
+    IS that separate track: it locks the native-auto-merge primitive on its own,
+    asserting each call site additionally refuses to delegate a migration PR.
+
+    The three production sites — the task-PR completion fallback
+    (task_lifecycle.py), the rollup auto-merge fallback (rollup_management.py),
+    and the release-promotion pending-CI fallback (release_promotion.py) — all
+    check ``pr_touches_migrations`` and, when True, skip delegation and hold the
+    PR in a retryable/parked state so the guarded path re-validates against the
+    live target branch before merging.
+
+    The scan is branch-aware (mirroring TestPreMergeDualHeadGuardCoverage): an
+    exclusion that covers one branch does NOT cover a sibling branch. A site is
+    covered when a ``pr_touches_migrations`` reference dominates it — either as a
+    prior sibling early-return guard (the release_promotion idiom) or as the test
+    of an enclosing ``if`` (the task-PR / rollup ``else``-branch idiom).
+
+    Source-level only (AST); NEVER executes a merge path.
+    """
+
+    _EXCLUSION_NAMES = frozenset({"pr_touches_migrations"})
+    _AUTOMERGE_NAMES = frozenset({"enable_auto_merge"})
+
+    # Whole files that DEFINE/re-export the native-auto-merge primitive. They
+    # make no migration decision (the calling site does), so they are exempt —
+    # mirrors TestPreMergeDualHeadGuardCoverage._EXEMPT_FILES.
+    _EXEMPT_FILES = {
+        "github_pulls.py": (
+            "defines the enable_auto_merge primitive (GraphQL "
+            "enablePullRequestAutoMerge mutation); makes no migration decision"
+        ),
+        "github.py": (
+            "re-exports enable_auto_merge for callers; makes no migration decision"
+        ),
+    }
+
+    # Specific (file, function) auto-merge sites that can never carry a migration
+    # onto an integration/promotion branch. Each entry MUST document WHY. Empty
+    # today: all three real sites carry the pr_touches_migrations exclusion. Add
+    # a genuinely-exempt site here with a reason rather than widening
+    # _EXEMPT_FILES (which would mask a newly-added unguarded site).
+    _EXEMPT_SITES: dict = {}
+
+    @staticmethod
+    def _collect_offenders(
+        source: str,
+        *,
+        filename: str,
+        rel: str,
+        exclusion_names: frozenset,
+        automerge_names: frozenset,
+    ) -> list:
+        def _called_name(call):
+            return _ast_called_name(call)
+
+        def _calls_exclusion(node) -> bool:
+            # An actual ``pr_touches_migrations(...)`` CALL anywhere in the
+            # subtree — as an ``if`` test or on an assignment RHS. A bare
+            # reference to the name (e.g. the captured verdict left unused) does
+            # NOT count: only a call produces a verdict to gate the delegation.
+            return any(
+                isinstance(n, ast.Call) and _called_name(n) in exclusion_names
+                for n in ast.walk(node)
+            )
+
+        def _assign_verdict_targets(stmt) -> set:
+            return _ast_assign_targets_for_predicated_call(
+                stmt,
+                call_predicate=lambda call: _called_name(call) in exclusion_names,
+            )
+
+        def _stmt_automerge_calls(stmt):
+            for node in ast.walk(stmt):
+                if (
+                    isinstance(node, ast.Call)
+                    and _called_name(node) in automerge_names
+                ):
+                    yield node
+
+        offenders: list = []
+
+        def _scan_body(
+            stmts, covered: bool, verdict_vars: set, func_name: str
+        ) -> None:
+            cur = covered
+            vvars = set(verdict_vars)
+            for stmt in stmts:
+                if isinstance(
+                    stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
+                    continue
+
+                if isinstance(stmt, ast.If):
+                    # An ``if pr_touches_migrations(...)`` test (or an ``if`` on a
+                    # verdict variable captured above) covers only the branch
+                    # whose outcome proves `pr_touches_migrations=False`.
+                    # Mixed predicates like `if (not touches) and feature_flag`
+                    # therefore cover only the body, not the else branch where
+                    # `touches` may still be true. A delegation AFTER such an
+                    # ``if`` is covered only when a migration-touching branch
+                    # early-exits — fail-closed, not symbol presence.
+                    branch_body_cov = cur or _ast_branch_implies_verdict(
+                        stmt.test,
+                        branch_truth=True,
+                        desired_truth=False,
+                        atom_predicate=lambda node: (
+                            isinstance(node, ast.Call)
+                            and _called_name(node) in exclusion_names
+                        )
+                        or (
+                            isinstance(node, ast.Name) and node.id in vvars
+                        ),
+                    )
+                    branch_else_cov = cur or _ast_branch_implies_verdict(
+                        stmt.test,
+                        branch_truth=False,
+                        desired_truth=False,
+                        atom_predicate=lambda node: (
+                            isinstance(node, ast.Call)
+                            and _called_name(node) in exclusion_names
+                        )
+                        or (
+                            isinstance(node, ast.Name) and node.id in vvars
+                        ),
+                    )
+                    _scan_body(stmt.body, branch_body_cov, vvars, func_name)
+                    _scan_body(stmt.orelse, branch_else_cov, vvars, func_name)
+                    if _ast_branch_implies_verdict(
+                        stmt.test,
+                        branch_truth=True,
+                        desired_truth=True,
+                        atom_predicate=lambda node: (
+                            isinstance(node, ast.Call)
+                            and _called_name(node) in exclusion_names
+                        )
+                        or (
+                            isinstance(node, ast.Name) and node.id in vvars
+                        ),
+                    ) and _ast_branch_early_exits(stmt.body):
+                        cur = True
+                    elif _ast_branch_implies_verdict(
+                        stmt.test,
+                        branch_truth=False,
+                        desired_truth=True,
+                        atom_predicate=lambda node: (
+                            isinstance(node, ast.Call)
+                            and _called_name(node) in exclusion_names
+                        )
+                        or (
+                            isinstance(node, ast.Name) and node.id in vvars
+                        ),
+                    ) and _ast_branch_early_exits(stmt.orelse):
+                        cur = True
+                    elif cur and (
+                        _ast_branch_early_exits(stmt.body)
+                        or _ast_branch_early_exits(stmt.orelse)
+                    ):
+                        cur = True
+                    continue
+
+                if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+                    _scan_body(stmt.body, cur, vvars, func_name)
+                    _scan_body(stmt.orelse, cur, vvars, func_name)
+                    continue
+                if isinstance(stmt, (ast.With, ast.AsyncWith)):
+                    _scan_body(stmt.body, cur, vvars, func_name)
+                    continue
+                if isinstance(stmt, ast.Try):
+                    _scan_body(stmt.body, cur, vvars, func_name)
+                    for handler in stmt.handlers:
+                        _scan_body(handler.body, cur, vvars, func_name)
+                    _scan_body(stmt.orelse, cur, vvars, func_name)
+                    _scan_body(stmt.finalbody, cur, vvars, func_name)
+                    continue
+                if hasattr(ast, "Match") and isinstance(stmt, ast.Match):
+                    for case in stmt.cases:
+                        _scan_body(case.body, cur, vvars, func_name)
+                    continue
+
+                for call in _stmt_automerge_calls(stmt):
+                    if (
+                        os.path.basename(rel),
+                        func_name,
+                    ) in TestNativeAutoMergeMigrationExclusionCoverage._EXEMPT_SITES:
+                        continue
+                    if not cur:
+                        offenders.append(
+                            f"  {rel}:{call.lineno} in {func_name}() — "
+                            "enable_auto_merge site not guarded by a "
+                            "pr_touches_migrations exclusion (native "
+                            "auto-merge TOCTOU window)"
+                        )
+                vvars |= _assign_verdict_targets(stmt)
+
+        tree = ast.parse(source, filename=filename)
+        for func in [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]:
+            _scan_body(func.body, False, set(), func.name)
+        return offenders
+
+    def test_all_native_auto_merge_sites_exclude_migrations(self):
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        offenders: list = []
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in sorted(files):
+                if not fname.endswith(".py"):
+                    continue
+                if fname in self._EXEMPT_FILES:
+                    continue
+                fpath = os.path.join(root, fname)
+                with open(fpath, encoding="utf-8") as f:
+                    source = f.read()
+                rel = os.path.relpath(fpath, app_dir)
+                offenders.extend(
+                    self._collect_offenders(
+                        source,
+                        filename=fpath,
+                        rel=rel,
+                        exclusion_names=self._EXCLUSION_NAMES,
+                        automerge_names=self._AUTOMERGE_NAMES,
+                    )
+                )
+
+        assert not offenders, (
+            "Found GitHub native-auto-merge (enable_auto_merge) call site(s) "
+            "under backend/app/ that can delegate a migration-carrying PR "
+            "WITHOUT a pr_touches_migrations exclusion.\n"
+            "Native auto-merge completes the merge asynchronously once checks "
+            "pass, so the target branch can advance between Blueprint's "
+            "pre-merge dual-head guard and the eventual merge — landing the PR "
+            "against a different Alembic chain than the one validated "
+            "(dual-head TOCTOU).\n"
+            "Fix each site by checking `await pr_touches_migrations(...)` before "
+            "delegating and, when True, holding the PR in its retryable/parked "
+            "state instead of calling enable_auto_merge — OR, if the site can "
+            "never carry a migration onto an integration/promotion branch, add "
+            "its (file, function) to "
+            "TestNativeAutoMergeMigrationExclusionCoverage._EXEMPT_SITES with a "
+            "documented reason.\n"
+            "Offenders:\n" + "\n".join(offenders)
+        )
+
+    def test_scan_flags_sibling_unexcluded_auto_merge_branch(self):
+        """A migration-excluded branch must not mask a sibling unexcluded
+        auto-merge branch — the exact hole a file-/function-wide allowlist would
+        leave open."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def demo():
+                if cond:
+                    if await pr_touches_migrations(token, owner, repo, pr_number):
+                        return
+                    await enable_auto_merge(token, owner, repo, pr_number)
+                else:
+                    await enable_auto_merge(token, owner, repo, pr_number)
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_auto_merge_fixture.py",
+            rel="synthetic_auto_merge_fixture.py",
+            exclusion_names=self._EXCLUSION_NAMES,
+            automerge_names=self._AUTOMERGE_NAMES,
+        )
+
+        assert offenders == [
+            "  synthetic_auto_merge_fixture.py:8 in demo() — enable_auto_merge "
+            "site not guarded by a pr_touches_migrations exclusion (native "
+            "auto-merge TOCTOU window)"
+        ]
+
+    def test_scan_accepts_else_branch_exclusion_idiom(self):
+        """The task-PR / rollup idiom — `if pr_touches: park else: auto-merge` —
+        is recognized as covered."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def demo():
+                if await pr_touches_migrations(token, owner, repo, pr_number):
+                    park()
+                else:
+                    await enable_auto_merge(token, owner, repo, pr_number)
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_auto_merge_fixture.py",
+            rel="synthetic_auto_merge_fixture.py",
+            exclusion_names=self._EXCLUSION_NAMES,
+            automerge_names=self._AUTOMERGE_NAMES,
+        )
+
+        assert offenders == []
+
+    def test_scan_accepts_early_return_exclusion_idiom(self):
+        """The release_promotion idiom — `if pr_touches: return` BEFORE a later
+        auto-merge sibling — is recognized as covered."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def demo():
+                if await pr_touches_migrations(token, owner, repo, pr_number):
+                    return record_failure()
+                try:
+                    await enable_auto_merge(token, owner, repo, pr_number)
+                except Exception:
+                    pass
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_auto_merge_fixture.py",
+            rel="synthetic_auto_merge_fixture.py",
+            exclusion_names=self._EXCLUSION_NAMES,
+            automerge_names=self._AUTOMERGE_NAMES,
+        )
+
+        assert offenders == []
+
+    def test_native_auto_merge_exclusion_verdict_ignored_is_flagged(self):
+        """Fail-closed ratchet (native auto-merge): capturing the
+        ``pr_touches_migrations`` verdict is NOT enough — it must gate the
+        delegation.
+
+        The documented false-negative: the exclusion is called and its result
+        assigned, but the value is never tested and ``enable_auto_merge`` is
+        delegated unconditionally. "Exclusion symbol referenced ⇒ covered" would
+        mark this safe; the hardened scan flags it because no branch early-exits
+        on the migration-touching verdict before the delegation.
+        """
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def demo():
+                touches = await pr_touches_migrations(
+                    token, owner, repo, pr_number
+                )
+                # verdict captured but ignored — delegation proceeds regardless
+                await enable_auto_merge(
+                    token, owner, repo, pr_number
+                )
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_auto_merge_fixture.py",
+            rel="synthetic_auto_merge_fixture.py",
+            exclusion_names=self._EXCLUSION_NAMES,
+            automerge_names=self._AUTOMERGE_NAMES,
+        )
+
+        assert offenders == [
+            "  synthetic_auto_merge_fixture.py:7 in demo() — enable_auto_merge "
+            "site not guarded by a pr_touches_migrations exclusion (native "
+            "auto-merge TOCTOU window)"
+        ], (
+            "A pr_touches_migrations verdict that is captured but ignored "
+            "(never gates an early-exit before enable_auto_merge) must be "
+            "flagged — referencing the exclusion symbol is not the same as "
+            "fail-closing on its verdict."
+        )
+
+    def test_mixed_condition_only_covers_the_guarded_automerge_branch(self):
+        """A mixed predicate like `if (not touches) and feature_flag` covers
+        only the body.
+
+        The else branch is reachable both when the feature flag is false and
+        when `touches=True`, so a delegated native auto-merge there must still
+        be flagged.
+        """
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def demo():
+                touches = await pr_touches_migrations(
+                    token, owner, repo, pr_number
+                )
+                if (not touches) and feature_flag:
+                    await enable_auto_merge(
+                        token, owner, repo, pr_number
+                    )
+                else:
+                    await enable_auto_merge(
+                        token, owner, repo, pr_number
+                    )
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_auto_merge_fixture.py",
+            rel="synthetic_auto_merge_fixture.py",
+            exclusion_names=self._EXCLUSION_NAMES,
+            automerge_names=self._AUTOMERGE_NAMES,
+        )
+
+        assert offenders == [
+            "  synthetic_auto_merge_fixture.py:11 in demo() — enable_auto_merge "
+            "site not guarded by a pr_touches_migrations exclusion (native "
+            "auto-merge TOCTOU window)"
+        ]
+
+
+# ── Operator message arming gate coverage (whole-package) ─────────────────
+
+
+class TestOperatorMessageArmingGateCoverage:
+    """Whole-package invariant: EVERY backend/app/ site that constructs an
+    operator-authored ProjectMessage (``from_type='user'``) must either route
+    its wake decision through the shared operator arming gate or be explicitly
+    exempted with a documented reason.
+
+    WHY: the live-chat endpoint and the project-scoped CLI endpoint were once
+    able to diverge on strategist wake behavior. This scan catches future
+    source-level message creation sites without executing any endpoint.
+
+    Modeled on the os.walk whole-package invariants in this module. The scan is
+    source-only (AST), function-scoped, and carries a tiny allowlist for the one
+    legitimate exception we have today.
+    """
+
+    _GATE_NAME = "maybe_arm_operator_refresh"
+    _MESSAGE_CLASS = "ProjectMessage"
+
+    # Allowlisted (file, function) sites that intentionally seed an operator
+    # message without a wake decision. The onboarding goal setter writes a
+    # passive NOTE before any strategic loop exists, so arming the strategist is
+    # unnecessary there.
+    _EXEMPT_SITES = {
+        (
+            "routers/admin_onboard.py",
+            "_seed_strategic_intent",
+        ): (
+            "seeds the onboarding goal as a passive NOTE before any strategic "
+            "loop exists; intentionally does not wake the strategist"
+        ),
+    }
+
+    @staticmethod
+    def _collect_offenders(
+        source: str,
+        *,
+        filename: str,
+        rel: str,
+        gate_name: str,
+        message_class: str,
+    ) -> list[str]:
+        def _called_name(call: "ast.Call") -> str | None:
+            """Return the bare callee name for ``foo(...)`` or ``mod.foo(...)``."""
+            return _ast_called_name(call)
+
+        def _calls_gate(node) -> bool:
+            """True if the shared arming gate is CALLED anywhere in the subtree."""
+            return any(
+                isinstance(n, ast.Call) and _called_name(n) == gate_name
+                for n in ast.walk(node)
+            )
+
+        def _gate_verdict_used(node) -> bool:
+            """True if the gate's verdict is used (not just called and ignored).
+
+            The gate must be called AND its verdict must appear in:
+            - A return statement/value, or
+            - A conditional test
+
+            Assigning the verdict to a variable but never using it does not count.
+            """
+            # Find all gate calls and their assigned targets
+            verdict_vars = set()
+            for n in ast.walk(node):
+                if isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+                    # Check if the RHS contains a gate call
+                    rhs = n.value if hasattr(n, "value") else None
+                    if rhs and any(
+                        isinstance(c, ast.Call) and _called_name(c) == gate_name
+                        for c in ast.walk(rhs)
+                    ):
+                        # Extract variable names assigned on LHS
+                        if isinstance(n, ast.Assign):
+                            for target in n.targets:
+                                if isinstance(target, ast.Name):
+                                    verdict_vars.add(target.id)
+                        elif isinstance(n, (ast.AugAssign, ast.AnnAssign)):
+                            if isinstance(n.target, ast.Name):
+                                verdict_vars.add(n.target.id)
+
+            # Now check if the verdict is actually used
+            # 1. Used directly in a return value
+            for n in ast.walk(node):
+                if isinstance(n, ast.Return) and n.value:
+                    # Check for direct gate call in return
+                    if any(
+                        isinstance(c, ast.Call) and _called_name(c) == gate_name
+                        for c in ast.walk(n.value)
+                    ):
+                        return True
+                    # Check for verdict variable in return
+                    for name_node in ast.walk(n.value):
+                        if isinstance(name_node, ast.Name) and name_node.id in verdict_vars:
+                            return True
+
+            # 2. Used in a conditional
+            for n in ast.walk(node):
+                if isinstance(n, ast.If):
+                    # Check for gate call in the conditional test
+                    if any(
+                        isinstance(c, ast.Call) and _called_name(c) == gate_name
+                        for c in ast.walk(n.test)
+                    ):
+                        return True
+                    # Check for verdict variable in the conditional test
+                    for name_node in ast.walk(n.test):
+                        if isinstance(name_node, ast.Name) and name_node.id in verdict_vars:
+                            return True
+
+            return False
+
+        def _is_operator_message_call(node: "ast.Call") -> bool:
+            """True for `ProjectMessage(..., from_type="user", ...)` calls."""
+            if _called_name(node) != message_class:
+                return False
+            for kw in node.keywords:
+                if (
+                    kw.arg == "from_type"
+                    and isinstance(kw.value, ast.Constant)
+                    and kw.value.value == "user"
+                ):
+                    return True
+            return False
+
+        offenders: list[str] = []
+        tree = ast.parse(source, filename=filename)
+
+        funcs = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not _is_operator_message_call(node):
+                continue
+
+            # Resolve the innermost enclosing function for an actionable
+            # offender message and a function-scoped guard check.
+            enclosing = None
+            for fn in funcs:
+                if fn.lineno <= node.lineno <= (fn.end_lineno or fn.lineno):
+                    if enclosing is None or fn.lineno > enclosing.lineno:
+                        enclosing = fn
+            func_name = enclosing.name if enclosing is not None else "<module>"
+
+            if (rel, func_name) in TestOperatorMessageArmingGateCoverage._EXEMPT_SITES:
+                continue
+
+            # Fail-closed hardening: the gate must be CALLED and its verdict USED.
+            # A bare reference to the gate symbol (e.g. in an import) is not enough;
+            # only an actual call produces a verdict to use.
+            gate_called = enclosing is not None and _calls_gate(enclosing)
+            verdict_used = gate_called and _gate_verdict_used(enclosing)
+            if not verdict_used:
+                offenders.append(
+                    f"  {rel}:{node.lineno} in {func_name}() — operator "
+                    "ProjectMessage site not covered by the shared arming gate"
+                )
+
+        return offenders
+
+    def test_scan_flags_unguarded_operator_message(self):
+        """Fail-closed basic: an operator ProjectMessage(from_type='user') with
+        no gate call in the enclosing function must be flagged."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def create_message(session, project_id, content):
+                msg = ProjectMessage(
+                    project_id=project_id,
+                    from_type="user",
+                    content=content
+                )
+                await session.add(msg)
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_operator_msg_fixture.py",
+            rel="synthetic_operator_msg_fixture.py",
+            gate_name=self._GATE_NAME,
+            message_class=self._MESSAGE_CLASS,
+        )
+
+        assert offenders == [
+            "  synthetic_operator_msg_fixture.py:3 in create_message() — operator "
+            "ProjectMessage site not covered by the shared arming gate"
+        ]
+
+    def test_scan_accepts_guarded_operator_message(self):
+        """A guarded operator message with the gate called and verdict assigned
+        and used in a response is accepted."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def create_message(session, project_id, content):
+                msg = ProjectMessage(
+                    project_id=project_id,
+                    from_type="user",
+                    content=content
+                )
+                arming = await maybe_arm_operator_refresh(
+                    session, project_id, msg_type, message_content=content
+                )
+                return {"id": msg.id, "arming": arming}
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_operator_msg_fixture.py",
+            rel="synthetic_operator_msg_fixture.py",
+            gate_name=self._GATE_NAME,
+            message_class=self._MESSAGE_CLASS,
+        )
+
+        assert offenders == []
+
+    def test_operator_gate_reference_without_verdict_usage_is_flagged(self):
+        """Fail-closed ratchet: referencing the gate symbol is NOT enough — the
+        verdict must actually be USED to drive the response or a conditional.
+
+        This is the documented false-negative the hardened scan prevents:
+        the gate is called and its result assigned, but the value is never
+        tested and the response is formed unconditionally. 'Gate symbol
+        referenced ⇒ covered' would mark this safe; the hardened scan flags it
+        because the verdict is not used to gate the response or a commit.
+        """
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def create_message(session, project_id, content):
+                msg = ProjectMessage(
+                    project_id=project_id,
+                    from_type="user",
+                    content=content
+                )
+                # verdict captured but NEVER used in response or conditional
+                arming = await maybe_arm_operator_refresh(
+                    session, project_id, msg_type, message_content=content
+                )
+                return {"id": msg.id, "status": "created"}
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_operator_msg_fixture.py",
+            rel="synthetic_operator_msg_fixture.py",
+            gate_name=self._GATE_NAME,
+            message_class=self._MESSAGE_CLASS,
+        )
+
+        assert offenders == [
+            "  synthetic_operator_msg_fixture.py:3 in create_message() — operator "
+            "ProjectMessage site not covered by the shared arming gate"
+        ], (
+            "A gate verdict that is captured but never used in the response "
+            "(the return dict lacks the arming field) must be flagged — "
+            "referencing the gate symbol is not the same as using its verdict."
+        )
+
+    def test_all_operator_message_sites_route_through_shared_gate(self):
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        offenders: list[str] = []
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in sorted(files):
+                if not fname.endswith(".py"):
+                    continue
+                fpath = os.path.join(root, fname)
+                rel = os.path.relpath(fpath, app_dir)
+                with open(fpath, encoding="utf-8") as f:
+                    source = f.read()
+
+                offenders.extend(
+                    self._collect_offenders(
+                        source,
+                        filename=fpath,
+                        rel=rel,
+                        gate_name=self._GATE_NAME,
+                        message_class=self._MESSAGE_CLASS,
+                    )
+                )
+
+        assert not offenders, (
+            "Found operator-authored ProjectMessage site(s) under backend/app/ "
+            "that do NOT route their wake decision through the shared operator "
+            f"arming gate ({self._GATE_NAME}, in app/strategic_trigger.py).\n"
+            "Fix each site by calling maybe_arm_operator_refresh(...) in the "
+            "enclosing function and using its verdict in the response, OR — if "
+            "the site is intentionally exempt — add its (file, function) to "
+            "TestOperatorMessageArmingGateCoverage._EXEMPT_SITES with a documented "
+            "reason.\n"
+            "Offenders:\n" + "\n".join(offenders)
+        )
+
+
 # ── Security Scanner Integrity ──────────────────────────────────────────────
 
 
@@ -827,6 +3407,221 @@ class TestNoRawBindDialectIdiom:
             "app.database.resolve_dialect_name(session) instead.\n"
             "Offenders:\n" + "\n".join(offenders)
         )
+
+
+class TestNoUnguardedPostgresJsonOp:
+    """Guard against PostgreSQL-only JSON *operators* emitted with no dialect branch.
+
+    The sibling ``TestNoRawBindDialectIdiom`` catches code that resolves the
+    dialect the *wrong* way (raw ``.bind.dialect``). It does NOT catch the more
+    dangerous case: code that emits a Postgres-only JSON operator with **no
+    dialect resolution at all**. Such SQL compiles and runs on Postgres — so CI
+    (which runs ``USE_TEST_POSTGRES=true``) stays green — and only blows up on
+    the local SQLite smoke gate (``./check`` / ``--no-postgres``) with
+    ``unrecognized token: "@"``. This is exactly how the account-health query
+    regressed: a perf optimization swapped a SQLite-safe predicate for the JSONB
+    containment operator ``@>`` (``.op("@>")``) with no dialect branch, and
+    nothing static flagged it.
+
+    This invariant flags any module under ``backend/app`` that emits a
+    Postgres-only JSON operator via either surface:
+
+    * the raw ``.op(...)`` surface — the JSONB containment operator ``@>`` and
+      the key-existence operator family ``?`` / ``?|`` / ``?&``; or
+    * the ``.has_key(...)`` *method* form — SQLAlchemy's JSONB key-existence
+      check, which compiles to the Postgres-only ``?`` operator and raises
+      ``sqlite3.OperationalError`` on the SQLite smoke gate exactly like
+      ``.op("?")`` does.
+
+    unless the module also routes dialect resolution through
+    ``app.database.resolve_dialect_name``. A module that branches on the
+    resolved dialect is presumed to guard the Postgres-only path behind it; if a
+    genuine exception is ever needed, add the file to ``allow_list`` (the same
+    escape hatch the ``.bind.dialect`` invariants use for ``database.py``).
+
+    The previously-documented ``.has_key()`` scope gap is now CLOSED: the four
+    pre-existing unguarded sites (digest_remediation, rollup_management,
+    autonomous_research, residual_case_endpoints) plus the mis-commented
+    admin_health site were all routed through ``resolve_dialect_name`` with a
+    portable ``func.json_extract`` SQLite fallback, so scanning ``.has_key()``
+    here no longer red-fails CI.
+    """
+
+    # The canonical resolver. A module that calls it is presumed to branch on
+    # the resolved dialect and guard its Postgres-only path.
+    _GUARD_TOKEN = "resolve_dialect_name"
+
+    # Raw Postgres-only JSON operators expressed via the SQLAlchemy ``.op(...)``
+    # surface: the JSONB containment operator ``@>`` and the key-existence
+    # operator family ``?`` / ``?|`` / ``?&``.
+    _PG_JSON_OP_RE = re.compile(r"""\.op\(\s*['"](?:@>|\?\|?|\?&)['"]\s*\)""")
+
+    # The ``.has_key(...)`` method form — SQLAlchemy's JSONB key-existence
+    # comparator, which compiles to the Postgres-only ``?`` operator. (Python 3
+    # dicts have no ``.has_key`` method, so a ``.has_key(`` call site in this
+    # codebase is always the JSONB operator.) A bare function named e.g.
+    # ``_build_config_has_key(...)`` has no leading dot and is not matched.
+    _PG_HAS_KEY_RE = re.compile(r"\.has_key\(")
+
+    @classmethod
+    def _scan_module_text(cls, text: str) -> list[int]:
+        """Return the 1-based line numbers that emit a Postgres-only JSON
+        operator — via either the raw ``.op(...)`` surface or the
+        ``.has_key(...)`` method form — skipping comment / ``# noqa`` lines
+        (mirrors the sibling scanners). Returns an empty list when the module is
+        guarded — i.e. it also contains ``resolve_dialect_name``."""
+        if cls._GUARD_TOKEN in text:
+            return []
+        hits: list[int] = []
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if line.lstrip().startswith("#") or "# noqa" in line:
+                continue
+            if cls._PG_JSON_OP_RE.search(line) or cls._PG_HAS_KEY_RE.search(line):
+                hits.append(lineno)
+        return hits
+
+    def test_no_unguarded_pg_json_op_in_app_code(self):
+        import os
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        # database.py *defines* resolve_dialect_name and only documents ``@>`` in
+        # prose (no ``.op("@>")`` call), so it is not matched; no entry required.
+        allow_list: set[str] = set()
+        offenders: list[str] = []
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in files:
+                if not fname.endswith(".py") or fname in allow_list:
+                    continue
+                fpath = os.path.join(root, fname)
+                with open(fpath, encoding="utf-8") as f:
+                    text = f.read()
+                for lineno in self._scan_module_text(text):
+                    rel = os.path.relpath(fpath, app_dir)
+                    line = text.splitlines()[lineno - 1]
+                    offenders.append(f"  {rel}:{lineno}: {line.strip()}")
+        assert not offenders, (
+            "Found a Postgres-only JSON operator (`.op('@>')` / `.op('?')` / "
+            "`.op('?|')` / `.op('?&')` or the `.has_key(...)` method form) in "
+            "backend/app/ with no dialect branch.\n"
+            "Such SQL runs on Postgres (CI stays green) but fails on the local "
+            "SQLite smoke gate with `unrecognized token: \"@\"` (or a `?` "
+            "parameter-placeholder error for `.has_key`). Route dialect "
+            "resolution through app.database.resolve_dialect_name(session) and "
+            "branch the Postgres-only path behind it (see account-health fix), "
+            "falling back to a portable `func.json_extract(...)` predicate on "
+            "SQLite (see landed_signal / agent_warm_continuity).\n"
+            "Offenders:\n" + "\n".join(offenders)
+        )
+
+    def test_scanner_flags_injected_unguarded_op(self):
+        """Self-test: the scanner must DETECT an unguarded `.op('@>')` — guards
+        against a scanner that silently matches nothing (mirrors
+        ``test_branch_local_guard_scan_catches_sibling_unguarded_branch``)."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            from sqlalchemy.dialects.postgresql import JSONB
+            from sqlalchemy import cast
+
+            async def failed_tasks(session):
+                stmt = select(Task).where(
+                    Task.context.op("@>")(cast({"failed": True}, JSONB))
+                )
+                return await session.execute(stmt)
+            """
+        )
+        assert self._scan_module_text(source) == [7]
+
+        # The key-existence operator family is detected too.
+        key_exists = 'Task.context.op("?")(literal("k"))\n'
+        assert self._scan_module_text(key_exists) == [1]
+
+    def test_scanner_flags_injected_unguarded_has_key(self):
+        """Self-test: the scanner must DETECT an unguarded `.has_key(...)`
+        method-form key-existence check — the surface this invariant was
+        extended to cover. Both the positive and the negated (`~...has_key`)
+        form must be flagged."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            from sqlmodel import select
+
+            async def remediation_tasks(session):
+                stmt = select(Task).where(
+                    Task.context.has_key("diagnosis_task_id"),
+                )
+                return await session.execute(stmt)
+            """
+        )
+        assert self._scan_module_text(source) == [6]
+
+        # The negated key-absence form (`~Task.context.has_key(...)`) is the
+        # exact shape that regressed in residual_case_endpoints / autonomous_
+        # research; it must be detected too.
+        negated = '.where(*filters, ~Task.context.has_key("failure_category"))\n'
+        assert self._scan_module_text(negated) == [1]
+
+    def test_scanner_ignores_non_method_has_key_function(self):
+        """Self-test: a bare function named `*_has_key(...)` (no leading dot) is
+        NOT the JSONB operator and must NOT be flagged — guards against the
+        scanner over-matching helper functions like
+        ``_build_config_has_key(project, key)``."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            def _build_config_has_key(project, key):
+                return key in (project.build_config or {})
+
+            is_default = not _build_config_has_key(project, "task_branch_prefix")
+            """
+        )
+        assert self._scan_module_text(source) == []
+
+    def test_scanner_passes_guarded_op(self):
+        """Self-test: a module that emits `.op('@>')` AND resolves the dialect
+        via resolve_dialect_name is NOT flagged."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            from app.database import resolve_dialect_name
+
+            async def failed_tasks(session):
+                if resolve_dialect_name(session) == "postgresql":
+                    pred = Task.context.op("@>")(cast({"failed": True}, JSONB))
+                else:
+                    pred = Task.context["failed"].as_boolean().is_(True)
+                return pred
+            """
+        )
+        assert self._scan_module_text(source) == []
+
+    def test_scanner_passes_guarded_has_key(self):
+        """Self-test: a module that emits `.has_key(...)` AND resolves the
+        dialect via resolve_dialect_name is NOT flagged — mirrors the canonical
+        ``func.json_extract`` SQLite fallback used in landed_signal /
+        agent_warm_continuity / the sites fixed alongside this invariant."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            from sqlalchemy import func
+            from app.database import resolve_dialect_name
+
+            async def remediation_tasks(session):
+                if resolve_dialect_name(session) == "postgresql":
+                    pred = Task.context.has_key("diagnosis_task_id")
+                else:
+                    pred = func.json_extract(
+                        Task.context, "$.diagnosis_task_id"
+                    ).isnot(None)
+                return pred
+            """
+        )
+        assert self._scan_module_text(source) == []
 
 
 # ── Base-branch fallback hardening ─────────────────────────────────────────
@@ -2024,6 +4819,67 @@ class TestReviewerOriginParity:
 # compatibility symbols without a CI failure.
 
 
+# Lifecycle/storage helpers + constants whose single canonical home is
+# ``app.playbook_storage``.  The ``playbook_lifecycle`` shim and the
+# ``playbook_learning`` facade must re-export every one of these BY IDENTITY —
+# never redefine a local copy (a "dead twin" that can drift independently).
+# Keep in sync with the re-export blocks in playbook_lifecycle.py / playbook_learning.py.
+_CANONICAL_PLAYBOOK_STORAGE_NAMES = frozenset(
+    {
+        # lifecycle helpers
+        "finalize_pending_playbook_entries",
+        "retire_idle_auto_entries",
+        "retire_ineffective_patterns",
+        "check_and_flag_stale_refs",
+        "record_playbook_applied",
+        "record_playbook_confirmed",
+        "_is_auto_playbook_suppressed",
+        "_get_prior_archive_entry",
+        "count_idle_auto_retired_within",
+        "count_low_success_retired_within",
+        "_extract_file_paths",
+        # lifecycle constants
+        "_AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS",
+        "_FILE_PATH_RE",
+        "_IDLE_RETIRE_DAYS",
+        "_RETIRE_MAX_SUCCESS_RATE",
+        "_RETIRE_MIN_FOLLOWED",
+        "_STALE_AGE_DAYS",
+        "_STALE_CONFIRM_THRESHOLD",
+    }
+)
+
+
+def _module_top_level_bound_names(module_path: str) -> set[str]:
+    """Return names *defined* (not imported) at module top level.
+
+    Collects targets of ``def``/``async def``/``class`` statements and
+    module-level assignments (``Assign``/``AnnAssign``), while deliberately
+    excluding names introduced via ``import`` / ``from ... import`` — those are
+    re-exports, which is exactly what the shim/facade are allowed to do.
+    """
+    import ast
+
+    with open(module_path, encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=module_path)
+
+    bound: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    bound.add(target.id)
+                elif isinstance(target, (ast.Tuple, ast.List)):
+                    for elt in target.elts:
+                        if isinstance(elt, ast.Name):
+                            bound.add(elt.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            bound.add(node.target.id)
+    return bound
+
+
 class TestPlaybookLearningFacadeCompat:
     def test_review_categories_is_canonical_object(self):
         """playbook_learning._REVIEW_CATEGORIES must be the same object as
@@ -2067,6 +4923,79 @@ class TestPlaybookLearningFacadeCompat:
         assert callable(finalize_pending_playbook_entries)
         assert callable(retire_idle_auto_entries)
         assert callable(retire_ineffective_patterns)
+
+    def test_facade_lifecycle_symbols_are_canonical_storage_objects(self):
+        """The facade must re-export each lifecycle helper/constant BY IDENTITY.
+
+        ``test_compat_lifecycle_and_storage_symbols_accessible`` only proves the
+        names resolve and are callable — a shadow copy with the same name would
+        pass it.  This tightens the guard to object identity: if the facade ever
+        starts pointing at a local re-implementation again (a "dead twin" that
+        can drift from the canonical storage logic), this fails.
+        """
+        import app.playbook_learning as learning
+        import app.playbook_storage as storage
+
+        mismatched = [
+            name
+            for name in sorted(_CANONICAL_PLAYBOOK_STORAGE_NAMES)
+            if getattr(learning, name) is not getattr(storage, name)
+        ]
+        assert not mismatched, (
+            "app.playbook_learning re-exports a shadow copy instead of the "
+            "canonical app.playbook_storage object for: "
+            f"{mismatched}. The facade must re-export by identity "
+            "(`from app.playbook_storage import <name>`), not redefine."
+        )
+
+    def test_lifecycle_shim_symbols_are_canonical_storage_objects(self):
+        """The playbook_lifecycle shim must re-export storage objects by identity.
+
+        Callers still import ``app.playbook_lifecycle.<name>`` (e.g.
+        ``playbook_auto``, ``autonomous_research``); those must resolve to the
+        one canonical storage implementation, not a re-introduced twin.
+        """
+        import app.playbook_lifecycle as shim
+        import app.playbook_storage as storage
+
+        mismatched = [
+            name
+            for name in sorted(_CANONICAL_PLAYBOOK_STORAGE_NAMES)
+            if getattr(shim, name) is not getattr(storage, name)
+        ]
+        assert not mismatched, (
+            "app.playbook_lifecycle re-exports a shadow copy instead of the "
+            "canonical app.playbook_storage object for: "
+            f"{mismatched}. The shim must re-export by identity, not redefine."
+        )
+
+    def test_shim_and_facade_do_not_redefine_lifecycle_helpers(self):
+        """Neither the shim nor the facade may *define* a canonical lifecycle name.
+
+        Source-scan tripwire: AST-parse playbook_lifecycle.py and
+        playbook_learning.py and assert that none of the canonical
+        storage-owned names is bound by a local ``def``/``class``/assignment.
+        Re-exports via ``import`` are allowed (and expected); a redefinition is
+        a dead twin that the identity checks above would also catch, but this
+        flags it at the source so the regression is obvious in review.
+        """
+        import os
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        offenders: list[str] = []
+        for fname in ("playbook_lifecycle.py", "playbook_learning.py"):
+            path = os.path.join(app_dir, fname)
+            redefined = _module_top_level_bound_names(path) & (
+                _CANONICAL_PLAYBOOK_STORAGE_NAMES
+            )
+            offenders.extend(f"  {fname}: {name}" for name in sorted(redefined))
+        assert not offenders, (
+            "A canonical app.playbook_storage lifecycle helper/constant is "
+            "redefined (not re-exported) in the shim/facade — this re-introduces "
+            "a dead twin that can drift from the canonical implementation. "
+            "Re-export it via `from app.playbook_storage import <name>` instead.\n"
+            "Offenders:\n" + "\n".join(offenders)
+        )
 
 
 # ── edges_considered Schema Invariants ────────────────────────────────────────
@@ -2890,6 +5819,36 @@ class TestVisionLockInvariant:
         _check_lock_invariant("vision", "vision", "with_vision_locked")
 
 
+# ── Running Update Lock Invariant ──────────────────────────────────────────────
+
+
+class TestRunningUpdateLockInvariant:
+    """Tripwire: direct <var>.running_update attribute assignments must not
+    increase above their per-file baseline recorded in lock_assignment_baseline.json.
+
+    Uses AST-based scanning (receiver-name-agnostic: matches any receiver so
+    aliases like proj / p / _proj are all caught).  Assignments inside
+    docstrings, comments, or string literals are naturally excluded.
+
+    The baseline is a ratchet — counts may only decrease as write sites are
+    migrated to the canonical reconciliation helper (reconcile_running_update /
+    apply_reconciled_running_update in running_update_merge.py). Adding a new
+    assignment to any file (even an already-baselined one) raises the count
+    above its baseline and fails this test.
+
+    To migrate a site: route it through apply_reconciled_running_update()
+    (running_update_merge.py) and lower the count in lock_assignment_baseline.json.
+    Remove the entry when count reaches 0.
+
+    Note: running_update does NOT use the task_locking.py with_*_locked()
+    helpers. Its guarantee is operator-wins reconciliation through the shared
+    running_update_merge helpers, not a row-lock pattern.
+    """
+
+    def test_no_new_unlocked_running_update_writes(self):
+        _check_lock_invariant("running_update", "running_update", "apply_reconciled_running_update")
+
+
 # ── Design-Doc Lock Assignment Guard ─────────────────────────────────────────
 
 
@@ -3611,3 +6570,1435 @@ class TestPrMergedLandedWriterAllowlist:
         # And it must NOT match the centralised-constant form the guarded setter
         # uses, so ``app/landed_signal.py`` is correctly left undetected.
         assert not self._DICT_PATTERN.search("        LANDED_SIGNAL_KEY: True,")
+
+
+# ── Typed mock-call helper convention ─────────────────────────────────────────
+#
+# Once a project-internal function's mock-call assertions adopt the type-safe
+# wrapper ``expectCalledWith`` (agent/src/utils/typed-mock-call.ts), signature
+# drift becomes a ``tsc`` error caught by the agent CI lane. Nothing, however,
+# stops a future edit from dropping back to the raw, untyped
+# ``expect(vi.mocked(fn)).toHaveBeenCalledWith(...)`` matcher for one of those
+# functions — silently re-opening the drift blind spot the wrapper closed.
+#
+# The agent Vitest suite is NOT run in CI and ``.github/workflows`` is
+# off-limits, so the durable lock must live in a BACKEND pytest test (which DOES
+# run in CI). This mirrors the precedent of ``test_agent_branch_invariants.py``,
+# which statically scans the agent TypeScript source.
+#
+# A HAND-MAINTAINED name list fails SILENT the moment a new project-internal
+# function appears: a raw ``expect(vi.mocked(newInternalFn)).toHaveBeenCalledWith
+# (...)`` on a function not in the list slips through unnoticed — the same
+# silent-escape meta-gap the Alembic ``_MERGE_NAMES`` guard had. So the guard
+# does NOT keep a name list. Instead it classifies each mock-call target through
+# the *test file's own imports*:
+#
+#   * A binding imported from a RELATIVE specifier (``./x.js``, ``../index.js``,
+#     ``../prompt.js``) is project-internal — a raw argument-bearing matcher on
+#     it is an offender and must adopt the typed helper.
+#   * A binding imported from a BARE specifier (``fs``, ``node:child_process``,
+#     ``ws``, any third-party package) is external — its signature is owned
+#     elsewhere, so a raw matcher is legitimately allowed.
+#
+# Namespace-qualified targets (``vi.mocked(idx.fn)`` with
+# ``import * as idx from '../index.js'`` or ``const idx = await import('../index.js')``)
+# resolve through the namespace binding. No-argument matchers
+# (``toHaveBeenCalled``) and setup calls (``mockResolvedValue``) are never
+# flagged — they carry no argument list to drift on signature. This mirrors the
+# self-locking precedent of ``TestPrMergedLandedWriterAllowlist`` in this file.
+
+# Documented exemptions: internal bindings that genuinely cannot adopt the typed
+# helper, mapping ``binding name -> human reason``. Mirrors the documented
+# allowlists used by the ``os.walk`` invariants elsewhere in this file. The
+# canonical case is an OVERLOADED function: ``Parameters<F>`` resolves only to
+# the LAST overload, so the wrapper would reject valid calls made against an
+# earlier overload. Keep this set minimal and justified — an empty set is the
+# correct default and means "every internal binding must use the typed helper".
+_TYPED_MOCK_EXEMPT: "dict[str, str]" = {}
+
+# Resolve agent/src across local + Docker test environments. Mirrors
+# ``_resolve_agent_src_root`` in test_agent_branch_invariants.py:
+#   1. AGENT_SRC_ROOT env override.
+#   2. /agent/src (Docker volume-mount target used by scripts/test-backend.sh).
+#   3. Host filesystem at ../../agent/src from this test file.
+
+
+def _resolve_agent_src_for_typed_mock() -> "Path | None":
+    candidates: list[Path] = []
+    env_override = os.getenv("AGENT_SRC_ROOT")
+    if env_override:
+        candidates.append(Path(env_override))
+    candidates.append(Path("/agent/src"))
+    candidates.append(Path(__file__).resolve().parents[2] / "agent" / "src")
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+_TYPED_MOCK_AGENT_SRC = _resolve_agent_src_for_typed_mock()
+
+
+# Matches a RAW argument-bearing mock-call assertion on ANY binding:
+#   expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(
+#   expect(vi.mocked(idx.setupWorkspace)).not.toHaveBeenCalledWith(
+#   expect(vi.mocked(captureTestBaseline)).toHaveBeenLastCalledWith(
+# The optional ``<namespace>.`` qualifier and the bare function name are both
+# captured so the scanner can resolve either through the file's import map. An
+# optional ``.not`` may precede the matcher. Only the argument-bearing matchers
+# (``toHaveBeenCalledWith`` / ``toHaveBeenLastCalledWith``) are matched — the
+# no-arg ``toHaveBeenCalled`` and ``.mockResolvedValue`` forms carry no argument
+# list and so cannot drift on signature.
+_RAW_TYPED_MOCK_RE = re.compile(
+    r"vi\.mocked\(\s*(?:(?P<ns>\w+)\.)?(?P<fn>\w+)\s*\)\s*\)\s*(?:\.not)?\."
+    r"(?P<matcher>toHaveBeenCalledWith|toHaveBeenLastCalledWith)"
+)
+
+# ── Import-classification helpers ─────────────────────────────────────────────
+# These build a per-file map of ``binding name -> is_internal`` from the test
+# file's own import statements, so a mock-call target can be classified as
+# project-internal (relative specifier) or external (bare specifier) without any
+# hand-maintained name list.
+_STATIC_IMPORT_RE = re.compile(
+    r"\bimport\s+(?P<clause>[^'\";]+?)\s+from\s+['\"](?P<spec>[^'\"]+)['\"]"
+)
+_DYNAMIC_DESTRUCTURE_RE = re.compile(
+    r"\b(?:const|let|var)\s*\{(?P<names>[^}]*)\}\s*=\s*await\s+"
+    r"import\(\s*['\"](?P<spec>[^'\"]+)['\"]"
+)
+_DYNAMIC_BINDING_RE = re.compile(
+    r"\b(?:const|let|var)\s+(?P<name>\w+)\s*=\s*\(?\s*await\s+"
+    r"import\(\s*['\"](?P<spec>[^'\"]+)['\"]"
+)
+
+
+def _spec_is_internal(spec: str) -> bool:
+    """A relative module specifier denotes project-internal source."""
+    return spec.startswith("./") or spec.startswith("../")
+
+
+def _bindings_from_static_clause(clause: str) -> "list[str]":
+    """Extract every runtime binding name from a static ``import`` clause.
+
+    Handles ``* as ns`` namespace, ``{ a, b as c, type D }`` named, and leading
+    default (``fs``, ``fs, { x }``) forms.
+    """
+    bindings: list[str] = []
+    clause = clause.strip()
+    ns = re.search(r"\*\s+as\s+(\w+)", clause)
+    if ns:
+        bindings.append(ns.group(1))
+    brace = re.search(r"\{([^}]*)\}", clause)
+    if brace:
+        for part in brace.group(1).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            part = re.sub(r"^type\s+", "", part)  # ``{ type Foo }`` inline form
+            alias = re.search(r"\bas\s+(\w+)\s*$", part)  # ``orig as alias``
+            if alias:
+                bindings.append(alias.group(1))
+            else:
+                head = re.match(r"(\w+)", part)
+                if head:
+                    bindings.append(head.group(1))
+    # Default import: a leading bare identifier before any ``{`` or ``*``.
+    lead = clause.split(",")[0].strip()
+    if re.fullmatch(r"\w+", lead):
+        bindings.append(lead)
+    return bindings
+
+
+def _bindings_from_destructure(names: str) -> "list[str]":
+    """Extract bindings from a dynamic ``const { a, default: fs } = await import``
+    destructure pattern (the right-hand side of ``key: alias`` is the binding).
+    """
+    bindings: list[str] = []
+    for part in names.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:  # ``{ default: fs }`` / ``{ orig: alias }``
+            part = part.split(":", 1)[1].strip()
+        head = re.match(r"(\w+)", part)
+        if head:
+            bindings.append(head.group(1))
+    return bindings
+
+
+def _parse_import_map(src: str) -> "dict[str, bool]":
+    """Map each imported binding name -> ``is_internal`` (relative specifier).
+
+    Covers static ``import`` (named, default, ``* as`` namespace) and dynamic
+    ``await import('...')`` (destructured, namespace, and ``.default``) forms.
+    When a binding name is bound more than once, internal wins (stricter), so a
+    binding ever sourced from a relative path is treated as internal.
+    """
+    # Run over comment-stripped source so a commented-out import is ignored, and
+    # join the lines so a multi-line ``import { ... } from '...'`` matches whole.
+    text = "\n".join(line for _, line in _strip_ts_comments(src))
+    result: dict[str, bool] = {}
+
+    def _record(binding: str, spec: str) -> None:
+        result[binding] = result.get(binding, False) or _spec_is_internal(spec)
+
+    for m in _STATIC_IMPORT_RE.finditer(text):
+        for binding in _bindings_from_static_clause(m.group("clause")):
+            _record(binding, m.group("spec"))
+    for m in _DYNAMIC_DESTRUCTURE_RE.finditer(text):
+        for binding in _bindings_from_destructure(m.group("names")):
+            _record(binding, m.group("spec"))
+    for m in _DYNAMIC_BINDING_RE.finditer(text):
+        _record(m.group("name"), m.group("spec"))
+    return result
+
+
+def _strip_ts_comments(src: str) -> "list[tuple[int, str]]":
+    """Return ``(lineno, text)`` pairs with comment lines/regions removed.
+
+    Compact self-contained stripper so a commented-out example
+    (``// expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(...)``) does
+    not trip the guard. Handles ``//`` line comments, trailing ``//``, and
+    ``/* ... */`` block comments (single- and multi-line). String-literal
+    awareness is intentionally simple (matching the precedent stripper in
+    test_agent_branch_invariants.py) — adequate for the agent test sources.
+    """
+    result: list[tuple[int, str]] = []
+    in_block = False
+    for i, line in enumerate(src.splitlines(), start=1):
+        stripped = line
+        if in_block:
+            end = stripped.find("*/")
+            if end == -1:
+                continue
+            stripped = stripped[end + 2 :]
+            in_block = False
+        while True:
+            start = stripped.find("/*")
+            if start == -1:
+                break
+            end = stripped.find("*/", start + 2)
+            if end == -1:
+                stripped = stripped[:start]
+                in_block = True
+                break
+            stripped = stripped[:start] + stripped[end + 2 :]
+        slash_idx = stripped.find("//")
+        if slash_idx != -1:
+            stripped = stripped[:slash_idx]
+        lstripped = stripped.lstrip()
+        if not lstripped or lstripped.startswith("*"):
+            continue
+        result.append((i, stripped))
+    return result
+
+
+def _scan_source_for_raw_typed_mock(
+    name: str, src: str, exempt: "dict[str, str] | None" = None
+) -> "list[str]":
+    """Return ``name:lineno: <line>`` offenders for one test source string.
+
+    An offender is a raw argument-bearing matcher whose target binding (or, for
+    ``ns.fn``, its namespace qualifier) resolves through the file's imports to a
+    project-internal (relative) specifier and whose function name is not in the
+    documented exemption set. External and unresolved bindings are left alone, so
+    the guard has zero false positives on Node-stdlib / third-party spies.
+    """
+    exempt = _TYPED_MOCK_EXEMPT if exempt is None else exempt
+    import_map = _parse_import_map(src)
+    offenders: list[str] = []
+    for lineno, line in _strip_ts_comments(src):
+        m = _RAW_TYPED_MOCK_RE.search(line)
+        if not m:
+            continue
+        lookup = m.group("ns") or m.group("fn")
+        if not import_map.get(lookup, False):
+            continue  # external or unresolved binding — raw matcher allowed.
+        if m.group("fn") in exempt:
+            continue  # documented, genuinely-unconvertible internal function.
+        offenders.append(f"{name}:{lineno}: {line.strip()}")
+    return offenders
+
+
+def _scan_for_raw_typed_mock(path: Path) -> "list[str]":
+    """Return ``file:lineno: <line>`` offenders in a single agent test file."""
+    return _scan_source_for_raw_typed_mock(
+        path.name, path.read_text(encoding="utf-8")
+    )
+
+
+def _iter_agent_test_files() -> "list[Path]":
+    """Glob every ``*.test.ts`` under the resolved agent/src tree."""
+    if _TYPED_MOCK_AGENT_SRC is None:
+        return []
+    return sorted(_TYPED_MOCK_AGENT_SRC.rglob("*.test.ts"))
+
+
+class TestTypedMockAssertConvention:
+    """Static guard: call-argument assertions on project-internal functions
+    (resolved through the test file's own RELATIVE imports) must use the
+    type-safe wrapper ``expectCalledWith`` (agent/src/utils/typed-mock-call.ts),
+    never the raw ``expect(vi.mocked(fn)).toHaveBeenCalledWith(...)`` matcher.
+
+    The raw matcher accepts ``any[]`` arguments, so a signature change to the
+    internal function silently leaves stale assertions green. The wrapper
+    constrains the asserted arguments to ``Parameters<F>``, turning drift into a
+    ``tsc`` error. Because the agent Vitest suite is not run in CI, this backend
+    guard is the only place the convention is CI-enforced.
+
+    Classification is by IMPORT, not by a hand-maintained name list: a binding
+    from a relative specifier (``../index.js``) is internal and must be typed; a
+    binding from a bare specifier (``fs``, third-party) is external and may stay
+    raw. This closes the silent-escape gap where a brand-new internal function,
+    absent from any list, would slip through.
+
+    Skips (does not fail) when ``agent/src`` is absent — the CI backend Docker
+    image builds from ``./backend`` only, so the agent source is not present
+    there; local runs and ``scripts/test-backend.sh`` mount ``agent/src`` and
+    enforce the guard.
+    """
+
+    _SKIP_REASON = (
+        "agent/src not available in this test environment "
+        "(CI docker context is ./backend; run locally or via "
+        "scripts/test-backend.sh from a checkout for enforcement)"
+    )
+
+    def test_protected_fn_allowlist_nonempty_and_resolved(self):
+        """The scan must not be silently vacuous: the exemption set must be a
+        documented dict and at least one agent test file must be discoverable.
+
+        (Repurposed from the former hardcoded-allowlist assertion — the guard
+        now classifies targets by import, so there is no name list to keep
+        non-empty. The non-vacuity check it provided is preserved here.) Mirrors
+        ``test_target_files_exist`` in test_agent_branch_invariants.py.
+        """
+        assert isinstance(_TYPED_MOCK_EXEMPT, dict), (
+            "_TYPED_MOCK_EXEMPT must be a dict of binding-name -> reason."
+        )
+        if _TYPED_MOCK_AGENT_SRC is None:
+            pytest.skip(self._SKIP_REASON)
+        test_files = _iter_agent_test_files()
+        assert test_files, (
+            "No agent *.test.ts files found under "
+            f"{_TYPED_MOCK_AGENT_SRC} — the typed-mock scan would be vacuous. "
+            "Has the agent test layout moved?"
+        )
+
+    def test_protected_fns_use_typed_helper(self):
+        """No agent ``*.test.ts`` file may assert call arguments on a
+        relative-imported (project-internal) function via the raw untyped
+        matcher.
+
+        Correct form (agent/src/utils/typed-mock-call.ts)::
+
+            import { expectCalledWith } from '../utils/typed-mock-call.js';
+            expectCalledWith(setupWorkspace, workspace, { scope: 'medium' });
+
+        Forbidden form (re-opens the signature-drift blind spot)::
+
+            import { setupWorkspace } from '../index.js';
+            expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(
+                workspace, { scope: 'medium' });
+
+        The ``.not`` and ``toHaveBeenLastCalledWith`` variants, and an optional
+        ``<module>.`` namespace qualifier (``idx.setupWorkspace``), are all
+        covered. No-argument forms (``toHaveBeenCalled()``,
+        ``.mockResolvedValue(...)``) and bindings from bare specifiers
+        (``fs.writeFileSync``) are intentionally NOT flagged.
+        """
+        if _TYPED_MOCK_AGENT_SRC is None:
+            pytest.skip(self._SKIP_REASON)
+        all_offenders: list[str] = []
+        for path in _iter_agent_test_files():
+            all_offenders.extend(_scan_for_raw_typed_mock(path))
+
+        assert not all_offenders, (
+            "Raw untyped mock-call assertion found on a project-internal "
+            "(relative-imported) function. The raw "
+            "``expect(vi.mocked(fn)).toHaveBeenCalledWith(...)`` matcher accepts "
+            "``any[]`` args, so a signature change would leave the assertion "
+            "silently green. Use the type-safe wrapper ``expectCalledWith`` / "
+            "``expectLastCalledWith`` / ``expectNotCalledWith`` from "
+            "``agent/src/utils/typed-mock-call.ts`` instead (or, if the function "
+            "genuinely cannot be typed, add it to ``_TYPED_MOCK_EXEMPT`` with a "
+            "reason):\n" + "\n".join(all_offenders)
+        )
+
+    def test_typed_mock_scanner_detects_injected_regression(self):
+        """Sanity-check the scanner against synthetic *sources* (with import
+        headers) so a future tweak to the regex or the import classifier does
+        not silently weaken the guard.
+
+        The ``bad`` source asserts call args on relative-imported bindings via
+        the raw matcher (named, namespace-qualified, and ``toHaveBeenLastCalled``
+        forms) — every one must be flagged. The ``good`` source uses the typed
+        wrapper, no-arg matchers, ``mockResolvedValue`` setup, bare-specifier
+        spies, and a commented-out example — none may be flagged.
+        """
+        bad_src = (
+            "import { setupWorkspace, runClaudeCode } from '../index.js';\n"
+            "import { captureTestBaseline } from '../utils/test-fix-loop.js';\n"
+            "import * as idx from '../index.js';\n"
+            "import fs from 'fs';\n"
+            "describe('x', () => {\n"
+            "  it('y', () => {\n"
+            "    expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(ws, {});\n"
+            "    expect(vi.mocked(idx.runClaudeCode)).not.toHaveBeenCalledWith(p);\n"
+            "    expect(vi.mocked(captureTestBaseline)).toHaveBeenLastCalledWith(ws, []);\n"
+            "  });\n"
+            "});\n"
+        )
+        offenders = _scan_source_for_raw_typed_mock("bad.test.ts", bad_src)
+        assert len(offenders) == 3, (
+            f"Expected 3 offenders on relative-imported bindings, got: {offenders}"
+        )
+
+        good_src = (
+            "import { expectCalledWith, expectNotCalledWith } from "
+            "'../utils/typed-mock-call.js';\n"
+            "import { setupWorkspace } from '../index.js';\n"
+            "import { captureTestBaseline } from '../utils/test-fix-loop.js';\n"
+            "import fs from 'fs';\n"
+            "import { execFileSync } from 'child_process';\n"
+            "describe('x', () => {\n"
+            "  it('y', () => {\n"
+            "    expectCalledWith(setupWorkspace, ws, {});\n"
+            "    expectNotCalledWith(captureTestBaseline, ws);\n"
+            "    expect(vi.mocked(setupWorkspace)).toHaveBeenCalled();\n"
+            "    expect(vi.mocked(captureTestBaseline)).not.toHaveBeenCalled();\n"
+            "    vi.mocked(setupWorkspace).mockResolvedValue({});\n"
+            "    expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledWith(p, d);\n"
+            "    expect(vi.mocked(execFileSync)).toHaveBeenCalledWith('git', []);\n"
+            "    // expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(x);\n"
+            "  });\n"
+            "});\n"
+        )
+        assert _scan_source_for_raw_typed_mock("good.test.ts", good_src) == [], (
+            "Scanner false-positive on known-good source (typed wrapper, no-arg "
+            "matchers, bare-specifier spies, or commented-out example)."
+        )
+
+    def test_scanner_classifies_by_import_not_namelist(self):
+        """The silent-escape the old name list missed: a brand-new internal
+        function — in NO list — is flagged purely because it is relative-imported,
+        and the SAME name imported from a bare specifier is NOT flagged. Also
+        exercises namespace and default resolution through dynamic imports.
+        """
+        internal = (
+            "import { newInternalFn } from '../foo.js';\n"
+            "expect(vi.mocked(newInternalFn)).toHaveBeenCalledWith(1, 2);\n"
+        )
+        assert _scan_source_for_raw_typed_mock("a.test.ts", internal), (
+            "A relative-imported function absent from any name list must still "
+            "be flagged — this is the silent-escape the import classifier closes."
+        )
+
+        external = (
+            "import { newInternalFn } from 'some-third-party';\n"
+            "expect(vi.mocked(newInternalFn)).toHaveBeenCalledWith(1, 2);\n"
+        )
+        assert _scan_source_for_raw_typed_mock("b.test.ts", external) == [], (
+            "The same name imported from a bare specifier must NOT be flagged."
+        )
+
+        # Namespace qualifier on a dynamic relative import resolves to internal.
+        dyn_internal = (
+            "it('x', async () => {\n"
+            "  const idx = await import('../index.js');\n"
+            "  expect(vi.mocked(idx.persistAndPostStatus)).toHaveBeenCalledWith(s);\n"
+            "});\n"
+        )
+        assert _scan_source_for_raw_typed_mock("c.test.ts", dyn_internal), (
+            "vi.mocked(idx.fn) with `const idx = await import('../index.js')` "
+            "must resolve through the namespace binding and be flagged."
+        )
+
+        # Namespace qualifier on a dynamic bare import stays external.
+        dyn_external = (
+            "it('x', async () => {\n"
+            "  const cp = await import('child_process');\n"
+            "  expect(vi.mocked(cp.execFileSync)).toHaveBeenCalledWith('git');\n"
+            "});\n"
+        )
+        assert _scan_source_for_raw_typed_mock("d.test.ts", dyn_external) == [], (
+            "A namespace binding from a bare specifier must not be flagged."
+        )
+
+        # Default-via-destructure dynamic import stays external too.
+        dyn_default = (
+            "it('x', async () => {\n"
+            "  const { default: fs } = await import('fs');\n"
+            "  expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledWith(p, d);\n"
+            "});\n"
+        )
+        assert _scan_source_for_raw_typed_mock("e.test.ts", dyn_default) == [], (
+            "`const { default: fs } = await import('fs')` is external."
+        )
+
+    def test_typed_mock_exempt_list_documented(self):
+        """Every exemption must carry a non-empty human reason, mirroring the
+        documented ``os.walk`` allowlists elsewhere in this file. An empty
+        exemption set is acceptable (the default); this guards future entries.
+        """
+        for binding, reason in _TYPED_MOCK_EXEMPT.items():
+            assert isinstance(reason, str) and reason.strip(), (
+                f"Exemption {binding!r} in _TYPED_MOCK_EXEMPT must document a "
+                "non-empty reason (e.g. 'overloaded signature — Parameters<F> "
+                "resolves to the last overload only')."
+            )
+
+    def test_typed_mock_exempt_list_suppresses_internal(self):
+        """An internal binding listed in the exemption set is NOT flagged even
+        with a raw argument-bearing matcher — but IS flagged once the exemption
+        is removed, proving the suppression is real and not incidental.
+        """
+        src = (
+            "import { overloadedFn } from '../index.js';\n"
+            "expect(vi.mocked(overloadedFn)).toHaveBeenCalledWith(a, b);\n"
+        )
+        control = _scan_source_for_raw_typed_mock("f.test.ts", src)
+        assert control, (
+            "Control: an internal binding must be flagged without an exemption."
+        )
+        suppressed = _scan_source_for_raw_typed_mock(
+            "f.test.ts", src, exempt={"overloadedFn": "overloaded signature"}
+        )
+        assert suppressed == [], (
+            "An exempt internal function must be suppressed by _TYPED_MOCK_EXEMPT."
+        )
+
+
+# ── Agent ⇄ backend test-runner detector parity (CI-enforced) ─────────────────
+#
+# Blueprint's no-CI merge gate depends on TWO test-suite detectors emitting the
+# same runner FAMILY *and* an equivalent COMMAND for every supported repo layout:
+#   - the agent runtime detector  : agent/src/utils/test-runners.ts
+#       (``detectTestRunners`` — runs at merge time against the cloned PR head)
+#   - the backend onboarding detector : backend/app/routers/admin_onboard.py
+#       (``_detect_build_config`` — runs against the GitHub Contents API)
+#
+# A shared fixture (backend/testing/__fixtures__/test_runner_layouts.json) is the
+# single source of truth. The BACKEND half is already pinned to it in plain
+# GitHub CI by ``TestSharedTestRunnerLayouts`` in test_onboard.py. The AGENT half
+# was only pinned by a *vitest* test, and the agent CI job runs only ``tsc
+# --noEmit`` (no vitest), so a single-sided change to the agent detector — a new
+# family, a changed command, a dropped manifest — was verified NOWHERE in CI.
+#
+# This block closes that gap using the same precedent as the SR-category mirror
+# (``AGENT_SELF_REVIEW_CATEGORIES`` / ``test_agent_categories_match_prompt_source``)
+# and the helper-exclusion scan above:
+#   1. ``AGENT_TEST_RUNNER_COMMANDS`` — a backend-resident declarative table of
+#      the family → emitted-command mapping the agent detector produces. Lives in
+#      the backend so it ships in CI's ``./backend`` Docker context.
+#   2. An ALWAYS-ON test pinning that table to the shared fixture (family
+#      coverage + exact command), so the table — and via the existing backend
+#      parity test, the backend detector — is pinned to the shared spec in plain
+#      GitHub CI, no agent/src required.
+#   3. A SOURCE-SCAN test that, when agent/src is available (the local +
+#      merge-gate path, where scripts/test-backend.sh mounts ../agent/src to
+#      /agent/src), statically parses test-runners.ts and asserts the agent
+#      detector's literal family → command mapping equals the table. It FAILS
+#      LOUDLY on a parse miss (anchor/region not found) and SKIPS with a clear
+#      marker only when agent/src is genuinely absent (the GH-only Docker
+#      context, exactly like the SR-category test).
+
+# Family → command the agent detector (``detectTestRunners``) emits for each
+# supported layout. MUST stay byte-for-byte in sync with BOTH:
+#   - the shared fixture test_runner_layouts.json (asserted always-on below), and
+#   - the literal runner objects in agent/src/utils/test-runners.ts (asserted by
+#     the source-scan below when agent/src is mounted).
+#
+# The family→command mapping itself lives in the shared, cross-language fixture
+# ``__fixtures__/test_runner_commands.json`` so the agent vitest parity loop and
+# this backend table consume ONE source of truth (no third hand-synced copy).
+# Edit that JSON AND test-runners.ts together; the source-scan fails otherwise.
+#
+# The ``script`` family is the lone dynamic-arg case: the agent emits
+# ``{ cmd: 'bash', args: [script] }`` where ``script`` ranges over a literal list
+# (``test.sh``, ``run-tests.sh``, ``run_tests.sh``, ``scripts/test.sh``). The
+# shared layout fixture exercises two of those members under this same family:
+# ``scripts_test_sh_root_convention`` (=> ``bash scripts/test.sh``) and
+# ``test_sh_root_convention`` (=> the root-level ``bash test.sh`` convention).
+# All bash fallbacks collapse to family ``script``, so the single representative
+# command in the JSON suffices and the table key still matches the fixture's
+# detectable-family set exactly; the per-member command variance is covered by
+# the ``_AGENT_DYNAMIC_ARG_FAMILIES`` skip, which verifies this family via its
+# script-list literal instead.
+def _load_agent_runner_commands() -> "dict[str, str]":
+    """Load the shared family→command fixture (read-only, single source of truth)."""
+    fixture_path = os.path.normpath(
+        os.path.join(
+            os.path.dirname(__file__), "__fixtures__", "test_runner_commands.json"
+        )
+    )
+    import json
+
+    with open(fixture_path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+AGENT_TEST_RUNNER_COMMANDS = _load_agent_runner_commands()
+
+# The lone family whose command the agent builds from a loop variable rather than
+# a literal ``args`` array, so it can't be reconstructed from the runner literal
+# and is verified via its script-list literal instead.
+_AGENT_DYNAMIC_ARG_FAMILIES = {"script"}
+
+
+def _load_shared_runner_layouts() -> list:
+    """Load the shared test-runner layout fixture (read-only)."""
+    fixture_path = os.path.normpath(
+        os.path.join(
+            os.path.dirname(__file__), "__fixtures__", "test_runner_layouts.json"
+        )
+    )
+    import json
+
+    with open(fixture_path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _resolve_agent_test_runners_ts_path() -> "str | None":
+    """Locate ``agent/src/utils/test-runners.ts`` across local + Docker envs.
+
+    Search order mirrors ``_resolve_prompt_ts_path``:
+      1. ``AGENT_TEST_RUNNERS_TS`` env override (caller-supplied path).
+      2. ``/agent/src/utils/test-runners.ts`` (Docker volume-mount target used by
+         ``scripts/test-backend.sh``).
+      3. Host filesystem at ``../../agent/src/utils/test-runners.ts`` from this
+         test file (``backend/testing/`` → repo root).
+
+    Returns the first existing path or ``None`` if none resolve.
+    """
+    env_override = os.getenv("AGENT_TEST_RUNNERS_TS")
+    candidates = []
+    if env_override:
+        candidates.append(env_override)
+    candidates.append("/agent/src/utils/test-runners.ts")
+    candidates.append(
+        os.path.normpath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "agent",
+                "src",
+                "utils",
+                "test-runners.ts",
+            )
+        )
+    )
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+# Matches a single-line TestRunner object literal's ``cmd``/``args`` pair, e.g.
+#   cmd: 'python3', args: ['-m', 'pytest']
+#   cmd: 'vendor/bin/phpunit', args: []
+# Every runner literal in test-runners.ts is emitted on one line, so a non-greedy
+# single-line match captures the command name and the raw args array body.
+_AGENT_RUNNER_LITERAL_RE = re.compile(r"cmd:\s*'([^']+)',\s*args:\s*\[([^\]]*)\]")
+_AGENT_QUOTED_STRING_RE = re.compile(r"'([^']*)'")
+
+
+def _reconstruct_agent_commands(source: str) -> "set[str]":
+    """Reconstruct every literal ``<cmd> <args...>`` the agent detector emits.
+
+    Parses each ``cmd: '<c>', args: [<a>...]`` runner literal and joins the
+    command with its *quoted* args (unquoted args — e.g. the ``[script]`` loop
+    variable or the ``pgFlag`` ternary — are intentionally dropped; those runners
+    are handled by their own family-specific assertions). Returns the set of
+    reconstructed command strings. Raises on a parse miss so the scan can never
+    silently pass with an empty set.
+    """
+    commands: "set[str]" = set()
+    for cmd, args_blob in _AGENT_RUNNER_LITERAL_RE.findall(source):
+        args = _AGENT_QUOTED_STRING_RE.findall(args_blob)
+        commands.add(" ".join([cmd, *args]).strip())
+    if not commands:
+        raise ValueError(
+            "No `cmd: '...', args: [...]` runner literals found in "
+            "agent/src/utils/test-runners.ts — the runner-literal format changed "
+            "or the file is empty. Update _AGENT_RUNNER_LITERAL_RE in "
+            "backend/testing/test_invariants.py to match the new emit format."
+        )
+    return commands
+
+
+def _extract_extra_family_region(source: str) -> str:
+    """Return the body of the ``detectExtraFamilyRunner`` helper.
+
+    This helper is the canonical home of the divergent-family runners
+    (Ruby/Gradle/Maven/Elixir/.NET/PHP/Composer). Scanning it lets the reverse
+    parity check catch a NEW extra family added to the agent without a matching
+    table entry. Raises (loud) if the anchor or its terminating ``return null;``
+    cannot be located — never silently returns an empty region.
+    """
+    start = source.find("detectExtraFamilyRunner = (")
+    if start == -1:
+        raise ValueError(
+            "Could not find `detectExtraFamilyRunner = (` anchor in "
+            "agent/src/utils/test-runners.ts — the divergent-family helper was "
+            "renamed or removed. Update _extract_extra_family_region in "
+            "backend/testing/test_invariants.py to match."
+        )
+    end = source.find("return null;", start)
+    if end == -1:
+        raise ValueError(
+            "Could not find the terminating `return null;` of "
+            "detectExtraFamilyRunner in agent/src/utils/test-runners.ts — the "
+            "helper's structure changed. Update _extract_extra_family_region."
+        )
+    return source[start:end]
+
+
+def _extract_generic_fallback_region(source: str) -> str:
+    """Return the body of the ``detectGenericFallbackRunner`` helper.
+
+    This helper is the canonical home of generic-fallback runners
+    (Makefile, just, Taskfile, tox, nox, shell scripts). Raises (loud) if the
+    anchor or its terminating ``return null;`` cannot be located — never
+    silently returns an empty region.
+    """
+    start = source.find("detectGenericFallbackRunner = (")
+    if start == -1:
+        raise ValueError(
+            "Could not find `detectGenericFallbackRunner = (` anchor in "
+            "agent/src/utils/test-runners.ts — the generic-fallback helper was "
+            "renamed or removed. Update _extract_generic_fallback_region in "
+            "backend/testing/test_invariants.py to match."
+        )
+    end = source.find("return null;", start)
+    if end == -1:
+        raise ValueError(
+            "Could not find the terminating `return null;` of "
+            "detectGenericFallbackRunner in agent/src/utils/test-runners.ts — the "
+            "helper's structure changed. Update _extract_generic_fallback_region."
+        )
+    return source[start:end]
+
+
+def _extract_core_root_region(source: str) -> str:
+    """Return the region where core root-level runners are emitted.
+
+    This covers npm, pytest, cargo, go detection at repo root.
+    Extracts from the first root-level manifest check to the nested scan.
+    Raises (loud) if the anchor cannot be located — never silently returns
+    an empty region.
+    """
+    start = source.find("const pkgPath = `${WORKSPACE}/package.json`;")
+    if start == -1:
+        raise ValueError(
+            "Could not find root-level runner detection anchor in "
+            "agent/src/utils/test-runners.ts. The core root runner detection "
+            "was refactored or removed. Update _extract_core_root_region in "
+            "backend/testing/test_invariants.py to match."
+        )
+    # End at the start of nested monorepo detection comment
+    end = source.find("--- Nested monorepo / external-layout detection", start)
+    if end == -1:
+        raise ValueError(
+            "Could not find nested monorepo comment in "
+            "agent/src/utils/test-runners.ts. The structure changed. "
+            "Update _extract_core_root_region."
+        )
+    return source[start:end]
+
+
+def _extract_nested_package_region(source: str) -> str:
+    """Return the region where nested-package runners are emitted.
+
+    This covers detection within subdirectories (services/, apps/, packages/,
+    etc.). Raises (loud) if the anchor or terminating condition cannot be
+    located — never silently returns an empty region.
+    """
+    start = source.find("const pushRunnerForPackageDir = (relPath: string): void => {")
+    if start == -1:
+        raise ValueError(
+            "Could not find `pushRunnerForPackageDir` anchor in "
+            "agent/src/utils/test-runners.ts — the nested-package detection "
+            "was refactored or removed. Update _extract_nested_package_region "
+            "in backend/testing/test_invariants.py to match."
+        )
+    # End before the closing of the main function (find the final closing brace)
+    # For safety, look for the specific pattern that ends the nested scanning
+    end = source.find("return runners;", start)
+    if end == -1:
+        raise ValueError(
+            "Could not find `return runners;` terminator after nested package region "
+            "in agent/src/utils/test-runners.ts. Update _extract_nested_package_region."
+        )
+    return source[start:end]
+
+
+def _extract_classifier_region(source: str) -> str:
+    """Extract the classifyTestExecution function from test-runners.ts.
+
+    Raises ValueError with a clear message if the function anchor cannot be found.
+    """
+    start = source.find("export function classifyTestExecution")
+    if start == -1:
+        raise ValueError(
+            "Could not find `export function classifyTestExecution` anchor in "
+            "agent/src/utils/test-runners.ts — the classifier function was "
+            "renamed or removed. Update _extract_classifier_region in "
+            "backend/testing/test_invariants.py to match."
+        )
+
+    # Find the end by searching for the final return statement of the function
+    end = source.find("\n  return 'ran';", start)
+    if end == -1:
+        raise ValueError(
+            "Could not find the terminating `return 'ran';` of "
+            "classifyTestExecution in agent/src/utils/test-runners.ts — the "
+            "function's structure changed. Update _extract_classifier_region."
+        )
+    # Include the return statement and closing brace
+    end = source.find("\n}", end) + 1
+    return source[start:end]
+
+
+class TestAgentTestRunnerTableParity:
+    """ALWAYS-ON: the backend-resident agent runner table is pinned to the shared
+    fixture. Runs in plain GitHub CI (no agent/src required).
+
+    The backend onboarding detector is already pinned to the same fixture by
+    ``TestSharedTestRunnerLayouts`` in test_onboard.py, so this test transitively
+    pins the table to the backend half for every layout — without duplicating or
+    weakening that backend parity assertion.
+    """
+
+    def test_table_keys_equal_fixture_detectable_families(self):
+        """The table's family set must exactly equal the fixture's detectable
+        families — no missing family, no phantom extra family."""
+        layouts = _load_shared_runner_layouts()
+        fixture_families = {
+            layout["family"] for layout in layouts if layout["detectable"]
+        }
+        table_families = set(AGENT_TEST_RUNNER_COMMANDS)
+        missing = fixture_families - table_families
+        extra = table_families - fixture_families
+        assert not missing and not extra, (
+            "AGENT_TEST_RUNNER_COMMANDS has drifted from the shared fixture "
+            "test_runner_layouts.json:\n"
+            f"  families in fixture but missing from table: {sorted(missing)}\n"
+            f"  families in table but absent from fixture:  {sorted(extra)}\n"
+            "Update AGENT_TEST_RUNNER_COMMANDS in backend/testing/test_invariants.py."
+        )
+
+    def test_table_has_nonempty_command_for_every_fixture_family(self):
+        """Every detectable fixture family must map to a non-empty command string
+        in the table — the family→command bridge has no gaps.
+
+        The shared fixture's schema is {name, files, detectable, family}; it
+        deliberately carries NO command (the canonical command lives in this table
+        and is pinned byte-for-byte to the agent source by the source-scan below
+        when agent/src is mounted). So the always-on guarantee here is coverage +
+        non-emptiness in plain GitHub CI, not the exact command string."""
+        layouts = _load_shared_runner_layouts()
+        missing = []
+        for layout in layouts:
+            if not layout["detectable"]:
+                continue
+            family = layout["family"]
+            command = AGENT_TEST_RUNNER_COMMANDS.get(family)
+            if not command or not command.strip():
+                missing.append(f"  {family} (layout {layout['name']})")
+        assert not missing, (
+            "AGENT_TEST_RUNNER_COMMANDS is missing a non-empty command for "
+            "detectable fixture family/families:\n" + "\n".join(missing) + "\n"
+            "Add the family→command entry in backend/testing/test_invariants.py."
+        )
+
+    def test_fixture_families_are_unambiguous(self):
+        """Defensive: the fixture must not assign the same family to layouts that
+        would require different commands — the single-command-per-family table
+        could not represent that. The fixture carries no command field, so we
+        assert the weaker structural invariant the table relies on: every
+        detectable layout names a family that exists as a single table key (a
+        dict is a function by construction, so one family => one command)."""
+        layouts = _load_shared_runner_layouts()
+        unknown = sorted(
+            {
+                layout["family"]
+                for layout in layouts
+                if layout["detectable"]
+                and layout["family"] not in AGENT_TEST_RUNNER_COMMANDS
+            }
+        )
+        assert not unknown, (
+            "Fixture names detectable family/families with no table entry: "
+            f"{unknown}. Every detectable family must map to exactly one command "
+            "in AGENT_TEST_RUNNER_COMMANDS."
+        )
+
+    @staticmethod
+    def _find_layout_by_file_path(layouts, predicate):
+        """Return the first layout whose ``files`` contains a path matching the
+        predicate, or ``None``. Read-only over the shared fixture schema
+        ``{name, files:[{path, content?}], detectable, family}``."""
+        for layout in layouts:
+            for entry in layout.get("files", []):
+                if predicate(entry.get("path", "")):
+                    return layout
+        return None
+
+    def test_composer_scripts_test_signal_pinned_by_name(self):
+        """NAMED DRIFT SIGNAL (composer): a detectable composer.json-with-
+        scripts.test layout (family ``composer``) must exist in the shared
+        fixture AND the table must map ``composer`` → ``composer test``.
+
+        The general family-set parity test stays green if BOTH the composer
+        fixture layout AND the composer table entry are deleted together; this
+        test names the signal so that removing, renaming, or re-committing it out
+        of either the fixture or the table fails by name in plain GitHub CI."""
+        layouts = _load_shared_runner_layouts()
+        layout = self._find_layout_by_file_path(
+            layouts, lambda p: p == "composer.json"
+        )
+        assert layout is not None, (
+            "NAMED SIGNAL LOST: no shared-fixture layout declares a root "
+            "'composer.json' file. The composer no-CI drift signal "
+            "(family 'composer', command 'composer test') must be carried by a "
+            "detectable layout in test_runner_layouts.json. Restore the "
+            "'composer_json_with_scripts_test' layout."
+        )
+        composer_entry = next(
+            entry
+            for entry in layout["files"]
+            if entry.get("path") == "composer.json"
+        )
+        assert '"test"' in composer_entry.get("content", ""), (
+            "NAMED SIGNAL WEAKENED: the composer.json layout "
+            f"'{layout['name']}' no longer declares a scripts.test entry in its "
+            "content. The composer signal requires a real scripts.test so the "
+            "no-CI detector emits 'composer test'."
+        )
+        assert layout["detectable"] is True, (
+            "NAMED SIGNAL DISABLED: the composer.json layout "
+            f"'{layout['name']}' is no longer detectable=true; the composer "
+            "no-CI drift signal would be silently dropped from coverage."
+        )
+        assert layout["family"] == "composer", (
+            "NAMED SIGNAL RENAMED: the composer.json layout "
+            f"'{layout['name']}' now names family '{layout['family']}', not "
+            "'composer'. The composer no-CI drift signal must keep family "
+            "'composer'."
+        )
+        assert AGENT_TEST_RUNNER_COMMANDS.get("composer") == "composer test", (
+            "NAMED SIGNAL LOST: AGENT_TEST_RUNNER_COMMANDS['composer'] is "
+            f"{AGENT_TEST_RUNNER_COMMANDS.get('composer')!r}, not 'composer "
+            "test'. Restore the composer command in "
+            "test_runner_commands.json / AGENT_TEST_RUNNER_COMMANDS."
+        )
+
+    def test_script_test_sh_signal_pinned_by_name(self):
+        """NAMED DRIFT SIGNAL (script): a detectable root ``scripts/test.sh``
+        layout (family ``script``) must exist in the shared fixture AND the
+        table must map ``script`` → ``bash scripts/test.sh``.
+
+        The general family-set parity test stays green if BOTH the script
+        fixture layout AND the script table entry are deleted together; this
+        test names the signal so that removing, renaming, or re-committing it out
+        of either the fixture or the table fails by name in plain GitHub CI."""
+        layouts = _load_shared_runner_layouts()
+        layout = self._find_layout_by_file_path(
+            layouts, lambda p: p == "scripts/test.sh"
+        )
+        assert layout is not None, (
+            "NAMED SIGNAL LOST: no shared-fixture layout declares a root "
+            "'scripts/test.sh' file. The script no-CI drift signal "
+            "(family 'script', command 'bash scripts/test.sh') must be carried "
+            "by a detectable layout in test_runner_layouts.json. Restore the "
+            "'scripts_test_sh_root_convention' layout."
+        )
+        assert layout["detectable"] is True, (
+            "NAMED SIGNAL DISABLED: the scripts/test.sh layout "
+            f"'{layout['name']}' is no longer detectable=true; the script "
+            "no-CI drift signal would be silently dropped from coverage."
+        )
+        assert layout["family"] == "script", (
+            "NAMED SIGNAL RENAMED: the scripts/test.sh layout "
+            f"'{layout['name']}' now names family '{layout['family']}', not "
+            "'script'. The script no-CI drift signal must keep family 'script'."
+        )
+        assert (
+            AGENT_TEST_RUNNER_COMMANDS.get("script") == "bash scripts/test.sh"
+        ), (
+            "NAMED SIGNAL LOST: AGENT_TEST_RUNNER_COMMANDS['script'] is "
+            f"{AGENT_TEST_RUNNER_COMMANDS.get('script')!r}, not 'bash "
+            "scripts/test.sh'. Restore the script command in "
+            "test_runner_commands.json / AGENT_TEST_RUNNER_COMMANDS."
+        )
+
+
+class TestAgentTestRunnerSourceParity:
+    """SOURCE-SCAN: when agent/src is mounted, the agent detector's literal
+    family → command mapping in test-runners.ts must equal the backend table.
+
+    Fires whenever the backend suite runs via scripts/test-backend.sh (the local
+    + no-CI merge-gate path, which mounts ../agent/src to /agent/src). Skips with
+    a clear marker only in the GH-only Docker context where agent/src is genuinely
+    absent — exactly the precedent of ``test_agent_categories_match_prompt_source``.
+
+    A single-sided change to the agent detector (new family, changed command,
+    dropped manifest) that is not mirrored in AGENT_TEST_RUNNER_COMMANDS fails
+    here; a table change not mirrored in test-runners.ts also fails.
+    """
+
+    @staticmethod
+    def _read_agent_source() -> str:
+        path = _resolve_agent_test_runners_ts_path()
+        if path is None:
+            pytest.skip(
+                "agent/src/utils/test-runners.ts not available in this test "
+                "environment (CI docker context is ./backend; run locally or via "
+                "scripts/test-backend.sh from a checkout for enforcement)"
+            )
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_agent_emits_table_command_for_every_family(self):
+        """Every non-dynamic table command must be reconstructable from a literal
+        runner object in test-runners.ts.
+
+        Catches a CHANGED command (e.g. ``mvn test`` → ``mvn verify``: the old
+        literal is gone) and a DROPPED manifest (the runner removed: command gone).
+        """
+        source = self._read_agent_source()
+        agent_commands = _reconstruct_agent_commands(source)  # raises on parse miss
+        missing = []
+        for family, command in AGENT_TEST_RUNNER_COMMANDS.items():
+            if family in _AGENT_DYNAMIC_ARG_FAMILIES:
+                continue
+            if command not in agent_commands:
+                missing.append(f"  {family}: expected agent to emit {command!r}")
+        assert not missing, (
+            "agent/src/utils/test-runners.ts no longer emits the command(s) the "
+            "backend table expects:\n"
+            + "\n".join(missing)
+            + "\n\nThe agent detector drifted from AGENT_TEST_RUNNER_COMMANDS. "
+            "Reconcile agent/src/utils/test-runners.ts and the table in "
+            "backend/testing/test_invariants.py."
+        )
+
+    def test_agent_emits_shell_script_runner(self):
+        """The dynamic-arg ``script`` family: the agent must emit a ``bash`` runner
+        and its script list must include all four shell-script variants: test.sh,
+        run-tests.sh, run_tests.sh, and scripts/test.sh.
+
+        Verified via the script-list literals because the command is built from a
+        loop variable, not a literal ``args`` array.
+        """
+        source = self._read_agent_source()
+        shell_command = AGENT_TEST_RUNNER_COMMANDS["script"]
+        # shell_command == "bash scripts/test.sh"
+        cmd, script = shell_command.split(" ", 1)
+        assert f"cmd: '{cmd}'" in source, (
+            f"agent/src/utils/test-runners.ts no longer emits a {cmd!r} runner; "
+            f"the shell family ({shell_command!r}) cannot be produced."
+        )
+        # Verify all four shell-script paths are present as string literals.
+        # If any were silently dropped, no detection would occur for repos using
+        # that convention.
+        shell_scripts = ['test.sh', 'run-tests.sh', 'run_tests.sh', 'scripts/test.sh']
+        for sh_script in shell_scripts:
+            assert f"'{sh_script}'" in source, (
+                f"agent/src/utils/test-runners.ts no longer lists {sh_script!r} in its "
+                f"shell-script fallback list; repos using this convention would no longer "
+                f"be detected. Reconcile the script list with AGENT_TEST_RUNNER_COMMANDS['script']."
+            )
+
+    def test_agent_emits_composer_json_detection_trigger(self):
+        """The ``composer`` family: the agent must look for ``composer.json`` as its
+        detection trigger inside the divergent-family helper, gated by the
+        manifest-content guard, and emit a ``composer`` runner.
+
+        This closes an asymmetry with the shell-``script`` family. For shell
+        scripts, ``test_agent_emits_shell_script_runner`` pins every filename the
+        agent looks for (test.sh, run-tests.sh, …) as a source literal, so a
+        renamed/removed detection trigger fails the parity scan. For composer,
+        only the emitted command (``composer test``) was reconstructed and
+        checked — nothing pinned the ``composer.json`` detection trigger itself.
+        As a result, dropping or mistyping ``has('composer.json')`` while leaving
+        the ``composer test`` command literal alive would silently stop the agent
+        from detecting composer repos at merge time, even though the backend
+        onboarding detector still detects ``composer.json`` — the exact silent
+        cross-detector divergence the parity suite exists to prevent. This test
+        pins the trigger in the same source-scan tier as the script-filename check.
+
+        Scoped to the ``detectExtraFamilyRunner`` region (not anywhere in the
+        file) so the assertion catches the trigger being moved out of the helper,
+        not merely a stray ``composer.json`` string elsewhere.
+        """
+        source = self._read_agent_source()
+        region = _extract_extra_family_region(source)  # raises (loud) on parse miss
+        composer_command = AGENT_TEST_RUNNER_COMMANDS["composer"]
+        # composer_command == "composer test"
+        cmd, _args = composer_command.split(" ", 1)
+        # (a) the composer.json detection trigger literal must live in the helper.
+        assert "'composer.json'" in region, (
+            "agent/src/utils/test-runners.ts no longer looks for 'composer.json' "
+            "in detectExtraFamilyRunner; composer repos would no longer be "
+            "detected at merge time even though the backend onboarding detector "
+            "still detects composer.json. Reconcile the composer detection trigger "
+            "with AGENT_TEST_RUNNER_COMMANDS['composer']."
+        )
+        # (b) the region must still emit a 'composer' runner (the command survives).
+        assert f"cmd: '{cmd}'" in region, (
+            f"agent/src/utils/test-runners.ts no longer emits a {cmd!r} runner in "
+            f"detectExtraFamilyRunner; the composer family ({composer_command!r}) "
+            "cannot be produced."
+        )
+        # (c) the trigger must stay content-gated by the manifest-script guard, so
+        # a composer.json without a real scripts.test still does not falsely detect.
+        assert "manifestDefinesTestScript" in region, (
+            "agent/src/utils/test-runners.ts no longer gates the composer.json "
+            "trigger with manifestDefinesTestScript in detectExtraFamilyRunner; "
+            "the trigger must remain content-gated to match the backend onboarding "
+            "detector's scripts.test requirement."
+        )
+
+    def test_agent_extra_family_runners_are_all_in_table(self):
+        """Reverse direction: every command the divergent-family helper emits must
+        appear in the backend table.
+
+        Catches a NEW family added to ``detectExtraFamilyRunner`` (e.g. an sbt
+        runner) without a matching AGENT_TEST_RUNNER_COMMANDS entry.
+        """
+        source = self._read_agent_source()
+        region = _extract_extra_family_region(source)  # raises (loud) on parse miss
+        region_commands = _reconstruct_agent_commands(region)
+        table_commands = set(AGENT_TEST_RUNNER_COMMANDS.values())
+        orphans = sorted(region_commands - table_commands)
+        assert not orphans, (
+            "agent/src/utils/test-runners.ts emits divergent-family command(s) "
+            f"with no entry in AGENT_TEST_RUNNER_COMMANDS: {orphans}. "
+            "Add the new family/command to the table in "
+            "backend/testing/test_invariants.py (and the shared fixture)."
+        )
+
+    def test_agent_generic_fallback_runners_are_all_in_table(self):
+        """Reverse direction: every command the generic-fallback helper emits
+        (Makefile, just, Taskfile, tox, nox, shell scripts) must appear in
+        the backend table.
+
+        Catches a NEW generic-fallback family added to ``detectGenericFallbackRunner``
+        without a matching AGENT_TEST_RUNNER_COMMANDS entry. The shell-script
+        family (with unquoted loop variable args) is excluded here and verified
+        separately via test_agent_emits_shell_script_runner.
+        """
+        source = self._read_agent_source()
+        region = _extract_generic_fallback_region(source)  # raises (loud) on parse miss
+        region_commands = _reconstruct_agent_commands(region)
+        table_commands = set(AGENT_TEST_RUNNER_COMMANDS.values())
+        # Exclude bare 'bash' command (it has unquoted loop-variable args)
+        # which is already verified in test_agent_emits_shell_script_runner
+        region_commands.discard('bash')
+        orphans = sorted(region_commands - table_commands)
+        assert not orphans, (
+            "agent/src/utils/test-runners.ts emits generic-fallback family command(s) "
+            f"with no entry in AGENT_TEST_RUNNER_COMMANDS: {orphans}. "
+            "Add the new family/command to the table in "
+            "backend/testing/test_invariants.py (and the shared fixture)."
+        )
+
+    def test_agent_core_root_runners_are_all_in_table(self):
+        """Reverse direction: every command emitted at root level (npm, pytest,
+        cargo, go) must appear in the backend table.
+
+        Catches a NEW core runner family added to root detection without a
+        matching AGENT_TEST_RUNNER_COMMANDS entry. Commands with unquoted ternary
+        variable args (like pgFlag for the Blueprint backend test script) are
+        excluded as they are internal/special cases not part of the standard
+        family set.
+        """
+        source = self._read_agent_source()
+        region = _extract_core_root_region(source)  # raises (loud) on parse miss
+        region_commands = _reconstruct_agent_commands(region)
+        table_commands = set(AGENT_TEST_RUNNER_COMMANDS.values())
+        # Exclude commands with unquoted ternary args that are already in the table
+        # (e.g., 'bash scripts/test-backend.sh' is a blueprint-internal case)
+        region_commands = {cmd for cmd in region_commands if cmd in table_commands or not cmd.startswith('bash')}
+        orphans = sorted(region_commands - table_commands)
+        assert not orphans, (
+            "agent/src/utils/test-runners.ts emits root-level core family command(s) "
+            f"with no entry in AGENT_TEST_RUNNER_COMMANDS: {orphans}. "
+            "Add the new family/command to the table in "
+            "backend/testing/test_invariants.py (and the shared fixture)."
+        )
+
+    def test_agent_nested_package_runners_are_all_in_table(self):
+        """Reverse direction: every command emitted in nested package detection
+        (services/, apps/, packages/, etc.) must appear in the backend table.
+
+        Catches a NEW family added to nested package detection without a
+        matching AGENT_TEST_RUNNER_COMMANDS entry. This includes core families
+        (pytest, npm, go, cargo) at nested levels plus any divergent or
+        generic-fallback families detected in subdirectories.
+        """
+        source = self._read_agent_source()
+        region = _extract_nested_package_region(source)  # raises (loud) on parse miss
+        region_commands = _reconstruct_agent_commands(region)
+        table_commands = set(AGENT_TEST_RUNNER_COMMANDS.values())
+        orphans = sorted(region_commands - table_commands)
+        assert not orphans, (
+            "agent/src/utils/test-runners.ts emits nested-package family command(s) "
+            f"with no entry in AGENT_TEST_RUNNER_COMMANDS: {orphans}. "
+            "Add the new family/command to the table in "
+            "backend/testing/test_invariants.py (and the shared fixture)."
+        )
+
+    def test_classifier_missing_command_requires_adjacency(self):
+        """The no-CI gate's classifier (classifyTestExecution) must not use loose
+        substring matching for the missing-command signal. A too-loose check that
+        scans the whole output for 'command' AND 'not found' independently would
+        false-positive on failures whose test ids contain 'command' (e.g.
+        test_command_parser) plus unrelated errors ('404 Not Found', 'element not
+        found'). This would cause the gate to incorrectly merge unverified PRs.
+
+        The classifier must require the two signal words to be adjacent (at most one
+        quoted/bare token between them) on the SAME line, with a word boundary on
+        `command` so test_command_parser doesn't match.
+        """
+        source = self._read_agent_source()
+        region = _extract_classifier_region(source)  # raises (loud) on parse miss
+
+        # Reject the loose pattern that would false-positive
+        loose_pattern = "lower.includes('command') && lower.includes('not found')"
+        assert loose_pattern not in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution uses loose "
+            "substring matching for 'command' and 'not found' independently, which "
+            "false-positives on genuine failures. The pattern must require adjacency "
+            f"on the same line. Found: {loose_pattern!r}. "
+            "Use a regex pattern like /\\bcommand\\b(?:\\s+(?:\"[^\"]*\"|'[^']*'|\\S+))?\\s+not\\s+found\\b/i"
+        )
+
+        # Verify the correct line-scoped detection is present. The classifier
+        # detects missing runners with a set of line-anchored, runner-shaped
+        # patterns (missingCommandPatterns) tested PER LINE — never a whole-output
+        # substring scan. Each pattern requires the CONTIGUOUS phrase "command not
+        # found" (or the yarn-shaped 'command "x" not found') on a runner-emitted
+        # line, so a failing suite whose output merely contains the two signal
+        # words non-adjacently stays a real run.
+        assert "missingCommandPatterns" in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution must define a "
+            "missingCommandPatterns set of line-anchored regexes for missing-command "
+            "detection."
+        )
+        assert "missingCommandPatterns.some(pattern => pattern.test(line))" in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution must test "
+            "missingCommandPatterns on individual lines (some(line => "
+            "missingCommandPatterns.some(pattern => pattern.test(line)))), not on "
+            "the whole output."
+        )
+        # The patterns must require the contiguous phrase on a runner-shaped line,
+        # never the two signal words matched independently across the output.
+        assert "command not found" in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution must require the "
+            "contiguous phrase 'command not found' in its runner-shaped patterns, "
+            "not 'command' and 'not found' matched independently."
+        )
+        assert "^(?:bash|sh):" in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution must line-anchor "
+            "its missing-command patterns to runner-emitted shapes (e.g. "
+            "'^(?:bash|sh):') so a quoted phrase mid-line stays a real run."
+        )
+
+    def test_classifier_empty_suite_signals_require_failure_guard(self):
+        """Empty-suite phrases may only classify as no_tests when no real
+        failure evidence is present. This prevents a genuine failing suite from
+        being downgraded just because its output mentions 'no tests ran',
+        'collected 0 items', or a similar placeholder phrase as data."""
+        source = self._read_agent_source()
+        region = _extract_classifier_region(source)  # raises (loud) on parse miss
+
+        assert "hasRealFailureEvidence" in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution no longer "
+            "defines a real-failure guard. Empty-suite phrases must be gated "
+            "by a failure-evidence check so genuine failures are not reclassified "
+            "as no_tests."
+        )
+        assert "!hasRealFailureEvidence" in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution no longer "
+            "requires `!hasRealFailureEvidence` before returning no_tests. "
+            "Restore the guard so real failures win over empty-suite phrases."
+        )
+        for phrase in [
+            "no test specified",
+            "missing script",
+            "No rule to make target",
+            "no tests ran",
+            "collected 0 items",
+            "No test files found",
+            "no tests to run",
+        ]:
+            assert phrase in region, (
+                "agent/src/utils/test-runners.ts classifyTestExecution no longer "
+                f"contains the empty-suite signature {phrase!r}; update this "
+                "invariant to match the classifier if the signal moved."
+            )
+
+    def test_classifier_real_failure_guard_covers_every_runner_family(self):
+        """COUPLED INVARIANT: the no-CI gate's runner detection can launch many
+        ecosystems (Go, Ruby/Rake, Gradle, Maven, Elixir, .NET, PHPUnit) beyond
+        pytest/vitest/Rust, and the real-failure guard (hasRealFailureEvidence)
+        MUST recognize a genuine failure in each one. Otherwise a failing suite
+        whose output ALSO quotes a placeholder diagnostic line (a captured child
+        process's "command not found", an assertion diff printing "no test
+        specified", a sub-invocation's "no tests ran") is misread as "no tests
+        ran" and the gate falls open, merging UNVERIFIED.
+
+        The agent vitest suite (which directly exercises the behavior) is run
+        NOWHERE automatically — not by ./check, not by CI — so this CI-enforced
+        source-scan pins "a family the gate can launch" and "its failure
+        signature is recognized" as ONE invariant. Each per-ecosystem failure
+        signature below must be present in the classifier region; a future edit
+        that silently drops one re-opens the fall-open and fails here.
+        """
+        source = self._read_agent_source()
+        region = _extract_classifier_region(source)  # raises (loud) on parse miss
+
+        assert "hasRealFailureEvidence" in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution no longer "
+            "defines the real-failure guard hasRealFailureEvidence."
+        )
+
+        # Each entry: (human label, list of acceptable source substrings — at
+        # least one must be present). The substrings are the line-anchored,
+        # non-zero-guarded signatures the guard uses for that family.
+        required_signatures = [
+            ("pytest collection/import/conftest `1 error` summary", [r"[1-9]\d*\s+errors?"]),
+            ("Go verbose per-test failure (--- FAIL:)", [r"^--- FAIL:"]),
+            ("Go tab-separated package FAIL summary", [r"^FAIL\t"]),
+            (".NET `Failed: N` (non-zero)", [r"Failed:\s+[1-9]"]),
+            (
+                "Elixir/Ruby/RSpec `N failure(s)` (non-zero)",
+                [r"[1-9]\d*\s+failures?"],
+            ),
+            ("PHPUnit/Maven `Failures: N` (non-zero)", [r"Failures:\s+[1-9]"]),
+            (
+                "Maven/Gradle/JUnit/PHPUnit `Errors: N` (non-zero)",
+                [r"Errors:\s+[1-9]"],
+            ),
+            (
+                "Minitest/ExUnit `N error(s)` (non-zero)",
+                [r"[1-9]\d*\s+errors?"],
+            ),
+        ]
+        missing = [
+            label
+            for label, candidates in required_signatures
+            if not any(candidate in region for candidate in candidates)
+        ]
+        assert not missing, (
+            "agent/src/utils/test-runners.ts classifyTestExecution's real-failure "
+            "guard no longer recognizes a genuine failure for runner family/"
+            f"families: {missing}. The no-CI gate's runner detection can still "
+            "launch these ecosystems, so dropping their failure signature re-opens "
+            "the merge-unverified fall-open. Restore the line-anchored, non-zero "
+            "signature(s) in hasRealFailureEvidence."
+        )
+
+        # The count-summary signatures MUST keep a non-zero guard so a zero-count
+        # summary (`Failed: 0`, `Failures: 0`, `0 failures`) is never mistaken for
+        # a real failure (which would hard-block a genuinely empty repo).
+        for nonzero_guard in [
+            r"Failed:\s+[1-9]",
+            r"Failures:\s+[1-9]",
+            r"[1-9]\d*\s+failures?",
+            r"Errors:\s+[1-9]",
+            r"[1-9]\d*\s+errors?",
+        ]:
+            assert nonzero_guard in region, (
+                "agent/src/utils/test-runners.ts classifyTestExecution dropped the "
+                f"non-zero count guard {nonzero_guard!r}; a zero-count summary would "
+                "be misread as a real failure and hard-block an empty repo."
+            )
+
+
+class TestAgentTestRunnerParseHelpers:
+    """ALWAYS-ON unit tests for the source-scan parser, driven by synthetic
+    source strings (no agent/src required). Demonstrates the scan catches drift
+    and fails loudly on a parse miss — mirroring ``TestSrCategoryParityHelper``.
+    """
+
+    def test_reconstructs_command_from_literal(self):
+        synthetic = (
+            "runners.push({ cmd: 'python3', args: ['-m', 'pytest'], cwd: W, "
+            "label: 'pytest (root)' });"
+        )
+        assert _reconstruct_agent_commands(synthetic) == {"python3 -m pytest"}
+
+    def test_reconstructs_command_with_empty_args(self):
+        synthetic = "return { cmd: 'vendor/bin/phpunit', args: [], cwd: d, label: x };"
+        assert _reconstruct_agent_commands(synthetic) == {"vendor/bin/phpunit"}
+
+    def test_dynamic_arg_runner_drops_unquoted_variable(self):
+        """A ``[script]`` loop-variable arg yields just the bare command — proving
+        the shell family genuinely needs its script-list assertion."""
+        synthetic = "runners.push({ cmd: 'bash', args: [script], cwd: W, label: l });"
+        assert _reconstruct_agent_commands(synthetic) == {"bash"}
+
+    def test_reconstruct_raises_on_parse_miss(self):
+        with pytest.raises(ValueError, match="No `cmd:"):
+            _reconstruct_agent_commands("// no runner literals here\nconst x = 1;")
+
+    def test_extract_extra_family_region_raises_on_missing_anchor(self):
+        with pytest.raises(ValueError, match="detectExtraFamilyRunner"):
+            _extract_extra_family_region("export function detectTestRunners() {}")
+
+    def test_extract_extra_family_region_raises_on_missing_terminator(self):
+        with pytest.raises(ValueError, match="return null;"):
+            _extract_extra_family_region(
+                "const detectExtraFamilyRunner = (absDir, label) => { return foo; }"
+            )
+
+    def test_scan_catches_changed_command(self):
+        """A drifted agent command (mvn verify) is absent from the reconstructed
+        set, so the family check would flag it."""
+        synthetic = "return { cmd: 'mvn', args: ['verify'], cwd: d, label: x };"
+        agent_commands = _reconstruct_agent_commands(synthetic)
+        assert "mvn test" not in agent_commands
+        assert "mvn verify" in agent_commands
+
+    def test_scan_catches_new_extra_family(self):
+        """A new divergent family with no table entry is surfaced as an orphan."""
+        region = (
+            "detectExtraFamilyRunner = (absDir, label) => {\n"
+            "  if (has('build.sbt')) return { cmd: 'sbt', args: ['test'], "
+            "cwd: absDir, label: l };\n"
+            "  return null;\n};"
+        )
+        body = _extract_extra_family_region(region)
+        orphans = _reconstruct_agent_commands(body) - set(
+            AGENT_TEST_RUNNER_COMMANDS.values()
+        )
+        assert orphans == {"sbt test"}
+
+    def test_extract_classifier_region_raises_on_missing_anchor(self):
+        with pytest.raises(ValueError, match="classifyTestExecution"):
+            _extract_classifier_region("export function detectTestRunners() {}")
+
+    def test_extract_classifier_region_raises_on_missing_return(self):
+        with pytest.raises(ValueError, match="return 'ran'"):
+            _extract_classifier_region(
+                "export function classifyTestExecution(output: string) { "
+                "return 'no_tests'; }"
+            )
+
+    def test_classifier_region_contains_missing_command_check(self):
+        """A synthetic classifier region with the correct pattern passes."""
+        synthetic = (
+            "export function classifyTestExecution(output: string) {\n"
+            "  const missingCommand = /\\bcommand\\b(?:\\s+(?:\"[^\"]*\"|'[^']*'|\\S+))?\\s+not\\s+found\\b/i;\n"
+            "  if (lines.some(line => missingCommand.test(line))) return 'no_tests';\n"
+            "  return 'ran';\n}"
+        )
+        region = _extract_classifier_region(synthetic)
+        assert "missingCommand" in region
+        assert ".some(line => missingCommand.test(line))" in region
+        assert r"\bcommand\b" in region

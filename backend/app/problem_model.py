@@ -346,6 +346,23 @@ SELF_REFLECTION_LOG_MAX = 20
 """Cap on project.self_reflection_log length — older entries are dropped."""
 
 
+GAP_HISTORY_DURABLE_MAX = 200
+"""Cap on a surviving gap's durable ``history`` after write-back restore.
+
+The strategic payload trims each active gap's ``history`` to only its most
+recent few entries before the agent ever sees it (see
+``strategic_spawning._GAP_HISTORY_KEEP``); :func:`_merge_gap`
+unions the durable head back in on write-back so a round-tripped trimmed view
+cannot truncate the log. This cap keeps the restored, append-only log bounded
+in the JSONB column — generous (far above the payload trim) so it never loses
+recent memory, but finite so it cannot grow without limit."""
+
+
+GAP_PAST_MOVES_DURABLE_MAX = 200
+"""Cap on a surviving gap's durable ``past_moves`` after write-back restore —
+see :data:`GAP_HISTORY_DURABLE_MAX`."""
+
+
 class SelfReflectionEntry(BaseModel):
     """Agent-written reflection about what was hard this cycle.
 
@@ -533,6 +550,15 @@ def _diff_summary(diff: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Note: the former ``ColdStartWipeError`` / ``_is_bootstrap_over_mature`` guard
+# (which hard-rejected a bootstrap-over-mature write) was removed when the
+# agent-owned collections moved to a non-destructive merge (main #7449). Under
+# merge semantics a trimmed or dropped payload can no longer wipe by omission —
+# omitted/empty collections are simply preserved — so the reject path is
+# redundant. Intentional removal is now explicit via the ``_deletions`` directive
+# in :func:`apply_agent_update`.
+
+
 # ---------------------------------------------------------------------------
 # User-editable intent updates
 # ---------------------------------------------------------------------------
@@ -581,6 +607,21 @@ def apply_user_intent_patch(
     merged = current.model_dump()
     merged.update(patch)
     validated = ProblemModel.model_validate(merged)
+    # When the patch carries ``intent``, the shallow merge replaced the whole
+    # intent object — dropping whatever ``source`` was previously stamped (e.g.
+    # the onboarding ``user_message`` provenance). Re-stamp operator authorship
+    # so the operator-wins protection (_preserve_operator_intent /
+    # _merge_operator_owned_fields, which gate on
+    # ``intent.source.type == 'user_message'``) keeps guarding the edited
+    # purpose against the next strategic cycle. A blanked purpose clears the
+    # source so an empty operator intent is not spuriously protected. Patches
+    # that omit ``intent`` (e.g. onboarding's context/constraints-only steering,
+    # which sets its own message_id-bearing source directly) are left untouched.
+    if "intent" in patch:
+        purpose = (validated.intent.purpose or "").strip()
+        validated.intent.source = (
+            Source(type="user_message", excerpt=purpose[:120]) if purpose else None
+        )
     validated.revision = current.revision + 1
     validated.last_updated = now_iso
     validated.last_updated_by = "user"
@@ -646,6 +687,34 @@ def _preserve_operator_intent(current: ProblemModel, proposed: ProblemModel) -> 
         proposed.context = current.context.model_copy(deep=True)
     if operator_owned and current.constraints and not proposed.constraints:
         proposed.constraints = list(current.constraints)
+
+
+def operator_owned_subset(raw: dict | None) -> dict[str, Any]:
+    """Extract the operator-owned subset (:data:`USER_EDITABLE_FIELDS`) from a
+    raw problem-model dict as a merge *ancestor*.
+
+    Returns ``{"intent": {"purpose": ...}, "context": {...}, "constraints": [...]}``
+    — the only three fields :func:`_merge_operator_owned_fields` reads off its
+    ``baseline`` argument. Tolerates extra/agent-owned keys (e.g. a ``_deletions``
+    directive or the full agent collections) so it can be handed the agent's raw
+    *pre-merge* proposal, and round-trips through :func:`parse_problem_model`.
+
+    Used by the ``set_problem_model`` write paths to remember the agent's own
+    last proposed operator-owned values per cycle, so a *second* same-cycle agent
+    write reconciles against the agent's prior proposal — not the cycle-start
+    snapshot — and is no longer misread as a mid-cycle operator edit. A genuine
+    operator edit (which moves ``current`` away from the agent's stored proposal)
+    still wins, because the merge keys on ``current != baseline``.
+    """
+    raw = raw or {}
+    intent = raw.get("intent") if isinstance(raw.get("intent"), dict) else {}
+    context = raw.get("context") if isinstance(raw.get("context"), dict) else {}
+    constraints = raw.get("constraints")
+    return {
+        "intent": {"purpose": str((intent or {}).get("purpose") or "")},
+        "context": dict(context or {}),
+        "constraints": list(constraints) if isinstance(constraints, list) else [],
+    }
 
 
 def _merge_operator_owned_fields(
@@ -828,10 +897,17 @@ def _upsert_by_key(
 def _merge_gap(current: Gap, proposed: Gap) -> Gap:
     """Upsert one gap: proposed wins for every field EXCEPT the append-only
     logs (``history``, ``past_moves``), which union current+proposed so a
-    trimmed tail echoed back by the agent cannot truncate the full record."""
+    trimmed tail echoed back by the agent cannot truncate the full record. The
+    unioned logs are bounded by :data:`GAP_HISTORY_DURABLE_MAX` /
+    :data:`GAP_PAST_MOVES_DURABLE_MAX` (oldest entries roll off) so the JSONB
+    column cannot grow without limit across cycles."""
     merged = proposed.model_copy(deep=True)
-    merged.history = _merge_append_log(current.history, proposed.history)
-    merged.past_moves = _merge_append_log(current.past_moves, proposed.past_moves)
+    merged.history = _merge_append_log(current.history, proposed.history)[
+        -GAP_HISTORY_DURABLE_MAX:
+    ]
+    merged.past_moves = _merge_append_log(current.past_moves, proposed.past_moves)[
+        -GAP_PAST_MOVES_DURABLE_MAX:
+    ]
     return merged
 
 
@@ -884,7 +960,10 @@ def apply_agent_update(
     revision and timestamp, preserves existing ``archived_gaps`` and
     ``revision_log``, carries forward operator-seeded strategic intent the
     agent omitted or blanked (see :func:`_preserve_operator_intent`),
-    auto-archives any gaps that are now closed or abandoned, and appends a
+    restores any append-only per-gap ``history``/``past_moves`` the payload
+    trimmed before the agent saw it (see :func:`_merge_agent_owned_collections`
+    / :func:`_merge_gap`), auto-archives any gaps that are now closed or
+    abandoned, and appends a
     revision-log entry summarizing the change.
 
     Returns a tuple of ``(new_raw_dict, diff_summary)``:
@@ -893,6 +972,11 @@ def apply_agent_update(
 
     Raises :class:`pydantic.ValidationError` if ``proposed_raw`` is malformed.
     Callers should catch and keep the current state on validation failure.
+
+    A trimmed or dropped payload can no longer wipe the durable model: the
+    agent-owned collections merge non-destructively (omitted/empty entries are
+    preserved — see below), so there is no separate bootstrap-over-mature reject
+    path. Intentional removal is explicit via ``_deletions``.
 
     Operator intent is protected, not frozen: a genuine, explicit, non-empty
     agent change to ``intent.purpose`` / ``context`` / ``constraints`` still

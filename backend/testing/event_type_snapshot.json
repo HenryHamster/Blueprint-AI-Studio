@@ -185,6 +185,18 @@
       "classification": "high_signal",
       "message_type": "NOTE",
       "source_fn": "post_version_auto_merge_stall_message"
+    },
+    {
+      "name": "strategic_steering_deferred",
+      "classification": "high_signal",
+      "message_type": "NOTE",
+      "source_fn": "post_strategic_steering_deferred_message"
+    },
+    {
+      "name": "strategic_steering_acted",
+      "classification": "high_signal",
+      "message_type": "NOTE",
+      "source_fn": "post_strategic_steering_acted_message"
     }
   ]
 }

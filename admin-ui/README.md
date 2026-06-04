@@ -1,82 +1,119 @@
-# React + TypeScript + Vite
+# Blueprint Admin UI
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+The admin UI is a React + TypeScript application built with Vite. It provides a dashboard for monitoring Blueprint agents, reviewing autonomous research findings, configuring settings, and viewing analytics in real time.
 
-## Viewport regression tests
+## Architecture
 
-Run `npm run test:viewport` to launch the headless-Chromium suite that
-asserts admin-ui pages render without horizontal overflow at 375px (the
-primary mobile target). The harness is opt-in per page — see
-[`CONTRIBUTING.md`](./CONTRIBUTING.md#viewport-regression-check) for how to
-add a check for a new component in ~5 lines. The default
-`npm run test:run` (jsdom) is unaffected.
+- **Framework:** React 18 + TypeScript
+- **Build tool:** Vite (with HMR for development)
+- **Styling:** Tailwind CSS
+- **Testing:** Vitest + Playwright (viewport regression tests)
+- **Deployment:** Built artifact deployed to Cloud Run alongside the backend
 
-Currently, two official plugins are available:
+## Development Setup
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+```bash
+# Install dependencies (from root of repo)
+npm install
 
-## React Compiler
+# Start dev server (runs on port 3001)
+npm run dev
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+# Build for production
+npm run build
 
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+# Run tests
+npm test                   # jsdom unit tests
+npm run test:viewport      # Chromium viewport regression tests
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+See [../DEVELOPMENT_GUIDE.md](../docs/DEVELOPMENT_GUIDE.md#react) for comprehensive development guidance.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+## Key Features
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+- **Real-time task monitoring** — View agent logs and task status via WebSocket streaming
+- **Autonomous research dashboard** — Track research findings, strategic directions, and autonomous cycles
+- **Project management** — Configure projects, manage GitHub integration, set approval gates
+- **Analytics** — Visualize metrics, cost analysis, and system health
+- **Settings** — Manage team access, LLM providers, warm VM pool configuration, and more
+
+## File Organization
+
+- `src/components/` — React components organized by feature (Task, Settings, Analytics, etc.)
+- `src/hooks/` — Custom React hooks (WebSocket, state management, polling)
+- `src/utils/` — Utility functions (API calls, formatting, time handling)
+- `src/types/` — TypeScript type definitions
+- `src/test/` — Testing utilities (viewport test framework)
+- `public/` — Static assets
+
+## Component Documentation
+
+See [../docs/FRONTEND_COMPONENTS.md](../docs/FRONTEND_COMPONENTS.md) for detailed component reference including:
+- Component props and usage patterns
+- Data hooks (`useAppState`, `usePoller`, `useWebSocket`)
+- Styling conventions (Tailwind CSS)
+- Testing patterns
+
+## API Integration
+
+API calls are in `src/api.ts` and handle:
+- Firebase authentication
+- Request deduplication (in-flight request collapsing)
+- Automatic retries for transient Cloud Run errors (502/503)
+- WebSocket authentication via signed tickets
+
+See [../docs/API_REFERENCE.md](../docs/API_REFERENCE.md) for complete endpoint reference.
+
+## Viewport Regression Tests
+
+The admin-ui runs an opt-in viewport regression suite to ensure pages render without horizontal overflow at mobile widths (375px target).
+
+```bash
+npm run test:viewport      # Run all viewport tests
+npm run test:viewport my-component  # Run specific component
 ```
+
+Tests use the `*.viewport.test.tsx` naming convention and are skipped by the default jsdom suite. See [CONTRIBUTING.md#viewport-regression-check](./CONTRIBUTING.md#viewport-regression-check) for details on adding a test for a new component.
+
+For headless Chromium setup help, see [CONTRIBUTING.md#running-locally-without-system-chromium-libs](./CONTRIBUTING.md#running-locally-without-system-chromium-libs).
+
+## Styling
+
+All styling uses Tailwind CSS. No CSS modules or styled-components.
+
+- Tailwind config: `tailwind.config.js` (at repo root)
+- Common colors, spacing, and responsive utilities documented in component source code
+- Prefer utility classes over custom CSS
+
+## Integration with Backend
+
+The admin-ui communicates with the FastAPI backend (`backend/app/routers/admin_*.py`) for:
+- Project and task data
+- WebSocket log streaming
+- Settings management
+- Analytics data
+- GitHub integration
+
+All backend routes require authentication (Firebase token or API key).
+
+## Contributing
+
+1. Read [CONTRIBUTING.md](./CONTRIBUTING.md) for viewport testing setup
+2. Follow component patterns in `src/components/`
+3. Update `src/types/` when adding new data structures
+4. Run `npm test` and `npm run test:viewport` before committing
+5. See [../CLAUDE.md](../CLAUDE.md) for coding standards
+
+## Troubleshooting
+
+**Module import errors?**
+- Run `npm install` from repo root to ensure hoisted node_modules are available
+
+**Viewport tests fail with missing Chromium?**
+- See [CONTRIBUTING.md#running-locally-without-system-chromium-libs](./CONTRIBUTING.md#running-locally-without-system-chromium-libs)
+
+**WebSocket disconnects?**
+- Check backend is running on correct port (default 8080)
+- Verify `VITE_API_URL` environment variable if not using localhost
+
+See [../DEBUG_GUIDE.md](../docs/DEBUG_GUIDE.md) for more troubleshooting guidance.

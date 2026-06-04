@@ -3862,6 +3862,17 @@ describe('cross-cutting guidance-block fingerprints — structural invariants fo
     expect(SIZE_GUARDRAIL_GUIDANCE).toContain('Size Guardrails Are Advisory');
   });
 
+  it('SIZE_GUARDRAIL_GUIDANCE points at the one-command --fix remediation, not an ad-hoc bump', () => {
+    // The divergent "current_size + 50-100 lines" hand-bump must be gone — it
+    // contradicted the canonical server/checker policy.
+    expect(SIZE_GUARDRAIL_GUIDANCE).not.toContain('50-100 lines');
+    // It must point at the single deterministic fix command (the checker's
+    // --fix mode), which applies the canonical bump policy.
+    expect(SIZE_GUARDRAIL_GUIDANCE).toContain('check_size_limits.py --fix');
+    // Keeps the "bump, don't refactor" framing.
+    expect(SIZE_GUARDRAIL_GUIDANCE).toContain('Bump, Don\'t Refactor');
+  });
+
   it('PRIOR_ATTEMPT_DIVERGENCE contains section header fingerprint', () => {
     expect(PRIOR_ATTEMPT_DIVERGENCE).toContain("If You're Retrying");
   });

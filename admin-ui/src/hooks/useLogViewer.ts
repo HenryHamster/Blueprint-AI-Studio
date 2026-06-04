@@ -6,11 +6,13 @@ import { API_BASE_URL, authHeaders, fetchTask } from '../api';
 interface UseLogViewerDeps {
   fetchTasksRef: React.MutableRefObject<() => void>;
   setDeployState: (ds: DeployState) => void;
+  fetchDirectionsRef?: React.MutableRefObject<() => void>;
+  selectedProjectId?: string | null;
 }
 
 let _trackLogIdCounter = 0;
 
-export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps) {
+export function useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, selectedProjectId }: UseLogViewerDeps) {
   const [logTask, setLogTask] = useState<Task | null>(null);
   const [logLines, setLogLines] = useState<string[]>([]);
   const [logsConnecting, setLogsConnecting] = useState(false);
@@ -18,11 +20,14 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
   const [wsDisconnectReason, setWsDisconnectReason] = useState<string | null>(null);
   const [wsConnected, setWsConnected] = useState(false);
   const [pipelineThrottle, setPipelineThrottle] = useState<{ reason: string; detail: string; recovery_seconds: number | null } | null>(null);
+  // Lightweight "strategist is working" indicator, toggled by strategic_cycle_started/completed events.
+  const [strategistActive, setStrategistActive] = useState(false);
   const pipelineThrottleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const wsReconnectAttemptRef = useRef<number>(0);
   const wsReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fetchTasksDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fetchDirectionsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsPingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastPongRef = useRef<number>(0);
   const wsPongTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -49,6 +54,14 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
     }
   }, [logTask, logTask?.status]);
 
+  // Client-side safety net: strategistActive is hook-global (not per-project),
+  // so a stale "working" state from a previous project must not bleed onto the
+  // newly-selected project's directions panel. Reset it whenever the selected
+  // project changes; the project's own strategic_cycle_started will re-arm it.
+  useEffect(() => {
+    setStrategistActive(false);
+  }, [selectedProjectId]);
+
   // Clean up WebSocket and timers on unmount
   useEffect(() => {
     return () => {
@@ -64,6 +77,12 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
       }
       if (pipelineThrottleTimerRef.current) {
         clearTimeout(pipelineThrottleTimerRef.current);
+      }
+      if (fetchTasksDebounceRef.current) {
+        clearTimeout(fetchTasksDebounceRef.current);
+      }
+      if (fetchDirectionsDebounceRef.current) {
+        clearTimeout(fetchDirectionsDebounceRef.current);
       }
     };
   }, []);
@@ -165,10 +184,26 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
         if (fetchTasksDebounceRef.current) clearTimeout(fetchTasksDebounceRef.current);
         fetchTasksDebounceRef.current = setTimeout(() => { fetchTasksRef.current(); }, 500);
       }
+
+      // Strategist activity events — drive a live refresh of the directions view.
+      // These only trigger refetches (the data still comes from the REST endpoints);
+      // event payloads are never applied directly as state.
+      const refetchDirections = () => {
+        if (fetchDirectionsDebounceRef.current) clearTimeout(fetchDirectionsDebounceRef.current);
+        fetchDirectionsDebounceRef.current = setTimeout(() => { fetchDirectionsRef?.current?.(); }, 500);
+      };
+      if (msg.event === 'strategic_updated') {
+        refetchDirections();
+      } else if (msg.event === 'strategic_cycle_started') {
+        setStrategistActive(true);
+      } else if (msg.event === 'strategic_cycle_completed') {
+        setStrategistActive(false);
+        refetchDirections();
+      }
     } catch {
       // ignore parse errors
     }
-  }, [appendTrackLog, setDeployState, fetchTasksRef]);
+  }, [appendTrackLog, setDeployState, fetchTasksRef, fetchDirectionsRef]);
 
   const connectWs = useCallback(async (projectId: string) => {
     try {
@@ -197,6 +232,11 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
         setLogsConnecting(false);
         setWsDisconnected(false);
         wasConnected = true;
+        // Client-side safety net: clear any stale "strategist working" state on
+        // (re)connect. If a strategic_cycle_completed was dropped while the WS
+        // was down, the indicator would otherwise stick on; a fresh cycle will
+        // re-emit strategic_cycle_started.
+        setStrategistActive(false);
         // Add system log for all tracked tasks
         for (const tid of trackedTaskIdsRef.current) {
           appendTrackLog(tid, 'system', 'Stream connected');
@@ -399,6 +439,7 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
     handleViewLogs, closeLogViewer,
     wsRef, wsConnected,
     pipelineThrottle,
+    strategistActive,
     // Tracking
     trackedTaskIds, trackedLogs, trackTask, untrackTask, untrackAll,
   };

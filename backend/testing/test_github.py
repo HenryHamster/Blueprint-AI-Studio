@@ -1718,6 +1718,7 @@ async def test_pr_merged_on_integration_triggers_build_config_refresh(
     assert resp.status_code == 200
     refresh_mock.assert_awaited_once()
     assert refresh_mock.await_args.args[0].id == project.id
+    assert refresh_mock.await_args.kwargs.get("ref") == "main"
 
 
 @pytest.mark.asyncio
@@ -2473,6 +2474,48 @@ async def test_check_run_no_matching_tasks_returns_no_match(client, db_session, 
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "no_match"
+
+
+@pytest.mark.asyncio
+async def test_check_run_success_on_integration_branch_refreshes_build_config(
+    client, db_session, mocker
+):
+    """A successful non-PR integration-branch landing still attempts the
+    empty-build_config refresh and keeps the webhook non-blocking."""
+    from app.models import Project
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    refresh_mock = mocker.patch(
+        "app.build_config_detection.maybe_refresh_empty_build_config",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    project = Project(
+        name="Integration landing refresh",
+        user_id="user1",
+        github_owner="landingorg",
+        github_repo="landingrepo",
+        integration_branch="main",
+        build_config={"repo_is_empty": True},
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    payload_bytes = _make_check_run_payload(
+        "landingorg",
+        "landingrepo",
+        "successsha123",
+        conclusion="success",
+        head_branch="main",
+    )
+    resp = await _post_webhook(client, payload_bytes, "check_run")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "no_match"
+    refresh_mock.assert_awaited_once()
+    assert refresh_mock.await_args.args[0].id == project.id
+    assert refresh_mock.await_args.kwargs.get("ref") == "main"
 
 
 @pytest.mark.asyncio
@@ -3980,3 +4023,133 @@ async def test_get_file_content_at_ref_request_error_is_indeterminate(mocker):
     )
     assert exists is None
     assert line_count is None
+
+
+# ── get_file_text_at_ref / commit_file_changes (Git Data API) ───────────────
+
+
+@pytest.mark.asyncio
+async def test_get_file_text_at_ref_decodes_200(mocker):
+    import base64
+    from app.github import get_file_text_at_ref
+
+    body = "EXPECTED_SCHEMA_REVISION = \"0137\"\n"
+    encoded = base64.b64encode(body.encode()).decode()
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(200, {"type": "file", "content": encoded}),
+    )
+    text = await get_file_text_at_ref(
+        "backend/app/main.py", token="t", owner="o", repo="r", ref="b"
+    )
+    assert text == body
+
+
+@pytest.mark.asyncio
+async def test_get_file_text_at_ref_404_returns_none(mocker):
+    from app.github import get_file_text_at_ref
+
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(404, {"message": "Not Found"}),
+    )
+    assert (
+        await get_file_text_at_ref("x.py", token="t", owner="o", repo="r", ref="b")
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_file_text_at_ref_non_200_returns_none(mocker):
+    from app.github import get_file_text_at_ref
+
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(500, {"message": "boom"}),
+    )
+    assert (
+        await get_file_text_at_ref("x.py", token="t", owner="o", repo="r", ref="b")
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_commit_file_changes_happy_path(mocker):
+    from app.github import commit_file_changes
+
+    req = mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            MockResponse(200, {"object": {"sha": "tip"}}),       # get-ref
+            MockResponse(200, {"tree": {"sha": "basetree"}}),     # get-commit
+            MockResponse(201, {"sha": "blob1"}),                  # create-blob
+            MockResponse(201, {"sha": "newtree"}),                # create-tree
+            MockResponse(201, {"sha": "newcommit"}),              # create-commit
+            MockResponse(200, {}),                                # update-ref
+        ],
+    )
+    sha = await commit_file_changes(
+        "t", "o", "r", "staging",
+        upserts={"backend/app/main.py": "X = 1\n"},
+        deletes=[],
+        message="msg",
+    )
+    assert sha == "newcommit"
+    # create-tree (4th call) payload should reference the base tree + new blob.
+    tree_call = req.call_args_list[3]
+    tree_json = tree_call.kwargs["json"]
+    assert tree_json["base_tree"] == "basetree"
+    assert tree_json["tree"][0]["sha"] == "blob1"
+
+
+@pytest.mark.asyncio
+async def test_commit_file_changes_delete_uses_sha_null(mocker):
+    from app.github import commit_file_changes
+
+    req = mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            MockResponse(200, {"object": {"sha": "tip"}}),
+            MockResponse(200, {"tree": {"sha": "basetree"}}),
+            MockResponse(201, {"sha": "blob1"}),
+            MockResponse(201, {"sha": "newtree"}),
+            MockResponse(201, {"sha": "newcommit"}),
+            MockResponse(200, {}),
+        ],
+    )
+    await commit_file_changes(
+        "t", "o", "r", "staging",
+        upserts={"backend/alembic/versions/0138_new.py": "src"},
+        deletes=["backend/alembic/versions/0137_new.py"],
+        message="rename",
+    )
+    tree_json = req.call_args_list[3].kwargs["json"]
+    entries = {e["path"]: e["sha"] for e in tree_json["tree"]}
+    assert entries["backend/alembic/versions/0138_new.py"] == "blob1"
+    # The deleted path is an explicit null-sha entry (Git Data API deletion).
+    assert "backend/alembic/versions/0137_new.py" in entries
+    assert entries["backend/alembic/versions/0137_new.py"] is None
+
+
+@pytest.mark.asyncio
+async def test_commit_file_changes_raises_on_bad_status(mocker):
+    from app.github import commit_file_changes
+
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            MockResponse(200, {"object": {"sha": "tip"}}),
+            MockResponse(404, {"message": "Not Found"}),  # get-commit fails
+        ],
+    )
+    with pytest.raises(RuntimeError):
+        await commit_file_changes(
+            "t", "o", "r", "staging",
+            upserts={"f.py": "x"}, deletes=[], message="m",
+        )

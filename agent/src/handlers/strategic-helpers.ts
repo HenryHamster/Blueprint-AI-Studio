@@ -82,7 +82,8 @@ function generateFetchScript(projectIdRaw: string): string {
   return `#!/bin/bash
 # Strategic-context fetch tool — pull detail for items the packer trimmed.
 # Reads ORCHESTRATOR_URL, AGENT_API_TOKEN from env. project_id is baked in.
-KIND="\${1:?Usage: fetch direction|playbook|gap <id>  OR  fetch problem-model}"
+KIND="\${1:?Usage: fetch problem-model|direction|playbook|gap [id]}"
+ID="\${2:-}"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 PROJECT="${projectId}"
@@ -90,12 +91,17 @@ PROJECT="${projectId}"
 
 # problem-model takes no id; everything else requires one.
 case "$KIND" in
-  problem-model) PATH_SUFFIX="problem_model" ;;
-  direction)  ID="\${2:?Usage: fetch direction <id>}"; PATH_SUFFIX="directions/$ID" ;;
-  playbook)   ID="\${2:?Usage: fetch playbook <id>}"; PATH_SUFFIX="playbook/$ID" ;;
-  gap)        ID="\${2:?Usage: fetch gap <id>}"; PATH_SUFFIX="gaps/$ID" ;;
-  *) echo "Unknown kind: $KIND (use direction|playbook|gap <id> or problem-model)" >&2; exit 1 ;;
+  problem-model) PATH_SUFFIX="problem-model" ;;
+  direction)  PATH_SUFFIX="directions/$ID" ;;
+  playbook)   PATH_SUFFIX="playbook/$ID" ;;
+  gap)        PATH_SUFFIX="gaps/$ID" ;;
+  *) echo "Unknown kind: $KIND (use problem-model|direction|playbook|gap)" >&2; exit 1 ;;
 esac
+
+if [ "$KIND" != "problem-model" ] && [ -z "$ID" ]; then
+  echo "[ERROR] fetch $KIND requires an id argument" >&2
+  exit 1
+fi
 
 curl -sS --max-time 20 --connect-timeout 10 \\
   -X GET "$API/api/agent/projects/$PROJECT/$PATH_SUFFIX" \\

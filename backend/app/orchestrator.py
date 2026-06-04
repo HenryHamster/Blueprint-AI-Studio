@@ -339,6 +339,15 @@ _last_type_throttle_broadcast: dict[str, float] = {}
 _last_type_unthrottle_broadcast: dict[str, float] = {}
 _previously_failing_types: set[str] = set()
 
+# No-CI merge gate: how many times a CRASHED verify_tests task (FAILED/CANCELLED,
+# or COMPLETED with no usable verdict artifact) may be re-spawned before the gate
+# falls open to an UNVERIFIED merge. A crashed verify task is most often transient
+# infra noise (a failed cold clone of the PR head), so one retry recovers the
+# common flake; the hard cap precludes any re-spawn loop. A genuine
+# detected=false verdict (a suite that ran and found nothing) is NOT a crash and
+# never retries — it falls open immediately, as before.
+_VERIFY_TESTS_MAX_RETRIES = 1
+
 # Debounce: fire the all-accounts-blocked alert once per stall episode.
 # Reset when any task dispatches successfully (stall resolved), then re-arm
 # if every eligible task is again blocked by account rate limits.
@@ -723,7 +732,10 @@ async def _persist_deps_satisfied(task: Task) -> None:
 
 from app.orchestrator_health import (
     _check_candidate_task_deps,
+    _effective_dep_task,
+    ensure_dependent_base_recut,
     get_confirmed_down_critical_deps,
+    recut_landed_cross_base_dependents,
 )
 
 
@@ -968,6 +980,28 @@ async def _mark_unblocked_dependents(completed_task: Task, verify_pr_merged) -> 
                 d, dep_tasks, du, dep_session, verify_pr_merged
             )
             if result_str == "eligible":
+                # A dependent unblocked by a cross-rollup code-dependency landing
+                # must have its base re-cut from current integration BEFORE it is
+                # marked warm-claimable — otherwise a warm VM could claim it via
+                # the _deps_satisfied marker and run against a base missing the
+                # landed code, bypassing the dispatch-loop re-cut. Reuse the same
+                # re-cut; skip the marker (keep holding) if it can't complete.
+                # Resolve effective (remap-following) dep rows first so a
+                # requeue-cancelled-and-replaced cross-base code-dependency is
+                # recognized as landed — otherwise the CANCELLED original is
+                # skipped by _has_landed_cross_base_code_dep and no re-cut fires,
+                # leaving the dependent stamped against a base missing the
+                # replacement's landed code (mirrors the dispatch loop and
+                # recut_landed_cross_base_dependents).
+                from app.orchestrator_health import ensure_dependent_base_recut
+
+                effective_dep_tasks = [
+                    await _effective_dep_task(dt, dep_session) for dt in dep_tasks
+                ]
+                if not await ensure_dependent_base_recut(
+                    d, effective_dep_tasks, dep_session
+                ):
+                    continue
                 eligible_ids.append(d.id)
     if not eligible_ids:
         return 0
@@ -1928,6 +1962,36 @@ async def orchestrator_worker():
                             )
                             _entry["count"] += _cancelled_count
                     elif all_met:
+                        # A cross-base GENUINE code-dependent must run against a
+                        # base that provably contains its landed dependency's
+                        # code, so re-cut its staging/rollup base from current
+                        # integration BEFORE stamping the warm-claim marker.
+                        # Stamping _deps_satisfied makes the task warm-claimable
+                        # via the /next-role backlog scan; if we stamped first and
+                        # the re-cut then conflicted/errored, a warm VM could claim
+                        # and dispatch it against a base MISSING the landed code
+                        # (the exact invariant this guards). Resolve effective
+                        # (remap-following) dep rows so a requeue-replaced
+                        # dependency is recognized as landed. No-op for tasks with
+                        # no landed cross-base code-dep (returns True immediately).
+                        effective_dep_tasks = [
+                            await _effective_dep_task(dt, session)
+                            for dt in dep_tasks
+                        ]
+                        if not await ensure_dependent_base_recut(
+                            task, effective_dep_tasks, session
+                        ):
+                            # Re-cut required but incomplete (merge conflict /
+                            # transient GitHub error) — keep HOLDING: do not stamp
+                            # the marker and do not dispatch. The task stays QUEUED
+                            # and is retried next cycle (a persistent conflict
+                            # surfaces for a fix task / operator).
+                            logger.warning(
+                                "[CROSS-BASE] Holding dependent %s — base re-cut "
+                                "incomplete; not marking warm-claimable",
+                                task.id,
+                            )
+                            continue
                         # Durably stamp the sticky readiness marker so the cheap
                         # /next-role warm-backlog scan and the dispatch
                         # first-refusal hold can treat this dependency-bearing
@@ -2113,6 +2177,18 @@ async def orchestrator_worker():
                             f"[ORCHESTRATOR] Deadlock resolution cycle complete: "
                             f"{narrow_broken} narrow + {broad_broken} broad = {total_broken} deadlock(s) broken"
                         )
+
+                # Step 2.45: Re-cut held cross-rollup code-dependents' bases from
+                # current integration. A dependent held until its genuine
+                # cross-base code-dependency landed must run against a base that
+                # provably contains that landed code; this merges integration
+                # into the dependent's staging/rollup base (preserving the rollup
+                # model). A dependent whose re-cut conflicts or errors is dropped
+                # from this cycle's eligible set so it never dispatches against a
+                # base missing its dependency's code — it stays QUEUED and retries.
+                eligible_ids = await recut_landed_cross_base_dependents(
+                    eligible_ids, candidate_tasks, _dep_by_id, session
+                )
 
                 # Step 2.5: File-conflict check — defer tasks that would conflict with in-progress work
                 eligible_ids = await filter_file_conflicts(
@@ -3089,7 +3165,14 @@ async def orchestrator_worker():
                         # Recorded only when the pool feature is on so the funnel
                         # denominator reflects the period the pool was actually live.
                         if is_warm_pool_enabled():
-                            record_pool_cold_dispatch()
+                            # Attribute the cold dispatch to the same resolved
+                            # account as the lease hit/miss recorded earlier in
+                            # this iteration so the per-account funnel
+                            # denominator reconciles with fleet totals. When
+                            # selection fell back to env credentials account_id
+                            # is None and the cold dispatch buckets under the
+                            # unattributed account, exactly as before.
+                            record_pool_cold_dispatch(account_id)
                     except Exception as e:
                         import traceback
 
@@ -4816,6 +4899,11 @@ async def orchestrator_worker():
                         # consumed in the locked block after the re-acquire below.
                         _no_ci_verify_gate = False
                         _no_ci_verify_base = ""
+                        # When a no-CI merge proceeds UNVERIFIED (immediate-pass
+                        # or undetected verify-verdict), record WHY so the
+                        # merge-confirmed block in handle_ci_completion can raise
+                        # exactly one operator alert. None = verified/normal path.
+                        _unverified_merge_reason = None
 
                         if _rt_cfg.get("ci_resolution_strict_mode", True):
                             from app import ci_resolution
@@ -4922,18 +5010,25 @@ async def orchestrator_worker():
                                                 f"targets internal staging branch "
                                                 f"'{_ci_base_ref}'"
                                             )
+                                            _unverified_merge_reason = (
+                                                "internal_staging_base"
+                                            )
                                         elif not _gate_on:
                                             _ci_reason = (
                                                 "the project declares no CI "
                                                 "(requires_ci_checks=False) and the "
                                                 "no_ci_test_gate kill-switch is off"
                                             )
+                                            _unverified_merge_reason = "kill_switch_off"
                                         else:
                                             _ci_reason = (
                                                 "the project declares no CI "
                                                 "(requires_ci_checks=False) and no "
                                                 "test command is detectable — merging "
                                                 "UNVERIFIED"
+                                            )
+                                            _unverified_merge_reason = (
+                                                "no_detectable_test_command"
                                             )
                                         logger.info(
                                             f"[CI] PR #{ci_pr_number} has 0 check-runs and "
@@ -5030,24 +5125,15 @@ async def orchestrator_worker():
                             if _v_recorded in ("pass", "undetected"):
                                 # Verdict already obtained on a prior poll —
                                 # proceed (idempotent until the merge lands).
-                                ci_result = {
-                                    "status": "completed",
-                                    "conclusion": "success",
-                                    "details": [],
-                                    "failed_logs": "",
-                                }
+                                ci_result = ci_resolution.build_no_ci_gate_ci_result(
+                                    _v_recorded
+                                )
                             elif _v_recorded == "fail":
                                 # Already classified failed — belt-and-suspenders
                                 # if we re-enter before ci_fix_spawned is set.
-                                ci_result = {
-                                    "status": "completed",
-                                    "conclusion": "failure",
-                                    "details": [],
-                                    "failed_logs": ci_loop.get(
-                                        "verify_tests_output",
-                                        "Detected test suite failed.",
-                                    ),
-                                }
+                                ci_result = ci_resolution.build_no_ci_gate_ci_result(
+                                    "fail", ci_loop.get("verify_tests_output", "")
+                                )
                             elif not _v_task_id:
                                 # First encounter: spawn verify_tests on PR head.
                                 _v_branch = _resolve_ci_fix_branch(
@@ -5072,6 +5158,9 @@ async def orchestrator_worker():
                                 _v_orig = ci_loop.get(
                                     "original_task_id", ""
                                 ) or ci_task.first_payload.get("original_task_id", "")
+                                _v_attempt = int(
+                                    ci_loop.get("verify_tests_retries", 0) or 0
+                                )
                                 _verify_task, _ = await _spawn_pipeline_task(
                                     ci_task,
                                     "verify_tests",
@@ -5081,6 +5170,7 @@ async def orchestrator_worker():
                                     _no_ci_verify_base,
                                     original_task_id=_v_orig,
                                     suppress_warm_handoff=True,
+                                    attempt=_v_attempt,
                                 )
                                 # _spawn_pipeline_task commits internally — re-lock
                                 # the parent before mutating it.
@@ -5182,6 +5272,9 @@ async def orchestrator_worker():
                                     )
                                     continue
                                 # Terminal — read the latest verdict artifact.
+                                # Only a COMPLETED verify task carries a usable
+                                # verdict; a FAILED/CANCELLED one is treated as a
+                                # crash (``_verdict`` stays None → crash-retry).
                                 _verdict = None
                                 if _verify_task.status == TaskStatus.COMPLETED:
                                     _verdict = await _latest_artifact_logs(
@@ -5189,24 +5282,147 @@ async def orchestrator_worker():
                                         _verify_task.id,
                                         ArtifactType.MERGE_TEST_RESULT,
                                     )
+                                # Peek (does NOT feed the verdict): a FAILED
+                                # verify task that posted setupFailed=true could
+                                # not run an EXISTING suite due to infra (dep
+                                # install / runner spawn), distinct from a cold
+                                # clone crash. Used only to label an
+                                # exhausted-retry UNVERIFIED merge for operators.
+                                _verify_setup_failed = False
+                                if _verify_task.status == TaskStatus.FAILED:
+                                    _failed_artifact = (
+                                        await _latest_artifact_logs(
+                                            session,
+                                            _verify_task.id,
+                                            ArtifactType.MERGE_TEST_RESULT,
+                                        )
+                                    )
+                                    _verify_setup_failed = bool(
+                                        isinstance(_failed_artifact, dict)
+                                        and _failed_artifact.get("setupFailed")
+                                    )
                                 _outcome, _detail = (
                                     ci_resolution.classify_merge_test_verdict(
                                         _verdict
                                     )
                                 )
+                                # Crash vs. genuinely-undetected split. A FAILED/
+                                # CANCELLED verify task — or a COMPLETED one that
+                                # posted no usable verdict artifact (``_verdict``
+                                # is None) — did not actually run the suite: this
+                                # is transient infra noise (most often a failed
+                                # cold clone of the PR head). Re-spawn once before
+                                # failing open. A detected=false verdict (a suite
+                                # that ran and found nothing — ``_verdict`` is a
+                                # dict) is NOT a crash and falls open immediately.
+                                _is_verify_crash = (
+                                    _outcome == "undetected" and _verdict is None
+                                )
+                                _verify_retries = int(
+                                    ci_loop.get("verify_tests_retries", 0) or 0
+                                )
+                                if (
+                                    _is_verify_crash
+                                    and _verify_retries < _VERIFY_TESTS_MAX_RETRIES
+                                ):
+                                    # Clear the crashed task id + verdict so the
+                                    # ``not _v_task_id`` branch re-spawns next
+                                    # poll (with attempt=verify_tests_retries for a
+                                    # distinct idempotency key).
+                                    ci_loop["verify_tests_retries"] = (
+                                        _verify_retries + 1
+                                    )
+                                    ci_loop.pop("verify_tests_task_id", None)
+                                    ci_loop.pop("verify_tests_verdict", None)
+                                    logger.warning(
+                                        f"[CI] PR #{ci_pr_number} no-CI merge gate: "
+                                        f"verify_tests {_v_task_id[:8]} crashed "
+                                        f"(status={_verify_task.status}, no verdict "
+                                        f"artifact) — re-spawning "
+                                        f"(retry {_verify_retries + 1}/"
+                                        f"{_VERIFY_TESTS_MAX_RETRIES}) before "
+                                        f"failing open"
+                                    )
+                                    ci_loop["ci_poll_interval"] = _v_poll_interval
+                                    ci_loop["ci_last_polled"] = (
+                                        _utcnow().isoformat()
+                                    )
+                                    ci_loop["head_sha"] = ci_head_sha
+                                    ci_task.latest_status_message = (
+                                        f"PR #{ci_pr_number} — verify_tests crashed, "
+                                        f"retrying detected-test gate "
+                                        f"({_verify_retries + 1}/"
+                                        f"{_VERIFY_TESTS_MAX_RETRIES})"
+                                    )
+                                    ci_task.context = {
+                                        **(ci_task.context or {}),
+                                        "review_loop": ci_loop,
+                                    }
+                                    flag_modified(ci_task, "context")
+                                    session.add(ci_task)
+                                    await session.commit()
+                                    await broadcast_to_project(
+                                        str(ci_task.project_id),
+                                        "task_updated",
+                                        {
+                                            "task_id": str(ci_task.id),
+                                            "status": ci_task.status,
+                                        },
+                                    )
+                                    continue
                                 ci_loop["verify_tests_verdict"] = _outcome
+                                # Auto-heal a stale stored test command: when the
+                                # verify run discovered the stored command was
+                                # stale and ran a real replacement suite, persist
+                                # the corrected per-directory command back into the
+                                # project's build_config so FUTURE merges use it
+                                # instead of re-discovering it every poll. This is
+                                # additive and best-effort — it never alters the
+                                # pass/fail/undetected merge decision and runs
+                                # regardless of the replacement suite's outcome (a
+                                # recovered-but-failing suite still means the stored
+                                # command should be corrected).
+                                if isinstance(_verdict, dict) and _verdict.get(
+                                    "recovered"
+                                ):
+                                    _recovered_dirs = (
+                                        _verdict.get("recovered_directories") or []
+                                    )
+                                    if _recovered_dirs:
+                                        from app.build_config_detection import (
+                                            persist_recovered_test_command,
+                                        )
+
+                                        _recover_proj = await session.get(
+                                            Project, ci_task.project_id
+                                        )
+                                        if _recover_proj is not None:
+                                            _persisted = (
+                                                await persist_recovered_test_command(
+                                                    _recover_proj,
+                                                    session,
+                                                    _recovered_dirs,
+                                                )
+                                            )
+                                            if _persisted:
+                                                ci_loop["recovered_test_command"] = (
+                                                    _recovered_dirs
+                                                )
+                                                logger.info(
+                                                    f"[CI] PR #{ci_pr_number} no-CI "
+                                                    f"merge gate: stored test command "
+                                                    f"was stale — persisted recovered "
+                                                    f"command(s) for "
+                                                    f"{len(_recovered_dirs)} "
+                                                    f"directory(ies) to converge "
+                                                    f"build_config"
+                                                )
                                 if _outcome == "pass":
                                     logger.info(
                                         f"[CI] PR #{ci_pr_number} no-CI merge gate: "
                                         f"detected test suite PASSED — proceeding to "
                                         f"merge (subject to review gate)"
                                     )
-                                    ci_result = {
-                                        "status": "completed",
-                                        "conclusion": "success",
-                                        "details": [],
-                                        "failed_logs": "",
-                                    }
                                 elif _outcome == "fail":
                                     logger.warning(
                                         f"[CI] PR #{ci_pr_number} no-CI merge gate: "
@@ -5214,30 +5430,59 @@ async def orchestrator_worker():
                                         f"merge, spawning fix with failing output"
                                     )
                                     ci_loop["verify_tests_output"] = _detail[:4000]
-                                    ci_result = {
-                                        "status": "completed",
-                                        "conclusion": "failure",
-                                        "details": [],
-                                        "failed_logs": _detail,
-                                    }
                                 else:
-                                    # detected=false or no usable verdict (verify
-                                    # task crashed / produced no artifact): fall
-                                    # back to proceed-without-checks. Absent-tests
-                                    # repos must still progress — merge UNVERIFIED.
+                                    # Fall open to proceed-without-checks (merge
+                                    # UNVERIFIED). Two paths reach here:
+                                    #   - detected=false: a suite ran and found no
+                                    #     runnable command — an absent-tests repo
+                                    #     must still progress.
+                                    #   - crash with retries exhausted: the verify
+                                    #     task never produced a verdict even after
+                                    #     ``_VERIFY_TESTS_MAX_RETRIES`` re-spawns.
+                                    _crash_exhausted = (
+                                        _is_verify_crash
+                                        and _verify_retries
+                                        >= _VERIFY_TESTS_MAX_RETRIES
+                                    )
+                                    # A setup-failure crash (suite exists but
+                                    # could not run) gets a distinct operator
+                                    # reason from a cold-clone crash or a genuine
+                                    # no-suite repo, so the resulting UNVERIFIED
+                                    # merge is diagnosable.
+                                    if _crash_exhausted and _verify_setup_failed:
+                                        _reason_phrase = (
+                                            f"verify_tests setup failed and retries "
+                                            f"exhausted ({_verify_retries}/"
+                                            f"{_VERIFY_TESTS_MAX_RETRIES}) — could "
+                                            f"not run an existing suite"
+                                        )
+                                        _unverified_merge_reason = (
+                                            "verify_setup_failed"
+                                        )
+                                    elif _crash_exhausted:
+                                        _reason_phrase = (
+                                            f"verify_tests crashed and retries "
+                                            f"exhausted ({_verify_retries}/"
+                                            f"{_VERIFY_TESTS_MAX_RETRIES})"
+                                        )
+                                        _unverified_merge_reason = (
+                                            "undetected_runtime"
+                                        )
+                                    else:
+                                        _reason_phrase = "no test command detectable"
+                                        _unverified_merge_reason = (
+                                            "undetected_runtime"
+                                        )
                                     logger.warning(
                                         f"[CI] PR #{ci_pr_number} no-CI merge gate: "
-                                        f"no test command detectable (verify_tests "
-                                        f"{_v_task_id[:8]} status="
+                                        + _reason_phrase
+                                        + f" (verify_tests {_v_task_id[:8]} status="
                                         f"{_verify_task.status}) — merge proceeding "
                                         f"UNVERIFIED"
                                     )
-                                    ci_result = {
-                                        "status": "completed",
-                                        "conclusion": "success",
-                                        "details": [],
-                                        "failed_logs": "",
-                                    }
+                                ci_result = ci_resolution.build_no_ci_gate_ci_result(
+                                    _outcome, _detail
+                                )
                                 # Persist the recorded verdict before
                                 # handle_ci_completion re-reads task.context.
                                 ci_task.context = {
@@ -5341,6 +5586,52 @@ async def orchestrator_worker():
 
                         # CI completed — delegate to shared handler
                         from app.ci_completion import handle_ci_completion
+
+                        # Thread the UNVERIFIED-merge reason (if any) into the
+                        # task context so the merge-confirmed block raises the
+                        # operator alert against an ACTUAL merge — not a merely
+                        # opened gate. flag_modified: nested JSONB dict mutation.
+                        if _unverified_merge_reason:
+                            from sqlalchemy.orm.attributes import flag_modified
+
+                            ci_loop["unverified_merge_reason"] = (
+                                _unverified_merge_reason
+                            )
+                            ci_task.context = {
+                                **(ci_task.context or {}),
+                                "review_loop": ci_loop,
+                            }
+                            flag_modified(ci_task, "context")
+                            session.add(ci_task)
+
+                        # Persist a Project-level record of what the no-CI merge
+                        # gate ACTUALLY did this poll so an operator can tell a
+                        # config that claims tests are gated from one whose live
+                        # path fell open to an UNVERIFIED merge. Only the no-CI
+                        # gate outcomes record here (verify gate ran, or an
+                        # immediate-pass set an unverified reason); normal
+                        # green/red CI leaves both flags falsy and is skipped.
+                        # executed_real_tests is True only when verify_tests
+                        # produced a real pass/fail verdict. Best-effort: the
+                        # helper never raises, so it cannot break the merge path.
+                        if _no_ci_verify_gate or _unverified_merge_reason:
+                            from app import ci_resolution
+
+                            _rt_proj = (
+                                await session.get(Project, ci_task.project_id)
+                                if ci_task.project_id
+                                else None
+                            )
+                            ci_resolution.record_no_ci_gate_runtime(
+                                session,
+                                _rt_proj,
+                                executed_real_tests=(
+                                    ci_loop.get("verify_tests_verdict")
+                                    in ("pass", "fail")
+                                ),
+                                unverified_reason=_unverified_merge_reason,
+                                when=_utcnow(),
+                            )
 
                         logger.info(
                             f"[CI] Poll fallback: CI completed for PR #{ci_pr_number}, processing"

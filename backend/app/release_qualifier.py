@@ -335,9 +335,16 @@ def _load_policy() -> dict[str, Any]:
 
 
 # Terminal task statuses — a qualifier child in any of these has finished
-# (whether it succeeded, failed, or was cancelled).
+# (whether it succeeded, failed, was cancelled, or is BLOCKED on a precondition
+# and so will not progress without intervention). BLOCKED is included so a
+# precondition-blocked qualifier child does not read as perpetually in-flight.
 _TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
-    {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+    {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.BLOCKED,
+    }
 )
 
 

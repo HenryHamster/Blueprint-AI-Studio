@@ -171,7 +171,7 @@ const STATUS_GROUPS: Array<{ key: 'proposed' | 'active' | 'paused' | 'completed'
 
 const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
 
-export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateToTask, selectedProjectId, projects = [] }: { onClose: () => void; addToast: (message: string, type: 'success' | 'error' | 'info') => void; onViewFindings?: (directionId: string) => void; onNavigateToTask?: (taskId: string) => void; selectedProjectId: string | null; projects?: Project[] }) {
+export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateToTask, selectedProjectId, projects = [], fetchDirectionsRef, strategistActive }: { onClose: () => void; addToast: (message: string, type: 'success' | 'error' | 'info') => void; onViewFindings?: (directionId: string) => void; onNavigateToTask?: (taskId: string) => void; selectedProjectId: string | null; projects?: Project[]; fetchDirectionsRef?: React.MutableRefObject<() => void>; strategistActive?: boolean }) {
   // Active tab
   const [activeTab, setActiveTab] = useState<DirectionsTab>('directions');
 
@@ -182,7 +182,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
   const [categoryFilter, setCategoryFilter] = useState<DirectionCategoryFilter>('all');
 
   // All data state + API handlers (+ form / autonomous-config sub-hooks)
-  const data = useDirectionsData({ selectedProjectId, addToast });
+  const data = useDirectionsData({ selectedProjectId, addToast, fetchDirectionsRef });
   const { form, config } = data;
 
   function toggleSection(key: string) {
@@ -225,6 +225,14 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
           runningUpdate={data.runningUpdate}
           triggerCycle={data.triggerCycle}
         />
+
+        {/* Live strategist activity indicator — driven by strategic_cycle_started/completed WS events */}
+        {strategistActive && (
+          <div className="px-5 py-2 border-b border-neutral-800 bg-indigo-950/40 flex items-center gap-2 shrink-0" role="status" aria-live="polite">
+            <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse" aria-hidden="true" />
+            <span className="text-xs text-indigo-300 font-medium">Strategist working…</span>
+          </div>
+        )}
 
         {/* === Directions tab content === */}
         {activeTab === 'directions' && (<>
@@ -373,9 +381,13 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
               projectId={selectedProjectId}
               document={data.runningUpdate}
               acknowledgedAt={data.runningUpdateAckAt}
+              reconciliation={data.runningUpdateReconciliation}
               addToast={addToast}
               onAcknowledged={() => {
                 data.setRunningUpdateAckAt(new Date().toISOString());
+              }}
+              onEdited={(newBody) => {
+                data.setRunningUpdate(newBody);
               }}
             />
           </div>

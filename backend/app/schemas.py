@@ -310,6 +310,15 @@ class BuildConfig(BaseModel):
     stale_branch_prefixes: List[str] | None = None
     protected_branches: List[str] | None = None
     enable_self_improvement: bool = False
+    # Whether this project's PRs must wait for required CI status checks before
+    # merging. Default True preserves CI-gated behavior (like Blueprint's own
+    # repo) for every existing project. An operator can declare
+    # ``requires_ci_checks = False`` for a greenfield/no-CI repository so a
+    # *definitive* absence of checks is treated as 'CI not applicable' instead
+    # of being polled until the merge backstop FAILs the task. This must survive
+    # validation on every write path (onboard, PATCH, re-detect, auto-refresh)
+    # — the merge gate reads it via ``ci_resolution.requires_ci_checks``.
+    requires_ci_checks: bool = True
     # Deterministic empty/near-empty repo signal, computed at onboarding from
     # the already-fetched root + first-level subdirectory listings during
     # build-config detection (see ``admin_onboard._classify_repo_emptiness``).
@@ -324,6 +333,29 @@ class BuildConfig(BaseModel):
     # agree. Default False so pre-existing projects (and any repo with detected
     # source) degrade gracefully.
     repo_is_empty: bool = False
+    # Marker that build-config detection did NOT complete at onboarding time —
+    # set True only when ``_detect_build_config`` returned an empty/falsy result
+    # or raised (a transient GitHub failure: 5xx, rate-limit, network blip, or a
+    # non-200 repo-contents listing). A detection that COMPLETED and genuinely
+    # found no tests sets ``repo_is_empty``/``has_ci`` instead and leaves this
+    # False, so a legitimately test-less repo is distinguishable from one whose
+    # detection never ran. The landing-time ``maybe_refresh_empty_build_config``
+    # treats True as a second re-detect trigger (alongside ``repo_is_empty``);
+    # a successful re-detect drops the marker (it is NOT in the fresh detected
+    # dict and ``apply_operator_build_config_overrides`` does not carry it
+    # forward), so the auto-refresh becomes a no-op once GitHub is reachable.
+    detection_incomplete: bool = False
+    # Tri-state CI-presence signal computed at onboarding/re-detect from the
+    # already-fetched ``.github/workflows`` listing during build-config detection
+    # (see ``admin_onboard._detect_build_config``). True = a GitHub Actions
+    # workflow file was observed; False = the bounded repo walk completed and
+    # found none; None = the read was incomplete/undetected (legacy stored
+    # configs also have None). Surfaced read-only in the UI to warn operators
+    # that a no-CI repo left with ``requires_ci_checks`` ON will stall PRs.
+    # ``model_dump(exclude_none=True)`` drops the key when None so legacy configs
+    # round-trip unchanged. This is detection/guidance only — it never auto-flips
+    # ``requires_ci_checks``.
+    has_ci: bool | None = None
     # Per-project alembic versions directory path. None means "use the project default".
     # NOTE: this single string feeds only the backend-side migration-file guard;
     # it is NOT the agent's full layout resolver — see ``migration`` below.
@@ -370,11 +402,33 @@ class BuildConfig(BaseModel):
         return v
 
 
+class MergeGateRuntime(BaseModel):
+    """Runtime-backed readiness of the no-CI merge gate — what the gate ACTUALLY
+    did the last time it ran a PR to a terminal outcome.
+
+    Distinct from the stored-config ``merge_verification_verdict`` advisory: this
+    is written best-effort by ``ci_resolution.record_no_ci_gate_runtime`` and read
+    back via ``ci_resolution.merge_gate_runtime_block``.  Every field is optional
+    so older clients and projects whose gate has never run remain valid (the API
+    returns ``null`` for the whole block in that case).  ``last_unverified_*`` are
+    populated only when the gate fell open to an UNVERIFIED merge and are
+    preserved across later verified runs.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    last_run_at: str | None = None
+    executed_real_tests: bool = False
+    last_unverified_at: str | None = None
+    last_unverified_reason: str | None = None
+
+
 class OnboardPayload(BaseModel):
     """Payload for the project onboarding endpoint."""
 
     github_owner: str = Field(..., min_length=1, pattern="^[a-zA-Z0-9_.-]+$")
     github_repo: str = Field(..., min_length=1, pattern="^[a-zA-Z0-9_.-]+$")
+    preview_only: bool = False
     name: str | None = None
     build_config_override: Dict[str, Any] | None = None
     promotion_target: str | None = None

@@ -1,7 +1,8 @@
-import { afterEach, describe, test, vi } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import RunningUpdatePanel from './RunningUpdatePanel';
+import { apiFetch } from '../api';
 import { expectNoOverflowAt, expectNoTextTruncationAt, expectMinTouchTargetAt } from '../test/viewport';
 
 // RunningUpdatePanel imports apiFetch from ../api (transitively pulls in firebase).
@@ -101,6 +102,154 @@ describe('RunningUpdatePanel — viewport regression', () => {
         r.render(<RunningUpdatePanel {...BASE_PROPS} document={mdContent} />);
       });
     });
+  });
+
+  test('Edit toggle reveals a textarea and Save issues a PUT with body+base', async () => {
+    const mockFetch = vi.mocked(apiFetch);
+    mockFetch.mockClear();
+    const onEdited = vi.fn();
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <RunningUpdatePanel
+          {...BASE_PROPS}
+          document="Original body"
+          onEdited={onEdited}
+        />,
+      );
+    });
+
+    // No textarea until Edit is toggled.
+    expect(host.querySelector('textarea')).toBeNull();
+
+    const editButton = Array.from(host.querySelectorAll('button')).find(
+      (b) => b.textContent?.trim() === 'Edit',
+    )!;
+    await act(async () => {
+      editButton.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+
+    const textarea = host.querySelector('textarea')!;
+    expect(textarea).not.toBeNull();
+    expect(textarea.value).toBe('Original body');
+
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(
+        HTMLTextAreaElement.prototype,
+        'value',
+      )!.set!;
+      setter.call(textarea, 'Edited body');
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+
+    const saveButton = Array.from(host.querySelectorAll('button')).find(
+      (b) => b.textContent?.trim() === 'Save',
+    )!;
+    await act(async () => {
+      saveButton.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/api/admin/projects/proj-1/running-update',
+      expect.objectContaining({
+        method: 'PUT',
+        body: JSON.stringify({ body: 'Edited body', base: 'Original body' }),
+      }),
+    );
+    expect(onEdited).toHaveBeenCalledWith('Edited body');
+  });
+
+  test('Save surfaces a 409 conflict without calling onEdited', async () => {
+    const mockFetch = vi.mocked(apiFetch);
+    mockFetch.mockClear();
+    mockFetch.mockResolvedValueOnce(new Response('{}', { status: 409 }));
+    const onEdited = vi.fn();
+    const addToast = vi.fn();
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <RunningUpdatePanel
+          {...BASE_PROPS}
+          document="Original body"
+          addToast={addToast}
+          onEdited={onEdited}
+        />,
+      );
+    });
+
+    const editButton = Array.from(host.querySelectorAll('button')).find(
+      (b) => b.textContent?.trim() === 'Edit',
+    )!;
+    await act(async () => {
+      editButton.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    const saveButton = Array.from(host.querySelectorAll('button')).find(
+      (b) => b.textContent?.trim() === 'Save',
+    )!;
+    await act(async () => {
+      saveButton.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+
+    expect(onEdited).not.toHaveBeenCalled();
+    expect(addToast).toHaveBeenCalledWith(expect.any(String), 'error');
+  });
+
+  test('reconciliation badge renders when an operator edit was preserved', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <RunningUpdatePanel
+          {...BASE_PROPS}
+          document="Reconciled body"
+          reconciliation={{
+            operator_wins_count: 2,
+            last_operator_win_at: new Date(Date.now() - 3_600_000).toISOString(),
+          }}
+        />,
+      );
+    });
+
+    expect(host.textContent).toContain('Your edit preserved');
+    // Pluralized count surfaces the number of superseded agent proposals.
+    expect(host.textContent).toContain('2 agent proposals superseded');
+  });
+
+  test('reconciliation badge is hidden when no operator edit was preserved', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <RunningUpdatePanel
+          {...BASE_PROPS}
+          document="Plain body"
+          reconciliation={null}
+        />,
+      );
+    });
+    expect(host.textContent).not.toContain('Your edit preserved');
+
+    // Also hidden when the count is explicitly zero.
+    await act(async () => {
+      r.render(
+        <RunningUpdatePanel
+          {...BASE_PROPS}
+          document="Plain body"
+          reconciliation={{ operator_wins_count: 0, last_operator_win_at: null }}
+        />,
+      );
+    });
+    expect(host.textContent).not.toContain('Your edit preserved');
   });
 
   test('Acknowledge button meets 44px touch target at 375px', async () => {

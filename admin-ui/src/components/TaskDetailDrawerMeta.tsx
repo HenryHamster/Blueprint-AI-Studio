@@ -10,6 +10,18 @@ import { SelfReviewPanel } from './TaskDetailDrawerSelfReview';
 import { TaskDiagnosticsPanel, TaskErrorLogsPanel, getLogEntryColor } from './TaskDetailDrawerDiagnostics';
 import { FailureDetailPanel } from './TaskDetailDrawerFailureDetail';
 
+// Human-readable labels for the no-CI UNVERIFIED-merge reason keys. Mirrors
+// backend _UNVERIFIED_REASON_LABELS (backend/app/alert_dispatch.py) — keep keys
+// in sync. The orchestrator writes the reason KEY into
+// review_loop["unverified_merge_reason"]; admin.py exposes it as
+// task.unverified_merge_reason.
+const UNVERIFIED_REASON_LABELS: Record<string, string> = {
+  no_detectable_test_command: 'no runnable test command could be detected',
+  kill_switch_off: 'the no-CI test-gate is disabled (kill-switch off)',
+  internal_staging_base: 'the PR targets an internal staging branch (CI is path-filtered there)',
+  undetected_runtime: 'the detected test suite produced no usable verdict',
+};
+
 function CopyableId({ value }: { value: string }) {
   const [copied, setCopied] = useState(false);
 
@@ -194,11 +206,39 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
       .catch(() => {});
   }, [task.project_id, provenanceDirectionId]);
 
-  const { prArtifacts, commitArtifacts, investigationArtifacts } = useMemo(() => ({
-    prArtifacts: (task.artifacts ?? []).filter(a => a.artifact_type === 'PULL_REQUEST' && a.pr_url && isSafeUrl(a.pr_url)),
-    commitArtifacts: (task.artifacts ?? []).filter(a => a.artifact_type === 'GIT_COMMIT'),
-    investigationArtifacts: (task.artifacts ?? []).filter(a => a.artifact_type === 'INVESTIGATION_REPORT'),
-  }), [task.artifacts]);
+  const { prArtifacts, commitArtifacts, investigationArtifacts, mergeTestVerdict, unverifiedMergeReason } = useMemo(() => {
+    const artifacts = task.artifacts ?? [];
+    // Surface the no-CI merge gate's verdict. The verify_tests handler posts a
+    // MERGE_TEST_RESULT artifact whose `logs` carry the JSON verdict
+    // ({detected, passed, tests, output}); the orchestrator consults it to
+    // decide the merge. Parse the latest such artifact (highest iteration) and
+    // map it to the same pass/fail/undetected outcome the backend gate uses
+    // (classify_merge_test_verdict in ci_resolution.py): detected=false →
+    // undetected; passed truthy → pass; otherwise → fail.
+    const mergeTestArtifacts = artifacts.filter(a => a.artifact_type === 'MERGE_TEST_RESULT' && a.logs);
+    let mergeTestVerdict: { outcome: 'pass' | 'fail' | 'undetected'; output: string } | null = null;
+    if (mergeTestArtifacts.length > 0) {
+      const latest = mergeTestArtifacts.reduce((a, b) => ((b.iteration ?? 1) >= (a.iteration ?? 1) ? b : a));
+      try {
+        const parsed = JSON.parse(latest.logs as string) as { detected?: boolean; passed?: boolean; output?: string };
+        const outcome: 'pass' | 'fail' | 'undetected' = parsed.detected === false
+          ? 'undetected'
+          : parsed.passed
+            ? 'pass'
+            : 'fail';
+        mergeTestVerdict = { outcome, output: typeof parsed.output === 'string' ? parsed.output : '' };
+      } catch {
+        mergeTestVerdict = null;
+      }
+    }
+    return {
+      prArtifacts: artifacts.filter(a => a.artifact_type === 'PULL_REQUEST' && a.pr_url && isSafeUrl(a.pr_url)),
+      commitArtifacts: artifacts.filter(a => a.artifact_type === 'GIT_COMMIT'),
+      investigationArtifacts: artifacts.filter(a => a.artifact_type === 'INVESTIGATION_REPORT'),
+      mergeTestVerdict,
+      unverifiedMergeReason: typeof task.unverified_merge_reason === 'string' ? task.unverified_merge_reason : null,
+    };
+  }, [task.artifacts, task.unverified_merge_reason]);
   // Group PR and commit artifacts by iteration for display
   const artifactIterations: { iteration: number; prs: typeof prArtifacts; commits: typeof commitArtifacts }[] = [];
   if (task.artifacts && task.artifacts.length > 0) {
@@ -392,6 +432,34 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
           </>
         );
       })()}
+
+      {(task.status === 'BLOCKED' || task.blocker_kind || task.blocked_reason || task.blocked_at || task.recheck_after) && (
+        <>
+          <SectionHeader>Blocker</SectionHeader>
+          {task.blocker_kind && (
+            <DetailRow label="Kind">
+              <span className="text-xs uppercase tracking-wider font-mono bg-amber-500/10 text-amber-300 border border-amber-500/20 px-2 py-0.5 rounded">{task.blocker_kind}</span>
+            </DetailRow>
+          )}
+          {task.blocked_reason && (
+            <DetailRow label="Reason"><span className="text-sm text-amber-200/90 break-words">{task.blocked_reason}</span></DetailRow>
+          )}
+          {task.blocked_at && <DetailRow label="Blocked at">{formatAbsolute(task.blocked_at)}</DetailRow>}
+          {task.recheck_after && (
+            <DetailRow label="Recheck after">
+              <span className="inline-flex items-center gap-2">
+                <span>{formatAbsolute(task.recheck_after)}</span>
+                {(() => {
+                  const recheckTime = parseTimestamp(task.recheck_after).getTime();
+                  if (recheckTime <= now30) return <span className="text-xs text-amber-400">recheck due</span>;
+                  const mins = Math.max(1, Math.ceil((recheckTime - now30) / 60000));
+                  return <span className="text-xs text-neutral-500 font-mono">in {mins}m</span>;
+                })()}
+              </span>
+            </DetailRow>
+          )}
+        </>
+      )}
 
       {task.description && <>
         <SectionHeader>Description</SectionHeader>
@@ -609,6 +677,65 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
           </>
         );
       })() : null}
+
+      {(mergeTestVerdict || unverifiedMergeReason) && (() => {
+        const config: Record<'pass' | 'fail' | 'undetected' | 'unverified', { label: string; badge: string; note: string }> = {
+          pass: {
+            label: 'Passed',
+            badge: 'text-emerald-400 bg-emerald-950/30 border-emerald-800/40',
+            note: "The repository's own test suite ran on the PR head and passed — it served as the merge gate.",
+          },
+          fail: {
+            label: 'Failed',
+            badge: 'text-red-400 bg-red-950/30 border-red-800/40',
+            note: "The repository's own test suite ran on the PR head and failed — the merge gate blocked the merge.",
+          },
+          undetected: {
+            label: 'No suite detected',
+            badge: 'text-neutral-400 bg-neutral-800/40 border-neutral-700/40',
+            note: 'No runnable test suite was detected on the PR head — the gate fell back to proceeding unverified.',
+          },
+          unverified: {
+            label: 'Merged unverified',
+            badge: 'text-amber-400 bg-amber-950/30 border-amber-800/40',
+            // Reason appended below; this note is the generic fallback.
+            note: 'The merge bypassed test verification.',
+          },
+        };
+        // The persisted unverified-merge reason is an independent signal that
+        // opens this section and selects the UNVERIFIED verdict. When both an
+        // artifact verdict and a reason are present, the reason takes precedence
+        // for the verdict label/note while any captured test output still shows.
+        const outcome: 'pass' | 'fail' | 'undetected' | 'unverified' =
+          unverifiedMergeReason || !mergeTestVerdict ? 'unverified' : mergeTestVerdict.outcome;
+        const v = config[outcome];
+        const reasonLabel = unverifiedMergeReason
+          ? (UNVERIFIED_REASON_LABELS[unverifiedMergeReason] ?? unverifiedMergeReason)
+          : null;
+        const note = reasonLabel
+          ? `The merge bypassed test verification — ${reasonLabel}.`
+          : v.note;
+        return (
+          <>
+            <SectionHeader>Merge Test Gate</SectionHeader>
+            <div className="space-y-3 bg-emerald-950/10 rounded-lg p-3 border border-emerald-900/30">
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-neutral-500 w-28 shrink-0">Verdict</span>
+                <span className={`text-xs font-semibold uppercase tracking-wider px-2 py-0.5 rounded border ${v.badge}`}>
+                  {v.label}
+                </span>
+              </div>
+              <p className="text-xs text-neutral-400 break-words">{note}</p>
+              {mergeTestVerdict?.output && (
+                <div className="flex items-start gap-2">
+                  <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Test Output</span>
+                  <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-neutral-800 font-mono min-w-0 flex-1">{mergeTestVerdict.output}</pre>
+                </div>
+              )}
+            </div>
+          </>
+        );
+      })()}
 
       <TaskDiagnosticsPanel task={task} />
 

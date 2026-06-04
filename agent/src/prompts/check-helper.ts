@@ -1,6 +1,7 @@
 import fs from 'fs';
 import { WORKSPACE } from '../index.js';
 import type { BuildConfig } from '../index.js';
+import { SHELL_CMD_RE } from '../shell-safety.js';
 import {
   buildScopedLintOneliner,
   detectLinterKind,
@@ -336,6 +337,24 @@ if touches backend/; then
     run "backend migration chain" bash -c 'python3 backend/app/migration_chain.py 2>&1'
   fi
 fi
+
+# Fast module size-guardrail check: no DB/Docker/network, sub-second. Mirrors
+# the line-count caps that backend/testing/test_invariants.py enforces, so a
+# size breach surfaces HERE (before ./pr open) instead of only after a PR is
+# open and a full CI/Docker round-trip is burned. Scope to whichever stacks
+# the diff touched, mapping admin-ui -> frontend (the JSON's section name).
+# Invoked BY REFERENCE as a committed script (exactly like the migration-chain
+# guard above) — no embedded Python heredoc (see CLAUDE.md). A breach makes
+# the checker exit non-zero, which \`run\` records in FAILED so ./check fails.
+# Remediate with: python3 backend/testing/check_size_limits.py --fix
+SIZE_SECTIONS=""
+if touches backend/;          then SIZE_SECTIONS="$SIZE_SECTIONS,backend"; fi
+if touches agent/;            then SIZE_SECTIONS="$SIZE_SECTIONS,agent"; fi
+if admin_ui_runtime_touched;  then SIZE_SECTIONS="$SIZE_SECTIONS,frontend"; fi
+SIZE_SECTIONS="\${SIZE_SECTIONS#,}"
+if [ -n "$SIZE_SECTIONS" ]; then
+  run "size guardrail ($SIZE_SECTIONS)" bash -c "python3 backend/testing/check_size_limits.py --sections $SIZE_SECTIONS 2>&1"
+fi
 `;
   // Stack-block selection (ordered, most specific first):
   //  1. build_config with directories  → config-driven per-directory blocks.
@@ -432,13 +451,22 @@ function buildConfigDrivenStackBlocks(buildConfig: BuildConfig): string {
     ([k, v]) => `export ${k}='${v}'`,
   );
   const sections: string[] = [];
+  // A command is interpolated into a single-quoted bash literal below, so it is
+  // only safe to emit when it clears SHELL_CMD_RE. resolveBuildConfig now RETAINS
+  // commands with quotes/operators verbatim (so the backend's tests_gated
+  // decision and the no-CI gate agree on whether the project has tests); those
+  // commands run safely via a `bash -c` argv in the no-CI gate, but they cannot
+  // be single-quote-interpolated here. Skip the unsafe ones — `./check` is a
+  // best-effort local convenience; the authoritative run is the no-CI gate.
+  const safeCmd = (cmd: string | undefined): cmd is string =>
+    typeof cmd === 'string' && cmd !== '' && SHELL_CMD_RE.test(cmd);
   for (const dir of dirs) {
     const dirPrefix = dir.path.replace(/\/$/, '');
     const inner: string[] = [];
-    if (dir.install_cmd) inner.push(`  run "${dirPrefix} install" bash -c 'cd "${dirPrefix}" && ${dir.install_cmd}'`);
-    if (dir.lint_cmd) inner.push(buildLintInner(dirPrefix, dir.lint_cmd));
-    if (dir.build_cmd) inner.push(`  run "${dirPrefix} build" bash -c 'cd "${dirPrefix}" && ${dir.build_cmd}'`);
-    if (dir.test_cmd) {
+    if (safeCmd(dir.install_cmd)) inner.push(`  run "${dirPrefix} install" bash -c 'cd "${dirPrefix}" && ${dir.install_cmd}'`);
+    if (safeCmd(dir.lint_cmd)) inner.push(buildLintInner(dirPrefix, dir.lint_cmd));
+    if (safeCmd(dir.build_cmd)) inner.push(`  run "${dirPrefix} build" bash -c 'cd "${dirPrefix}" && ${dir.build_cmd}'`);
+    if (safeCmd(dir.test_cmd)) {
       inner.push(`  if [ "$WITH_TESTS" = "1" ]; then`);
       inner.push(`    run "${dirPrefix} test" bash -c 'cd "${dirPrefix}" && ${dir.test_cmd}'`);
       inner.push(`  fi`);

@@ -97,6 +97,26 @@ async def tl_db(mocker):
     await _engine.dispose()
 
 
+@pytest.fixture(autouse=True)
+def _default_no_migration_pr(mocker):
+    """Default the inline pre-merge Alembic dual-head guard to a no-op.
+
+    Both inline merge paths in ``_process_post_commit`` (review-APPROVE and the
+    non-staging small-scope auto-approve) now run
+    ``enforce_premerge_migration_guard`` before merging, which calls
+    ``github.get_pr_files``. Existing merge-reaching tests only mock
+    ``_merge_with_retry`` / ``merge_pull_request``; without this default an
+    unmocked ``get_pr_files`` would make the guard DEFER and falsely hold the
+    merge. A PR that touches only a non-migration file passes the guard cleanly.
+    Tests that exercise the guard re-patch ``app.github.get_pr_files`` to
+    override this default.
+    """
+    mocker.patch(
+        "app.github.get_pr_files",
+        AsyncMock(return_value=[{"filename": "README.md"}]),
+    )
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
@@ -391,6 +411,202 @@ async def test_requeue_limit_records_direction_result_on_non_infra_failure(tl_db
     assert streak is not None, "expected direction streak to be recorded"
     assert streak["consecutive_failures"] == 1
     assert streak["last_failure_class"] == "CODE_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_requeue_limit_blocks_when_all_failed_children_blocked_precondition(
+    tl_db, mocker
+):
+    """Parent at the requeue limit whose only failed child is BLOCKED_PRECONDITION
+    transitions to the recoverable BLOCKED state — not force-FAILED with a
+    confabulated CODE_ERROR category — and raises a precondition-blocker alert.
+    Mirrors the all-children-terminal sweep treatment in the limit path.
+    """
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 3},
+    )
+    # FAILED child whose status message routes to BLOCKED_PRECONDITION.
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        latest_status_message="BLOCKER: upstream PR #42 not yet merged",
+    )
+
+    result = await _requeue_parent_task(parent, session)
+
+    assert result == 0
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.BLOCKED
+    assert parent.status != TaskStatus.FAILED
+    # Budget-exempt precondition class retained for historical consumers.
+    assert parent.context.get("failure_category") == "BLOCKED_PRECONDITION"
+    assert parent.blocker_kind == "upstream_dependency"
+    # A precondition-blocker alert is surfaced.
+    precondition_alerts = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.task_id == parent.id,
+                    Alert.title.contains("Precondition blocker"),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(precondition_alerts) == 1
+    assert precondition_alerts[0].severity == AlertSeverity.WARNING
+
+
+@pytest.mark.asyncio
+async def test_requeue_limit_blocks_when_child_in_first_class_blocked_state(
+    tl_db, mocker
+):
+    """Parent at the requeue limit with a first-class BLOCKED child (invisible to
+    the old FAILED-only query) transitions to BLOCKED, not FAILED."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 3},
+    )
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.BLOCKED,
+        parent_task_id=parent.id,
+        latest_status_message="BLOCKER: dep not landed",
+    )
+
+    result = await _requeue_parent_task(parent, session)
+
+    assert result == 0
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.BLOCKED
+    assert (parent.context or {}).get("blocker", {}).get("source") == "parent"
+
+
+@pytest.mark.asyncio
+async def test_requeue_limit_fails_when_genuine_and_blocked_children_mixed(
+    tl_db, mocker
+):
+    """Parent at the requeue limit with a genuine CODE_ERROR child alongside a
+    blocked sibling still FAILS — with the worst GENUINE category, not the
+    CODE_ERROR fallback derived from blocked/empty input."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 3},
+    )
+    # Genuine failure with a known category.
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={"failure_category": "CODE_ERROR"},
+        latest_status_message="tests failed",
+    )
+    # Blocked-on-precondition sibling — must not force the parent to BLOCKED.
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.BLOCKED,
+        parent_task_id=parent.id,
+        latest_status_message="BLOCKER: dep not landed",
+    )
+
+    result = await _requeue_parent_task(parent, session)
+
+    assert result == 0
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert parent.context.get("failure_category") == "CODE_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_requeue_limit_fails_when_genuine_cancelled_child_present(tl_db, mocker):
+    """Parent at the requeue limit with a genuine (non-superseded) CANCELLED child
+    still FAILS — a genuine cancellation prevents parking as BLOCKED."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 3},
+    )
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.BLOCKED,
+        parent_task_id=parent.id,
+        latest_status_message="BLOCKER: dep not landed",
+    )
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        parent_task_id=parent.id,
+        context={"failure_detail": "review_cap_exhausted"},
+        latest_status_message="Cancelled after review cap exhausted",
+    )
+
+    result = await _requeue_parent_task(parent, session)
+
+    assert result == 0
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_requeue_limit_records_no_direction_failure_when_blocked(tl_db, mocker):
+    """A parent that hits the requeue limit but parks as BLOCKED must NOT record a
+    direction-health failure (the blocked verdict is budget-exempt)."""
+    import app.shared_state as _ss
+    from app.routers.agent_status import _recorded_task_ids
+
+    _ss.direction_failure_streaks.clear()
+    _recorded_task_ids.clear()
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 3, "direction_id": "d-blocked-7"},
+    )
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        latest_status_message="BLOCKER: upstream PR not yet merged",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.BLOCKED
+    assert _ss.direction_failure_streaks.get("d-blocked-7") is None
 
 
 @pytest.mark.asyncio
@@ -723,10 +939,10 @@ async def test_requeue_all_children_blocked_escalates_precondition_alert(tl_db, 
     """All-children-blocked parent raises ONE deduplicated precondition alert.
 
     When every FAILED child is BLOCKED_PRECONDITION (upstream dependency unmet),
-    the parent terminates as BLOCKED_PRECONDITION rather than a code failure, and
-    a single operator-visible WARNING alert describing the upstream blocker is
-    raised — not a silent generic FAILED. Re-running the requeue must NOT spam a
-    second alert (deduplicated by task + blocker identity).
+    the parent transitions into the first-class BLOCKED state rather than a code
+    failure, and a single operator-visible WARNING alert describing the upstream
+    blocker is raised — not a silent generic FAILED. Re-running the requeue must
+    NOT spam a second alert (deduplicated by task + blocker identity).
     """
     import app.shared_state as _ss
     from app.routers.agent_status import _recorded_task_ids
@@ -752,9 +968,19 @@ async def test_requeue_all_children_blocked_escalates_precondition_alert(tl_db, 
     await _requeue_parent_task(parent, session)
 
     await session.refresh(parent)
-    assert parent.status == TaskStatus.FAILED
-    # Parent classified as the budget-exempt precondition class, not a code error.
+    assert parent.status == TaskStatus.BLOCKED
+    # Parent retains the budget-exempt precondition class for compatibility with
+    # historical consumers (digest metrics, analytics), even though it is no
+    # longer a FAILED task.
     assert parent.context.get("failure_category") == "BLOCKED_PRECONDITION"
+    # Durable blocker metadata is persisted on the task itself.
+    blocker = parent.context.get("blocker") or {}
+    assert blocker.get("source") == "parent"
+    assert blocker.get("failure_class") == "BLOCKED_PRECONDITION"
+    assert parent.blocker_kind == "upstream_dependency"
+    assert parent.blocked_reason == parent.latest_status_message
+    assert parent.blocked_at is not None
+    assert parent.recheck_after is not None and parent.recheck_after > parent.blocked_at
 
     precondition_alerts = (
         (
@@ -789,6 +1015,507 @@ async def test_requeue_all_children_blocked_escalates_precondition_alert(tl_db, 
         .all()
     )
     assert len(precondition_alerts) == 1
+
+
+def test_enter_blocked_state_persists_metadata_no_budget_burn():
+    """enter_blocked_state moves a task to BLOCKED with durable metadata and
+    preserves the BLOCKED_PRECONDITION class — without touching attempt_count."""
+    from app.task_blocked import enter_blocked_state, get_blocker_metadata
+
+    task = Task(
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+    )
+    enter_blocked_state(
+        task,
+        waiting_on="upstream dependency",
+        reason="BLOCKER: dep not landed",
+    )
+    assert task.status == TaskStatus.BLOCKED
+    # Retry budget untouched.
+    assert task.attempt_count == 0
+    # Classification preserved for historical/analytics consumers.
+    assert task.context["failure_category"] == "BLOCKED_PRECONDITION"
+    assert task.context["failure_class"] == "BLOCKED_PRECONDITION"
+    meta = get_blocker_metadata(task)
+    assert meta["waiting_on"] == "upstream dependency"
+    assert meta["reason"] == "BLOCKER: dep not landed"
+    assert meta["source"] == "agent"
+    assert meta["blocker_kind"] == "upstream_dependency"
+    assert meta["escalated"] is False
+    assert meta["recheck_at"]  # recheck timing persisted
+    assert task.blocker_kind == "upstream_dependency"
+    assert task.blocked_reason == "BLOCKER: dep not landed"
+    assert task.blocked_at is not None
+    assert task.recheck_after is not None and task.recheck_after > task.blocked_at
+
+
+def test_unblock_to_queued_clears_metadata_and_requeues():
+    """unblock_to_queued is the BLOCKED -> QUEUED out-transition: it clears the
+    blocker metadata and re-queues the task for dispatch."""
+    from app.task_blocked import enter_blocked_state, unblock_to_queued
+
+    task = Task(
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    enter_blocked_state(task, waiting_on="dep", reason="blocked")
+    assert task.status == TaskStatus.BLOCKED
+    # In-transition wrote the BLOCKED_PRECONDITION compat tags.
+    assert (task.context or {}).get("failure_class") == "BLOCKED_PRECONDITION"
+    assert (task.context or {}).get("failure_category") == "BLOCKED_PRECONDITION"
+
+    unblock_to_queued(task)
+    assert task.status == TaskStatus.QUEUED
+    assert "blocker" not in (task.context or {})
+    # The out-transition must also drop the stale BLOCKED_PRECONDITION tags so a
+    # recovered task does not carry them into its next run.
+    assert "failure_class" not in (task.context or {})
+    assert "failure_category" not in (task.context or {})
+    assert task.blocker_kind is None
+    assert task.blocked_reason is None
+    assert task.blocked_at is None
+    assert task.recheck_after is None
+
+
+def test_clear_blocker_metadata_preserves_authoritative_verdict():
+    """An authoritative non-blocked verdict written after the block must survive
+    clearing — only the stale BLOCKED_PRECONDITION tags are dropped."""
+    from app.task_blocked import clear_blocker_metadata, enter_blocked_state
+
+    task = Task(
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    enter_blocked_state(task, waiting_on="dep", reason="blocked")
+    # A later authoritative classifier overwrites the failure class.
+    ctx = dict(task.context or {})
+    ctx["failure_class"] = "RATE_LIMIT"
+    ctx["failure_category"] = "RATE_LIMIT"
+    task.context = ctx
+
+    clear_blocker_metadata(task)
+    assert "blocker" not in (task.context or {})
+    assert (task.context or {}).get("failure_class") == "RATE_LIMIT"
+    assert (task.context or {}).get("failure_category") == "RATE_LIMIT"
+
+
+def test_mark_blocker_escalated_sets_marker():
+    """mark_blocker_escalated flips the escalation marker and stamps a time."""
+    from app.task_blocked import (
+        enter_blocked_state,
+        get_blocker_metadata,
+        mark_blocker_escalated,
+    )
+
+    task = Task(
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    enter_blocked_state(task, waiting_on="dep", reason="blocked")
+    mark_blocker_escalated(task, detail="deadline elapsed")
+    meta = get_blocker_metadata(task)
+    assert meta["escalated"] is True
+    assert meta["escalated_at"]
+    assert meta["escalation_detail"] == "deadline elapsed"
+
+
+@pytest.mark.asyncio
+async def test_requeue_parent_blocked_when_child_in_blocked_state(tl_db, mocker):
+    """A parent whose only unsucceeded child is in the first-class BLOCKED state
+    transitions to BLOCKED (not FAILED) without burning its requeue budget."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.BLOCKED,
+        parent_task_id=parent.id,
+        latest_status_message="BLOCKER: dep not landed",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.BLOCKED
+    assert (parent.context or {}).get("blocker", {}).get("source") == "parent"
+    # Requeue budget untouched — this was not a retry.
+    assert (parent.context or {}).get("_requeue_count", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_requeue_parent_failed_when_blocked_and_genuine_cancelled_child_mixed(
+    tl_db, mocker
+):
+    """A genuine CANCELLED child prevents the parent from parking as BLOCKED."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.BLOCKED,
+        parent_task_id=parent.id,
+        latest_status_message="BLOCKER: dep not landed",
+    )
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        parent_task_id=parent.id,
+        context={"failure_detail": "review_cap_exhausted"},
+        latest_status_message="Cancelled after review cap exhausted",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert parent.status != TaskStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_requeue_parent_blocked_ignores_superseded_cancelled_child(tl_db, mocker):
+    """A blocked + superseded-cancelled mix re-evaluates for rollup instead of BLOCKED."""
+    precondition_alert = mocker.patch(
+        "app.alert_dispatch._maybe_create_precondition_blocker_alert",
+        new_callable=AsyncMock,
+    )
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 0},
+    )
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.BLOCKED,
+        parent_task_id=parent.id,
+        latest_status_message="BLOCKER: dep not landed",
+    )
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        parent_task_id=parent.id,
+        context={"_replaced_by_task_id": str(uuid.uuid4())},
+        latest_status_message="Parent requeued — replaced by retry",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    assert parent.context.get("_requeue_count") == 0
+    assert "awaiting rollup re-evaluation" in (parent.latest_status_message or "")
+    assert "blocked on upstream precondition" not in (parent.latest_status_message or "")
+    assert precondition_alert.await_count == 0
+    precondition_alert.assert_not_awaited()
+    alerts = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.task_id == parent.id,
+                    Alert.title.contains("Precondition blocker"),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert alerts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("child_specs", "expected_status", "expected_alert_calls", "expected_message"),
+    [
+        (
+            [
+                (
+                    TaskStatus.BLOCKED,
+                    None,
+                    "BLOCKER: dep not landed",
+                )
+            ],
+            TaskStatus.BLOCKED,
+            1,
+            "blocked on upstream precondition",
+        ),
+        (
+            [
+                (TaskStatus.BLOCKED, None, "BLOCKER: dep not landed"),
+                (
+                    TaskStatus.CANCELLED,
+                    {"_replaced_by_task_id": str(uuid.uuid4())},
+                    "Parent requeued — replaced by retry",
+                ),
+            ],
+            TaskStatus.EVALUATING,
+            0,
+            "awaiting rollup re-evaluation",
+        ),
+        (
+            [
+                (TaskStatus.BLOCKED, None, "BLOCKER: dep not landed"),
+                (
+                    TaskStatus.CANCELLED,
+                    {"failure_detail": "review_cap_exhausted"},
+                    "Cancelled after review cap exhausted",
+                ),
+            ],
+            TaskStatus.FAILED,
+            0,
+            "Re-evaluation limit reached",
+        ),
+        (
+            [
+                (TaskStatus.BLOCKED, None, "BLOCKER: dep not landed"),
+                (
+                    TaskStatus.FAILED,
+                    {"failure_category": "CODE_ERROR"},
+                    "tests failed",
+                ),
+            ],
+            TaskStatus.FAILED,
+            0,
+            "Re-evaluation limit reached",
+        ),
+        (
+            [
+                (TaskStatus.BLOCKED, None, "BLOCKER: dep not landed"),
+                (TaskStatus.COMPLETED, {"pr_merged": True}, None),
+            ],
+            TaskStatus.EVALUATING,
+            0,
+            "awaiting rollup re-evaluation",
+        ),
+    ],
+)
+async def test_requeue_limit_respects_mixed_terminal_child_sets(
+    tl_db,
+    mocker,
+    child_specs,
+    expected_status,
+    expected_alert_calls,
+    expected_message,
+):
+    """The limit path should distinguish pure blocked, mixed, and rollup cases."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    precondition_alert = mocker.patch(
+        "app.alert_dispatch._maybe_create_precondition_blocker_alert",
+        new_callable=AsyncMock,
+    )
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 3},
+    )
+
+    for status, context, latest_status_message in child_specs:
+        await _make_task(
+            session,
+            project.id,
+            status=status,
+            parent_task_id=parent.id,
+            context=context,
+            latest_status_message=latest_status_message,
+        )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    assert parent.status == expected_status
+    assert expected_message in (parent.latest_status_message or "")
+    assert precondition_alert.await_count == expected_alert_calls
+    if expected_status == TaskStatus.BLOCKED:
+        assert (parent.context or {}).get("blocker", {}).get("source") == "parent"
+    else:
+        assert (parent.context or {}).get("blocker") is None
+        assert (parent.context or {}).get("_requeue_count") == 3
+
+
+@pytest.mark.asyncio
+async def test_requeue_terminal_all_non_genuine_cancelled_single(tl_db, mocker):
+    """All-children-terminal path: a parent whose ONLY unsucceeded child is a
+    non-genuine cancel (cascade/replaced-by-retry) finalizes FAILED immediately —
+    not parked EVALUATING forever — with an accurate message and NO direction
+    health penalty / failure alert."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    failure_alert = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    record_failure = mocker.patch(
+        "app.task_lifecycle_requeue._record_parent_failure"
+    )
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 0, "direction_id": "d-non-genuine"},
+    )
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        parent_task_id=parent.id,
+        context={"_replaced_by_task_id": str(uuid.uuid4())},
+        latest_status_message="Parent requeued — replaced by retry",
+    )
+
+    result = await _requeue_parent_task(parent, session)
+
+    assert result == 0
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert "superseded/cancelled" in (parent.latest_status_message or "")
+    assert "nothing to roll up" in (parent.latest_status_message or "")
+    # Accurate, non-confabulated category — SCOPE_EMPTY, not AGENT_TIMEOUT.
+    assert parent.context.get("failure_category") == "SCOPE_EMPTY"
+    # Budget untouched — nothing was retried.
+    assert parent.context.get("_requeue_count") == 0
+    # Non-genuine cancels → no direction-health ding and no failure alert.
+    record_failure.assert_not_called()
+    failure_alert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_requeue_terminal_all_non_genuine_cancelled_multiple_kinds(
+    tl_db, mocker
+):
+    """All non-genuine-cancel taxonomy classes together (cascade, superseded,
+    pr_closed_non_rejection, cap_exhausted_after_approve, REASSIGNED, SCOPE_EMPTY)
+    with nothing else → parent FAILED, no direction-health ding."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    record_failure = mocker.patch(
+        "app.task_lifecycle_requeue._record_parent_failure"
+    )
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 0},
+    )
+    non_genuine_specs = [
+        ({"_replaced_by_task_id": str(uuid.uuid4())}, "Parent requeued — replaced by retry"),
+        ({}, "Superseded by task abc123"),
+        ({"failure_detail": "pr_closed_non_rejection"}, "PR closed without rejection"),
+        ({"failure_detail": "cap_exhausted_after_approve"}, "Capped after approval"),
+        ({"failure_category": "REASSIGNED"}, "Reassigned to another agent"),
+        ({"failure_category": "SCOPE_EMPTY"}, "SCOPE_EMPTY: nothing to do"),
+    ]
+    for ctx, msg in non_genuine_specs:
+        await _make_task(
+            session,
+            project.id,
+            status=TaskStatus.CANCELLED,
+            parent_task_id=parent.id,
+            context=ctx,
+            latest_status_message=msg,
+        )
+
+    result = await _requeue_parent_task(parent, session)
+
+    assert result == 0
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert "All 6 subtask(s) superseded/cancelled" in (parent.latest_status_message or "")
+    assert parent.context.get("failure_category") == "SCOPE_EMPTY"
+    record_failure.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_requeue_limit_all_non_genuine_cancelled_terminates_failed(tl_db, mocker):
+    """Requeue-LIMIT path: parent at the cap whose only unsucceeded child is a
+    non-genuine cancel terminates FAILED (kept in lockstep with the
+    all-children-terminal path) without a direction-health ding."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    record_failure = mocker.patch(
+        "app.task_lifecycle_requeue._record_parent_failure"
+    )
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 3},
+    )
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        parent_task_id=parent.id,
+        context={"_replaced_by_task_id": str(uuid.uuid4())},
+        latest_status_message="Parent requeued — replaced by retry",
+    )
+
+    result = await _requeue_parent_task(parent, session)
+
+    assert result == 0
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert "superseded/cancelled" in (parent.latest_status_message or "")
+    assert parent.context.get("failure_category") == "SCOPE_EMPTY"
+    record_failure.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_requeue_non_genuine_cancel_with_active_replacement_stays_evaluating(
+    tl_db, mocker
+):
+    """A non-genuine cancel alongside a still-active replacement child must STAY
+    EVALUATING — the live replacement may yet roll up; do NOT terminate."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 0},
+    )
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        parent_task_id=parent.id,
+        context={"_replaced_by_task_id": str(uuid.uuid4())},
+        latest_status_message="Parent requeued — replaced by retry",
+    )
+    # Still-active replacement clone.
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=parent.id,
+    )
+
+    result = await _requeue_parent_task(parent, session)
+
+    assert result == 0
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    assert "awaiting rollup re-evaluation" in (parent.latest_status_message or "")
+    assert parent.context.get("_requeue_count") == 0
 
 
 @pytest.mark.asyncio
@@ -2353,6 +3080,55 @@ async def test_process_post_commit_omits_unsent_timing_fields(tl_db, mocker):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "task_type,expected_phase",
+    [("design_doc_update", 1), ("strategic_review", 2)],
+)
+@pytest.mark.parametrize(
+    "status", [TaskStatus.FAILED, TaskStatus.CANCELLED]
+)
+async def test_process_post_commit_emits_cycle_completed_on_terminal_strategic(
+    tl_db, mocker, task_type, expected_phase, status
+):
+    """A strategic task that terminates FAILED/CANCELLED never reaches the
+    COMPLETED completion handlers, so the lifecycle backstop must emit
+    strategic_cycle_completed to clear the frontend "Strategist working…"
+    indicator (review iter-1 MAJOR, task_lifecycle.py:4006)."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session, project.id, task_type=task_type, status=status
+    )
+    emit = AsyncMock()
+    mocker.patch("app.strategic_events.emit_strategic_cycle_completed", new=emit)
+
+    payload = AgentStatusPayload(task_id=task.id, status=status)
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    emit.assert_awaited_once_with(task.project_id, task.id, expected_phase)
+
+
+@pytest.mark.asyncio
+async def test_process_post_commit_no_cycle_completed_for_nonstrategic_failure(
+    tl_db, mocker
+):
+    """The terminal-failure backstop is gated on strategic task types — a
+    non-strategic FAILED task must NOT emit strategic_cycle_completed."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session, project.id, task_type="fix", status=TaskStatus.FAILED
+    )
+    emit = AsyncMock()
+    mocker.patch("app.strategic_events.emit_strategic_cycle_completed", new=emit)
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.FAILED)
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    emit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_process_post_commit_transient_handler_failure_requeues_after_rollback(
     tl_db, mocker
 ):
@@ -3182,6 +3958,376 @@ async def test_residual_remediation_case_merged_on_merge(tl_db, mocker):
     await session.refresh(case)
     assert case.status == ResidualCaseStatus.MERGED
     assert case.updated_at >= now
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Inline pre-merge Alembic dual-head guard (parity with the CI-completion path)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# A diff that adds a migration whose revision id ("0002") collides with a
+# revision already on the target branch — the dual-head vector.
+_TL_DUAL_HEAD_DIFF = (
+    "diff --git a/backend/alembic/versions/0002_dup.py "
+    "b/backend/alembic/versions/0002_dup.py\n"
+    "new file mode 100644\n"
+    "--- /dev/null\n"
+    "+++ b/backend/alembic/versions/0002_dup.py\n"
+    '+"""dup migration"""\n'
+    '+revision = "0002"\n'
+    '+down_revision = "0001"\n'
+)
+
+
+def _patch_dual_head_collision(mocker):
+    """Make the inline guard see a same-revision dual-head collision."""
+    mocker.patch(
+        "app.github.get_pr_files",
+        AsyncMock(
+            return_value=[{"filename": "backend/alembic/versions/0002_dup.py"}]
+        ),
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        AsyncMock(return_value=_TL_DUAL_HEAD_DIFF),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        AsyncMock(return_value=["0001_init.py", "0002_existing.py"]),
+    )
+
+
+async def _setup_approve_merge(session, project, *, base_branch="main"):
+    """Create original + review tasks wired for the APPROVE inline-merge path."""
+    original = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "X", "base_branch": base_branch}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        context={},
+    )
+    session.add(original)
+    await session.commit()
+    await session.refresh(original)
+
+    review_task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 5151,
+                "branch": "feat/x",
+                "base_branch": base_branch,
+                "original_task_id": str(original.id),
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        context={
+            "review_loop": {
+                "pr_number": 5151,
+                "branch": "feat/x",
+                "base_branch": base_branch,
+                "original_task_id": str(original.id),
+                "iteration": 1,
+            },
+        },
+    )
+    session.add(review_task)
+    await session.commit()
+    await session.refresh(review_task)
+    return original, review_task
+
+
+def payload_for(review_task):
+    """Build the APPROVE completion payload for a review task."""
+    return AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/5151",
+        artifact_type=ArtifactType.PULL_REQUEST,
+        verdict_json='{"verdict": "APPROVE", "issues": []}',
+    )
+
+
+def _patch_approve_merge_env(mocker):
+    """Mocks shared by the APPROVE inline-merge tests (CI green, PR open)."""
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "head": {"sha": "abc123", "ref": "feat/x"},
+            "state": "open",
+            "merged": False,
+        },
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new_callable=AsyncMock,
+        return_value={"status": "completed", "conclusion": "success"},
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+    mocker.patch("app.github.submit_pr_review", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._comment_with_retry", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.asyncio.sleep", new_callable=AsyncMock)
+
+
+@pytest.mark.asyncio
+async def test_process_post_commit_review_approve_merge_held_on_dual_head(
+    tl_db, mocker
+):
+    """APPROVE + CI green: a same-revision dual head HOLDS the inline merge."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    _, review_task = await _setup_approve_merge(session, project)
+
+    _patch_approve_merge_env(mocker)
+    _patch_dual_head_collision(mocker)
+    merge_mock = mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+
+    result = await _process_post_commit(
+        review_task.id, payload_for(review_task), _session_factory=factory
+    )
+
+    assert result == {"status": "accepted"}
+    merge_mock.assert_not_called()
+    await session.refresh(review_task)
+    assert review_task.status == TaskStatus.EVALUATING
+    rl = (review_task.context or {}).get("review_loop", {})
+    assert rl.get("ci_waiting") is True
+    assert rl.get("review_approved") is True
+    assert "dual-head" in (review_task.latest_status_message or "").lower()
+    assert "0002" in (review_task.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_process_post_commit_review_approve_merge_proceeds_when_guard_ok(
+    tl_db, mocker
+):
+    """APPROVE + CI green + clean (non-migration) PR: the inline merge fires."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    _, review_task = await _setup_approve_merge(session, project)
+
+    _patch_approve_merge_env(mocker)
+    # autouse _default_no_migration_pr fixture already returns a non-migration
+    # file from get_pr_files, so the guard returns ok.
+    merge_mock = mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+
+    await _process_post_commit(
+        review_task.id, payload_for(review_task), _session_factory=factory
+    )
+
+    merge_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_small_scope_auto_approve_merge_held_on_dual_head(tl_db, mocker):
+    """Non-staging auto_approve_small path HOLDS the merge on a dual head."""
+    session, factory = tl_db
+    project = await _make_project(session)
+
+    direction_id = "dir-auto-approve"
+    project.directions = [{"id": direction_id, "title": "d"}]
+    session.add(project)
+    await session.commit()
+
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "small", "direction_id": direction_id},
+    )
+    task.payloads = [{"type": "create", "prompt": "x", "base_branch": "main"}]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    # Force the auto_approve_small gate open.
+    mocker.patch(
+        "app.direction_metrics._compute_acceptance_rate", return_value=0.9
+    )
+    mocker.patch(
+        "app.task_lifecycle.should_auto_approve_diff",
+        return_value=(True, "small clean diff"),
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "clean", "report": ""},
+    )
+    _patch_dual_head_collision(mocker)
+    merge_mock = mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/77",
+        branch="blueprint/task-aa",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+    result = await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    assert result == {"status": "accepted"}
+    merge_mock.assert_not_called()
+    await session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+    assert "dual-head" in (task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_small_scope_auto_approve_merge_blocked_by_guard_skips_auto_merge(
+    tl_db, mocker
+):
+    """A blocking pre-merge guard verdict prevents the auto-merge fallback."""
+    session, factory = tl_db
+    project = await _make_project(session)
+
+    direction_id = "dir-auto-approve"
+    project.directions = [{"id": direction_id, "title": "d"}]
+    session.add(project)
+    await session.commit()
+
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "small", "direction_id": direction_id},
+    )
+    task.payloads = [{"type": "create", "prompt": "x", "base_branch": "main"}]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch("app.direction_metrics._compute_acceptance_rate", return_value=0.9)
+    mocker.patch(
+        "app.task_lifecycle.should_auto_approve_diff",
+        return_value=(True, "small clean diff"),
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "clean", "report": ""},
+    )
+    merge_mock = mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+    enable_auto_merge_mock = mocker.patch(
+        "app.github.enable_auto_merge",
+        new_callable=AsyncMock,
+        return_value={"enabled": True},
+    )
+    mocker.patch(
+        "app.rollup_migration_validation.enforce_premerge_migration_guard",
+        new_callable=AsyncMock,
+        return_value=(False, "dual-head: duplicate migration revision"),
+    )
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/77",
+        branch="blueprint/task-aa",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+    result = await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    assert result == {"status": "accepted"}
+    merge_mock.assert_not_called()
+    enable_auto_merge_mock.assert_not_called()
+    await session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+    assert "dual-head" in (task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_small_scope_intermediate_merge_skips_guard(tl_db, mocker):
+    """A staging-branch (intermediate) small-scope merge does NOT invoke the guard."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "small"},
+    )
+    task.payloads = [
+        {"type": "create", "prompt": "x", "base_branch": "research/cycle-1"}
+    ]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "clean", "report": ""},
+    )
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    # If the guard ran it would call get_pr_files first; assert it never does.
+    guard_files = mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "README.md"}],
+    )
+    merge_mock = mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/88",
+        branch="blueprint/task-bb",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    merge_mock.assert_awaited_once()
+    guard_files.assert_not_called()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4368,6 +5514,13 @@ async def test_auto_merge_clean_state_enables_auto_merge_not_review(tl_db, mocke
         new_callable=AsyncMock,
         return_value={"enabled": True},
     )
+    # The pre-auto-merge migration guard calls get_pr_files; a non-migration
+    # file keeps the GitHub-auto-merge fast path (pr_touches_migrations=False).
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "backend/app/foo.py"}],
+    )
 
     session, factory = tl_db
     project = await _make_project(session)
@@ -4424,6 +5577,118 @@ async def test_auto_merge_clean_state_enables_auto_merge_not_review(tl_db, mocke
     )
     assert _review_approved(parked_loop), (
         "_review_approved must return True so handle_ci_completion can merge"
+    )
+
+
+@pytest.mark.parametrize("mergeable_state", ["clean", "blocked", "unstable"])
+@pytest.mark.asyncio
+async def test_auto_merge_migration_pr_skips_github_auto_merge(
+    tl_db, mocker, mergeable_state
+):
+    """A migration-carrying PR must NOT be delegated to GitHub native auto-merge.
+
+    For clean/blocked/unstable states the non-migration path arms
+    enable_auto_merge. A PR that touches alembic/versions must instead park in
+    CI-wait so handle_ci_completion re-runs the pre-merge Alembic guard against
+    the live target branch — otherwise the merge could land against a different
+    migration chain than the one Blueprint validated.
+    """
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+
+    spawn_calls: list = []
+
+    async def _capture_spawn(*args, **kwargs):
+        spawn_calls.append((args, kwargs))
+        mock_task = mocker.MagicMock()
+        mock_task.id = uuid.uuid4()
+        mock_task.first_payload = {"type": "review"}
+        mock_task.status = TaskStatus.QUEUED
+        return (mock_task, True)
+
+    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
+    )
+    mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": False, "message": "not mergeable"},
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "mergeable_state": mergeable_state,
+            "head": {"sha": "abc123", "ref": "blueprint/task-deadbeef"},
+        },
+    )
+    enable_auto_merge_mock = mocker.patch(
+        "app.github.enable_auto_merge",
+        new_callable=AsyncMock,
+        return_value={"enabled": True},
+    )
+    # A migration file makes pr_touches_migrations return True → no delegation.
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[
+            {"filename": "backend/alembic/versions/0140_add_widget.py"},
+        ],
+    )
+
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "small"},
+    )
+    task.payloads = [
+        {
+            "type": "create",
+            "prompt": "implement feature Y",
+            "base_branch": "research/cycle-1",
+        }
+    ]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/91",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    enable_auto_merge_mock.assert_not_called()
+    assert not spawn_calls, (
+        "Migration PR must park in CI-wait, not spawn a recovery task"
+    )
+
+    await session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+    parked_loop = (task.context or {}).get("review_loop", {})
+    assert parked_loop.get("ci_waiting") is True, (
+        "migration PR must park with ci_waiting=True so handle_ci_completion "
+        "re-enters and re-runs the pre-merge Alembic guard"
     )
 
 
@@ -4736,8 +6001,8 @@ class TestRequeueExtractionTripwire:
 # clears the poison and the chain finishes cleanly.
 # ══════════════════════════════════════════════════════════════════════════════
 
-from sqlalchemy import text as _sa_text
-from sqlalchemy.exc import (
+from sqlalchemy import text as _sa_text  # noqa: E402 — deliberate mid-file import for the post-commit poison-recovery test section below
+from sqlalchemy.exc import (  # noqa: E402 — see above
     IntegrityError as _IntegrityError,
     PendingRollbackError as _PendingRollbackError,
 )

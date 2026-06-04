@@ -532,6 +532,7 @@ async def with_vision_locked(
     mutate_fn: Callable[[dict], None],
     *,
     skip_locked: bool = False,
+    timeout: float = 30.0,
 ) -> bool:
     """Atomic read-modify-write of project.vision under a project row lock.
 
@@ -541,6 +542,11 @@ async def with_vision_locked(
     dict loaded *inside* the lock, then writes the result back. Caller is
     responsible for committing.
 
+    ``timeout`` is forwarded to :func:`project_lock` and bounds how long a
+    blocking acquire (``skip_locked=False``) waits before raising
+    ``OperationalError`` — operator-steering callers pass a short timeout so a
+    contended project surfaces a retryable error instead of stalling.
+
     This is the canonical helper for serializing vision mutations from
     background task completions (strategic_completion, research_completion,
     etc.). Using it consistently prevents concurrent background writers from
@@ -548,7 +554,9 @@ async def with_vision_locked(
     same lost-update class already eliminated for ``design_doc`` and
     ``directions``.
     """
-    async with project_lock(session, project_id, skip_locked=skip_locked) as project:
+    async with project_lock(
+        session, project_id, skip_locked=skip_locked, timeout=timeout
+    ) as project:
         if project is None:
             return False
         vision = dict(project.vision or {})

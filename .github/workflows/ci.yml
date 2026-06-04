@@ -343,23 +343,16 @@ jobs:
 
       - name: Start PostgreSQL (pull with retry + mirror fallback)
         run: |
-          # registry-1.docker.io (Docker Hub) intermittently times out / rate-
-          # limits anonymous pulls from shared GH runner IPs ("context deadline
-          # exceeded" on the /v2/ handshake, or toomanyrequests). When it
-          # outlasts the retry window the shard hard-fails (exit 125: the loop
-          # falls through and docker run re-pulls and dies), and we saw both
-          # Docker Hub AND mirror.gcr.io fail together. So we LEAD with
-          # public.ecr.aws — AWS ECR Public's mirror of the Docker official
-          # library images — which serves anonymous pulls with NO rate limit on
-          # a wholly separate CDN, so most runs never touch Docker Hub at all.
-          # mirror.gcr.io (Google's pull-through cache) stays as a third path.
-          # Whichever source wins is retagged to postgres:15 (docker run below
-          # is then unchanged).
+          # registry-1.docker.io (Docker Hub) intermittently times out from GH
+          # runners ("context deadline exceeded" on the /v2/ handshake) — a
+          # connectivity blip, not a rate limit. When it outlasts the retry
+          # window the shard hard-fails (exit 125: the loop falls through and
+          # docker run re-pulls and dies). mirror.gcr.io is Google's public
+          # pull-through cache of Docker Hub's library images; it rides a
+          # different network path, so we fall back to it and retag to
+          # postgres:15 (docker run below is then unchanged).
           ok=
-          for src in \
-            public.ecr.aws/docker/library/postgres:15 \
-            postgres:15 \
-            mirror.gcr.io/library/postgres:15; do
+          for src in postgres:15 mirror.gcr.io/library/postgres:15; do
             for i in 1 2 3; do
               docker pull "$src" && { ok=1; break; }
               echo "::warning::$src pull failed (attempt $i/3) — backing off"
@@ -371,7 +364,7 @@ jobs:
             fi
           done
           if [ -z "$ok" ]; then
-            echo "::error::could not pull postgres:15 from public.ecr.aws, Docker Hub, or mirror.gcr.io"
+            echo "::error::could not pull postgres:15 from Docker Hub or mirror.gcr.io"
             exit 1
           fi
           docker run -d --name postgres --network host \

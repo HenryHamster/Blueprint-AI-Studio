@@ -5145,17 +5145,80 @@ async def test_pipeline_dedup_cancels_when_sibling_already_running(db_session, m
     result = await filter_pipeline_duplicates(
         [candidate.id], [candidate], db_session, broadcast_mock
     )
-    await db_session.commit()
+    # NOTE: no external commit here — the filter must durably commit the
+    # CANCELLED transition itself BEFORE broadcasting. Expiring the candidate
+    # forces the refresh below to re-read from the DB, proving the transition
+    # is persisted (not merely set in-memory and pending rollback).
     assert result == [], "Duplicate with running sibling must be filtered out"
+    db_session.expire(candidate)
     await db_session.refresh(candidate)
     assert candidate.status == TaskStatus.CANCELLED
     assert "Deduplicated" in (candidate.latest_status_message or "")
+    # The CANCELLED broadcast must have fired (after the commit above).
+    broadcast_mock.assert_awaited_once()
     # Cancelled candidate must carry an infra failure_category so rollup parents
     # don't get upgraded to CODE_ERROR by worst_child_failure_category.
     assert (candidate.context or {}).get("failure_category") == "AGENT_TIMEOUT"
     # Sibling must not be touched.
     await db_session.refresh(running)
     assert running.status == TaskStatus.IN_PROGRESS
+
+
+@pytest.mark.asyncio
+async def test_pipeline_dedup_commits_cancelled_before_broadcast(db_session, mocker):
+    """Regression: the dedup-cancel path must durably commit the loser's
+    terminal CANCELLED transition BEFORE emitting the task_updated broadcast.
+    Emitting first lets the UI refetch /api/admin/tasks and read a still-QUEUED
+    row (stale UI), and a later rollback would discard the CANCELLED change
+    after the event already announced it (lost transition)."""
+    from datetime import datetime, timezone
+    from app.orchestrator_filters import filter_pipeline_duplicates
+
+    project = await _make_db_project(db_session)
+
+    running = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 777, "base_branch": "main"}],
+    )
+    candidate = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "review", "pr_number": 777, "base_branch": "main"}],
+        created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+    )
+    db_session.add(running)
+    db_session.add(candidate)
+    await db_session.commit()
+    await db_session.refresh(candidate)
+
+    # Record the relative order of session.commit() and the broadcast. The
+    # filter must commit the CANCELLED transition first so the event is never
+    # emitted for an uncommitted (rollback-able) change.
+    events: list[str] = []
+    real_commit = db_session.commit
+
+    async def _record_commit(*args, **kwargs):
+        result = await real_commit(*args, **kwargs)
+        events.append("commit")
+        return result
+
+    async def _on_broadcast(*_args, **_kwargs):
+        events.append("broadcast")
+
+    mocker.patch.object(db_session, "commit", side_effect=_record_commit)
+    broadcast_mock = mocker.AsyncMock(side_effect=_on_broadcast)
+
+    result = await filter_pipeline_duplicates(
+        [candidate.id], [candidate], db_session, broadcast_mock
+    )
+    assert result == []
+    broadcast_mock.assert_awaited_once()
+    # A commit must be recorded, and the last commit before the broadcast must
+    # precede it — proving commit-before-broadcast ordering.
+    assert "commit" in events
+    assert events.index("broadcast") > 0
+    assert events[events.index("broadcast") - 1] == "commit"
 
 
 @pytest.mark.asyncio
@@ -6997,6 +7060,102 @@ async def test_release_safeguard_gate_sets_ci_waiting_when_evaluating(db_session
     assert orig.requires_approval is False
     assert (orig.context or {}).get("review_loop", {}).get("ci_waiting") is True
     assert (orig.context or {}).get("review_loop", {}).get("pr_number") == 7
+
+
+_SG_DUAL_HEAD_DIFF = (
+    "diff --git a/backend/alembic/versions/0002_dup.py "
+    "b/backend/alembic/versions/0002_dup.py\n"
+    "new file mode 100644\n"
+    "--- /dev/null\n"
+    "+++ b/backend/alembic/versions/0002_dup.py\n"
+    '+"""dup migration"""\n'
+    '+revision = "0002"\n'
+    '+down_revision = "0001"\n'
+)
+
+
+@pytest.mark.asyncio
+async def test_release_safeguard_gate_post_gate_merge_held_on_dual_head(
+    db_session, mocker
+):
+    """A gated post-gate merge (orig already COMPLETED) HOLDS on a dual head.
+
+    Exercises the _sg_gated=True branch of _maybe_release_safeguard_gate: the
+    held PR targets the project integration branch and adds a migration whose
+    revision id collides with one already on that branch, so the pre-merge
+    Alembic dual-head guard must block — merge_pull_request is never called and
+    the PR is left open for the guarded retry/resolver flow.
+    """
+    from app.task_completion import _maybe_release_safeguard_gate
+
+    project = make_project(integration_branch="automain")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # orig already terminalized (COMPLETED) with an open held PR — the path that
+    # fires the merge directly from the gate-release rather than via CI polling.
+    orig = make_task(
+        project_id=project.id,
+        requires_approval=True,
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(orig)
+    await db_session.commit()
+    await db_session.refresh(orig)
+
+    safeguard = make_task(
+        project_id=project.id,
+        context={"safeguard_for_task_id": str(orig.id), "safeguard_pr_number": 42},
+    )
+
+    mocker.patch(
+        "app.task_completion.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    # PR is open, unmerged, and targets the integration branch -> _sg_gated=True.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "state": "open",
+            "merged": False,
+            "base": {"ref": "automain"},
+        },
+    )
+    # Make the real dual-head guard see a same-revision collision on the target.
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "backend/alembic/versions/0002_dup.py"}],
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new_callable=AsyncMock,
+        return_value=_SG_DUAL_HEAD_DIFF,
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new_callable=AsyncMock,
+        return_value=["0001_init.py", "0002_existing.py"],
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+
+    await _maybe_release_safeguard_gate(safeguard, [], db_session)
+
+    # Gate still released, but the held merge was NOT fired — left open for the
+    # guarded retry/resolver flow.
+    merge_mock.assert_not_called()
+    await db_session.refresh(orig)
+    assert orig.requires_approval is False
+    # Idempotency flag was set with the gate-clear commit so the merge is never
+    # re-attempted from here even though it was held.
+    assert (orig.context or {}).get("_safeguard_merge_fired") is True
 
 
 # ── Cross-cutting gate: integration (spawn + merge-gate) ──────────────────────

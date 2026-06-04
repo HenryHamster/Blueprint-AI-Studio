@@ -622,3 +622,63 @@ describe('FAILURE_CLASS_CONFIG', () => {
     expect(screen.getByText('Wedged agent — retries with a fresh agent')).toBeInTheDocument();
   });
 });
+
+describe('TaskCard verify_tests task type', () => {
+  it('renders the Verify Tests badge (not the generic Hash fallback) for a verify_tests task', () => {
+    const task = makeTask({ task_type: 'verify_tests' });
+    render(<TaskCard task={task} {...baseProps} />);
+    // The TaskTypeBadge sets title to the styled label; the generic fallback
+    // would title it with the raw task_type string instead.
+    expect(screen.getByTitle('Verify Tests')).toBeInTheDocument();
+    expect(screen.queryByTitle('verify_tests')).toBeNull();
+  });
+});
+
+describe('TaskCard BLOCKED status', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('renders a distinct Blocked status badge for a BLOCKED task', () => {
+    const task = makeTask({ status: 'BLOCKED' });
+    render(<TaskCard task={task} {...baseProps} />);
+    // Badge label is present (visually revealed on hover but in the DOM).
+    expect(screen.getAllByText('Blocked').length).toBeGreaterThan(0);
+  });
+
+  it('renders the blocker reason and kind when metadata is present', () => {
+    const task = makeTask({
+      status: 'BLOCKED',
+      blocker_kind: 'file_conflict',
+      blocked_reason: 'Waiting on rollup PR #123 to merge',
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText('Waiting on rollup PR #123 to merge')).toBeInTheDocument();
+    expect(screen.getByText('file_conflict')).toBeInTheDocument();
+  });
+
+  it('renders cleanly for a BLOCKED task with no blocker metadata (backward compat)', () => {
+    const task = makeTask({ status: 'BLOCKED' });
+    render(<TaskCard task={task} {...baseProps} />);
+    // Falls back to the generic precondition message instead of crashing.
+    expect(screen.getByText('Parked on an unmet precondition')).toBeInTheDocument();
+  });
+
+  it('does not render a blocker block for a non-blocked task without metadata', () => {
+    const task = makeTask({ status: 'IN_PROGRESS' });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.queryByText('Parked on an unmet precondition')).toBeNull();
+  });
+
+  it('offers a cancel action for a BLOCKED task', async () => {
+    const user = userEvent.setup();
+    const onCancel = vi.fn();
+    const task = makeTask({ status: 'BLOCKED' });
+    render(<TaskCard task={task} {...baseProps} onCancel={onCancel} />);
+    // First click arms the confirm, second confirms.
+    const cancelBtn = screen.getByTitle('Cancel');
+    await user.click(cancelBtn);
+    await user.click(screen.getByTitle(/Confirm cancel/));
+    expect(onCancel).toHaveBeenCalledWith('task-1');
+  });
+});

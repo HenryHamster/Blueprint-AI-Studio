@@ -941,7 +941,8 @@ async def test_warm_pool_miss_paths_record_lease_miss_by_reason(
             db_session.add(t)
             return t
 
-        # (a) No COMPATIBLE idle member: required model differs from the member's.
+        # (a) Idle inventory exists, but no COMPATIBLE member: required model
+        # differs from the member's, so this is a no_compatible_member miss.
         t_a = _new_task()
         await db_session.commit()
         await db_session.refresh(t_a)
@@ -956,7 +957,8 @@ async def test_warm_pool_miss_paths_record_lease_miss_by_reason(
             is None
         )
 
-        # (b) Blacklisted boot account: the member's account is excluded.
+        # (b) Blacklisted boot account: idle inventory still exists, but the
+        # member is ineligible, so this is also a no_compatible_member miss.
         t_b = _new_task()
         await db_session.commit()
         await db_session.refresh(t_b)
@@ -998,7 +1000,8 @@ async def test_warm_pool_miss_paths_record_lease_miss_by_reason(
         funnel = get_pool_funnel_snapshot()
         assert funnel["pool_lease_hits"] == 0
         by_reason = funnel["lease_miss_by_reason"]
-        assert by_reason.get("no_idle_member", 0) >= 2  # (a) + (b)
+        assert by_reason.get("no_compatible_member", 0) >= 2  # (a) + (b)
+        assert by_reason.get("no_idle_member", 0) == 0
         assert by_reason.get("suppressed", 0) >= 1  # (c)
         assert funnel["lease_miss_total"] >= 3
 

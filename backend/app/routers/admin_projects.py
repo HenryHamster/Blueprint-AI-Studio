@@ -34,6 +34,10 @@ from app.auth import get_current_user
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
 from app.task_locking import lock_project_or_429
 from app.build_config_lint import build_config_lint_warnings
+from app.ci_resolution import (
+    compute_merge_verification_verdict,
+    merge_gate_runtime_block,
+)
 
 router = APIRouter(
     prefix="/api/admin",
@@ -89,6 +93,7 @@ async def get_all_projects(
             Project.paused,
             Project.archived,
             Project.build_config,
+            Project.merge_gate_runtime,
             Project.sr_catch_rate_targets,
             Project.running_update_acknowledged_at,
             func.coalesce(func.jsonb_array_length(Project.directions), 0).label(
@@ -126,6 +131,8 @@ async def get_all_projects(
                     row.build_config or {}, row.my_role
                 ),
                 "build_config_warnings": build_config_lint_warnings(row.build_config),
+                "merge_verification_verdict": compute_merge_verification_verdict(row),
+                "merge_gate_runtime": merge_gate_runtime_block(row),
                 "sr_catch_rate_targets": row.sr_catch_rate_targets or {},
                 "running_update_acknowledged_at": (
                     row.running_update_acknowledged_at.isoformat()
@@ -183,6 +190,8 @@ async def get_project(
         "self_reflection_log": project.self_reflection_log or [],
         "build_config": _redact_build_config(project.build_config or {}, role),
         "build_config_warnings": build_config_lint_warnings(project.build_config),
+        "merge_verification_verdict": compute_merge_verification_verdict(project),
+        "merge_gate_runtime": merge_gate_runtime_block(project),
         "autonomous_enabled": project.autonomous_enabled,
         "paused": project.paused,
         "is_self_repo": project.is_self_repo,
@@ -384,6 +393,7 @@ async def update_project(
                 "stale_branch_prefixes",
                 "protected_branches",
                 "enable_self_improvement",
+                "requires_ci_checks",
             ):
                 if _field not in incoming and _field in existing_bc:
                     incoming[_field] = existing_bc[_field]
@@ -442,16 +452,14 @@ async def update_project(
         # so the agent can distinguish user edits during its next cycle.
         from pydantic import ValidationError as _PmValidationError
 
-        from app.problem_model import ProblemModel, parse_problem_model
+        from app.problem_model import apply_user_intent_patch, parse_problem_model
 
-        ALLOWED_USER_FIELDS = {"intent", "context", "constraints"}
-        invalid = set(payload.problem_model_patch.keys()) - ALLOWED_USER_FIELDS
-        if invalid:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cannot edit agent-owned problem_model fields: {sorted(invalid)}. "
-                f"Editable fields: {sorted(ALLOWED_USER_FIELDS)}",
-            )
+        # Stale-write guard runs first so a concurrent writer is reported as a
+        # 409 before we attempt the merge. The editable-subset validation and
+        # the operator-provenance re-stamp both live in apply_user_intent_patch,
+        # so onboarding and this editor save share one correct path (the inline
+        # shallow merge used to drop intent.source, silently un-protecting an
+        # operator-edited purpose against the next strategic cycle).
         current = parse_problem_model(project.problem_model)
         if (
             payload.problem_model_base_revision is not None
@@ -465,17 +473,18 @@ async def update_project(
                     "Reload and retry."
                 ),
             )
-        merged_raw: Dict[str, Any] = current.model_dump()
-        merged_raw.update(payload.problem_model_patch)
         try:
-            validated = ProblemModel.model_validate(merged_raw)
+            validated = apply_user_intent_patch(
+                project.problem_model,
+                payload.problem_model_patch,
+                _utcnow().isoformat(),
+            )
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve)) from None
         except _PmValidationError as ve:
             raise HTTPException(
                 status_code=400, detail=f"Invalid problem_model patch: {ve}"
             ) from None
-        validated.revision = current.revision + 1
-        validated.last_updated = _utcnow().isoformat()
-        validated.last_updated_by = "user"
         project.problem_model = validated.model_dump()
         flag_modified(project, "problem_model")
 
@@ -488,6 +497,8 @@ async def update_project(
     # build_config so the value reflects what was actually persisted.
     response = project.model_dump()
     response["build_config_warnings"] = build_config_lint_warnings(project.build_config)
+    response["merge_verification_verdict"] = compute_merge_verification_verdict(project)
+    response["merge_gate_runtime"] = merge_gate_runtime_block(project)
     return response
 
 
@@ -519,7 +530,6 @@ async def detect_project_build_config(
     from app.github import get_repo_installation_token
     from app.routers.admin_onboard import _detect_build_config
     from app.schemas import BuildConfig as BuildConfigSchema
-
     token = await get_repo_installation_token(project.github_owner, project.github_repo)
     if not token:
         raise HTTPException(
@@ -528,7 +538,13 @@ async def detect_project_build_config(
         )
 
     detected = await _detect_build_config(
-        token, project.github_owner, project.github_repo
+        token,
+        project.github_owner,
+        project.github_repo,
+        # Preserve the legacy default-branch behavior for projects that still
+        # have a NULL integration_branch column: omitting ref lets GitHub read
+        # the repo's actual default branch instead of forcing synthetic "main".
+        ref=project.integration_branch,
     )
 
     detected = apply_operator_build_config_overrides(
@@ -548,6 +564,8 @@ async def detect_project_build_config(
     return {
         "build_config": project.build_config or {},
         "build_config_warnings": build_config_lint_warnings(project.build_config),
+        "merge_verification_verdict": compute_merge_verification_verdict(project),
+        "merge_gate_runtime": merge_gate_runtime_block(project),
     }
 
 
@@ -572,6 +590,62 @@ async def acknowledge_running_update(
     return {
         "status": "acknowledged",
         "acknowledged_at": project.running_update_acknowledged_at.isoformat(),
+    }
+
+
+class RunningUpdateEdit(BaseModel):
+    """Operator edit to the running_update body.
+
+    ``body`` is the new full document. ``base`` is the document text the
+    operator started editing from; when supplied it is compared against the
+    current stored document under the row lock to detect a concurrent writer
+    (agent cycle / routine digest) and reject the edit with a 409 so the
+    operator can reload and retry — the same optimistic-concurrency discipline
+    vision/design_doc use, adapted to a plain TEXT column with no embedded
+    revision counter.
+    """
+
+    body: str
+    base: str | None = None
+
+
+@router.put("/projects/{project_id}/running-update")
+@limiter.limit("30/minute")
+async def edit_running_update(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: RunningUpdateEdit,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Operator edit of the project's running_update body.
+
+    Mirrors the operator-editable treatment vision and problem_model already
+    get: the operator can correct a stale claim, add context, or flag a
+    concern in the living status narrative. The write takes the project row
+    lock and refreshes the field so a concurrent agent write is observed; when
+    a ``base`` is supplied and differs from the current document a 409 is
+    raised. A mid-cycle edit survives the next strategic cycle via the existing
+    operator-wins reconciliation in ``running_update_merge``."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    project = await lock_project_or_429(session, project.id)
+    await session.refresh(project, attribute_names=["running_update"])
+    if payload.base is not None and (project.running_update or "") != payload.base:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "running_update was modified by another writer since you began "
+                "editing. Reload and retry."
+            ),
+        )
+    project.running_update = payload.body
+    session.add(project)
+    await session.commit()
+    return {
+        "status": "updated",
+        "running_update": project.running_update,
     }
 
 

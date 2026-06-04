@@ -73,7 +73,7 @@ const ALLOWLIST: AllowEntry[] = [
   },
   {
     path: 'components/ProjectBuildConfigSection.tsx',
-    line: 504,
+    line: 612,
     pattern: 'fallback-blueprint',
     rationale:
       "Display-only fallback inside a <code> sample of the task-branch " +

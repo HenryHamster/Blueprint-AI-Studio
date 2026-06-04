@@ -2424,6 +2424,54 @@ async def test_rollup_auto_merge_blocked_calls_enable_auto_merge(rollup_db, mock
     assert (parent.context or {}).get("_merge_deferred_state") == "blocked"
 
 
+@pytest.mark.parametrize("mergeable_state", ["blocked", "unstable"])
+@pytest.mark.asyncio
+async def test_rollup_auto_merge_skips_github_for_migration_pr(
+    rollup_db, mocker, mergeable_state
+):
+    """A migration-carrying rollup PR must NOT be delegated to GitHub native
+    auto-merge: the target branch can advance while checks are pending, so the
+    merge could land against a different migration chain than the one validated.
+    Skip enable_auto_merge and fall through to the deferral / re-validation path
+    (the deferral counter must still increment so a stuck PR escalates)."""
+    state = {"state": mergeable_state}
+    _patch_deferred_counter_mocks(mocker, state)
+    # Override the empty get_pr_files mock so pr_touches_migrations returns True.
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "backend/alembic/versions/0140_add_widget.py"}],
+    )
+    # With a migration file present, the pre-merge combined-chain guard would
+    # otherwise fetch the (unmocked) diff and defer before the post-merge-failure
+    # branch. Force "ok" so flow reaches the auto-merge fallback we're testing.
+    mocker.patch(
+        "app.rollup_management._validate_rollup_migration_chain",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
+    )
+    mock_enable = mocker.patch(
+        "app.github.enable_auto_merge",
+        new_callable=AsyncMock,
+        return_value={"enabled": True},
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent-xyz"
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+
+    mock_enable.assert_not_awaited()
+    # Deferral / re-validation path still runs so a stuck PR still escalates.
+    assert (parent.context or {}).get("_merge_deferred_count") == 1
+    assert (parent.context or {}).get("_merge_deferred_state") == mergeable_state
+
+
 @pytest.mark.asyncio
 async def test_rollup_per_state_alert_does_not_refire_on_flap(rollup_db, mocker):
     """A PR that flaps blocked↔unstable between sweeps resets the per-state
@@ -3571,6 +3619,69 @@ async def test_strategic_completion_no_api_no_logs_increments_failures(
     await strategic_db.refresh(project)
     assert project.vision.get("_strategic_failures") == 3
     alert_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_strategic_op_emits_strategic_updated(strategic_db, mocker):
+    """A live strategic write op broadcasts a strategic_updated refetch signal.
+
+    set_running_update → kind 'running_update'; set_problem_model → kind
+    'problem_model'. Each op routes through the shared strategic_events helper
+    AFTER its commit, so the directions view stays live regardless of origin.
+    """
+    from unittest.mock import AsyncMock
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    project = Project(name="P", user_id="u1", vision={"purpose": "p"})
+    strategic_db.add(project)
+    await strategic_db.commit()
+    await strategic_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review"}],
+    )
+    strategic_db.add(task)
+    await strategic_db.commit()
+    await strategic_db.refresh(task)
+    task_id = str(task.id)
+
+    async def _override_session():
+        yield strategic_db
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+    bcast = mocker.patch("app.strategic_events.broadcast_to_project", new=AsyncMock())
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_running_update",
+                    "task_id": task_id,
+                    "data": {"markdown": "# Living update"},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+    events = [c.args for c in bcast.await_args_list if c.args[1] == "strategic_updated"]
+    assert len(events) == 1, "expected one strategic_updated broadcast"
+    assert events[0][0] == str(project.id)
+    assert events[0][2] == {"kind": "running_update"}
 
 
 @pytest.mark.asyncio

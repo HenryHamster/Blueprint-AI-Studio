@@ -1,6 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 import React, { useState, useEffect, useRef, memo, forwardRef } from 'react';
-import { CheckCircle, AlertTriangle, Clock, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package, ArrowUpDown, Wrench, MoreHorizontal, Radio, Layers, Gauge, Compass, FileText, Copy, Check } from 'lucide-react';
+import { CheckCircle, AlertTriangle, Clock, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, ShieldCheck, Package, ArrowUpDown, Wrench, MoreHorizontal, Radio, Layers, Gauge, Compass, FileText, Copy, Check } from 'lucide-react';
 import { formatDurationMs, parseTimestamp } from '../utils/time';
 import { authGet, API_BASE_URL } from '../api';
 import { EXIT_REASON_COLORS } from '../utils/fixLoopColors';
@@ -166,6 +166,7 @@ export const TASK_TYPE_STYLES: Record<string, { bg: string; text: string; icon: 
   design_doc_update: { bg: 'bg-slate-500/10 border-slate-500/20', text: 'text-slate-400', icon: FileText, label: 'Design Doc' },
   self_audit: { bg: 'bg-fuchsia-500/10 border-fuchsia-500/20', text: 'text-fuchsia-400', icon: Shield, label: 'Self Audit' },
   memo: { bg: 'bg-stone-500/10 border-stone-500/20', text: 'text-stone-400', icon: FileText, label: 'Memo' },
+  verify_tests: { bg: 'bg-emerald-500/10 border-emerald-500/20', text: 'text-emerald-400', icon: ShieldCheck, label: 'Verify Tests' },
 };
 
 function parsePhase(statusMessage: string): string {
@@ -363,6 +364,7 @@ export function StatusBadge({ status }: { status: TaskStatus }) {
   const configs: Partial<Record<TaskStatus, { bg: string; text: string; icon: typeof Activity; label: string; spin?: boolean }>> = {
     PROVISIONING: { bg: 'bg-sky-500/5 border-sky-500/10', text: 'text-sky-400/70', icon: Activity, label: 'Provisioning…', spin: true },
     EVALUATING: { bg: 'bg-indigo-500/5 border-indigo-500/10', text: 'text-indigo-400/70', icon: Clock, label: 'Evaluating' },
+    BLOCKED: { bg: 'bg-amber-500/10 border-amber-500/30', text: 'text-amber-400', icon: ShieldAlert, label: 'Blocked' },
     CANCELLED: { bg: 'bg-neutral-500/10 border-neutral-500/20', text: 'text-neutral-500', icon: X, label: 'Cancelled' },
   };
   const cfg = configs[status];
@@ -577,6 +579,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
     design_doc_update: 'border-l-sky-400',
     self_audit: 'border-l-fuchsia-400',
     memo: 'border-l-stone-400',
+    verify_tests: 'border-l-emerald-500',
   };
   const borderColor = task.task_type ? (taskTypeBorderColor[task.task_type] ?? 'border-l-neutral-700') : 'border-l-neutral-700';
 
@@ -625,7 +628,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                 <CheckCircle className="w-3.5 h-3.5" />
               </button>
             )}
-            {(task.status === 'IN_PROGRESS' || task.status === 'QUEUED' || task.status === 'PROVISIONING') && (
+            {(task.status === 'IN_PROGRESS' || task.status === 'QUEUED' || task.status === 'PROVISIONING' || task.status === 'BLOCKED') && (
               <button
                 title={confirmAction === 'cancel' ? `Confirm cancel (${confirmCountdown}s)` : 'Cancel'}
                 onClick={(e) => { e.stopPropagation(); handleDestructiveClick('cancel', () => onCancel(task.id)); }}
@@ -848,6 +851,35 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
       ) : null}
 
       {task.plan_output ? <PlanPreview planOutput={task.plan_output} /> : null}
+
+      {(task.status === 'BLOCKED' || task.blocker_kind || task.blocked_reason) ? (
+        <div className="bg-amber-950/30 border border-amber-900/40 rounded-lg px-2.5 py-2 mb-2">
+          <div className="flex items-center gap-1.5 mb-0.5">
+            <ShieldAlert className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+            <span className="text-[11px] font-semibold text-amber-400">Blocked</span>
+            {task.blocker_kind ? (
+              <span className="text-[9px] uppercase tracking-wider font-mono bg-amber-500/10 text-amber-300 border border-amber-500/20 px-1.5 py-0.5 rounded">
+                {task.blocker_kind}
+              </span>
+            ) : null}
+          </div>
+          {task.blocked_reason ? (
+            <p className="text-[11px] text-amber-200/80 break-words">{task.blocked_reason}</p>
+          ) : (
+            <p className="text-[11px] text-amber-200/60 italic">Parked on an unmet precondition</p>
+          )}
+          {(() => {
+            if (!task.recheck_after) return null;
+            const recheckTime = parseTimestamp(task.recheck_after).getTime();
+            const isFuture = recheckTime > now30;
+            if (isFuture) {
+              const mins = Math.max(1, Math.ceil((recheckTime - now30) / 60000));
+              return <p className="text-[10px] text-amber-400/80 mt-0.5 font-mono">Rechecks in {mins}m</p>;
+            }
+            return <p className="text-[10px] text-amber-400/80 mt-0.5 font-mono">Recheck due</p>;
+          })()}
+        </div>
+      ) : null}
 
       {task.depends_on && task.depends_on.length > 0 ? (
         <div className="text-[10px] text-neutral-500 mb-2 font-mono flex items-center gap-1">

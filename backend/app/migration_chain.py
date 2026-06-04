@@ -227,6 +227,488 @@ def validate_added_migrations(sources: dict[str, str]) -> str | None:
     return None
 
 
+def validate_combined_migration_chain(
+    existing_filenames: list[str], added_sources: dict[str, str]
+) -> str | None:
+    """Validate a rollup's added migrations against the target branch's chain.
+
+    The in-isolation guard (:func:`validate_added_migrations`) only proves the
+    *added* migrations form one linear extension; it treats their anchoring
+    ``down_revision`` as a valid external reference. That is blind to the most
+    common parallel-development collision: two independently-cut branches each
+    add "the next" migration with the SAME revision id (or anchored to a
+    revision that is no longer the target's head). Each branch's own CI is
+    green, but merged they produce duplicate revisions / multiple Alembic heads
+    and the app refuses to boot on the next schema-version check.
+
+    This combines the two: ``existing_filenames`` are the migration filenames
+    currently on the target branch (the filename ``NNNN`` prefix is the existing
+    revision id, kept in lockstep with the in-file revision by the
+    migration-chain invariant), and ``added_sources`` maps an identifier to the
+    source of each migration the rollup adds. Returns ``None`` when the combined
+    chain is valid; otherwise a precise, actionable reason naming the colliding
+    or stale revision and the fix. The in-isolation checks still run first, so
+    this is a strict superset of :func:`validate_added_migrations`.
+
+    With no existing migrations (empty/greenfield target) it degrades exactly to
+    :func:`validate_added_migrations`.
+    """
+    reason = validate_added_migrations(added_sources)
+    if reason is not None:
+        return reason
+    if not added_sources:
+        return None
+
+    existing_revisions = {
+        rev
+        for fn in existing_filenames
+        if (rev := _filename_revision_prefix(fn)) is not None
+    }
+    if not existing_revisions:
+        # No existing chain to combine against — in-isolation result stands.
+        return None
+    existing_head = max(existing_revisions, key=int)
+
+    added_chain, _duplicates, _unparseable = build_migration_chain(added_sources)
+
+    # (a) A revision id the rollup adds already exists on the target branch.
+    collisions = sorted(set(added_chain) & existing_revisions, key=int)
+    if collisions:
+        rev = collisions[0]
+        return (
+            f"Alembic revision '{rev}' already exists on the target branch; "
+            f"renumber to the next free revision and rechain onto the current "
+            f"head '{existing_head}'."
+        )
+
+    # (b) The added chain's root must attach to the target's current head; a
+    # stale ``down_revision`` (anchored to an older revision, or to None when
+    # the target already has migrations) would create a second Alembic head.
+    roots = find_roots(added_chain)  # exactly 1 — validate_added_migrations ensured
+    root_rev = roots[0]
+    anchor = added_chain[root_rev]
+    if anchor != existing_head:
+        return (
+            f"Alembic migration '{root_rev}' anchors to down_revision "
+            f"'{anchor}', but the target branch head is '{existing_head}'; "
+            f"rechain '{root_rev}' onto '{existing_head}'."
+        )
+    return None
+
+
+_EXPECTED_SCHEMA_REVISION_RE = re.compile(
+    r"""(?P<lead>EXPECTED_SCHEMA_REVISION\s*=\s*)['"]\w+['"]"""
+)
+
+
+def rewrite_expected_schema_revision(
+    main_source: str, new_revision: str
+) -> tuple[str, int]:
+    """Rewrite the ``EXPECTED_SCHEMA_REVISION = "NNNN"`` literal in ``main.py``.
+
+    Returns ``(rewritten_source, count)`` where ``count`` is the number of
+    assignments replaced (0 when the literal is absent — the caller must not
+    guess and should fall back rather than push a malformed bump). The quote
+    style is normalised to double quotes, matching the in-repo declaration.
+    """
+    return _EXPECTED_SCHEMA_REVISION_RE.subn(
+        lambda m: f'{m.group("lead")}"{new_revision}"', main_source, count=1
+    )
+
+
+def _rewrite_migration_source(
+    source: str, new_revision: str, new_down_revision: str
+) -> str:
+    """Renumber a single migration file's ``revision`` / ``down_revision``.
+
+    Replaces the first ``revision = '...'`` assignment with *new_revision* and
+    the first ``down_revision = '...'`` (or ``down_revision = None``) assignment
+    with *new_down_revision*, preserving the existing quote style for the
+    revision token. Pure string rewrite — used only on a not-yet-merged
+    rollup's own newly-added migration file.
+    """
+
+    def _sub_rev(m: "re.Match[str]") -> str:
+        return m.group(0).replace(m.group(1), new_revision, 1)
+
+    def _sub_down(m: "re.Match[str]") -> str:
+        full = m.group(0)
+        if m.group(1):  # down_revision = '<rev>'
+            return full.replace(m.group(1), new_down_revision, 1)
+        # down_revision = None  ->  down_revision = "<head>"
+        return full[: full.rindex("None")] + f'"{new_down_revision}"'
+
+    source = _REVISION_RE.sub(_sub_rev, source, count=1)
+    source = _DOWN_REVISION_RE.sub(_sub_down, source, count=1)
+    return source
+
+
+def _renumbered_filename(old_path: str, new_revision: str) -> str:
+    """Rename a migration path so its ``NNNN`` prefix matches *new_revision*.
+
+    Keeps the directory and the descriptive suffix after the first underscore
+    (e.g. ``.../0137_add_foo.py`` -> ``.../0138_add_foo.py``).
+    """
+    directory, basename = os.path.split(old_path)
+    suffix = basename[len(basename.split("_", 1)[0]):]  # leading "_..." (or "")
+    return os.path.join(directory, new_revision + suffix) if directory else (
+        new_revision + suffix
+    )
+
+
+def plan_migration_reconciliation(
+    existing_filenames: list[str], added_sources: dict[str, str]
+) -> dict | None:
+    """Plan a mechanical renumber of a rollup's colliding migration chain.
+
+    Returns ``None`` unless the block is unambiguously mechanically
+    reconcilable: the rollup adds migrations that form a SINGLE LINEAR CHAIN
+    (per :func:`validate_added_migrations`, which already requires exactly one
+    head and one root) blocked SOLELY by a revision-id collision with the target
+    branch or a stale ``down_revision`` anchor (the two classes
+    :func:`validate_combined_migration_chain` rejects). When the rollup bundles
+    several chained migrations (multiple subtasks each contributing one) whose
+    oldest collides with the head, the entire chain is renumbered into a
+    contiguous, increasing block above every existing revision, mirroring the
+    back-merge :func:`plan_integration_side_renumber` planner. Anything genuinely
+    ambiguous — migrations that do not form one linear chain (multiple
+    independent collisions / multiple heads / multiple roots), a fan-out tail, a
+    parse failure, or an already-valid chain — returns ``None`` so the caller
+    falls back to a clear operator alert rather than guessing.
+
+    When reconcilable, returns a plan dict::
+
+        {
+            "upserts",                       # path -> new source: every renamed +
+                                             #   renumbered migration in the chain
+            "deletes",                       # [old paths] being renamed away
+            "old_path", "new_path",          # rename of the chain's root migration
+            "old_revision", "new_revision",  # the root's NNNN renumber
+            "new_down_revision",             # the root rechained onto target head
+            "new_source",                    # the root's rewritten body
+            "expected_schema_revision",      # the resulting single head == numeric max
+        }
+
+    The colliding migration AND its entire linear descendant tail are renumbered
+    MONOTONICALLY (numeric-max revision == structural head). The reconciled set
+    is verified against :func:`validate_combined_migration_chain` plus a
+    single-head and numeric-max-is-head guard before being returned, so a
+    renumber that would not resolve to one clean monotonic head yields ``None``
+    rather than an unsafe push. The scalar ``old_*``/``new_*``/``new_source``
+    keys describe the chain's root and are preserved for the degenerate
+    single-migration case so existing callers keep working.
+    """
+    # Must be a valid single linear extension in isolation; a body/structure
+    # problem (multi-head, multi-root, duplicate, unparseable) is not mechanical.
+    if validate_added_migrations(added_sources) is not None:
+        return None
+    if not added_sources:
+        return None
+
+    existing_revisions = {
+        rev
+        for fn in existing_filenames
+        if (rev := _filename_revision_prefix(fn)) is not None
+    }
+    if not existing_revisions:
+        # No existing chain to collide against — nothing to reconcile.
+        return None
+    existing_head = max(existing_revisions, key=int)
+
+    added_chain, _duplicates, _unparseable = build_migration_chain(added_sources)
+
+    # validate_added_migrations guaranteed exactly one head and one root.
+    root_rev = find_roots(added_chain)[0]
+    collisions = set(added_chain) & existing_revisions
+    stale_anchor = added_chain[root_rev] != existing_head
+    if not collisions and not stale_anchor:
+        # Already a clean linear extension onto the head — no block to fix.
+        return None
+
+    # revision -> path for the added set (unique: validate_added_migrations
+    # rejected duplicates and unparseable files above).
+    rev_to_path = {
+        parse_revision_identifiers(src)[0]: path
+        for path, src in added_sources.items()
+    }
+
+    # The added chain must be a single linear tail from its root; a diamond
+    # (one root + one head but an internal fan-out) is not mechanically
+    # rechainable. The tail plus the root must cover the whole added set.
+    children: dict[str, list[str]] = {}
+    for rev, down in added_chain.items():
+        if down is not None:
+            children.setdefault(down, []).append(rev)
+    tail = _linear_descendant_tail(root_rev, children)
+    if tail is None:
+        return None
+    chain_order = [root_rev, *tail]
+    if len(chain_order) != len(added_chain):
+        return None
+
+    # Next free revisions: a contiguous, increasing block strictly above every
+    # existing revision (target or added) so the whole renumbered chain cannot
+    # collide. Node N gets max+1+N, rechained onto its renumbered predecessor
+    # (the root onto the target branch head). This keeps the NNNN order in
+    # lockstep with the chain order, so the numeric maximum revision is the true
+    # head and the combined-chain guard's numeric-max head shortcut stays correct.
+    all_revisions = existing_revisions | set(added_chain)
+    max_revision = max(all_revisions, key=int)
+    width = len(max_revision)
+    base = int(max_revision)
+
+    upserts: dict[str, str] = {}
+    deletes: list[str] = []
+    prev_new_revision = existing_head
+    new_revision = ""  # the root migration's new revision (chain_order[0])
+    new_path = ""
+    for offset, rev in enumerate(chain_order):
+        renumbered = f"{base + 1 + offset:0{width}d}"
+        node_old_path = rev_to_path[rev]
+        node_new_path = _renumbered_filename(node_old_path, renumbered)
+        upserts[node_new_path] = _rewrite_migration_source(
+            added_sources[node_old_path], renumbered, prev_new_revision
+        )
+        deletes.append(node_old_path)
+        if offset == 0:
+            new_revision = renumbered
+            new_path = node_new_path
+        prev_new_revision = renumbered
+
+    old_path = rev_to_path[root_rev]
+
+    # Verify the reconciled added set against the same combined-chain validation
+    # the guard uses — never return a plan that would not actually resolve.
+    reconciled = {
+        path: src for path, src in added_sources.items() if path not in deletes
+    }
+    reconciled.update(upserts)
+    if validate_combined_migration_chain(existing_filenames, reconciled):
+        return None
+    reconciled_chain, _dups, _unp = build_migration_chain(reconciled)
+    heads = find_heads(reconciled_chain)
+    if len(heads) != 1:
+        return None
+
+    # Monotonicity guard: the numeric-max revision MUST be the structural head,
+    # otherwise the combined-chain guard's numeric-max head shortcut would
+    # mis-identify the head on the next migration. Never emit a non-monotonic
+    # plan — fall back to the operator path instead.
+    if max(reconciled_chain, key=int) != heads[0]:
+        return None
+
+    return {
+        "upserts": upserts,
+        "deletes": deletes,
+        "old_path": old_path,
+        "new_path": new_path,
+        "old_revision": root_rev,
+        "new_revision": new_revision,
+        "new_down_revision": existing_head,
+        "new_source": upserts[new_path],
+        "expected_schema_revision": heads[0],
+    }
+
+
+def _linear_descendant_tail(
+    start_revision: str, children: dict[str, list[str]]
+) -> list[str] | None:
+    """Ordered descendants of *start_revision* when they form a simple linear tail.
+
+    ``children`` maps a revision to the list of revisions that declare it as
+    their ``down_revision``. Walks downstream from *start_revision* requiring
+    every node to have at most one child; returns the descendants in chain order
+    (nearest first, excluding *start_revision* itself). Returns ``None`` on any
+    fan-out (a node with more than one child) or cycle — i.e. anything that is
+    not a single linear tail and therefore not mechanically rechainable.
+    """
+    tail: list[str] = []
+    seen = {start_revision}
+    current = start_revision
+    while True:
+        kids = children.get(current, [])
+        if not kids:
+            return tail
+        if len(kids) > 1:
+            return None  # fan-out — the tail branches
+        nxt = kids[0]
+        if nxt in seen:
+            return None  # cycle — not a linear tail
+        seen.add(nxt)
+        tail.append(nxt)
+        current = nxt
+
+
+def plan_integration_side_renumber(
+    promotion_target_filenames: list[str], integration_sources: dict[str, str]
+) -> dict | None:
+    """Plan a mechanical renumber of the integration branch's colliding migration.
+
+    The BACK-MERGE mirror of :func:`plan_migration_reconciliation`. When the
+    promotion target (e.g. ``main``) is back-merged into the integration branch
+    (e.g. ``automain``), the promotion-target migration is ALREADY APPLIED IN
+    PRODUCTION and is therefore immutable — it must never be renumbered. The
+    migration that must move is the one on the INTEGRATION branch whose revision
+    id independently reused the same ``NNNN`` slot, together with any
+    integration-branch migrations that linearly chain off it.
+
+    ``promotion_target_filenames`` are the immutable migration filenames on the
+    promotion target (the ``NNNN`` prefix is the revision id, kept in lockstep
+    with the in-file revision by the migration-chain invariant); they supply the
+    colliding revision id and the unified head. ``integration_sources`` maps
+    path -> source for the integration branch's post-divergence migrations (the
+    colliding migration and its descendant tail — NOT the migrations shared with
+    the promotion target).
+
+    Returns ``None`` unless the block is unambiguously mechanically reconcilable:
+    EXACTLY ONE integration migration's revision id collides with a
+    promotion-target revision id, that colliding migration is anchored to the
+    shared promotion-target ancestor, and its descendants form a single linear
+    tail. Anything else — zero or multiple collisions, a parse failure, a
+    duplicate revision, a filename/revision desync, a fan-out tail, or a result
+    that would not resolve to one clean head — returns ``None`` so the caller
+    falls back to the guided resolver rather than guessing.
+
+    When reconcilable, returns a plan dict::
+
+        {
+            "upserts",                  # path -> new source: the renamed +
+                                        #   renumbered colliding migration AND
+                                        #   every node in its linear descendant
+                                        #   tail, renumbered monotonically
+            "deletes",                  # [old colliding path, *old tail paths]
+                                        #   being renamed away
+            "old_path", "new_path",     # the rename of the colliding migration
+            "old_revision", "new_revision",
+            "new_down_revision",        # the unified promotion-target head
+            "expected_schema_revision", # the resulting single head == numeric max
+        }
+
+    The colliding migration and its entire linear descendant tail are
+    renumbered into a contiguous, increasing block of fresh revision ids above
+    every existing revision, each rechained onto its renumbered predecessor, so
+    the reconciled chain is MONOTONIC (numeric-max revision == structural head).
+
+    The reconciled result is verified against
+    :func:`validate_combined_migration_chain` before being returned, so a
+    renumber that would not resolve to exactly one clean head yields ``None``
+    rather than an unsafe push. Reuses the existing chain helpers throughout —
+    it does not introduce a second migration-safety rule set.
+    """
+    target_revisions = {
+        rev
+        for fn in promotion_target_filenames
+        if (rev := _filename_revision_prefix(fn)) is not None
+    }
+    if not target_revisions:
+        return None
+    target_head = max(target_revisions, key=int)
+
+    if not integration_sources:
+        return None
+    int_chain, duplicates, unparseable = build_migration_chain(integration_sources)
+    if duplicates or unparseable:
+        return None
+    if find_filename_revision_mismatches(integration_sources):
+        return None
+
+    # Exactly one integration revision id may collide with a target revision id.
+    collisions = set(int_chain) & target_revisions
+    if len(collisions) != 1:
+        return None
+    colliding_rev = next(iter(collisions))
+
+    # The colliding migration must anchor to the shared promotion-target
+    # ancestor (a genuine divergence-point collision), not to another
+    # integration migration (a non-mechanical fork we must not auto-renumber).
+    if int_chain[colliding_rev] not in target_revisions:
+        return None
+
+    # revision -> path for the integration set (unique: no duplicates above).
+    rev_to_path = {
+        parse_revision_identifiers(src)[0]: path
+        for path, src in integration_sources.items()
+    }
+
+    # The colliding migration's descendants must form a single linear tail.
+    children: dict[str, list[str]] = {}
+    for rev, down in int_chain.items():
+        if down is not None:
+            children.setdefault(down, []).append(rev)
+    tail = _linear_descendant_tail(colliding_rev, children)
+    if tail is None:
+        return None
+
+    # Next free revisions: a contiguous, increasing block strictly above every
+    # existing revision (target or integration) so the whole renumbered tail
+    # cannot collide. The colliding migration AND its entire linear descendant
+    # tail are renumbered MONOTONICALLY — node N gets max+1+N, rechained onto
+    # its renumbered predecessor (the colliding node onto the unified
+    # promotion-target head). This keeps the NNNN order in lockstep with the
+    # chain order, so the numeric maximum revision is the true head and the
+    # combined-chain guard's numeric-max head shortcut stays correct.
+    all_revisions = target_revisions | set(int_chain)
+    max_revision = max(all_revisions, key=int)
+    width = len(max_revision)
+    base = int(max_revision)
+
+    # Chain order: the colliding migration first, then its linear descendants.
+    chain_order = [colliding_rev, *tail]
+
+    upserts: dict[str, str] = {}
+    deletes: list[str] = []
+    # The colliding migration anchors to the unified promotion-target head; each
+    # subsequent tail node anchors to its renumbered predecessor.
+    prev_new_revision = target_head
+    new_revision = ""  # the colliding migration's new revision (chain_order[0])
+    new_path = ""
+    for offset, rev in enumerate(chain_order):
+        renumbered = f"{base + 1 + offset:0{width}d}"
+        node_old_path = rev_to_path[rev]
+        node_new_path = _renumbered_filename(node_old_path, renumbered)
+        upserts[node_new_path] = _rewrite_migration_source(
+            integration_sources[node_old_path], renumbered, prev_new_revision
+        )
+        deletes.append(node_old_path)
+        if offset == 0:
+            new_revision = renumbered
+            new_path = node_new_path
+        prev_new_revision = renumbered
+
+    old_path = rev_to_path[colliding_rev]
+
+    # Verify the reconciled integration set against the same combined-chain
+    # validator the guard uses — never return a plan that would not resolve.
+    reconciled = {
+        path: src for path, src in integration_sources.items() if path not in deletes
+    }
+    reconciled.update(upserts)
+    if validate_combined_migration_chain(promotion_target_filenames, reconciled):
+        return None
+    reconciled_chain, _dups, _unp = build_migration_chain(reconciled)
+    heads = find_heads(reconciled_chain)
+    if len(heads) != 1:
+        return None
+
+    # Monotonicity guard: the numeric-max revision MUST be the structural head,
+    # otherwise the combined-chain guard's numeric-max head shortcut would
+    # mis-identify the head on the next migration. Never emit a non-monotonic
+    # plan — fall back to the guided resolver instead.
+    if max(reconciled_chain, key=int) != heads[0]:
+        return None
+
+    return {
+        "upserts": upserts,
+        "deletes": deletes,
+        "old_path": old_path,
+        "new_path": new_path,
+        "old_revision": colliding_rev,
+        "new_revision": new_revision,
+        "new_down_revision": target_head,
+        "expected_schema_revision": heads[0],
+    }
+
+
 if __name__ == "__main__":
     _dir = sys.argv[1] if len(sys.argv) > 1 else None
     sys.exit(main(_dir))

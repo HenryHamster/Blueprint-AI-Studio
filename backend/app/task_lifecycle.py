@@ -203,6 +203,8 @@ from app.retry_prompt import (  # noqa: E402, F401, RUF100
 from app.task_lifecycle_requeue import (  # noqa: E402, F401, RUF100
     _record_parent_failure,
     _requeue_parent_task,
+    _resolve_terminal_parent_verdict,
+    _terminate_all_non_genuine_cancelled,
 )
 
 
@@ -954,7 +956,52 @@ async def _process_post_commit(
                                 await session.commit()
                                 return {"status": "accepted"}
 
-                        merge_result = await _merge_with_retry(
+                        # Pre-merge Alembic dual-head guard for the non-staging
+                        # auto-approve path (`auto_approve_small` → main/promotion
+                        # target). The staging/intermediate case (`is_intermediate`)
+                        # merges onto a staging branch that never carries a
+                        # migration onto the integration branch, so it is out of
+                        # scope and skips the guard. On a block-or-defer verdict do
+                        # NOT merge — park EVALUATING with ci_waiting so the guarded
+                        # CI-completion sweep retries once the collision resolves.
+                        if not is_intermediate:
+                            from app.rollup_migration_validation import (
+                                enforce_premerge_migration_guard,
+                            )
+
+                            (
+                                _dh_ok,
+                                _dh_reason,
+                            ) = await enforce_premerge_migration_guard(
+                                gh_token, owner, repo, pr_number, base_branch
+                            )
+                            if not _dh_ok:
+                                logger.warning(
+                                    f"[PIPELINE] Auto-approve merge held for PR "
+                                    f"#{pr_number} — Alembic combined-chain guard: "
+                                    f"{_dh_reason}"
+                                )
+                                task.status = TaskStatus.EVALUATING
+                                task.latest_status_message = (
+                                    f"Merge held — Alembic dual-head guard: {_dh_reason}"
+                                )[:500]
+                                task.context = {
+                                    **(task.context or {}),
+                                    "review_loop": {
+                                        **((task.context or {}).get("review_loop") or {}),
+                                        "ci_waiting": True,
+                                        "review_approved": True,
+                                        "ci_passed": True,
+                                        "pr_number": pr_number,
+                                        "branch": branch,
+                                        "base_branch": base_branch,
+                                    },
+                                }
+                                session.add(task)
+                                await session.commit()
+                                return {"status": "accepted"}
+
+                        merge_result = await _merge_with_retry(  # premerge-guard-exempt: migration PRs are parked above in the dual-head guard branch (returns "accepted"); this merge only runs for staging-only branches that never carry a migration onto the integration trunk
                             merge_pull_request,
                             gh_token,
                             owner,
@@ -1055,26 +1102,49 @@ async def _process_post_commit(
                                 )
                                 ms = (pr_detail.get("mergeable_state") or "").lower()
                                 if ms in ("blocked", "unstable", "clean"):
-                                    am_result = await enable_auto_merge(
-                                        gh_token,
-                                        owner,
-                                        repo,
-                                        pr_number,
-                                        project_id=str(task.project_id),
+                                    from app.rollup_migration_validation import (
+                                        pr_touches_migrations,
                                     )
-                                    if am_result.get("enabled"):
+
+                                    # Migration-carrying PRs must NOT be delegated to
+                                    # GitHub native auto-merge: the target branch can
+                                    # advance while checks are still pending, so the
+                                    # eventual merge could land against a different
+                                    # migration chain than the one Blueprint validated.
+                                    # Skip delegation and park in CI-wait so
+                                    # handle_ci_completion re-enters and re-runs the
+                                    # pre-merge Alembic guard against the live ci_base
+                                    # before merging.
+                                    if await pr_touches_migrations(
+                                        gh_token, owner, repo, pr_number
+                                    ):
+                                        recovery_type = None
                                         logger.info(
-                                            f"[PIPELINE] Enabled GitHub auto-merge on PR #{pr_number} (mergeable_state={ms})"
+                                            f"[PIPELINE] PR #{pr_number} (mergeable_state={ms}) "
+                                            f"touches Alembic migrations — skipping GitHub auto-merge; "
+                                            f"parking in CI-wait for re-validation against {base_branch}"
                                         )
                                     else:
-                                        logger.info(
-                                            f"[PIPELINE] Auto-merge enablement declined for PR #{pr_number}: {am_result.get('message')}"
+                                        am_result = await enable_auto_merge(  # premerge-guard-exempt: only the non-migration branch reaches here; migration-touching PRs are diverted to CI-wait re-validation in the if-branch above, so auto-merge never fires for a migration PR
+                                            gh_token,
+                                            owner,
+                                            repo,
+                                            pr_number,
+                                            project_id=str(task.project_id),
                                         )
-                                    if ms == "clean":
-                                        # PR is clean/ready — transient API failure, not a real
-                                        # conflict. Skip recovery task spawn; let auto-merge
-                                        # fire when GitHub is ready.
-                                        recovery_type = None
+                                        if am_result.get("enabled"):
+                                            logger.info(
+                                                f"[PIPELINE] Enabled GitHub auto-merge on PR #{pr_number} (mergeable_state={ms})"
+                                            )
+                                        else:
+                                            logger.info(
+                                                f"[PIPELINE] Auto-merge enablement declined for PR #{pr_number}: {am_result.get('message')}"
+                                            )
+                                        if ms == "clean":
+                                            # PR is clean/ready — transient API failure, not a real
+                                            # conflict. Skip recovery task spawn; let auto-merge
+                                            # fire when GitHub is ready.
+                                            recovery_type = None
                                 elif ms == "dirty":
                                     recovery_type = "fix"
                             except Exception as _am_exc:
@@ -2236,7 +2306,59 @@ async def _process_post_commit(
                                     exc_info=True,
                                 )
 
-                        merge_result = await _merge_with_retry(
+                        # Pre-merge Alembic dual-head guard (parity with the
+                        # CI-completion, rollup, hotfix back-merge and promotion
+                        # paths). When CI has ALREADY finished green by the time
+                        # the review APPROVE arrives, the merge fires inline here
+                        # rather than from the guarded CI-completion handler — so
+                        # without this check two task PRs that each add 'the next'
+                        # migration with the same revision id would both merge and
+                        # leave the integration branch with a dual Alembic head.
+                        # Only integration/promotion-targeted merges need it; on a
+                        # block-or-defer verdict do NOT merge — park EVALUATING with
+                        # the same ci_waiting/review_approved/ci_passed flags the
+                        # CI-completion path sets so the guarded sweep retries once
+                        # the collision resolves.
+                        if is_ci_gated_merge:
+                            from app.rollup_migration_validation import (
+                                enforce_premerge_migration_guard,
+                            )
+
+                            (
+                                _dh_ok,
+                                _dh_reason,
+                            ) = await enforce_premerge_migration_guard(
+                                gh_token, owner, repo, pr_number, base_branch
+                            )
+                            if not _dh_ok:
+                                logger.warning(
+                                    f"[CI] Inline merge held for PR #{pr_number} — "
+                                    f"Alembic combined-chain guard: {_dh_reason}"
+                                )
+                                task.status = TaskStatus.EVALUATING
+                                task.latest_status_message = (
+                                    f"Merge held — Alembic dual-head guard: {_dh_reason}"
+                                )[:500]
+                                task.context = {
+                                    **(task.context or {}),
+                                    "review_loop": {
+                                        **review_loop,
+                                        "ci_waiting": True,
+                                        "review_approved": True,
+                                        "ci_passed": True,
+                                        "head_sha": head_sha,
+                                        "pr_number": pr_number,
+                                        "branch": branch,
+                                        "base_branch": base_branch,
+                                        "original_task_id": original_task_id,
+                                    },
+                                }
+                                session.add(task)
+                                await session.commit()
+                                action_taken = True
+                                return {"status": "accepted"}
+
+                        merge_result = await _merge_with_retry(  # premerge-guard-exempt: migration PRs are parked above in the dual-head guard branch (returns "accepted"); this merge only runs for staging-only branches that never carry a migration onto the integration trunk
                             merge_pull_request,
                             gh_token,
                             owner,
@@ -4119,15 +4241,31 @@ async def _process_post_commit(
             # task transition. Requiring all-terminal makes the aggregation a
             # no-op for autonomous projects (always something in flight) while
             # preserving finite-project semantics.
+            # BLOCKED counts as terminal-for-now here: in a FINITE project the
+            # all-terminal guard only trips when nothing is in flight, so a
+            # remaining BLOCKED child has no in-project producer left to clear
+            # its precondition and will never un-block on its own. Excluding it
+            # would hang the project forever (previously these were FAILED rows
+            # caught by the `any FAILED` branch); including it preserves the old
+            # rollup, mapping a stuck BLOCKED child to a FAILED project outcome.
             all_terminal = all(
-                s in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
+                s
+                in (
+                    TaskStatus.COMPLETED,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                    TaskStatus.BLOCKED,
+                )
                 for s in executable_statuses
             )
             new_project_status = None
             if all_terminal:
                 if all(s == TaskStatus.COMPLETED for s in executable_statuses):
                     new_project_status = ProjectStatus.COMPLETED
-                elif any(s == TaskStatus.FAILED for s in executable_statuses):
+                elif any(
+                    s in (TaskStatus.FAILED, TaskStatus.BLOCKED)
+                    for s in executable_statuses
+                ):
                     new_project_status = ProjectStatus.FAILED
                 elif all(
                     s in [TaskStatus.COMPLETED, TaskStatus.CANCELLED]
@@ -4252,6 +4390,27 @@ async def _process_post_commit(
             "task_updated",
             {"task_id": str(task.id), "status": payload.status},
         )
+
+        # Strategist-indicator backstop: a strategic task (design_doc_update /
+        # strategic_review) that terminates FAILED/CANCELLED (VM crash, timeout)
+        # never reaches the COMPLETED completion handlers that emit
+        # strategic_cycle_completed, so the frontend "Strategist working…"
+        # indicator would stick on. Pair the spawn-time strategic_cycle_started
+        # here. COMPLETED is deliberately excluded — the completion handlers own
+        # that emit, and a COMPLETED design_doc_update that chained to Phase 2
+        # must keep the cycle active.
+        _peek_strategic_type = task.first_payload.get("type", "")
+        if _peek_strategic_type in (
+            "design_doc_update",
+            "strategic_review",
+        ) and payload.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+            from app.strategic_events import emit_strategic_cycle_completed
+
+            await emit_strategic_cycle_completed(
+                task.project_id,
+                task.id,
+                1 if _peek_strategic_type == "design_doc_update" else 2,
+            )
 
         return {
             "status": "received",

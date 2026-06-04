@@ -95,7 +95,13 @@ def _is_non_genuine_cancelled(task: Task) -> bool:
 
 
 def _counts_as_failure(task: Task) -> bool:
-    """Terminal status that represents a genuine failure for direction metrics."""
+    """Terminal status that represents a genuine failure for direction metrics.
+
+    BLOCKED is deliberately excluded: it is a non-terminal holding state for a
+    task whose precondition is absent, not a failure. Counting it here would
+    inflate direction failure rates and let parked work consume retry budget it
+    never spent. Blocked tasks are tracked separately (see ``tasks_blocked``).
+    """
     if task.status == TaskStatus.FAILED:
         return True
     return task.status == TaskStatus.CANCELLED and not _is_non_genuine_cancelled(task)
@@ -360,6 +366,13 @@ async def _update_direction_research_outcomes(
     )
     entry["tasks_cancelled"] = sum(
         1 for ct in child_tasks_rows if ct.status == TaskStatus.CANCELLED
+    )
+    # BLOCKED tasks are counted separately from FAILED — they are parked on an
+    # absent precondition, not failures, and the auto-unblock sweep is expected
+    # to return them to QUEUED. Surfacing the count keeps them out of the
+    # failure tally while still being visible to operators/analytics.
+    entry["tasks_blocked"] = sum(
+        1 for ct in child_tasks_rows if ct.status == TaskStatus.BLOCKED
     )
     entry["prs_merged"] = sum(
         1

@@ -69,7 +69,7 @@ def test_has_detectable_tests_true_when_any_test_cmd_present():
     p = _proj(
         {
             "directories": [
-                {"path": "backend/", "test_cmd": "python3 -m pytest"},
+                {"path": "backend/", "test_cmd": "python3 -m pytest -x -q"},
                 {"path": "ui/", "test_cmd": ""},
             ]
         }
@@ -92,6 +92,85 @@ def test_has_detectable_tests_none_project():
     assert ci_resolution.has_detectable_tests(None) is False
 
 
+# compute_merge_verification_verdict — read-only operator advisory. Must REUSE
+# requires_ci_checks / has_detectable_tests and agree with them.
+
+
+def test_verdict_ci_checks_when_requires_ci_default():
+    # Default project (requires_ci_checks True) → merges wait for GitHub CI.
+    p = _proj()
+    verdict = ci_resolution.compute_merge_verification_verdict(p)
+    assert verdict == {"state": "ci_checks", "test_commands": []}
+    # Agrees with the gate predicate.
+    assert ci_resolution.requires_ci_checks(p) is True
+
+
+def test_verdict_ci_checks_even_with_detectable_tests():
+    # requires_ci_checks True takes precedence over present test commands.
+    p = _proj(
+        {"directories": [{"path": "backend/", "test_cmd": "python3 -m pytest -x -q"}]}
+    )
+    verdict = ci_resolution.compute_merge_verification_verdict(p)
+    assert verdict["state"] == "ci_checks"
+    assert verdict["test_commands"] == []
+
+
+def test_verdict_tests_gated_collects_commands():
+    # requires_ci_checks False + detectable tests → tests_gated, only non-empty
+    # test_cmd values returned with their path, stored order preserved.
+    p = _proj(
+        {
+            "requires_ci_checks": False,
+            "directories": [
+                {"path": "backend/", "test_cmd": "python3 -m pytest -x -q"},
+                {"path": "ui/", "test_cmd": "   "},
+                {"path": "agent/", "test_cmd": "npm test"},
+            ],
+        }
+    )
+    verdict = ci_resolution.compute_merge_verification_verdict(p)
+    assert verdict["state"] == "tests_gated"
+    assert verdict["test_commands"] == [
+        {"path": "backend/", "test_cmd": "python3 -m pytest -x -q"},
+        {"path": "agent/", "test_cmd": "npm test"},
+    ]
+    # The verdict agrees with the gate predicates.
+    assert ci_resolution.requires_ci_checks(p) is False
+    assert ci_resolution.has_detectable_tests(p) is True
+
+
+def test_verdict_tests_gated_handles_missing_path():
+    p = _proj(
+        {
+            "requires_ci_checks": False,
+            "directories": [{"test_cmd": "go test ./..."}],
+        }
+    )
+    verdict = ci_resolution.compute_merge_verification_verdict(p)
+    assert verdict["state"] == "tests_gated"
+    assert verdict["test_commands"] == [{"path": "", "test_cmd": "go test ./..."}]
+
+
+def test_verdict_unverified_when_no_tests():
+    # requires_ci_checks False + no runnable suite → PRs merge UNVERIFIED.
+    p = _proj({"requires_ci_checks": False, "directories": [{"path": "x/"}]})
+    verdict = ci_resolution.compute_merge_verification_verdict(p)
+    assert verdict == {"state": "unverified", "test_commands": []}
+    assert ci_resolution.has_detectable_tests(p) is False
+
+
+def test_verdict_none_project_is_stable_default_shape():
+    # None project → CI-gated default, no raise (mirrors requires_ci_checks).
+    verdict = ci_resolution.compute_merge_verification_verdict(None)
+    assert verdict == {"state": "ci_checks", "test_commands": []}
+
+
+def test_verdict_missing_build_config_is_safe():
+    p = _proj(None)
+    verdict = ci_resolution.compute_merge_verification_verdict(p)
+    assert verdict == {"state": "ci_checks", "test_commands": []}
+
+
 # should_run_no_ci_test_gate — the orchestrator's gating decision
 
 
@@ -99,7 +178,7 @@ def _no_ci_repo():
     return _proj(
         {
             "requires_ci_checks": False,
-            "directories": [{"path": "backend/", "test_cmd": "python3 -m pytest"}],
+            "directories": [{"path": "backend/", "test_cmd": "python3 -m pytest -x -q"}],
         }
     )
 
@@ -140,7 +219,7 @@ def test_gate_skipped_on_internal_staging_base():
 def test_gate_skipped_for_ci_gated_repo():
     # CI-gated repo (requires_ci_checks default True): the no_checks branch keeps
     # polling; the gate must never engage.
-    p = _proj({"directories": [{"path": "backend/", "test_cmd": "python3 -m pytest"}]})
+    p = _proj({"directories": [{"path": "backend/", "test_cmd": "python3 -m pytest -x -q"}]})
     assert (
         ci_resolution.should_run_no_ci_test_gate(p, "main", gate_enabled=True) is False
     )
@@ -204,6 +283,40 @@ def test_classify_verdict_none_is_undetected():
         "undetected",
         "",
     )
+
+
+# ---------------------------------------------------------------------------
+# build_no_ci_gate_ci_result — outcome → ci_result the orchestrator hands to
+# handle_ci_completion. This is the live transition the orchestrator's inline
+# no-CI gate performs; pinning it here means a regression that flips a blocking
+# `fail` into a merge-allowing `success` fails a test.
+# ---------------------------------------------------------------------------
+def test_build_ci_result_fail_blocks_merge_with_detail():
+    result = ci_resolution.build_no_ci_gate_ci_result("fail", "FAILED test_add")
+    assert result["status"] == "completed"
+    assert result["conclusion"] == "failure"
+    assert result["failed_logs"] == "FAILED test_add"
+
+
+def test_build_ci_result_fail_blank_detail_gets_fallback_message():
+    # A failing verdict must never spawn a fix with empty output.
+    result = ci_resolution.build_no_ci_gate_ci_result("fail", "")
+    assert result["conclusion"] == "failure"
+    assert result["failed_logs"] == "Detected test suite failed."
+
+
+def test_build_ci_result_pass_proceeds_to_merge():
+    result = ci_resolution.build_no_ci_gate_ci_result("pass")
+    assert result["status"] == "completed"
+    assert result["conclusion"] == "success"
+    assert result["failed_logs"] == ""
+
+
+def test_build_ci_result_undetected_proceeds_unverified():
+    # detected=false / no usable verdict → proceed-without-checks (merge UNVERIFIED).
+    result = ci_resolution.build_no_ci_gate_ci_result("undetected")
+    assert result["conclusion"] == "success"
+    assert result["failed_logs"] == ""
 
 
 @pytest.mark.asyncio
@@ -663,3 +776,57 @@ async def test_explicit_pr_number_filters_associated_prs(mocker):
     assert result["ci_passed"] is True
     assert result["state"] == "green"
     assert result["head_sha_resolved"] == target_sha
+
+
+# requires_ci_checks PERSISTENCE — the field must survive the validated write
+# path (BuildConfig(**...).model_dump(exclude_none=True)) and the operator-
+# override carry-forward used by manual re-detect / empty-config auto-refresh.
+# These exercise the actual persistence layer, not a hand-built reader dict.
+
+
+def test_build_config_schema_persists_requires_ci_checks_false():
+    from app.schemas import BuildConfig as BuildConfigSchema
+
+    persisted = BuildConfigSchema(
+        **{"requires_ci_checks": False}
+    ).model_dump(exclude_none=True)
+    # exclude_none must NOT strip an explicit False (False is not None).
+    assert persisted["requires_ci_checks"] is False
+
+
+def test_build_config_schema_defaults_requires_ci_checks_true():
+    from app.schemas import BuildConfig as BuildConfigSchema
+
+    persisted = BuildConfigSchema().model_dump(exclude_none=True)
+    # Default True preserves CI-gated behavior for existing projects.
+    assert persisted["requires_ci_checks"] is True
+
+
+def test_override_merge_preserves_existing_requires_ci_checks_false():
+    from app.build_config_detection import apply_operator_build_config_overrides
+
+    # Repo detection never emits requires_ci_checks; a stored False must carry
+    # forward onto freshly-detected config so re-detect does not re-gate the repo.
+    detected = {"language": "python", "directories": []}
+    merged = apply_operator_build_config_overrides(
+        detected, {"requires_ci_checks": False}
+    )
+    assert merged["requires_ci_checks"] is False
+
+
+def test_override_merge_absent_requires_ci_checks_leaves_detected_unchanged():
+    from app.build_config_detection import apply_operator_build_config_overrides
+
+    detected = {"language": "python"}
+    merged = apply_operator_build_config_overrides(detected, {"other": 1})
+    assert "requires_ci_checks" not in merged
+
+
+def test_override_merge_preserves_existing_requires_ci_checks_true():
+    from app.build_config_detection import apply_operator_build_config_overrides
+
+    detected = {"language": "python"}
+    merged = apply_operator_build_config_overrides(
+        detected, {"requires_ci_checks": True}
+    )
+    assert merged["requires_ci_checks"] is True

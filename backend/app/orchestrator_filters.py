@@ -12,6 +12,7 @@ slot-capping:
 
 import logging
 import uuid
+from datetime import datetime, timedelta
 from typing import Callable, Coroutine, Any
 
 from sqlalchemy import func
@@ -21,6 +22,7 @@ from sqlmodel import select
 from app.migration_path import is_migration_file
 from app.models import Task, TaskStatus
 from app.shared_state import is_direction_held, DEFAULT_TASK_SCOPE
+from app.time_utils import _utcnow
 from app.task_capabilities import READ_ONLY_TASK_TYPES
 
 logger = logging.getLogger("blueprint")
@@ -31,6 +33,15 @@ logger = logging.getLogger("blueprint")
 # clears within a cycle or two never spams the Alerts banner.
 _PRECONDITION_ESCALATE_THRESHOLD = 3
 
+# Once a candidate has been deferred on the same precondition blocker for
+# ``_PRECONDITION_ESCALATE_THRESHOLD`` consecutive cycles we stop re-judging it
+# on every fast dispatch cycle and instead park it in the first-class BLOCKED
+# state, scheduling the periodic unblock sweep to re-evaluate it no sooner than
+# ``recheck_after``.  This replaces the old "stay QUEUED forever, re-judge every
+# 0.5–5s" churn with one cheap recheck per interval (see
+# ``reaper_sweeps.sweep_unblock_blocked_tasks``).
+_BLOCKED_RECHECK_INTERVAL = timedelta(minutes=5)
+
 
 async def _record_defer_and_maybe_escalate(
     candidate: Task,
@@ -38,22 +49,33 @@ async def _record_defer_and_maybe_escalate(
     *,
     blocker_kind: str,
     detail: str,
+    block_code: str,
     threshold: int = _PRECONDITION_ESCALATE_THRESHOLD,
+    broadcast_fn: Callable[..., Coroutine[Any, Any, None]] | None = None,
 ) -> None:
     """Track repeated deferral of *candidate* on the same precondition blocker.
 
     Persists a per-blocker defer counter in
     ``candidate.context['_precondition_defer']`` keyed by ``blocker_kind``
     (the blocker identity — overlapping files or the blocking rollup title).
-    Once the count reaches *threshold* and the blocker has not yet been
-    escalated, raise ONE deduplicated operator alert and stamp
-    ``_precondition_escalated_key`` so it does not re-fire on every subsequent
-    dispatch cycle. The counter (and escalation stamp) reset when the blocker
-    identity changes, so a task that moves from one blocker to a different one
-    starts a fresh persistence count.
+    Once the count reaches *threshold* the candidate is parked in the
+    first-class ``BLOCKED`` state (durable ``blocker_kind`` / ``blocked_reason``
+    / ``blocked_at`` / ``recheck_after`` metadata) so it stops burning fast
+    dispatch cycles — the periodic unblock sweep takes over rechecking it. On
+    the cycle that first crosses the threshold (and only then) we also raise ONE
+    deduplicated operator alert, stamping ``_precondition_escalated_key`` so it
+    does not re-fire every cycle. The counter (and escalation stamp) reset when
+    the blocker identity changes, so a task that moves from one blocker to a
+    different one starts a fresh persistence count.
 
-    Alerting only — the candidate stays QUEUED and is NOT dispatched; we never
-    dispatch work known to be blocked, we just make the blocker visible.
+    ``block_code`` is the short categorical code persisted as ``Task.blocker_kind``
+    (the column is ``VARCHAR(64)``) — e.g. ``"file_conflict"`` or
+    ``"pending_rollup"`` — while ``blocker_kind`` is the human-readable blocker
+    identity used for the defer-counter key and the alert title.
+
+    We never dispatch work known to be blocked: below the threshold the
+    candidate stays QUEUED (deferred this cycle); at/above it the candidate is
+    BLOCKED so the normal queue path skips it entirely.
     """
     ctx = candidate.context or {}
     defer = ctx.get("_precondition_defer") or {}
@@ -64,12 +86,53 @@ async def _record_defer_and_maybe_escalate(
         # stale escalation stamp from a previous, now-cleared blocker.
         count = 1
         ctx.pop("_precondition_escalated_key", None)
+        # Drop a stale first-blocked onset stamp only if it belongs to a
+        # *different* blocker identity. A same-identity stamp must survive
+        # optimistic-requeue episodes: the unblock sweep wipes
+        # ``_precondition_defer`` when it requeues a conflict/rollup blocker, but
+        # the blocker (and therefore its escalation deadline onset) persists.
+        fb = ctx.get("_blocked_first_at") or {}
+        if fb.get("key") != blocker_kind:
+            ctx.pop("_blocked_first_at", None)
     ctx["_precondition_defer"] = {"key": blocker_kind, "count": count}
 
     already_escalated = ctx.get("_precondition_escalated_key") == blocker_kind
     should_escalate = count >= threshold and not already_escalated
     if should_escalate:
         ctx["_precondition_escalated_key"] = blocker_kind
+
+    # At/above the threshold, park the task in BLOCKED so it leaves the QUEUED
+    # candidate pool. The unblock sweep re-evaluates it at/after recheck_after,
+    # moving it back to QUEUED when the precondition clears.
+    if count >= threshold:
+        now = _utcnow()
+        # Preserve the ONSET of this blocker identity across optimistic-requeue
+        # episodes so the deadline escalation (reaper_sweeps,
+        # ``_BLOCKED_ESCALATE_AFTER``) measures from the TRUE first-blocked time.
+        # Conflict/rollup blockers have no dependency edge, so the unblock sweep
+        # requeues them every interval and dispatch re-blocks them here. A fresh
+        # ``blocked_at`` per episode would mean ``now - blocked_at`` never
+        # reaches the deadline, so a permanently-stuck conflict (e.g. a pending
+        # rollup that never merges) would loop indefinitely without the ERROR
+        # escalation. The sweep only wipes ``_blocked_first_at`` on a genuine
+        # dependency clear, so for conflict blockers it survives the requeue.
+        first_blocked = ctx.get("_blocked_first_at") or {}
+        blocked_onset = None
+        if first_blocked.get("key") == blocker_kind and first_blocked.get("at"):
+            try:
+                blocked_onset = datetime.fromisoformat(first_blocked["at"])
+            except (ValueError, TypeError):
+                blocked_onset = None
+        if blocked_onset is None:
+            blocked_onset = now
+            ctx["_blocked_first_at"] = {"key": blocker_kind, "at": now.isoformat()}
+
+        candidate.status = TaskStatus.BLOCKED
+        candidate.blocker_kind = block_code[:64]
+        candidate.blocked_reason = detail
+        candidate.blocked_at = blocked_onset
+        candidate.recheck_after = now + _BLOCKED_RECHECK_INTERVAL
+        candidate.latest_status_message = f"Blocked: {detail}"[:500]
 
     candidate.context = ctx
     flag_modified(candidate, "context")
@@ -83,15 +146,47 @@ async def _record_defer_and_maybe_escalate(
         )
 
         logger.warning(
-            f"[DISPATCH] Escalating persistent precondition blocker on task "
-            f"{candidate.id} after {count} deferrals: {blocker_kind}"
+            f"[DISPATCH] Parking task {candidate.id} in BLOCKED after {count} "
+            f"deferrals on persistent precondition blocker: {blocker_kind}"
         )
+        # Durability contract: the CALLER owns the task commit, not the alert
+        # helper. Commit the BLOCKED parking FIRST so the transition is durable
+        # before we raise the operator alert or broadcast it to the UI. This
+        # mirrors the other two caller families (task_lifecycle_requeue.py:272
+        # and agent_status.py:1452 — session.add -> commit -> alert -> broadcast)
+        # and removes the old implicit "who committed first" dependency on the
+        # alert helper's side-effect commit. If this commit RAISES, the
+        # transition did not persist; the exception propagates and the BLOCKED
+        # broadcast below is never reached, so the UI never sees a task_updated
+        # BLOCKED event for a state the database rolled back.
+        await session.commit()
+        # The alert helper now owns ONLY its own alert insert/commit; its return
+        # value is informational. Whether the operator alert is newly created
+        # (returns True) or already exists (returns False) no longer decides who
+        # committed the task — it is already durable above — so all three cases
+        # (new alert, existing alert, failed commit) converge on the single
+        # contract: broadcast BLOCKED iff the transition persisted.
         await _maybe_create_precondition_blocker_alert(
             candidate,
             session,
             blocker_kind=blocker_kind,
             detail=detail,
         )
+        if broadcast_fn:
+            try:
+                await broadcast_fn(
+                    str(candidate.project_id),
+                    "task_updated",
+                    {
+                        "task_id": str(candidate.id),
+                        "status": "BLOCKED",
+                        "message": candidate.latest_status_message,
+                    },
+                )
+            except Exception:
+                logger.debug(
+                    f"Failed to broadcast BLOCKED for {candidate.id}", exc_info=True
+                )
 
 
 def _is_test_file(path: str) -> bool:
@@ -365,6 +460,8 @@ async def filter_file_conflicts(
                 session,
                 blocker_kind=f"file conflict on {overlapping_files}",
                 detail=defer_msg,
+                block_code="file_conflict",
+                broadcast_fn=broadcast_fn,
             )
         else:
             non_conflicting.append(eid)
@@ -485,6 +582,8 @@ async def filter_rollup_conflicts(
                 session,
                 blocker_kind=f"pending rollup '{blocking_title[:60]}'",
                 detail=defer_msg,
+                block_code="pending_rollup",
+                broadcast_fn=broadcast_fn,
             )
         else:
             if stale_overlap:
@@ -779,15 +878,26 @@ async def filter_scope_empty(
         await close_orphan_pr_if_any(
             candidate, session, reason="dispatch_scope_empty_preempt"
         )
+        # Commit the terminal CANCELLED transition BEFORE broadcasting so the
+        # websocket event never announces a status the API has not yet
+        # persisted (stale-UI defect) and is never emitted for a change that a
+        # later rollback discards (lost-transition defect). Same commit-then-
+        # broadcast discipline as PR #7721 (unblock sweep). expire_on_commit is
+        # False (database.py), so committing here does NOT expire candidate or
+        # the other in-memory candidate_tasks the downstream dispatch steps
+        # still read. Snapshot the broadcast literals before committing.
+        _project_id = str(candidate.project_id)
+        _task_id = str(candidate.id)
+        await session.commit()
         try:
             await broadcast_fn(
-                str(candidate.project_id),
+                _project_id,
                 "task_updated",
-                {"task_id": str(candidate.id), "status": "CANCELLED", "message": msg},
+                {"task_id": _task_id, "status": "CANCELLED", "message": msg},
             )
         except Exception:
             logger.debug(
-                f"Failed to broadcast SCOPE_EMPTY for {candidate.id}", exc_info=True
+                f"Failed to broadcast SCOPE_EMPTY for {_task_id}", exc_info=True
             )
         logger.info(
             f"[DISPATCH] SCOPE_EMPTY: pre-empting task {candidate.id} — "
@@ -915,19 +1025,27 @@ async def filter_pipeline_duplicates(
             await close_orphan_pr_if_any(
                 candidate, session, reason="dispatch_dedup_running_sibling"
             )
+            # Commit the terminal CANCELLED transition BEFORE broadcasting so
+            # the event is durable and never rolled back out from under it
+            # (see filter_scope_empty for the full rationale). Snapshot the
+            # broadcast literals before the commit.
+            _project_id = str(candidate.project_id)
+            _task_id = str(eid)
+            _dedup_msg = candidate.latest_status_message
+            await session.commit()
             try:
                 await broadcast_fn(
-                    str(candidate.project_id),
+                    _project_id,
                     "task_updated",
                     {
-                        "task_id": str(eid),
+                        "task_id": _task_id,
                         "status": "CANCELLED",
-                        "message": candidate.latest_status_message,
+                        "message": _dedup_msg,
                     },
                 )
             except Exception:
                 logger.debug(
-                    f"Failed to broadcast dedup cancel for {eid}", exc_info=True
+                    f"Failed to broadcast dedup cancel for {_task_id}", exc_info=True
                 )
             logger.warning(
                 f"[DISPATCH] Cancelling duplicate {fp.get('type')} {eid} — "
@@ -963,19 +1081,27 @@ async def filter_pipeline_duplicates(
                 await close_orphan_pr_if_any(
                     candidate, session, reason="dispatch_dedup_queued_sibling"
                 )
+                # Commit the terminal CANCELLED transition BEFORE broadcasting
+                # so the event is durable and never rolled back out from under
+                # it (see filter_scope_empty for the full rationale). Snapshot
+                # the broadcast literals before the commit.
+                _project_id = str(candidate.project_id)
+                _task_id = str(eid)
+                _dedup_msg = candidate.latest_status_message
+                await session.commit()
                 try:
                     await broadcast_fn(
-                        str(candidate.project_id),
+                        _project_id,
                         "task_updated",
                         {
-                            "task_id": str(eid),
+                            "task_id": _task_id,
                             "status": "CANCELLED",
-                            "message": candidate.latest_status_message,
+                            "message": _dedup_msg,
                         },
                     )
                 except Exception:
                     logger.debug(
-                        f"Failed to broadcast dedup cancel for {eid}", exc_info=True
+                        f"Failed to broadcast dedup cancel for {_task_id}", exc_info=True
                     )
                 logger.warning(
                     f"[DISPATCH] Cancelling duplicate {fp.get('type')} {eid} — "

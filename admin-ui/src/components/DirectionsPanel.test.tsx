@@ -259,6 +259,20 @@ describe('DirectionsPanel', () => {
     expect(body.completion_criteria).toBe('Done when merged');
   });
 
+  it('renders the strategist-working indicator when strategistActive is true', async () => {
+    mockFetch(baseResponses);
+    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} strategistActive />);
+    await screen.findByPlaceholderText('New direction...');
+    expect(screen.getByText('Strategist working…')).toBeInTheDocument();
+  });
+
+  it('hides the strategist-working indicator when strategistActive is absent/false', async () => {
+    mockFetch(baseResponses);
+    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    await screen.findByPlaceholderText('New direction...');
+    expect(screen.queryByText('Strategist working…')).toBeNull();
+  });
+
   it('clicking the close backdrop fires onClose', async () => {
     mockFetch(baseResponses);
     const user = userEvent.setup();

@@ -80,6 +80,8 @@ import {
   buildScopeCalibrationSignal,
   buildFilteredFindingsSection,
   buildRejectedProposalsSection,
+  buildOperatorOverridesSection,
+  buildRunningUpdateSupersededSection,
   buildUserPausedSection,
   readProgressArtifact,
   buildPortfolioComposition,
@@ -761,6 +763,70 @@ describe('buildRejectedProposalsSection', () => {
     const out = buildRejectedProposalsSection(many);
     expect(out).toContain('proposal 9');
     expect(out).not.toContain('proposal 10');
+  });
+});
+
+describe('buildOperatorOverridesSection', () => {
+  it('returns empty string for empty input', () => {
+    expect(buildOperatorOverridesSection([])).toBe('');
+  });
+
+  it('renders vision/intent overrides with agent + operator values', () => {
+    const out = buildOperatorOverridesSection([
+      { document: 'vision', field: 'vision.goal', agent_value: 'ship fast', operator_value: 'ship safe', at: '2026-06-02T10:00:00Z' },
+      { document: 'intent', field: 'intent.purpose', agent_value: 'rewrite', operator_value: 'refine', at: '2026-06-01T10:00:00Z' },
+    ]);
+    expect(out).toContain('## Operator Overrides Since Last Cycle');
+    expect(out).toContain('do NOT simply re-propose');
+    expect(out).toContain('(2026-06-02) vision `vision.goal`');
+    expect(out).toContain('you proposed "ship fast"; the operator kept "ship safe".');
+    expect(out).toContain('(2026-06-01) intent `intent.purpose`');
+  });
+
+  it('renders running_update overrides without an operator scalar value', () => {
+    const out = buildOperatorOverridesSection([
+      { document: 'running_update', field: 'running_update', agent_value: 'my rewrite', at: '2026-06-03T10:00:00Z' },
+    ]);
+    expect(out).toContain('(2026-06-03) running_update');
+    expect(out).toContain('the operator kept their own running_update edit');
+  });
+
+  it('caps at 8 entries', () => {
+    const many = Array.from({ length: 12 }, (_, i) => ({
+      document: 'vision', field: `f${i}`, agent_value: `a${i}`, operator_value: `o${i}`, at: '2026-06-01T00:00:00Z',
+    }));
+    const out = buildOperatorOverridesSection(many);
+    expect(out).toContain('`f7`');
+    expect(out).not.toContain('`f8`');
+  });
+});
+
+describe('buildRunningUpdateSupersededSection', () => {
+  it('returns empty string for null/undefined signal', () => {
+    expect(buildRunningUpdateSupersededSection(null)).toBe('');
+    expect(buildRunningUpdateSupersededSection(undefined)).toBe('');
+  });
+
+  it('returns empty string when count is zero or missing', () => {
+    expect(buildRunningUpdateSupersededSection({ count: 0 })).toBe('');
+    expect(buildRunningUpdateSupersededSection({})).toBe('');
+  });
+
+  it('renders an operator-authoritative note with the most-recent date', () => {
+    const out = buildRunningUpdateSupersededSection({
+      count: 2,
+      most_recent_at: '2026-05-20T09:30:00Z',
+    });
+    expect(out).toContain('operator preserved their own running_update');
+    expect(out).toContain('operator-authoritative');
+    expect(out).toContain('do NOT rewrite it from a blank slate');
+    expect(out).toContain('most recent: 2026-05-20');
+  });
+
+  it('renders the note without a date tail when most_recent_at is absent', () => {
+    const out = buildRunningUpdateSupersededSection({ count: 1 });
+    expect(out).toContain('operator preserved their own running_update');
+    expect(out).not.toContain('most recent:');
   });
 });
 

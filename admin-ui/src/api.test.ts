@@ -1,92 +1,31 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { onboardProject } from './api';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { previewOnboardProject } from './api';
 
 vi.mock('./firebase', () => ({
   getIdToken: vi.fn(async () => 'test-token'),
 }));
 
-describe('onboardProject', () => {
-  let fetchSpy: ReturnType<typeof vi.fn>;
-
-  beforeEach(() => {
-    fetchSpy = vi.fn(async () => new Response(JSON.stringify({
-      project_id: 'project-123',
-      build_config: {},
-    }), { status: 200 }));
-    vi.stubGlobal('fetch', fetchSpy);
-  });
-
+describe('previewOnboardProject', () => {
   afterEach(() => {
-    vi.unstubAllGlobals();
-    vi.clearAllMocks();
+    vi.restoreAllMocks();
   });
 
-  it('serializes structured steering and omits blank fields', async () => {
-    await onboardProject(
-      'acme',
-      'platform',
-      undefined,
-      undefined,
-      undefined,
-      'Ship the fix',
-      {
-        context: {
-          project_type: ' startup ',
-          users: ' ',
-          team: '4 engineers',
-          deploy_cadence: '',
-          notes: 'Prioritize reliability',
-        },
-        constraints: ['  Do not change workflows  ', ''],
-      },
+  it('serializes preview_only and the override payload', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ build_config: {}, default_branch: 'main' }), { status: 200 }),
     );
 
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
-    const [url, init] = fetchSpy.mock.calls[0];
-    const requestPath = String(url).startsWith('http') ? new URL(String(url)).pathname : String(url);
-    expect(requestPath).toBe('/api/admin/projects/onboard');
-    const body = JSON.parse(String(init?.body));
-    expect(body).toEqual({
-      github_owner: 'acme',
-      github_repo: 'platform',
-      goal: 'Ship the fix',
-      initial_steering: {
-        context: {
-          project_type: 'startup',
-          team: '4 engineers',
-          notes: 'Prioritize reliability',
-        },
-        constraints: ['Do not change workflows'],
-      },
-    });
-  });
+    await previewOnboardProject('acme', 'repo', undefined, { requires_ci_checks: false });
 
-  it('omits initial_steering when every structured field is blank', async () => {
-    await onboardProject(
-      'acme',
-      'platform',
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      {
-        context: {
-          project_type: ' ',
-          users: '',
-          team: '',
-          deploy_cadence: ' ',
-          notes: ' ',
-        },
-        constraints: ['   '],
-      },
-    );
-
-    const [, init] = fetchSpy.mock.calls[0];
-    const body = JSON.parse(String(init?.body));
-    expect(body).toEqual({
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('/api/admin/projects/onboard');
+    expect((init as RequestInit).method).toBe('POST');
+    expect(JSON.parse(String((init as RequestInit).body))).toEqual({
       github_owner: 'acme',
-      github_repo: 'platform',
+      github_repo: 'repo',
+      preview_only: true,
+      build_config_override: { requires_ci_checks: false },
     });
-    expect(body.initial_steering).toBeUndefined();
   });
 });

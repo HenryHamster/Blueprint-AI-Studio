@@ -56,6 +56,19 @@ const populatedState: WarmVmStateResponse = {
     active_warm_chains: 1,
     active_backlog_reuse_claims: 1,
     active_chain_continuity_claims: 0,
+    // All three breakers OPEN so the suppression callouts render into the 375px
+    // overflow gate (they are otherwise absent when nothing is suppressed).
+    pool_circuit_breaker_suppressed: true,
+    pool_suppressed_until: '2026-06-03T12:30:00',
+    pool_claim_failures_last_hour: 7,
+    pool_failure_rate_threshold: 5,
+    circuit_breaker_suppressed: true,
+    suppressed_until: '2026-06-03T09:15:00',
+    clear_rate_threshold: 10,
+    backlog_reuse_circuit_breaker_suppressed: true,
+    backlog_reuse_suppressed_until: '2026-06-03T10:45:00',
+    backlog_reuse_failures_last_hour: 8,
+    backlog_reuse_failure_rate_threshold: 5,
   },
   warm_continuity_enabled: true,
   warm_backlog_reuse_enabled: true,
@@ -243,6 +256,57 @@ describe('WarmVmPanel — viewport regression', () => {
       root = r;
       await act(async () => {
         r.render(<WarmVmPanel onViewTask={() => {}} projects={projects} />);
+      });
+      await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    });
+
+    const panelRoot = host?.firstElementChild as HTMLElement | null;
+    expect(panelRoot).not.toBeNull();
+    const rect = panelRoot!.getBoundingClientRect();
+    expect(rect.right).toBeLessThanOrEqual(388);
+  });
+
+  test('cost-guard + circuit-breaker banners render without horizontal overflow at 375px', async () => {
+    const stateWithBanners = {
+      ...emptyState,
+      warm_pin_metrics: {
+        ...emptyState.warm_pin_metrics,
+        pool_circuit_breaker_suppressed: true,
+        pool_suppressed_until: new Date(Date.now() + 600_000).toISOString(),
+        pool_claim_failures_last_hour: 12,
+        pool_failure_rate_threshold: 5,
+      },
+      pool_metrics: {
+        enabled: true,
+        target_size: 2,
+        current_size: 2,
+        idle_count: 2,
+        cost_guard: {
+          engaged: true,
+          reason:
+            'Pool hit rate 2.0% is below the 10% floor over 24h (50 dispatches) ' +
+            'while idle spend is $5.00 — draining idle members and pausing ' +
+            'provisioning until the hit rate recovers.',
+          hit_rate: 0.02,
+          total_dispatches: 50,
+          idle_cost_usd: 5.0,
+          min_hit_rate: 0.1,
+          min_idle_cost_usd: 1.0,
+        },
+      },
+    } as unknown as WarmVmStateResponse;
+    const { authGet } = await import('../api');
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      new Response(JSON.stringify(stateWithBanners), { status: 200 }),
+    );
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<WarmVmPanel onViewTask={() => {}} />);
       });
       await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
     });

@@ -24,6 +24,7 @@ from app.release_promotion import (
     _record_promotion_success,
     _resolve_github_with_session,
 )
+from app.rollup_migration_validation import _validate_migration_chain_post_merge
 from app.release_scoring import _CI_RED, _classify_check_runs
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
@@ -74,6 +75,16 @@ def _promotion_pending_timeout_seconds() -> float:
     if value <= 0:
         return _PROMOTION_PENDING_TIMEOUT_SECONDS_DEFAULT
     return value
+
+
+def _pr_number_from_url(pr_url: str | None) -> int | None:
+    """Parse a GitHub pull-request number from its URL, if possible."""
+    if not isinstance(pr_url, str) or not pr_url:
+        return None
+    try:
+        return int(pr_url.rstrip("/").split("/")[-1])
+    except ValueError:
+        return None
 
 
 async def _reconcile_if_promotion_failed_landed(
@@ -166,6 +177,55 @@ async def _reconcile_if_promotion_failed_landed(
                 token, owner, repo, candidate_sha, version, project=project
             ):
                 return False
+
+            pr_number = _pr_number_from_url(base_record.get("pr_url"))
+            if pr_number is None:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile: candidate %s for v%d is "
+                    "on main, but the promotion_failed PR number could not be "
+                    "parsed from %r — deferring live target validation",
+                    candidate_sha[:8],
+                    version.version_number,
+                    base_record.get("pr_url"),
+                )
+                return False
+
+            alembic_status, alembic_reason = await _validate_migration_chain_post_merge(
+                token,
+                owner,
+                repo,
+                pr_number,
+                promotion_target,
+            )
+            if alembic_status == "defer":
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile: candidate %s for v%d is "
+                    "on main, but post-merge Alembic health check is deferred: %s",
+                    candidate_sha[:8],
+                    version.version_number,
+                    alembic_reason,
+                )
+                return False
+            if alembic_status == "block":
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile: candidate %s for v%d is "
+                    "on main, but the live target Alembic chain has a genuine "
+                    "third-party collision — recording promotion_failed: %s",
+                    candidate_sha[:8],
+                    version.version_number,
+                    alembic_reason,
+                )
+                await _record_promotion_failure(
+                    session,
+                    version,
+                    base_record,
+                    "migration_guard_blocked",
+                    detail=alembic_reason,
+                    pr_url=_idempotent_pr_url(base_record),
+                    lock_released=True,
+                )
+                await session.commit()
+                return True
 
             logger.info(
                 "[RELEASE_QUALIFIER] reconcile: candidate %s for v%d is on "
@@ -319,6 +379,45 @@ async def _reconcile_if_pending_auto_merge_landed(
             if await _candidate_already_on_main(
                 token, owner, repo, candidate_sha, version, project=project
             ):
+                alembic_status, alembic_reason = await _validate_migration_chain_post_merge(
+                    token,
+                    owner,
+                    repo,
+                    int(pr_number),
+                    promotion_target,
+                )
+                if alembic_status == "defer":
+                    logger.warning(
+                        "[RELEASE_QUALIFIER] reconcile pending_auto_merge: "
+                        "candidate %s for v%d is on main, but post-merge "
+                        "Alembic health check is deferred: %s",
+                        candidate_sha[:8],
+                        version.version_number,
+                        alembic_reason,
+                    )
+                    return False
+                if alembic_status == "block":
+                    logger.warning(
+                        "[RELEASE_QUALIFIER] reconcile pending_auto_merge: "
+                        "candidate %s for v%d is on main, but the live target "
+                        "Alembic chain has a genuine third-party collision — "
+                        "recording promotion_failed: %s",
+                        candidate_sha[:8],
+                        version.version_number,
+                        alembic_reason,
+                    )
+                    await _record_promotion_failure(
+                        session,
+                        version,
+                        base_record,
+                        "migration_guard_blocked",
+                        detail=alembic_reason,
+                        pr_url=pr_url,
+                        lock_released=True,
+                    )
+                    await session.commit()
+                    return True
+
                 logger.info(
                     "[RELEASE_QUALIFIER] reconcile pending_auto_merge: candidate "
                     "%s for v%d is on main — recording promotion",

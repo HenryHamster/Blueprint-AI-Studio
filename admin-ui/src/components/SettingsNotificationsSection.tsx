@@ -24,6 +24,7 @@ const EVENT_OPTIONS: { key: string; label: string; description: string; defaultO
   { key: 'RESIDUAL_FIX_UNSUSPENDED', label: 'Residual Fix Unsuspended', description: 'When a previously-suspended residual fingerprint case is manually re-enabled by an operator', defaultOn: false },
   { key: 'DIRECTION_BURN_PAUSE', label: 'Direction Burn Pause', description: 'When a direction is auto-paused for accumulating non-merging finished tasks beyond the safe rolling-window threshold', defaultOn: true },
   { key: 'account_model_regression_quarantined', label: 'Account/Model Regression Quarantined', description: 'When a provider/model pair is auto-quarantined due to detected regression in success rate', defaultOn: true },
+  { key: 'MERGE_UNVERIFIED', label: 'Merged Without Test Verification', description: 'When a no-CI repo merges a PR without running tests (UNVERIFIED-merge fallback)', defaultOn: true },
 ];
 
 interface SettingsNotificationsSectionProps {

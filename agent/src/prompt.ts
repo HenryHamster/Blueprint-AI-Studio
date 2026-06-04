@@ -343,13 +343,32 @@ If a test fails with a message containing \`module_size_limits.json\` or
 in that JSON file — NOT to refactor the source. The assertion message
 itself walks you through the bump procedure; follow it literally.
 
+The fast local gate runs the guardrail too: \`./check\` invokes
+\`python3 backend/testing/check_size_limits.py --sections <touched stacks>\`,
+so a breach now surfaces BEFORE you open a PR — not only in CI.
+
+This covers BOTH size guardrails:
+- a breach of an EXISTING cap — \`has <N> lines (limit: <M>)\` /
+  \`(cap: <M>)\`; and
+- the complementary coverage failure for a NEW oversized file that has
+  no cap at all — \`has <N> lines (threshold: 1500)\` / \`NO cap entry\`
+  (\`test_*_no_uncapped_large_file\`). The fix is to ADD a cap entry, NOT
+  to extract or split the file.
+
 Specifically:
-1. Read the failing assertion. It will tell you the file path, current
-   line count, and the limit it exceeded.
-2. Edit \`backend/testing/module_size_limits.json\` (for backend files) or
-   \`admin-ui/src/...\` size config (for frontend files). Bump the limit
-   for the offending file by enough headroom (current_size + 50-100 lines).
-3. Commit both the source change AND the JSON edit in the same PR.
+1. Read the failing assertion (or the \`./check\` "size guardrail" failure).
+   It names the file path, current line count, and either the cap it
+   exceeded or the threshold it crossed with no cap entry.
+2. Run the single deterministic fix command from the repo root:
+   \`python3 backend/testing/check_size_limits.py --fix\`
+   This rewrites ONLY the breached caps AND adds a cap entry for any
+   uncapped over-threshold file in
+   \`backend/testing/module_size_limits.json\` using the SAME canonical bump
+   policy the server's size-breach endpoint applies
+   (\`max(current+200, current*1.15)\` rounded up to 50). Do NOT hand-edit
+   the cap to an ad-hoc number, and do NOT refactor — the one command keeps
+   it policy-consistent so the guardrail still catches runaway growth.
+3. Commit both the source change AND the regenerated JSON in the same PR.
 
 **Do NOT** refactor or extract code unless your task explicitly says to.
 Refactoring during a create/fix task is a strategic decision that belongs

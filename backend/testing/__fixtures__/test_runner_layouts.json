@@ -1,0 +1,464 @@
+[
+  {
+    "name": "pytest_ini_root",
+    "files": [
+      {
+        "path": "pytest.ini"
+      }
+    ],
+    "detectable": true,
+    "family": "pytest"
+  },
+  {
+    "name": "pyproject_toml_with_pytest",
+    "files": [
+      {
+        "path": "pyproject.toml",
+        "content": "[tool.pytest.ini_options]\n"
+      }
+    ],
+    "detectable": true,
+    "family": "pytest"
+  },
+  {
+    "name": "pyproject_toml_without_pytest",
+    "files": [
+      {
+        "path": "pyproject.toml",
+        "content": "[build-system]\nrequires = [\"setuptools>=68\"]\n"
+      }
+    ],
+    "detectable": false,
+    "family": null
+  },
+  {
+    "name": "setup_py_bare_root",
+    "files": [
+      {
+        "path": "setup.py",
+        "content": "from setuptools import setup\nsetup(name=\"demo\")\n"
+      }
+    ],
+    "detectable": false,
+    "family": null
+  },
+  {
+    "name": "package_json_with_scripts_test",
+    "files": [
+      {
+        "path": "package.json",
+        "content": "{\"scripts\":{\"test\":\"vitest\"}}"
+      }
+    ],
+    "detectable": true,
+    "family": "npm"
+  },
+  {
+    "name": "justfile_with_test_target",
+    "files": [
+      {
+        "path": "Justfile",
+        "content": "test:\n\tcargo test\n"
+      }
+    ],
+    "detectable": true,
+    "family": "just"
+  },
+  {
+    "name": "justfile_without_test_target",
+    "files": [
+      {
+        "path": "justfile",
+        "content": "build:\n\tcargo build\n"
+      }
+    ],
+    "detectable": false,
+    "family": null
+  },
+  {
+    "name": "taskfile_yaml_with_test_target",
+    "files": [
+      {
+        "path": "Taskfile.yaml",
+        "content": "version: '3'\n\ntasks:\n  test:\n    cmds:\n      - go test ./...\n"
+      }
+    ],
+    "detectable": true,
+    "family": "task"
+  },
+  {
+    "name": "taskfile_yml_without_test_target",
+    "files": [
+      {
+        "path": "Taskfile.yml",
+        "content": "version: '3'\n\ntasks:\n  build:\n    cmds:\n      - go build ./...\n"
+      }
+    ],
+    "detectable": false,
+    "family": null
+  },
+  {
+    "name": "makefile_with_test_target",
+    "files": [
+      {
+        "path": "Makefile",
+        "content": "build:\n\tgo build ./...\n\ntest:\n\tgo test ./...\n"
+      }
+    ],
+    "detectable": true,
+    "family": "make"
+  },
+  {
+    "name": "makefile_without_test_target",
+    "files": [
+      {
+        "path": "Makefile",
+        "content": "build:\n\tgo build ./...\n\nlint:\n\tgolangci-lint run\n"
+      }
+    ],
+    "detectable": false,
+    "family": null
+  },
+  {
+    "name": "makefile_test_prefix_not_exact",
+    "files": [
+      {
+        "path": "Makefile",
+        "content": "test-integration:\n\tgo test ./...\n"
+      }
+    ],
+    "detectable": false,
+    "family": null
+  },
+  {
+    "name": "cargo_toml_root",
+    "files": [
+      {
+        "path": "Cargo.toml"
+      }
+    ],
+    "detectable": true,
+    "family": "cargo"
+  },
+  {
+    "name": "tox_ini_root",
+    "files": [
+      {
+        "path": "tox.ini"
+      }
+    ],
+    "detectable": true,
+    "family": "tox"
+  },
+  {
+    "name": "noxfile_root",
+    "files": [
+      {
+        "path": "noxfile.py"
+      }
+    ],
+    "detectable": true,
+    "family": "nox"
+  },
+  {
+    "name": "go_mod_root",
+    "files": [
+      {
+        "path": "go.mod"
+      }
+    ],
+    "detectable": true,
+    "family": "go"
+  },
+  {
+    "name": "libs_web_pyproject_nested",
+    "files": [
+      {
+        "path": "libs/web/pyproject.toml",
+        "content": "[tool.pytest.ini_options]\n"
+      }
+    ],
+    "detectable": true,
+    "family": "pytest"
+  },
+  {
+    "name": "modules_api_package_json_nested",
+    "files": [
+      {
+        "path": "modules/api/package.json",
+        "content": "{\"scripts\":{\"test\":\"vitest\"}}"
+      }
+    ],
+    "detectable": true,
+    "family": "npm"
+  },
+  {
+    "name": "crates_core_cargo_nested",
+    "files": [
+      {
+        "path": "crates/core/Cargo.toml"
+      }
+    ],
+    "detectable": true,
+    "family": "cargo"
+  },
+  {
+    "name": "cmd_tool_go_mod_nested",
+    "files": [
+      {
+        "path": "cmd/tool/go.mod"
+      }
+    ],
+    "detectable": true,
+    "family": "go"
+  },
+  {
+    "name": "pkg_svc_setup_cfg_nested",
+    "files": [
+      {
+        "path": "pkg/svc/setup.cfg",
+        "content": "[tool:pytest]\naddopts = -q\n"
+      }
+    ],
+    "detectable": true,
+    "family": "pytest"
+  },
+  {
+    "name": "gemfile_rakefile_root",
+    "files": [
+      {
+        "path": "Gemfile"
+      },
+      {
+        "path": "Rakefile"
+      }
+    ],
+    "detectable": true,
+    "family": "ruby"
+  },
+  {
+    "name": "build_gradle_root",
+    "files": [
+      {
+        "path": "build.gradle"
+      }
+    ],
+    "detectable": true,
+    "family": "gradle"
+  },
+  {
+    "name": "pom_xml_root",
+    "files": [
+      {
+        "path": "pom.xml"
+      }
+    ],
+    "detectable": true,
+    "family": "maven"
+  },
+  {
+    "name": "mix_exs_root",
+    "files": [
+      {
+        "path": "mix.exs"
+      }
+    ],
+    "detectable": true,
+    "family": "elixir"
+  },
+  {
+    "name": "csproj_root",
+    "files": [
+      {
+        "path": "App.csproj"
+      }
+    ],
+    "detectable": true,
+    "family": "dotnet"
+  },
+  {
+    "name": "phpunit_xml_root",
+    "files": [
+      {
+        "path": "phpunit.xml"
+      }
+    ],
+    "detectable": true,
+    "family": "php"
+  },
+  {
+    "name": "composer_json_with_scripts_test",
+    "files": [
+      {
+        "path": "composer.json",
+        "content": "{\"scripts\":{\"test\":\"phpunit\",\"lint\":\"phpcs\"}}"
+      }
+    ],
+    "detectable": true,
+    "family": "composer"
+  },
+  {
+    "name": "scripts_test_sh_root_convention",
+    "files": [
+      {
+        "path": "scripts/test.sh",
+        "content": "#!/usr/bin/env bash\nexit 0\n"
+      }
+    ],
+    "detectable": true,
+    "family": "script"
+  },
+  {
+    "name": "test_sh_root_convention",
+    "files": [
+      {
+        "path": "test.sh",
+        "content": "#!/usr/bin/env bash\nexit 0\n"
+      }
+    ],
+    "detectable": true,
+    "family": "script"
+  },
+  {
+    "name": "empty_repo",
+    "files": [],
+    "detectable": false,
+    "family": null
+  },
+  {
+    "name": "services_python_pytest_nested",
+    "files": [
+      {
+        "path": "services/api/pytest.ini"
+      }
+    ],
+    "detectable": true,
+    "family": "pytest"
+  },
+  {
+    "name": "apps_node_with_scripts_test_nested",
+    "files": [
+      {
+        "path": "apps/web/package.json",
+        "content": "{\"scripts\":{\"test\":\"vitest run\"}}"
+      }
+    ],
+    "detectable": true,
+    "family": "npm"
+  },
+  {
+    "name": "packages_go_mod_nested",
+    "files": [
+      {
+        "path": "packages/svc/go.mod"
+      }
+    ],
+    "detectable": true,
+    "family": "go"
+  },
+  {
+    "name": "src_pkg_cargo_nested",
+    "files": [
+      {
+        "path": "src/engine/Cargo.toml"
+      }
+    ],
+    "detectable": true,
+    "family": "cargo"
+  },
+  {
+    "name": "server_python_pytest_nonallowlist_nested",
+    "files": [
+      {
+        "path": "server/api/pytest.ini"
+      }
+    ],
+    "detectable": true,
+    "family": "pytest"
+  },
+  {
+    "name": "web_node_with_scripts_test_nonallowlist_nested",
+    "files": [
+      {
+        "path": "web/app/package.json",
+        "content": "{\"scripts\":{\"test\":\"vitest run\"}}"
+      }
+    ],
+    "detectable": true,
+    "family": "npm"
+  },
+  {
+    "name": "tools_cli_go_mod_nonallowlist_nested",
+    "files": [
+      {
+        "path": "tools/cli/go.mod"
+      }
+    ],
+    "detectable": true,
+    "family": "go"
+  },
+  {
+    "name": "app_singular_cargo_nonallowlist_nested",
+    "files": [
+      {
+        "path": "app/Cargo.toml"
+      }
+    ],
+    "detectable": true,
+    "family": "cargo"
+  },
+  {
+    "name": "polyglot_root_pytest_and_node",
+    "files": [
+      {
+        "path": "pytest.ini"
+      },
+      {
+        "path": "package.json",
+        "content": "{\"scripts\":{\"test\":\"vitest\"}}"
+      }
+    ],
+    "detectable": true,
+    "family": "npm",
+    "agent_families": ["npm"],
+    "onboard_families": ["npm", "pytest"]
+  },
+  {
+    "name": "root_pytest_with_nested_node_package",
+    "files": [
+      {
+        "path": "pytest.ini"
+      },
+      {
+        "path": "apps/web/package.json",
+        "content": "{\"scripts\":{\"test\":\"vitest run\"}}"
+      }
+    ],
+    "detectable": true,
+    "family": "pytest",
+    "agent_families": ["pytest"],
+    "onboard_families": ["npm", "pytest"]
+  },
+  {
+    "name": "composer_json_without_scripts_test",
+    "files": [
+      {
+        "path": "composer.json",
+        "content": "{\"name\":\"myapp\"}"
+      }
+    ],
+    "detectable": false,
+    "family": null
+  },
+  {
+    "name": "package_json_without_scripts_test",
+    "files": [
+      {
+        "path": "package.json",
+        "content": "{\"name\":\"myapp\"}"
+      }
+    ],
+    "detectable": false,
+    "family": null
+  }
+]

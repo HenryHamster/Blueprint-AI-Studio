@@ -216,6 +216,48 @@ def test_packer_meta_preserved_through_validate_internal_payload():
     assert validated["_packer_meta"]["budget_total"] == 10_000
 
 
+def test_pre_trim_marker_surfaced_into_packer_meta():
+    """A section pre-trimmed before the packer ran is reported in _packer_meta.
+
+    The strategic problem_model has its per-gap append-only memory trimmed in
+    strategic_spawning._agent_view_problem_model — BEFORE pack_under_budget
+    runs. That trim leaves a ``_gap_memory_trimmed`` marker on the section.
+    The packer must reflect it in ``_packer_meta.gap_memory_trimmed`` so the
+    agent's existing fetch-decision channel reports it even though the packer
+    itself shipped the section in full (no summarize/drop happened).
+    """
+    marker = [{"gap_id": "g-auth", "fields": {"history": {"shown": 5, "total": 31}}}]
+    payload = {
+        "problem_model": {"gaps": [{"id": "g-auth"}], "_gap_memory_trimmed": marker},
+    }
+    schema = {"problem_model": {"priority": "high"}}
+    out = pack_under_budget(payload, schema, budget=10_000)
+    # Section shipped in full — not trimmed or dropped by the packer itself.
+    assert "problem_model" in out
+    assert out["_packer_meta"]["trimmed"] == []
+    assert out["_packer_meta"]["dropped"] == []
+    # ...but the pre-trim IS surfaced in the metadata channel.
+    assert out["_packer_meta"]["gap_memory_trimmed"] == [
+        {"key": "problem_model", "gaps": marker},
+    ]
+
+
+def test_no_pre_trim_marker_yields_empty_list():
+    """When no section carries a pre-trim marker, the field is an empty list."""
+    payload = {"problem_model": {"gaps": [{"id": "g-auth"}]}}
+    schema = {"problem_model": {"priority": "high"}}
+    out = pack_under_budget(payload, schema, budget=10_000)
+    assert out["_packer_meta"]["gap_memory_trimmed"] == []
+
+
+def test_empty_pre_trim_marker_not_surfaced():
+    """An empty/false marker means nothing was actually trimmed — don't report it."""
+    payload = {"problem_model": {"gaps": [], "_gap_memory_trimmed": []}}
+    schema = {"problem_model": {"priority": "high"}}
+    out = pack_under_budget(payload, schema, budget=10_000)
+    assert out["_packer_meta"]["gap_memory_trimmed"] == []
+
+
 def test_summarize_returning_larger_value_falls_back_to_original(caplog):
     """If summarize_fn returns something larger (caller bug), use original.
 

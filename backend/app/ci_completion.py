@@ -48,6 +48,35 @@ from app.models import Task, TaskStatus, _utcnow
 logger = logging.getLogger(__name__)
 
 
+async def _refresh_empty_build_config_after_integration_landing(
+    project_id, landed_ref: str
+) -> bool:
+    """Run best-effort build-config refresh in an isolated session."""
+    try:
+        from app.build_config_detection import maybe_refresh_empty_build_config
+        from app.database import AsyncSessionLocal
+        from app.models import Project
+
+        async with AsyncSessionLocal() as refresh_session:
+            project = await refresh_session.get(Project, project_id)
+            if project is None:
+                return False
+            return await maybe_refresh_empty_build_config(
+                project,
+                refresh_session,
+                ref=landed_ref,
+            )
+    except Exception as e:
+        logger.warning(
+            "[CI] Failed isolated build_config refresh after integration landing "
+            "for project %s on %s: %s",
+            project_id,
+            landed_ref,
+            e,
+            exc_info=True,
+        )
+        return False
+
 
 async def _attempt_merge_with_retry_and_escalation(
     task: Task,
@@ -87,7 +116,10 @@ async def _attempt_merge_with_retry_and_escalation(
         ci_passed) — heartbeat-only mutations don't touch those fields.
     """
     from app.github import merge_pull_request, create_pr_comment, get_pull_request
-    from app.alert_dispatch import _maybe_create_failure_alert
+    from app.alert_dispatch import (
+        _maybe_create_failure_alert,
+        _maybe_create_unverified_merge_alert,
+    )
     from app.branch_resolution import (
         is_custom_staged_rollup_root,
         merged_pr_counts_as_integration_landing,
@@ -140,6 +172,32 @@ async def _attempt_merge_with_retry_and_escalation(
         or ci_payload.get("base_branch", "")
         or get_project_integration_branch(_merge_project)
     )
+
+    # Pre-merge Alembic dual-head guard (parity with the autonomous rollup and
+    # hotfix back-merge paths). Two task PRs can each independently add 'the
+    # next' migration with the same revision id; each passes its own isolated
+    # CI and then lands a duplicate revision / dual head when the second one
+    # merges against the advanced integration branch. Validate the combined
+    # chain against ``ci_base`` BEFORE merging; on a block-or-defer verdict hold
+    # the merge (leave the task EVALUATING, caller commits) and return False —
+    # mirroring the requires_approval early-return above. This runs after that
+    # approval gate so gate-block behavior is unchanged.
+    if ci_pr_number:
+        from app.rollup_migration_validation import enforce_premerge_migration_guard
+
+        _ok_to_merge, _hold_reason = await enforce_premerge_migration_guard(
+            gh_token, owner, repo, ci_pr_number, ci_base
+        )
+        if not _ok_to_merge:
+            logger.warning(
+                f"[CI] Merge held for PR #{ci_pr_number} — Alembic combined-chain "
+                f"guard: {_hold_reason}"
+            )
+            task.latest_status_message = (
+                f"Merge held — Alembic dual-head guard: {_hold_reason}"
+            )[:500]
+            session.add(task)
+            return False
 
     # Round 4 W1: capture a content snapshot BEFORE releasing the lock.
     # ``parent_id_local`` mirrors the snapshot-stale convention from
@@ -444,24 +502,6 @@ async def _attempt_merge_with_retry_and_escalation(
                                 )
                         _orig_session.add(orig)
                         await _orig_session.commit()
-                        # Once a bootstrapped repo gains a project structure on
-                        # its integration branch, refresh an empty build_config
-                        # so verification commands exist without a manual step.
-                        # Best-effort + idempotent (cheap in-memory guard).
-                        if (
-                            record_pr_merged
-                            and orig_project is not None
-                            and ci_base == _integration_branch
-                        ):
-                            from app.build_config_detection import (
-                                maybe_refresh_empty_build_config,
-                            )
-
-                            await maybe_refresh_empty_build_config(
-                                orig_project,
-                                _orig_session,
-                                ref=_integration_branch,
-                            )
                         # Refresh the direction's research-history merge counts:
                         # prs_merged was snapshotted when this child COMPLETED
                         # (PR open, not merged); now that it has landed, recompute
@@ -478,6 +518,37 @@ async def _attempt_merge_with_retry_and_escalation(
             except Exception as e:
                 logger.warning(
                     f"[CI] Failed to set pr_merged on {ci_orig_id}: {e}", exc_info=True
+                )
+        # Once a bootstrapped repo gains a project structure on its landed
+        # integration branch, refresh an empty build_config so verification
+        # commands exist without a manual step. Keep this isolated from the
+        # merge-task session because the helper swallows failures via rollback.
+        if (
+            _merge_project is not None
+            and ci_base == get_project_integration_branch(_merge_project)
+        ):
+            await _refresh_empty_build_config_after_integration_landing(
+                _merge_project.id,
+                ci_base,
+            )
+        # No-CI UNVERIFIED-merge alert: if the orchestrator decided this merge
+        # proceeds without test verification (undetected verdict / kill-switch
+        # off / internal staging base / no detectable test command), surface it
+        # ONCE to the operator now that the merge actually landed. Deduped per
+        # PR inside the helper; isolated so an alert error never undoes the merge.
+        _unverified_reason = ci_loop.get("unverified_merge_reason")
+        if _unverified_reason:
+            try:
+                await _maybe_create_unverified_merge_alert(
+                    task,
+                    session,
+                    pr_number=ci_pr_number,
+                    reason=_unverified_reason,
+                )
+            except Exception as _ue:
+                logger.warning(
+                    f"[CI] PR #{ci_pr_number} unverified-merge alert failed: {_ue}",
+                    exc_info=True,
                 )
         logger.info(f"[CI] PR #{ci_pr_number} merged ({source})")
         return True

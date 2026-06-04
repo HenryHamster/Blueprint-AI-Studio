@@ -191,17 +191,16 @@ function validateBuildConfigShellSafety(buildConfig: BuildConfig | undefined): v
     if (!SHELL_CMD_RE.test(dir.path)) {
       throw new Error(`build_config directory path contains unsafe characters for shell interpolation: ${dir.path}`);
     }
-    const cmds: Array<[string, string | undefined]> = [
-      ['install_cmd', dir.install_cmd],
-      ['lint_cmd', dir.lint_cmd],
-      ['build_cmd', dir.build_cmd],
-      ['test_cmd', dir.test_cmd],
-    ];
-    for (const [field, val] of cmds) {
-      if (val !== undefined && val !== '' && !SHELL_CMD_RE.test(val)) {
-        throw new Error(`build_config ${field} for ${dir.path} contains unsafe characters for shell interpolation: ${val}`);
-      }
-    }
+    // NOTE: per-directory commands (install/lint/build/test) are intentionally
+    // NOT validated here. resolveBuildConfig retains operator-configured commands
+    // with quotes/shell operators verbatim so the backend's tests_gated decision
+    // and the agent's no-CI gate agree on whether a project has runnable tests.
+    // Those commands run safely via a `bash -c` argv in the no-CI gate (execFile,
+    // no interpolation), and buildConfigDrivenStackBlocks SKIPS any command that
+    // fails SHELL_CMD_RE rather than interpolating it — so throwing here would
+    // needlessly abort ./check generation for an otherwise-runnable config.
+    // path and env_var values below ARE still validated: they are interpolated
+    // with no skip fallback.
   }
   for (const [k, v] of Object.entries(buildConfig.env_vars ?? {})) {
     if (!ENV_NAME_RE.test(k)) {

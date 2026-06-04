@@ -1,3 +1,11 @@
+/**
+ * Test failure capture and baseline initialization for the fix-loop.
+ *
+ * Runs the project's test suite at task start to capture a baseline of
+ * pre-existing test failures. The fix-loop uses this baseline to distinguish
+ * regression failures (caused by the agent's changes) from pre-existing ones.
+ */
+
 import { execSync } from 'child_process';
 import fs from 'fs';
 import type WebSocket from 'ws';
@@ -77,6 +85,73 @@ function captureFixIterationDiffStat(): string {
 
 function buildFixLoopGuidanceSuffix(): string {
   return `\n\n${READ_THE_FAILURE_MESSAGE}\n${SIZE_GUARDRAIL_GUIDANCE}\n${PRIOR_ATTEMPT_DIVERGENCE}`;
+}
+
+/**
+ * Detect the stable signature of a module size-guardrail breach in test output.
+ *
+ * A size breach is the one failure class with a single canonical, policy-defined
+ * remediation (bump the cap via the shared checker) — never a code refactor and
+ * never a weakened test. Detecting it deterministically lets the fix loop apply
+ * that remediation directly instead of handing the decision to LLM judgment,
+ * which has historically prescribed a code-extraction refactor against the
+ * explicit instruction (losing a full strategic cycle on a documented run).
+ *
+ * Three structured forms are recognized — two cap-breach forms and the
+ * complementary missing-cap (coverage meta-test) form:
+ *  - the test_invariants breach assertion: "<path> has <N> lines (limit: <M>)."
+ *  - the fast local checker breach line: "[breach] <section>/<rel>: <N> lines (cap: <M>)"
+ *  - the missing-cap coverage failure: "<path> has <N> lines (threshold: <M>)" /
+ *    "NO cap entry" (test_*_no_uncapped_large_file and the checker's [uncapped]
+ *    line). Its single remediation is to ADD a cap entry — `check_size_limits.py
+ *    --fix` now does this deterministically, same as a breach bump.
+ * Any form must be anchored by a size-guardrail token so an unrelated assertion
+ * that merely mentions "lines (limit: N)" cannot trigger a cap bump.
+ */
+export function matchesSizeBreachSignature(text: string): boolean {
+  if (!text) return false;
+  const assertionForm = /\bhas\s+\d+\s+lines\s+\(limit:\s*\d+\)/i.test(text);
+  const checkerForm = /\blines\s+\(cap:\s*\d+\)/i.test(text);
+  const thresholdForm = /\blines\s+\(threshold:\s*\d+\)/i.test(text);
+  const missingCapForm = /\bNO cap entry\b/i.test(text);
+  if (!assertionForm && !checkerForm && !thresholdForm && !missingCapForm) return false;
+  return (
+    /module_size_limits\.json/i.test(text) ||
+    /size guardrail/i.test(text) ||
+    /size breach/i.test(text)
+  );
+}
+
+/**
+ * Run the canonical size-cap bump (`check_size_limits.py --fix`) from the repo
+ * root. The checker rewrites ONLY the breached caps in module_size_limits.json
+ * using the shared `bump_size_limit` policy — it edits no source or test files,
+ * guaranteeing a policy-consistent remediation. Returns true when a cap was
+ * bumped, false on a no-op ("No breaches to fix") or failure, so the caller can
+ * fall back to the prompt-level guidance path.
+ */
+async function runDeterministicSizeCapBump(ws: WebSocket | null): Promise<boolean> {
+  sendLog(
+    ws,
+    'Size-guardrail breach detected — running deterministic cap bump ' +
+    '(python3 backend/testing/check_size_limits.py --fix) instead of an LLM refactor.\n',
+  );
+  try {
+    const out = await execFileAsync(
+      'python3',
+      ['backend/testing/check_size_limits.py', '--fix'],
+      { cwd: WORKSPACE, timeoutMs: TEST_RUNNER_TIMEOUT },
+    );
+    sendLog(ws, `${out}\n`);
+    // The checker prints "No breaches to fix" when nothing changed — treat that
+    // as a no-op so the caller falls back to the Claude fix path.
+    if (/No breaches to fix/i.test(out)) return false;
+    return true;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    sendLog(ws, `WARNING: deterministic size-cap bump failed: ${msg.slice(0, 500)}\n`);
+    return false;
+  }
 }
 
 function withRequiredTestmon(runner: TestRunner): TestRunner {
@@ -502,7 +577,11 @@ export async function testFixLoop(
       }
     }
 
-    if (failures.length === 0) {
+    const reportableFailures = anyRealTestExecuted
+      ? failures.filter(failure => classifyTestExecution(failure.message) === 'ran')
+      : failures;
+
+    if (reportableFailures.length === 0) {
       // "No failures" is only a pass if we actually ran at least one
       // runner. If every runner hit setup errors (npm ci / spawn
       // timeout), tests didn't run — we can't claim they passed, and
@@ -535,14 +614,14 @@ export async function testFixLoop(
     // When baseline is available, separate new failures from pre-existing ones.
     // A failure block is pre-existing when all parsed test IDs within it appear
     // in the baseline. Unparseable failures (size=0) are treated as new (safe default).
-    let fixableFailures: Array<{ label: string; message: string; structuredIds?: Set<string> }> = failures;
+    let fixableFailures: Array<{ label: string; message: string; structuredIds?: Set<string> }> = reportableFailures;
     let preExistingNote = '';
 
     if (baselineFailures) {
       const newFailures: typeof failures = [];
       const preExistingFailures: typeof failures = [];
 
-      for (const failure of failures) {
+      for (const failure of reportableFailures) {
         // Structured IDs (from vitest JSON reporter) win over stdout parsing.
         // Fall back to parseFailingTests only when JSON wasn't available.
         const failureIds = failure.structuredIds ?? parseFailingTests(failure.message);
@@ -609,6 +688,26 @@ export async function testFixLoop(
       });
       const preExistingHint = preExistingNote ? ' (pre-existing failures excluded)' : '';
       sendLog(ws, `${phasePrefix}Tests failed (attempt ${attempt + 1}/${totalAttempts})${preExistingHint}:\n${combinedFailures.slice(-LOG_TAIL_BYTES)}\nClaude will attempt to fix...\n`);
+
+      // Deterministic size-guardrail remediation takes precedence over the LLM
+      // fix path. A size breach has a stable, machine-detectable signature and a
+      // single policy-defined fix (bump the cap via the shared checker). Resolve
+      // it here, before the model gets a vote, so the outcome no longer depends
+      // on the model resisting its refactor bias. On success we re-run the suite
+      // to verify the breach cleared without spending an LLM fix attempt; the
+      // prompt-level SIZE_GUARDRAIL_GUIDANCE remains the fallback for the no-op
+      // case (e.g. a breach the checker can't resolve).
+      if (matchesSizeBreachSignature(combinedFailures)) {
+        const bumped = await runDeterministicSizeCapBump(ws);
+        if (bumped) {
+          git(['add', '-A']);
+          prevDiff = currDiff;
+          currDiff = captureDiffLines();
+          continue;
+        }
+        sendLog(ws, 'Deterministic size-cap bump made no change — falling back to the Claude fix path.\n');
+      }
+
       const analysisSections = analysisContext ? condensedAnalysisSections(analysisContext) : '';
       const analysisPrefix = analysisSections ? `## Module Analysis\n\n${analysisSections}\n\n` : '';
       // Broader, investigation-first prompt. The previous "These tests

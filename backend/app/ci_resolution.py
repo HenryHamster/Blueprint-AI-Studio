@@ -127,6 +127,147 @@ def has_detectable_tests(project) -> bool:
     return False
 
 
+def compute_merge_verification_verdict(project) -> dict[str, Any]:
+    """Read-only advisory describing what the no-CI merge gate will do for a
+    project's normal (non-staging-base) PRs — display data for the operator,
+    NOT a live decision input.
+
+    The verdict is computed purely from the project's persisted
+    ``build_config`` by REUSING this module's existing gate predicates
+    (:func:`requires_ci_checks` and :func:`has_detectable_tests`); it never
+    re-implements test detection.  The three mutually-exclusive states follow
+    the same precedence the gate itself uses:
+
+      - ``"ci_checks"`` — :func:`requires_ci_checks` is True (the default):
+        merges wait for the repository's GitHub required CI checks.
+      - ``"tests_gated"`` — ``requires_ci_checks`` is False AND
+        :func:`has_detectable_tests` is True: the repo's own detected test
+        command(s) run on the PR head as the merge verdict.  ``test_commands``
+        lists each non-empty ``build_config.directories[].test_cmd`` paired
+        with its directory ``path`` (in stored order).
+      - ``"unverified"`` — ``requires_ci_checks`` is False AND no detectable
+        tests: PRs merge with no test verification at all.
+
+    Returns
+    -------
+    A stable, JSON-serializable dict::
+
+        {"state": "ci_checks" | "tests_gated" | "unverified",
+         "test_commands": [{"path": str, "test_cmd": str}, ...]}
+
+    ``test_commands`` is ``[]`` for every state except ``"tests_gated"``.
+
+    Handles ``project is None`` / missing ``build_config`` defensively
+    (mirroring :func:`has_detectable_tests`): a ``None`` project yields the
+    CI-gated default shape, matching ``requires_ci_checks``'s default-True
+    semantics, and never raises.
+    """
+    if requires_ci_checks(project):
+        return {"state": "ci_checks", "test_commands": []}
+
+    if has_detectable_tests(project):
+        build_config = getattr(project, "build_config", None) or {}
+        directories = build_config.get("directories") or []
+        test_commands: list[dict[str, str]] = []
+        for d in directories:
+            if not isinstance(d, dict):
+                continue
+            test_cmd = str(d.get("test_cmd") or "").strip()
+            if not test_cmd:
+                continue
+            test_commands.append(
+                {"path": str(d.get("path") or ""), "test_cmd": test_cmd}
+            )
+        return {"state": "tests_gated", "test_commands": test_commands}
+
+    return {"state": "unverified", "test_commands": []}
+
+
+def record_no_ci_gate_runtime(
+    db_session,
+    project,
+    *,
+    executed_real_tests: bool,
+    unverified_reason: str | None,
+    when,
+) -> None:
+    """Best-effort persist of the no-CI merge gate's LAST runtime outcome onto
+    ``project.merge_gate_runtime``.
+
+    Where :func:`compute_merge_verification_verdict` is a read-only advisory
+    derived purely from stored ``build_config``, this captures what the gate
+    ACTUALLY did the last time it ran a PR through to a terminal outcome — so an
+    operator can distinguish a config that *claims* tests are gated from one
+    whose live no-CI path fell open to an UNVERIFIED merge.
+
+    Always records ``last_run_at`` (ISO) and ``executed_real_tests``
+    (True ONLY when verify-tests produced a real pass/fail verdict — i.e. a
+    suite actually ran to a verdict). When the gate fell open to UNVERIFIED
+    (``unverified_reason`` is set), additionally stamps ``last_unverified_at``
+    and ``last_unverified_reason``. A verified run does NOT clear those
+    ``last_unverified_*`` fields — they preserve the most recent fall-open,
+    which remains historically true.
+
+    Best-effort by contract: it mutates the in-memory ``project`` and stages it
+    on ``db_session`` (the caller's commit persists it) but NEVER raises — a
+    failure here must not block or break the merge hot path.
+    """
+    try:
+        if project is None:
+            return
+        when_iso = when.isoformat() if hasattr(when, "isoformat") else str(when)
+        runtime: dict[str, Any] = dict(
+            getattr(project, "merge_gate_runtime", None) or {}
+        )
+        runtime["last_run_at"] = when_iso
+        runtime["executed_real_tests"] = bool(executed_real_tests)
+        if unverified_reason:
+            runtime["last_unverified_at"] = when_iso
+            runtime["last_unverified_reason"] = str(unverified_reason)
+        project.merge_gate_runtime = runtime
+        try:
+            from sqlalchemy.orm.attributes import flag_modified
+
+            flag_modified(project, "merge_gate_runtime")
+        except Exception:  # noqa: BLE001
+            # flag_modified is a no-op safety net for the JSONB nested-dict
+            # write; a detached/plain object (e.g. a unit-test stub) simply
+            # skips it. Never let this break the merge path.
+            pass
+        if db_session is not None:
+            db_session.add(project)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[CI_RESOLUTION] failed to record no-CI gate runtime readiness",
+            exc_info=True,
+        )
+
+
+def merge_gate_runtime_block(project) -> dict[str, Any] | None:
+    """Normalize ``project.merge_gate_runtime`` into the stable API block, or
+    ``None`` when the gate has never run for this project.
+
+    Returns a JSON-serializable dict with the four operator-facing keys
+    (``last_run_at``, ``executed_real_tests``, ``last_unverified_at``,
+    ``last_unverified_reason``).  ``last_unverified_*`` are omitted when the gate
+    has never fallen open to an UNVERIFIED merge.  Defensive against a missing /
+    malformed column so it can be attached to every project API response without
+    raising.
+    """
+    raw = getattr(project, "merge_gate_runtime", None)
+    if not isinstance(raw, dict) or not raw:
+        return None
+    block: dict[str, Any] = {
+        "last_run_at": raw.get("last_run_at"),
+        "executed_real_tests": bool(raw.get("executed_real_tests", False)),
+    }
+    if raw.get("last_unverified_at") is not None:
+        block["last_unverified_at"] = raw.get("last_unverified_at")
+    if raw.get("last_unverified_reason") is not None:
+        block["last_unverified_reason"] = raw.get("last_unverified_reason")
+    return block
+
+
 def should_run_no_ci_test_gate(project, branch: str | None, *, gate_enabled: bool) -> bool:
     """Whether a definitive ``no_checks`` PR should be gated on a ``verify_tests``
     verdict (run the repo's detected suite on the PR head) instead of taking the
@@ -187,6 +328,45 @@ def classify_merge_test_verdict(
         return ("pass", "")
     output = str(verdict.get("output") or "").strip()
     return ("fail", output or "Detected test suite failed (no output captured).")
+
+
+def build_no_ci_gate_ci_result(
+    outcome: MergeTestOutcome, detail: str = ""
+) -> dict[str, Any]:
+    """Map a no-CI merge-gate ``outcome`` to the ``ci_result`` dict the
+    orchestrator hands to ``handle_ci_completion``.
+
+    This is the load-bearing transition the orchestrator's inline no-CI gate
+    performs once it has a ``verify_tests`` verdict (a sibling to
+    ``classify_merge_test_verdict``, which produces that ``outcome``):
+
+      - ``"fail"``                  → ``conclusion="failure"`` so the existing
+                                      ``handle_ci_completion`` block-and-fix path
+                                      fires carrying ``detail`` as ``failed_logs``.
+                                      A blank ``detail`` falls back to a generic
+                                      message so the fix task is never spawned
+                                      with empty output.
+      - ``"pass"`` / ``"undetected"`` → ``conclusion="success"`` so the merge may
+                                      proceed (``"undetected"`` merges UNVERIFIED:
+                                      an absent-tests repo must still progress).
+
+    Extracted so a regression in this mapping — e.g. flipping ``fail`` back to a
+    merge-allowing ``success`` — fails a test rather than silently shipping
+    merge-without-checks.
+    """
+    if outcome == "fail":
+        return {
+            "status": "completed",
+            "conclusion": "failure",
+            "details": [],
+            "failed_logs": detail or "Detected test suite failed.",
+        }
+    return {
+        "status": "completed",
+        "conclusion": "success",
+        "details": [],
+        "failed_logs": "",
+    }
 
 
 ResolutionSource = Literal["branch_head", "merge_sha", "unresolved"]

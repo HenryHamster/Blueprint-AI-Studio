@@ -2,6 +2,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Capture the prompt the handler hands to the thinker (analysis) pass.
 let capturedThinkerPrompt: string | undefined;
+// Capture the params the handler passes to buildThinkerPrompt so tests can
+// assert on derived values (problem_model recovery framing).
+let capturedThinkerParams: Record<string, unknown> | undefined;
 
 vi.mock('fs', () => ({
   default: {
@@ -56,7 +59,10 @@ vi.mock('./research-direction-context.js', () => ({
 
 vi.mock('../prompts/thinker.js', () => ({
   computeResearchPlanPromptFingerprint: () => 'fp',
-  buildThinkerPrompt: () => 'BASE_THINKER_PROMPT',
+  buildThinkerPrompt: (p: Record<string, unknown>) => {
+    capturedThinkerParams = p;
+    return 'BASE_THINKER_PROMPT';
+  },
   // Capture the rendered prompt, then short-circuit so the executor pass never runs.
   runThinkerWithGate: vi.fn((prompt: string) => {
     capturedThinkerPrompt = prompt;
@@ -68,6 +74,10 @@ vi.mock('./research-plan.js', () => ({
   buildStrategicCompletionLogs: () => ({ logs: '', warning: '' }),
   readProgressArtifact: () => '',
   buildRejectedProposalsSection: () => '',
+  buildOperatorOverridesSection: (o: Array<Record<string, unknown>>) =>
+    Array.isArray(o) && o.length ? `OPERATOR_OVERRIDES(${o.length})` : '',
+  buildRunningUpdateSupersededSection: (signal: Record<string, unknown> | null | undefined) =>
+    signal && Number(signal.count) > 0 ? '\n_operator preserved running_update_\n' : '',
   buildUserPausedSection: () => '',
   buildVersionPhaseSection: () => '',
   buildMemoCitationsSection: () => '',
@@ -102,6 +112,200 @@ describe('renderStrategicPromptSuffix', () => {
   it('returns empty string when prompt_suffix is absent', () => {
     expect(renderStrategicPromptSuffix({})).toBe('');
     expect(renderStrategicPromptSuffix({ prompt_suffix: '' })).toBe('');
+  });
+});
+
+describe('handleStrategic problem_model recovery framing', () => {
+  beforeEach(() => {
+    capturedThinkerParams = undefined;
+  });
+
+  it('dropped-but-nonempty: packer dropped problem_model → steer to fetch, not bootstrap', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      // problem_model absent from payload (dropped under byte budget)
+      _packer_meta: {
+        dropped: [{ key: 'problem_model', reason: 'exceeds remaining budget even after summarize' }],
+        trimmed: [],
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-d', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const params = capturedThinkerParams;
+    expect(params).toBeDefined();
+    expect(params?.problemModelRecovery).toBe('fetch');
+    const section = String(params?.problemModelSection);
+    // Must NOT present this as a first cycle...
+    expect(section).not.toContain('this is the first cycle');
+    // ...and must steer to fetch-the-full-model-then-edit.
+    expect(section).toContain('./fetch problem-model');
+    expect(section).toContain('EXISTS but was not shipped in full');
+  });
+
+  it('trimmed/summarized: packer summarized problem_model → steer to fetch even with partial JSON', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      problem_model: { intent: { purpose: 'partial' } },
+      _packer_meta: {
+        dropped: [],
+        trimmed: [{ key: 'problem_model', kind: 'summarized' }],
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-t', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const params = capturedThinkerParams;
+    expect(params?.problemModelRecovery).toBe('fetch');
+    const section = String(params?.problemModelSection);
+    expect(section).toContain('./fetch problem-model');
+    expect(section).not.toContain('this is the first cycle');
+  });
+
+  it('true-empty: no packer drop/trim and empty model → bootstrap framing (first cycle)', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      // no problem_model, no packer meta naming it
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-e', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const params = capturedThinkerParams;
+    expect(params?.problemModelRecovery).toBe('empty');
+    const section = String(params?.problemModelSection);
+    expect(section).toContain('this is the first cycle');
+    expect(section).not.toContain('./fetch problem-model');
+  });
+
+  it('present: full model shipped → present framing, no fetch steering', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      problem_model: { intent: { purpose: 'real' }, capabilities: [], gaps: [] },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-p', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const params = capturedThinkerParams;
+    expect(params?.problemModelRecovery).toBe('present');
+    const section = String(params?.problemModelSection);
+    expect(section).toContain('```json');
+    expect(section).not.toContain('this is the first cycle');
+    expect(section).not.toContain('EXISTS but was not shipped in full');
+  });
+});
+
+describe('handleStrategic operator_overrides wiring', () => {
+  beforeEach(() => {
+    capturedThinkerParams = undefined;
+  });
+
+  it('threads payload.operator_overrides into the thinker params', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      operator_overrides: [
+        { document: 'running_update', field: 'running_update', agent_value: 'a', at: '2026-06-01' },
+        { document: 'vision', field: 'vision.goal', agent_value: 'b', operator_value: 'c', at: '2026-06-02' },
+      ],
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-ov', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const params = capturedThinkerParams;
+    expect(params?.operatorOverridesSection).toBe('OPERATOR_OVERRIDES(2)');
+  });
+
+  it('passes empty section when operator_overrides absent', async () => {
+    const payload: Record<string, unknown> = { project_name: 'Blueprint' };
+    const statusRef = { value: '' };
+    await handleStrategic('task-no-ov', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const params = capturedThinkerParams;
+    expect(params?.operatorOverridesSection).toBe('');
+  });
+});
+
+describe('handleStrategic running_update_superseded wiring', () => {
+  beforeEach(() => {
+    capturedThinkerParams = undefined;
+  });
+
+  it('wires a running_update_superseded section when the payload signal is present', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      running_update_superseded: { count: 2, most_recent_at: '2026-05-20T09:30:00Z' },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-rus', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(String(capturedThinkerParams?.runningUpdateSupersededSection)).toContain(
+      'operator preserved running_update'
+    );
+  });
+
+  it('passes an empty section when no superseded signal is present', async () => {
+    const payload: Record<string, unknown> = { project_name: 'Blueprint' };
+    const statusRef = { value: '' };
+    await handleStrategic('task-rus-empty', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(capturedThinkerParams?.runningUpdateSupersededSection).toBe('');
+  });
+});
+
+describe('handleStrategic per-gap memory pre-trim wiring', () => {
+  beforeEach(() => {
+    capturedThinkerParams = undefined;
+  });
+
+  it('extracts gap_ids from problem_model._gap_memory_trimmed and passes them to the thinker', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      problem_model: {
+        intent: { purpose: 'real' },
+        gaps: [{ id: 'g-long-lived' }, { id: 'g-fresh' }],
+        // The backend pre-trim marker: per-gap append-only memory shortened
+        // to a recent window before the byte-budget packer ran.
+        _gap_memory_trimmed: [
+          { gap_id: 'g-long-lived', fields: { history: { shown: 3, total: 41 } } },
+        ],
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-gm', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const params = capturedThinkerParams;
+    expect(params).toBeDefined();
+    // The model is still 'present' — the pre-trim is independent of packer drops.
+    expect(params?.problemModelRecovery).toBe('present');
+    expect(params?.gapMemoryTrimmedGapIds).toEqual(['g-long-lived']);
+  });
+
+  it('passes an empty list when no gap memory was trimmed', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      problem_model: { intent: { purpose: 'real' }, gaps: [{ id: 'g-1' }] },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-gm-empty', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(capturedThinkerParams?.gapMemoryTrimmedGapIds).toEqual([]);
+  });
+
+  it('drops entries with missing gap_id from the trimmed list', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      problem_model: {
+        intent: { purpose: 'real' },
+        _gap_memory_trimmed: [
+          { gap_id: 'g-a', fields: {} },
+          { fields: {} }, // malformed: no gap_id
+          { gap_id: 'g-b', fields: {} },
+        ],
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-gm-mal', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(capturedThinkerParams?.gapMemoryTrimmedGapIds).toEqual(['g-a', 'g-b']);
   });
 });
 

@@ -171,6 +171,15 @@ export const TASK_CAPABILITIES = [
     synthetic: false,
   },
   {
+    id: 'verify_tests',
+    label: 'Verify Tests',
+    description: 'Run repo tests as the no-CI merge gate',
+    userLaunchable: false,
+    providerConfigurable: true,
+    filterVisible: true,
+    synthetic: false,
+  },
+  {
     id: 'rollup',
     label: 'Rollup',
     description: 'Rollup PR aggregation',

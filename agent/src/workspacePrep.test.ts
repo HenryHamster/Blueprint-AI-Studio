@@ -26,11 +26,13 @@ vi.mock('child_process', () => ({
 // workspacePrep imports it for warning output.
 const cloneWithRetryMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const logMock = vi.hoisted(() => vi.fn());
+const registerSizeCapMergeDriverMock = vi.hoisted(() => vi.fn());
 
 vi.mock('./index.js', () => ({
   cloneWithRetry: cloneWithRetryMock,
   log: logMock,
   GIT_REFERENCE_CACHE_ROOT: '/opt/agent-cache/git',
+  registerSizeCapMergeDriver: registerSizeCapMergeDriverMock,
 }));
 
 // ── Imports (after mocks) ────────────────────────────────────────────────────
@@ -46,6 +48,7 @@ describe('prepareWorkspaceForRole', () => {
     fsMocks.existsSync.mockReset();
     fsMocks.existsSync.mockReturnValue(false);
     logMock.mockReset();
+    registerSizeCapMergeDriverMock.mockReset();
     delete process.env.BLUEPRINT_WARM_HANDOFF;
   });
 
@@ -79,6 +82,9 @@ describe('prepareWorkspaceForRole', () => {
     // No git invocations on the cold path.
     const gitCalls = execFileSyncMock.mock.calls.filter(c => c[0] === 'git');
     expect(gitCalls.length).toBe(0);
+    // The sizecap merge driver is registered after the clone so the
+    // .gitattributes mapping is actually active.
+    expect(registerSizeCapMergeDriverMock).toHaveBeenCalledWith('/ws');
   });
 
   it('cold path: depth=0 → omit --depth flag (full clone semantics)', async () => {
@@ -158,6 +164,8 @@ describe('prepareWorkspaceForRole', () => {
     expect(cleanLine).toContain('-e .testmondata');
     expect(cleanLine).toContain('-e .vitest_cache');
     expect(cleanLine).toContain('-e .pnpm-store');
+    // Warm reuse also (re-)registers the sizecap merge driver.
+    expect(registerSizeCapMergeDriverMock).toHaveBeenCalledWith('/ws');
   });
 
   it('warm path failure: git fetch throws → falls through to cold clone', async () => {

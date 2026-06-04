@@ -2079,6 +2079,11 @@ async def _handle_strategic_completion(
             session, project, task, retired_ids, retired_rationales
         )
         await session.commit()
+        # Post-commit: the live strategic ops already emitted per-write
+        # `strategic_updated` events during execution; here we close the cycle.
+        from app.strategic_events import emit_strategic_cycle_completed
+
+        await emit_strategic_cycle_completed(task.project_id, task.id, 2)
         logger.info(
             f"[STRATEGIC] Task {task.id} complete via API: vision rev {vision_rev}, {active_dirs} active directions"
         )
@@ -2115,6 +2120,10 @@ async def _handle_strategic_completion(
         task.latest_status_message = "Strategic output could not be parsed"
         session.add(task)
         await session.commit()
+        # Post-commit: the cycle ended (in failure) — close it for the UI.
+        from app.strategic_events import emit_strategic_cycle_completed
+
+        await emit_strategic_cycle_completed(task.project_id, task.id, 2)
         failure_num = current_vision.get("_strategic_failures", "?") if project else "?"
         logger.warning(
             f"[STRATEGIC] Task {task.id}: unparseable output (failure #{failure_num})"
@@ -2262,6 +2271,11 @@ async def _handle_strategic_completion(
             # the 3-way operator-wins merge, mirroring the vision baseline
             # resolution above. Degrade to None (blank-preservation only) when
             # no cycle/baseline is resolvable (legacy task).
+            # Prefer the agent's own prior same-cycle proposal as the merge
+            # ancestor (mirrors the live set_problem_model op) so a second write
+            # is not misread as an operator edit; fall back to the cycle-start
+            # snapshot on the first/only write. Degrade to None (blank-
+            # preservation only) when no cycle/baseline is resolvable.
             pm_baseline: dict | None = None
             pm_cycle_id = task.strategic_cycle_id or (task.context or {}).get(
                 "strategic_cycle_id"
@@ -2269,9 +2283,13 @@ async def _handle_strategic_completion(
             if pm_cycle_id:
                 pm_cycle_row = await strategic_cycle.get(session, pm_cycle_id)
                 if pm_cycle_row is not None:
-                    snap = strategic_cycle.baseline_problem_model(pm_cycle_row)
-                    if snap:
-                        pm_baseline = snap
+                    prior = strategic_cycle.agent_problem_model_proposal(pm_cycle_row)
+                    if prior is not None:
+                        pm_baseline = prior
+                    else:
+                        snap = strategic_cycle.baseline_problem_model(pm_cycle_row)
+                        if snap:
+                            pm_baseline = snap
 
             try:
                 new_pm_raw, pm_diff = apply_agent_update(
@@ -2297,17 +2315,49 @@ async def _handle_strategic_completion(
                 "[STRATEGIC] Failed to apply problem_model update (non-fatal)"
             )
 
-    # Replace project.running_update with the agent's refined markdown
-    # document. Unlike the old per-cycle append, the document is a living
-    # narrative the agent rewrites each cycle — the user sees a single
-    # clean view of current state, not a log of summaries.
+    # Reconcile project.running_update operator-wins via the same shared helper
+    # the live set_running_update op uses, so the two write paths cannot drift.
+    # The document is a living narrative the agent rewrites each cycle; a
+    # concurrent operator body edit is preserved (operator wins, agent's
+    # document recorded for next cycle) and a mid-cycle routine-event digest
+    # append is re-integrated rather than discarded. Degrades to blind-assign
+    # when no cycle/baseline is resolvable (legacy task).
     if isinstance(new_running_update, str):
         try:
-            project.running_update = new_running_update
-            logger.info(
-                f"[STRATEGIC] Set running_update for project {project.id} "
-                f"(length: {len(new_running_update)} chars)"
+            from app.running_update_merge import apply_reconciled_running_update
+
+            ru_baseline: str | None = None
+            ru_cycle_row = None
+            ru_cycle_id = task.strategic_cycle_id or (task.context or {}).get(
+                "strategic_cycle_id"
             )
+            if ru_cycle_id:
+                ru_cycle_row = await strategic_cycle.get(session, ru_cycle_id)
+                if ru_cycle_row is not None:
+                    ru_baseline = strategic_cycle.baseline_running_update(
+                        ru_cycle_row
+                    )
+            ru_rejected = apply_reconciled_running_update(
+                project,
+                baseline=ru_baseline,
+                agent=new_running_update,
+                cycle=ru_cycle_row,
+            )
+            if ru_cycle_row is not None:
+                # Persist the advanced baseline so a later same-cycle write
+                # reconciles against this document, not the cycle-start snapshot.
+                session.add(ru_cycle_row)
+            if ru_rejected is not None:
+                logger.info(
+                    f"[STRATEGIC] running_update: concurrent operator edit "
+                    f"preserved for project {project.id}; agent's document "
+                    f"({len(new_running_update)} chars) recorded as a rejected edit"
+                )
+            else:
+                logger.info(
+                    f"[STRATEGIC] Set running_update for project {project.id} "
+                    f"(length: {len(new_running_update)} chars)"
+                )
         except Exception:
             logger.exception("[STRATEGIC] Failed to set running_update (non-fatal)")
 
@@ -2988,6 +3038,23 @@ async def _handle_strategic_completion(
     await (
         session.commit()
     )  # Single commit: vision + directions + messages + task status
+    # Post-commit: notify the admin UI of every strategist output this
+    # legacy-parse path wrote, then close the cycle. Tiny refetch signals.
+    from app.strategic_events import (
+        STRATEGIC_KIND_DIRECTIONS,
+        STRATEGIC_KIND_PROBLEM_MODEL,
+        STRATEGIC_KIND_RUNNING_UPDATE,
+        emit_strategic_cycle_completed,
+        emit_strategic_updated,
+    )
+
+    if isinstance(new_running_update, str):
+        await emit_strategic_updated(task.project_id, STRATEGIC_KIND_RUNNING_UPDATE)
+    if new_problem_model and isinstance(new_problem_model, dict):
+        await emit_strategic_updated(task.project_id, STRATEGIC_KIND_PROBLEM_MODEL)
+    if ops_applied or retires_applied:
+        await emit_strategic_updated(task.project_id, STRATEGIC_KIND_DIRECTIONS)
+    await emit_strategic_cycle_completed(task.project_id, task.id, 2)
     logger.info(
         f"[STRATEGIC] Task {task.id} complete: vision rev {vision_rev}, {ops_applied} direction ops, {msgs_created} msgs created, {msgs_resolved} resolved"
     )

@@ -2547,3 +2547,163 @@ async def test_strand_backstop_skips_rollup_parent(eval_db, mocker):
         f"Rollup parent must be skipped by the strand backstop, got {task.status}"
     )
     assert not (task.context or {}).get("pr_merged")
+
+
+# ── Rollup all-cancelled finalizer routes through the shared verdict ───────────
+# These exercise the REAL production entry point (the EVALUATING-timeout sweep →
+# the un-mocked rollup finalizer) for a parent whose children are all CANCELLED,
+# proving the rollup path now produces the SAME terminal verdict as the
+# requeue/reaper path instead of the old quiet-CANCELLED divergence.
+
+
+@pytest.mark.asyncio
+async def test_eval_sweep_all_non_genuine_cancelled_finalizes_failed_scope_empty(
+    eval_db, mocker
+):
+    """A parent whose children are ALL non-genuine cancels (superseded /
+    replaced-by-retry / reassigned / scope-empty), reached via the real
+    _check_evaluating_timeouts() sweep + un-mocked _check_and_trigger_rollup,
+    finalizes FAILED with the SCOPE_EMPTY category, NO direction-health penalty,
+    NO failure alert — and still clears rollup transient state + runs branch
+    cleanup."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mock_cleanup = mocker.patch(
+        "app.rollup_management._cleanup_branches", new_callable=AsyncMock
+    )
+    mock_alert = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mock_signals = mocker.patch("app.rollup_management._record_rollup_failure_signals")
+
+    project = Project(name="Eval NonGenuine Cancel", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "research parent"}],
+        status=TaskStatus.EVALUATING,
+        # A leftover rollup transient counter that MUST be scrubbed on finalize.
+        context={"direction_id": "d-nongenuine", "_rollup_retries": 2},
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    # One child per non-genuine taxonomy class.
+    non_genuine_children = [
+        # cascade kill: replaced-by-retry clone took over
+        Task(
+            project_id=project.id,
+            parent_task_id=parent.id,
+            payloads=[{"type": "create", "prompt": "c1"}],
+            status=TaskStatus.CANCELLED,
+            context={"_replaced_by_task_id": str(uuid.uuid4())},
+        ),
+        # cascade kill: superseded message prefix
+        Task(
+            project_id=project.id,
+            parent_task_id=parent.id,
+            payloads=[{"type": "create", "prompt": "c2"}],
+            status=TaskStatus.CANCELLED,
+            latest_status_message="Superseded by fix on PR #1",
+        ),
+        # work landed elsewhere markers
+        Task(
+            project_id=project.id,
+            parent_task_id=parent.id,
+            payloads=[{"type": "create", "prompt": "c3"}],
+            status=TaskStatus.CANCELLED,
+            context={"failure_detail": "pr_closed_non_rejection"},
+        ),
+        # REASSIGNED / SCOPE_EMPTY handoffs that land CANCELLED
+        Task(
+            project_id=project.id,
+            parent_task_id=parent.id,
+            payloads=[{"type": "create", "prompt": "c4"}],
+            status=TaskStatus.CANCELLED,
+            context={"failure_category": "SCOPE_EMPTY"},
+        ),
+    ]
+    for _c in non_genuine_children:
+        eval_db.add(_c)
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert parent.context.get("failure_category") == "SCOPE_EMPTY"
+    # Non-genuine → no failure alert and no direction-health signal.
+    mock_alert.assert_not_awaited()
+    mock_signals.assert_not_called()
+    # Rollup-path obligations the shared requeue helper does NOT perform.
+    mock_cleanup.assert_awaited()
+    assert "_rollup_retries" not in (parent.context or {})
+
+
+@pytest.mark.asyncio
+async def test_eval_sweep_all_genuine_cancelled_finalizes_failed_with_alert(
+    eval_db, mocker
+):
+    """A parent whose children are ALL GENUINE cancels (no non-genuine markers —
+    e.g. an operator manually cancelled every child), reached via the same real
+    sweep + un-mocked finalizer, now finalizes FAILED (NOT the old quiet
+    CANCELLED) with a failure alert + direction-health signal — matching the
+    requeue/reaper verdict so the two sweeps cannot disagree."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mock_cleanup = mocker.patch(
+        "app.rollup_management._cleanup_branches", new_callable=AsyncMock
+    )
+    mock_alert = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    # The genuine-cancel branch now routes through the SAME shared
+    # ``_record_parent_failure`` ding the requeue/reaper path uses (parity locked
+    # by test_parent_terminal_parity) rather than the rollup-only
+    # ``_record_rollup_failure_signals``.
+    mock_parent_failure = mocker.patch(
+        "app.task_lifecycle_requeue._record_parent_failure"
+    )
+    mock_signals = mocker.patch("app.rollup_management._record_rollup_failure_signals")
+
+    project = Project(name="Eval Genuine Cancel", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "research parent"}],
+        status=TaskStatus.EVALUATING,
+        context={"direction_id": "d-genuine", "_rollup_retries": 1},
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    for _i in range(2):
+        eval_db.add(
+            Task(
+                project_id=project.id,
+                parent_task_id=parent.id,
+                payloads=[{"type": "create", "prompt": f"c{_i}"}],
+                status=TaskStatus.CANCELLED,
+            )
+        )
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert parent.context.get("failure_category") == "AGENT_TIMEOUT"
+    # Genuine cancel is a terminal failure in BOTH sweeps — alert + the shared
+    # parent-failure ding fire. The rollup-only signal helper is NOT used; the
+    # finalizer mirrors the requeue/reaper path's ``_record_parent_failure``.
+    mock_alert.assert_awaited()
+    mock_parent_failure.assert_called_once()
+    mock_signals.assert_not_called()
+    mock_cleanup.assert_awaited()
+    assert "_rollup_retries" not in (parent.context or {})

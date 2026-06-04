@@ -818,8 +818,14 @@ async def _spawn_verify_tests_task(
     branch: str,
     base_branch: str,
     original_task_id: str,
+    attempt: int = 0,
 ) -> tuple[Task | None, bool]:
     """Spawn (or reuse) a one-shot ``verify_tests`` merge-gate task on a PR head.
+
+    ``attempt`` is the verify-gate retry counter (0 on first spawn). It feeds the
+    idempotency-key ``iteration`` so a re-spawn after a crashed prior attempt gets
+    a distinct key — a not-yet-terminalized corpse cannot block the retry, and
+    TaskHistory lineage stays clean.
 
     Returns ``(task, was_created)`` like ``_spawn_pipeline_task``:
       - ``(existing, False)`` when an active verify_tests task for this PR is
@@ -862,7 +868,7 @@ async def _spawn_verify_tests_task(
         task_type="verify_tests",
         pr_number=pr_number,
         original_task_id=original_task_id,
-        iteration=0,
+        iteration=attempt,
         is_rollup=False,
     )
     existing_by_key = await _get_active_pipeline_task_by_key(session, idempotency_key)
@@ -994,6 +1000,7 @@ async def _spawn_pipeline_task(
     investigated_files: list[str] | None = None,
     skip_rereview_minor_only: bool = False,
     suppress_warm_handoff: bool = False,
+    attempt: int = 0,
 ) -> tuple[Task | None, bool]:
     """Spawn a review or fix task as part of the automated review pipeline.
 
@@ -1096,6 +1103,7 @@ async def _spawn_pipeline_task(
             branch=branch,
             base_branch=base_branch,
             original_task_id=resolved_original_id,
+            attempt=attempt,
         )
 
     # Dedup guard for active pipeline tasks on this PR/chain. The match axes are

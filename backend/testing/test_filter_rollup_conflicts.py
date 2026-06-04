@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock
 
 from app.models import Project, Task, TaskStatus
 from app.orchestrator_filters import filter_rollup_conflicts
+from testing.factories import make_alert
 
 
 async def _mk_project(session, name="Rollup Filter Test"):
@@ -219,3 +220,183 @@ class TestRollupFilterSiblingExemption:
             [sibling.id], [sibling], db_session, broadcast_fn
         )
         assert result == [sibling.id]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BLOCKED deferral durability — pending-rollup caller family
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestRollupDeferralDurability:
+    """The BLOCKED deferral durability contract for the pending-rollup caller
+    family, mirroring the file-conflict family (test_filter_file_conflicts):
+    at the escalation threshold the shared helper commits the BLOCKED parking
+    BEFORE alerting/broadcasting, and a task_updated BLOCKED event is emitted
+    iff that transition persisted (never on an aborted/rolled-back commit).
+    """
+
+    async def _setup(self, db_session, *, title="Refactor: decompose module"):
+        """Build a pending-rollup conflict: an EVALUATING rollup parent with a
+        COMPLETED large-scope refactor child, and an EXTERNAL QUEUED candidate
+        whose files significantly overlap the pending-rollup set (so the base
+        rollup filter fires every cycle)."""
+        project = await _mk_project(db_session, "Rollup Durability")
+        rollup_parent = await _mk_task(
+            db_session,
+            project.id,
+            status=TaskStatus.EVALUATING,
+            payloads=[{"type": "research"}],
+            title="Research: decomposition",
+        )
+        files = [
+            "backend/app/a.py",
+            "backend/app/b.py",
+            "backend/app/c.py",
+            "backend/app/d.py",
+        ]
+        await _mk_task(
+            db_session,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            parent_task_id=rollup_parent.id,
+            payloads=[{"type": "refactor"}],
+            context={"scope": "large", "related_files": files},
+            title=title,
+        )
+        candidate = await _mk_task(
+            db_session,
+            project.id,
+            status=TaskStatus.QUEUED,
+            parent_task_id=None,
+            payloads=[{"type": "create"}],
+            context={"related_files": files[:2]},
+            title="External feature on the same files",
+        )
+        return project, candidate, title
+
+    @pytest.mark.asyncio
+    async def test_persistent_rollup_conflict_parks_task_in_blocked(
+        self, db_session, mocker
+    ):
+        """At the escalation threshold the candidate is parked in BLOCKED with
+        ``block_code='pending_rollup'`` and a BLOCKED broadcast is emitted."""
+        mocker.patch(
+            "app.alert_dispatch._maybe_create_precondition_blocker_alert",
+            new_callable=AsyncMock,
+        )
+        _project, candidate, _title = await self._setup(db_session)
+        broadcast_fn = AsyncMock()
+
+        # Below the threshold the task stays QUEUED (deferred this cycle only).
+        await filter_rollup_conflicts(
+            [candidate.id], [candidate], db_session, broadcast_fn
+        )
+        assert candidate.status == TaskStatus.QUEUED
+        assert candidate.blocker_kind is None
+
+        # Cross the threshold (default 3) → parked BLOCKED with durable metadata.
+        await filter_rollup_conflicts(
+            [candidate.id], [candidate], db_session, broadcast_fn
+        )
+        await filter_rollup_conflicts(
+            [candidate.id], [candidate], db_session, broadcast_fn
+        )
+        assert candidate.status == TaskStatus.BLOCKED
+        assert candidate.blocker_kind == "pending_rollup"
+        assert candidate.blocked_reason and "pending rollup" in candidate.blocked_reason
+        assert candidate.blocked_at is not None
+        assert (
+            candidate.recheck_after is not None
+            and candidate.recheck_after > candidate.blocked_at
+        )
+        # The transition persisted (real db_session.commit), so the BLOCKED
+        # broadcast fired exactly once with the parked state.
+        blocked_calls = [
+            cc
+            for cc in broadcast_fn.call_args_list
+            if cc.args[2].get("status") == "BLOCKED"
+        ]
+        assert len(blocked_calls) == 1
+        assert blocked_calls[0].args[0] == str(candidate.project_id)
+        assert blocked_calls[0].args[1] == "task_updated"
+        assert blocked_calls[0].args[2]["task_id"] == str(candidate.id)
+        assert "Blocked:" in blocked_calls[0].args[2]["message"]
+
+    @pytest.mark.asyncio
+    async def test_reblock_with_existing_alert_broadcasts_after_commit(
+        self, db_session, mocker
+    ):
+        """Existing-alert path: when the operator alert for this blocker already
+        exists, the helper returns False (no new alert/commit). The caller has
+        already committed the parked task itself, so BLOCKED is still broadcast
+        — durability no longer depends on the alert helper committing."""
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+        project, candidate, title = await self._setup(db_session)
+        existing = make_alert(
+            project_id=project.id,
+            task_id=candidate.id,
+            severity="WARNING",
+            title=f"Precondition blocker: pending rollup '{title[:60]}'",
+            message="Waiting: overlaps pending rollup",
+        )
+        db_session.add(existing)
+        await db_session.commit()
+        broadcast_fn = AsyncMock()
+
+        for _ in range(3):
+            await filter_rollup_conflicts(
+                [candidate.id], [candidate], db_session, broadcast_fn
+            )
+
+        await db_session.refresh(candidate)
+        assert candidate.status == TaskStatus.BLOCKED
+        blocked_calls = [
+            cc
+            for cc in broadcast_fn.call_args_list
+            if cc.args[2].get("status") == "BLOCKED"
+        ]
+        assert len(blocked_calls) == 1
+        assert "Blocked:" in blocked_calls[0].args[2]["message"]
+
+    @pytest.mark.asyncio
+    async def test_failed_commit_suppresses_blocked_broadcast(
+        self, db_session, mocker
+    ):
+        """Failed-commit path: when the BLOCKED parking commit raises, the
+        transition did not persist, so NO BLOCKED task_updated event may escape
+        the aborted transaction, and the operator alert (which sits after the
+        commit) never fires."""
+        esc = mocker.patch(
+            "app.alert_dispatch._maybe_create_precondition_blocker_alert",
+            new_callable=AsyncMock,
+        )
+        _project, candidate, _title = await self._setup(db_session)
+        broadcast_fn = AsyncMock()
+
+        # First two cycles stay QUEUED (count < threshold → no commit attempted).
+        await filter_rollup_conflicts(
+            [candidate.id], [candidate], db_session, broadcast_fn
+        )
+        await filter_rollup_conflicts(
+            [candidate.id], [candidate], db_session, broadcast_fn
+        )
+        assert candidate.status == TaskStatus.QUEUED
+        broadcast_fn.reset_mock()
+
+        # Patch the parking commit to raise, then cross the threshold. The filter
+        # reads via session.execute (autoflush, not commit), so only the helper's
+        # explicit parking commit is affected.
+        mocker.patch.object(
+            db_session, "commit", new=AsyncMock(side_effect=RuntimeError("db down"))
+        )
+        with pytest.raises(RuntimeError):
+            await filter_rollup_conflicts(
+                [candidate.id], [candidate], db_session, broadcast_fn
+            )
+
+        assert candidate.status == TaskStatus.BLOCKED  # mutated in memory only
+        assert all(
+            cc.args[2].get("status") != "BLOCKED"
+            for cc in broadcast_fn.call_args_list
+        )
+        esc.assert_not_called()

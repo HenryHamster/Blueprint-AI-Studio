@@ -1,13 +1,16 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { apiFetch } from '../api';
 import { useDirectionForm } from './useDirectionForm';
 import { useAutonomousConfig } from './useAutonomousConfig';
 import type { Direction } from '../components/DirectionsPanel';
-import type { ProblemModel } from '../types';
+import type { ProblemModel, RunningUpdateReconciliation } from '../types';
 
 interface UseDirectionsDataDeps {
   selectedProjectId: string | null;
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
+  // Optional ref the live WS handler (useLogViewer) calls to trigger a refetch
+  // when the strategist emits an update. Populated here, reset to a no-op on unmount.
+  fetchDirectionsRef?: React.MutableRefObject<() => void>;
 }
 
 /**
@@ -18,7 +21,7 @@ interface UseDirectionsDataDeps {
  * (rather than in the panel) so they share the same `fetchDirections` /
  * `setError` / `addToast` closures the API handlers below rely on.
  */
-export function useDirectionsData({ selectedProjectId, addToast }: UseDirectionsDataDeps) {
+export function useDirectionsData({ selectedProjectId, addToast, fetchDirectionsRef }: UseDirectionsDataDeps) {
   const [directions, setDirections] = useState<Direction[]>([]);
   const [autonomousEnabled, setAutonomousEnabled] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -28,6 +31,8 @@ export function useDirectionsData({ selectedProjectId, addToast }: UseDirections
   const [problemModel, setProblemModel] = useState<ProblemModel>({});
   const [runningUpdate, setRunningUpdate] = useState<string | null>(null);
   const [runningUpdateAckAt, setRunningUpdateAckAt] = useState<string | null>(null);
+  const [runningUpdateReconciliation, setRunningUpdateReconciliation] =
+    useState<RunningUpdateReconciliation | null>(null);
 
   // Error feedback
   const [error, setError] = useState<string | null>(null);
@@ -58,6 +63,21 @@ export function useDirectionsData({ selectedProjectId, addToast }: UseDirections
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedProjectId]);
 
+  // Always points at the latest fetchDirections closure (recreated each render).
+  const fetchDirectionsLatestRef = useRef(fetchDirections);
+  fetchDirectionsLatestRef.current = fetchDirections;
+
+  // Register a stable callback into the externally-owned ref so the live WS
+  // handler can trigger a refetch. Reset to a no-op on unmount to avoid a
+  // stale-closure setState after the panel closes.
+  useEffect(() => {
+    if (!fetchDirectionsRef) return;
+    fetchDirectionsRef.current = () => fetchDirectionsLatestRef.current();
+    return () => {
+      fetchDirectionsRef.current = () => {};
+    };
+  }, [fetchDirectionsRef]);
+
   async function fetchDirections() {
     setLoading(true);
     try {
@@ -73,6 +93,7 @@ export function useDirectionsData({ selectedProjectId, addToast }: UseDirections
       setProblemModel(data.problem_model ?? {});
       setRunningUpdate(typeof data.running_update === 'string' ? data.running_update : null);
       setRunningUpdateAckAt(data.running_update_acknowledged_at ?? null);
+      setRunningUpdateReconciliation(data.running_update_reconciliation ?? null);
       if (countsRes.ok) {
         const countsData = await countsRes.json();
         setTaskCounts(countsData.counts ?? {});
@@ -355,8 +376,10 @@ export function useDirectionsData({ selectedProjectId, addToast }: UseDirections
     problemModel,
     setProblemModel,
     runningUpdate,
+    setRunningUpdate,
     runningUpdateAckAt,
     setRunningUpdateAckAt,
+    runningUpdateReconciliation,
     error,
     setError,
     researchingIds,

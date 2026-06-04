@@ -565,12 +565,13 @@ class TestPreconditionBlockerAlert:
         mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         project, task = await self._make_task(db_session)
 
-        await _maybe_create_precondition_blocker_alert(
+        created = await _maybe_create_precondition_blocker_alert(
             task,
             db_session,
             blocker_kind="file conflict on a.py, b.py",
             detail="Waiting: file conflict on a.py, b.py",
         )
+        assert created is True
 
         alerts = await _all_alerts(db_session, task_id=task.id)
         assert len(alerts) == 1
@@ -587,13 +588,15 @@ class TestPreconditionBlockerAlert:
         mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         _project, task = await self._make_task(db_session)
 
-        await _maybe_create_precondition_blocker_alert(
+        created = await _maybe_create_precondition_blocker_alert(
             task, db_session, blocker_kind="upstream dependency", detail="first"
         )
+        assert created is True
         # Re-fire on the same blocker identity must NOT create a second alert.
-        await _maybe_create_precondition_blocker_alert(
+        created = await _maybe_create_precondition_blocker_alert(
             task, db_session, blocker_kind="upstream dependency", detail="second"
         )
+        assert created is False
 
         alerts = await _all_alerts(db_session, task_id=task.id)
         assert len(alerts) == 1
@@ -605,12 +608,14 @@ class TestPreconditionBlockerAlert:
         mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         _project, task = await self._make_task(db_session)
 
-        await _maybe_create_precondition_blocker_alert(
+        created = await _maybe_create_precondition_blocker_alert(
             task, db_session, blocker_kind="file conflict on a.py", detail="d1"
         )
-        await _maybe_create_precondition_blocker_alert(
+        assert created is True
+        created = await _maybe_create_precondition_blocker_alert(
             task, db_session, blocker_kind="pending rollup 'Refactor X'", detail="d2"
         )
+        assert created is True
 
         alerts = await _all_alerts(db_session, task_id=task.id)
         assert len(alerts) == 2
@@ -625,15 +630,48 @@ class TestPreconditionBlockerAlert:
         )
         project, task = await self._make_task(db_session)
 
-        await _maybe_create_precondition_blocker_alert(
+        created = await _maybe_create_precondition_blocker_alert(
             task, db_session, blocker_kind="upstream dependency", detail="d"
         )
+        assert created is True
 
         mock_bc.assert_called_once()
         call_args = mock_bc.call_args
         assert call_args[0][0] == str(project.id)
         assert call_args[0][1] == "alert_created"
         assert call_args[0][2]["severity"] == "WARNING"
+
+    @pytest.mark.asyncio
+    async def test_dedup_path_does_not_commit_caller_task_mutation(
+        self, db_session, mocker
+    ):
+        """Contract boundary: on the dedup (existing-alert) path the helper
+        returns False WITHOUT committing, so it never flushes a task mutation the
+        caller staged on its behalf. Callers that park a task into BLOCKED
+        (orchestrator_filters._record_defer_and_maybe_escalate) must own that
+        commit themselves — durability must not hinge on whether this helper
+        happened to create (and therefore commit) an alert this cycle."""
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+        _project, task = await self._make_task(db_session)
+
+        # Seed the alert so the next call hits the dedup short-circuit.
+        created = await _maybe_create_precondition_blocker_alert(
+            task, db_session, blocker_kind="file conflict on a.py", detail="d1"
+        )
+        assert created is True
+
+        # Spy on commit, stage a task mutation the helper must NOT persist.
+        commit_spy = mocker.spy(db_session, "commit")
+        task.status = TaskStatus.BLOCKED
+        db_session.add(task)
+
+        created = await _maybe_create_precondition_blocker_alert(
+            task, db_session, blocker_kind="file conflict on a.py", detail="d2"
+        )
+        assert created is False
+        # The dedup path committed nothing — the caller's staged BLOCKED mutation
+        # is not persisted as a side effect of the alert helper.
+        commit_spy.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

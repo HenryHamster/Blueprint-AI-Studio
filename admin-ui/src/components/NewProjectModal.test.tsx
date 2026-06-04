@@ -4,6 +4,25 @@ import userEvent from '@testing-library/user-event';
 import { NewProjectModal } from './NewProjectModal';
 
 const mocks = vi.hoisted(() => ({
+  previewOnboardProjectMock: vi.fn(async () => ({
+    build_config: {
+      language: 'python',
+      has_ci: false,
+      requires_ci_checks: true,
+      directories: [
+        {
+          path: 'backend/',
+          type: 'python',
+          lint_cmd: 'ruff check',
+          build_cmd: '',
+          test_cmd: '',
+          install_cmd: '',
+        },
+      ],
+    },
+    default_branch: 'main',
+    merge_verification_verdict: { state: 'ci_checks', test_commands: [] },
+  })),
   onboardProjectMock: vi.fn(async () => ({
     project_id: 'project-12345',
     build_config: {},
@@ -22,12 +41,13 @@ vi.mock('../api', () => ({
     return new Response('{}', { status: 200 });
   }),
   authGet: vi.fn(async () => new Response(JSON.stringify({ repositories: [] }), { status: 200 })),
+  previewOnboardProject: mocks.previewOnboardProjectMock,
   onboardProject: mocks.onboardProjectMock,
   API_BASE_URL: 'http://localhost:3000',
 }));
 
 describe('NewProjectModal onboarding steering', () => {
-  it('builds a structured initial_steering payload from the form fields', async () => {
+  it('previews the detected merge-gate draft and posts the edited override on create', async () => {
     const user = userEvent.setup();
     render(
       <NewProjectModal
@@ -47,14 +67,46 @@ describe('NewProjectModal onboarding steering', () => {
     await user.type(screen.getByPlaceholderText("e.g., Don't modify .github/workflows/"), 'No workflow edits');
     await user.click(screen.getByRole('button', { name: 'Add constraint' }));
     await user.click(screen.getByRole('button', { name: 'Continue' }));
+    await screen.findByText('Merge-gate draft');
+    const requiresCiToggle = screen.getByRole('checkbox', { name: 'Require CI checks' });
+    await user.click(requiresCiToggle);
+    await user.clear(screen.getByPlaceholderText('Leave blank to keep the merge gate unverified'));
+    await user.type(screen.getByPlaceholderText('Leave blank to keep the merge gate unverified'), 'python3 -m pytest');
     await user.click(await screen.findByRole('button', { name: 'Create Project' }));
 
+    await waitFor(() => expect(mocks.previewOnboardProjectMock).toHaveBeenCalled());
     await waitFor(() => expect(mocks.onboardProjectMock).toHaveBeenCalled());
-    expect(mocks.onboardProjectMock).toHaveBeenCalledWith(
+    expect(mocks.previewOnboardProjectMock).toHaveBeenCalledWith(
       'acme',
       'platform',
       undefined,
       undefined,
+      undefined,
+      'Ship the core fix',
+      {
+        context: {
+          project_type: 'startup',
+          users: 'Platform team',
+          team: '4 engineers + 1 PM',
+          deploy_cadence: 'weekly',
+          notes: 'Reliability over speed',
+        },
+        constraints: ['No workflow edits'],
+      },
+    );
+    expect(mocks.onboardProjectMock).toHaveBeenCalledWith(
+      'acme',
+      'platform',
+      undefined,
+      expect.objectContaining({
+        requires_ci_checks: false,
+        directories: [
+          expect.objectContaining({
+            path: 'backend/',
+            test_cmd: 'python3 -m pytest',
+          }),
+        ],
+      }),
       undefined,
       'Ship the core fix',
       {

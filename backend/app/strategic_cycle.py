@@ -74,15 +74,22 @@ async def create(
     phase1_task_id=None,
     baseline_vision: Optional[Mapping[str, Any]] = None,
     baseline_problem_model: Optional[Mapping[str, Any]] = None,
+    baseline_running_update: str | None = None,
 ) -> StrategicCycle:
     """Insert a new StrategicCycle row at phase-1 spawn.
 
-    ``baseline_vision`` and ``baseline_problem_model`` are snapshot at cycle
-    start so the 3-way merges in ``strategic_completion`` / the live API path
-    can compare operator edits against the same baseline the agent was given.
-    Both are stored under ``cycle_metadata`` to avoid a per-project schema
-    change, and both are skipped by :func:`_to_legacy_dict` so the snapshots
-    never leak into the agent's cycle-history context.
+    ``baseline_vision``, ``baseline_problem_model`` and
+    ``baseline_running_update`` are snapshot at cycle start so the operator-wins
+    merges in ``strategic_completion`` / the live API path can compare operator
+    edits against the same baseline the agent was given. All three are stored
+    under ``cycle_metadata`` to avoid a per-project schema change, and all three
+    are skipped by :func:`_to_legacy_dict` so the snapshots never leak into the
+    agent's cycle-history context.
+
+    ``baseline_running_update`` is stored as a string (``""`` when the document
+    was empty at spawn); a missing key on the row signals a legacy cycle with no
+    snapshot, which :func:`baseline_running_update` reports as ``None`` so the
+    reconciliation degrades to blind-assign.
     """
     cycle = StrategicCycle(
         id=cycle_id or new_cycle_id(),
@@ -93,6 +100,9 @@ async def create(
         cycle_metadata={
             "baseline_vision": dict(baseline_vision or {}),
             "baseline_problem_model": dict(baseline_problem_model or {}),
+            "baseline_running_update": baseline_running_update
+            if isinstance(baseline_running_update, str)
+            else "",
         },
     )
     session.add(cycle)
@@ -390,6 +400,120 @@ def baseline_problem_model(cycle: StrategicCycle) -> dict[str, Any]:
     return dict(snap) if isinstance(snap, dict) else {}
 
 
+AGENT_PM_PROPOSAL_KEY = "agent_problem_model_proposal"
+"""cycle_metadata key holding the agent's last proposed operator-owned subset
+(intent.purpose / context / constraints) for the in-flight cycle. Set after each
+successful ``set_problem_model`` write; absent until the first write. Skipped by
+:func:`_to_legacy_dict` so it never leaks into agent cycle-history context."""
+
+
+def agent_problem_model_proposal(cycle: StrategicCycle) -> dict[str, Any] | None:
+    """Read the agent's last proposed operator-owned subset for this cycle.
+
+    Returns ``None`` when the agent has not yet written problem_model this cycle
+    (first/only write) so callers fall back to the cycle-start
+    :func:`baseline_problem_model` snapshot. On a *second* same-cycle write this
+    is preferred as the merge ancestor so the agent's own prior write is not
+    misread as a mid-cycle operator edit (a genuine operator edit still moves
+    ``current`` away from this proposal and wins). See
+    :func:`set_agent_problem_model_proposal`."""
+    meta = cycle.cycle_metadata or {}
+    snap = meta.get(AGENT_PM_PROPOSAL_KEY)
+    return dict(snap) if isinstance(snap, dict) else None
+
+
+def set_agent_problem_model_proposal(
+    cycle: StrategicCycle, subset: Mapping[str, Any]
+) -> None:
+    """Store the agent's pre-merge operator-owned subset for this cycle.
+
+    ``subset`` is the shape produced by ``problem_model.operator_owned_subset``
+    (intent.purpose / context / constraints). Flags ``cycle_metadata`` modified;
+    the caller is responsible for ``session.add(cycle)`` / commit."""
+    new_meta = dict(cycle.cycle_metadata or {})
+    new_meta[AGENT_PM_PROPOSAL_KEY] = dict(subset)
+    cycle.cycle_metadata = new_meta
+    flag_modified(cycle, "cycle_metadata")
+
+
+AGENT_VISION_PROPOSAL_KEY = "agent_vision_proposal"
+"""cycle_metadata key holding the agent's last proposed vision for the in-flight
+cycle. Set after each successful live ``set_vision`` write; absent until the
+first write. Skipped by :func:`_to_legacy_dict` so it never leaks into agent
+cycle-history context. Mirrors :data:`AGENT_PM_PROPOSAL_KEY`."""
+
+
+def agent_vision_proposal(cycle: StrategicCycle) -> dict[str, Any] | None:
+    """Read the agent's last proposed vision for this cycle.
+
+    Returns ``None`` when the agent has not yet written vision this cycle
+    (first/only write) so callers fall back to the cycle-start
+    :func:`baseline_vision` snapshot. On a *second* same-cycle write this is
+    preferred as the merge ancestor so the agent's own prior write is not
+    misread as a mid-cycle operator edit (a genuine operator edit still moves
+    ``current`` away from this proposal and wins). Mirrors
+    :func:`agent_problem_model_proposal`."""
+    meta = cycle.cycle_metadata or {}
+    snap = meta.get(AGENT_VISION_PROPOSAL_KEY)
+    return dict(snap) if isinstance(snap, dict) else None
+
+
+def set_agent_vision_proposal(cycle: StrategicCycle, vision: Mapping[str, Any]) -> None:
+    """Store the agent's pre-merge proposed vision for this cycle.
+
+    Flags ``cycle_metadata`` modified; the caller is responsible for
+    ``session.add(cycle)`` / commit. Mirrors
+    :func:`set_agent_problem_model_proposal`."""
+    new_meta = dict(cycle.cycle_metadata or {})
+    new_meta[AGENT_VISION_PROPOSAL_KEY] = dict(vision)
+    cycle.cycle_metadata = new_meta
+    flag_modified(cycle, "cycle_metadata")
+
+
+def baseline_running_update(cycle: StrategicCycle) -> str | None:
+    """Read the snapshot of ``running_update`` taken at cycle start.
+
+    Returns the snapshot string (``""`` when the document was empty at spawn),
+    or ``None`` for a legacy cycle that predates the snapshot (no key on the
+    row). Used by the live ``set_running_update`` op and the
+    strategic-completion fallback to reconcile a concurrent operator edit
+    operator-wins; ``None`` degrades the reconciliation to today's blind-assign.
+    """
+    meta = cycle.cycle_metadata or {}
+    if "baseline_running_update" not in meta:
+        return None
+    snap = meta.get("baseline_running_update")
+    return snap if isinstance(snap, str) else ""
+
+
+def advance_running_update_baseline(cycle: StrategicCycle, value: str) -> None:
+    """Advance the cycle's ``running_update`` baseline to ``value``.
+
+    Called after every successful (non-operator-superseded) agent write so a
+    subsequent same-cycle agent write reconciles against what the agent last
+    persisted rather than the frozen cycle-start snapshot. Without this advance
+    the second same-cycle write sees ``current != baseline`` and is misclassified
+    as an operator edit and discarded.
+
+    A genuine operator edit made between two agent writes still diverges from
+    this advanced baseline, so operator-wins is preserved.
+
+    Legacy cycles whose ``cycle_metadata`` never carried a ``baseline_running_update``
+    key (:func:`baseline_running_update` returns ``None`` for them, degrading to
+    blind-assign) are left untouched — writing the key would silently flip them
+    onto the reconciliation path mid-cycle.
+    """
+    meta = cycle.cycle_metadata
+    if not isinstance(meta, dict) or "baseline_running_update" not in meta:
+        return
+    if meta.get("baseline_running_update") == value:
+        return
+    new_meta = dict(meta)
+    new_meta["baseline_running_update"] = value
+    cycle.cycle_metadata = new_meta
+    flag_modified(cycle, "cycle_metadata")
+
+
 def _to_legacy_dict(cycle: StrategicCycle) -> dict[str, Any]:
     """Render a StrategicCycle row in the legacy cycle_history JSONB shape.
 
@@ -427,7 +551,13 @@ def _to_legacy_dict(cycle: StrategicCycle) -> dict[str, Any]:
     # history shape, and must never leak into agent cycle-history context).
     meta = cycle.cycle_metadata or {}
     for k, v in meta.items():
-        if k in ("baseline_vision", "baseline_problem_model"):
+        if k in (
+            "baseline_vision",
+            "baseline_problem_model",
+            "baseline_running_update",
+            AGENT_PM_PROPOSAL_KEY,
+            AGENT_VISION_PROPOSAL_KEY,
+        ):
             continue
         out[k] = v
     return out

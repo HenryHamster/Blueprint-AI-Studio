@@ -81,6 +81,7 @@ import { ALL_AGENT_TASK_TYPES } from '../taskCapabilities.js';
 import type { AgentTaskType } from '../taskCapabilities.js';
 import { handlers } from './index.js';
 import { persistAndPostStatus } from '../index.js';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 
 // ── Handler registry tests ────────────────────────────────────────────────────
 describe('handlers registry', () => {
@@ -264,7 +265,7 @@ describe('memo bake smoke contract', () => {
 
     await handlers.memo('bake-smoke-001', payload, task, '', 'owner', 'repo', null, { value: '' });
 
-    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+    expectCalledWith(persistAndPostStatus,
       'bake-smoke-001',
       expect.objectContaining({
         status: 'COMPLETED',

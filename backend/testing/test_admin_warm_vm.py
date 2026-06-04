@@ -41,6 +41,22 @@ async def test_warm_vm_state_empty(client: AsyncClient, db_session):
         assert "warm_continuity_enabled" in body
         assert "warm_backlog_reuse_enabled" in body
         assert isinstance(body["warm_backlog_reuse_enabled"], bool)
+        # Warm-pool retarget controls are surfaced so the panel can reflect each
+        # flag's current state and offer a confirm-and-PATCH toggle.
+        assert "warm_pool_account_retarget_enabled" in body
+        assert isinstance(body["warm_pool_account_retarget_enabled"], bool)
+        assert body["warm_pool_account_retarget_enabled"] == bool(
+            _shared_state.runtime_config.get(
+                "warm_pool_account_retarget_enabled", False
+            )
+        )
+        assert "warm_pool_cross_provider_retarget_enabled" in body
+        assert isinstance(body["warm_pool_cross_provider_retarget_enabled"], bool)
+        assert body["warm_pool_cross_provider_retarget_enabled"] == bool(
+            _shared_state.runtime_config.get(
+                "warm_pool_cross_provider_retarget_enabled", False
+            )
+        )
         assert isinstance(body["next_role_poll_timeout_secs"], int)
         funnel = body.get("chain_continuity_funnel", {})
         assert isinstance(funnel, dict)
@@ -448,3 +464,20 @@ async def test_warm_vm_state_includes_pool_metrics(client: AsyncClient, db_sessi
     amort = pool["cost_amortization_by_account"]["unattributed"]
     assert amort["pool_idle_cost_usd"] > 0
     assert "pool_hit_rate" in amort
+    # The cost-aware auto-drain guard diagnostic is embedded so the panel can
+    # render a banner when it engages. With a healthy/low-volume funnel it is
+    # present but disengaged, and carries the floors + current values.
+    assert "cost_guard" in pool
+    guard = pool["cost_guard"]
+    assert isinstance(guard, dict)
+    for key in (
+        "engaged",
+        "reason",
+        "hit_rate",
+        "total_dispatches",
+        "idle_cost_usd",
+        "min_hit_rate",
+        "min_idle_cost_usd",
+    ):
+        assert key in guard, f"missing pool_metrics.cost_guard.{key}"
+    assert isinstance(guard["engaged"], bool)

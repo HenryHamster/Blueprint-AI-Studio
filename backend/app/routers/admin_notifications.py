@@ -21,6 +21,7 @@ from app.models import (
     ProjectMember,
     ProjectMessage,
     MessageType,
+    MESSAGE_CONTENT_MAX,
     MessagesLastSeen,
     MessagesNoisePrefs,
     MessagesSavedViews,
@@ -126,8 +127,10 @@ ROUTINE_EVENT_TYPES: frozenset = frozenset(
 
 # System-emitted NOTE event types classified as high_signal in event_type_snapshot.json.
 # These must always survive paging regardless of routine message volume, identical to
-# how BLOCKER/FEEDBACK/BUG_REPORT are guaranteed.  Escalation types (auto_fix_escalated,
-# residual_fix_escalated, etc.) are already safe because they emit as BLOCKER messages.
+# how BLOCKER/FEEDBACK/BUG_REPORT are guaranteed.  This includes the operator steering
+# receipt/confirmation pair so the queued receipt remains visible while it waits behind
+# an active cycle. Escalation types (auto_fix_escalated, residual_fix_escalated, etc.)
+# are already safe because they emit as BLOCKER messages.
 HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset = frozenset(
     {
         "failure_alert",
@@ -140,6 +143,8 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset = frozenset(
         "release_stabilize_stalled",
         "release_ci_unresolved_stall",
         "release_auto_merge_stalled",
+        "strategic_steering_deferred",
+        "strategic_steering_acted",
     }
 )
 
@@ -154,11 +159,14 @@ _RESERVED_PREFS_KEYS = (_TEMP_MUTES_KEY, _MUTE_WINDOW_KEY)
 
 
 def append_routine_digest(project: Project, event_type: str, summary: str) -> None:
-    """Append a one-line digest entry for a routine event to project.running_update."""
-    now_str = _utcnow().strftime("%Y-%m-%d %H:%M")
-    line = f"- [{now_str}] **{event_type}**: {summary[:200]}"
-    current = (project.running_update or "").rstrip()
-    project.running_update = f"{current}\n{line}" if current else line
+    """Append a one-line digest entry for a routine event to project.running_update.
+
+    Thin wrapper delegating to the canonical ``Project.append_routine_digest``
+    so the digest format lives in exactly one place. Does NOT commit — the
+    caller owns the transaction (and, on the user-facing message path, the
+    project row lock that makes the read-append-write concurrency-safe).
+    """
+    project.append_routine_digest(event_type, summary)
 
 
 from app.payload_schemas import ALL_TASK_TYPES as _VALID_TASK_TYPES  # noqa: E402
@@ -466,8 +474,10 @@ async def create_message(
         project_id = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid project_id format")
-    # Verify user has access
-    project = await _get_user_project(project_id, current_user["user_id"], session)
+    # Verify user has access. The returned instance is only used for the
+    # access check; the routine-digest branch below re-reads the project under
+    # a row lock so its read-append-write on running_update is concurrency-safe.
+    await _get_user_project(project_id, current_user["user_id"], session)
 
     valid_types = {t.value for t in MessageType}
     msg_type = payload.message_type.upper()
@@ -476,8 +486,14 @@ async def create_message(
             status_code=400,
             detail=f"Invalid message_type. Must be one of: {', '.join(valid_types)}",
         )
-    if not payload.content.strip():
+    content = payload.content.strip()
+    if not content:
         raise HTTPException(status_code=400, detail="Content cannot be empty")
+    if len(content) > MESSAGE_CONTENT_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Content exceeds {MESSAGE_CONTENT_MAX} character limit",
+        )
     # Cap context size to prevent storage abuse
     ctx = payload.context or {}
     if len(json.dumps(ctx)) > 50_000:
@@ -487,16 +503,51 @@ async def create_message(
         project_id=project_id,
         message_type=MessageType(msg_type),
         from_type="user",
-        content=payload.content.strip()[:5000],
+        content=content,
         context=ctx,
     )
     session.add(msg)
     event_type = ctx.get("event_type")
     if event_type and event_type in ROUTINE_EVENT_TYPES:
-        append_routine_digest(project, event_type, payload.content.strip())
+        # The routine-digest append is a read-modify-write on running_update,
+        # which races with concurrent message creates and with the agent's
+        # locked set_running_update reconciliation. Acquire the project row
+        # lock (matching the codebase's existing idiom) so the append reads a
+        # fresh, committed running_update and serializes against other writers;
+        # without it, a stale read could silently drop a digest line or clobber
+        # the agent's reconciled document. populate_existing on the locked read
+        # refreshes the identity-mapped project loaded by _get_user_project.
+        locked_project = await lock_project_or_429(session, project_id)
+        append_routine_digest(locked_project, event_type, content)
     await session.commit()
     await session.refresh(msg)
-    return {"id": str(msg.id), "status": "created"}
+
+    # Wake the strategist on genuine operator steering. This is the live-chat
+    # surface the admin MessagesPanel composer hits, and it must steer exactly
+    # like the project-scoped CLI endpoint (routers/directions.py). The shared
+    # gate decides whether to arm (non-passive type, not a routine digest event)
+    # so the two paths cannot diverge again. Best-effort: the helper does not
+    # commit (we own the txn) and swallows its own errors, so message creation
+    # never fails on it; the second commit persists the marker independently.
+    from app.strategic_trigger import ARMING_STEERING, maybe_arm_operator_refresh
+
+    # The shared gate returns the *truthful* arming outcome — the actual wake
+    # decision for this message (steering / passive note / routine event), or
+    # ``not_armed`` when a genuine steering message could NOT persist its marker
+    # because the project row was momentarily contended. We surface that string
+    # verbatim and commit only when the marker was really armed, so the operator
+    # is never told their message reached the strategist when it did not.
+    # Additive ``arming`` field — existing ``id``/``status`` are unchanged.
+    arming = await maybe_arm_operator_refresh(
+        session,
+        project_id,
+        MessageType(msg_type),
+        event_type=event_type,
+        message_content=content,
+    )
+    if arming == ARMING_STEERING:
+        await session.commit()
+    return {"id": str(msg.id), "status": "created", "arming": arming}
 
 
 @router.patch("/messages/{message_id}")
@@ -515,8 +566,14 @@ async def resolve_message(
 
     if msg.status == "resolved":
         return {"id": str(msg.id), "status": "already_resolved"}
+    resolution = (payload.resolution or "").strip()
+    if len(resolution) > MESSAGE_CONTENT_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Content exceeds {MESSAGE_CONTENT_MAX} character limit",
+        )
     msg.status = "resolved"
-    msg.resolution = (payload.resolution or "").strip()[:5000] or None
+    msg.resolution = resolution or None
     msg.resolved_at = _utcnow()
     session.add(msg)
     await session.commit()

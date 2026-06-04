@@ -489,7 +489,18 @@ async def _check_evaluating_timeouts(progress_cb=None):
     # the EVALUATING_FAIL backstop. 2h gives operators a reasonable window
     # to approve/deny independent of the configured wall-clock.
     APPROVAL_GATE_FAIL_SECONDS = 2 * 3600
-    TERMINAL = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+    # BLOCKED is treated as terminal-for-now in this EVALUATING-timeout sweep:
+    # (a) a BLOCKED child must NOT be cascade-CANCELLED on a CI-backstop timeout
+    # (that would destroy its durable blocked state — it stays parked exactly as
+    # a FAILED child would have stayed terminal), and (b) a parent whose
+    # remaining children are all BLOCKED must still count as all-children-settled
+    # so the missed-rollup recovery fires instead of pinning EVALUATING forever.
+    TERMINAL = {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.BLOCKED,
+    }
 
     try:
         from app import pause_clock

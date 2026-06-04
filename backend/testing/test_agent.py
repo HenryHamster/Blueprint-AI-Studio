@@ -24,6 +24,7 @@ from app.models import (
     TaskStatus,
 )
 from app.auth import create_agent_token
+from app.schemas import AgentStatusPayload
 
 
 def _resolve_sr_recent_miss_examples_contract_fixture() -> Path:
@@ -1164,12 +1165,19 @@ async def test_agent_claim_preserves_payload_promotion_target_override(
 
 
 @pytest.mark.asyncio
-async def test_agent_status_already_completed_returns_200_idempotent(
-    client: AsyncClient, db_session, mocker
+@pytest.mark.parametrize(
+    "terminal_status",
+    [TaskStatus.COMPLETED, TaskStatus.BLOCKED],
+    ids=["completed", "blocked"],
+)
+async def test_agent_status_terminal_returns_200_idempotent(
+    client: AsyncClient,
+    db_session,
+    mocker,
+    terminal_status: TaskStatus,
 ):
     """
-    Tests that completing a task that is already in a terminal state (COMPLETED)
-    returns 200 rather than 409, demonstrating idempotent behavior for agent retries.
+    Duplicate status posts against terminal tasks return 200 already_terminal.
     """
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
 
@@ -1182,7 +1190,7 @@ async def test_agent_status_already_completed_returns_200_idempotent(
         project_id=project.id,
         payloads=[{"cmd": "run"}],
         vm_instance_id="agent-vm-idempotent",
-        status=TaskStatus.COMPLETED,
+        status=terminal_status,
     )
     db_session.add(task)
     await db_session.commit()
@@ -1201,6 +1209,49 @@ async def test_agent_status_already_completed_returns_200_idempotent(
     data = resp.json()
     assert data["status"] == "already_terminal"
     assert data["task_id"] == str(task.id)
+
+
+@pytest.mark.asyncio
+async def test_agent_status_locked_blocked_task_returns_already_terminal():
+    from fastapi import BackgroundTasks
+    from starlette.requests import Request
+    from app.routers.agent_status import update_agent_status
+    from unittest.mock import MagicMock
+
+    task_id = uuid.uuid4()
+    blocked_task = MagicMock()
+    blocked_task.id = task_id
+    blocked_task.vm_instance_id = "agent-vm-status-locked"
+    blocked_task.status = TaskStatus.BLOCKED
+
+    first_result = MagicMock()
+    first_result.scalars.return_value.first.return_value = None
+    second_result = MagicMock()
+    second_result.scalars.return_value.first.return_value = blocked_task
+
+    session = AsyncMock()
+    session.execute = AsyncMock(side_effect=[first_result, second_result])
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/agent/status",
+            "headers": [],
+        }
+    )
+    payload = AgentStatusPayload(task_id=task_id, status=TaskStatus.COMPLETED)
+    token = {"sub": str(task_id), "vm_instance_id": "agent-vm-status-locked"}
+
+    result = await update_agent_status(
+        request=request,
+        payload=payload,
+        background_tasks=BackgroundTasks(),
+        session=session,
+        token=token,
+    )
+
+    assert result == {"status": "already_terminal", "task_id": str(task_id)}
 
 
 @pytest.mark.asyncio
@@ -1543,8 +1594,13 @@ async def test_agent_token_rejected_on_deny_list_hit_non_idempotent_path(
 )
 @pytest.mark.parametrize(
     "terminal_status",
-    [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED],
-    ids=["completed", "failed", "cancelled"],
+    [
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.BLOCKED,
+    ],
+    ids=["completed", "failed", "cancelled", "blocked"],
 )
 async def test_agent_token_rejected_when_task_terminal_status(
     client: AsyncClient, db_session, endpoint: str, terminal_status: TaskStatus, caplog
@@ -6243,7 +6299,14 @@ def test_agent_ws_invalid_token_closes_with_1008(mocker, caplog):
 
 
 @pytest.mark.asyncio
-async def test_agent_ws_auth_closes_on_terminal_task(mocker, caplog):
+@pytest.mark.parametrize(
+    "terminal_status",
+    [TaskStatus.COMPLETED, TaskStatus.BLOCKED],
+    ids=["completed", "blocked"],
+)
+async def test_agent_ws_auth_closes_on_terminal_task(
+    mocker, caplog, terminal_status: TaskStatus
+):
     import app.routers.projects as projects_module
     from unittest.mock import AsyncMock, MagicMock
 
@@ -6257,7 +6320,7 @@ async def test_agent_ws_auth_closes_on_terminal_task(mocker, caplog):
     mock_task.id = task_id
     mock_task.project_id = project_id
     mock_task.vm_instance_id = "agent-vm-terminal-ws"
-    mock_task.status = TaskStatus.COMPLETED
+    mock_task.status = terminal_status
 
     mock_execute_result = MagicMock()
     mock_execute_result.scalars.return_value.first.return_value = mock_task
@@ -6473,8 +6536,13 @@ async def test_agent_ws_receive_loop_rejects_terminated_task(mocker, caplog):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_status",
+    [TaskStatus.COMPLETED, TaskStatus.BLOCKED],
+    ids=["completed", "blocked"],
+)
 async def test_agent_ws_receive_loop_closes_on_periodic_recheck_terminal(
-    mocker, caplog
+    mocker, caplog, terminal_status: TaskStatus
 ):
     import app.routers.projects as projects_module
     from unittest.mock import AsyncMock, MagicMock
@@ -6495,7 +6563,7 @@ async def test_agent_ws_receive_loop_closes_on_periodic_recheck_terminal(
     fresh_task.id = task_id
     fresh_task.project_id = project_id
     fresh_task.vm_instance_id = "agent-vm-periodic"
-    fresh_task.status = TaskStatus.COMPLETED
+    fresh_task.status = terminal_status
 
     mock_execute_result = MagicMock()
     mock_execute_result.scalars.return_value.first.return_value = mock_task
@@ -6615,7 +6683,14 @@ async def test_agent_ws_closes_on_termination_without_messages(mocker):
 
 
 @pytest.mark.asyncio
-async def test_agent_ws_closes_on_db_fallback_when_denylist_misses(mocker):
+@pytest.mark.parametrize(
+    "terminal_status",
+    [TaskStatus.COMPLETED, TaskStatus.BLOCKED],
+    ids=["completed", "blocked"],
+)
+async def test_agent_ws_closes_on_db_fallback_when_denylist_misses(
+    mocker, terminal_status: TaskStatus
+):
     """
     Regression: WS must close ≤5s after task termination even when the
     in-memory deny-list is empty (cache miss after restart, listener gap, or
@@ -6647,7 +6722,7 @@ async def test_agent_ws_closes_on_db_fallback_when_denylist_misses(mocker):
     terminal_task.id = task_id
     terminal_task.project_id = project_id
     terminal_task.vm_instance_id = None
-    terminal_task.status = TaskStatus.COMPLETED
+    terminal_task.status = terminal_status
 
     auth_execute_result = MagicMock()
     auth_execute_result.scalars.return_value.first.return_value = initial_task
@@ -6847,6 +6922,80 @@ async def test_reassigned_lands_cancelled_no_retry_no_alert(
     )
     assert task.status != TaskStatus.QUEUED, "REASSIGNED must not retry"
     assert (task.context or {}).get("failure_category") == "REASSIGNED"
+    alert_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_blocker_lands_blocked_no_retry_no_alert(
+    client: AsyncClient, db_session, mocker
+):
+    """A BLOCKER: outcome (./blocked) must move the task into the first-class
+    BLOCKED state — NOT retry (no attempt_count burn), NOT FAILED, NOT fire a
+    failure alert — and persist durable blocker metadata on the task itself.
+
+    Regression for the precondition-blocker retry-burn: BLOCKED_PRECONDITION was
+    in INFRA_CLASSES but a standalone task still ran through the FAILED->QUEUED
+    retry branch, re-dispatching a VM up to max_retries against the same wall.
+    """
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    project = Project(name="Blocked Test", user_id="test-user-blocked")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build x"}],
+        vm_instance_id="agent-vm-blocked",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-blocked")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "failure_category": "BLOCKED_PRECONDITION",
+        "logs": "BLOCKER: upstream rollup PR #99 not yet merged to main",
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+    assert resp.json().get("status") == "blocked"
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.BLOCKED, (
+        f"BLOCKER: must land BLOCKED, not {task.status} — it is a precondition "
+        f"block, not a code failure"
+    )
+    assert task.status != TaskStatus.QUEUED, "BLOCKED must not retry"
+    # Retry budget is NOT burned.
+    assert task.attempt_count == 0
+    # BLOCKED_PRECONDITION classification preserved for historical consumers.
+    assert (task.context or {}).get("failure_category") == "BLOCKED_PRECONDITION"
+    # Durable blocker metadata persisted on the task itself, not only the status
+    # message: what it waits on, a human-readable reason, and recheck timing.
+    blocker = (task.context or {}).get("blocker") or {}
+    assert blocker.get("source") == "agent"
+    assert blocker.get("failure_class") == "BLOCKED_PRECONDITION"
+    assert "BLOCKER:" in (blocker.get("reason") or "")
+    assert blocker.get("recheck_at")
+    assert task.blocker_kind == "upstream_dependency"
+    assert "BLOCKER:" in (task.blocked_reason or "")
+    assert task.blocked_at is not None
+    assert task.recheck_after is not None and task.recheck_after > task.blocked_at
+    # No failure alert for a non-failure outcome.
     alert_mock.assert_not_called()
 
 
@@ -7110,6 +7259,87 @@ async def test_post_commit_disconnect_inline_returns_pending_not_500(
     # The write-ahead marker must be set so the sweep retries the deferred effects.
     await db_session.refresh(task)
     assert task.post_commit_pending is True
+
+
+@pytest.mark.asyncio
+async def test_agent_status_post_commit_resolves_engine_from_none_bind_session(
+    client: AsyncClient, db_session, mocker
+):
+    import conftest as _testing_conftest
+    from sqlalchemy.ext.asyncio import AsyncSession as _AS, async_sessionmaker
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    async def _process_post_commit(task_id, _payload, _session_factory):
+        async with _session_factory() as session:
+            assert await session.get(Task, task_id), (
+                "resolved post-commit session factory must load the task even "
+                "when the request session exposes bind=None"
+            )
+        return {"status": "accepted", "task_id": str(task_id)}
+
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=AsyncMock,
+        side_effect=_process_post_commit,
+    )
+
+    project = Project(name="None Bind Post Commit", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    factory = async_sessionmaker(
+        _testing_conftest.engine, class_=_AS, expire_on_commit=False
+    )
+
+    class _NoneBindSession:
+        bind = None
+
+        def __init__(self, session):
+            self._session = session
+
+        def get_bind(self, *args, **kwargs):
+            return _testing_conftest.engine
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    async def _override_get_session():
+        async with factory() as session:
+            yield _NoneBindSession(session)
+
+    app.dependency_overrides[get_session] = _override_get_session
+    try:
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "build"}],
+            vm_instance_id="agent-vm-inline",
+            status=TaskStatus.IN_PROGRESS,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        token = create_agent_token(str(task.id), task.vm_instance_id)
+        headers = {"x-agent-token": token}
+        payload = {"task_id": str(task.id), "status": "COMPLETED"}
+        resp = await client.post("/api/agent/status", json=payload, headers=headers)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "accepted"
+        await db_session.refresh(task)
+        assert task.post_commit_pending is False
+
+        task.post_commit_pending = True
+        db_session.add(task)
+        await db_session.commit()
+        resp = await client.post("/api/agent/status", json=payload, headers=headers)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "accepted"
+        await db_session.refresh(task)
+        assert task.post_commit_pending is False
+    finally:
+        app.dependency_overrides.pop(get_session, None)
 
 
 @pytest.mark.asyncio
@@ -14162,6 +14392,12 @@ async def test_hotfix_backmerge_runs_for_hotfix_merge_to_main(db_session, mocker
         "app.github.merge_pull_request",
         new=AsyncMock(return_value={"merged": True}),
     )
+    # The combined-Alembic-chain back-merge guard (step 3b) lists the PR's files
+    # before merging. This back-merge touches no migrations, so the guard returns
+    # "ok" and the merge proceeds; with no files the guard short-circuits before
+    # any diff/ref fetch. Unmocked it would hit the network, defer the merge, and
+    # the status would be "deferred" instead of "merged".
+    mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=[]))
     mocker.patch("app.hotfix_backmerge.broadcast_to_project", new_callable=AsyncMock)
 
     result = await hotfix_backmerge.open_backmerge_pr(

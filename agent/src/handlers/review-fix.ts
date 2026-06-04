@@ -394,7 +394,11 @@ export async function handleReview(
   // Read project_context for active/sibling task awareness
   const reviewProjectCtx = task.project_context as Record<string, unknown> | undefined;
   const reviewDirectionId = (taskContext?.direction_id as string | undefined) || '';
-  const reviewProjectCtxSection = reviewProjectCtx ? formatProjectContext(reviewProjectCtx, 'review', taskScope, reviewDirectionId) + '\n\n' : '';
+  const reviewRelatedFiles =
+    (payload.related_files as string[] | undefined) ||
+    (taskContext?.related_files as string[] | undefined) ||
+    [];
+  const reviewProjectCtxSection = reviewProjectCtx ? formatProjectContext(reviewProjectCtx, 'review', taskScope, reviewDirectionId, reviewRelatedFiles.length) + '\n\n' : '';
 
   // Build prior review history section (for iterations > 1)
   const annotatedReviewHistory = annotateResolvedIssues(reviewHistory);

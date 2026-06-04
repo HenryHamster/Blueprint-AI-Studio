@@ -40,6 +40,7 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     autonomous_enabled: true,
     directions: [{ id: 'd-1', text: 'Ship the retry fix', priority: 'high', status: 'active', added_at: '2026-04-24T00:00:00Z' }],
     created_at: '2026-04-23T10:00:00Z',
+    merge_verification_verdict: { state: 'ci_checks', test_commands: [] },
     ...overrides,
   };
 }
@@ -127,6 +128,24 @@ describe('ProjectDashboard', () => {
     expect(onNewProject).toHaveBeenCalled();
   });
 
+  it('renders a blocked task count distinct from queued', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    render(
+      <ProjectDashboard
+        projects={[makeProject()]}
+        tasks={[
+          makeTask('proj-1', 'QUEUED'),
+          makeTask('proj-1', 'BLOCKED'),
+          makeTask('proj-1', 'BLOCKED'),
+        ]}
+        selectedProjectId="proj-1"
+        onSelectProject={vi.fn()}
+      />,
+    );
+    expect(screen.getByText('1 queued')).toBeInTheDocument();
+    expect(screen.getByText('2 blocked')).toBeInTheDocument();
+  });
+
   it('renders a per-project status badge', () => {
     localStorage.setItem('projectDashboardCollapsed', 'false');
     render(
@@ -139,6 +158,101 @@ describe('ProjectDashboard', () => {
     );
     expect(screen.getByText('Deploying')).toBeInTheDocument();
     expect(screen.getByText('Failed')).toBeInTheDocument();
+  });
+
+  it('renders the merge-gate posture badge for each verdict state', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    render(
+      <ProjectDashboard
+        projects={[
+          makeProject({
+            id: 'proj-ci',
+            name: 'CI Project',
+            merge_verification_verdict: { state: 'ci_checks', test_commands: [] },
+          }),
+          makeProject({
+            id: 'proj-tests',
+            name: 'Tests Project',
+            merge_verification_verdict: {
+              state: 'tests_gated',
+              test_commands: [{ path: 'backend/', test_cmd: 'pytest' }],
+            },
+          }),
+          makeProject({
+            id: 'proj-unverified',
+            name: 'Unverified Project',
+            merge_verification_verdict: { state: 'unverified', test_commands: [] },
+          }),
+          makeProject({
+            id: 'proj-stall',
+            name: 'Stall Risk Project',
+            build_config: { has_ci: false, requires_ci_checks: true },
+            merge_verification_verdict: { state: 'ci_checks', test_commands: [] },
+          }),
+        ]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByText('CI gated')).toHaveLength(1);
+    expect(screen.getByText('Tests gated')).toBeInTheDocument();
+    expect(screen.getByText('UNVERIFIED')).toBeInTheDocument();
+    expect(screen.getByText('Stall risk')).toBeInTheDocument();
+  });
+
+  it('keeps the tests-gated badge green when no runtime block is present', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    render(
+      <ProjectDashboard
+        projects={[makeProject({
+          id: 'proj-tests',
+          name: 'Tests Project',
+          merge_verification_verdict: {
+            state: 'tests_gated',
+            test_commands: [{ path: 'backend/', test_cmd: 'pytest' }],
+          },
+        })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+      />,
+    );
+
+    const badge = screen.getByText('Tests gated');
+    expect(badge).toHaveAttribute('data-runtime-state', 'absent');
+    expect(badge).toHaveAttribute('title', expect.stringContaining("Blueprint will run the project's detected test command(s) before merging PRs."));
+  });
+
+  it('shows a warning badge when the live gate last fell back to UNVERIFIED', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    render(
+      <ProjectDashboard
+        projects={[makeProject({
+          id: 'proj-tests',
+          name: 'Tests Project',
+          merge_verification_verdict: {
+            state: 'tests_gated',
+            test_commands: [{ path: 'backend/', test_cmd: 'pytest' }],
+          },
+          merge_gate_runtime: {
+            last_run_at: '2026-04-24T11:00:00Z',
+            executed_real_tests: true,
+            last_unverified_at: '2026-04-24T11:30:00Z',
+            last_unverified_reason: 'no_test_command_detected',
+          },
+        })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+      />,
+    );
+
+    const badge = screen.getByText('Tests gated?');
+    expect(badge).toHaveAttribute('data-runtime-state', 'unverified-fallback');
+    expect(badge).toHaveAttribute('title', expect.stringContaining('UNVERIFIED'));
+    expect(badge).toHaveAttribute('title', expect.stringContaining('no test command detected'));
   });
 
   it('counts paused projects from the paused flag in the summary strip', () => {

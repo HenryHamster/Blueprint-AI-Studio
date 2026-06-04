@@ -57,13 +57,14 @@ const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
   { id: 'IN_PROGRESS', label: 'In Progress', includes: ['IN_PROGRESS'] },
   { id: 'EVALUATING', label: 'Evaluating', includes: ['EVALUATING'] },
+  { id: 'BLOCKED', label: 'Blocked', includes: ['BLOCKED'] },
   { id: 'FAILED', label: 'Failed', includes: ['FAILED'] },
   { id: 'CANCELLED', label: 'Cancelled', includes: ['CANCELLED'] },
   { id: 'COMPLETED', label: 'Completed', includes: ['COMPLETED'] },
 ];
 
 const SORT_KEY = 'blueprint-admin:kanban-sort';
-const CANCELLABLE_STATUSES = new Set(['QUEUED', 'IN_PROGRESS', 'PROVISIONING', 'EVALUATING']);
+const CANCELLABLE_STATUSES = new Set(['QUEUED', 'IN_PROGRESS', 'PROVISIONING', 'EVALUATING', 'BLOCKED']);
 const TERMINAL_STATUSES = new Set(['COMPLETED', 'CANCELLED', 'FAILED']);
 
 
@@ -443,7 +444,9 @@ export default function App() {
       const searchMatch = !query || t.id.toLowerCase().includes(query) || (t.title?.toLowerCase().includes(query)) || (t.description?.toLowerCase().includes(query)) || (t.latest_status_message?.toLowerCase().includes(query));
       const projectMatch = s.selectedProjectId === null || t.project_id === s.selectedProjectId;
       const dateMatch = cutoff === null || parseTimestamp(t.created_at).getTime() >= cutoff;
-      const blockedMatch = !s.blockedFilter || (t.status === 'QUEUED' && t.depends_on != null && t.depends_on.length > 0);
+      // Prefer the first-class BLOCKED status; fall back to the legacy
+      // QUEUED+depends_on inference for older payloads predating the status.
+      const blockedMatch = !s.blockedFilter || t.status === 'BLOCKED' || (t.status === 'QUEUED' && t.depends_on != null && t.depends_on.length > 0);
       const approvalMatch = !s.requiresApproval || t.requires_approval;
       const failureClassMatch = s.failureClassFilter.length === 0 || (t.status === 'FAILED' && t.failure_class != null && s.failureClassFilter.includes(t.failure_class));
       const stuckMatch = !s.stuckFilter || stuckTaskIds.has(t.id);
@@ -864,6 +867,7 @@ export default function App() {
           onMessageCountChange={handleMessageCountChange}
           onOpenTask={handleViewTask}
           notifyOnHighSignalMessage={s.notifyOnHighSignalMessage}
+          strategistActive={s.strategistActive}
         />
       ) : s.showArchive ? (
         <ArchiveView
@@ -1222,6 +1226,8 @@ export default function App() {
           addToast={s.addToast}
           selectedProjectId={s.selectedProjectId}
           projects={s.projects}
+          fetchDirectionsRef={s.fetchDirectionsRef}
+          strategistActive={s.strategistActive}
           onViewFindings={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
           onNavigateToTask={(taskId) => {
             const target = s.tasks.find(t => t.id === taskId);

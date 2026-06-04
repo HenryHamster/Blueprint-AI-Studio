@@ -23,14 +23,24 @@ from app.models import (
     Project,
     TaskHistory,
     TaskStatus,
+    MessageType,
     ProjectMessage,
     SystemMaturity,
 )
 from app.payload_schemas import pack_under_budget, validate_internal_payload
+from app.problem_model import REJECTED_AGENT_EDITS_KEY as PM_REJECTED_EDITS_KEY
+from app.running_update_merge import RUNNING_UPDATE_REJECTED_KIND
 from app.source_ref_validation import (
     classify_existing_paths,
     ground_design_doc,
     resolve_branch_verification_context,
+)
+from app.strategic_trigger import (
+    ARMING_STEERING,
+    ORIGIN_OPERATOR,
+    classify_operator_arming,
+    strategic_refresh_excerpt,
+    strategic_refresh_origin,
 )
 import app.shared_state as _shared_state
 from app.shared_state import (
@@ -39,6 +49,7 @@ from app.shared_state import (
     runtime_config as _runtime_config,
 )
 from app.time_utils import _utcnow
+from app.vision_merge import REJECTED_EDITS_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -140,14 +151,21 @@ def _agent_view_problem_model(pm: dict | None) -> dict:
         return {}
     trimmed = dict(pm)
     trimmed.pop("archived_gaps", None)
+    # The rejected-agent-edits ledger is surfaced to the agent through the
+    # dedicated, consolidated ``operator_overrides`` payload key (see
+    # :func:`_build_operator_overrides_summary`) — strip it here so the raw,
+    # unbounded ledger is not double-shipped inside problem_model.
+    trimmed.pop("rejected_agent_edits", None)
     gaps = trimmed.get("gaps") or []
     if gaps:
         new_gaps = []
+        gap_memory_trimmed: list[dict] = []
         for g in gaps:
             if not isinstance(g, dict):
                 new_gaps.append(g)
                 continue
             g2 = dict(g)
+            shortened: dict[str, dict] = {}
             for key, keep in (
                 ("history", _GAP_HISTORY_KEEP),
                 ("past_moves", _GAP_PAST_MOVES_KEEP),
@@ -155,10 +173,117 @@ def _agent_view_problem_model(pm: dict | None) -> dict:
             ):
                 arr = g2.get(key)
                 if isinstance(arr, list) and len(arr) > keep:
+                    shortened[key] = {"shown": keep, "total": len(arr)}
                     g2[key] = arr[-keep:]
+            if shortened:
+                gap_memory_trimmed.append(
+                    {"gap_id": g2.get("id"), "fields": shortened}
+                )
             new_gaps.append(g2)
         trimmed["gaps"] = new_gaps
+        # Surface the pre-trim so the strategic agent can tell a gap's
+        # append-only memory was shortened to a recent window for payload
+        # size. This trim runs BEFORE the byte-budget packer, so it would
+        # otherwise never appear in the payload's packer metadata and the
+        # agent would mistake the shortened view for the gap's full arc.
+        # The marker rides in the agent-facing problem_model (the durable
+        # project.problem_model is never mutated — this operates on a copy)
+        # and steers the agent to ./fetch full gap history before deciding
+        # whether to push, refine, or retire a long-lived gap.
+        if gap_memory_trimmed:
+            trimmed["_gap_memory_trimmed"] = gap_memory_trimmed
     return trimmed
+
+
+# Maximum operator-override entries surfaced to the next strategic cycle, and
+# the per-value character cap. The override summary closes the operator-wins
+# reconciliation loop: the reconciliation writers record each overridden agent
+# value into rolling, capped ledgers (vision ``_rejected_agent_edits`` and
+# problem_model ``rejected_agent_edits``) "so next cycle's agent can see what
+# was overridden and reconcile" — this helper reads those ledgers (read-only;
+# never clears or mutates them) into one bounded list. Kept small so it can
+# never bloat the prompt; the payload packer drops it whole under budget.
+_OPERATOR_OVERRIDES_MAX = 8
+_OVERRIDE_VALUE_MAXLEN = 240
+
+
+def _truncate_override_value(value: Any) -> Any:
+    """Char-bound a single ledger value so the override summary stays compact.
+
+    Strings are truncated with an ellipsis marker; non-strings are coerced to
+    their ``repr`` and truncated the same way so a stray dict/list cannot blow
+    the per-entry budget.
+    """
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else repr(value)
+    if len(text) > _OVERRIDE_VALUE_MAXLEN:
+        return text[:_OVERRIDE_VALUE_MAXLEN] + "…"
+    return text
+
+
+def _build_operator_overrides_summary(project: Project) -> list[dict]:
+    """Consolidate the operator-wins rejected-edit ledgers into one bounded list.
+
+    Reads both reconciliation ledgers — ``project.vision[_rejected_agent_edits]``
+    (vision scalar conflicts + ``running_update_superseded`` entries) and
+    ``project.problem_model[rejected_agent_edits]`` (operator-owned intent /
+    context / constraints conflicts) — and normalizes each entry to a compact,
+    char-bounded shape::
+
+        {document, field, kind, agent_value, operator_value, at}
+
+    ``document`` is ``running_update`` | ``vision`` | ``intent`` so the agent
+    can tell which document it overrode. Running-update entries have no operator
+    value (the operator's winning value is the live running_update body itself),
+    so ``operator_value`` is ``None`` there. Sorted newest-first and capped at
+    :data:`_OPERATOR_OVERRIDES_MAX`. Read-only: neither ledger is cleared or
+    mutated. Returns ``[]`` when both ledgers are empty.
+    """
+    entries: list[dict] = []
+
+    vision = project.vision if isinstance(project.vision, dict) else {}
+    for e in vision.get(REJECTED_EDITS_KEY) or []:
+        if not isinstance(e, dict):
+            continue
+        field = e.get("field") or ""
+        if field == "running_update":
+            document = "running_update"
+        else:
+            document = "vision"
+        entries.append(
+            {
+                "document": document,
+                "field": field,
+                "kind": e.get("kind"),
+                "agent_value": _truncate_override_value(e.get("agent_value")),
+                # Vision conflicts log the operator's winning value as
+                # ``user_value``; running_update entries carry none.
+                "operator_value": _truncate_override_value(e.get("user_value")),
+                "at": e.get("at"),
+            }
+        )
+
+    pm = project.problem_model if isinstance(project.problem_model, dict) else {}
+    for e in pm.get(PM_REJECTED_EDITS_KEY) or []:
+        if not isinstance(e, dict):
+            continue
+        field = e.get("field") or ""
+        document = "intent" if field.startswith("intent") else "problem_model"
+        entries.append(
+            {
+                "document": document,
+                "field": field,
+                "kind": e.get("kind"),
+                "agent_value": _truncate_override_value(e.get("agent_value")),
+                "operator_value": _truncate_override_value(e.get("operator_value")),
+                "at": e.get("at"),
+            }
+        )
+
+    # Newest-first by ISO timestamp; missing/empty ``at`` sorts last.
+    entries.sort(key=lambda x: x.get("at") or "", reverse=True)
+    return entries[:_OPERATOR_OVERRIDES_MAX]
 
 
 async def _verify_capability_backing_paths(
@@ -530,6 +655,83 @@ def _summarize_outcome_evaluation(oe: dict) -> dict:
     return trimmed
 
 
+_OPERATOR_STEERING_QUOTE_MAX_CHARS = 600
+_OPERATOR_STEERING_QUOTE_COUNT = 2
+
+
+def _build_operator_steering_directive(
+    conversation_thread: list, *, fallback_excerpt: str | None = None
+) -> str | None:
+    """High-priority steering directive for an operator-woken strategic cycle.
+
+    When a strategic cycle is spawned *because* an operator-origin
+    strategic-refresh marker was armed, the operator's steering message would
+    otherwise appear only as one undifferentiated entry in the (capped)
+    ``conversation_thread`` snapshot. This selects the most recent operator
+    steering message(s) from that same thread — ``from == 'user'``, excluding
+    passive ``NOTE``s and system/routine digest events via the shared
+    ``classify_operator_arming`` gate so "steering" means exactly what arming
+    meant — and frames them as the reason this cycle exists, so the strategist
+    treats them as a priority directive rather than one of N messages.
+
+    ``fallback_excerpt`` is the operator message text persisted on the refresh
+    marker at arm time. When the live thread snapshot carries no qualifying
+    operator steering message (e.g. it aged out of the recent-messages window
+    before the deferred cycle reached its review phase), the directive is
+    synthesized from this durable excerpt instead — so an operator wake never
+    silently loses its steering. Returns ``None`` only when neither the thread
+    nor the fallback yields any steering text, in which case the caller appends
+    no steering framing.
+    """
+    steering_msgs = []
+    for m in conversation_thread:
+        if m.get("from") != "user":
+            continue
+        try:
+            mtype = m.get("type")
+            if not isinstance(mtype, MessageType):
+                mtype = MessageType(mtype)
+            event_type = (m.get("context") or {}).get("event_type")
+            if (
+                classify_operator_arming(mtype, event_type=event_type)
+                != ARMING_STEERING
+            ):
+                continue
+        except Exception:
+            # Unknown/malformed type — treat as steering rather than silently
+            # dropping a potential directive.
+            pass
+        steering_msgs.append(m)
+    # conversation_thread is chronological (oldest→newest); the steering
+    # message(s) that woke this cycle are the most recent, so quote the tail.
+    quoted = []
+    for m in steering_msgs[-_OPERATOR_STEERING_QUOTE_COUNT:]:
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        if len(content) > _OPERATOR_STEERING_QUOTE_MAX_CHARS:
+            content = content[:_OPERATOR_STEERING_QUOTE_MAX_CHARS] + "…"
+        quoted.append(f"  > {content}")
+    # Thread-aging fallback: the live snapshot yielded no operator message, but
+    # the excerpt was durably persisted on the refresh marker at arm time. Build
+    # the directive from it using the same truncation/framing as a found message.
+    if not quoted and fallback_excerpt:
+        content = fallback_excerpt.strip()
+        if content:
+            if len(content) > _OPERATOR_STEERING_QUOTE_MAX_CHARS:
+                content = content[:_OPERATOR_STEERING_QUOTE_MAX_CHARS] + "…"
+            quoted.append(f"  > {content}")
+    if not quoted:
+        return None
+    return (
+        "OPERATOR STEERING — THIS CYCLE WAS TRIGGERED BY OPERATOR STEERING.\n"
+        "An operator sent a live-chat steering message that woke this strategic "
+        "cycle; acting on that steering is the reason this cycle exists. Treat "
+        "the operator message(s) below as a priority directive, NOT as one of "
+        "the undifferentiated conversation_thread entries:\n" + "\n".join(quoted)
+    )
+
+
 def _summarize_conversation_thread(thread: list) -> list:
     """Keep the most recent N conversation messages."""
     if (
@@ -607,6 +809,13 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "running_update": {"priority": "high"},
     "running_update_acknowledged_at": {"priority": "high"},
     "user_last_active_at": {"priority": "high"},
+    # Bounded summary of the operator's recent reconciliation overrides (what the
+    # agent proposed vs. what the operator kept, per document). Medium priority
+    # with no summarize_fn: it is already capped + char-bounded at build time, so
+    # the packer drops it whole under budget rather than trimming. Closes the
+    # operator-wins reconciliation loop so the agent reconciles instead of
+    # re-proposing overridden values.
+    "operator_overrides": {"priority": "medium"},
     # Core working set (the big stuff) — summarize when over budget
     "directions_summary": {"priority": "high", "summarize": _summarize_directions},
     "problem_model": {"priority": "high", "summarize": _agent_view_problem_model},
@@ -626,6 +835,7 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "anomaly_summary": {"priority": "low"},
     "playbook_summary": {"priority": "low"},
     "rejected_proposals": {"priority": "low"},
+    "running_update_superseded": {"priority": "low"},
     "prediction_calibration_factor": {"priority": "low"},
     "prediction_calibration_note": {"priority": "low"},
     # Mode-aware additions: only present when non-empty
@@ -1664,6 +1874,22 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     # vision at cycle start so the 3-way merge in strategic_completion can
     # compare user edits against the same baseline the agent was given.
     cycle_id = strategic_cycle.new_cycle_id()
+    # Capture the operator-origin steering signal at spawn time: the pending
+    # refresh marker is still armed here (the autonomous loop's spawn-record
+    # consumes it AFTER this returns), but it will be gone by the time Phase 2
+    # (_spawn_strategic_review) chains off this task's completion. Persist the
+    # flag on the task context so the Phase 2 chain can re-surface the operator
+    # steering directive rather than silently dropping it on architecture cycles.
+    operator_steered = strategic_refresh_origin(project.vision) == ORIGIN_OPERATOR
+    task_context: dict = {"strategic_cycle_id": cycle_id}
+    if operator_steered:
+        task_context["operator_steered"] = True
+        # Persist the operator steering excerpt alongside the flag: the marker is
+        # consumed when this Phase 1 spawn is recorded, so Phase 2 must carry the
+        # text forward (the live thread snapshot may age it out before then).
+        steering_excerpt = strategic_refresh_excerpt(project.vision)
+        if steering_excerpt:
+            task_context["steering_excerpt"] = steering_excerpt
     new_task = Task(
         project_id=project.id,
         title=f"Architecture review: {project.name}",
@@ -1672,7 +1898,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
-        context={"strategic_cycle_id": cycle_id},
+        context=task_context,
         strategic_cycle_id=cycle_id,
     )
     session.add(new_task)
@@ -1690,8 +1916,13 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         phase1_task_id=new_task.id,
         baseline_vision=project.vision or {},
         baseline_problem_model=project.problem_model or {},
+        baseline_running_update=project.running_update,
     )
     await session.commit()
+    # Post-commit: signal the admin UI that a strategic cycle (Phase 1) started.
+    from app.strategic_events import emit_strategic_cycle_started
+
+    await emit_strategic_cycle_started(project.id, new_task.id, 1)
     logger.info(
         f"[STRATEGIC] Spawned design_doc_update task {new_task.id} for project {project.id} (cycle {cycle_id})"
     )
@@ -1699,13 +1930,34 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
 
 
 async def _spawn_strategic_review(
-    project: Project, session: AsyncSession, cycle_id: str | None = None
+    project: Project,
+    session: AsyncSession,
+    cycle_id: str | None = None,
+    operator_steered: bool = False,
+    steering_excerpt: str | None = None,
 ) -> bool:
     """Spawn Phase 2 of the strategic cycle: vision + direction review.
 
     Called by _handle_design_doc_completion after the design doc is updated.
     Uses type 'strategic_review' so it doesn't block tactical research.
     Returns True if a task was created, False if skipped.
+
+    ``operator_steered`` carries the operator-origin signal forward when this
+    spawn is the Phase 2 tail of an architecture cycle. On that path the
+    pending refresh marker has already been consumed by the autonomous loop's
+    spawn-record (it cleared once for the Phase 1 design_doc spawn), so
+    ``strategic_refresh_origin(project.vision)`` reads ``None`` here and the
+    steering directive would otherwise be dropped (~1/3 of operator wakes land
+    on an architecture cycle). The caller threads the flag through the
+    design_doc task context so the directive still reaches the strategist.
+
+    ``steering_excerpt`` is the operator's message text, threaded forward on the
+    architecture-cycle Phase 2 path (where the marker — and its persisted
+    excerpt — was already consumed at Phase 1 spawn). On the strategy-only path
+    it is ``None`` and the excerpt is read directly from the still-armed marker.
+    Either way it feeds ``_build_operator_steering_directive`` as the durable
+    fallback so the directive survives the operator message aging out of the
+    volatile conversation-thread snapshot.
     """
     from app.task_lifecycle import _has_active_strategic_task
 
@@ -1908,6 +2160,32 @@ async def _spawn_strategic_review(
     ]
     rejected_proposals.sort(key=lambda r: r.get("rejected_at") or "", reverse=True)
     rejected_proposals = rejected_proposals[:10]
+
+    # running_update operator-override signal (last 30 days). When the
+    # operator-wins reconciliation preserved an operator mid-cycle edit over the
+    # agent's running_update rewrite, ``apply_reconciled_running_update`` records a
+    # ``running_update_superseded`` entry in the vision rejected-edits ledger.
+    # Surface a small derived signal so next cycle's thinker treats the document
+    # as operator-authoritative rather than a blank slate to rewrite. Derived
+    # server-side (count + most-recent ``at``) so it survives even if the full
+    # vision blob is summarized away under the payload byte budget.
+    _superseded_entries = [
+        e
+        for e in ((project.vision or {}).get(REJECTED_EDITS_KEY) or [])
+        if isinstance(e, dict)
+        and e.get("kind") == RUNNING_UPDATE_REJECTED_KIND
+        and (e.get("at") or "") >= cutoff_iso
+    ]
+    running_update_superseded = (
+        {
+            "count": len(_superseded_entries),
+            "most_recent_at": max(
+                (e.get("at") or "") for e in _superseded_entries
+            ),
+        }
+        if _superseded_entries
+        else None
+    )
 
     # Fetch unified conversation thread — recent messages chronologically,
     # regardless of status.  Gives the strategic agent a coherent back-and-forth
@@ -2713,6 +2991,35 @@ async def _spawn_strategic_review(
             if prompt_suffix
             else _parallelism_hint
         )
+    # If this cycle was woken by operator steering, lead the prompt_suffix with
+    # a high-priority steering directive so the operator's message reaches and
+    # steers the strategist instead of being diluted into conversation_thread.
+    # Two ways an operator wake reaches here:
+    #   - Strategy-only cycle: the operator-origin pending refresh marker is
+    #     still armed (read here BEFORE autonomous_research.clear_strategic_refresh
+    #     consumes it on the loop's spawn-record path).
+    #   - Architecture cycle Phase 2: the marker was already consumed when the
+    #     Phase 1 design_doc spawn was recorded, so it reads None now —
+    #     ``operator_steered`` is threaded in from the design_doc task context
+    #     to keep the directive alive across the Phase 1 → Phase 2 chain.
+    # Read-only on the marker; scheduled/qualification cycles never reach this.
+    if operator_steered or strategic_refresh_origin(project.vision) == ORIGIN_OPERATOR:
+        # Durable fallback excerpt: the threaded Phase 2 value (architecture
+        # cycle, marker already consumed) takes precedence; otherwise read it
+        # from the still-armed marker (strategy-only cycle). This keeps the
+        # directive alive when the operator message has aged out of the thread.
+        _fallback_excerpt = steering_excerpt or strategic_refresh_excerpt(
+            project.vision
+        )
+        _steering_directive = _build_operator_steering_directive(
+            conversation_thread, fallback_excerpt=_fallback_excerpt
+        )
+        if _steering_directive:
+            prompt_suffix = (
+                f"{_steering_directive}\n{prompt_suffix}"
+                if prompt_suffix
+                else _steering_directive
+            )
     payload: dict = pack_under_budget(
         {
             "type": "strategic_review",
@@ -2762,7 +3069,17 @@ async def _spawn_strategic_review(
             "open_messages": open_msgs,
             "conversation_thread": conversation_thread,
             **(
+                {"operator_overrides": _operator_overrides}
+                if (_operator_overrides := _build_operator_overrides_summary(project))
+                else {}
+            ),
+            **(
                 {"rejected_proposals": rejected_proposals} if rejected_proposals else {}
+            ),
+            **(
+                {"running_update_superseded": running_update_superseded}
+                if running_update_superseded
+                else {}
             ),
             **({"prompt_suffix": prompt_suffix} if prompt_suffix else {}),
             # Mode-aware: include only when non-empty so cold-start projects
@@ -2835,6 +3152,10 @@ async def _spawn_strategic_review(
             phase2_task_id=new_task.id,
         )
     await session.commit()
+    # Post-commit: signal the admin UI that a strategic cycle (Phase 2) started.
+    from app.strategic_events import emit_strategic_cycle_started
+
+    await emit_strategic_cycle_started(project.id, new_task.id, 2)
     logger.info(
         f"[STRATEGIC] Spawned strategic_review task {new_task.id} for project {project.id}"
     )

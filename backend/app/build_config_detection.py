@@ -13,9 +13,24 @@ import cycle.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_dir_path(path: Any) -> str:
+    """Normalize a directory path for matching across config sources.
+
+    Recovered directories carry repo-root-relative paths (``"."``, ``"services/api"``)
+    that must match the stored ``build_config.directories[*].path`` regardless of a
+    leading ``"./"`` or trailing slash. An empty/whitespace path collapses to ``"."``
+    (the repo root), matching the seeding convention.
+    """
+    s = str(path or "").strip()
+    if s.startswith("./"):
+        s = s[2:]
+    s = s.rstrip("/")
+    return s or "."
 
 
 def apply_operator_build_config_overrides(
@@ -29,9 +44,10 @@ def apply_operator_build_config_overrides(
     - ``git_user_email`` / ``git_user_name`` — preserved only when truthy.
     - ``env_vars``, reviewer/parallelism toggles, branch namespace/prefixes,
       ``pr_title_prefix``, staging/stale branch prefix lists,
-      ``protected_branches`` and ``enable_self_improvement`` — preserved
-      whenever the key is present in ``existing`` (including empty-list/falsey
-      values), so deliberate operator customization survives re-detection.
+      ``protected_branches``, ``enable_self_improvement`` and
+      ``requires_ci_checks`` — preserved whenever the key is present in
+      ``existing`` (including empty-list/falsey values), so deliberate operator
+      customization survives re-detection.
     """
     existing = existing or {}
 
@@ -64,6 +80,11 @@ def apply_operator_build_config_overrides(
         detected["protected_branches"] = existing["protected_branches"]
     if "enable_self_improvement" in existing:
         detected["enable_self_improvement"] = existing["enable_self_improvement"]
+    # The no-CI merge policy is operator-owned and never emitted by repo
+    # detection; carry an explicit choice (including False) forward so manual
+    # re-detect and empty-config auto-refresh do not silently re-gate the repo.
+    if "requires_ci_checks" in existing:
+        detected["requires_ci_checks"] = existing["requires_ci_checks"]
 
     return detected
 
@@ -98,10 +119,21 @@ async def maybe_refresh_empty_build_config(project, session, *, ref=None) -> boo
     """
     try:
         existing = project.build_config or {}
-        # Only refresh while the durable onboarding signal still says the repo
-        # is empty/near-empty. Once a refresh flips repo_is_empty=False, the
-        # helper becomes a no-op on later landing paths.
-        if not existing.get("repo_is_empty"):
+        # Refresh while EITHER durable onboarding signal still says this repo
+        # warrants re-detection:
+        #   - ``repo_is_empty``: a greenfield repo whose structure may have
+        #     landed since onboarding, or
+        #   - ``detection_incomplete``: onboarding-time detection never completed
+        #     (a transient GitHub failure), so the stored config has no real test
+        #     command and the no-CI gate would merge UNVERIFIED forever.
+        # A repo whose detection COMPLETED and genuinely found no tests sets
+        # neither flag, so it is never re-scanned here. Once a successful
+        # re-detect persists a config (flipping repo_is_empty=False and dropping
+        # the detection_incomplete marker), the helper becomes a no-op on later
+        # landing paths.
+        if not existing.get("repo_is_empty") and not existing.get(
+            "detection_incomplete"
+        ):
             return False
         if not getattr(project, "github_owner", None) or not getattr(
             project, "github_repo", None
@@ -154,6 +186,114 @@ async def maybe_refresh_empty_build_config(project, session, *, ref=None) -> boo
     except Exception:  # noqa: BLE001 — best-effort, must never break landing
         logger.warning(
             "[BUILD_CONFIG] Auto-refresh of empty build_config failed for "
+            "project %s; leaving config unchanged",
+            getattr(project, "id", None),
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001 — keep the caller's session usable
+            pass
+        return False
+
+
+async def persist_recovered_test_command(
+    project, session, recovered_directories: List[Dict[str, Any]]
+) -> bool:
+    """Persist a self-healed no-CI test command back into ``build_config``.
+
+    When the no-CI merge gate's ``verify_tests`` run discovers that a project's
+    stored test command is stale and runs a real replacement suite from the
+    already-cloned workspace, it reports the per-directory configs that ACTUALLY
+    RAN as ``recovered_directories`` (``[{path, type, test_cmd}, ...]``,
+    repo-root-relative). This helper folds those corrected commands back into
+    ``project.build_config.directories`` so FUTURE merges use the runnable
+    command instead of re-discovering it on every poll.
+
+    Merge semantics:
+
+    - Match an existing directory by normalized ``path`` and update its
+      ``test_cmd`` (and ``type`` only when the stored entry is missing one);
+      append a new entry for a recovered directory with no stored match.
+    - ONLY operates on the ``directories`` list — every operator-owned field
+      (Git identity, branch prefixes, ``requires_ci_checks``, ``env_vars``,
+      etc.) is left untouched, so operator customization is preserved.
+    - CONSERVATIVE GUARD: a recovered entry is applied only when it carries a
+      concrete, non-empty ``test_cmd``. A blank/placeholder command is skipped,
+      so a non-empty stored command is never overwritten with an empty one.
+
+    Like :func:`maybe_refresh_empty_build_config`, this is BEST-EFFORT: any
+    exception is logged, the session rolled back, and NEVER raised into the
+    merge path. Returns True iff a change was validated and persisted.
+    """
+    try:
+        if not recovered_directories:
+            return False
+
+        from pydantic import ValidationError
+        from sqlalchemy.orm.attributes import flag_modified
+
+        from app.schemas import BuildConfig as BuildConfigSchema
+
+        existing = dict(project.build_config or {})
+        directories = [dict(d) for d in (existing.get("directories") or [])]
+        index_by_path = {
+            _normalize_dir_path(d.get("path")): i for i, d in enumerate(directories)
+        }
+
+        changed = False
+        for recovered in recovered_directories:
+            if not isinstance(recovered, dict):
+                continue
+            cmd = str(recovered.get("test_cmd") or "").strip()
+            # CONSERVATIVE GUARD: never persist a blank/placeholder command, and
+            # never overwrite a stored command with an empty one.
+            if not cmd:
+                continue
+            norm = _normalize_dir_path(recovered.get("path"))
+            rec_type = recovered.get("type")
+            if norm in index_by_path:
+                entry = directories[index_by_path[norm]]
+                if entry.get("test_cmd") != cmd:
+                    entry["test_cmd"] = cmd
+                    changed = True
+                # Fill in type only when the stored entry lacks one.
+                if rec_type and not entry.get("type"):
+                    entry["type"] = rec_type
+                    changed = True
+            else:
+                new_entry: Dict[str, Any] = {"path": norm, "test_cmd": cmd}
+                if rec_type:
+                    new_entry["type"] = rec_type
+                directories.append(new_entry)
+                index_by_path[norm] = len(directories) - 1
+                changed = True
+
+        if not changed:
+            return False
+
+        existing["directories"] = directories
+        try:
+            validated = BuildConfigSchema(**existing)
+            project.build_config = validated.model_dump(exclude_none=True)
+        except ValidationError:
+            # A recovered entry produced a shape the schema rejects (e.g. a
+            # ``type`` outside the allowed set). Store raw so the corrected
+            # command still takes effect and the operator can fix it in the UI
+            # (mirrors the manual re-detect path's raw-store fallback).
+            project.build_config = existing
+        flag_modified(project, "build_config")
+        await session.commit()
+        logger.info(
+            "[BUILD_CONFIG] Persisted recovered no-CI test command(s) for "
+            "project %s: %s",
+            getattr(project, "id", None),
+            [_normalize_dir_path(d.get("path")) for d in recovered_directories],
+        )
+        return True
+    except Exception:  # noqa: BLE001 — best-effort, must never break the merge gate
+        logger.warning(
+            "[BUILD_CONFIG] Persisting recovered test command failed for "
             "project %s; leaving config unchanged",
             getattr(project, "id", None),
             exc_info=True,

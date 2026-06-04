@@ -15,6 +15,7 @@ import { useMessageList } from './useMessageList';
 import { MessagesListView } from './MessagesListView';
 import { MessagesPanelHeader, type WebhookStats } from './MessagesPanelHeader';
 import { MessagesComposer } from './MessagesComposer';
+import { armingToastCopy, parseArmingOutcome, type ArmingOutcome } from './messageArming';
 import { MessagesBatchActionBar } from './MessagesBatchActionBar';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 
@@ -60,6 +61,8 @@ interface MessagesPanelProps {
   onMessageCountChange?: (count: number) => void;
   onOpenTask?: (taskId: string) => void;
   notifyOnHighSignalMessage?: boolean;
+  /** Live signal: whether a strategic cycle is currently running for this project. */
+  strategistActive?: boolean;
 }
 
 type MessagesPanelPrefs = { version: 1; routineExpanded: boolean; showResolved: boolean; criticalOnly: boolean };
@@ -108,7 +111,7 @@ async function postBackendLastSeen(projectId: string, timestamp: number): Promis
   } catch { /* ignore — localStorage already saved */ }
 }
 
-export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage }: MessagesPanelProps) {
+export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, strategistActive }: MessagesPanelProps) {
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
   const [loading, setLoading] = useState(true);
   // Compose
@@ -116,6 +119,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const [newContent, setNewContent] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [replyTo, setReplyTo] = useState<{ id: string; content: string; from: string } | null>(null);
+  // Real arming outcome the server reported for the last send (null before any
+  // send, or after the operator changes the message type so the composer reverts
+  // to a fresh type-based prediction).
+  const [lastArming, setLastArming] = useState<ArmingOutcome | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   // Per-message action state
@@ -713,10 +720,24 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      // Read the server's real arming decision (additive, backward-compatible
+      // field) so the toast and composer hint reflect what actually happened
+      // rather than a type-only guess. Tolerate older responses without it.
+      let arming: ArmingOutcome | null = null;
+      try {
+        const data = await res.json();
+        arming = parseArmingOutcome(data?.arming);
+      } catch {
+        // No/invalid JSON body — fall back to generic confirmation copy.
+      }
       setNewContent('');
       setReplyTo(null);
+      setLastArming(arming);
       if (textareaRef.current) textareaRef.current.style.height = 'auto';
-      addToast('Message sent', 'success');
+      // A genuine steering message the server could not arm (`not_armed`) is a
+      // partial outcome — the message saved, but the strategist was not woken.
+      // Surface it as info, not a green success, so the receipt is truthful.
+      addToast(armingToastCopy(arming), arming === 'not_armed' ? 'info' : 'success');
       await fetchMessages();
     } catch {
       addToast('Failed to send message', 'error');
@@ -954,6 +975,16 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         onClose={onClose}
       />
 
+      {/* Live strategist activity indicator — driven by strategic_cycle_started/completed
+          WS events, mirroring the DirectionsPanel affordance. Gives the operator
+          at-a-glance context that a steer composed now will queue for the next cycle. */}
+      {strategistActive && (
+        <div className="px-4 md:px-6 py-2 border-b border-neutral-800 bg-indigo-950/40 flex items-center gap-2 shrink-0" role="status" aria-live="polite">
+          <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse" aria-hidden="true" />
+          <span className="text-xs text-indigo-300 font-medium">Strategist working…</span>
+        </div>
+      )}
+
       {/* Save view dialog */}
       {showSaveDialog && (
         <SaveViewDialog
@@ -1034,7 +1065,9 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         newContent={newContent}
         submitting={submitting}
         replyTo={replyTo}
-        onChangeType={setNewType}
+        lastArming={lastArming}
+        strategistBusy={strategistActive}
+        onChangeType={(value) => { setNewType(value); setLastArming(null); }}
         onChangeContent={setNewContent}
         onCancelReply={() => setReplyTo(null)}
         onSubmit={handleSubmit}

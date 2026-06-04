@@ -364,3 +364,171 @@ async def test_agent_fetch_gap_handles_active_and_archived(
         f"/api/agent/projects/{project.id}/gaps/g-missing", headers=headers
     )
     assert r3.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_problem_model_returns_full_durable_model(
+    client: AsyncClient, db_session
+):
+    """Agent can fetch the full durable problem_model, including archived gaps.
+
+    This is the read-only escape hatch for cases where the strategic payload
+    dropped or summarized the section under budget pressure.
+    """
+    project = Project(
+        name="Problem Model Fetch Test",
+        user_id="test-user-pm",
+        problem_model={
+            "revision": 17,
+            "intent": {
+                "purpose": "Ship a durable fetch path.",
+                "current_focus": "recover full strategic state",
+            },
+            "constraints": [
+                {"id": "c-1", "text": "Keep the model read-only."},
+            ],
+            "friction": [
+                {"id": "f-1", "name": "budget pressure", "status": "active"},
+            ],
+            "capabilities": [
+                {
+                    "id": "cap-1",
+                    "name": "read model",
+                    "status": "mature",
+                    "backing_paths": ["backend/app/routers/agent_strategic_fetch.py"],
+                }
+            ],
+            "gaps": [
+                {
+                    "id": "g-active",
+                    "name": "Active gap",
+                    "history": [f"h{i}" for i in range(12)],
+                    "past_moves": [f"m{i}" for i in range(9)],
+                    "evidence": [f"e{i}" for i in range(7)],
+                },
+            ],
+            "archived_gaps": [
+                {
+                    "id": "g-archived",
+                    "name": "Archived gap",
+                    "history": [f"ah{i}" for i in range(4)],
+                    "past_moves": [f"am{i}" for i in range(3)],
+                    "evidence": [f"ae{i}" for i in range(2)],
+                }
+            ],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-pm")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-pm")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/problem-model",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    assert body["data"]["revision"] == 17
+    assert body["data"]["intent"]["purpose"] == "Ship a durable fetch path."
+    assert body["data"]["constraints"][0]["text"] == "Keep the model read-only."
+    assert body["data"]["friction"][0]["name"] == "budget pressure"
+    assert body["data"]["capabilities"][0]["backing_paths"] == [
+        "backend/app/routers/agent_strategic_fetch.py"
+    ]
+    assert len(body["data"]["gaps"][0]["history"]) == 12
+    assert len(body["data"]["gaps"][0]["past_moves"]) == 9
+    assert len(body["data"]["gaps"][0]["evidence"]) == 7
+    assert body["data"]["archived_gaps"][0]["id"] == "g-archived"
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_problem_model_hyphen_rejects_cross_project(
+    client: AsyncClient, db_session
+):
+    """Cross-project fetches for the full model (hyphen route) still return 404."""
+    project_a = Project(name="A", user_id="test-user-a")
+    project_b = Project(
+        name="B",
+        user_id="test-user-b",
+        problem_model={"intent": {"purpose": "hidden"}},
+    )
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(project_id=project_a.id, payloads=[{}], vm_instance_id="agent-vm-a")
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token = create_agent_token(str(task_a.id), "agent-vm-a")
+    res = await client.get(
+        f"/api/agent/projects/{project_b.id}/problem-model",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_problem_model_both_spellings_return_same_body(
+    client: AsyncClient, db_session
+):
+    """Both /problem_model (underscore) and /problem-model (hyphen) spellings
+    return 200 and identical bodies. This regression test locks the dual-alias
+    guarantee: deleting either decorator would break the test."""
+    project = Project(
+        name="Spelling Test",
+        user_id="test-user-spelling",
+        problem_model={
+            "revision": 5,
+            "intent": {"purpose": "Image rollover compatibility"},
+            "gaps": [
+                {
+                    "id": "g-1",
+                    "name": "Test gap",
+                    "history": [{"ts": "t1", "event": "created"}],
+                }
+            ],
+            "archived_gaps": [{"id": "g-old", "name": "Archived", "status": "closed"}],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-spelling"
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-spelling")
+    headers = {"x-agent-token": token}
+
+    # Fetch via underscore route
+    res_underscore = await client.get(
+        f"/api/agent/projects/{project.id}/problem_model", headers=headers
+    )
+    assert res_underscore.status_code == 200, res_underscore.text
+    body_underscore = res_underscore.json()
+
+    # Fetch via hyphen route
+    res_hyphen = await client.get(
+        f"/api/agent/projects/{project.id}/problem-model", headers=headers
+    )
+    assert res_hyphen.status_code == 200, res_hyphen.text
+    body_hyphen = res_hyphen.json()
+
+    # Both must return identical bodies
+    assert body_underscore == body_hyphen
+    assert body_underscore["data"]["revision"] == 5
+    assert body_underscore["data"]["intent"]["purpose"] == "Image rollover compatibility"

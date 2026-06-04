@@ -1325,8 +1325,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             Task.project_id == task.project_id,
             Artifact.artifact_type == ArtifactType.PULL_REQUEST,
             Artifact.pr_url.isnot(None),
+            # Exclude BLOCKED alongside the terminal statuses: a BLOCKED task
+            # cannot currently progress, so its related_files are not actively
+            # contested and must not suppress otherwise-valid new work as a
+            # false-positive file-scope conflict.
             Task.status.not_in(
-                [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+                [
+                    TaskStatus.COMPLETED,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                    TaskStatus.BLOCKED,
+                ]
             ),
         )
         .limit(200)

@@ -45,6 +45,7 @@ describe('buildThinkerPrompt', () => {
     packerMetaSection: '',
     strategicContext: '',
     problemModelSection: '## Your current understanding (problem_model)\n_(empty — bootstrap)_',
+    problemModelRecovery: 'empty',
     reflectionSection: '## What you previously said was hard\n_(no prior)_',
     selfImprovementBlock: '',
     runningUpdateSection: '## Running update (living document — rewrite, don\'t append)\n_(empty)_',
@@ -58,6 +59,7 @@ describe('buildThinkerPrompt', () => {
     dirHealthSummary: 'Active: 0/10 slots.',
     userPausedSection: '',
     rejectedProposalsSection: '',
+    operatorOverridesSection: '',
     portfolioCompositionText: 'No active directions — portfolio is empty.',
     systemMaturitySection: '',
     driftSection: '',
@@ -123,11 +125,62 @@ describe('buildThinkerPrompt', () => {
   it('problem_model section uses bootstrap text when problemModelSection signals empty', () => {
     const prompt = buildThinkerPrompt({
       ...base,
+      problemModelRecovery: 'empty',
       problemModelSection: '## Your current understanding (problem_model)\n_(empty — bootstrap)_',
     });
     expect(prompt).toContain('_(empty — bootstrap)_');
     // Bootstrap guidance section should also be present
     expect(prompt).toContain('# Bootstrap (when the problem_model is empty)');
+    // ...and the fetch-then-edit recovery block must NOT appear on a true first cycle
+    expect(prompt).not.toContain('# Recover your durable model (fetch-then-edit)');
+  });
+
+  it('renders the fetch-then-edit recovery block (not bootstrap) when recovery is fetch', () => {
+    const prompt = buildThinkerPrompt({ ...base, problemModelRecovery: 'fetch' });
+    // Recovery wording present; bootstrap absent
+    expect(prompt).toContain('# Recover your durable model (fetch-then-edit)');
+    expect(prompt).toContain('./fetch problem-model');
+    expect(prompt).not.toContain('# Bootstrap (when the problem_model is empty)');
+    // Section 6 now uses non-destructive-merge semantics (main #7449): there is
+    // no inline "full replacement" caveat; recovery is steered by the standalone
+    // fetch-then-edit block above plus section 6's own fetch-the-full-state note.
+    expect(prompt).toContain('first to read the full current state');
+  });
+
+  it('steers to ./fetch full gap history when gapMemoryTrimmedGapIds is non-empty', () => {
+    const prompt = buildThinkerPrompt({
+      ...base,
+      problemModelRecovery: 'present',
+      gapMemoryTrimmedGapIds: ['g-strategic-mem', 'g-auth'],
+    });
+    // Steering block present and naming the trimmed gaps
+    expect(prompt).toContain('# Some gap memory was shortened for payload size');
+    expect(prompt).toContain('g-strategic-mem');
+    expect(prompt).toContain('g-auth');
+    // It must point at the fetch helpers the agent already has
+    expect(prompt).toContain('./fetch problem-model');
+    expect(prompt).toContain('./fetch gap <gap_id>');
+    // It must reference the backend marker the agent inspects
+    expect(prompt).toContain('_gap_memory_trimmed');
+    // Steering lands before the output instructions so the thinker sees it
+    expect(prompt.indexOf('# Some gap memory was shortened')).toBeLessThan(
+      prompt.indexOf('## 1. State assessment'),
+    );
+  });
+
+  it('omits the gap-memory steering block when no gap memory was trimmed', () => {
+    const empty = buildThinkerPrompt({ ...base, gapMemoryTrimmedGapIds: [] });
+    expect(empty).not.toContain('# Some gap memory was shortened for payload size');
+    // Field absent entirely → also omitted (present model, normal cycle)
+    const absent = buildThinkerPrompt({ ...base, problemModelRecovery: 'present' });
+    expect(absent).not.toContain('# Some gap memory was shortened for payload size');
+  });
+
+  it('renders neither bootstrap nor recovery block when the model is present', () => {
+    const prompt = buildThinkerPrompt({ ...base, problemModelRecovery: 'present' });
+    expect(prompt).not.toContain('# Bootstrap (when the problem_model is empty)');
+    expect(prompt).not.toContain('# Recover your durable model (fetch-then-edit)');
+    expect(prompt).not.toContain('Recovery caveat');
   });
 
   it('vision section rendered only when visionJson is non-empty', () => {
@@ -146,12 +199,32 @@ describe('buildThinkerPrompt', () => {
     expect(without).not.toContain('## System Maturity');
   });
 
+  it('operator overrides section rendered only when operatorOverridesSection is non-empty', () => {
+    const with_ = buildThinkerPrompt({ ...base, operatorOverridesSection: '\n## Operator Overrides Since Last Cycle\nentry\n' });
+    expect(with_).toContain('## Operator Overrides Since Last Cycle');
+
+    const without = buildThinkerPrompt({ ...base, operatorOverridesSection: '' });
+    expect(without).not.toContain('## Operator Overrides Since Last Cycle');
+  });
+
   it('drift section rendered only when driftSection is non-empty', () => {
     const with_ = buildThinkerPrompt({ ...base, driftSection: '\n## Drift Signals\nover_claim: true\n' });
     expect(with_).toContain('## Drift Signals');
 
     const without = buildThinkerPrompt({ ...base, driftSection: '' });
     expect(without).not.toContain('## Drift Signals');
+  });
+
+  it('running_update superseded note rendered only when runningUpdateSupersededSection is non-empty', () => {
+    const note = '\n_Last cycle the operator preserved their own running_update over your proposed rewrite._\n';
+    const with_ = buildThinkerPrompt({ ...base, runningUpdateSupersededSection: note });
+    expect(with_).toContain('operator preserved their own running_update');
+
+    const without = buildThinkerPrompt({ ...base, runningUpdateSupersededSection: '' });
+    expect(without).not.toContain('operator preserved their own running_update');
+
+    const absent = buildThinkerPrompt(base);
+    expect(absent).not.toContain('operator preserved their own running_update');
   });
 
   it('efficiency snapshot section rendered when efficiencySnapshotSection is non-empty', () => {
@@ -426,6 +499,7 @@ describe('buildThinkerPrompt on_automain annotation', () => {
     packerMetaSection: '',
     strategicContext: '',
     problemModelSection: '## Your current understanding (problem_model)\n_(empty)_',
+    problemModelRecovery: 'empty',
     reflectionSection: '## What you previously said was hard\n_(no prior)_',
     selfImprovementBlock: '',
     runningUpdateSection: '## Running update (living document — rewrite, don\'t append)\n_(empty)_',
@@ -439,6 +513,7 @@ describe('buildThinkerPrompt on_automain annotation', () => {
     dirHealthSummary: 'Active: 0/10 slots.',
     userPausedSection: '',
     rejectedProposalsSection: '',
+    operatorOverridesSection: '',
     portfolioCompositionText: 'No active directions — portfolio is empty.',
     systemMaturitySection: '',
     driftSection: '',
@@ -481,6 +556,7 @@ describe('buildThinkerPrompt + renderStrategicPromptSuffix (strategic handler co
     packerMetaSection: '',
     strategicContext: '',
     problemModelSection: '## Your current understanding (problem_model)\n_(empty — bootstrap)_',
+    problemModelRecovery: 'empty',
     reflectionSection: '## What you previously said was hard\n_(no prior)_',
     selfImprovementBlock: '',
     runningUpdateSection: '## Running update\n_(empty)_',
@@ -494,6 +570,7 @@ describe('buildThinkerPrompt + renderStrategicPromptSuffix (strategic handler co
     dirHealthSummary: 'Active: 0/10 slots.',
     userPausedSection: '',
     rejectedProposalsSection: '',
+    operatorOverridesSection: '',
     portfolioCompositionText: 'No active directions — portfolio is empty.',
     systemMaturitySection: '',
     driftSection: '',

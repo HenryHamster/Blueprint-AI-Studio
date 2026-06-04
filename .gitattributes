@@ -1,0 +1,10 @@
+# Custom merge driver for the size-guardrail caps file. Parallel in-flight PRs
+# routinely each bump a cap in this one shared JSON, producing textual conflicts
+# whose intent never actually conflicts (policy only ever raises caps). The
+# `sizecap` driver performs a max-cap union merge so those conflicts auto-resolve.
+#
+# A .gitattributes entry alone does NOT activate the driver — git requires the
+# `merge.sizecap.driver` command to be registered in the repo's local git config,
+# which a clone does not carry. The agent's workspace-prep step installs that
+# config (registerSizeCapMergeDriver). See backend/testing/merge_size_limits.py.
+backend/testing/module_size_limits.json merge=sizecap

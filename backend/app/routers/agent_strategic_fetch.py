@@ -115,7 +115,8 @@ async def agent_fetch_playbook_entry(
 
 
 @router.get("/projects/{project_id}/problem_model")
-@limiter.limit("30/minute")
+@router.get("/projects/{project_id}/problem-model")
+@limiter.limit("60/minute")
 async def agent_fetch_problem_model(
     request: Request,
     project_id: uuid.UUID,
@@ -126,7 +127,13 @@ async def agent_fetch_problem_model(
     payload trimmed (per-gap arrays capped, archived_gaps dropped) or dropped
     problem_model under budget pressure and the agent wants the complete
     current state before writing — writes merge non-destructively, so this is
-    for reading the whole record, not a precondition for a safe write."""
+    for reading the whole record, not a precondition for a safe write.
+
+    Both the underscore (``/problem_model``) and hyphen (``/problem-model``)
+    spellings are served as aliases: ``main`` shipped the underscore route
+    (#7449) and ``automain`` shipped the hyphen route (#7451). Keeping both
+    means agents from either baked image can fetch the model during the
+    image-rollover window."""
     project = await _resolve_agent_project(project_id, token, session)
     return {"status": "success", "data": project.problem_model or {}}
 

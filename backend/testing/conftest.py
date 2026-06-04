@@ -20,7 +20,7 @@ os.environ.setdefault("WS_TICKET_SECRET", "test-ws-ticket-secret")
 # SQLite does not support PostgreSQL's JSONB type.  Add a visit_JSONB method
 # to the SQLite type compiler so it renders JSONB as plain JSON when the
 # in-memory SQLite engine creates tables for testing.
-from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler as _SQLiteTypeCompiler
+from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler as _SQLiteTypeCompiler  # noqa: E402
 
 
 def _sqlite_visit_JSONB(self, type_, **kw):
@@ -29,9 +29,9 @@ def _sqlite_visit_JSONB(self, type_, **kw):
 
 _SQLiteTypeCompiler.visit_JSONB = _sqlite_visit_JSONB
 
-from app.main import app
-from app.database import get_session
-from app.auth import get_current_user, require_admin
+from app.main import app  # noqa: E402
+from app.database import get_session  # noqa: E402
+from app.auth import get_current_user, require_admin  # noqa: E402
 
 # --- Database engine selection ---
 # CI explicitly sets USE_TEST_POSTGRES=true to use real PostgreSQL.
@@ -81,7 +81,7 @@ else:
 # different loop". Both test engines use a non-reusing pool (NullPool for Postgres,
 # StaticPool for SQLite), so binding here keeps every session on the same DB without
 # cross-loop connection reuse.
-import app.database as _app_database
+import app.database as _app_database  # noqa: E402
 
 _app_database._LazyEngine._engine = engine
 

@@ -29,6 +29,21 @@ from app.review_pipeline import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _default_no_migration_pr(mocker):
+    """Default the pre-merge Alembic dual-head guard to a no-op for merge tests.
+
+    The CI merge primitive now runs ``enforce_premerge_migration_guard`` (which
+    calls ``github.get_pr_files``) before merging. Pipeline tests that drive a
+    merge do not all mock that call; returning an empty (no-migration) file list
+    short-circuits the guard to ``ok``. Tests that exercise other ``get_pr_files``
+    behaviors re-patch it explicitly, which overrides this default.
+    """
+    from unittest.mock import AsyncMock
+
+    mocker.patch("app.github.get_pr_files", AsyncMock(return_value=[{"filename": "README.md"}]))
+
+
 def _naive_utcnow() -> datetime:
     """Naive UTC datetime matching what app.time_utils._utcnow() produces."""
     return datetime.now(timezone.utc).replace(tzinfo=None)

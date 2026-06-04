@@ -169,6 +169,13 @@ _on_task_terminal_callbacks.append(
 # for the full rationale.
 _on_task_revive_callbacks.append(lambda tid: _terminated_task_ids.pop(tid, None))
 
+_AGENT_INACTIVE_TASK_STATUSES = (
+    TaskStatus.COMPLETED,
+    TaskStatus.FAILED,
+    TaskStatus.CANCELLED,
+    TaskStatus.BLOCKED,
+)
+
 # Issue M3 (warm-VM continuity audit): JWTs for terminated tasks remain valid
 # for the JWT's full TTL (1h). The is_idempotent_path branch accepts these
 # terminal-task tokens on /next-role and /vm-heartbeat so a legitimate warm
@@ -217,8 +224,9 @@ async def verify_agent_token(
     rejected with 403 vm_instance_mismatch — failing fast on a real
     failure mode, not on legitimate work.
 
-    Rejects tokens for tasks that are no longer active (completed/failed/cancelled),
-    EXCEPT when the same VM that the task is currently assigned to is retrying
+    Rejects tokens for tasks that are no longer active
+    (completed/failed/cancelled/blocked), EXCEPT when the same VM that the task
+    is currently assigned to is retrying
     /status or /credentials/rotate (idempotency).
     """
     payload = verify_agent_jwt(x_agent_token)
@@ -374,11 +382,7 @@ async def verify_agent_token(
                     token_project_id=token_project,
                 )
                 raise HTTPException(status_code=403, detail="vm_instance_mismatch")
-            if task.status in (
-                TaskStatus.COMPLETED,
-                TaskStatus.FAILED,
-                TaskStatus.CANCELLED,
-            ):
+            if task.status in _AGENT_INACTIVE_TASK_STATUSES:
                 _terminated_task_ids[task_id] = time.time()
                 # Same-VM idempotent retry on terminal task is OK; different
                 # VM (or any non-idempotent path) fails fast.
@@ -3389,8 +3393,10 @@ async def agent_heartbeat(
             headers={"Retry-After": "30"},
         )
 
-    # Signal agent to stop if task was cancelled/completed externally
-    if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+    # Signal agent to stop if task was cancelled/completed/blocked externally.
+    # BLOCKED is terminal-for-now (precondition absent): the VM must stop rather
+    # than keep heartbeating against work that can't run yet.
+    if task.status in _AGENT_INACTIVE_TASK_STATUSES:
         raise HTTPException(status_code=409, detail="Task already terminal")
 
     task.last_heartbeat = _utcnow()

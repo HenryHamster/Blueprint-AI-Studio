@@ -19,7 +19,7 @@ from sqlalchemy import func as _func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.database import AsyncSessionLocal
+from app.database import AsyncSessionLocal, resolve_dialect_name
 from app.rollup_locking import (  # noqa: F401 — re-exported for callers/tests
     _ParentMutatedDuringPRCreation,
     _capture_rollup_parent_snapshot,
@@ -41,8 +41,10 @@ from app.rollup_branch_cleanup import (  # noqa: F401 — re-exported for caller
 )
 from app.rollup_migration_validation import (  # noqa: F401 - re-exported for callers/tests
     _extract_rollup_migration_sources,
+    _plan_rollup_migration_reconciliation,
     _touches_alembic_versions,
     _validate_rollup_migration_chain,
+    pr_touches_migrations,
 )
 from app.rollup_pr_verification import (  # noqa: F401 — re-exported for callers/tests
     MAX_REVIEW_RESPAWNS,
@@ -87,6 +89,131 @@ logger = logging.getLogger(__name__)
 # github_pulls.create_pull_request, which catches any duplicate that still slips
 # through GitHub's non-atomic enforcement.
 _ROLLUP_PR_CREATE_CLAIM_TTL_S = 300
+
+# Bounded auto-reconcile attempts per rollup PR for a pure mechanical Alembic
+# revision collision. Two attempts is enough to absorb a transient
+# push/re-validate race; beyond that we fall back to the operator-alert / agent
+# fix path rather than loop on a non-mechanical block.
+_ALEMBIC_AUTORECONCILE_CAP = 2
+
+
+async def _attempt_alembic_autoreconcile(
+    parent: Task,
+    session: AsyncSession,
+    gh_token: str,
+    owner: str,
+    repo: str,
+    rollup_pr_number: int,
+    rollup_pr_url: str,
+    staging_branch: str,
+    target_branch: str,
+    parent_ctx: dict,
+    current_count: int,
+) -> bool:
+    """Try to auto-renumber a rollup migration that collides with the target head.
+
+    Returns ``True`` when a reconciliation commit was pushed to *staging_branch*
+    (the caller defers one sweep so re-validation can pass and the rollup can
+    merge with no operator step). Returns ``False`` — leaving the parent
+    untouched — for every non-mechanical case, missing literal, or push failure,
+    so the caller falls through to the existing operator-alert / agent-fix path.
+    Conservative and fail-safe: only the unambiguous single-added-migration
+    collision / stale-anchor is auto-remediated.
+    """
+    from app.migration_chain import rewrite_expected_schema_revision
+    from app.github import get_file_text_at_ref, commit_file_changes
+
+    try:
+        plan = await _plan_rollup_migration_reconciliation(
+            gh_token, owner, repo, rollup_pr_number, target_branch
+        )
+    except Exception as e:  # noqa: BLE001 — fail-safe: fall back to operator path
+        logger.warning(
+            f"[ROLLUP] PR #{rollup_pr_number} alembic auto-reconcile planning "
+            f"failed ({type(e).__name__}: {e}); falling back to fix path"
+        )
+        return False
+    if not plan:
+        return False
+
+    # The migration becomes the new head, so EXPECTED_SCHEMA_REVISION must bump
+    # to match. Read main.py at the staging-branch tip and rewrite the literal;
+    # if it is absent we must not guess — fall back.
+    try:
+        main_text = await get_file_text_at_ref(
+            "backend/app/main.py",
+            token=gh_token,
+            owner=owner,
+            repo=repo,
+            ref=staging_branch,
+            project_id=str(parent.project_id),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[ROLLUP] PR #{rollup_pr_number} alembic auto-reconcile could not "
+            f"fetch main.py ({type(e).__name__}: {e}); falling back to fix path"
+        )
+        return False
+    if not main_text:
+        return False
+    new_main_text, replaced = rewrite_expected_schema_revision(
+        main_text, plan["expected_schema_revision"]
+    )
+    if replaced == 0:
+        logger.warning(
+            f"[ROLLUP] PR #{rollup_pr_number} alembic auto-reconcile: no "
+            f"EXPECTED_SCHEMA_REVISION literal in main.py; falling back to fix path"
+        )
+        return False
+
+    # The plan renumbers the colliding migration AND its entire linear
+    # descendant tail (one entry per renamed file in ``upserts``/``deletes``);
+    # merge the rewritten main.py into the upserts. Renumber always changes the
+    # NNNN prefix, so every old path is deleted so the rename is clean (one head,
+    # no duplicate revision).
+    upserts = {**plan["upserts"], "backend/app/main.py": new_main_text}
+    deletes = list(plan["deletes"])
+    try:
+        await commit_file_changes(
+            gh_token,
+            owner,
+            repo,
+            staging_branch,
+            upserts=upserts,
+            deletes=deletes,
+            message=(
+                f"fix(alembic): auto-renumber rollup migration "
+                f"{plan['old_revision']}->{plan['new_revision']} and rechain onto "
+                f"{plan['new_down_revision']}"
+            ),
+            project_id=str(parent.project_id),
+        )
+    except Exception as e:  # noqa: BLE001 — push failed: fall back to fix path
+        logger.warning(
+            f"[ROLLUP] PR #{rollup_pr_number} alembic auto-reconcile push failed "
+            f"({type(e).__name__}: {e}); falling back to fix path"
+        )
+        return False
+
+    parent.context = {
+        **parent_ctx,
+        "rollup_pr_url": rollup_pr_url,
+        "rollup_pr_number": rollup_pr_number,
+        "_alembic_autoreconcile_pr": rollup_pr_number,
+        "_alembic_autoreconcile_count": current_count + 1,
+    }
+    parent.latest_status_message = (
+        f"Rollup PR #{rollup_pr_number} — auto-renumbered Alembic migration "
+        f"{plan['old_revision']}->{plan['new_revision']}; re-validating next cycle"
+    )[:500]
+    session.add(parent)
+    await session.commit()
+    logger.info(
+        f"[ROLLUP] PR #{rollup_pr_number} alembic collision auto-reconciled: "
+        f"renumbered {plan['old_revision']}->{plan['new_revision']} on "
+        f"{staging_branch}, bumped EXPECTED_SCHEMA_REVISION; deferring re-validation"
+    )
+    return True
 
 
 async def _classify_merged_rollup_landing(
@@ -582,6 +709,11 @@ async def _check_and_trigger_rollup(
             TaskStatus.PROVISIONING,
             TaskStatus.IN_PROGRESS,
             TaskStatus.EVALUATING,
+            # A BLOCKED child is non-terminal work parked on a precondition; the
+            # auto-unblock sweep is expected to return it to QUEUED. Counting it
+            # as active keeps the rollup waiting rather than rolling up an
+            # incomplete subtree or miscounting it as a silent failure.
+            TaskStatus.BLOCKED,
         ):
             active_count += 1
             all_done = False
@@ -1034,20 +1166,99 @@ async def _check_and_trigger_rollup(
 
     child_statuses = [c.status for c in children]
 
-    # Edge case: all children cancelled — nothing to rollup, mark parent cancelled
+    # Edge case: all rollup children CANCELLED — nothing to roll up. Route the
+    # terminal verdict through the SAME shared helper the requeue/reaper path
+    # uses (``_resolve_terminal_parent_verdict`` /
+    # ``_terminate_all_non_genuine_cancelled``) so the two finalizers cannot
+    # land the same child set in two different terminal states. The
+    # EVALUATING-timeout recovery sweep
+    # (recovery_sweeps._check_evaluating_timeouts) reaches this finalizer with
+    # NO age gate and usually wins the race against the reaper's ~15-min requeue
+    # rescue — so it MUST agree with the requeue verdict instead of diverging
+    # (the cross-sweep drift the shared helper exists to prevent). This branch
+    # historically hard-coded CANCELLED, which diverged from the requeue path's
+    # verdict for an identical child set: FAILED + SCOPE_EMPTY when every child
+    # is a non-genuine cancel (superseded / replaced-by-retry / cascade /
+    # reassigned / scope-empty), or FAILED + AGENT_TIMEOUT when a genuine
+    # cancellation is present. That divergence is exactly what
+    # test_parent_terminal_parity locks.
+    #
+    # ``children`` is the rollup set (review/fix pipeline children already
+    # filtered out above) — the same set the shared helper classifies. Every
+    # child is CANCELLED in this branch, so no FAILED child can be
+    # BLOCKED_PRECONDITION: ``blocked_count`` is 0.
     if children and cancelled_count == len(children):
-        parent.status = TaskStatus.CANCELLED
+        from app.task_lifecycle_requeue import (
+            _record_parent_failure,
+            _resolve_terminal_parent_verdict,
+            _terminate_all_non_genuine_cancelled,
+        )
+
+        _, verdict_reason = await _resolve_terminal_parent_verdict(
+            parent, children, 0
+        )
+
+        # Clear rollup transient deferral/retry counters before EITHER terminal
+        # finalize commits so they don't leak into a future cycle. The shared
+        # ``_terminate_all_non_genuine_cancelled`` helper commits internally and
+        # does NOT clear rollup state or clean branches (the requeue path has no
+        # such state), so the rollup path owns both around the helper here.
         parent.context = _clear_rollup_transient_state(parent.context)
+
+        if verdict_reason == "all_non_genuine_cancelled":
+            # Every cancel is non-genuine (superseded / replaced-by-retry /
+            # reassigned / scope-empty): the work may have landed elsewhere, so
+            # this is FAILED + SCOPE_EMPTY with NO direction-health penalty and
+            # NO failure alert — byte-for-byte the requeue/reaper finalize. The
+            # shared helper persists the category, commits, and broadcasts; we
+            # clean up the staging branches after.
+            await _terminate_all_non_genuine_cancelled(
+                parent, children, session, broadcast_to_project
+            )
+            await _cleanup_branches(parent, session)
+            logger.info(
+                f"[ROLLUP] Parent {parent.id} FAILED (SCOPE_EMPTY) — all "
+                f"{len(children)} children non-genuine cancelled"
+            )
+            return
+
+        # At least one GENUINE cancel (e.g. an operator manually cancelling
+        # every child, or a child cancelled under its own review/fix
+        # divergence). DECISION: finalize FAILED — NOT the previous quiet
+        # CANCELLED. The shared verdict counts a genuine cancel as a terminal
+        # failure, and the requeue/reaper path (locked by
+        # test_requeue_all_cancelled_children_marks_parent_failed) already
+        # finalizes this exact child set to FAILED + AGENT_TIMEOUT with a
+        # failure alert + a direction-health signal via ``_record_parent_failure``.
+        # Because the recovery sweep wins the race to this finalizer most of the
+        # time, it must produce the SAME terminal state and the SAME side effects
+        # (including the SAME ``_record_parent_failure`` ding the reaper path
+        # uses — this is what test_parent_terminal_parity asserts) rather than the
+        # quieter CANCELLED that silently disagreed with the reaper.
+        from app.failure_classification import (
+            AGENT_TIMEOUT,
+            persist_failure_category,
+        )
+
+        parent.status = TaskStatus.FAILED
         parent.latest_status_message = f"All {len(children)} subtasks were cancelled"
+        persist_failure_category(parent, AGENT_TIMEOUT)
+        _record_parent_failure(parent, AGENT_TIMEOUT)
         session.add(parent)
+        await _maybe_create_failure_alert(
+            parent, session, parent.latest_status_message
+        )
         await session.commit()
         await _cleanup_branches(parent, session)
         await broadcast_to_project(
             str(parent.project_id),
             "task_updated",
-            {"task_id": str(parent.id), "status": TaskStatus.CANCELLED},
+            {"task_id": str(parent.id), "status": TaskStatus.FAILED},
         )
-        logger.info(f"[ROLLUP] Parent {parent.id} cancelled — all children cancelled")
+        logger.info(
+            f"[ROLLUP] Parent {parent.id} FAILED — all {len(children)} children "
+            f"cancelled, genuine cancellation present (shared verdict)"
+        )
         return
 
     if all_done and (len(children) - cancelled_count) > 0:
@@ -1967,7 +2178,7 @@ async def _check_and_trigger_rollup(
                     # subsequent task. Fail-safe: fetch/parse failure does not
                     # auto-merge. Runs in this unlocked window (GitHub I/O).
                     alembic_status, alembic_reason = await _validate_rollup_migration_chain(
-                        gh_token, owner, repo, rollup_pr_number
+                        gh_token, owner, repo, rollup_pr_number, target_branch
                     )
 
                     # Re-acquire to apply mutations / dispatch alerts.
@@ -2146,6 +2357,36 @@ async def _check_and_trigger_rollup(
                         await session.commit()
                         return
                     if alembic_status == "block":
+                        # Before the operator-alert / agent-fix fallback, try a
+                        # bounded automatic reconciliation of a PURE mechanical
+                        # collision: a single added migration that simply needs a
+                        # new revision number + a rechain onto the current head.
+                        # Anything ambiguous (multi-migration, body conflict,
+                        # parse failure, non-resolving renumber) yields no plan
+                        # and falls through unchanged. The per-PR counter caps
+                        # retries so a non-mechanical block never loops.
+                        _ar_pr = parent_ctx.get("_alembic_autoreconcile_pr")
+                        _ar_count = (
+                            int(parent_ctx.get("_alembic_autoreconcile_count", 0))
+                            if _ar_pr == rollup_pr_number
+                            else 0
+                        )
+                        if _ar_count < _ALEMBIC_AUTORECONCILE_CAP:
+                            _reconciled = await _attempt_alembic_autoreconcile(
+                                parent,
+                                session,
+                                gh_token,
+                                owner,
+                                repo,
+                                rollup_pr_number,
+                                rollup_pr_url,
+                                staging_branch,
+                                target_branch,
+                                parent_ctx,
+                                _ar_count,
+                            )
+                            if _reconciled:
+                                return
                         # C5: gate the approval flag on require_approval_gates.
                         # A broken combined migration chain is deterministic and
                         # would break `alembic upgrade head` for the whole project,
@@ -2561,31 +2802,47 @@ async def _check_and_trigger_rollup(
                             # 15-minute stale-parent sweep. Deferral counters below still
                             # run so a genuinely stuck PR still escalates to approval.
                             if _ms_key in ("blocked", "unstable"):
-                                try:
-                                    from app.github import enable_auto_merge
+                                # Migration-carrying rollup PRs must NOT be handed to
+                                # GitHub native auto-merge: the target branch can advance
+                                # while checks are pending, so the eventual merge could land
+                                # against a different migration chain than the one Blueprint
+                                # validated. Skip delegation and fall through to the
+                                # deferral / re-validation path so _validate_rollup_migration_chain
+                                # re-runs against the live target_branch on the next sweep.
+                                if await pr_touches_migrations(
+                                    gh_token, owner, repo, rollup_pr_number
+                                ):
+                                    logger.info(
+                                        f"[ROLLUP] PR #{rollup_pr_number} mergeable_state={_ms_key} "
+                                        f"touches Alembic migrations — skipping GitHub auto-merge; "
+                                        f"deferring for re-validation against {target_branch}"
+                                    )
+                                else:
+                                    try:
+                                        from app.github import enable_auto_merge
 
-                                    am_result = await enable_auto_merge(
-                                        gh_token,
-                                        owner,
-                                        repo,
-                                        rollup_pr_number,
-                                        project_id=str(parent.project_id),
-                                    )
-                                    if am_result.get("enabled"):
-                                        logger.info(
-                                            f"[ROLLUP] PR #{rollup_pr_number} mergeable_state={_ms_key} "
-                                            f"— enabled GitHub auto-merge"
+                                        am_result = await enable_auto_merge(
+                                            gh_token,
+                                            owner,
+                                            repo,
+                                            rollup_pr_number,
+                                            project_id=str(parent.project_id),
                                         )
-                                    else:
-                                        logger.info(
-                                            f"[ROLLUP] PR #{rollup_pr_number} auto-merge enablement "
-                                            f"declined: {am_result.get('message')}"
+                                        if am_result.get("enabled"):
+                                            logger.info(
+                                                f"[ROLLUP] PR #{rollup_pr_number} mergeable_state={_ms_key} "
+                                                f"— enabled GitHub auto-merge"
+                                            )
+                                        else:
+                                            logger.info(
+                                                f"[ROLLUP] PR #{rollup_pr_number} auto-merge enablement "
+                                                f"declined: {am_result.get('message')}"
+                                            )
+                                    except Exception as _am_exc:
+                                        logger.warning(
+                                            f"[ROLLUP] Auto-merge enablement failed for PR "
+                                            f"#{rollup_pr_number}: {_am_exc}"
                                         )
-                                except Exception as _am_exc:
-                                    logger.warning(
-                                        f"[ROLLUP] Auto-merge enablement failed for PR "
-                                        f"#{rollup_pr_number}: {_am_exc}"
-                                    )
                             prev_state = parent_ctx.get("_merge_deferred_state")
                             deferred_count = (
                                 (parent_ctx.get("_merge_deferred_count", 0) + 1)
@@ -2796,7 +3053,17 @@ async def _check_and_trigger_rollup(
                             # R4-W2 (M3): ``has_key`` uses the GIN ``?``
                             # operator and matches ``ix_task_context_gin``;
                             # the prior ``as_string().is_not(None)`` form
-                            # bypassed the index.
+                            # bypassed the index. ``?`` is Postgres-only, so
+                            # branch on the resolved dialect and fall back to
+                            # the portable ``json_extract`` form on SQLite.
+                            if resolve_dialect_name(session) == "postgresql":
+                                _rollup_pr_present = Task.context.has_key(
+                                    "rollup_pr_url"
+                                )
+                            else:
+                                _rollup_pr_present = _func.json_extract(
+                                    Task.context, "$.rollup_pr_url"
+                                ).isnot(None)
                             recent_rollups = (
                                 await session.execute(
                                     select(_func.count())
@@ -2806,7 +3073,7 @@ async def _check_and_trigger_rollup(
                                         Task.id != parent.id,
                                         Task.updated_at
                                         >= _utcnow() - timedelta(hours=1),
-                                        Task.context.has_key("rollup_pr_url"),
+                                        _rollup_pr_present,
                                     )
                                 )
                             ).scalar() or 0

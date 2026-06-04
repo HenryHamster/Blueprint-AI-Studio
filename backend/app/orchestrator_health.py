@@ -19,9 +19,97 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 import app.shared_state as _shared_state
+from app.landed_signal import has_landed_signal
 from app.models import Project, Task, TaskStatus
+from app.orchestrator_filters import _prod_files
 
 logger = logging.getLogger("blueprint")
+
+
+# ---------------------------------------------------------------------------
+# Genuine-code vs ordering-only dependency policy
+# ---------------------------------------------------------------------------
+
+# Task types that PRODUCE a code change, and therefore can carry a real code
+# relationship to a dependent. Pure-sequencing types (research / plan / review /
+# investigate / strategic) only order work — a dependency of that kind never
+# propagates code into the dependent's base, so it is ordering-only.
+_CODE_PRODUCING_TASK_TYPES = frozenset(
+    {"create", "fix", "refactor", "migrate", "docs", "deps", "qa", "modify", ""}
+)
+
+# Dependent task types that exist specifically to TRANSFORM another task's
+# output: a modify / fix / refactor that ``depends_on`` a code-producing task is,
+# by virtue of that edge, changing the dependency's code.
+_OUTPUT_TRANSFORMING_TASK_TYPES = frozenset({"fix", "modify", "refactor"})
+
+
+def _task_type(task: Task) -> str:
+    """The task's payload type, normalized ("" == default create)."""
+    return (task.first_payload or {}).get("type", "create") or ""
+
+
+def _is_code_producing_task(task: Task) -> bool:
+    """True when *task* emits a code change (vs. a pure-sequencing task type)."""
+    return _task_type(task) in _CODE_PRODUCING_TASK_TYPES
+
+
+def is_genuine_code_dependency(dependent: Task, dependency: Task) -> bool:
+    """True when *dependency* has a real CODE relationship with *dependent*.
+
+    This is the policy that separates a GENUINE code-dependency (whose landed
+    code the dependent must build on) from an ORDERING-ONLY dependency (pure
+    sequencing, no code relationship). It composes with — does not duplicate —
+    the dispatch file-overlap logic in :mod:`app.orchestrator_filters` by reusing
+    its :func:`_prod_files` test-file-excluding overlap helper.
+
+    A dependency is a genuine code-dependency when BOTH hold:
+
+      1. it is a code-producing task (``create`` / ``fix`` / ``refactor`` /
+         ``migrate`` / … — not research / plan / review / strategic), AND
+      2. it has a real code relationship with the dependent, established by
+         EITHER
+
+         (a) file-overlap between the two tasks' production target files
+             (``related_files`` with test files excluded), OR
+         (b) the dependent being a modify / fix / refactor that exists to change
+             the dependency's output — the ``depends_on`` edge from such a task
+             to a code-producing task IS that relationship. This holds UNLESS
+             both sides declare files that provably do NOT overlap (in which case
+             there is no code relationship and the dependency is ordering-only).
+
+    Everything else — a code-producing dependency a non-transforming dependent
+    merely sequences after with no file overlap, or any dependency on a
+    non-code-producing (research/plan/…) task — is ordering-only.
+    """
+    if not _is_code_producing_task(dependency):
+        return False
+
+    dependent_files = _prod_files((dependent.context or {}).get("related_files") or [])
+    dependency_files = _prod_files(
+        (dependency.context or {}).get("related_files") or []
+    )
+    # (a) overlapping production target files == a real code relationship.
+    if dependent_files & dependency_files:
+        return True
+    # (b) a modify/fix/refactor dependent transforms the dependency's output.
+    if _task_type(dependent) in _OUTPUT_TRANSFORMING_TASK_TYPES:
+        # When both sides declare files that provably do not overlap, there is no
+        # code relationship — treat as ordering-only. When either side omits its
+        # file metadata we cannot disprove overlap, so the transforming-dependent
+        # edge stands (hold rather than risk a missing-code dispatch).
+        return not (dependent_files and dependency_files)
+    return False
+
+
+def is_ordering_only_dependency(dependent: Task, dependency: Task) -> bool:
+    """True when *dependency* is pure sequencing — no code relationship.
+
+    The exact complement of :func:`is_genuine_code_dependency`; named explicitly
+    so dispatch call sites read in the affirmative ("this is ordering-only, do
+    not hold").
+    """
+    return not is_genuine_code_dependency(dependent, dependency)
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +390,152 @@ def _same_base_branch(a: Task, b: Task) -> bool:
     return a_base == b_base
 
 
+async def _effective_dep_task(dt: Task, session: AsyncSession) -> Task:
+    """Follow a requeue-cancelled dependency to its replacement clone.
+
+    Mirrors the ``_replaced_by_task_id`` remap in :func:`_check_candidate_task_deps`
+    so the re-cut path resolves the row that actually carries the landed code (the
+    replacement), not the superseded CANCELLED original — otherwise a remapped
+    cross-base code-dependency would resolve to a CANCELLED row, ``status !=
+    COMPLETED`` would short-circuit :func:`_has_landed_cross_base_code_dep`, and
+    the re-cut would be silently skipped. Returns *dt* unchanged when there is no
+    replacement to follow (or it cannot be loaded)."""
+    if dt.status != TaskStatus.CANCELLED:
+        return dt
+    replacement_id_str = (dt.context or {}).get("_replaced_by_task_id")
+    if not replacement_id_str:
+        return dt
+    try:
+        replacement = await session.get(Task, uuid.UUID(replacement_id_str))
+    except (ValueError, AttributeError):
+        replacement = None
+    return replacement or dt
+
+
+def _has_landed_cross_base_code_dep(dependent: Task, dep_tasks: list) -> bool:
+    """True when *dependent* has a CROSS-BASE GENUINE code-dependency that has
+    LANDED on integration — i.e. its base must be re-cut before it can safely
+    run. Pure helper shared by both re-cut call sites (dispatch + completion)."""
+    return any(
+        (not _same_base_branch(dependent, dep))
+        and is_genuine_code_dependency(dependent, dep)
+        and dep.status == TaskStatus.COMPLETED
+        and has_landed_signal(dep)
+        for dep in dep_tasks
+    )
+
+
+async def ensure_dependent_base_recut(
+    dependent: Task, dep_tasks: list, session: AsyncSession
+) -> bool:
+    """Ensure *dependent*'s base provably contains a landed cross-base code-dep.
+
+    If *dependent* has a CROSS-BASE GENUINE code-dependency that has landed on
+    integration, merge current integration into the dependent's staging/rollup
+    base (without re-homing onto integration — the rollup model is preserved).
+
+    Returns True when the base is safe to dispatch against — either no re-cut was
+    needed, or the re-cut succeeded — and False when a re-cut is required but
+    could not complete (merge conflict or transient GitHub error), so the caller
+    must keep HOLDING the dependent rather than dispatch it against a base
+    missing the landed code.
+
+    Single source of truth for the re-cut, shared by the dispatch driver
+    (:func:`recut_landed_cross_base_dependents`) and the completion-side
+    warm-claim trigger (``orchestrator._mark_unblocked_dependents``).
+    """
+    if not _has_landed_cross_base_code_dep(dependent, dep_tasks):
+        return True
+    project = await session.get(Project, dependent.project_id)
+    if project is None:
+        # Cannot resolve the integration branch — hold to be safe.
+        return False
+    from app.branch_resolution import recut_dependent_base_from_integration
+
+    outcome = await recut_dependent_base_from_integration(dependent, project, session)
+    return outcome == "ok"
+
+
+async def recut_landed_cross_base_dependents(
+    eligible_ids: list,
+    candidate_tasks: list,
+    dep_by_id: dict,
+    session: AsyncSession,
+) -> list:
+    """Re-cut held cross-rollup code-dependents' bases from current integration.
+
+    Dispatch step run AFTER dependency resolution and BEFORE provisioning. For
+    each eligible candidate that has a CROSS-BASE GENUINE code-dependency which
+    has now LANDED on integration, merge current integration into the
+    candidate's staging / rollup base so it provably contains the landed code —
+    WITHOUT re-homing the dependent onto integration (the rollup and the
+    qualify->promote gate are preserved). A candidate whose re-cut cannot
+    complete (merge conflict or transient GitHub error) is DROPPED from this
+    cycle's eligible set so it never dispatches against a base missing its
+    dependency's code; it stays QUEUED and is retried next cycle (a persistent
+    conflict surfaces for a fix task / operator).
+
+    Idempotent: when a candidate's base already bases on the integration trunk,
+    or already contains integration's HEAD, the re-cut is a cheap no-op.
+
+    Defense-in-depth: a dropped candidate that was already stamped
+    ``_deps_satisfied`` (the warm-claim marker) this cycle has that marker
+    durably CLEARED here, so the cheap ``/next-role`` backlog scan
+    (``warm_backlog_reuse``) cannot warm-claim it and dispatch it against a base
+    missing the landed code. The dispatch loop now re-cuts BEFORE stamping, so
+    this clear is belt-and-suspenders for any other stamp path.
+    """
+    if not eligible_ids:
+        return eligible_ids
+
+    task_by_id = {t.id: t for t in candidate_tasks}
+    dropped: set = set()
+    for eid in eligible_ids:
+        cand = task_by_id.get(eid)
+        if cand is None or not (cand.depends_on or []):
+            continue
+        dep_tasks = []
+        for raw in cand.depends_on or []:
+            try:
+                du = uuid.UUID(raw)
+            except (ValueError, AttributeError):
+                continue
+            dep = dep_by_id.get(du)
+            if dep is not None:
+                # Follow the requeue-cancelled → replacement remap so a remapped
+                # cross-base code-dependency's landed code still triggers re-cut.
+                dep_tasks.append(await _effective_dep_task(dep, session))
+        if not dep_tasks:
+            continue
+        if not await ensure_dependent_base_recut(cand, dep_tasks, session):
+            dropped.add(eid)
+            await _clear_deps_satisfied_marker(cand.id, session)
+            logger.warning(
+                "[CROSS-BASE] Holding dependent %s this cycle — base re-cut incomplete",
+                eid,
+            )
+    if not dropped:
+        return eligible_ids
+    return [eid for eid in eligible_ids if eid not in dropped]
+
+
+async def _clear_deps_satisfied_marker(task_id, session: AsyncSession) -> None:
+    """Durably clear the ``_deps_satisfied`` warm-claim marker on *task_id*.
+
+    Used when a held cross-base code-dependent is dropped from this cycle's
+    eligible set: the marker must not outlive the eligibility, or a warm VM could
+    claim the task via the backlog scan and dispatch it against a base that does
+    not yet contain its dependency's landed code."""
+    row = await session.get(Task, task_id)
+    if row is None or not (row.context or {}).get("_deps_satisfied"):
+        return
+    new_ctx = dict(row.context or {})
+    new_ctx.pop("_deps_satisfied", None)
+    row.context = new_ctx
+    session.add(row)
+    await session.commit()
+
+
 async def _check_candidate_task_deps(
     task: Task,
     dep_tasks: list,
@@ -366,23 +600,46 @@ async def _check_candidate_task_deps(
                 continue
             any_failed = True
             break
-        # Cross-rollup deps are timing-only: the dependent's base branch never
-        # inherits this dep's result (the dep merges into its own rollup branch
-        # while the dependent cuts from a different one), so waiting on an
-        # unfinished cross-base dep buys no propagation — only serialization.
-        # Scope the *wait* to same-base deps, where the dep's merge actually
-        # lands in the dependent's base. A FAILED dep still cascade-cancels above
-        # regardless of base; only the wait is loosened here. File-overlap
-        # conflict avoidance is handled separately by the dispatch filters
-        # (filter_file_conflicts / filter_rollup_conflicts), so dropping the
-        # cross-base wait does not remove conflict protection.
+        # A cross-base dependency only reaches the dependent's base when it lands
+        # on the SHARED integration trunk. Distinguish a GENUINE code-dependency
+        # (whose landed code the dependent must build on — HOLD until it lands,
+        # then re-cut the base) from an ORDERING-ONLY one (pure sequencing — its
+        # result never reaches the dependent's base, so waiting buys only
+        # serialization). Same-base deps are unchanged: the dep's merge lands
+        # directly in the dependent's base, so the existing all_met / PR-merge
+        # wait applies. A FAILED dep still cascade-cancels above regardless of
+        # base; only the WAIT policy is decided here. File-overlap conflict
+        # avoidance for in-flight work is still handled by the dispatch filters
+        # (filter_file_conflicts / filter_rollup_conflicts).
         same_base = _same_base_branch(task, effective_dt)
+        cross_base_code_dep = (not same_base) and is_genuine_code_dependency(
+            task, effective_dt
+        )
 
         if effective_dt.status != TaskStatus.COMPLETED:
-            if same_base:
+            # Hold while the dep is in flight whenever its result must reach the
+            # dependent: same-base (merge lands in the dependent's base) OR a
+            # cross-base genuine code-dependency (held until it lands on
+            # integration, after which the dependent's base is re-cut). An
+            # ordering-only cross-base dep never propagates, so it stays
+            # non-blocking exactly as before.
+            if same_base or cross_base_code_dep:
                 all_met = False
             continue
-        # For create tasks, also require PR to be merged — but only when the dep
+
+        if cross_base_code_dep:
+            # COMPLETED cross-rollup genuine code-dependency: its code is only
+            # reachable from the dependent's integration trunk once it has LANDED
+            # on integration (has_landed_signal). A merge to its own staging /
+            # rollup branch (pr_merged-to-staging) is NOT enough — keep holding
+            # until it lands, after which the dependent becomes eligible and its
+            # base is re-cut from current integration before dispatch.
+            if not has_landed_signal(effective_dt):
+                all_met = False
+            continue
+
+        # Same-base (or ordering-only cross-base) COMPLETED dependency. For
+        # create tasks, also require PR to be merged — but only when the dep
         # shares this task's base (else the merge lands where the dependent can't
         # see it, so the merge requirement is meaningless).
         dt_type = (effective_dt.first_payload).get("type", "create")

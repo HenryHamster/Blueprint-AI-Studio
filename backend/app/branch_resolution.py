@@ -810,6 +810,81 @@ async def merged_pr_counts_as_integration_landing(
     return False
 
 
+async def recut_dependent_base_from_integration(task, project, session) -> str:
+    """Re-cut a held cross-rollup code-dependent's base from CURRENT integration.
+
+    A dependent that was HELD until a genuine cross-rollup code-dependency landed
+    on the integration trunk must run against a base that PROVABLY contains that
+    landed code. This merges the project's integration branch INTO the
+    dependent's staging/rollup base branch (via the GitHub merges API), bringing
+    the landed code in without re-homing the dependent onto integration — so the
+    rollup model and the qualify->promote gate are preserved.
+
+    The dependent keeps its own staging branch (it still rolls up); only its
+    content is brought up to current integration. Sibling work already on a
+    shared staging branch is preserved because a merge never rewrites the base's
+    own commits.
+
+    Returns one of:
+      * ``"ok"``        — base already bases on integration (no-op) OR the merge
+        succeeded / was already up to date. The base now contains the landed
+        code; the dependent is safe to dispatch.
+      * ``"conflict"``  — the merge would conflict; the caller must NOT dispatch
+        and should hold for follow-up (a fix task / operator).
+      * ``"error"``     — a transient GitHub / credential error; retry next
+        cycle (the dependent stays held).
+
+    Deferred imports keep this module a leaf on the hot resolver path.
+    """
+    integration_branch = get_project_integration_branch(project)
+    base_branch = (getattr(task, "first_payload", None) or {}).get(
+        "base_branch"
+    ) or integration_branch
+    if base_branch == integration_branch:
+        # The dependent already bases on the integration trunk — cloning its
+        # HEAD at dispatch already includes the landed code. Nothing to re-cut.
+        return "ok"
+
+    try:
+        from app.routers.agent import get_github_token_for_task
+        from app.github import merge_branch
+
+        token, owner, repo = await get_github_token_for_task(task.id, session)
+        result = await merge_branch(
+            token,
+            owner,
+            repo,
+            base=base_branch,
+            head=integration_branch,
+            commit_message=(
+                f"Merge {integration_branch} into {base_branch} so dependent "
+                f"task {str(task.id)[:8]} bases on landed dependency code"
+            ),
+            project_id=str(getattr(task, "project_id", "") or "") or None,
+        )
+    except Exception:
+        logger.exception(
+            "[CROSS-BASE] Re-cut of base %r from integration %r failed for task %s",
+            base_branch,
+            integration_branch,
+            getattr(task, "id", None),
+        )
+        return "error"
+
+    if result.get("merged"):
+        logger.info(
+            "[CROSS-BASE] Re-cut base %r from integration %r for task %s (%s)",
+            base_branch,
+            integration_branch,
+            getattr(task, "id", None),
+            "already up to date" if result.get("already") else "merged",
+        )
+        return "ok"
+    if result.get("conflict"):
+        return "conflict"
+    return "error"
+
+
 def is_single_branch_project(project) -> bool:
     """True when a project's integration branch IS its promotion target.
 

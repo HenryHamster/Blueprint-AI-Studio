@@ -485,6 +485,231 @@ async def get_file_content_at_ref(
         return None, None
 
 
+async def list_versions_at_ref(
+    token: str,
+    owner: str,
+    repo: str,
+    ref: str,
+    project_id: str | None = None,
+) -> list[str]:
+    """List the Alembic migration filenames under ``alembic/versions`` at *ref*.
+
+    Supplies the rollup migration guard with the *target branch's current*
+    migration set so the combined chain (target head + the rollup's added
+    migrations) can be validated. Returns the basenames of the files in the
+    versions directory (e.g. ``["0001_init.py", ..., "0137_cascade.py"]``);
+    callers derive the existing revision ids and the current head from those
+    filenames (the filename ``NNNN`` prefix is kept in lockstep with the
+    in-file revision by the migration-chain invariant).
+
+    Fail-safe contract for the auto-merge guard: returns ``[]`` when the
+    directory does not exist on *ref* (HTTP 404 — a greenfield repo with no
+    migrations) but RAISES on any other non-200 status, unexpected payload,
+    or transport error so the caller defers (never waves a merge through on
+    an inability to read the target branch's migrations).
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    versions_dir = "backend/alembic/versions"
+    encoded_path = quote(versions_dir, safe="/")
+    encoded_ref = quote(ref, safe="")
+    url = (
+        f"https://api.github.com/repos/{owner}/{repo}/contents/"
+        f"{encoded_path}?ref={encoded_ref}"
+    )
+    response = await _github_request(
+        "GET", url, headers, max_retries=2, project_id=project_id
+    )
+    if response.status_code == 404:
+        return []
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"GitHub contents listing for {versions_dir} on "
+            f"{owner}/{repo}@{ref} returned HTTP {response.status_code}"
+        )
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise RuntimeError(
+            f"GitHub contents listing for {versions_dir} on "
+            f"{owner}/{repo}@{ref} did not return a directory listing"
+        )
+    return [
+        entry["name"]
+        for entry in payload
+        if isinstance(entry, dict)
+        and entry.get("type") == "file"
+        and isinstance(entry.get("name"), str)
+    ]
+
+
+async def get_file_text_at_ref(
+    path: str,
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    ref: str,
+    project_id: str | None = None,
+) -> str | None:
+    """Fetch the decoded TEXT of *path* at ``owner/repo@ref``.
+
+    Sibling of :func:`get_file_content_at_ref` (which only answers existence +
+    line count); the auto-reconcile path needs the actual source of
+    ``backend/app/main.py`` to rewrite its ``EXPECTED_SCHEMA_REVISION`` literal.
+    Goes through :func:`_github_request`, so it is quota-accounted and
+    rate-limit-aware like every other GitHub call.
+
+    Returns the decoded UTF-8 text on HTTP 200, or ``None`` for any
+    non-retrievable / non-decodable outcome (404, non-200, non-file payload,
+    undecodable body, or transport error). Fail-safe like its read siblings:
+    ``None`` never means "empty file", it means "could not read".
+    """
+    import base64
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    encoded_path = quote(path, safe="/")
+    encoded_ref = quote(ref, safe="")
+    url = (
+        f"https://api.github.com/repos/{owner}/{repo}/contents/"
+        f"{encoded_path}?ref={encoded_ref}"
+    )
+    try:
+        response = await _github_request(
+            "GET", url, headers, max_retries=2, project_id=project_id
+        )
+        if response.status_code != 200:
+            if response.status_code != 404:
+                logger.warning(
+                    "[GITHUB] text fetch for %s on %s/%s@%s: HTTP %s",
+                    path,
+                    owner,
+                    repo,
+                    ref,
+                    response.status_code,
+                )
+            return None
+        payload = response.json()
+        if not (isinstance(payload, dict) and payload.get("type") == "file"):
+            return None
+        content_b64 = payload.get("content")
+        if not isinstance(content_b64, str):
+            return None
+        return base64.b64decode(content_b64).decode()
+    except Exception as e:  # noqa: BLE001 — never let a fetch error read as content
+        logger.warning(
+            "[GITHUB] Failed text fetch for %s on %s/%s@%s: %s",
+            path,
+            owner,
+            repo,
+            ref,
+            e,
+        )
+        return None
+
+
+async def commit_file_changes(
+    token: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    *,
+    upserts: dict[str, str],
+    deletes: list[str] | None = None,
+    message: str,
+    project_id: str | None = None,
+) -> str:
+    """Commit *upserts* (path -> text) and *deletes* to *branch* atomically.
+
+    Uses the low-level Git Data API so an arbitrary set of file changes lands in
+    ONE commit (vs. the contents API's one-commit-per-file): read the branch's
+    tip + base tree, create a blob per upsert, build a new tree on top of the
+    base tree (deletions are entries with ``sha: null``), create a commit
+    parented on the tip, then fast-forward ``heads/{branch}`` to it.
+
+    Returns the new commit SHA. RAISES ``RuntimeError`` on any unexpected status
+    (the caller treats a failed push as "could not reconcile" and falls back to
+    the operator-alert path).
+    """
+    deletes = deletes or []
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    base = f"https://api.github.com/repos/{owner}/{repo}"
+
+    def _json(resp: httpx.Response, expected: int, what: str) -> dict:
+        if resp.status_code != expected:
+            raise RuntimeError(
+                f"GitHub Git Data API {what} on {owner}/{repo}@{branch} "
+                f"returned HTTP {resp.status_code} (expected {expected})"
+            )
+        return resp.json()
+
+    # 1. Current branch tip commit.
+    ref_resp = await _github_request(
+        "GET", f"{base}/git/ref/heads/{quote(branch, safe='')}", headers,
+        project_id=project_id,
+    )
+    tip_sha = _json(ref_resp, 200, "get-ref")["object"]["sha"]
+
+    # 2. Base tree of that commit.
+    commit_resp = await _github_request(
+        "GET", f"{base}/git/commits/{tip_sha}", headers, project_id=project_id
+    )
+    base_tree_sha = _json(commit_resp, 200, "get-commit")["tree"]["sha"]
+
+    # 3. A blob per upsert.
+    tree_entries: list[dict] = []
+    for path, content in upserts.items():
+        blob_resp = await _github_request(
+            "POST", f"{base}/git/blobs", headers,
+            json={"content": content, "encoding": "utf-8"},
+            project_id=project_id,
+        )
+        blob_sha = _json(blob_resp, 201, "create-blob")["sha"]
+        tree_entries.append(
+            {"path": path, "mode": "100644", "type": "blob", "sha": blob_sha}
+        )
+    # Deletions: a tree entry with sha null removes the path.
+    for path in deletes:
+        tree_entries.append(
+            {"path": path, "mode": "100644", "type": "blob", "sha": None}
+        )
+
+    # 4. New tree on top of the existing base tree.
+    tree_resp = await _github_request(
+        "POST", f"{base}/git/trees", headers,
+        json={"base_tree": base_tree_sha, "tree": tree_entries},
+        project_id=project_id,
+    )
+    new_tree_sha = _json(tree_resp, 201, "create-tree")["sha"]
+
+    # 5. Commit parented on the current tip.
+    commit_create_resp = await _github_request(
+        "POST", f"{base}/git/commits", headers,
+        json={"message": message, "tree": new_tree_sha, "parents": [tip_sha]},
+        project_id=project_id,
+    )
+    new_commit_sha = _json(commit_create_resp, 201, "create-commit")["sha"]
+
+    # 6. Fast-forward the branch ref to the new commit.
+    update_resp = await _github_request(
+        "PATCH", f"{base}/git/refs/heads/{quote(branch, safe='')}", headers,
+        json={"sha": new_commit_sha, "force": False},
+        project_id=project_id,
+    )
+    _json(update_resp, 200, "update-ref")
+    return new_commit_sha
+
+
 # ---------------------------------------------------------------------------
 # Public-interface façade
 #
@@ -541,6 +766,7 @@ from app.github_issues import (  # noqa: F401
 from app.github_refs import (  # noqa: F401
     create_branch,
     create_tag,
+    merge_branch,
     get_branch_sha,
     get_repo_default_branch,
     delete_branch,

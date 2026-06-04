@@ -66,6 +66,13 @@ def _mock_automerge_deps(mocker, *, pr_files, diff, merge_merged=True):
     mocker.patch(
         "app.github.get_pull_request_diff", new_callable=AsyncMock, return_value=diff
     )
+    # Target-branch migration listing for the combined-chain guard. Default to
+    # an empty existing chain so the combined check degrades to the in-isolation
+    # validation these tests assert against; target-branch-collision cases
+    # override this return value.
+    mocker.patch(
+        "app.github.list_versions_at_ref", new_callable=AsyncMock, return_value=[]
+    )
     mocker.patch(
         "app.github.get_pull_request",
         new_callable=AsyncMock,
@@ -135,6 +142,127 @@ async def test_clean_single_head_migration_rollup_auto_merges(cleanup_db, mocker
     mock_spawn.assert_not_called()
     await cleanup_db.refresh(parent)
     assert parent.requires_approval is False
+
+
+@pytest.mark.asyncio
+async def test_rollup_guard_block_skips_auto_merge(cleanup_db, mocker):
+    """A blocking combined-chain verdict prevents the auto-merge fallback."""
+    diff = _added_file_diff("backend/alembic/versions/0124_a.py", "0124", "0123")
+    mock_merge, mock_spawn = _mock_automerge_deps(
+        mocker,
+        pr_files=_files("backend/alembic/versions/0124_a.py"),
+        diff=diff,
+    )
+    enable_auto_merge_mock = mocker.patch(
+        "app.github.enable_auto_merge",
+        new_callable=AsyncMock,
+        return_value={"enabled": True, "message": "ok"},
+    )
+    mocker.patch(
+        "app.rollup_management._validate_rollup_migration_chain",
+        new=AsyncMock(return_value=("block", "dual-head: duplicate revision")),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_merge.assert_not_called()
+    enable_auto_merge_mock.assert_not_called()
+    mock_spawn.assert_awaited_once()
+    await cleanup_db.refresh(parent)
+    assert parent.requires_approval is True
+    assert "alembic" in (parent.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_pr_touches_migrations_positive(mocker):
+    """pr_touches_migrations returns True when a PR file is under alembic/versions."""
+    from app.rollup_migration_validation import pr_touches_migrations
+
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=_files(
+            "backend/app/models.py",
+            "backend/alembic/versions/0140_add_widget.py",
+        ),
+    )
+    assert await pr_touches_migrations("tok", "owner", "repo", 42) is True
+
+
+@pytest.mark.asyncio
+async def test_pr_touches_migrations_negative(mocker):
+    """pr_touches_migrations returns False when no PR file touches alembic/versions."""
+    from app.rollup_migration_validation import pr_touches_migrations
+
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=_files("backend/app/models.py", "admin-ui/src/App.tsx"),
+    )
+    assert await pr_touches_migrations("tok", "owner", "repo", 42) is False
+
+
+@pytest.mark.asyncio
+async def test_pr_touches_migrations_fetch_error_failsafe(mocker):
+    """A files-fetch error is fail-safe True: an unknown file set must NOT be
+    treated as migration-free (the caller would otherwise take the auto-merge
+    fast path that bypasses Blueprint's re-entry guard)."""
+    from app.rollup_migration_validation import pr_touches_migrations
+
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("502 from GitHub"),
+    )
+    assert await pr_touches_migrations("tok", "owner", "repo", 42) is True
+
+
+@pytest.mark.asyncio
+async def test_rollup_blocked_migration_pr_does_not_delegate_auto_merge(
+    cleanup_db, mocker
+):
+    """A migration-carrying rollup PR in mergeable_state=blocked must not be
+    handed to GitHub native auto-merge; it defers for re-validation instead."""
+    from app.rollup_management import _check_and_trigger_rollup
+
+    _mock_rollup_merge_conflict_deps(mocker, mergeable_state="blocked")
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=_files("backend/alembic/versions/0140_add_widget.py"),
+    )
+    # Force the pre-merge combined-chain guard to "ok" so flow reaches the
+    # post-merge-failure auto-merge branch where pr_touches_migrations is checked
+    # (otherwise the migration file makes it defer on the unmocked diff fetch).
+    mocker.patch(
+        "app.rollup_management._validate_rollup_migration_chain",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
+    )
+    enable_auto_merge_mock = mocker.patch(
+        "app.github.enable_auto_merge",
+        new_callable=AsyncMock,
+        return_value={"enabled": True},
+    )
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    enable_auto_merge_mock.assert_not_called()
+    await cleanup_db.refresh(parent)
+    assert (parent.context or {}).get("_merge_deferred_state") == "blocked"
 
 
 @pytest.mark.asyncio
@@ -388,6 +516,181 @@ async def test_unfetchable_migration_diff_defers_failsafe(cleanup_db, mocker):
     await cleanup_db.refresh(parent)
     assert parent.status == TaskStatus.EVALUATING
     assert parent.requires_approval is False
+
+
+@pytest.mark.asyncio
+async def test_head_collision_single_migration_auto_renumbers_and_defers(
+    cleanup_db, mocker
+):
+    """A rollup whose ONLY blocker is a single added migration colliding with the
+    target branch head is auto-renumbered: the reconcile commit (renamed migration
+    + bumped EXPECTED_SCHEMA_REVISION) is pushed to the STAGING branch and the
+    rollup is deferred one sweep — NOT merged, NO operator/re-chain fix spawned,
+    NOT held for approval. A per-PR reconcile counter is stamped so a
+    non-converging block cannot loop forever. Applied history stays immutable:
+    only the not-yet-merged staging branch is rewritten."""
+    diff = _added_file_diff("backend/alembic/versions/0124_a.py", "0124", "0123")
+    mock_merge, mock_spawn = _mock_automerge_deps(
+        mocker,
+        pr_files=_files("backend/alembic/versions/0124_a.py"),
+        diff=diff,
+    )
+    # Target branch already has 0124 → the added 0124 collides with the head.
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new_callable=AsyncMock,
+        return_value=["0123_base.py", "0124_taken.py"],
+    )
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new_callable=AsyncMock,
+        return_value='EXPECTED_SCHEMA_REVISION = "0124"\n',
+    )
+    mock_commit = mocker.patch(
+        "app.github.commit_file_changes", new_callable=AsyncMock, return_value=True
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_commit.assert_awaited_once()
+    mock_merge.assert_not_awaited()
+    mock_spawn.assert_not_called()
+    # Rewrite lands on the staging branch (research/conflict-stg), never the target.
+    assert mock_commit.await_args.args[3] == "research/conflict-stg"
+    upserts = mock_commit.await_args.kwargs["upserts"]
+    deletes = mock_commit.await_args.kwargs["deletes"]
+    # Renumbered onto the next free revision after the head (0124 → 0125).
+    assert "backend/alembic/versions/0125_a.py" in upserts
+    assert "backend/app/main.py" in upserts
+    assert '"0125"' in upserts["backend/app/main.py"]
+    assert "backend/alembic/versions/0124_a.py" in deletes
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    assert parent.requires_approval is False
+    ctx = parent.context or {}
+    assert ctx.get("_alembic_autoreconcile_pr") == 4242
+    assert ctx.get("_alembic_autoreconcile_count") == 1
+
+
+@pytest.mark.asyncio
+async def test_head_collision_multi_migration_auto_renumbers_full_tail_and_defers(
+    cleanup_db, mocker
+):
+    """A rollup bundling SEVERAL chained migrations (multiple subtasks) whose
+    oldest collides with the target head is auto-reconciled at parity with the
+    single-migration case: the colliding migration AND its full linear
+    descendant tail are renumbered monotonically into a contiguous block, the
+    reconcile commit (all renamed migrations + bumped EXPECTED_SCHEMA_REVISION)
+    is pushed to the STAGING branch, and the rollup is deferred one sweep — NOT
+    merged, NO operator/re-chain fix spawned."""
+    # Branch-time head was 0123; subtasks cut 0124 (down 0123) and 0125 (down
+    # 0124). Target advanced to head 0124, so the oldest 0124 collides.
+    diff = _added_file_diff(
+        "backend/alembic/versions/0124_a.py", "0124", "0123"
+    ) + _added_file_diff("backend/alembic/versions/0125_b.py", "0125", "0124")
+    mock_merge, mock_spawn = _mock_automerge_deps(
+        mocker,
+        pr_files=_files(
+            "backend/alembic/versions/0124_a.py",
+            "backend/alembic/versions/0125_b.py",
+        ),
+        diff=diff,
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new_callable=AsyncMock,
+        return_value=["0123_base.py", "0124_taken.py"],
+    )
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new_callable=AsyncMock,
+        return_value='EXPECTED_SCHEMA_REVISION = "0124"\n',
+    )
+    mock_commit = mocker.patch(
+        "app.github.commit_file_changes", new_callable=AsyncMock, return_value=True
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_commit.assert_awaited_once()
+    mock_merge.assert_not_awaited()
+    mock_spawn.assert_not_called()
+    assert mock_commit.await_args.args[3] == "research/conflict-stg"
+    upserts = mock_commit.await_args.kwargs["upserts"]
+    deletes = mock_commit.await_args.kwargs["deletes"]
+    # The whole chain renumbered above max(0125) → 0126, 0127; main.py bumped to
+    # the new head 0127.
+    assert "backend/alembic/versions/0126_a.py" in upserts
+    assert "backend/alembic/versions/0127_b.py" in upserts
+    assert "backend/app/main.py" in upserts
+    assert '"0127"' in upserts["backend/app/main.py"]
+    # Both old paths deleted so the rename is clean.
+    assert "backend/alembic/versions/0124_a.py" in deletes
+    assert "backend/alembic/versions/0125_b.py" in deletes
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    assert parent.requires_approval is False
+    ctx = parent.context or {}
+    assert ctx.get("_alembic_autoreconcile_pr") == 4242
+    assert ctx.get("_alembic_autoreconcile_count") == 1
+
+
+@pytest.mark.asyncio
+async def test_head_collision_autoreconcile_cap_falls_back_to_fix(cleanup_db, mocker):
+    """Once the per-PR auto-reconcile counter reaches the cap, a still-blocked
+    rollup stops re-renumbering and falls back to the conservative operator-alert /
+    re-chain fix path instead of looping the mechanical rewrite forever."""
+    diff = _added_file_diff("backend/alembic/versions/0124_a.py", "0124", "0123")
+    mock_merge, mock_spawn = _mock_automerge_deps(
+        mocker,
+        pr_files=_files("backend/alembic/versions/0124_a.py"),
+        diff=diff,
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new_callable=AsyncMock,
+        return_value=["0123_base.py", "0124_taken.py"],
+    )
+    mock_commit = mocker.patch("app.github.commit_file_changes", new_callable=AsyncMock)
+
+    from app.rollup_management import (
+        _ALEMBIC_AUTORECONCILE_CAP,
+        _check_and_trigger_rollup,
+    )
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(
+        cleanup_db,
+        project.id,
+        extra_context={
+            "_alembic_autoreconcile_pr": 4242,
+            "_alembic_autoreconcile_count": _ALEMBIC_AUTORECONCILE_CAP,
+        },
+    )
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    # Cap reached → no further renumber; fall back to the re-chain fix path.
+    mock_commit.assert_not_awaited()
+    mock_merge.assert_not_awaited()
+    mock_spawn.assert_awaited_once()
+    assert mock_spawn.await_args.args[1] == "fix"
+    await cleanup_db.refresh(parent)
+    assert parent.requires_approval is True
+    assert parent.status == TaskStatus.EVALUATING
 
 
 # ---------------------------------------------------------------------------
@@ -1162,6 +1465,11 @@ async def test_admin_rollup_merge_to_promotion_target_proceeds_unqualified(
     )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
     mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+    # The pre-merge Alembic dual-head guard lists the PR's files; this rollup
+    # touches no migrations, so an empty list yields an "ok" verdict and the
+    # merge proceeds. Without the mock the guard's GitHub call 401s and the
+    # fail-safe "defer" verdict would wrongly refuse this merge.
+    mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
@@ -1208,6 +1516,9 @@ async def test_admin_rollup_hotfix_to_promotion_target_merges(cleanup_db, mocker
     )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
     mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+    # See sibling test: empty PR-file list → "ok" Alembic guard verdict so the
+    # hotfix merge proceeds instead of hitting the fail-safe "defer" refusal.
+    mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
     mocker.patch(
         "app.admin_task_mutations._maybe_spawn_rollup_smoketest", new_callable=AsyncMock
     )

@@ -11,10 +11,12 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
+
+from app.database import resolve_dialect_name
 
 from app.models import (
     Project,
@@ -350,12 +352,20 @@ async def compute_remediation_funnel(
     )
     _inv_tasks = _inv_result.scalars().all()
     # R4-W2 (M3): ``has_key`` uses the JSONB ``?`` operator so the
-    # ``ix_task_context_gin`` GIN index can satisfy the predicate.
+    # ``ix_task_context_gin`` GIN index can satisfy the predicate. ``?`` is
+    # Postgres-only, so branch on the resolved dialect and fall back to the
+    # portable ``json_extract`` IS NOT NULL form on SQLite.
+    if resolve_dialect_name(session) == "postgresql":
+        _diagnosis_present = Task.context.has_key("diagnosis_task_id")
+    else:
+        _diagnosis_present = func.json_extract(
+            Task.context, "$.diagnosis_task_id"
+        ).isnot(None)
     _rem_result = await session.execute(
         select(Task)
         .where(
             *_funnel_filters,
-            Task.context.has_key("diagnosis_task_id"),
+            _diagnosis_present,
         )
         .limit(10000)
     )
@@ -617,11 +627,19 @@ async def compute_remediation_funnel(
     }
 
     # R4-W2 (M3): ``has_key`` uses the JSONB ``?`` operator so the
-    # ``ix_task_context_gin`` GIN index can satisfy the predicate.
+    # ``ix_task_context_gin`` GIN index can satisfy the predicate. ``?`` is
+    # Postgres-only, so branch on the resolved dialect and fall back to the
+    # portable ``json_extract`` IS NOT NULL form on SQLite.
+    if resolve_dialect_name(session) == "postgresql":
+        _cum_diagnosis_present = Task.context.has_key("diagnosis_task_id")
+    else:
+        _cum_diagnosis_present = func.json_extract(
+            Task.context, "$.diagnosis_task_id"
+        ).isnot(None)
     _cum_filters = [
         Task.status == TaskStatus.COMPLETED,
         or_(
-            Task.context.has_key("diagnosis_task_id"),
+            _cum_diagnosis_present,
             Task.auto_remediation.is_(True),  # promoted column (audit W1)
         ),
         landed_signal_predicate(session),

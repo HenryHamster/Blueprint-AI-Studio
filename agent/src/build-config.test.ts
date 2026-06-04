@@ -274,12 +274,15 @@ describe('resolveBuildConfig', () => {
     expect(resolveBuildConfig(task)).toBeUndefined();
   });
 
-  it('rejects shell-unsafe directory paths and command values', () => {
+  it('drops shell-unsafe directory PATHS but retains shell-composed COMMANDS verbatim', () => {
     const task = {
       build_config: {
         directories: [
+          // unsafe PATH → whole directory dropped (path is interpolated as a cwd)
           { path: 'svc$(whoami)`rm`;echo|cat&', type: 'node', lint_cmd: 'npm run lint' },
           { path: 'backend', type: 'python', build_cmd: 'python -m build' },
+          // unsafe COMMAND no longer drops the dir — the command is retained so
+          // the backend's tests_gated decision and the agent's gate agree.
           { path: 'worker', type: 'python', install_cmd: 'pip install -e . && echo bad' },
         ],
       },
@@ -287,6 +290,24 @@ describe('resolveBuildConfig', () => {
     expect(resolveBuildConfig(task)).toEqual({
       directories: [
         { path: 'backend', type: 'python', build_cmd: 'python -m build' },
+        { path: 'worker', type: 'python', install_cmd: 'pip install -e . && echo bad' },
+      ],
+    });
+  });
+
+  it('retains quoted and shell-composed test commands so the gate can run them', () => {
+    const task = {
+      build_config: {
+        directories: [
+          { path: 'svc', type: 'python', test_cmd: 'pytest -k "not slow"' },
+          { path: 'core', type: 'go', test_cmd: 'go test ./... && go vet ./...' },
+        ],
+      },
+    };
+    expect(resolveBuildConfig(task)).toEqual({
+      directories: [
+        { path: 'svc', type: 'python', test_cmd: 'pytest -k "not slow"' },
+        { path: 'core', type: 'go', test_cmd: 'go test ./... && go vet ./...' },
       ],
     });
   });

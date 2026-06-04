@@ -16,12 +16,13 @@ from datetime import timedelta
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.auth import require_admin
-from app.database import get_session
+from app.database import get_session, resolve_dialect_name
 from app.models import (
     ResidualRemediationCase,
     ResidualRemediationCaseStatus,
@@ -60,9 +61,20 @@ async def get_residual_fingerprints(
     if project_id:
         filters.append(Task.project_id == project_id)
 
+    # ``~has_key`` compiles to the Postgres-only JSONB ``?`` (key-existence)
+    # operator, which raises ``sqlite3.OperationalError`` on the SQLite smoke
+    # gate. Branch on the resolved dialect and fall back to the portable
+    # ``json_extract`` IS NULL form for the key-absence check on SQLite.
+    if resolve_dialect_name(session) == "postgresql":
+        _no_failure_category = ~Task.context.has_key("failure_category")
+    else:
+        _no_failure_category = func.json_extract(
+            Task.context, "$.failure_category"
+        ).is_(None)
+
     result = await session.execute(
         select(Task)
-        .where(*filters, ~Task.context.has_key("failure_category"))
+        .where(*filters, _no_failure_category)
         .options(
             load_only(
                 Task.id,

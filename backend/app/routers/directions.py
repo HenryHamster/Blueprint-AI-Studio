@@ -17,6 +17,7 @@ from app.models import (
     TaskHistory,
     ProjectMessage,
     MessageType,
+    MESSAGE_CONTENT_MAX,
     RECOMMENDED_MODE_META_KEY,
     _utcnow,
 )
@@ -25,6 +26,7 @@ from app.admin import _get_user_project, _get_user_project_with_role
 from app.payload_schemas import validate_internal_payload
 from app.task_locking import lock_project_or_429, with_directions_locked
 from app.direction_lifecycle import _reset_outcome_detection_state
+from app.strategic_events import STRATEGIC_KIND_DIRECTIONS, emit_strategic_updated
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +90,9 @@ async def get_directions(
     from app.strategic_completion import (
         _compute_churn_metrics,
         _compute_lifetime_burn_metrics,
+    )  # noqa: PLC0415
+    from app.running_update_merge import (
+        summarize_running_update_reconciliation,
     )  # noqa: PLC0415
 
     project = await _get_user_project(project_id, current_user["user_id"], session)
@@ -157,6 +162,9 @@ async def get_directions(
             project.running_update_acknowledged_at.isoformat()
             if project.running_update_acknowledged_at
             else None
+        ),
+        "running_update_reconciliation": summarize_running_update_reconciliation(
+            project.vision
         ),
         "self_reflection_log": project.self_reflection_log or [],
         "is_self_repo": bool(project.is_self_repo),
@@ -232,6 +240,7 @@ async def add_direction(
             headers={"Retry-After": "2"},
         )
     await session.commit()
+    await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
 
     return {"direction": direction}
 
@@ -314,6 +323,7 @@ async def replace_directions(
             headers={"Retry-After": "2"},
         )
     await session.commit()
+    await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
     return {"directions": normalized}
 
 
@@ -383,6 +393,7 @@ async def remove_direction(
             vm_ids_to_delete.append(t.vm_instance_id)
 
     await session.commit()
+    await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
 
     # Delete VMs for cancelled tasks (after commit)
     for vm_id in vm_ids_to_delete:
@@ -433,6 +444,7 @@ async def reorder_directions(
             headers={"Retry-After": "2"},
         )
     await session.commit()
+    await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
     return {"directions": reordered}
 
 
@@ -736,6 +748,7 @@ async def update_direction(
             headers={"Retry-After": "2"},
         )
     await session.commit()
+    await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
     return {"direction": updated_direction[0]}
 
 
@@ -1010,9 +1023,10 @@ async def create_message(
     project = await _get_user_project(project_id, user["user_id"], session)
     if not payload.content.strip():
         raise HTTPException(status_code=400, detail="Content cannot be empty")
-    if len(payload.content) > 5000:
+    if len(payload.content) > MESSAGE_CONTENT_MAX:
         raise HTTPException(
-            status_code=400, detail="Content exceeds 5000 character limit"
+            status_code=400,
+            detail=f"Content exceeds {MESSAGE_CONTENT_MAX} character limit",
         )
 
     try:
@@ -1032,7 +1046,31 @@ async def create_message(
     await session.commit()
     await session.refresh(msg)
 
-    return {"id": str(msg.id), "status": "created"}
+    # An operator message that warrants strategist attention (steering /
+    # feedback / question / blocker — anything but a passive NOTE) arms the
+    # coalescing strategic-refresh marker so the autonomous loop wakes the
+    # strategist promptly (bypassing strategic_spawn_cooldown) instead of
+    # waiting for the next scheduled cycle. Routed through the shared gate so
+    # this CLI path and the canonical live-chat endpoint
+    # (admin_notifications.create_message) can never diverge again. Best-effort
+    # and coalescing: the helper does not commit (we own the txn), swallows its
+    # own errors so message creation never fails on it, and the min-interval
+    # floor + failure breaker keep a burst of messages from storming spawns.
+    #
+    # The gate returns the truthful arming outcome (steering / passive note /
+    # routine event, or ``not_armed`` when a genuine steering message could not
+    # persist its marker under row contention). Surfaced verbatim and committed
+    # only on a real arm, identically to admin_notifications.create_message, so
+    # the two endpoints cannot diverge.
+    from app.strategic_trigger import ARMING_STEERING, maybe_arm_operator_refresh
+
+    arming = await maybe_arm_operator_refresh(
+        session, project.id, msg_type, message_content=payload.content.strip()
+    )
+    if arming == ARMING_STEERING:
+        await session.commit()
+
+    return {"id": str(msg.id), "status": "created", "arming": arming}
 
 
 @router.get("/projects/{project_id}/messages")

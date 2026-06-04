@@ -318,6 +318,107 @@ async def _maybe_create_failure_alert(
         logger.warning(f"[NOTIFY] TASK_FAILED dispatch setup failed: {_ne}")
 
 
+# Human-readable labels for the no-CI UNVERIFIED-merge reasons. The orchestrator
+# writes the reason KEY into review_loop["unverified_merge_reason"] at the two
+# UNVERIFIED decision sites, so keep these keys stable. The reason is NOT part of
+# the dedup title (the PR number is), so the label only shapes the message text.
+_UNVERIFIED_REASON_LABELS = {
+    "no_detectable_test_command": "no runnable test command could be detected",
+    "kill_switch_off": "the no-CI test-gate is disabled (kill-switch off)",
+    "internal_staging_base": (
+        "the PR targets an internal staging branch (CI is path-filtered there)"
+    ),
+    "undetected_runtime": "the detected test suite produced no usable verdict",
+    "verify_setup_failed": (
+        "the detected test suite exists but could not be run "
+        "(setup/runner infrastructure failed after retries)"
+    ),
+}
+
+
+async def _maybe_create_unverified_merge_alert(
+    task: "Task",
+    session: AsyncSession,
+    *,
+    pr_number: "int | None",
+    reason: str,
+    severity: AlertSeverity = AlertSeverity.WARNING,
+) -> None:
+    """Create a deduplicated operator Alert when a no-CI merge proceeds UNVERIFIED.
+
+    For repos with no required CI checks, Blueprint runs the repo's own detected
+    tests as the merge gate. The 'undetected' verdict — no detectable test
+    command, the gate kill-switch off, an internal staging base, or a verify run
+    that produced no usable verdict — falls back to merging the PR WITHOUT test
+    verification so genuinely test-less repos still make progress. That fallback
+    was previously info-log only; this surfaces it in the same Alerts banner as
+    other pipeline escalations so the operator who turned off 'required CI checks'
+    learns that a specific merge proceeded with zero test verification, and why.
+
+    The PASS and FAIL verdicts gate correctly and never reach here — only the
+    UNVERIFIED merge does. Alerting only; it does not change the merge outcome.
+
+    Deduplicated by ``(task_id, title)`` where the title encodes the PR number
+    (NOT the reason), so a single unverified merge raises exactly ONE alert even
+    if a later merge sweep re-enters the path. ``task`` should be the chain task
+    so the alert is task-linked (renders a "View task" button in the banner).
+    """
+    label = _UNVERIFIED_REASON_LABELS.get(reason, reason)
+    pr_label = f"PR #{pr_number}" if pr_number is not None else "PR"
+    title = f"Merged UNVERIFIED: {pr_label} — no test verification"
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task.id,
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    alert = Alert(
+        project_id=task.project_id,
+        severity=severity,
+        title=title,
+        message=(
+            f"{pr_label} merged without test verification because {label}. "
+            f"This project has no required CI checks, so Blueprint runs the "
+            f"repo's own detected tests as the merge gate — this merge proceeded "
+            f"UNVERIFIED. Review the merge if test coverage was expected."
+        ),
+        task_id=task.id,
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(task.project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": severity.value,
+            "title": alert.title,
+        },
+    )
+    try:
+        from app.notification_dispatch import dispatch_external_notification
+        import asyncio as _asyncio
+
+        _asyncio.ensure_future(  # noqa: RUF006  # fire-and-forget; caller does not await
+            dispatch_external_notification(
+                task.project_id,
+                "MERGE_UNVERIFIED",
+                {
+                    "task_id": str(task.id),
+                    "task_title": task.title or str(task.id)[:8],
+                    "pr_number": pr_number,
+                    "reason": reason,
+                    "reason_label": label,
+                },
+            )
+        )
+    except Exception as _ne:
+        logger.warning(f"[NOTIFY] MERGE_UNVERIFIED dispatch setup failed: {_ne}")
+
+
 async def _maybe_create_circuit_breaker_alert(
     project_id: "uuid.UUID",
     session: AsyncSession,
@@ -514,7 +615,7 @@ async def _maybe_create_precondition_blocker_alert(
     blocker_kind: str,
     detail: str,
     severity: AlertSeverity = AlertSeverity.WARNING,
-) -> None:
+) -> bool:
     """Create a deduplicated operator Alert for a persistent precondition blocker.
 
     Fires when a *recognized* precondition blocker won't clear on its own: a
@@ -533,6 +634,14 @@ async def _maybe_create_precondition_blocker_alert(
     rollup title), so a blocker that persists across many dispatch cycles
     raises exactly ONE alert. A genuinely *different* blocker on the same task
     (distinct ``blocker_kind``) gets its own alert.
+
+    Commit boundary: when it inserts a new alert this helper commits ONLY its
+    own ``Alert`` row — it does NOT own, and must not be relied on to flush, any
+    pending task mutation the caller staged. Callers that park a task into
+    ``BLOCKED`` (``orchestrator_filters._record_defer_and_maybe_escalate``,
+    ``task_lifecycle_requeue``) commit that transition themselves BEFORE calling
+    here, so the durability of the task state never depends on whether this
+    helper happened to create an alert (and therefore commit) this cycle.
     """
     title = f"Precondition blocker: {blocker_kind}"[:200]
     existing = await session.execute(
@@ -543,7 +652,7 @@ async def _maybe_create_precondition_blocker_alert(
         )
     )
     if existing.scalars().first() is not None:
-        return
+        return False
     alert = Alert(
         project_id=task.project_id,
         severity=severity,
@@ -559,6 +668,60 @@ async def _maybe_create_precondition_blocker_alert(
         {
             "alert_id": str(alert.id),
             "severity": severity.value,
+            "title": alert.title,
+        },
+    )
+    return True
+
+
+async def _maybe_create_blocked_escalation_alert(
+    task: "Task",
+    session: AsyncSession,
+    *,
+    blocker_kind: str,
+    detail: str,
+) -> None:
+    """Create ONE deduplicated ERROR alert for a permanently-stuck BLOCKED task.
+
+    The terminal escalation path of the unblock sweep
+    (``reaper_sweeps.sweep_unblock_blocked_tasks``): when a BLOCKED task's
+    precondition is genuinely unsatisfiable (its dependency cascade-cancelled)
+    or its blocker outlives the escalation deadline, the sweep stops rechecking
+    and raises this alert so the operator can intervene (requeue, re-scope, or
+    cancel). It is distinct from ``_maybe_create_precondition_blocker_alert``
+    (a WARNING raised the moment a blocker first persists) — this ERROR means
+    "automatic recovery has given up".
+
+    Deduplicated by ``(task_id, title)`` against undismissed alerts, where the
+    title encodes ``blocker_kind``, so the deadline/dead-dependency escalation
+    fires exactly once per blocked task and does not re-fire while the operator
+    still has the alert open.
+    """
+    title = f"Task permanently blocked: {blocker_kind}"[:200]
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task.id,
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    alert = Alert(
+        project_id=task.project_id,
+        severity=AlertSeverity.ERROR,
+        title=title,
+        message=detail[:1000],
+        task_id=task.id,
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(task.project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.ERROR.value,
             "title": alert.title,
         },
     )

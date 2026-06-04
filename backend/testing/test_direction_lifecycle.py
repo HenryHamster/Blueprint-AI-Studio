@@ -965,7 +965,6 @@ async def test_process_lifecycle_churn_pause_emits_blocker_notification(
     )
 
     # A BLOCKER ProjectMessage with event_type='direction_churn_pause' must be present
-    from sqlmodel import select
 
     msgs = (
         (
@@ -1476,7 +1475,6 @@ async def test_lifecycle_clears_outcome_scaffolding_when_progress_resumes(
 async def test_scaffolding_memo_spawned_on_first_flag(db_session, mocker):
     """A memo task is spawned the first time a direction is flagged as outcome-less scaffolding."""
     from unittest.mock import AsyncMock
-    from sqlmodel import select
 
     mocker.patch(
         "app.notification_dispatch.post_direction_outcome_stalled_message",
@@ -1526,7 +1524,6 @@ async def test_scaffolding_memo_spawned_on_first_flag(db_session, mocker):
 async def test_scaffolding_memo_not_respawned_on_evidence_refresh(db_session, mocker):
     """No additional memo is spawned on subsequent lifecycle passes while the flag is still set."""
     from unittest.mock import AsyncMock
-    from sqlmodel import select
 
     mocker.patch(
         "app.notification_dispatch.post_direction_outcome_stalled_message",

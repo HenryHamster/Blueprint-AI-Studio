@@ -53,6 +53,9 @@ export function useAppState() {
 
   // ── Shared refs (cross-domain glue owned by the facade) ──────────────────
   const fetchTasksRef = useRef<() => Promise<void>>(async () => {});
+  // Populated by useDirectionsData (when the directions panel is mounted) so the
+  // shared WS handler in useLogViewer can live-refresh the directions view.
+  const fetchDirectionsRef = useRef<() => void>(() => {});
   const defaultTaskBranchRef = useRef<string | null>(null);
   const selectedProjectRepoRef = useRef<string | null>(null);
   const prevTasksRef = useRef<Task[]>([]);
@@ -72,8 +75,9 @@ export function useAppState() {
     handleViewLogs, closeLogViewer,
     wsRef, wsConnected,
     pipelineThrottle,
+    strategistActive,
     trackedTaskIds, trackedLogs, trackTask, untrackTask, untrackAll,
-  } = useLogViewer({ fetchTasksRef, setDeployState });
+  } = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, selectedProjectId });
 
   const { searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter, stuckMinSeconds, setStuckMinSeconds, failureClassFilter, setFailureClassFilter } = useSearchFilters();
 
@@ -605,6 +609,7 @@ export function useAppState() {
     githubAccount, connectGitHub,
     // Directions
     showDirections, setShowDirections,
+    fetchDirectionsRef, strategistActive,
     // Metrics
     showMetrics, setShowMetrics, metricsHistory, cumulativeCost, cumulativeVmHours, metricsWindow, setMetricsWindow,
     // Archive

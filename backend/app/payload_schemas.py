@@ -376,6 +376,18 @@ def _enforce_payload_size(payload: dict) -> None:
 _TIER_RANK: dict[str, int] = {"critical": 1000, "high": 100, "medium": 10, "low": 1}
 
 
+# Pre-trim marker key. A section may be shortened *before* the byte-budget
+# packer ever runs — e.g. each active gap's append-only ``history`` /
+# ``past_moves`` in the strategic ``problem_model`` is trimmed to a recent
+# window in ``strategic_spawning._agent_view_problem_model``. That trim never
+# flows through the packer's own summarize/drop path, so it would never appear
+# in ``_packer_meta`` and the agent would mistake the shortened view for the
+# gap's complete arc. ``pack_under_budget`` reflects any such marker found on a
+# packed value into ``_packer_meta`` so the agent inspects ONE channel — the
+# same one it already reads to decide whether to ``./fetch`` fuller detail.
+_PRE_TRIM_MARKER_KEY = "_gap_memory_trimmed"
+
+
 def _serialized_size(v: Any) -> int:
     """Serialized JSON byte length of *v* using the project-standard `default=str`."""
     return len(json.dumps(v, default=str).encode())
@@ -539,11 +551,23 @@ def pack_under_budget(
                 }
             )
 
+    # Surface any pre-trim marker carried on a shipped section into the packer
+    # metadata. The packed section still holds its own marker, but reflecting it
+    # here gives the agent a single fetch-decision channel even for trims the
+    # packer itself never performed (see _PRE_TRIM_MARKER_KEY).
+    gap_memory_trimmed: list[dict] = []
+    for key, value in packed.items():
+        if isinstance(value, dict):
+            marker = value.get(_PRE_TRIM_MARKER_KEY)
+            if isinstance(marker, list) and marker:
+                gap_memory_trimmed.append({"key": key, "gaps": marker})
+
     packed["_packer_meta"] = {
         "budget_total": budget,
         "budget_used": used,
         "trimmed": trimmed,
         "dropped": dropped,
+        "gap_memory_trimmed": gap_memory_trimmed,
     }
     return packed
 

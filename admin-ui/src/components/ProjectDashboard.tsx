@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { ChevronDown, ChevronUp, FolderKanban, GitBranch, Compass, UserPlus, Plus, Settings, MoreVertical, Trash2, AlertTriangle, RotateCcw, Pause, Play, Archive, ArchiveRestore } from 'lucide-react';
 import type { Task } from './TaskCard';
-import { parseTimestamp } from '../utils/time';
+import { formatAbsolute, parseTimestamp } from '../utils/time';
 import { projectStatusBadge } from '../utils/projectStatus';
 import { ProjectApprovalGateSection } from './ProjectApprovalGateSection';
 import { fetchApprovalGateConfig, updateApprovalGateConfig, deleteProject, resetProject, setProjectPaused, archiveProject, unarchiveProject, fetchArchivedProjects, type ApprovalGateConfigResponse } from '../api';
@@ -52,9 +52,70 @@ function getTaskCounts(tasks: Task[], projectId: string) {
     queued: projectTasks.filter(t => t.status === 'QUEUED').length,
     running: projectTasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length,
     evaluating: projectTasks.filter(t => t.status === 'EVALUATING').length,
+    blocked: projectTasks.filter(t => t.status === 'BLOCKED').length,
     failed: projectTasks.filter(t => t.status === 'FAILED').length,
     completed: projectTasks.filter(t => t.status === 'COMPLETED').length,
     total: projectTasks.length,
+  };
+}
+
+function humanizeMergeGateReason(reason: string): string {
+  return reason.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function getMergeGateBadge(project: Project) {
+  const verdict = project.merge_verification_verdict ?? { state: 'ci_checks' as const, test_commands: [] };
+  const buildConfig = project.build_config ?? null;
+  const runtime = project.merge_gate_runtime ?? null;
+  const lastVerifiedAt = runtime?.executed_real_tests && runtime.last_run_at ? parseTimestamp(runtime.last_run_at) : null;
+  const lastUnverifiedAt = runtime?.last_unverified_at ? parseTimestamp(runtime.last_unverified_at) : null;
+  const lastUnverifiedReason = runtime?.last_unverified_reason ? humanizeMergeGateReason(runtime.last_unverified_reason) : null;
+  const runtimeMismatch = verdict.state === 'tests_gated' && Boolean(lastUnverifiedAt && (!lastVerifiedAt || lastUnverifiedAt.getTime() > lastVerifiedAt.getTime()));
+
+  if (
+    verdict.state === 'ci_checks' &&
+    buildConfig?.has_ci === false &&
+    buildConfig.requires_ci_checks !== false
+  ) {
+    return {
+      label: 'Stall risk',
+      classes: 'bg-red-500/15 text-red-300 border-red-500/20',
+      title: 'No CI detected while required CI checks remain on. PRs will stall until the merge backstop times out.',
+    };
+  }
+
+  if (verdict.state === 'tests_gated') {
+    if (runtimeMismatch) {
+      return {
+        label: 'Tests gated?',
+        classes: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
+        title: `Config says tests-gated, but the last live merge fell back to UNVERIFIED${lastUnverifiedAt ? ` at ${formatAbsolute(lastUnverifiedAt.getTime())}` : ''}${lastUnverifiedReason ? ` because ${lastUnverifiedReason}.` : '.'}${lastVerifiedAt ? ` Last verified real-test run: ${formatAbsolute(lastVerifiedAt.getTime())}.` : ''}`,
+        runtimeState: 'unverified-fallback',
+      };
+    }
+
+    return {
+      label: 'Tests gated',
+      classes: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/20',
+      title: `Blueprint will run the project's detected test command(s) before merging PRs.${lastVerifiedAt ? ` Last verified real-test run: ${formatAbsolute(lastVerifiedAt.getTime())}.` : ''}`,
+      runtimeState: lastVerifiedAt ? 'verified' : (runtime ? 'unknown' : 'absent'),
+    };
+  }
+
+  if (verdict.state === 'unverified') {
+    return {
+      label: 'UNVERIFIED',
+      classes: 'bg-yellow-500/15 text-yellow-300 border-yellow-500/30',
+      title: `No test command was detected. PRs merge without verification.${lastUnverifiedAt ? ` Last live merge fell back to UNVERIFIED at ${formatAbsolute(lastUnverifiedAt.getTime())}.${lastUnverifiedReason ? ` Reason: ${lastUnverifiedReason}.` : ''}` : ''}`,
+      runtimeState: lastUnverifiedAt ? 'unverified' : (runtime ? 'unknown' : 'absent'),
+    };
+  }
+
+  return {
+    label: 'CI gated',
+    classes: 'bg-blue-500/15 text-blue-300 border-blue-500/20',
+    title: "Blueprint will wait for the repository's GitHub CI checks before merging PRs.",
+    runtimeState: runtime ? 'unknown' : 'absent',
   };
 }
 
@@ -372,6 +433,18 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                         </span>
                       );
                     })()}
+                    {(() => {
+                      const badge = getMergeGateBadge(project);
+                      return (
+                          <span
+                          className={`flex items-center gap-0.5 text-[9px] font-bold rounded px-1 py-0.5 border ${badge.classes}`}
+                          title={badge.title}
+                          data-runtime-state={badge.runtimeState}
+                        >
+                          {badge.label}
+                        </span>
+                      );
+                    })()}
                     {project.paused && (
                       <span
                         className="flex items-center gap-0.5 text-[9px] font-bold rounded px-1 py-0.5 bg-orange-500/15 text-orange-400 border border-orange-500/20"
@@ -618,6 +691,7 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                     {counts.queued > 0 && <span className="text-neutral-400">{counts.queued} queued</span>}
                     {counts.running > 0 && <span className="text-blue-400">{counts.running} running</span>}
                     {counts.evaluating > 0 && <span className="text-amber-400">{counts.evaluating} evaluating</span>}
+                    {counts.blocked > 0 && <span className="text-amber-500">{counts.blocked} blocked</span>}
                     {counts.failed > 0 && <span className="text-red-400">{counts.failed} failed</span>}
                     {counts.completed > 0 && <span className="text-emerald-400">{counts.completed} done</span>}
                     {counts.total === 0 && <span className="text-neutral-600">no tasks</span>}

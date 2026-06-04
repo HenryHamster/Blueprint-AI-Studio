@@ -1,0 +1,184 @@
+[
+  {
+    "name": "bash_missing_runner",
+    "category": "command-not-found",
+    "genuine_suite": false,
+    "expected": "no_tests",
+    "output": "bash: pytest: command not found"
+  },
+  {
+    "name": "zsh_missing_runner",
+    "category": "command-not-found",
+    "genuine_suite": false,
+    "expected": "no_tests",
+    "output": "zsh: command not found: pytest"
+  },
+  {
+    "name": "yarn_missing_test_script",
+    "category": "command-not-found",
+    "genuine_suite": false,
+    "expected": "no_tests",
+    "output": "error Command \"test\" not found."
+  },
+  {
+    "name": "failing_suite_command_in_test_id_not_found_assertion",
+    "category": "command-not-found",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "FAILED test_command_parser\nE   KeyError: 'x' not found\n1 failed in 0.31s"
+  },
+  {
+    "name": "failing_suite_404_not_found_body",
+    "category": "command-not-found",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "FAILED test_command_router - assert 404 == 200, body was '404 Not Found'\n1 failed in 0.12s"
+  },
+  {
+    "name": "npm_missing_script",
+    "category": "missing-script",
+    "genuine_suite": false,
+    "expected": "no_tests",
+    "output": "npm ERR! Missing script: \"test\"\nnpm ERR! Test failed."
+  },
+  {
+    "name": "npm_no_test_specified_placeholder",
+    "category": "no-test-specified",
+    "genuine_suite": false,
+    "expected": "no_tests",
+    "output": "> demo@1.0.0 test\n> echo \"Error: no test specified\" && exit 1\n\nError: no test specified\nnpm ERR! Test failed."
+  },
+  {
+    "name": "make_missing_target_backtick",
+    "category": "make-target",
+    "genuine_suite": false,
+    "expected": "no_tests",
+    "output": "make: *** No rule to make target `test'. Stop."
+  },
+  {
+    "name": "make_missing_target_single_quote",
+    "category": "make-target",
+    "genuine_suite": false,
+    "expected": "no_tests",
+    "output": "make: *** No rule to make target 'test'. Stop."
+  },
+  {
+    "name": "pytest_collected_zero_items",
+    "category": "zero-test",
+    "genuine_suite": false,
+    "expected": "no_tests",
+    "output": "collected 0 items\n\nno tests ran in 0.01s"
+  },
+  {
+    "name": "pytest_collected_zero_items_with_error",
+    "category": "zero-test",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "collected 0 items / 1 error\n\nERROR tests/test_import.py - ImportError: cannot import name foo\n1 error in 0.01s"
+  },
+  {
+    "name": "rust_zero_test_summary",
+    "category": "zero-test",
+    "genuine_suite": false,
+    "expected": "no_tests",
+    "output": "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+  },
+  {
+    "name": "go_no_test_files_only",
+    "category": "zero-test",
+    "genuine_suite": false,
+    "expected": "no_tests",
+    "output": "?   \texample.com/pkg\t[no test files]"
+  },
+  {
+    "name": "pytest_real_pass_with_collected_count",
+    "category": "zero-test",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "collected 3 items\n\ntest_widget.py ...                                          [100%]\n\n3 passed in 0.52s"
+  },
+  {
+    "name": "rust_mixed_zero_and_real_module",
+    "category": "zero-test",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\nrunning 5 tests\ntest cases::add ... ok\ntest cases::sub ... ok\ntest cases::mul ... ok\ntest cases::div ... ok\ntest cases::mod ... ok\n\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s"
+  },
+  {
+    "name": "go_real_pass_package",
+    "category": "zero-test",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "ok  \texample.com/pkg\t0.42s"
+  },
+  {
+    "name": "go_fail_quoting_command_not_found",
+    "category": "command-not-found",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "--- FAIL: TestHelperInvocation (0.01s)\n    runner_test.go:42: child process output did not match\nbash: testhelper: command not found\nFAIL\texample.com/runner\t0.03s\nFAIL"
+  },
+  {
+    "name": "dotnet_fail_quoting_no_test_specified",
+    "category": "no-test-specified",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "  Failed MyApp.Tests.RunnerTests.InvokesNpm [12 ms]\n  Error Message:\n   Assert.Equal() Failure: Strings differ\n   Expected: <empty string>\n   Actual:\nError: no test specified\nFailed!  - Failed:     1, Passed:     4, Skipped:     0, Total:     5"
+  },
+  {
+    "name": "elixir_fail_quoting_make_target",
+    "category": "make-target",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "  1) test runs the make target (Mix.RunnerTest)\n     test/runner_test.exs:8\n     Assertion with == failed\n     code:  assert exit_code == 0\n     stderr was:\nmake: *** No rule to make target 'test'. Stop.\n\nFinished in 0.05 seconds\n1 test, 1 failure"
+  },
+  {
+    "name": "rake_minitest_fail_quoting_command_not_found",
+    "category": "command-not-found",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "# Running:\n\nF\n\n  1) Failure:\nRunnerTest#test_invokes_helper [test/runner_test.rb:9]:\nExpected captured stderr to be empty.\nbash: helper: command not found\n\n1 runs, 1 assertions, 1 failures, 0 errors, 0 skips"
+  },
+  {
+    "name": "phpunit_fail_quoting_no_tests_ran",
+    "category": "zero-test",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "PHPUnit 10.5.0\n\nThere was 1 failure:\n\n1) RunnerTest::testPytestRuns\nFailed asserting that string contains \"passed\".\nno tests ran in 0.01s\n\nFAILURES!\nTests: 1, Assertions: 1, Failures: 1."
+  },
+  {
+    "name": "maven_fail_quoting_missing_script",
+    "category": "missing-script",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "[ERROR] RunnerTest.invokesNpm:21 expected:<> but was child stderr:\nMissing script: \"test\"\n[INFO] Results:\n[ERROR] Tests run: 3, Failures: 1, Errors: 0, Skipped: 0"
+  },
+  {
+    "name": "gradle_fail_quoting_collected_zero",
+    "category": "zero-test",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "> Task :test FAILED\n\nRunnerTest > invokesPytest() FAILED\n    org.opentest4j.AssertionFailedError: child output did not contain a pass summary\ncollected 0 items\n\n5 tests completed, 1 failed"
+  },
+  {
+    "name": "maven_error_only_quoting_missing_script",
+    "category": "missing-script",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "[ERROR] RunnerTest.invokesNpm:21 » IllegalState child stderr was not empty:\nMissing script: \"test\"\n[INFO] Results:\n[ERROR] Tests run: 3, Failures: 0, Errors: 1, Skipped: 0"
+  },
+  {
+    "name": "minitest_error_only_quoting_command_not_found",
+    "category": "command-not-found",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "# Running:\n\nE\n\n  1) Error:\nRunnerTest#test_invokes_helper:\nErrno::ENOENT: No such file or directory - helper\nbash: helper: command not found\n\n1 runs, 0 assertions, 0 failures, 1 errors, 0 skips"
+  },
+  {
+    "name": "junit_error_only_quoting_no_tests_ran",
+    "category": "zero-test",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "> Task :test FAILED\n\nRunnerTest > invokesPytest() FAILED\n    java.lang.IllegalStateException: child suite produced no pass summary\nno tests ran in 0.01s\n\nTests run: 5, Failures: 0, Errors: 1, Skipped: 0"
+  }
+]

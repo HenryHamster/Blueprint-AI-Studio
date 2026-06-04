@@ -24,7 +24,7 @@ from sqlalchemy import func, update, case
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
 
-from app.database import get_session
+from app.database import get_session, resolve_async_engine
 from app.shared_state import (
     derive_task_branch as _derive_task_branch,
     backfill_branch_columns,
@@ -350,12 +350,24 @@ async def get_all_tasks(
             if t.last_tool_use_at
             else None,
             "attempt_count": t.attempt_count,
+            # Durable BLOCKED-state metadata (alembic 0137). Nullable for any
+            # non-BLOCKED or pre-migration task; the admin UI guards on presence.
+            "blocker_kind": t.blocker_kind,
+            "blocked_reason": t.blocked_reason,
+            "blocked_at": t.blocked_at.isoformat() if t.blocked_at else None,
+            "recheck_after": t.recheck_after.isoformat() if t.recheck_after else None,
             "payloads": t.payloads,
             "context": {
                 k: v
                 for k, v in (t.context or {}).items()
                 if not k.startswith("max_plan_")
             },
+            # Slim, read-only mirror of the no-CI gate's UNVERIFIED-merge reason
+            # (review_loop["unverified_merge_reason"]). None for verified /
+            # normal merges. See the detail endpoint for rationale.
+            "unverified_merge_reason": (t.context or {})
+            .get("review_loop", {})
+            .get("unverified_merge_reason"),
             "archived": t.archived,
             "artifacts": artifacts_map.get(str(t.id), []),
             "pr_url": pr_map.get(str(t.id)),
@@ -503,10 +515,15 @@ async def _bulk_retry_one_task(
     nuke siblings, and (c) ``_requeue_parent_task`` runs scoped to one
     parent rather than queueing on the bulk transaction.
 
-    The scoped session is built from ``request_session.bind`` so it shares
-    the same engine — in production that's the module-level engine; in
-    tests it's the test engine (in-memory SQLite or test Postgres). Mirrors
-    the agent_status.py post-commit pattern.
+    The scoped session is built from the engine ``request_session`` resolves
+    to (via :func:`resolve_async_engine`) so it shares the same engine — in
+    production that's the module-level engine, in tests the test engine
+    (in-memory SQLite or test Postgres). It does NOT trust ``request_session
+    .bind`` directly: a session created from ``async_sessionmaker`` exposes a
+    None ``.bind`` in production (the engine resolves lazily at execute-time),
+    and feeding that None into a new ``async_sessionmaker`` yields an unbound
+    factory whose sessions fail to resolve an engine. Mirrors the
+    agent_status.py post-commit pattern (and shares its resolution helper).
 
     Returns the old vm_instance_id when the caller should schedule a VM
     delete after commit, or ``None`` for parent-type tasks (which clone
@@ -517,7 +534,7 @@ async def _bulk_retry_one_task(
     from app.task_lifecycle import _requeue_parent_task
 
     scoped_factory = async_sessionmaker(
-        request_session.bind,
+        resolve_async_engine(request_session),
         class_=AsyncSession,
         expire_on_commit=False,
     )
@@ -970,12 +987,27 @@ async def get_task(
         if task.last_tool_use_at
         else None,
         "attempt_count": task.attempt_count,
+        # Durable BLOCKED-state metadata (alembic 0137). Nullable for any
+        # non-BLOCKED or pre-migration task; the admin UI guards on presence.
+        "blocker_kind": task.blocker_kind,
+        "blocked_reason": task.blocked_reason,
+        "blocked_at": task.blocked_at.isoformat() if task.blocked_at else None,
+        "recheck_after": task.recheck_after.isoformat()
+        if task.recheck_after
+        else None,
         "payloads": task.payloads,
         "context": {
             k: v
             for k, v in (task.context or {}).items()
             if not k.startswith("max_plan_")
         },
+        # Slim, read-only mirror of the no-CI gate's UNVERIFIED-merge reason
+        # (review_loop["unverified_merge_reason"]). None for verified / normal
+        # merges. Lets the Task Detail drawer surface why a merge bypassed
+        # verification without digging into raw nested context shape.
+        "unverified_merge_reason": (task.context or {})
+        .get("review_loop", {})
+        .get("unverified_merge_reason"),
         "archived": task.archived,
         "artifacts": artifacts_list,
         "pr_url": pr_url,
