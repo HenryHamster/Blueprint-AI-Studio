@@ -3,7 +3,7 @@ import { fileURLToPath } from 'url';
 import fs from 'fs';
 import path from 'path';
 import WebSocket from 'ws';
-import { handlers, type Handler } from './handlers/index.js';
+import { handlers, resolveHandler } from './handlers/index.js';
 import { extractJsonObject, extractJsonArray, JsonExtractionError } from './json-extract.js';
 import {
   startEventLoopLagMonitor, traceHeartbeat, installExitMarkers, recordFinalState,
@@ -2912,22 +2912,28 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     const { token: ghToken, owner, repo } = ghRes.data;
     log(`GitHub: ${owner}/${repo}`);
 
-    // Dispatch to handler.
-    // Audit 2026-04-25 (W4/C4): unknown task types used to silently fall back
-    // to the `create` handler, which then operated on payloads of the wrong
-    // shape and produced wrong output. Now we throw — the failure surfaces
-    // immediately as a real failure, not silent wrong work. This satisfies
-    // the "fail fast on actual failure" rule from the audit.
-    const handlersMap: Partial<Record<string, Handler>> = handlers;
-    const knownHandler = handlersMap[taskType];
-    if (!knownHandler) {
-      const supported = Object.keys(handlers).sort().join(', ');
-      throw new Error(
-        `Unknown task type "${taskType}". Backend emitted a task type the agent does not handle. ` +
-        `Supported handlers: ${supported}`
-      );
+    // Dispatch to handler — contract-driven (registry-driven task types).
+    //
+    // A BESPOKE handler (exact-type match in the handlers map) preserves all
+    // current behavior. Otherwise we resolve a GENERIC runner from the
+    // backend-published `task_capability` contract (run_shape × agent_mode ×
+    // output_kind), so a task type the backend REGISTERS becomes runnable
+    // WITHOUT an agent code edit + redeploy.
+    //
+    // Audit 2026-04-25 (W4/C4): we still fail fast on a genuinely unrunnable
+    // type — a run-shape with no generic runner yet (the reserved
+    // experiment_loop, or any unrecognized shape) throws with a clear message
+    // rather than silently doing wrong work. But a NEW type of a known shape
+    // (single_agent read-only knowledge, or workflow write/PR) no longer throws.
+    const resolution = resolveHandler(taskType, task, payload);
+    if (!resolution.handler) {
+      throw new Error(resolution.reason);
     }
-    const handler = knownHandler;
+    if (resolution.dispatch === 'generic') {
+      log(`No bespoke handler for "${taskType}" — dispatching via contract-driven generic runner (${resolution.runnerLabel}).`);
+      sendLog(ws, `Dispatching task type "${taskType}" via generic ${resolution.runnerLabel} runner (contract-driven).\n`);
+    }
+    const handler = resolution.handler;
     await handler(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
     // Phase 0 telemetry: t_handler_complete. Captured only on the success
     // path so failures don't pollute the completion-duration histogram.

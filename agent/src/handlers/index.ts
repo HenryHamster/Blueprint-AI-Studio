@@ -10,6 +10,18 @@ import { handleDesignDocUpdate } from './design-doc.js';
 import { handleMemo } from './memo.js';
 import { handleVerifyTests } from './verify-tests.js';
 import { handleComputeExperiment } from './compute-experiment.js';
+import {
+  resolveTaskCapabilityContract,
+  resolveGenericRunner,
+  type TaskCapabilityContract,
+} from './contract-dispatch.js';
+
+export {
+  resolveTaskCapabilityContract,
+  resolveGenericRunner,
+  type TaskCapabilityContract,
+  type GenericRunner,
+} from './contract-dispatch.js';
 
 export type Handler = (
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -51,3 +63,45 @@ export const handlers: Record<AgentTaskType, Handler> = {
   verify_tests: handleVerifyTests,
   compute_experiment: handleComputeExperiment,
 };
+
+// ── Contract-driven handler resolution ───────────────────────────────────────
+// The result of resolving a claimed task type to a runner. A type with a BESPOKE
+// handler keeps all its current behavior; otherwise a GENERIC runner is resolved
+// from the published task_capability contract. `handler: null` means no runner
+// exists for the contract yet (e.g. the reserved experiment_loop, or any
+// unrecognized run-shape) — the caller must fail loudly with `reason`.
+export type HandlerResolution =
+  | { handler: Handler; dispatch: 'bespoke' }
+  | { handler: Handler; dispatch: 'generic'; runnerLabel: string }
+  | { handler: null; dispatch: 'none'; reason: string };
+
+/**
+ * Resolve the runner for a claimed task. Bespoke handlers win (exact-type match);
+ * otherwise a generic runner is selected from the capability contract so a newly
+ * registered task type of a known run-shape is runnable without an agent edit.
+ */
+export function resolveHandler(
+  taskType: string,
+  task: Record<string, unknown>,
+  payload: Record<string, unknown>,
+): HandlerResolution {
+  const bespoke = (handlers as Partial<Record<string, Handler>>)[taskType];
+  if (bespoke) return { handler: bespoke, dispatch: 'bespoke' };
+
+  const contract: TaskCapabilityContract = resolveTaskCapabilityContract(task, payload);
+  const generic = resolveGenericRunner(contract);
+  if (generic) {
+    return { handler: generic.handler, dispatch: 'generic', runnerLabel: generic.label };
+  }
+
+  const supported = Object.keys(handlers).sort().join(', ');
+  return {
+    handler: null,
+    dispatch: 'none',
+    reason:
+      `Unknown task type "${taskType}" with no generic runner for run_shape=${contract.run_shape}, ` +
+      `agent_mode=${contract.agent_mode}, output_kind=${contract.output_kind}. ` +
+      `Generic dispatch supports single_agent read_only→knowledge/none/verdict ` +
+      `and workflow write→pr. Bespoke handlers: ${supported}`,
+  };
+}

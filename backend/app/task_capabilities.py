@@ -607,6 +607,22 @@ def get_task_capability(task_type: str | TaskType) -> TaskCapability | None:
     return TASK_CAPABILITY_BY_VALUE.get(value)
 
 
+def agent_capability_slice(task_type: str | TaskType) -> dict | None:
+    """Return the agent-facing capability slice for a claimed task type."""
+    capability = get_task_capability(task_type)
+    if capability is None:
+        return None
+    return {
+        "run_shape": capability.run_shape,
+        "agent_mode": capability.agent_mode,
+        "output_kind": capability.output_kind,
+        "requires_code": capability.requires_code,
+        "requires_web": capability.requires_web,
+        "requires_compute": capability.requires_compute,
+        "is_bespoke_dispatch": False,
+    }
+
+
 def _capability_to_catalog_entry(capability: TaskCapability) -> dict:
     """Serialize one capability into a plain JSON-safe catalog entry.
 

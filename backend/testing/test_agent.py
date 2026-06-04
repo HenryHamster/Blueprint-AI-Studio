@@ -96,6 +96,7 @@ async def test_agent_claim_success(client: AsyncClient, db_session):
     assert data["task_id"] is not None
     assert data["title"] is not None
     assert "payloads" in data
+    assert "task_capability" not in data
 
     await db_session.refresh(task)
     assert task.status == TaskStatus.IN_PROGRESS
@@ -122,6 +123,38 @@ async def test_agent_claim_missing_task_row_returns_401(client: AsyncClient):
     headers = {"x-agent-token": token}
     resp = await client.post("/api/agent/claim", headers=headers)
     assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_includes_task_capability_slice(client: AsyncClient, db_session):
+    project = Project(name="Agent Claim Capability Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "cmd": "ls"}],
+        vm_instance_id="agent-vm-capability",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-capability")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["task_capability"] == {
+        "run_shape": "workflow",
+        "agent_mode": "write",
+        "output_kind": "pr",
+        "requires_code": True,
+        "requires_web": False,
+        "requires_compute": False,
+        "is_bespoke_dispatch": False,
+    }
 
 
 @pytest.mark.smoketest

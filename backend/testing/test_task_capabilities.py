@@ -9,6 +9,7 @@ from httpx import ASGITransport, AsyncClient
 from app.payload_schemas import TaskType, validate_task_payload
 from app.task_capabilities import (
     ALL_TASK_TYPES,
+    agent_capability_slice,
     COMPLETION_HANDLER_BY_TASK_TYPE,
     EVALUATION_STRATEGY_BY_TASK_TYPE,
     FILTER_VISIBLE_TASK_TYPES,
@@ -263,6 +264,31 @@ def test_product_task_types_derived_from_registry():
 def test_task_capability_lookup_is_metadata_only():
     assert get_task_capability("create").label == "Create"
     assert get_task_capability("future_fundamental_type") is None
+
+
+def test_agent_capability_slice_exposes_agent_contract_fields():
+    research = agent_capability_slice("research")
+    create = agent_capability_slice("create")
+
+    assert research == {
+        "run_shape": "single_agent",
+        "agent_mode": "read_only",
+        "output_kind": "knowledge",
+        "requires_code": True,
+        "requires_web": True,
+        "requires_compute": False,
+        "is_bespoke_dispatch": False,
+    }
+    assert create == {
+        "run_shape": "workflow",
+        "agent_mode": "write",
+        "output_kind": "pr",
+        "requires_code": True,
+        "requires_web": False,
+        "requires_compute": False,
+        "is_bespoke_dispatch": False,
+    }
+    assert agent_capability_slice("future_fundamental_type") is None
 
 
 def test_registry_does_not_constrain_payload_extension_fields():

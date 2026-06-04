@@ -51,6 +51,7 @@ from app.shared_state import (
     get_project_promotion_target,
     get_project_integration_branch,
 )
+from app.task_capabilities import agent_capability_slice
 import app.shared_state as _shared_state
 from app.storage import generate_upload_signed_url, ARTIFACT_BUCKET_NAME
 from app.github import (
@@ -822,7 +823,10 @@ async def claim_task(
             "integration_branch": project_integration_branch,
         }
 
-    task_type = task.first_payload.get("type", "")
+    task_type = _claimed_first_payload.get("type", "")
+    task_capability = agent_capability_slice(task_type)
+    if task_capability is not None:
+        response["task_capability"] = task_capability
     if task_type in ("research", "plan", "create", "fix", "refactor", "review"):
         # Active tasks (IN_PROGRESS or EVALUATING) in the same project.
         # Phase B4 (H-P6): load_only drops status_log/plan_output JSONB.
