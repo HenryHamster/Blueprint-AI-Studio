@@ -687,7 +687,16 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
     /\b[1-9]\d*\s+failures?\b/i.test(line) ||
     // PHPUnit/Maven: "Tests: .., Assertions: .., Failures: N" /
     // "Tests run: .., Failures: N, .." — non-zero.
-    /\bFailures:\s+[1-9]\d*\b/i.test(line)
+    /\bFailures:\s+[1-9]\d*\b/i.test(line) ||
+    // ERROR-outcome counts (a test ERROR — an exception/setup/collection error —
+    // is reported with a count SEPARATE from assertion FAILURES). A run whose
+    // only failure signal is a non-zero error count is still real-failure
+    // evidence and must not fall open to no_tests.
+    // Maven/Gradle/JUnit/PHPUnit: "Tests run: X, Failures: 0, Errors: N" — non-zero.
+    /\bErrors:\s+[1-9]\d*\b/i.test(line) ||
+    // Minitest/ExUnit count summaries: "1 runs, .., 0 failures, 1 errors, .." /
+    // "N errors" — non-zero (the failure-count rule above misses an error-only run).
+    /\b[1-9]\d*\s+errors?\b/i.test(line)
   ));
   const noTestSpecified = /^(?:npm (?:ERR!|error)\s+)?error:\s*no test specified\s*$/i;
   if (!hasRealFailureEvidence && trimmedLines.some(line => noTestSpecified.test(line))) return 'no_tests';

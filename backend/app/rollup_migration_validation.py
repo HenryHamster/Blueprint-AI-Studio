@@ -3,6 +3,8 @@
 import app.github as github
 from app.migration_chain import (
     _filename_revision_prefix,
+    build_migration_chain,
+    find_heads,
     plan_integration_side_renumber,
     plan_migration_reconciliation,
     validate_added_migrations,
@@ -191,13 +193,21 @@ async def _validate_migration_chain_post_merge(
     Instead, this check lists the current migration filenames on *target_branch*
     and looks for any revision id (NNNN filename prefix) that appears in more
     than one file — a genuine third-party duplicate that the pre-merge guard
-    should have prevented but may have slipped through.  A clean target (every
-    revision id appears exactly once) returns ``("ok", None)``.
+    should have prevented but may have slipped through.  It then reads every
+    target-branch migration's source, builds the in-file revision/down_revision
+    chain over the WHOLE set as one (NOT an added-vs-existing comparison, which
+    would falsely flag the candidate's own just-merged revisions — see #7731),
+    and blocks on a genuine third-party dual head (more than one Alembic head
+    built from distinct revision ids) or a broken chain (a ``down_revision``
+    pointing at a revision absent from the branch).  A clean target (every
+    revision id appears exactly once and the chain has a single head with no
+    dangling anchor) returns ``("ok", None)``.
 
-    Returns ``("defer", reason)`` on GitHub I/O failure (consistent with the
-    pre-merge guard's fail-safe semantics) and ``("block", reason)`` when a
-    genuine duplicate revision id is found.  When the PR does not touch Alembic
-    migrations, returns ``("ok", None)`` immediately.
+    Returns ``("defer", reason)`` on GitHub I/O failure — including any per-file
+    source fetch failure or empty body — consistent with the pre-merge guard's
+    fail-safe semantics, and ``("block", reason)`` when a genuine duplicate
+    revision id, dual head, or broken chain is found.  When the PR does not touch
+    Alembic migrations, returns ``("ok", None)`` immediately.
     """
     try:
         files = await github.get_pr_files(gh_token, owner, repo, pr_number)
@@ -239,6 +249,70 @@ async def _validate_migration_chain_post_merge(
                 f"third-party revision collision — chain needs manual resolution",
             )
         seen[rev] = fn
+
+    # Full-chain health check: the filename-prefix pass above only catches a
+    # duplicate revision id.  A genuine third-party collision can also surface as
+    # a dual head built from DISTINCT revision ids (two leaves), or a broken
+    # chain (a down_revision pointing at a revision no longer on the branch) —
+    # both make the target unbootable (the schema-revision startup gate fails)
+    # yet leave every filename prefix unique.  To detect those we must read each
+    # migration's in-file revision/down_revision (filenames alone are not enough)
+    # and reason over the WHOLE target-branch set as a single chain.  Validating
+    # added-vs-existing here would falsely flag the candidate's own just-merged
+    # revisions (#7731), so we deliberately build one combined chain instead.
+    sources: dict[str, str] = {}
+    for fn in existing_filenames:
+        if _filename_revision_prefix(fn) is None:
+            # Not a migration-style NNNN file — skip rather than fetch/parse it.
+            continue
+        path = f"{_ALEMBIC_VERSIONS_DIR}/{fn}"
+        try:
+            text = await github.get_file_text_at_ref(
+                path,
+                token=gh_token,
+                owner=owner,
+                repo=repo,
+                ref=target_branch,
+            )
+        except Exception as e:
+            return (
+                "defer",
+                f"could not fetch migration source '{path}' at '{target_branch}' "
+                f"for post-merge chain health check: {type(e).__name__}: {e}",
+            )
+        if not text:
+            return (
+                "defer",
+                f"empty migration source for '{path}' at '{target_branch}' — "
+                f"deferring post-merge chain health check",
+            )
+        sources[fn] = text
+
+    if sources:
+        chain, _duplicates, _unparseable = build_migration_chain(sources)
+        heads = find_heads(chain)
+        if len(heads) > 1:
+            return (
+                "block",
+                f"target branch '{target_branch}' has {len(heads)} Alembic heads "
+                f"({', '.join(sorted(heads))}) after the candidate landed — a "
+                f"genuine third-party dual head; the schema-revision startup gate "
+                f"would fail. Chain needs manual resolution.",
+            )
+        dangling = sorted(
+            rev
+            for rev, down in chain.items()
+            if down is not None and down not in chain
+        )
+        if dangling:
+            rev = dangling[0]
+            return (
+                "block",
+                f"Alembic migration '{rev}' on '{target_branch}' has "
+                f"down_revision '{chain[rev]}', which is not present on the "
+                f"branch — broken migration chain; the schema-revision startup "
+                f"gate would fail. Chain needs manual resolution.",
+            )
 
     return ("ok", None)
 

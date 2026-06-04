@@ -7880,6 +7880,14 @@ class TestAgentTestRunnerSourceParity:
                 [r"[1-9]\d*\s+failures?"],
             ),
             ("PHPUnit/Maven `Failures: N` (non-zero)", [r"Failures:\s+[1-9]"]),
+            (
+                "Maven/Gradle/JUnit/PHPUnit `Errors: N` (non-zero)",
+                [r"Errors:\s+[1-9]"],
+            ),
+            (
+                "Minitest/ExUnit `N error(s)` (non-zero)",
+                [r"[1-9]\d*\s+errors?"],
+            ),
         ]
         missing = [
             label
@@ -7898,7 +7906,13 @@ class TestAgentTestRunnerSourceParity:
         # The count-summary signatures MUST keep a non-zero guard so a zero-count
         # summary (`Failed: 0`, `Failures: 0`, `0 failures`) is never mistaken for
         # a real failure (which would hard-block a genuinely empty repo).
-        for nonzero_guard in [r"Failed:\s+[1-9]", r"Failures:\s+[1-9]", r"[1-9]\d*\s+failures?"]:
+        for nonzero_guard in [
+            r"Failed:\s+[1-9]",
+            r"Failures:\s+[1-9]",
+            r"[1-9]\d*\s+failures?",
+            r"Errors:\s+[1-9]",
+            r"[1-9]\d*\s+errors?",
+        ]:
             assert nonzero_guard in region, (
                 "agent/src/utils/test-runners.ts classifyTestExecution dropped the "
                 f"non-zero count guard {nonzero_guard!r}; a zero-count summary would "

@@ -159,5 +159,26 @@
     "genuine_suite": true,
     "expected": "ran",
     "output": "> Task :test FAILED\n\nRunnerTest > invokesPytest() FAILED\n    org.opentest4j.AssertionFailedError: child output did not contain a pass summary\ncollected 0 items\n\n5 tests completed, 1 failed"
+  },
+  {
+    "name": "maven_error_only_quoting_missing_script",
+    "category": "missing-script",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "[ERROR] RunnerTest.invokesNpm:21 » IllegalState child stderr was not empty:\nMissing script: \"test\"\n[INFO] Results:\n[ERROR] Tests run: 3, Failures: 0, Errors: 1, Skipped: 0"
+  },
+  {
+    "name": "minitest_error_only_quoting_command_not_found",
+    "category": "command-not-found",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "# Running:\n\nE\n\n  1) Error:\nRunnerTest#test_invokes_helper:\nErrno::ENOENT: No such file or directory - helper\nbash: helper: command not found\n\n1 runs, 0 assertions, 0 failures, 1 errors, 0 skips"
+  },
+  {
+    "name": "junit_error_only_quoting_no_tests_ran",
+    "category": "zero-test",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "> Task :test FAILED\n\nRunnerTest > invokesPytest() FAILED\n    java.lang.IllegalStateException: child suite produced no pass summary\nno tests ran in 0.01s\n\nTests run: 5, Failures: 0, Errors: 1, Skipped: 0"
   }
 ]
