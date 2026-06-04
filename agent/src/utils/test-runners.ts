@@ -584,7 +584,10 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
   const lines = output.split(/\r?\n/);
   const trimmedLines = lines.map(line => line.trim());
   // npm placeholder: the default `package.json` test script prints
-  // "Error: no test specified" and exits 1 without running anything.
+  // "Error: no test specified" and exits 1 without running anything. Anchor to
+  // the runner-emitted line shape so a real suite that merely asserts on the
+  // literal "Error: no test specified" as data (e.g. `AssertionError: expected
+  // 'Error: no test specified' in output`) stays a real run.
   const hasRealFailureEvidence = trimmedLines.some(line => (
     /^FAILED\s+\S+/.test(line) ||
     /^FAIL\s{2,}\S+/.test(line) ||
@@ -594,38 +597,49 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
     /\b[1-9]\d*\s+failed\b/i.test(line) ||
     /\btest result:\s+ok\.\s+[1-9]\d*\s+passed;\s+[1-9]\d*\s+failed\b/i.test(line)
   ));
-  const lineMatches = (pattern: RegExp): boolean => trimmedLines.some(line => pattern.test(line));
-  if (!hasRealFailureEvidence && lineMatches(/^Error:\s+no test specified\b/i)) return 'no_tests';
+  const noTestSpecified = /^(?:npm (?:ERR!|error)\s+)?error:\s*no test specified\s*$/i;
+  if (!hasRealFailureEvidence && trimmedLines.some(line => noTestSpecified.test(line))) return 'no_tests';
   // npm/yarn/pnpm: missing test script in package.json.
-  // npm: "Error: Missing script: "test"" or "npm ERR! Missing script: "test""
-  // yarn: "error Command "test" not found."
-  // pnpm: "ERR!  No matching version found for test"
-  if (!hasRealFailureEvidence && lineMatches(/missing script/i)) return 'no_tests';
-  // Shell / package-manager missing-runner messages put the literal phrase
-  // "command not found" together on a single line:
-  //   bash:  "bash: pytest: command not found"
-  //   zsh:   "zsh: command not found: pytest"
-  //   pnpm:  "error: command not found: test"
-  //   yarn:  'error Command "test" not found.'  (one token between the words)
-  // A whole-output substring test for "command" AND "not found" independently
-  // FALSE-POSITIVES on a genuinely failing suite: a failing test id such as
-  // `test_command_parser` plus an unrelated assertion ("404 Not Found",
-  // "KeyError: 'x' not found", "element not found") trips both checks even
-  // though no runner was missing — misreading the failure as "no tests ran"
-  // and letting the no-CI gate merge UNVERIFIED. Require the two signal words
-  // to be adjacent (at most one quoted/bare token between them) on the SAME
-  // line, with a word boundary on `command` so `test_command_parser` does not
-  // match. Genuine failures whose signal words are far apart or on different
-  // lines fall through to 'ran'.
-  const missingCommand = /\bcommand\b(?:\s+(?:"[^"]*"|'[^']*'|\S+))?\s+not\s+found\b/i;
-  if (!hasRealFailureEvidence && lines.some(line => missingCommand.test(line))) return 'no_tests';
-  // make: "No rule to make target 'test'" or "No rule to make target `test'"
-  if (!hasRealFailureEvidence && lineMatches(/no rule to make target/i)) return 'no_tests';
-  // pytest: "no tests ran in 0.01s" / "collected 0 items".
-  if (!hasRealFailureEvidence && lineMatches(/^no tests ran\b/i)) return 'no_tests';
-  if (!hasRealFailureEvidence && lineMatches(/^collected 0 items\b/i)) return 'no_tests';
-  // vitest: "No test files found, exiting with code 1".
-  if (!hasRealFailureEvidence && lineMatches(/^no test files found\b/i)) return 'no_tests';
+  //   npm: 'Error: Missing script: "test"' or 'npm ERR! Missing script: "test"'
+  //   yarn: 'error Command "test" not found.'  (handled by missingCommand below)
+  //   pnpm: 'ERR!  No matching version found for test'
+  // Anchor to the runner-emitted line shape (`Error:` / `npm ERR!` at the
+  // front, plus the quoted script name) so a failing test that quotes the full
+  // diagnostic line as assertion data stays a real run.
+  const missingScript = /^(?:(?:npm (?:ERR!|error)\s+)?(?:error:\s*)?)missing script:\s*["']test["'](?:\s|$)/i;
+  if (!hasRealFailureEvidence && trimmedLines.some(line => missingScript.test(line))) return 'no_tests';
+  // Shell / package-manager missing-runner messages put the contiguous phrase
+  // "command not found" in specific runner-shaped lines:
+  //   bash/sh: "bash: pytest: command not found"
+  //   zsh:     "zsh: command not found: pytest"
+  //   pnpm:    "error: command not found: test"
+  //   yarn:    'error Command "test" not found.'
+  // Match only those line shapes so a failing suite that QUOTES the literal
+  // phrase "command not found" (or that merely contains `command` and `not
+  // found` elsewhere on the line) stays a real run.
+  const missingCommandPatterns = [
+    /^(?:bash|sh):\s+\S+:\s+command not found\s*$/i,
+    /^zsh:\s+command not found:\s+\S+\s*$/i,
+    /^error:\s+command not found:\s+\S+\s*$/i,
+    /^error\s+command\s+["'][^"']+["']\s+not\s+found\.?\s*$/i,
+  ];
+  if (!hasRealFailureEvidence && trimmedLines.some(line => missingCommandPatterns.some(pattern => pattern.test(line)))) return 'no_tests';
+  // make: "make: *** No rule to make target 'test'". Anchor to the make
+  // diagnostic prefix (`make:`/`make[N]:` + `***`) so a test asserting on the
+  // bare phrase "No rule to make target" as data stays a real run.
+  const noRuleToMake = /^make(?:\[\d+\])?:\s*\*\*\*\s*no rule to make target\b/i;
+  if (!hasRealFailureEvidence && trimmedLines.some(line => noRuleToMake.test(line))) return 'no_tests';
+  // pytest: the summary line "no tests ran in 0.01s". Anchor to the
+  // `in <duration>s` summary form so a test quoting the bare phrase "no tests
+  // ran" as assertion data stays a real run.
+  const pytestNoTestsRan = /^no tests ran in\s+[\d.]+\s*s\s*$/i;
+  if (!hasRealFailureEvidence && trimmedLines.some(line => pytestNoTestsRan.test(line))) return 'no_tests';
+  // pytest: a line-leading "collected 0 items" header. Line-anchored so an
+  // assertion quoting the phrase mid-line stays a real run.
+  if (!hasRealFailureEvidence && trimmedLines.some(line => /^collected 0 items\b/i.test(line))) return 'no_tests';
+  // vitest: "No test files found, exiting with code 1". Line-anchored so an
+  // assertion quoting the bare phrase "no test files" mid-line stays a real run.
+  if (!hasRealFailureEvidence && trimmedLines.some(line => /^no test files found\b/i.test(line))) return 'no_tests';
   // Go: `go test` on an empty package reports `? pkg [no test files]`.
   // The default reporter also emits `ok pkg ...` lines when real tests ran,
   // so only classify as no_tests when every observed package line is empty or
@@ -639,9 +653,13 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
       return 'no_tests';
     }
   }
-  // Go / Rust filtered-out suites can emit "no tests to run" without a real
-  // test body executing.
-  if (!hasRealFailureEvidence && lineMatches(/^.*no tests to run.*$/i)) return 'no_tests';
+  // test body executing. Anchor to the runner-emitted forms (Go's
+  // "testing: warning: no tests to run" / a standalone "[no tests to run]")
+  // so a test asserting on the literal bracketed phrase as data stays a real
+  // run. Bracketed Go package summaries are already handled by the `goResults`
+  // branch above.
+  if (!hasRealFailureEvidence && trimmedLines.some(line => /^testing:\s*warning:\s*no tests to run\b/i.test(line))) return 'no_tests';
+  if (!hasRealFailureEvidence && trimmedLines.some(line => /^\[no tests to run\]$/i.test(line))) return 'no_tests';
   // Rust: zero-test runs emit a zero-count summary. Require the summary and
   // the `running 0 tests` header, while excluding any non-zero run counts so
   // mixed suites still count as real verification.

@@ -210,6 +210,31 @@ describe('handleVerifyTests', () => {
     expect(verdict.output).toContain('AssertionError');
   });
 
+  it('real failure whose output quotes a placeholder phrase → detected=true, passed=false, no stale-command recovery', async () => {
+    // The suite genuinely ran and failed; its failure text merely QUOTES a
+    // placeholder literal ("no test specified") as assertion data. Because the
+    // tightened classifier keeps this a real run, testFixLoop returns
+    // noTestsExecuted unset — so verify-tests must NOT enter the noTestsExecuted
+    // branch (no stale-command recovery / detected=false fall-open) and must
+    // report the real failure verdict instead.
+    vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+    vi.mocked(testFixLoop).mockResolvedValue({
+      passed: false,
+      testFailuresDetected: true,
+      failureSummary: "FAILED test_cli.py::test_help - AssertionError: expected 'no test specified' in output",
+    });
+
+    await handleVerifyTests('t9b', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(true);
+    expect(verdict.passed).toBe(false);
+    expect(verdict.output).toContain('no test specified');
+    // No stale-command recovery: testFixLoop invoked exactly once (the stored
+    // runner), never re-run with a replacement override.
+    expect(vi.mocked(testFixLoop)).toHaveBeenCalledTimes(1);
+  });
+
   it('stale stored command + real replacement that PASSES → recovered=true, detected/passed reflect replacement', async () => {
     // Stored runner is the stale `make test`; auto-detection surfaces a real
     // pytest suite at services/api.

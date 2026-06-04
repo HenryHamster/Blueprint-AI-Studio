@@ -1388,6 +1388,89 @@ describe('classifyTestExecution — placeholder/empty suite detection', () => {
     )).toBe('no_tests');
   });
 
+  // Regression: a genuinely failing suite whose output merely QUOTES a
+  // placeholder phrase as assertion data (not a runner diagnostic) must
+  // classify as a real run so its failure blocks the no-CI merge gate. The
+  // pre-fix classifier used whole-output substring checks that misread all of
+  // these as "no_tests", failing the gate open.
+  it('failing test asserting on literal "no test specified" → ran', () => {
+    expect(classifyTestExecution(
+      "FAILED test_cli.py::test_help - AssertionError: expected 'no test specified' in output\n1 failed in 0.30s",
+    )).toBe('ran');
+  });
+
+  it('failing test asserting on full literal "Error: no test specified" → ran', () => {
+    expect(classifyTestExecution(
+      "FAILED test_cli.py::test_help - AssertionError: expected 'Error: no test specified' in output\n1 failed in 0.30s",
+    )).toBe('ran');
+  });
+
+  it('failing test asserting on literal "Missing script" → ran', () => {
+    expect(classifyTestExecution(
+      "FAILED test_pkg.py::test_error - AssertionError: 'Missing script' not in stderr\n1 failed in 0.12s",
+    )).toBe('ran');
+  });
+
+  it('failing test asserting on full literal "Missing script: \\"test\\"" → ran', () => {
+    expect(classifyTestExecution(
+      'FAILED test_pkg.py::test_error - AssertionError: expected \'Missing script: "test"\' in stderr\n1 failed in 0.12s',
+    )).toBe('ran');
+  });
+
+  it('failing test asserting on literal "No rule to make target" → ran', () => {
+    expect(classifyTestExecution(
+      "FAILED test_make.py::test_help - AssertionError: 'No rule to make target' in help_text\n1 failed in 0.08s",
+    )).toBe('ran');
+  });
+
+  it('failing test asserting on full make diagnostic literal → ran', () => {
+    expect(classifyTestExecution(
+      "FAILED test_make.py::test_help - AssertionError: expected \"make: *** No rule to make target 'test'. Stop.\" in stderr\n1 failed in 0.08s",
+    )).toBe('ran');
+  });
+
+  it('failing test asserting on literal "no tests ran" → ran', () => {
+    expect(classifyTestExecution(
+      "FAILED test_runner.py::test_msg - AssertionError: expected 'no tests ran' message\n1 failed in 0.05s",
+    )).toBe('ran');
+  });
+
+  it('failing test asserting on full literal "no tests ran in 0.02s" → ran', () => {
+    expect(classifyTestExecution(
+      "FAILED test_runner.py::test_msg - AssertionError: expected 'no tests ran in 0.02s' message\n1 failed in 0.05s",
+    )).toBe('ran');
+  });
+
+  it('failing test asserting on literal "collected 0 items" mid-line → ran', () => {
+    expect(classifyTestExecution(
+      "FAILED test_pytest_wrapper.py::test_banner - assert 'collected 0 items' in captured\n1 failed in 0.04s",
+    )).toBe('ran');
+  });
+
+  it('failing test asserting on literal "no test files" mid-line → ran', () => {
+    expect(classifyTestExecution(
+      "FAILED test_vitest_wrapper.ts - expected stderr to contain 'no test files'\n Tests  1 failed (1)",
+    )).toBe('ran');
+  });
+
+  it('failing test asserting on literal "no tests to run" → ran', () => {
+    expect(classifyTestExecution(
+      "FAILED test_go_wrapper.py::test_filter - AssertionError: 'no tests to run' not in out\n1 failed in 0.06s",
+    )).toBe('ran');
+  });
+
+  it('failing test asserting on full literal "[no tests to run]" → ran', () => {
+    expect(classifyTestExecution(
+      "FAILED test_go_wrapper.py::test_filter - AssertionError: expected '[no tests to run]' in out\n1 failed in 0.06s",
+    )).toBe('ran');
+  });
+
+  it('failing test asserting on full literal "command not found" → ran', () => {
+    expect(classifyTestExecution(
+      "FAILED test_shell_wrapper.py::test_missing_runner - AssertionError: expected 'command not found' in stderr\n1 failed in 0.07s",
+    )).toBe('ran');
+  });
+
   it('a real failing test ("1 failed") → ran (never misread as no_tests)', () => {
     expect(classifyTestExecution(
       'Test Files  1 failed (1)\n     Tests  1 failed | 2 passed (3)',

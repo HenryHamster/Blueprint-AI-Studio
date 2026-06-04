@@ -135,6 +135,28 @@ describe('testFixLoop — noTestsExecuted aggregation (maxFixAttempts: 0)', () =
     expect(result.noTestsExecuted).toBe(false);
   });
 
+  it('real failure quoting a placeholder phrase as data → noTestsExecuted=false, failure stays reportable', async () => {
+    // The suite genuinely ran and a test failed; its assertion text merely
+    // QUOTES the npm placeholder literal "no test specified". A whole-output
+    // substring classifier would misread this as an empty suite and drop the
+    // failure, failing the no-CI gate open. The anchored classifier keeps it
+    // a real run so the failure blocks the merge.
+    execFileAsync.mockRejectedValue(
+      new Error("Command failed: python3 -m pytest -x -q\nFAILED test_cli.py::test_help - AssertionError: expected 'no test specified' in output\n1 failed in 0.30s"),
+    );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [REAL_RUNNER] },
+    );
+
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(true);
+    expect(result.noTestsExecuted).toBe(false);
+    expect(result.failureSummary).toContain('AssertionError');
+  });
+
   it('a genuine passing suite → noTestsExecuted is NOT set', async () => {
     execFileAsync.mockResolvedValue('Tests  3 passed (3)\nTest Files  1 passed (1)');
 

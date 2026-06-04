@@ -1,0 +1,107 @@
+[
+  {
+    "name": "bash_missing_runner",
+    "category": "command-not-found",
+    "genuine_suite": false,
+    "expected": "no_tests",
+    "output": "bash: pytest: command not found"
+  },
+  {
+    "name": "zsh_missing_runner",
+    "category": "command-not-found",
+    "genuine_suite": false,
+    "expected": "no_tests",
+    "output": "zsh: command not found: pytest"
+  },
+  {
+    "name": "yarn_missing_test_script",
+    "category": "command-not-found",
+    "genuine_suite": false,
+    "expected": "no_tests",
+    "output": "error Command \"test\" not found."
+  },
+  {
+    "name": "failing_suite_command_in_test_id_not_found_assertion",
+    "category": "command-not-found",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "FAILED test_command_parser\nE   KeyError: 'x' not found\n1 failed in 0.31s"
+  },
+  {
+    "name": "failing_suite_404_not_found_body",
+    "category": "command-not-found",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "FAILED test_command_router - assert 404 == 200, body was '404 Not Found'\n1 failed in 0.12s"
+  },
+  {
+    "name": "npm_missing_script",
+    "category": "missing-script",
+    "genuine_suite": false,
+    "expected": "no_tests",
+    "output": "npm ERR! Missing script: \"test\"\nnpm ERR! Test failed."
+  },
+  {
+    "name": "npm_no_test_specified_placeholder",
+    "category": "no-test-specified",
+    "genuine_suite": false,
+    "expected": "no_tests",
+    "output": "> demo@1.0.0 test\n> echo \"Error: no test specified\" && exit 1\n\nError: no test specified\nnpm ERR! Test failed."
+  },
+  {
+    "name": "make_missing_target_backtick",
+    "category": "make-target",
+    "genuine_suite": false,
+    "expected": "no_tests",
+    "output": "make: *** No rule to make target `test'. Stop."
+  },
+  {
+    "name": "make_missing_target_single_quote",
+    "category": "make-target",
+    "genuine_suite": false,
+    "expected": "no_tests",
+    "output": "make: *** No rule to make target 'test'. Stop."
+  },
+  {
+    "name": "pytest_collected_zero_items",
+    "category": "zero-test",
+    "genuine_suite": false,
+    "expected": "no_tests",
+    "output": "collected 0 items\n\nno tests ran in 0.01s"
+  },
+  {
+    "name": "rust_zero_test_summary",
+    "category": "zero-test",
+    "genuine_suite": false,
+    "expected": "no_tests",
+    "output": "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+  },
+  {
+    "name": "go_no_test_files_only",
+    "category": "zero-test",
+    "genuine_suite": false,
+    "expected": "no_tests",
+    "output": "?   \texample.com/pkg\t[no test files]"
+  },
+  {
+    "name": "pytest_real_pass_with_collected_count",
+    "category": "zero-test",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "collected 3 items\n\ntest_widget.py ...                                          [100%]\n\n3 passed in 0.52s"
+  },
+  {
+    "name": "rust_mixed_zero_and_real_module",
+    "category": "zero-test",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\nrunning 5 tests\ntest cases::add ... ok\ntest cases::sub ... ok\ntest cases::mul ... ok\ntest cases::div ... ok\ntest cases::mod ... ok\n\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s"
+  },
+  {
+    "name": "go_real_pass_package",
+    "category": "zero-test",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "ok  \texample.com/pkg\t0.42s"
+  }
+]
