@@ -634,6 +634,14 @@ async def _maybe_create_precondition_blocker_alert(
     rollup title), so a blocker that persists across many dispatch cycles
     raises exactly ONE alert. A genuinely *different* blocker on the same task
     (distinct ``blocker_kind``) gets its own alert.
+
+    Commit boundary: when it inserts a new alert this helper commits ONLY its
+    own ``Alert`` row — it does NOT own, and must not be relied on to flush, any
+    pending task mutation the caller staged. Callers that park a task into
+    ``BLOCKED`` (``orchestrator_filters._record_defer_and_maybe_escalate``,
+    ``task_lifecycle_requeue``) commit that transition themselves BEFORE calling
+    here, so the durability of the task state never depends on whether this
+    helper happened to create an alert (and therefore commit) this cycle.
     """
     title = f"Precondition blocker: {blocker_kind}"[:200]
     existing = await session.execute(

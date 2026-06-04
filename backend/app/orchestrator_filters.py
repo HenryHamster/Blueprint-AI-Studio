@@ -149,18 +149,29 @@ async def _record_defer_and_maybe_escalate(
             f"[DISPATCH] Parking task {candidate.id} in BLOCKED after {count} "
             f"deferrals on persistent precondition blocker: {blocker_kind}"
         )
-        alert_created = await _maybe_create_precondition_blocker_alert(
+        # Durability contract: the CALLER owns the task commit, not the alert
+        # helper. Commit the BLOCKED parking FIRST so the transition is durable
+        # before we raise the operator alert or broadcast it to the UI. This
+        # mirrors the other two caller families (task_lifecycle_requeue.py:272
+        # and agent_status.py:1452 — session.add -> commit -> alert -> broadcast)
+        # and removes the old implicit "who committed first" dependency on the
+        # alert helper's side-effect commit. If this commit RAISES, the
+        # transition did not persist; the exception propagates and the BLOCKED
+        # broadcast below is never reached, so the UI never sees a task_updated
+        # BLOCKED event for a state the database rolled back.
+        await session.commit()
+        # The alert helper now owns ONLY its own alert insert/commit; its return
+        # value is informational. Whether the operator alert is newly created
+        # (returns True) or already exists (returns False) no longer decides who
+        # committed the task — it is already durable above — so all three cases
+        # (new alert, existing alert, failed commit) converge on the single
+        # contract: broadcast BLOCKED iff the transition persisted.
+        await _maybe_create_precondition_blocker_alert(
             candidate,
             session,
             blocker_kind=blocker_kind,
             detail=detail,
         )
-        # The UI must only see BLOCKED after the state is durable. A newly
-        # inserted alert commits the task mutation inside the helper; when the
-        # alert already exists, commit the parked task here because filtered-out
-        # candidates have no later post-commit task_updated broadcast path.
-        if not alert_created:
-            await session.commit()
         if broadcast_fn:
             try:
                 await broadcast_fn(
