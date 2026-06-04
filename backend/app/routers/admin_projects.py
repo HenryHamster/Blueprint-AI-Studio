@@ -1160,6 +1160,7 @@ async def get_task_type_cost_adherence(
     (MissingGreenlet). Scoped to the caller's projects.
     """
     from app.digest_metrics import compute_task_type_cost_adherence
+    from app.models import ComputeJob
     from app.models import get_task_total_vm_cost_usd_or_none  # noqa: F401  (accessor used in compute fn)
     from app.task_capabilities import TASK_CAPABILITY_BY_VALUE
 
@@ -1193,12 +1194,39 @@ async def get_task_type_cost_adherence(
     )
     tasks = result.scalars().all()
 
+    # Off-VM task types (e.g. compute_experiment) hold only a lightweight
+    # monitoring VM; their real spend lives on the linked compute jobs' durable
+    # ``final_cost_usd`` ledger. Aggregate that spend per task so the compute
+    # function can measure those types honestly instead of from Task VM fields.
+    # Lightweight second query (sum grouped by task_id, scoped to user projects);
+    # keeps the compute transform DB-free.
+    compute_cost_result = await session.execute(
+        select(
+            ComputeJob.task_id,
+            func.coalesce(func.sum(ComputeJob.final_cost_usd), 0.0).label("spend"),
+        )
+        .where(
+            ComputeJob.project_id.in_(user_pids),
+            ComputeJob.task_id.isnot(None),
+            ComputeJob.final_cost_usd.isnot(None),
+        )
+        .group_by(ComputeJob.task_id)
+    )
+    compute_job_cost_by_task = {
+        str(task_id): float(spend)
+        for task_id, spend in compute_cost_result.all()
+        if task_id is not None
+    }
+
     ceilings = {
         value: cap.cost_ceiling_usd
         for value, cap in TASK_CAPABILITY_BY_VALUE.items()
     }
     rows = compute_task_type_cost_adherence(
-        tasks, window_start=window_start, ceilings=ceilings
+        tasks,
+        window_start=window_start,
+        ceilings=ceilings,
+        compute_job_cost_by_task=compute_job_cost_by_task,
     )
     return {"window_days": days, "task_types": rows}
 

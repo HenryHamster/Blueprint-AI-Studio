@@ -251,6 +251,26 @@ async def get_compute_job_for_task(
     return result.scalars().first()
 
 
+async def stamp_compute_job_result_reference(
+    session,
+    *,
+    task_id: uuid.UUID,
+    job_id: uuid.UUID,
+    result_reference: str | None,
+) -> ComputeJob | None:
+    """Persist a terminal result reference on the matching compute-job row."""
+    reference = (result_reference or "").strip()
+    if not reference:
+        return None
+    job = await get_compute_job_for_task(session, job_id=job_id, task_id=task_id)
+    if job is None:
+        return None
+    job.result_reference = reference
+    job.updated_at = _utcnow()
+    session.add(job)
+    return job
+
+
 async def _lock_compute_job(session, job_id: uuid.UUID) -> ComputeJob | None:
     result = await session.execute(
         select(ComputeJob)

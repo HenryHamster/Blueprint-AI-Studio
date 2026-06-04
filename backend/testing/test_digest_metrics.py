@@ -440,6 +440,76 @@ def test_cost_adherence_renders_row_per_registered_type():
     assert by_id["create"]["over_ceiling"] is False
 
 
+def test_cost_adherence_compute_substrate_sources_from_compute_jobs():
+    """A compute-substrate type (compute_experiment) is measured from the
+    compute-job ledger, not from Task VM fields."""
+    now = _utcnow()
+    window_start = now - timedelta(days=14)
+    # Three compute_experiment tasks. Their banked VM cost is intentionally
+    # different (and would mislead) — the honest cost comes from the compute-job
+    # ledger keyed by task id.
+    tasks = [_make_cost_task("compute_experiment", 0.01) for _ in range(3)]
+    compute_job_cost_by_task = {
+        str(tasks[0].id): 6.0,
+        str(tasks[1].id): 8.0,
+        str(tasks[2].id): 10.0,
+    }
+    rows = compute_task_type_cost_adherence(
+        tasks,
+        window_start=window_start,
+        ceilings={"compute_experiment": 5.0},
+        compute_job_cost_by_task=compute_job_cost_by_task,
+    )
+    row = next(r for r in rows if r["id"] == "compute_experiment")
+    assert row["sample_count"] == 3
+    assert row["avg_cost_usd"] == pytest.approx(8.0)
+    assert row["p95_cost_usd"] == pytest.approx(10.0)
+    # Average ($8) exceeds the $5 ceiling with >= MIN_SAMPLES runs.
+    assert row["over_ceiling"] is True
+
+
+def test_cost_adherence_compute_substrate_no_ledger_entry_no_sample():
+    """A compute-substrate task with VM cost but no compute-job spend contributes
+    no sample — it must NOT fall back to the monitoring VM's cost."""
+    now = _utcnow()
+    window_start = now - timedelta(days=14)
+    # Banked VM cost present, but no entry (and a non-positive entry) in the
+    # compute-job ledger -> no samples.
+    tasks = [
+        _make_cost_task("compute_experiment", 3.0),
+        _make_cost_task("compute_experiment", 3.0),
+    ]
+    rows = compute_task_type_cost_adherence(
+        tasks,
+        window_start=window_start,
+        ceilings={"compute_experiment": 5.0},
+        compute_job_cost_by_task={str(tasks[1].id): 0.0},  # non-positive -> skip
+    )
+    row = next(r for r in rows if r["id"] == "compute_experiment")
+    assert row["sample_count"] == 0
+    assert row["avg_cost_usd"] is None
+    assert row["over_ceiling"] is False
+
+
+def test_cost_adherence_non_compute_type_still_uses_vm_cost():
+    """Regression: non-compute types keep sourcing cost from VM fields and ignore
+    the compute-job ledger."""
+    now = _utcnow()
+    window_start = now - timedelta(days=14)
+    tasks = [_make_cost_task("create", 4.0) for _ in range(3)]
+    rows = compute_task_type_cost_adherence(
+        tasks,
+        window_start=window_start,
+        ceilings={"create": 8.0},
+        # A stray compute-job entry for a create task must be ignored.
+        compute_job_cost_by_task={str(tasks[0].id): 999.0},
+    )
+    row = next(r for r in rows if r["id"] == "create")
+    assert row["sample_count"] == 3
+    assert row["avg_cost_usd"] == pytest.approx(4.0)
+    assert row["over_ceiling"] is False
+
+
 def test_compute_failure_grouping_empty():
     """Empty failed-task list returns zeroed-out structure."""
     now = _utcnow()

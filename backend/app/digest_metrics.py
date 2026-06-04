@@ -2156,14 +2156,32 @@ def compute_task_type_cost_adherence(
     window_start: datetime,
     ceilings: Dict[str, Optional[float]],
     min_samples: int = TASK_TYPE_COST_ADHERENCE_MIN_SAMPLES,
+    compute_job_cost_by_task: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
-    """Per-task-type actual VM cost (avg/p95/sample count) vs the declared ceiling.
+    """Per-task-type actual cost (avg/p95/sample count) vs the declared ceiling.
 
     Pure transform over already-loaded ``Task`` rows — no DB access. Buckets
-    terminal, in-window tasks by their declared type (``first_payload['type']``),
-    derives each task's total VM cost via ``get_task_total_vm_cost_usd_or_none``
-    (which includes banked retry spend), and compares the per-type average against
-    the declared ``cost_ceiling_usd`` for that type.
+    terminal, in-window tasks by their declared type (``first_payload['type']``)
+    and compares the per-type average against the declared ``cost_ceiling_usd``
+    for that type.
+
+    Cost source is type-dependent so the surface is honest for off-VM types:
+
+    * Task types that run on the **compute-job substrate** (registry predicate
+      ``runs_on_compute_substrate`` — ``requires_compute AND NOT requires_code``,
+      e.g. ``compute_experiment``) hold only a lightweight monitoring VM; their
+      real spend lives on the linked ``ComputeJob.final_cost_usd``. For these we
+      source cost from ``compute_job_cost_by_task`` (keyed by ``str(task.id)``),
+      NOT from the task's VM fields. A task with no entry there — or a
+      non-positive entry — contributes no sample (the compute job has not yet
+      reported durable spend).
+    * All other types use ``get_task_total_vm_cost_usd_or_none`` (which includes
+      banked retry spend), as before.
+
+    ``compute_job_cost_by_task`` maps ``str(task_id) -> summed final_cost_usd`` for
+    that task's compute jobs; the caller aggregates it from the ``ComputeJob``
+    ledger. ``None`` (the default) means "no compute-job ledger supplied" — every
+    compute-substrate task then yields no sample, keeping legacy callers valid.
 
     ``ceilings`` maps task-type id -> declared ceiling (or None for types with no
     declared ceiling). The returned rows cover every type present in ``ceilings``
@@ -2183,7 +2201,9 @@ def compute_task_type_cost_adherence(
         TaskStatus,
         get_task_total_vm_cost_usd_or_none,
     )
+    from app.task_capabilities import runs_on_compute_substrate
 
+    compute_job_cost_by_task = compute_job_cost_by_task or {}
     _terminal = (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
     costs_by_type: Dict[str, List[float]] = defaultdict(list)
     for t in tasks:
@@ -2191,10 +2211,18 @@ def compute_task_type_cost_adherence(
             continue
         if t.created_at is None or t.created_at < window_start:
             continue
-        cost = get_task_total_vm_cost_usd_or_none(t)
-        if cost is None:
-            continue
         task_type = (t.first_payload or {}).get("type", "create")
+        if runs_on_compute_substrate(task_type):
+            # Off-VM type: honest spend lives on the linked compute job, not the
+            # lightweight monitoring VM. No (or non-positive) ledger entry => no
+            # sample.
+            cost = compute_job_cost_by_task.get(str(t.id))
+            if cost is None or cost <= 0:
+                continue
+        else:
+            cost = get_task_total_vm_cost_usd_or_none(t)
+            if cost is None:
+                continue
         costs_by_type[task_type].append(cost)
 
     rows: List[Dict[str, Any]] = []

@@ -55,6 +55,7 @@ async def _make_job(session, project, *, status=ComputeJobStatus.RUNNING, title=
         machine_type="e2-standard-2",
         spend_cap_usd=2.0,
         accrued_cost_usd=0.5,
+        result_reference="https://storage.example.com/jobs/job-1/result.json",
     )
     session.add(job)
     await session.commit()
@@ -75,6 +76,7 @@ async def test_list_compute_jobs_viewer_ok(client: AsyncClient, db_session):
     assert jobs[0]["id"] == str(job.id)
     assert jobs[0]["task_title"] == "compute_experiment task"
     assert jobs[0]["task_type"] == "compute_experiment"
+    assert jobs[0]["result_reference"] == "https://storage.example.com/jobs/job-1/result.json"
 
 
 @pytest.mark.asyncio

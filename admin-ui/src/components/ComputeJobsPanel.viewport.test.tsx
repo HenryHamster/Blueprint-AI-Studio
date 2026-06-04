@@ -24,6 +24,7 @@ const stressJobs: ComputeJob[] = [
     last_polled_at: new Date(Date.now() - 15_000).toISOString(),
     accrued_cost_usd: 4.62,
     final_cost_usd: null,
+    result_reference: null,
     task_title:
       'compute_experiment: long-running hyperparameter sweep across the entire candidate space for the new ranking model',
     task_type: 'compute_experiment',
@@ -47,15 +48,20 @@ const stressJobs: ComputeJob[] = [
     last_polled_at: new Date(Date.now() - 300_000).toISOString(),
     accrued_cost_usd: 0.87,
     final_cost_usd: 0.87,
+    result_reference: 'https://storage.example.com/jobs/job-2/result.json',
     task_title: 'compute_experiment: aborted batch eval run',
     task_type: 'compute_experiment',
   },
 ];
 
-vi.mock('../api', () => ({
-  fetchComputeJobs: vi.fn(async () => stressJobs),
-  killComputeJob: vi.fn(async () => stressJobs[0]),
-}));
+vi.mock('../api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../api')>();
+  return {
+    ...actual,
+    fetchComputeJobs: vi.fn(async () => stressJobs),
+    killComputeJob: vi.fn(async () => stressJobs[0]),
+  };
+});
 
 import { ComputeJobsPanel } from './ComputeJobsPanel';
 

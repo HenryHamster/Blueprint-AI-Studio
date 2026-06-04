@@ -73,6 +73,7 @@ KIND_RESEARCH_QUALITY = "research_quality"
 KIND_AUDIT_FINDINGS = "audit_findings"
 KIND_MEMO_ARTIFACT = "memo_artifact"
 KIND_VERIFICATION_VERDICT = "verification_verdict"
+KIND_COMPUTE_RESULT = "compute_result"
 # Read-only types that have no type-specific honest signal yet (review, plan,
 # strategic_review, design_doc_update, smoketest, debug, investigate). They are
 # terminal but contribute no success/failure signal of their own — neutral.
@@ -233,6 +234,59 @@ def _evaluate_verify_tests(task: Task) -> TaskOutcome:
     return TaskOutcome("neutral", KIND_VERIFICATION_VERDICT)
 
 
+# Terminal compute-job outcomes that are intentional, non-failing ends to an
+# experiment rather than a compute error: a budget teardown
+# (SPEND_CAP_EXCEEDED), a deadline teardown (TIMED_OUT), and an operator kill
+# (CANCELLED). They cleared the completion gate — the job produced a costed,
+# terminal outcome — so they are ``neutral`` (the experiment ran but yielded no
+# success/failure signal of its own), not ``failure``.
+_COMPUTE_NEUTRAL_OUTCOMES = frozenset(
+    {"SPEND_CAP_EXCEEDED", "TIMED_OUT", "CANCELLED"}
+)
+
+
+def _compute_result(task: Task) -> dict | None:
+    """Best-effort read of a compute_experiment task's durable result dict.
+
+    ``_handle_compute_experiment_completion`` stores
+    ``plan_output['compute_result'] = {'outcome', 'final_cost_usd'}`` on a
+    clean terminal completion. Reads task-locally (deferred-column safe) and
+    returns ``None`` when no result is present.
+    """
+    raw_plan_output = _task_local_attr(task, "plan_output")
+    if not isinstance(raw_plan_output, dict):
+        return None
+    result = raw_plan_output.get("compute_result")
+    return result if isinstance(result, dict) else None
+
+
+def _evaluate_compute_experiment(task: Task) -> TaskOutcome:
+    """Outcome for a compute_experiment task — judged on its terminal job outcome.
+
+    The honest terminal signal is the compute job's ``outcome`` stored in
+    ``plan_output['compute_result']`` by the completion gate. ``SUCCESS`` is a
+    ``success``; ``FAILURE`` is a ``failure``; the intentional terminations
+    (``SPEND_CAP_EXCEEDED`` budget kill, ``TIMED_OUT`` deadline kill,
+    ``CANCELLED`` operator kill) are ``neutral`` — they cleared the gate as
+    deliberate terminal outcomes, not crashes. When no ``compute_result`` is
+    present (e.g. the gate failed the task and it never stored one), fall back
+    to the direction-metrics failure notion: ``failure`` if it counts as a
+    genuine failure, else ``neutral``.
+    """
+    result = _compute_result(task)
+    if result is not None:
+        outcome = str(result.get("outcome") or "").strip().upper()
+        if outcome == "SUCCESS":
+            return TaskOutcome("success", KIND_COMPUTE_RESULT)
+        if outcome == "FAILURE":
+            return TaskOutcome("failure", KIND_COMPUTE_RESULT)
+        if outcome in _COMPUTE_NEUTRAL_OUTCOMES:
+            return TaskOutcome("neutral", KIND_COMPUTE_RESULT)
+    if _counts_as_failure(task):
+        return TaskOutcome("failure", KIND_COMPUTE_RESULT)
+    return TaskOutcome("neutral", KIND_COMPUTE_RESULT)
+
+
 # Built-in per-type evaluators for read-only task types that carry an honest
 # terminal signal. Keyed by task-type value (the registry's canonical id). Read
 # only types absent from this map degrade to KIND_READ_ONLY_UNCLASSIFIED.
@@ -244,6 +298,7 @@ _READ_ONLY_EVALUATORS: dict[str, Callable[[Task], TaskOutcome]] = {
     "release_audit": _evaluate_audit,
     "memo": _evaluate_memo,
     "verify_tests": _evaluate_verify_tests,
+    "compute_experiment": _evaluate_compute_experiment,
 }
 
 
@@ -453,6 +508,30 @@ def _build_self_audit_summary(task: Task, ctx: SummaryContext) -> dict[str, Any]
     return _summary_dict(task, verdict, evidence, highlights)
 
 
+def _build_compute_experiment_summary(
+    task: Task, ctx: SummaryContext
+) -> dict[str, Any] | None:
+    """Operator summary for a compute_experiment task — the terminal job result.
+
+    Reads the durable ``plan_output['compute_result']`` (``outcome`` +
+    ``final_cost_usd``) and surfaces the outcome label as the verdict with the
+    outcome and measured spend as evidence. Returns ``None`` when no
+    ``compute_result`` is present so the caller falls through to the no-summary
+    contract (the same way the other builders degrade on a missing artifact).
+    """
+    result = _compute_result(task)
+    if result is None:
+        return None
+    outcome = str(result.get("outcome") or "unknown").strip() or "unknown"
+    verdict = outcome.lower()
+    evidence = [_summary_item("Outcome", outcome)]
+    cost = result.get("final_cost_usd")
+    if cost is not None:
+        evidence.append(_summary_item("Final cost", f"${cost}"))
+    highlights = [_summary_item("Outcome", outcome)]
+    return _summary_dict(task, verdict, evidence, highlights)
+
+
 def _build_findings_summary(task: Task, ctx: SummaryContext) -> dict[str, Any] | None:
     """Shared builder for the structured-findings task types (security_audit,
     perf, release_audit, …) and the fallback for any unregistered type whose
@@ -494,6 +573,7 @@ SUMMARY_BUILDERS: dict[str, Callable[[Task, SummaryContext], dict[str, Any] | No
     "security_audit": _build_findings_summary,
     "perf": _build_findings_summary,
     "release_audit": _build_findings_summary,
+    "compute_experiment": _build_compute_experiment_summary,
 }
 
 

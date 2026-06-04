@@ -2746,6 +2746,40 @@ def test_counts_as_failure_excludes_cascade_cancelled():
     assert _counts_as_failure(t)
 
 
+def _compute_experiment_task(outcome, *, status=TaskStatus.COMPLETED):
+    plan_output = (
+        {"compute_result": {"outcome": outcome, "final_cost_usd": 1.0}}
+        if outcome is not None
+        else None
+    )
+    return Task(
+        project_id=uuid.uuid4(),
+        title="compute",
+        payloads=[{"type": "compute_experiment"}],
+        status=status,
+        context={},
+        plan_output=plan_output,
+        created_by="ORCHESTRATOR",
+    )
+
+
+def test_compute_experiment_outcome_feeds_success_predicate():
+    """A SUCCESS compute_experiment is a successful outcome; budget/deadline
+    terminations are neutral (not successes, not failures)."""
+    from app.task_outcomes import evaluate_task_outcome, is_successful_outcome
+
+    success = _compute_experiment_task("SUCCESS")
+    assert is_successful_outcome(success) is True
+    assert evaluate_task_outcome(success).status == "success"
+
+    spend_cap = _compute_experiment_task("SPEND_CAP_EXCEEDED")
+    assert is_successful_outcome(spend_cap) is False
+    assert evaluate_task_outcome(spend_cap).status == "neutral"
+
+    failure = _compute_experiment_task("FAILURE")
+    assert evaluate_task_outcome(failure).status == "failure"
+
+
 def _cancelled_task(context):
     return Task(
         project_id=uuid.uuid4(),

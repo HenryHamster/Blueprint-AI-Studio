@@ -35,6 +35,7 @@ from app.models import (
     TaskHistory,
     TaskStatus,
 )
+from app.compute_jobs import stamp_compute_job_result_reference
 from app.task_capabilities import WRITE_TASK_TYPES
 from app.task_evaluators import (
     EvaluationVerdict,
@@ -125,6 +126,20 @@ def _estimated_task_cost_usd(task: Task) -> Optional[float]:
         return None
     rate = get_vm_rate_per_second(spot=task.vm_spot)
     return (task.vm_stopped_at - task.vm_provisioned_at).total_seconds() * rate
+
+
+def _extract_compute_result_reference(logs: str) -> Optional[str]:
+    try:
+        payload = json.loads(logs)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    reference = payload.get("result_reference")
+    if isinstance(reference, str):
+        reference = reference.strip()
+        return reference or None
+    return None
 
 
 def build_blueprint_pr_footer(
@@ -1763,6 +1778,26 @@ async def _handle_compute_experiment_completion(
         )[:500]
     else:  # pragma: no cover - defensive; the gate guarantees a measurement
         task.latest_status_message = "Compute experiment completed"
+    result_reference = _extract_compute_result_reference(logs)
+    job_id = None
+    try:
+        payload = json.loads(logs)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        raw_job_id = payload.get("job_id")
+        if raw_job_id is not None:
+            try:
+                job_id = uuid.UUID(str(raw_job_id))
+            except (TypeError, ValueError):
+                job_id = None
+    if job_id is not None:
+        await stamp_compute_job_result_reference(
+            session,
+            task_id=task.id,
+            job_id=job_id,
+            result_reference=result_reference,
+        )
     task.plan_output = plan_output
     flag_modified(task, "plan_output")
     task.status = TaskStatus.COMPLETED

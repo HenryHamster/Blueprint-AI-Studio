@@ -18,6 +18,7 @@ from app.models import Task, TaskStatus
 from app.task_outcomes import (
     KIND_AUDIT_FINDINGS,
     KIND_CODE_MERGE,
+    KIND_COMPUTE_RESULT,
     KIND_MEMO_ARTIFACT,
     KIND_READ_ONLY_UNCLASSIFIED,
     KIND_RESEARCH_QUALITY,
@@ -253,6 +254,66 @@ def test_verify_tests_no_verdict_is_neutral():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Compute-experiment family
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_compute_task(
+    outcome: str | None,
+    *,
+    status: TaskStatus = TaskStatus.COMPLETED,
+    final_cost_usd: float | None = 1.25,
+) -> Task:
+    """Build a compute_experiment task carrying a terminal compute_result."""
+    plan_output = None
+    if outcome is not None:
+        plan_output = {
+            "compute_result": {
+                "outcome": outcome,
+                "final_cost_usd": final_cost_usd,
+            }
+        }
+    return _make_task("compute_experiment", status=status, plan_output=plan_output)
+
+
+def test_compute_experiment_success_is_success():
+    task = _make_compute_task("SUCCESS")
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_COMPUTE_RESULT)
+
+
+def test_compute_experiment_failure_is_failure():
+    task = _make_compute_task("FAILURE")
+    assert evaluate_task_outcome(task) == TaskOutcome("failure", KIND_COMPUTE_RESULT)
+
+
+def test_compute_experiment_spend_cap_is_neutral():
+    task = _make_compute_task("SPEND_CAP_EXCEEDED")
+    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_COMPUTE_RESULT)
+
+
+def test_compute_experiment_timed_out_is_neutral():
+    task = _make_compute_task("TIMED_OUT")
+    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_COMPUTE_RESULT)
+
+
+def test_compute_experiment_cancelled_is_neutral():
+    task = _make_compute_task("CANCELLED")
+    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_COMPUTE_RESULT)
+
+
+def test_compute_experiment_missing_result_failed_status_is_failure():
+    # No compute_result stored (gate failed it) + FAILED status → failure.
+    task = _make_compute_task(None, status=TaskStatus.FAILED)
+    assert evaluate_task_outcome(task) == TaskOutcome("failure", KIND_COMPUTE_RESULT)
+
+
+def test_compute_experiment_missing_result_completed_is_neutral():
+    # Completed but no compute_result and not a genuine failure → neutral.
+    task = _make_compute_task(None, status=TaskStatus.COMPLETED)
+    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_COMPUTE_RESULT)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Forward-compatibility & registry seam
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -394,6 +455,27 @@ def test_summary_unregistered_type_falls_through_to_findings():
 
 def test_summary_type_without_findings_is_none():
     task = _make_task("plan", plan_output={"notes": "nothing structured"})
+    assert build_task_evaluation_summary(task) is None
+
+
+def test_summary_compute_experiment_success():
+    task = _make_compute_task("SUCCESS", final_cost_usd=2.5)
+    summary = build_task_evaluation_summary(task)
+    assert summary is not None
+    assert summary["verdict"] == "success"
+    assert summary["evidence"][0] == {"label": "Outcome", "value": "SUCCESS"}
+    assert summary["evidence"][1] == {"label": "Final cost", "value": "$2.5"}
+
+
+def test_summary_compute_experiment_spend_cap():
+    task = _make_compute_task("SPEND_CAP_EXCEEDED", final_cost_usd=5.0)
+    summary = build_task_evaluation_summary(task)
+    assert summary["verdict"] == "spend_cap_exceeded"
+    assert summary["evidence"][0]["value"] == "SPEND_CAP_EXCEEDED"
+
+
+def test_summary_compute_experiment_without_result_is_none():
+    task = _make_compute_task(None)
     assert build_task_evaluation_summary(task) is None
 
 

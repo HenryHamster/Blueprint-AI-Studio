@@ -645,6 +645,35 @@ STRATEGIC_PHASE_BY_TASK_TYPE: dict[str, str] = {
     for capability in TASK_CAPABILITIES
     if capability.strategic_phase is not None
 }
+# Canonical registry of task types that run their heavy work on the budgeted
+# compute-job substrate rather than on the agent VM — they hold only a
+# lightweight monitoring VM while real spend accrues on the linked
+# ``ComputeJob`` (persisted to ``ComputeJob.final_cost_usd``). The discriminating
+# signal is ``requires_compute AND NOT requires_code``: such a type needs compute
+# capacity but does not check out a code-working VM, so its honest observed cost
+# lives on the compute job, not on Task VM fields. This is the SINGLE source of
+# truth for "is this an off-VM / compute-substrate task type?" — cost-adherence
+# reporting reads it to source spend from the compute-job ledger. Today only
+# ``compute_experiment`` matches; future off-VM types are included automatically
+# by declaring the same capability shape (no edit at the metric call site).
+COMPUTE_SUBSTRATE_TASK_TYPES: frozenset[str] = frozenset(
+    capability.id.value
+    for capability in TASK_CAPABILITIES
+    if capability.requires_compute and not capability.requires_code
+)
+
+
+def runs_on_compute_substrate(task_type: str | TaskType | None) -> bool:
+    """True if ``task_type`` runs its heavy work on the compute-job substrate.
+
+    Membership is derived from the registry (``COMPUTE_SUBSTRATE_TASK_TYPES``);
+    unknown / unregistered types return False (conservative default — measure
+    from the VM-cost path).
+    """
+    if task_type is None:
+        return False
+    value = task_type.value if isinstance(task_type, TaskType) else str(task_type)
+    return value in COMPUTE_SUBSTRATE_TASK_TYPES
 
 
 def strategic_phase_for(task_type: str | TaskType) -> str | None:

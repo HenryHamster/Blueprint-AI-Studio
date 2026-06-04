@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, cleanup } from '@testing-library/react';
 import { DetailsTab } from './TaskDetailDrawerMeta';
 import type { Task } from '../types/task';
+import { fetchComputeJobs } from '../api';
 
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
@@ -15,6 +16,7 @@ vi.mock('../api', () => ({
   authGet: vi.fn(async () => new Response(JSON.stringify({ stats: {} }), { status: 200 })),
   apiFetch: vi.fn(async () => new Response(JSON.stringify({ task_id: 'task-1', fix_loop_history: {}, summary: {} }), { status: 200 })),
   API_BASE_URL: 'http://localhost:8000',
+  fetchComputeJobs: vi.fn(async () => []),
   fetchTaskSerialConsole: vi.fn(async () => ({ serial_log: '', source: 'cached', vm_status: 'TERMINATED', vm_instance_id: 'test' })),
 }));
 
@@ -147,5 +149,39 @@ describe('DetailsTab — Merge Test Gate', () => {
     expect(screen.getByText('pass')).toBeInTheDocument();
     expect(screen.getByText(/verified on PR head/)).toBeInTheDocument();
     expect(screen.getByText('Merge Test Gate')).toBeInTheDocument();
+  });
+
+  it('renders the terminal compute result reference when present', async () => {
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+      {
+        id: 'job-1',
+        project_id: 'proj-1',
+        task_id: 'task-verify-1',
+        backend: 'gcp_compute_engine',
+        external_compute_id: 'compute-job-vm-1',
+        machine_type: 'e2-standard-2',
+        status: 'SUCCEEDED',
+        terminal_reason: 'compute job finished',
+        outcome: 'SUCCESS',
+        spend_cap_usd: 4,
+        wall_clock_deadline: '2026-01-01T00:00:00Z',
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:10:00Z',
+        started_at: '2026-01-01T00:00:00Z',
+        completed_at: '2026-01-01T00:10:00Z',
+        last_polled_at: '2026-01-01T00:10:00Z',
+        accrued_cost_usd: 1.5,
+        final_cost_usd: 1.5,
+        result_reference: 'https://storage.example.com/jobs/job-1/result.json',
+        task_title: 'compute_experiment: run a budgeted job',
+        task_type: 'compute_experiment',
+      },
+    ]);
+    const task = makeTask({ project_id: 'proj-1' as unknown as Task['project_id'] });
+    render(<DetailsTab task={task} />);
+    expect(await screen.findByRole('link', { name: /https:\/\/storage\.example\.com\/jobs\/job-1\/result\.json/i })).toHaveAttribute(
+      'href',
+      'https://storage.example.com/jobs/job-1/result.json',
+    );
   });
 });

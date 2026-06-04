@@ -124,6 +124,43 @@ async def test_compute_completion_success_passes_gate_and_completes(
 
 
 @pytest.mark.asyncio
+async def test_compute_completion_stamps_terminal_result_reference(
+    db_session, _quiet_compute_io
+):
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.37
+    job.final_cost_usd = 0.37
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    db_session.add(job)
+    await db_session.commit()
+
+    result_reference = "https://storage.example.com/jobs/job-abc/result.json"
+    await _handle_compute_experiment_completion(
+        task,
+        _result_artifact(job_id=str(job.id), result_reference=result_reference),
+        db_session,
+    )
+
+    await db_session.refresh(job)
+    assert job.result_reference == result_reference
+
+
+@pytest.mark.asyncio
 async def test_compute_completion_spend_cap_kill_is_honest_terminal(
     db_session, _quiet_compute_io
 ):
@@ -141,6 +178,32 @@ async def test_compute_completion_spend_cap_kill_is_honest_terminal(
     await db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
     assert task.plan_output["compute_result"]["outcome"] == "SPEND_CAP_EXCEEDED"
+
+
+@pytest.mark.asyncio
+async def test_compute_completion_classifies_outcome_after_gate(
+    db_session, _quiet_compute_io
+):
+    """The terminal classification of a completed compute_experiment matches the
+    stored compute_result: a SUCCESS run is a success outcome while a spend-cap
+    kill is neutral — tying the analytics verdict to the gated terminal result."""
+    from app.task_outcomes import evaluate_task_outcome
+
+    success = await _make_compute_task(db_session)
+    await _handle_compute_experiment_completion(
+        success, _result_artifact(), db_session
+    )
+    await db_session.refresh(success)
+    assert evaluate_task_outcome(success).status == "success"
+
+    spend_cap = await _make_compute_task(db_session)
+    await _handle_compute_experiment_completion(
+        spend_cap,
+        _result_artifact(outcome="SPEND_CAP_EXCEEDED", status="FAILED"),
+        db_session,
+    )
+    await db_session.refresh(spend_cap)
+    assert evaluate_task_outcome(spend_cap).status == "neutral"
 
 
 @pytest.mark.asyncio

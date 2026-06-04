@@ -36,6 +36,7 @@ function makeJob(overrides: Partial<ComputeJob> = {}): ComputeJob {
     last_polled_at: new Date().toISOString(),
     accrued_cost_usd: 1.0,
     final_cost_usd: null,
+    result_reference: null,
     task_title: 'compute_experiment: sweep',
     task_type: 'compute_experiment',
     ...overrides,
@@ -102,6 +103,21 @@ describe('ComputeJobsPanel render + kill', () => {
     await waitFor(() => expect(killComputeJob).toHaveBeenCalledWith('job-1'));
     await findByText('Killed by operator');
     expect(queryByText('Kill')).toBeNull();
+  });
+
+  test('renders a safe terminal result link', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        accrued_cost_usd: 1.0,
+        final_cost_usd: 1.0,
+        result_reference: 'https://storage.example.com/jobs/job-1/result.json',
+      }),
+    ]);
+    const { findByRole } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const link = await findByRole('link', { name: /https:\/\/storage\.example\.com\/jobs\/job-1\/result\.json/i });
+    expect(link).toHaveAttribute('href', 'https://storage.example.com/jobs/job-1/result.json');
   });
 
   test('renders nothing when there are no jobs', async () => {

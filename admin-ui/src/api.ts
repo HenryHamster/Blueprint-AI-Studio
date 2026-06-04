@@ -1613,6 +1613,7 @@ export interface ComputeJob {
   last_polled_at: string | null;
   accrued_cost_usd: number | null;
   final_cost_usd: number | null;
+  result_reference: string | null;
   // Augmented by the admin list endpoint from the launching Task.
   task_title: string | null;
   task_type: string | null;

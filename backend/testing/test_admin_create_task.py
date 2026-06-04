@@ -229,3 +229,101 @@ async def test_non_hotfix_create_task_still_works(client: AsyncClient, db_sessio
     payloads = get_resp.json()["payloads"]
     assert payloads[0]["type"] == "create"
     assert "hotfix" not in payloads[0]
+
+
+# --- Non-launchable task-type guard (reject doomed compute_experiment) -------
+#
+# The manual creation path only carries the generic CreateTaskPayload fields; it
+# cannot supply the launch contract a compute_experiment needs (non-empty
+# command + positive spend_cap_usd + positive deadline_seconds). The endpoint
+# must reject any task_type the capability registry declares non-launchable BEFORE
+# any Task row is created, rather than enqueueing a task that only fails later on
+# the agent. The gate is registry-driven (USER_LAUNCHABLE_TASK_TYPES), so it
+# generalizes to every non-launchable type, not just compute_experiment.
+
+
+async def _count_tasks(db_session, project_id) -> int:
+    from sqlalchemy import func, select
+
+    from app.models import Task
+
+    return (
+        await db_session.execute(
+            select(func.count(Task.id)).where(Task.project_id == project_id)
+        )
+    ).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_compute_experiment_rejected_at_creation(
+    client: AsyncClient, db_session
+):
+    """compute_experiment is not user_launchable → 400, and no Task is created."""
+    project = await _make_project_with_member(db_session, "acme/widget")
+
+    resp = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "title": "Doomed compute experiment",
+            "prompt": "run the experiment",
+            "base_branch": "main",
+            "task_type": "compute_experiment",
+        },
+    )
+
+    assert resp.status_code == 400, resp.text
+    # HTTPException detail surfaces at error.message (main.py http_exception_handler).
+    message = resp.json()["error"]["message"].lower()
+    assert "compute_experiment" in message
+    assert "launchable" in message
+    # The doomed task must never have been persisted.
+    assert await _count_tasks(db_session, project.id) == 0
+
+
+@pytest.mark.asyncio
+async def test_non_launchable_type_rejected(client: AsyncClient, db_session):
+    """A different non-launchable type (memo) is rejected by the same registry
+    gate — proving the guard is registry-driven, not a compute_experiment
+    special case."""
+    project = await _make_project_with_member(db_session, "acme/widget")
+
+    resp = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "title": "Memo via manual path",
+            "prompt": "reason about a topic",
+            "base_branch": "main",
+            "task_type": "memo",
+        },
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "memo" in resp.json()["error"]["message"].lower()
+    assert await _count_tasks(db_session, project.id) == 0
+
+
+@pytest.mark.asyncio
+async def test_user_launchable_type_still_accepted(client: AsyncClient, db_session):
+    """Regression guard: the non-launchable gate must not over-reject. A
+    user_launchable type (research) is still accepted and persisted."""
+    project = await _make_project_with_member(db_session, "acme/widget")
+
+    resp = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "title": "Codebase research",
+            "prompt": "analyze the codebase",
+            "base_branch": "main",
+            "task_type": "research",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    task_id = resp.json()["id"]
+    get_resp = await client.get(f"/api/admin/tasks/{task_id}")
+    assert get_resp.status_code == 200
+    assert get_resp.json()["payloads"][0]["type"] == "research"
+    assert await _count_tasks(db_session, project.id) == 1

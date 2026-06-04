@@ -170,16 +170,35 @@ function TaskComputeJobsSection({ task }: { task: Task }) {
         const cap = job.spend_cap_usd ?? 0;
         const spent = (active ? job.accrued_cost_usd : job.final_cost_usd ?? job.accrued_cost_usd) ?? 0;
         return (
-          <DetailRow key={job.id} label={job.backend}>
-            <span className="inline-flex flex-wrap items-center gap-1.5 min-w-0">
-              <span className={`text-xs px-1.5 py-0.5 rounded ${active ? 'bg-sky-900/40 text-sky-300' : job.outcome === 'SUCCESS' ? 'bg-emerald-900/40 text-emerald-400' : 'bg-red-900/40 text-red-400'}`}>
-                {active ? job.status : computeJobTerminalLabel(job)}
+          <div key={job.id} className="space-y-1">
+            <DetailRow label={job.backend}>
+              <span className="inline-flex flex-wrap items-center gap-1.5 min-w-0">
+                <span className={`text-xs px-1.5 py-0.5 rounded ${active ? 'bg-sky-900/40 text-sky-300' : job.outcome === 'SUCCESS' ? 'bg-emerald-900/40 text-emerald-400' : 'bg-red-900/40 text-red-400'}`}>
+                  {active ? job.status : computeJobTerminalLabel(job)}
+                </span>
+                <span className="text-xs text-neutral-400 font-mono break-words">
+                  ${spent.toFixed(2)} / ${cap.toFixed(2)}
+                </span>
               </span>
-              <span className="text-xs text-neutral-400 font-mono break-words">
-                ${spent.toFixed(2)} / ${cap.toFixed(2)}
-              </span>
-            </span>
-          </DetailRow>
+            </DetailRow>
+            {job.result_reference && (
+              <DetailRow label="Result">
+                {isSafeUrl(job.result_reference) ? (
+                  <a
+                    href={job.result_reference}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1.5 text-sky-400 hover:text-sky-300 hover:underline break-all"
+                  >
+                    <span className="break-all">{job.result_reference}</span>
+                    <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                  </a>
+                ) : (
+                  <span className="break-all text-neutral-300 font-mono text-xs">{job.result_reference}</span>
+                )}
+              </DetailRow>
+            )}
+          </div>
         );
       })}
     </>

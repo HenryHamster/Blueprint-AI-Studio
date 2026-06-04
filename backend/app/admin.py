@@ -54,6 +54,7 @@ from app.payload_schemas import (
     TaskType,
     validate_task_payload,
 )
+from app.task_capabilities import USER_LAUNCHABLE_TASK_TYPES
 from app.schemas import TaskEvaluationSummary, TaskEvaluationSummaryItem
 from app.task_outcomes import build_task_evaluation_summary
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
@@ -1288,6 +1289,28 @@ async def create_task_manually(
                 "hotfix=true is only supported for task_type='plan' "
                 f"(got '{payload.task_type.value}'); a non-plan hotfix would "
                 "merge to main without the automain back-merge."
+            ),
+        )
+
+    # Guard: the manual operator creation path may only emit task types the
+    # capability registry declares ``user_launchable``. A non-launchable type
+    # (e.g. ``compute_experiment``) needs a launch contract — for
+    # compute_experiment, a non-empty ``command`` plus positive
+    # ``spend_cap_usd`` and ``deadline_seconds`` — that this endpoint's
+    # ``CreateTaskPayload`` does not carry, so accepting it would enqueue a
+    # task that only fails later on the agent (``compute_launch_failed``) and at
+    # the backend launch endpoint. Reject cleanly at the boundary. Gating off
+    # ``USER_LAUNCHABLE_TASK_TYPES`` (the registry-derived single source of
+    # truth) means a newly registered launchable/non-launchable type is honored
+    # here automatically with no edit to this call site.
+    if payload.task_type.value not in USER_LAUNCHABLE_TASK_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"task_type '{payload.task_type.value}' is not operator-launchable "
+                "and cannot be created through this endpoint. It requires a launch "
+                "contract the manual creation path does not supply; launch it "
+                "through its dedicated path instead."
             ),
         )
 

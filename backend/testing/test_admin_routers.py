@@ -21,6 +21,7 @@ from app.models import (
     AllowedUser,
     Artifact,
     ArtifactType,
+    ComputeJob,
     Project,
     ProjectMember,
     ProjectStatus,
@@ -2463,6 +2464,52 @@ class TestTaskTypeCostAdherence:
         assert create["declared_ceiling_usd"] == (
             TASK_CAPABILITY_BY_VALUE["create"].cost_ceiling_usd
         )
+
+    @pytest.mark.asyncio
+    async def test_compute_experiment_cost_from_compute_jobs(
+        self, client: AsyncClient, db_session
+    ):
+        """compute_experiment cost is sourced from the linked compute jobs'
+        durable final_cost_usd, not the lightweight monitoring VM."""
+        from datetime import timedelta
+        from app.time_utils import _utcnow
+        from app.models import ComputeJobStatus
+
+        project = await _make_project(db_session, name="Compute Cost Project")
+        now = _utcnow()
+        # Three terminal compute_experiment tasks whose monitoring VM cost is
+        # near-zero; the honest spend lives on the linked compute jobs.
+        for spend in (6.0, 8.0, 10.0):
+            task = Task(
+                project_id=project.id,
+                payloads=[{"type": "compute_experiment"}],
+                status=TaskStatus.COMPLETED,
+                created_at=now - timedelta(hours=1),
+                vm_runtime_cost_banked_db=0.01,
+            )
+            db_session.add(task)
+            await db_session.flush()
+            db_session.add(
+                ComputeJob(
+                    project_id=project.id,
+                    task_id=task.id,
+                    backend="test",
+                    status=ComputeJobStatus.SUCCEEDED,
+                    final_cost_usd=spend,
+                )
+            )
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/task-types/cost-adherence")
+        assert resp.status_code == 200
+        by_id = {r["id"]: r for r in resp.json()["task_types"]}
+        row = by_id["compute_experiment"]
+        assert row["sample_count"] == 3
+        # avg of compute-job spend ($8), NOT the ~$0.01 monitoring VM cost.
+        assert row["avg_cost_usd"] == pytest.approx(8.0)
+        assert row["declared_ceiling_usd"] == 5.0
+        # avg $8 exceeds the $5 ceiling with >= MIN_SAMPLES runs.
+        assert row["over_ceiling"] is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

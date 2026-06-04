@@ -450,6 +450,72 @@ describe('useTaskModal', () => {
     expect(addToast).toHaveBeenCalledWith('PR branch is required for fix tasks', 'error');
   });
 
+  it('handleCreateTask surfaces a wrapped backend rejection message', async () => {
+    // The backend rejects a doomed task with an HTTPException, which the app
+    // serializes as { error: { message } }. The operator must see that message,
+    // not a silent failure.
+    fetchSpy.mockResolvedValue({
+      ok: false,
+      statusText: 'Bad Request',
+      json: vi.fn().mockResolvedValue({
+        error: { message: "task_type 'compute_experiment' is not operator-launchable" },
+      }),
+    });
+    const addToast = vi.fn();
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskTitle('t');
+      result.current.setNewTaskPrompt('p');
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(addToast).toHaveBeenCalledWith(
+      expect.stringContaining('not operator-launchable'),
+      'error',
+    );
+  });
+
+  // --- Duplicate-task flow: non-launchable types must not be re-emitted ---
+
+  it('openDuplicateTaskModal collapses a non-launchable task_type to create', () => {
+    const { result } = renderHook(() =>
+      useTaskModal('create', vi.fn(), { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.openDuplicateTaskModal({
+        id: 'task-99',
+        title: 'Old compute experiment',
+        description: 'rerun it',
+        task_type: 'compute_experiment',
+        payloads: [{ base_branch: 'main' }],
+      } as unknown as Parameters<typeof result.current.openDuplicateTaskModal>[0]);
+    });
+    // A non-launchable source type must not be re-submitted verbatim; it
+    // collapses to the launchable 'create' default so the duplicate can never
+    // emit a doomed compute_experiment.
+    expect(result.current.newTaskType).toBe('create');
+  });
+
+  it('openDuplicateTaskModal preserves a launchable task_type', () => {
+    const { result } = renderHook(() =>
+      useTaskModal('create', vi.fn(), { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.openDuplicateTaskModal({
+        id: 'task-100',
+        title: 'Old research',
+        description: 'rerun it',
+        task_type: 'research',
+        payloads: [{ base_branch: 'main' }],
+      } as unknown as Parameters<typeof result.current.openDuplicateTaskModal>[0]);
+    });
+    expect(result.current.newTaskType).toBe('research');
+  });
+
   // --- localStorage integration ---
 
   it('getDefaultModelForType reads task-type-specific model from localStorage', () => {
