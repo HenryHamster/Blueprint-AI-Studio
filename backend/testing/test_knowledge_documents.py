@@ -18,10 +18,17 @@ from httpx import AsyncClient
 from sqlmodel import select
 
 from app.knowledge_completion import (
+    _PENDING_DOCUMENT_KEY,
     _handle_web_research_completion,
+    _is_usable_citation,
     _parse_web_research_document,
 )
-from app.models import KnowledgeDocument, TaskStatus
+from app.models import KnowledgeDocument, Task, TaskStatus
+from app.schemas import AgentStatusPayload
+from app.task_evaluators import (
+    QUALITY_GRADER_SOURCE_KEY,
+    QUALITY_GRADER_VERDICT_KEY,
+)
 from app.task_outcomes import (
     KIND_KNOWLEDGE_DOCUMENT,
     TaskOutcome,
@@ -109,6 +116,28 @@ class TestParseDocument:
     def test_empty_returns_none(self):
         assert _parse_web_research_document("") is None
         assert _parse_web_research_document(None) is None  # type: ignore[arg-type]
+
+
+# ── _is_usable_citation predicate ───────────────────────────────────────────
+
+
+class TestUsableCitation:
+    def test_accepts_web_urls(self):
+        assert _is_usable_citation("https://example.com/x") is True
+        assert _is_usable_citation("http://example.com") is True
+
+    def test_accepts_file_references(self):
+        assert _is_usable_citation("file:docs/x.md") is True
+        assert _is_usable_citation("docs/notes/source.md") is True
+
+    def test_rejects_empty_and_whitespace(self):
+        assert _is_usable_citation("") is False
+        assert _is_usable_citation("   ") is False
+
+    def test_rejects_non_string_and_junk(self):
+        assert _is_usable_citation(None) is False  # type: ignore[arg-type]
+        assert _is_usable_citation(123) is False  # type: ignore[arg-type]
+        assert _is_usable_citation("not-a-url") is False
 
 
 # ── completion handler (integration with db_session) ────────────────────────
@@ -288,6 +317,347 @@ async def test_unparseable_document_fails_gate(db_session, _quiet_broadcast):
     assert docs == []
     await db_session.refresh(task)
     assert task.status == TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_no_citations_fails_gate_and_persists_no_document(
+    db_session, _quiet_broadcast
+):
+    """A well-formed title/summary/body with an EMPTY citation list fails the
+    forward-quality gate: web research must be grounded. No document persists."""
+    project, task = await _make_web_research_task(db_session, project_name="WRnocite")
+
+    document = {
+        "title": "Ungrounded summary of X",
+        "summary": "Looks plausible but cites nothing.",
+        "body": "# X\n\nA detailed-looking body with no sources whatsoever.",
+        "citations": [],
+        "tags": ["survey"],
+        "topic": "X",
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    docs = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert docs == []
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert task.context["evaluation_gate"]["passed"] is False
+    assert task.context["evaluation_gate"]["strategy"] == "forward-quality"
+
+
+@pytest.mark.asyncio
+async def test_junk_citations_fail_gate(db_session, _quiet_broadcast):
+    """Citations that are empty / whitespace / non-URL junk are not usable: the
+    gate fails and no document persists."""
+    project, task = await _make_web_research_task(db_session, project_name="WRjunkcite")
+
+    document = {
+        "title": "Ungrounded summary of X",
+        "summary": "Cites only junk.",
+        "body": "# X\n\nA detailed-looking body with junk citations only.",
+        "citations": ["", "   ", "not-a-url"],
+        "tags": ["survey"],
+        "topic": "X",
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    docs = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert docs == []
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_file_reference_citation_is_usable(db_session, _quiet_broadcast):
+    """A file reference (no http) is a usable citation: the gate passes and a
+    single document persists."""
+    project, task = await _make_web_research_task(db_session, project_name="WRfilecite")
+
+    document = {
+        "title": "Grounded by a file reference",
+        "summary": "Cites a file, not a URL.",
+        "body": "# X\n\nDetailed markdown grounded in a file reference.",
+        "citations": ["file:docs/x.md"],
+        "tags": ["survey"],
+        "topic": "X",
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    docs = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(docs) == 1
+    assert docs[0].source_citations == ["file:docs/x.md"]
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+
+# ── forward-quality grader escalation + resume (flag ON) ────────────────────
+#
+# web_research's honest quality gate has two tiers: the cheap synchronous
+# structural gate (always) and an optional INDEPENDENT forward-quality grader
+# (research_quality_grader_enabled, dark by default) that re-enters the
+# completion path with a pass/fail verdict. These tests prove the web_research
+# slice of the escalation/resume path end-to-end, mirroring the research and
+# security_audit grader-resume tests.
+
+
+def _enable_web_research_grader(mocker):
+    """Flip the dark-shipped research-quality-grader flag ON for one test."""
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"research_quality_grader_enabled": True},
+    )
+
+
+def _well_formed_document() -> dict:
+    return {
+        "title": "State of X on the web",
+        "summary": "A concise survey of X with citations.",
+        "body": "# X\n\nDetailed markdown body explaining X in depth.",
+        "citations": ["https://example.com/x", "file:docs/x.md"],
+        "tags": ["survey", "web"],
+        "topic": "X",
+    }
+
+
+@pytest.mark.asyncio
+async def test_grader_enabled_escalates_and_parks(
+    db_session, _quiet_broadcast, mocker
+):
+    """With the grader flag ON, a valid cited document does NOT persist on the
+    first pass: the task parks EVALUATING behind exactly one independent grader,
+    the parsed document is stashed in context, and no KnowledgeDocument yet."""
+    _enable_web_research_grader(mocker)
+    project, task = await _make_web_research_task(db_session, project_name="WRgrade")
+
+    document = _well_formed_document()
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    # No document persisted yet — it is gated behind the grade.
+    docs = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert docs == []
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+    # The parsed document is stashed so the resume pass can persist it intact.
+    assert task.context[_PENDING_DOCUMENT_KEY]["body"] == document["body"]
+
+    # Exactly one independent grader task, linked back to the source.
+    graders = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project.id, Task.id != task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(graders) == 1
+    grader = graders[0]
+    assert (grader.context or {}).get(QUALITY_GRADER_SOURCE_KEY) == str(task.id)
+    assert (grader.first_payload or {}).get("type") == "investigate"
+
+
+@pytest.mark.asyncio
+async def test_grader_pass_persists_one_doc_and_records_verdict(
+    db_session, _quiet_broadcast
+):
+    """RESUME pass with a PASS verdict pre-seeded in context persists exactly one
+    document, records the grader verdict (including grader_task_id), COMPLETED."""
+    project, task = await _make_web_research_task(db_session, project_name="WRpass")
+
+    document = _well_formed_document()
+    grader_id = str(uuid.uuid4())
+    ctx = dict(task.context or {})
+    ctx[_PENDING_DOCUMENT_KEY] = document
+    ctx[QUALITY_GRADER_VERDICT_KEY] = {
+        "passed": True,
+        "reason": "well-grounded survey",
+        "grader_task_id": grader_id,
+        "strategy": "forward-quality",
+    }
+    task.context = ctx
+    db_session.add(task)
+    await db_session.commit()
+
+    # On resume the reconstructed logs are only the status line; persistence must
+    # rely on the stashed document, so pass an empty body here.
+    await _handle_web_research_completion(task, "", db_session)
+
+    docs = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(docs) == 1
+    doc = docs[0]
+    assert doc.body == document["body"]
+    assert doc.forward_quality_verdict["passed"] is True
+    assert doc.forward_quality_verdict["grader_task_id"] == grader_id
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_grader_fail_marks_failed_and_persists_no_document(
+    db_session, _quiet_broadcast
+):
+    """RESUME pass with a FAIL verdict marks the source FAILED and persists no
+    document — a failing independent grade never completes clean."""
+    project, task = await _make_web_research_task(db_session, project_name="WRfailgrade")
+
+    document = _well_formed_document()
+    ctx = dict(task.context or {})
+    ctx[_PENDING_DOCUMENT_KEY] = document
+    ctx[QUALITY_GRADER_VERDICT_KEY] = {
+        "passed": False,
+        "reason": "claims unsupported by the cited sources",
+        "grader_task_id": str(uuid.uuid4()),
+        "strategy": "forward-quality",
+    }
+    task.context = ctx
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_web_research_completion(task, "", db_session)
+
+    docs = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert docs == []
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert task.context["evaluation_gate"]["passed"] is False
+    assert task.context["evaluation_gate"]["strategy"] == "forward-quality"
+
+
+@pytest.mark.asyncio
+async def test_grader_resume_reconstructs_document_from_stash_body_intact(
+    db_session, _quiet_broadcast, mocker
+):
+    """Full e2e through ``_resolve_quality_grader_completion``: a parked source
+    whose plan_output is unset (so the reconstructed resume logs carry only the
+    status line) must recover the parsed document from the context stash and
+    persist its body INTACT. This guards the subtle stash-recovery the resume
+    path depends on."""
+    from app.task_lifecycle import _resolve_quality_grader_completion
+
+    # The resolver broadcasts from task_lifecycle; quiet that too.
+    mocker.patch(
+        "app.task_lifecycle.broadcast_to_project", new=AsyncMock(return_value=None)
+    )
+
+    project, source = await _make_web_research_task(db_session, project_name="WRresume")
+
+    document = _well_formed_document()
+    # Park the source exactly as spawn_forward_quality_grader leaves it: stashed
+    # document + awaiting flag, EVALUATING, and crucially NO plan_output (so the
+    # resolver's resume_logs reconstruction falls to the status line, not a body).
+    source.status = TaskStatus.EVALUATING
+    source.plan_output = None
+    ctx = dict(source.context or {})
+    ctx[_PENDING_DOCUMENT_KEY] = document
+    ctx["awaiting_quality_grader"] = True
+    source.context = ctx
+    db_session.add(source)
+    await db_session.commit()
+    await db_session.refresh(source)
+
+    grader = make_task(
+        project_id=project.id,
+        title="[GRADE] forward-quality grade for web_research",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "investigate", "base_branch": "main"}],
+        context={QUALITY_GRADER_SOURCE_KEY: str(source.id)},
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(grader)
+    await db_session.commit()
+    await db_session.refresh(grader)
+
+    payload = AgentStatusPayload(
+        task_id=grader.id,
+        status=TaskStatus.COMPLETED,
+        logs='{"verdict": "pass", "reasoning": "well-grounded and cited"}',
+    )
+    await _resolve_quality_grader_completion(grader, payload, db_session)
+
+    docs = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == source.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(docs) == 1
+    # The persisted body must equal the ORIGINAL stashed body — proving the
+    # resume path recovered the document from the stash, not from the (status
+    # line only) reconstructed logs.
+    assert docs[0].body == document["body"]
+    assert docs[0].source_citations == document["citations"]
+
+    await db_session.refresh(source)
+    assert source.status == TaskStatus.COMPLETED
+    assert source.context[QUALITY_GRADER_VERDICT_KEY]["passed"] is True
 
 
 # ── list / search / get-by-id endpoints ─────────────────────────────────────

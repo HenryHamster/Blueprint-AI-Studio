@@ -92,7 +92,7 @@ Write your document as a JSON object to ${documentPath} (use Bash to write the f
 
 Rules:
 - title, summary, and body are REQUIRED and must be non-empty strings. body must be substantive markdown grounded in the sources you read.
-- source_citations is a list of the web URLs you actually used (plus any file references). Cite the sources behind your claims — an ungrounded document fails the quality gate.
+- source_citations is REQUIRED and must contain at least one usable citation — a web URL (https://...) or a file reference (file:... or a path). Cite the sources behind your claims: an ungrounded document with no usable citation FAILS the forward-quality gate and is discarded.
 - tags and topic are optional but recommended; tags is a list of short strings.
 - Also emit the same JSON object as the VERY LAST thing in your response (in addition to writing the file), so it can be recovered if the file write fails.
 

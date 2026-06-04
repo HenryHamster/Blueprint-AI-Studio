@@ -53,9 +53,40 @@ logger = logging.getLogger(__name__)
 # carry the grader's output, not the original document).
 _PENDING_DOCUMENT_KEY = "_web_research_document"
 
-# Required structural keys for a knowledge document. citations / tags / topic
-# are optional and normalized to safe defaults.
+# Required structural keys for a knowledge document. tags / topic are optional
+# and normalized to safe defaults. At least one *usable* source citation is
+# required — see :func:`_usable_citations` — because a web_research task is, by
+# contract, a web-grounded, citation-backed knowledge producer.
 _DOCUMENT_REQUIRED_KEYS = ("title", "summary", "body")
+
+
+def _is_usable_citation(value: Any) -> bool:
+    """True when ``value`` is a non-empty citation that grounds the document.
+
+    The agent contract permits both web URLs and file references, so a usable
+    citation is either an ``http(s)://`` URL or a file reference (a ``file:``
+    URI or a path-like string with a ``/`` separator). Empty / whitespace-only
+    strings and non-string junk are rejected — they do not ground anything.
+    """
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if lowered.startswith(("http://", "https://", "file:")):
+        return True
+    # Accept a path-like file reference (e.g. ``docs/x.md``) but reject bare
+    # junk tokens with no separator (e.g. ``not-a-url``).
+    return "/" in text
+
+
+def _usable_citations(obj: dict[str, Any]) -> list[str]:
+    """Return the stripped, usable citation strings from a parsed document."""
+    raw = obj.get("citations") or obj.get("source_citations") or []
+    if not isinstance(raw, list):
+        return []
+    return [c.strip() for c in raw if _is_usable_citation(c)]
 
 
 def _parse_web_research_document(text: str | None) -> dict[str, Any] | None:
@@ -128,9 +159,9 @@ def _normalize_document(obj: dict[str, Any], task: Task) -> dict[str, Any]:
     """
     payload = task.first_payload or {}
 
-    citations = obj.get("citations") or obj.get("source_citations") or []
-    if not isinstance(citations, list):
-        citations = []
+    # Persist only usable citations (web URLs / file references); junk entries
+    # are dropped so the stored document reflects the grounded sources only.
+    citations = _usable_citations(obj)
 
     tags = obj.get("tags")
     if not isinstance(tags, list) or not tags:
@@ -269,6 +300,19 @@ async def _handle_web_research_completion(
                 session,
             )
             return
+        # Defense-in-depth: a graded document must still carry a usable citation.
+        if not _usable_citations(document):
+            await _fail_gate(
+                task,
+                EvaluationVerdict(
+                    False,
+                    "web_research output has no usable source citation "
+                    "(at least one web URL or file reference is required)",
+                    "forward-quality",
+                ),
+                session,
+            )
+            return
         await _persist_document(task, document, grader_verdict, session)
         return
 
@@ -288,6 +332,22 @@ async def _handle_web_research_completion(
                 False,
                 "web_research output is not a parseable knowledge document "
                 "(missing title/summary/body)",
+                "forward-quality",
+            ),
+            session,
+        )
+        return
+
+    # A web_research document MUST be grounded: at least one usable source
+    # citation (web URL or file reference). Enforce BEFORE grader escalation or
+    # persistence so an ungrounded summary never parks for grading nor persists.
+    if not _usable_citations(document):
+        await _fail_gate(
+            task,
+            EvaluationVerdict(
+                False,
+                "web_research output has no usable source citation "
+                "(at least one web URL or file reference is required)",
                 "forward-quality",
             ),
             session,
