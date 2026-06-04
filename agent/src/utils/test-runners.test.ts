@@ -226,6 +226,33 @@ describe('detectTestRunners — bare pytest guard (C19)', () => {
     expect(runners[0].args).toEqual(['-m', 'pytest', '-x', '-q']);
   });
 
+  it('BuildConfig test_cmd with a QUOTED argument tokenizes round-trip (no whole-dir drop)', () => {
+    // `pytest -k "not slow"` must NOT be naively whitespace-split (that would
+    // yield args ['-k','"not','slow"'] and run the wrong selector); the
+    // quote-aware tokenizer keeps "not slow" as one arg. Runs via execFile, so
+    // no shell is needed for a plain (operator-free) quoted command.
+    const buildConfig: BuildConfig = {
+      directories: [{ path: 'svc', type: 'python', test_cmd: 'pytest -k "not slow"' }],
+    };
+    const runners = detectTestRunners(buildConfig);
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('pytest');
+    expect(runners[0].args).toEqual(['-k', 'not slow']);
+  });
+
+  it('BuildConfig test_cmd with shell operators wraps in `bash -c` so it runs verbatim', () => {
+    // `go test ./... && go vet ./...` needs a real shell for `&&`. It is wrapped
+    // as a single bash -c argv element (execFile, no re-interpretation) instead
+    // of being dropped — which previously produced a false 'no tests detected'.
+    const buildConfig: BuildConfig = {
+      directories: [{ path: 'core', type: 'go', test_cmd: 'go test ./... && go vet ./...' }],
+    };
+    const runners = detectTestRunners(buildConfig);
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('bash');
+    expect(runners[0].args).toEqual(['-c', 'go test ./... && go vet ./...']);
+  });
+
   it('classifyTestExecution treats Go empty-package output as no_tests', () => {
     expect(classifyTestExecution('?    example.com/foo [no test files]')).toBe('no_tests');
   });
@@ -1291,6 +1318,17 @@ describe('describeRunnerDirectory — runner → build_config directory descript
     expect(describeRunnerDirectory(mk('bash', ['test.sh'], '/tmp/workspace')).type).toBe('other');
     expect(describeRunnerDirectory(mk('sh', ['run-tests.sh'], '/tmp/workspace')).type).toBe('other');
     expect(describeRunnerDirectory(mk('gradle', ['test'], '/tmp/workspace')).type).toBe('other');
+  });
+
+  it('unwraps a `bash -c` runner back to the original test_cmd (not the wrapper)', () => {
+    // A shell-composed test_cmd is run via `bash -c '<cmd>'`. The recovered
+    // directory descriptor must reconstruct the ORIGINAL command so a stale
+    // stored config converges onto what the operator wrote, and type keys off
+    // the unwrapped first token.
+    expect(describeRunnerDirectory(mk('bash', ['-c', 'go test ./... && go vet ./...'], '/tmp/workspace/core')))
+      .toEqual({ path: 'core', type: 'go', test_cmd: 'go test ./... && go vet ./...' });
+    expect(describeRunnerDirectory(mk('bash', ['-c', 'pytest -k "not slow" || true'], '/tmp/workspace/svc')))
+      .toEqual({ path: 'svc', type: 'python', test_cmd: 'pytest -k "not slow" || true' });
   });
 });
 

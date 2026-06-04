@@ -452,16 +452,14 @@ async def update_project(
         # so the agent can distinguish user edits during its next cycle.
         from pydantic import ValidationError as _PmValidationError
 
-        from app.problem_model import ProblemModel, parse_problem_model
+        from app.problem_model import apply_user_intent_patch, parse_problem_model
 
-        ALLOWED_USER_FIELDS = {"intent", "context", "constraints"}
-        invalid = set(payload.problem_model_patch.keys()) - ALLOWED_USER_FIELDS
-        if invalid:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cannot edit agent-owned problem_model fields: {sorted(invalid)}. "
-                f"Editable fields: {sorted(ALLOWED_USER_FIELDS)}",
-            )
+        # Stale-write guard runs first so a concurrent writer is reported as a
+        # 409 before we attempt the merge. The editable-subset validation and
+        # the operator-provenance re-stamp both live in apply_user_intent_patch,
+        # so onboarding and this editor save share one correct path (the inline
+        # shallow merge used to drop intent.source, silently un-protecting an
+        # operator-edited purpose against the next strategic cycle).
         current = parse_problem_model(project.problem_model)
         if (
             payload.problem_model_base_revision is not None
@@ -475,17 +473,18 @@ async def update_project(
                     "Reload and retry."
                 ),
             )
-        merged_raw: Dict[str, Any] = current.model_dump()
-        merged_raw.update(payload.problem_model_patch)
         try:
-            validated = ProblemModel.model_validate(merged_raw)
+            validated = apply_user_intent_patch(
+                project.problem_model,
+                payload.problem_model_patch,
+                _utcnow().isoformat(),
+            )
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve)) from None
         except _PmValidationError as ve:
             raise HTTPException(
                 status_code=400, detail=f"Invalid problem_model patch: {ve}"
             ) from None
-        validated.revision = current.revision + 1
-        validated.last_updated = _utcnow().isoformat()
-        validated.last_updated_by = "user"
         project.problem_model = validated.model_dump()
         flag_modified(project, "problem_model")
 

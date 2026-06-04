@@ -607,6 +607,21 @@ def apply_user_intent_patch(
     merged = current.model_dump()
     merged.update(patch)
     validated = ProblemModel.model_validate(merged)
+    # When the patch carries ``intent``, the shallow merge replaced the whole
+    # intent object — dropping whatever ``source`` was previously stamped (e.g.
+    # the onboarding ``user_message`` provenance). Re-stamp operator authorship
+    # so the operator-wins protection (_preserve_operator_intent /
+    # _merge_operator_owned_fields, which gate on
+    # ``intent.source.type == 'user_message'``) keeps guarding the edited
+    # purpose against the next strategic cycle. A blanked purpose clears the
+    # source so an empty operator intent is not spuriously protected. Patches
+    # that omit ``intent`` (e.g. onboarding's context/constraints-only steering,
+    # which sets its own message_id-bearing source directly) are left untouched.
+    if "intent" in patch:
+        purpose = (validated.intent.purpose or "").strip()
+        validated.intent.source = (
+            Source(type="user_message", excerpt=purpose[:120]) if purpose else None
+        )
     validated.revision = current.revision + 1
     validated.last_updated = now_iso
     validated.last_updated_by = "user"

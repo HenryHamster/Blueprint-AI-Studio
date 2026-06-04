@@ -1275,6 +1275,110 @@ def test_apply_user_intent_patch_rejects_malformed_subset():
         )
 
 
+def test_apply_user_intent_patch_intent_edit_stamps_operator_source():
+    """Editing intent.purpose through the user-facing path re-stamps the
+    operator (user_message) provenance the shallow merge would otherwise drop —
+    so the operator-wins protection keeps guarding the edited purpose."""
+    model = apply_user_intent_patch(
+        {"revision": 3, "intent": {"purpose": "old", "current_focus": "f"}},
+        {"intent": {"purpose": "Operator-edited purpose", "current_focus": "f"}},
+        "2026-06-02T12:00:00",
+    )
+    assert model.intent.purpose == "Operator-edited purpose"
+    assert model.intent.source is not None
+    assert model.intent.source.type == "user_message"
+    assert model.intent.source.excerpt == "Operator-edited purpose"
+
+
+def test_apply_user_intent_patch_blanking_purpose_clears_source():
+    """Blanking the purpose through the editor clears the source so an empty
+    operator intent is not spuriously treated as protected."""
+    model = apply_user_intent_patch(
+        {
+            "revision": 1,
+            "intent": {
+                "purpose": "had a purpose",
+                "source": {"type": "user_message", "message_id": "m-1"},
+            },
+        },
+        {"intent": {"purpose": "   "}},
+        "2026-06-02T12:00:00",
+    )
+    assert model.intent.purpose.strip() == ""
+    assert model.intent.source is None
+
+
+def test_apply_user_intent_patch_without_intent_preserves_existing_source():
+    """A patch that omits intent (onboarding's context/constraints-only
+    steering) leaves the existing message_id-bearing source untouched."""
+    model = apply_user_intent_patch(
+        {
+            "revision": 1,
+            "intent": {
+                "purpose": "seeded goal",
+                "source": {
+                    "type": "user_message",
+                    "message_id": "m-42",
+                    "excerpt": "seeded goal",
+                },
+            },
+        },
+        {"context": {"project_type": "startup"}},
+        "2026-06-02T12:00:00",
+    )
+    assert model.intent.purpose == "seeded goal"
+    assert model.intent.source is not None
+    assert model.intent.source.type == "user_message"
+    assert model.intent.source.message_id == "m-42"
+    assert model.context.project_type == "startup"
+
+
+def test_editor_purpose_edit_survives_divergent_agent_cycle():
+    """End-to-end protection: an operator edits the purpose via the user-facing
+    patch path, then a strategic cycle proposes a different purpose. The
+    operator's value must win and the agent's discarded value must be recorded
+    in the rejected-edits ledger — exactly as an onboarded purpose is guarded."""
+    # The model the agent saw at cycle spawn (onboarded purpose).
+    baseline_raw = {
+        "revision": 5,
+        "intent": {
+            "purpose": "Onboarded purpose",
+            "current_focus": "phase 1",
+            "source": {"type": "user_message", "message_id": "m-seed"},
+        },
+    }
+    # Operator edits the purpose mid-cycle through the official editor path.
+    edited = apply_user_intent_patch(
+        baseline_raw,
+        {"intent": {"purpose": "Operator-edited purpose", "current_focus": "phase 1"}},
+        "2026-06-02T12:00:00",
+    )
+    assert edited.intent.source is not None
+    assert edited.intent.source.type == "user_message"
+
+    # Agent's next cycle proposes a divergent purpose.
+    proposed = {
+        "revision": 5,
+        "intent": {"purpose": "Agent-proposed purpose", "current_focus": "phase 2"},
+    }
+    new_raw, _diff = apply_agent_update(
+        edited.model_dump(),
+        proposed,
+        "2026-06-02T13:00:00",
+        baseline_raw=baseline_raw,
+    )
+
+    # Operator's purpose wins; agent's discarded value is in the ledger.
+    assert new_raw["intent"]["purpose"] == "Operator-edited purpose"
+    ledger = new_raw["rejected_agent_edits"]
+    assert any(
+        entry["field"] == "intent.purpose"
+        and entry["operator_value"] == "Operator-edited purpose"
+        and entry["agent_value"] == "Agent-proposed purpose"
+        for entry in ledger
+    )
+
+
 # ---------------------------------------------------------------------------
 # apply_agent_update — non-destructive merge of AGENT-OWNED collections
 #
@@ -1673,6 +1777,42 @@ def test_project_append_routine_digest_appends_additional_lines():
     assert len(lines) == 2
     assert "pr_merged" in lines[0]
     assert "auto_fix_result" in lines[1]
+
+
+def test_append_routine_digest_collapses_multiline_summary():
+    """A multi-line summary collapses to a single physical line matching the
+    canonical digest shape, so the reconciliation classifier never misreads the
+    append as an operator body edit."""
+    from app.models import Project
+    from app.running_update_merge import _DIGEST_LINE_RE
+
+    p = Project(name="test", user_id="u1")
+    multiline = "Line one\r\nLine two\nLine three\rLine four\n\n  extra  spaces"
+    p.append_routine_digest("operator_message", multiline)
+
+    lines = p.running_update.splitlines()
+    assert len(lines) == 1
+    assert _DIGEST_LINE_RE.match(lines[0])
+    # All newline-separated fragments survive on the single collapsed line.
+    assert "Line one Line two Line three Line four extra spaces" in lines[0]
+    assert "\n" not in p.running_update
+    assert "\r" not in p.running_update
+
+
+def test_append_routine_digest_truncates_after_collapse():
+    """Truncation to 200 chars applies after whitespace collapse, and the result
+    remains a single line."""
+    from app.models import Project
+
+    p = Project(name="test", user_id="u1")
+    summary = "word\n" * 200  # 1000 chars of newline-separated tokens
+    p.append_routine_digest("auto_fix_result", summary)
+
+    lines = p.running_update.splitlines()
+    assert len(lines) == 1
+    # The summary portion after the "**: " prefix is capped at 200 chars.
+    body = lines[0].split("**: ", 1)[1]
+    assert len(body) <= 200
 
 
 def test_source_is_reusable_across_model_elements():

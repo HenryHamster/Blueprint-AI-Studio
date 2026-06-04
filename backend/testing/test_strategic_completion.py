@@ -8167,6 +8167,33 @@ def test_reconcile_running_update_digest_append_reintegrated():
     assert rejected is None
 
 
+def test_reconcile_running_update_multiline_summary_digest_preserved():
+    """End-to-end guard for the multi-line lost-update: a routine digest produced
+    by the canonical ``append_routine_digest`` from a MULTI-LINE summary must be
+    classified as a pure digest append, not an operator body edit. Pre-fix the
+    multi-line summary spanned several physical lines and the agent's refreshed
+    running_update was silently discarded into the rejected-edits ledger."""
+    from app.models import Project
+    from app.running_update_merge import reconcile_running_update
+
+    baseline = "BASELINE DOC"
+    project = Project(name="t", user_id="u1")
+    project.running_update = baseline
+    # A routine-typed message with multi-line free-text content fires mid-cycle.
+    project.append_routine_digest(
+        "cycle_summary", "First paragraph.\n\nSecond paragraph with detail."
+    )
+    current = project.running_update
+
+    doc, rejected = reconcile_running_update(
+        baseline=baseline, agent="AGENT REFRESHED DOC", current=current
+    )
+    # Agent wins; no spurious running_update_superseded; digest re-integrated.
+    assert rejected is None
+    assert doc.startswith("AGENT REFRESHED DOC\n")
+    assert "First paragraph. Second paragraph with detail." in doc
+
+
 def test_reconcile_running_update_digest_append_on_empty_baseline():
     """An empty baseline followed by only a digest line is still a pure digest
     append — the agent doc wins and the digest is re-integrated."""

@@ -6992,6 +6992,93 @@ async def test_unblock_sweep_wipes_first_blocked_on_genuine_dep_clear(
 
 
 @pytest.mark.asyncio
+async def test_unblock_sweep_conflict_blocker_with_stale_satisfied_dep_escalates_past_deadline(
+    reaper_db, mocker
+):
+    """Regression: a conflict blocker that ALSO carries an already-satisfied
+    dependency edge must still escalate past the deadline.
+
+    A successfully-completed dependency id is never stripped from depends_on, so
+    a file_conflict/pending_rollup blocker routinely lists a now-completed dep.
+    The escalation discriminator must key off the blocker IDENTITY, not the mere
+    presence of dep edges — otherwise the conflict loops QUEUED<->BLOCKED forever
+    and the operator ERROR alert never fires.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    dep = Task(
+        project_id=project.id, title="dep", description="x",
+        status=TaskStatus.COMPLETED, created_by="u", requires_approval=False,
+        payloads=[{"type": "fix"}], context={}, status_log=[],
+    )
+    reaper_db.add(dep)
+    await reaper_db.commit()
+    await reaper_db.refresh(dep)
+    now = _utcnow()
+    t = await _blocked_task(
+        reaper_db, project, blocker_kind="file_conflict",
+        depends_on=[str(dep.id)],
+        blocked_at=now - _BLOCKED_ESCALATE_AFTER - timedelta(minutes=5),
+        recheck_after=now - timedelta(minutes=1),
+    )
+    verify = AsyncMock(return_value=True)
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now, verify_pr_merged=verify)
+
+    # Escalated terminally, NOT requeued — the conflict never cleared.
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    assert t.context.get("_blocked_escalated") is True
+    alerts = (
+        await reaper_db.execute(
+            _select(Alert).where(
+                Alert.task_id == t.id, Alert.severity == AlertSeverity.ERROR
+            )
+        )
+    ).scalars().all()
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_conflict_blocker_with_stale_dep_preserves_first_blocked(
+    reaper_db, mocker
+):
+    """A conflict blocker with a stale satisfied dep that is NOT yet past the
+    deadline requeues optimistically AND preserves its first-blocked onset stamp,
+    so the next block episode keeps counting toward the deadline."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    dep = Task(
+        project_id=project.id, title="dep", description="x",
+        status=TaskStatus.COMPLETED, created_by="u", requires_approval=False,
+        payloads=[{"type": "fix"}], context={}, status_log=[],
+    )
+    reaper_db.add(dep)
+    await reaper_db.commit()
+    await reaper_db.refresh(dep)
+    now = _utcnow()
+    onset = (now - timedelta(hours=1)).isoformat()
+    t = await _blocked_task(
+        reaper_db, project, blocker_kind="file_conflict",
+        depends_on=[str(dep.id)],
+        blocked_at=now - timedelta(hours=1),
+        recheck_after=now - timedelta(minutes=1),
+        context={"_blocked_first_at": {"key": "file conflict on a.py", "at": onset}},
+    )
+    verify = AsyncMock(return_value=True)
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now, verify_pr_merged=verify)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    # Onset survives the optimistic requeue even though a stale dep edge lingers.
+    assert t.context.get("_blocked_first_at", {}).get("at") == onset
+    assert t.context.get("_blocked_escalated") is None
+
+
+@pytest.mark.asyncio
 async def test_unblock_sweep_clears_failure_class_so_later_genuine_failure_reclassifies(
     reaper_db, mocker
 ):

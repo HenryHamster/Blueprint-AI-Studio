@@ -700,7 +700,23 @@ async def sweep_unblock_blocked_tasks(
             blocker_source = (
                 blocker_meta.get("source") if isinstance(blocker_meta, dict) else None
             )
-            is_genuine_clear = bool(task.depends_on) or blocker_source == "parent"
+            # Conflict/rollup blockers are transient-but-self-re-blocking:
+            # dispatch requeues them every recheck interval and re-blocks if
+            # the precondition still holds. Their deadline must measure from
+            # the TRUE first-blocked onset, so they are escalation-eligible and
+            # onset-preserving even when they carry stale, already-satisfied
+            # dependency edges (a successfully-completed dep id is never
+            # stripped from depends_on). Key the discriminator off the actual
+            # blocker identity, NOT the mere presence of dependency edges —
+            # otherwise a conflict-blocked task with a satisfied dep would skip
+            # escalation and reset its onset every cycle, looping forever.
+            is_optimistic_conflict = task.blocker_kind in {
+                "file_conflict",
+                "pending_rollup",
+            }
+            is_genuine_clear = (not is_optimistic_conflict) and (
+                bool(task.depends_on) or blocker_source == "parent"
+            )
             if (
                 not is_genuine_clear
                 and task.blocked_at is not None
@@ -717,12 +733,13 @@ async def sweep_unblock_blocked_tasks(
                 )
                 changed = True
                 continue
-            # A conflict/rollup blocker has no dependency edge and is requeued
-            # optimistically — unless it has already crossed the deadline and
-            # needs terminal escalation instead. A genuine dependency clear
-            # (had dep edges) resets all.
+            # A conflict/rollup blocker is requeued optimistically and must
+            # preserve its first-blocked onset across the requeue (so the next
+            # block episode keeps counting toward the deadline) — unless it has
+            # already crossed the deadline and was escalated above. A genuine
+            # dependency/parent clear resets all, including the onset.
             _clear_blocked_fields(
-                task, preserve_first_blocked=not task.depends_on
+                task, preserve_first_blocked=is_optimistic_conflict
             )
             task.status = TaskStatus.QUEUED
             task.latest_status_message = "Unblocked — requeued for dispatch"

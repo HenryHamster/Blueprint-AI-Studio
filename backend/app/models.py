@@ -555,9 +555,21 @@ class Project(SQLModel, table=True):
         Canonical home for this logic — callers (notification_dispatch, admin_notifications,
         strategic_completion) mutate running_update through this method so the format stays
         consistent. Does NOT commit — caller is responsible for session.add(project).
+
+        The entry is ALWAYS a single physical line. Routine-event summaries come
+        from free-text message content and may contain newlines; any line-breaking
+        whitespace is collapsed to single spaces BEFORE truncation so the emitted
+        line matches the canonical single-line digest shape consumed by
+        ``running_update_merge._DIGEST_LINE_RE``. If a multi-line summary spanned
+        several physical lines, the reconciliation classifier would misread the
+        append as an operator body edit and silently discard the agent's refreshed
+        running_update.
         """
         now_str = _utcnow().strftime("%Y-%m-%d %H:%M")
-        line = f"- [{now_str}] **{event_type}**: {summary[:200]}"
+        # Collapse every newline form (\r\n, \r, \n) and any resulting runs of
+        # whitespace into single spaces so the digest entry is one physical line.
+        flattened = " ".join((summary or "").split())
+        line = f"- [{now_str}] **{event_type}**: {flattened[:200]}"
         current = (self.running_update or "").rstrip()
         self.running_update = f"{current}\n{line}" if current else line
 

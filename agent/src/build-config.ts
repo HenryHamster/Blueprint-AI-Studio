@@ -43,10 +43,18 @@ export function resolveBuildConfig(task: Record<string, unknown>): BuildConfig |
     const buildCmd = dir.build_cmd ?? dir.build_command;
     const testCmd = dir.test_cmd ?? dir.test_command;
     const installCmd = dir.install_cmd;
-    if (typeof lintCmd === 'string' && lintCmd !== '' && !SHELL_CMD_RE.test(lintCmd)) continue;
-    if (typeof buildCmd === 'string' && buildCmd !== '' && !SHELL_CMD_RE.test(buildCmd)) continue;
-    if (typeof testCmd === 'string' && testCmd !== '' && !SHELL_CMD_RE.test(testCmd)) continue;
-    if (typeof installCmd === 'string' && installCmd !== '' && !SHELL_CMD_RE.test(installCmd)) continue;
+    // Retain command strings VERBATIM — including quotes and shell operators
+    // (`pytest -k "not slow"`, `go test ./... && go vet ./...`). These are NOT
+    // dropped on a SHELL_CMD_RE miss: the backend's tests_gated decision counts
+    // any non-empty test_cmd as a gating suite, so dropping a metachar command
+    // here would make the agent report 'no tests detected' while the backend
+    // still believes the project is test-gated — the exact divergence that
+    // merges UNVERIFIED. The command sinks now handle these safely: the no-CI
+    // gate runs them via a `bash -c` argv (execFile, no interpolation — see
+    // detectTestRunners), and the best-effort ./check generator skips any
+    // command unsafe to single-quote-interpolate. The `path` traversal +
+    // SHELL_CMD_RE check above is retained because path IS interpolated as a cwd
+    // with no skip fallback.
     if (typeof lintCmd === 'string') entry.lint_cmd = lintCmd;
     if (typeof buildCmd === 'string') entry.build_cmd = buildCmd;
     if (typeof testCmd === 'string') entry.test_cmd = testCmd;

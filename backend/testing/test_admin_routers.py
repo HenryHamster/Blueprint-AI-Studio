@@ -5226,6 +5226,107 @@ class TestPatchProblemModel:
         assert pm["last_updated_by"] == "user"
 
     @pytest.mark.asyncio
+    async def test_patch_intent_stamps_operator_source(
+        self, client: AsyncClient, db_session
+    ):
+        """Editing intent.purpose via the official editor PATCH path stamps a
+        user_message provenance source, so the operator-wins protection keeps
+        recognizing the purpose as operator-authored on the next cycle. (The
+        editor payload sends no source; the backend must re-stamp it.)"""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        # Onboarded purpose with a user_message source; editor save must not
+        # leave a null source behind.
+        project.problem_model = {
+            "intent": {
+                "purpose": "Onboarded.",
+                "current_focus": "",
+                "source": {"type": "user_message", "message_id": "m-seed"},
+            },
+            "revision": 2,
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "problem_model_patch": {
+                    "intent": {"purpose": "Operator-edited.", "current_focus": ""}
+                }
+            },
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["intent"]["purpose"] == "Operator-edited."
+        assert pm["intent"]["source"] is not None
+        assert pm["intent"]["source"]["type"] == "user_message"
+
+    @pytest.mark.asyncio
+    async def test_edited_purpose_survives_divergent_agent_cycle(
+        self, client: AsyncClient, db_session
+    ):
+        """Full regression: an operator edits the purpose via PATCH, then a
+        simulated strategic cycle proposes a different purpose. The operator's
+        value must win and the agent's discarded value must be recorded in the
+        rejected-edits ledger (the operator-override badge source)."""
+        from sqlalchemy.orm.attributes import flag_modified
+        from app.problem_model import apply_agent_update
+
+        project = await _make_project(db_session)
+        baseline = {
+            "intent": {
+                "purpose": "Onboarded purpose.",
+                "current_focus": "phase 1",
+                "source": {"type": "user_message", "message_id": "m-seed"},
+            },
+            "revision": 3,
+        }
+        project.problem_model = dict(baseline)
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        # Operator edits the purpose through the official editor path.
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "problem_model_patch": {
+                    "intent": {
+                        "purpose": "Operator-edited purpose.",
+                        "current_focus": "phase 1",
+                    }
+                }
+            },
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+
+        # Simulate the next strategic cycle proposing a divergent purpose.
+        proposed = {
+            "intent": {
+                "purpose": "Agent-proposed purpose.",
+                "current_focus": "phase 2",
+            },
+        }
+        new_raw, _diff = apply_agent_update(
+            project.problem_model,
+            proposed,
+            "2026-06-02T13:00:00",
+            baseline_raw=baseline,
+        )
+
+        assert new_raw["intent"]["purpose"] == "Operator-edited purpose."
+        assert any(
+            entry["field"] == "intent.purpose"
+            and entry["agent_value"] == "Agent-proposed purpose."
+            for entry in new_raw["rejected_agent_edits"]
+        )
+
+    @pytest.mark.asyncio
     async def test_problem_model_stale_revision_returns_409(
         self, client: AsyncClient, db_session
     ):

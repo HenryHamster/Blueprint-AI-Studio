@@ -394,14 +394,34 @@ describe('writeCodeChangeHelpers — shell injection validation', () => {
     expect(() => { writeCodeChangeHelpers({ ...validCfg, owner: 'my.org-123', repo: 'my-repo.v2' }); }).not.toThrow();
   });
 
-  it('rejects build_config command with shell metacharacters', async () => {
+  it('does NOT throw on a shell-composed build_config command — it is skipped from ./check', async () => {
+    // resolveBuildConfig now retains commands with shell operators verbatim so
+    // the backend's tests_gated decision and the agent's no-CI gate agree on
+    // whether the project has tests. Such a command cannot be single-quote
+    // interpolated into ./check, so it is OMITTED rather than throwing — but a
+    // sibling safe command in the same directory IS still emitted.
+    const captured: Record<string, string> = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      captured[path] = content;
+    });
     const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
     expect(() => {
       writeCodeChangeHelpers({
         ...validCfg,
-        buildConfig: { directories: [{ path: 'svc', type: 'node', build_cmd: 'npm run build; rm -rf /' }] },
+        buildConfig: {
+          directories: [{
+            path: 'svc',
+            type: 'node',
+            build_cmd: 'npm run build; rm -rf /',
+            test_cmd: 'npm test',
+          }],
+        },
       });
-    }).toThrow(/build_cmd/);
+    }).not.toThrow();
+    const checkScript = captured['/tmp/workspace/check'];
+    expect(checkScript).not.toContain('npm run build; rm -rf /');
+    expect(checkScript).toContain('npm test');
   });
 
   it('rejects build_config env_var value with command substitution', async () => {

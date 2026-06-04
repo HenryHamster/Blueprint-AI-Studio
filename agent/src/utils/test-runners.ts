@@ -126,6 +126,62 @@ function fileMentionsPytest(path: string): boolean {
   }
 }
 
+// Shell metacharacters that require a real shell to interpret. A command
+// containing any of these (operators, redirections, substitutions, globs,
+// backslash escapes) cannot be run by execFile after a naive whitespace split —
+// it must round-trip through `bash -c`. Quote characters alone do NOT need a
+// shell: a quoted argument like `-k "not slow"` is handled by the tokenizer.
+const SHELL_OPERATORS_RE = /[&;|$`<>(){}*?\\]/;
+
+/** Quote-aware tokenizer for an operator-configured test command. Splits on
+ *  unquoted whitespace while preserving single/double-quoted segments as a
+ *  single argument (with the surrounding quotes stripped), so
+ *  `pytest -k "not slow"` → ['pytest', '-k', 'not slow']. Unbalanced quotes
+ *  fall back to a plain whitespace split (the bash -c branch already handles
+ *  anything genuinely shell-shaped). */
+function tokenizeCommand(cmd: string): string[] {
+  const tokens: string[] = [];
+  let current = '';
+  let quote: '"' | "'" | null = null;
+  let started = false;
+  for (const ch of cmd) {
+    if (quote) {
+      if (ch === quote) { quote = null; } else { current += ch; }
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; started = true; continue; }
+    if (/\s/.test(ch)) {
+      if (started) { tokens.push(current); current = ''; started = false; }
+      continue;
+    }
+    current += ch;
+    started = true;
+  }
+  if (started) tokens.push(current);
+  if (quote !== null) return cmd.split(/\s+/).filter(Boolean);
+  return tokens;
+}
+
+/** Build a TestRunner argv from an operator-configured test command.
+ *
+ *  - A command needing shell features (operators, substitutions, redirections,
+ *    globs, backslash escapes) is wrapped as `{cmd:'bash', args:['-c', cmd]}` so
+ *    the operator's own command runs verbatim under a shell. The runner is
+ *    executed via execFile (NOT a shell), so the command string is passed as a
+ *    single argv element and is never re-interpreted — injection-safe.
+ *  - A plain command is tokenized quote-aware so `pytest -k "not slow"` yields
+ *    `{cmd:'pytest', args:['-k','not slow']}`. Plain commands keep their
+ *    historical `{cmd,args}` shape byte-for-byte, so pytest-selector targeting
+ *    and family-parity invariants are unchanged. */
+function runnerFromTestCmd(testCmd: string, cwd: string): { cmd: string; args: string[]; cwd: string } {
+  if (SHELL_OPERATORS_RE.test(testCmd)) {
+    return { cmd: 'bash', args: ['-c', testCmd], cwd };
+  }
+  const tokens = tokenizeCommand(testCmd);
+  if (tokens.length === 0) return { cmd: 'bash', args: ['-c', testCmd], cwd };
+  return { cmd: tokens[0], args: tokens.slice(1), cwd };
+}
+
 export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
   const { existsSync, readFileSync, readdirSync } = fs;
   const runners: TestRunner[] = [];
@@ -135,8 +191,7 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
     for (const dir of buildConfig.directories) {
       if (dir.test_cmd) {
         const cwd = dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE;
-        const parts = dir.test_cmd.split(/\s+/);
-        runners.push({ cmd: parts[0], args: parts.slice(1), cwd, label: `${dir.test_cmd} (${dir.path || 'root'})` });
+        runners.push({ ...runnerFromTestCmd(dir.test_cmd, cwd), label: `${dir.test_cmd} (${dir.path || 'root'})` });
       }
     }
   }
@@ -523,6 +578,16 @@ export function describeRunnerDirectory(runner: TestRunner): { path: string; typ
   } else if (path.startsWith(`${WORKSPACE}/`)) {
     path = path.slice(WORKSPACE.length + 1);
   }
+  // A `bash -c '<cmd>'` runner wraps an operator-configured command that needed
+  // shell features (see runnerFromTestCmd). Reconstruct the ORIGINAL command so
+  // a recovered directory entry round-trips back to what the operator wrote,
+  // not the `bash -c …` wrapper. runnerKindFromCmd then keys off the unwrapped
+  // first token instead of collapsing every wrapped suite to 'other'.
+  if (runner.cmd === 'bash' && runner.args.length === 2 && runner.args[0] === '-c') {
+    const original = runner.args[1];
+    const firstToken = tokenizeCommand(original)[0] ?? original;
+    return { path, type: runnerKindFromCmd(firstToken), test_cmd: original };
+  }
   return { path, type: runnerKindFromCmd(runner.cmd), test_cmd: [runner.cmd, ...runner.args].join(' ') };
 }
 
@@ -752,6 +817,11 @@ export function extractPytestSelectorsFromOutput(output: string): string[] {
 }
 
 function acceptsPytestSelectors(runner: TestRunner): boolean {
+  // A `bash -c '<cmd>'` wrapper runs its command string as a single argv
+  // element; appending selectors as further argv would land them in $0/$1…
+  // (positional params of the shell), NOT as arguments to the wrapped pytest.
+  // So never target-append to a wrapped runner — let it run its full suite.
+  if (runner.cmd === 'bash' && runner.args[0] === '-c') return false;
   const cmdAndArgs = [runner.cmd, ...runner.args].join(' ');
   return cmdAndArgs.includes('pytest') || cmdAndArgs.includes('scripts/test-backend.sh');
 }
