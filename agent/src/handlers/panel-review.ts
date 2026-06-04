@@ -38,8 +38,6 @@ import {
   buildReviewSeverityGuideSection,
 } from '../prompts/review-prompt.js';
 
-const PANEL_REVIEW_OUTPUT_TYPE = 'panel_review_verdict';
-
 export const PANEL_REVIEW_LENSES = [
   {
     id: 'correctness',
@@ -145,65 +143,49 @@ function dedupeIssues(issues: PanelReviewIssue[]): PanelReviewIssue[] {
   return deduped;
 }
 
-function normalizePanelReviewVerdict(
-  raw: unknown,
+function panelReviewLensOutputType(lensId: PanelReviewLensId): string {
+  return `panel_review_lens_${lensId}`;
+}
+
+/**
+ * Code-side synthesis of the per-lens agent passes into the single structured
+ * verdict object the backend evaluator + completion handler already consume.
+ *
+ * Determinism is the point: each lens runs as its OWN agent pass, but the
+ * aggregation is plain TypeScript so the emitted shape is guaranteed to satisfy
+ * the backend's required-lens + non-empty-summary gate. overall_verdict is
+ * REQUEST_CHANGES whenever ANY lens requests changes (fail-toward-blocking), so
+ * the panel cannot silently approve when one lens found a blocker.
+ */
+function synthesizePanelReviewVerdict(
+  lensVerdicts: Record<PanelReviewLensId, PanelReviewLensVerdict>,
   investigatedFiles: string[],
-): PanelReviewVerdict | null {
-  if (!raw || typeof raw !== 'object') return null;
-  const payload = raw as Record<string, unknown>;
-  const overallVerdict = strVal(payload.overall_verdict).trim();
-  if (overallVerdict !== 'APPROVE' && overallVerdict !== 'REQUEST_CHANGES') return null;
-  const summary = strVal(payload.summary || payload.feedback).trim();
-  if (!summary) return null;
+): PanelReviewVerdict {
+  const lensIds = PANEL_REVIEW_LENSES.map(lens => lens.id);
+  const overallVerdict: 'APPROVE' | 'REQUEST_CHANGES' = lensIds.some(
+    id => lensVerdicts[id].verdict === 'REQUEST_CHANGES',
+  )
+    ? 'REQUEST_CHANGES'
+    : 'APPROVE';
 
-  const rawLenses = payload.lenses;
-  if (!rawLenses || typeof rawLenses !== 'object') return null;
-  const lensPayloads = rawLenses as Record<string, unknown>;
+  const summary = PANEL_REVIEW_LENSES
+    .map(lens => `${lens.label} [${lensVerdicts[lens.id].verdict}]: ${lensVerdicts[lens.id].summary}`)
+    .join('\n');
 
-  const normalizedLenses = {} as Record<PanelReviewLensId, PanelReviewLensVerdict>;
-  for (const lens of PANEL_REVIEW_LENSES) {
-    const normalized = normalizeLensVerdict(lensPayloads[lens.id], lens.id);
-    if (!normalized) return null;
-    normalizedLenses[lens.id] = normalized;
-  }
-
-  const issuePool = Array.isArray(payload.issues)
-    ? payload.issues
-      .map(issue => {
-        const explicitLens = strVal((issue as Record<string, unknown> | undefined)?.lens).trim() as PanelReviewLensId;
-        const fallbackLens = PANEL_REVIEW_LENSES.some(lens => lens.id === explicitLens)
-          ? explicitLens
-          : undefined;
-        return normalizeIssue(issue, fallbackLens ?? 'correctness');
-      })
-      .filter((issue): issue is PanelReviewIssue => issue !== null)
-    : [];
-  const flattenedLensIssues = PANEL_REVIEW_LENSES.flatMap(lens => normalizedLenses[lens.id].issues);
-  const issues = dedupeIssues(issuePool.length > 0 ? [...issuePool, ...flattenedLensIssues] : flattenedLensIssues);
-
-  const declaredInvestigated = Array.isArray(payload.investigated_files)
-    ? payload.investigated_files.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-    : [];
-  const investigated = Array.from(new Set([...declaredInvestigated, ...investigatedFiles])).slice(0, 50);
+  const issues = dedupeIssues(lensIds.flatMap(id => lensVerdicts[id].issues));
+  const investigated = Array.from(new Set(investigatedFiles)).slice(0, 50);
 
   return {
     overall_verdict: overallVerdict,
     summary,
     issues,
     investigated_files: investigated,
-    lenses: normalizedLenses,
+    lenses: lensVerdicts,
   };
 }
 
-function buildPanelReviewLensSection(): string {
-  return PANEL_REVIEW_LENSES.map((lens, index) => (
-    `${index + 1}. ${lens.label} (\`${lens.id}\`)\n` +
-    `   Focus: ${lens.focus}\n` +
-    '   Deliver: one verdict, one short summary, and zero or more substantiated issues.\n'
-  )).join('\n');
-}
-
-function buildPanelReviewPrompt(args: {
+function buildPanelReviewLensPrompt(args: {
+  lens: (typeof PANEL_REVIEW_LENSES)[number];
   taskId: string;
   prNumber: number;
   branch: string;
@@ -219,6 +201,7 @@ function buildPanelReviewPrompt(args: {
   claudeMdPrefix: string;
 }): string {
   const {
+    lens,
     taskId,
     prNumber,
     branch,
@@ -233,27 +216,25 @@ function buildPanelReviewPrompt(args: {
     buildConfig,
     claudeMdPrefix,
   } = args;
-  const lensSection = buildPanelReviewLensSection();
+  const outputPath = `/tmp/${panelReviewLensOutputType(lens.id)}_${taskId}.json`;
   return `${claudeMdPrefix}${playbookSection}${projectContext}${buildReviewMasterPreamble(prNumber, branch, baseBranch)}
 
-This is the fixed \`panel_review\` workflow. Do not collapse this into a normal single-pass review.
-Run the declared lenses one at a time from clean perspectives, then synthesize one structured verdict object.
+This is ONE independent pass of the fixed \`panel_review\` multi-agent workflow.
+You are the **${lens.label}** reviewer (lens id: \`${lens.id}\`). Other lenses run as
+SEPARATE agent passes — do NOT review outside your lens, and do NOT try to produce
+an overall panel verdict. Judge this PR solely through your lens.
+
+Your lens focus: ${lens.focus}
 
 ${originalPrompt ? `Original task prompt: ${originalPrompt}\n\n` : ''}${prTitle ? `PR title: ${prTitle}\n` : ''}${prBody ? `PR description:\n${prBody}\n\n` : ''}Files changed in this PR:
 ${changedFiles}${diffShortstat ? `\nDiff volume: ${diffShortstat}\n` : ''}
 
-Declared review lenses:
-${lensSection}
-
-Workflow rules:
+Rules for your lens pass:
 - Read the diff and any surrounding files you need with \`git diff origin/${baseBranch}...HEAD\` and targeted file reads.
-- Keep the lens passes separate. Do not let one lens summary stand in for another.
 - Use severities \`critical\`, \`major\`, or \`minor\`.
-- Only include substantiated issues with a concrete description. Prefer one primary lens per issue; avoid duplicate issue spam across lenses.
-- A lens should return \`REQUEST_CHANGES\` only for blocking defects inside that lens's scope.
-- Set \`overall_verdict\` to \`REQUEST_CHANGES\` when any lens returns \`REQUEST_CHANGES\`; otherwise \`APPROVE\`.
-- Always populate every declared lens key even when there are no issues. Use an empty \`issues\` array when clean.
-- Track the files you actually inspected. Include them in \`investigated_files\`.
+- Only include substantiated issues with a concrete description, scoped to your lens.
+- Return \`REQUEST_CHANGES\` only for a blocking defect inside your lens's scope; otherwise \`APPROVE\`.
+- Use an empty \`issues\` array when your lens is clean.
 
 ${buildReviewDiffAccessHint(baseBranch)}
 
@@ -261,48 +242,24 @@ ${buildReviewChecklistSection(buildConfig, baseBranch)}
 
 ${buildReviewSeverityGuideSection()}
 
-After finishing all lens passes, write EXACTLY ONE JSON object with this schema:
+After your lens pass, write EXACTLY ONE JSON object with this schema to ${outputPath}:
 \`\`\`json
 {
-  "overall_verdict": "APPROVE|REQUEST_CHANGES",
-  "summary": "Short synthesis of the overall panel result.",
+  "verdict": "APPROVE|REQUEST_CHANGES",
+  "summary": "Short synthesis of your ${lens.label} lens result.",
   "issues": [
     {
       "severity": "critical|major|minor",
       "description": "What blocks or why it is notable.",
       "file": "path/to/file.ts",
-      "line": 123,
-      "lens": "correctness|security|code_quality|test_coverage"
+      "line": 123
     }
-  ],
-  "investigated_files": ["path/you/read.ts"],
-  "lenses": {
-    "correctness": {
-      "verdict": "APPROVE|REQUEST_CHANGES",
-      "summary": "Per-lens synthesis.",
-      "issues": []
-    },
-    "security": {
-      "verdict": "APPROVE|REQUEST_CHANGES",
-      "summary": "Per-lens synthesis.",
-      "issues": []
-    },
-    "code_quality": {
-      "verdict": "APPROVE|REQUEST_CHANGES",
-      "summary": "Per-lens synthesis.",
-      "issues": []
-    },
-    "test_coverage": {
-      "verdict": "APPROVE|REQUEST_CHANGES",
-      "summary": "Per-lens synthesis.",
-      "issues": []
-    }
-  }
+  ]
 }
 \`\`\`
 
 IMPORTANT:
-- Also write that JSON object to /tmp/${PANEL_REVIEW_OUTPUT_TYPE}_${taskId}.json.
+- Write the JSON object to ${outputPath} (NOT in the repository).
 - The file must contain ONLY the JSON object, with no markdown fence or commentary.
 - Do not write to /tmp/review_verdict_${taskId}.json; this task has its own structured verdict channel.
 
@@ -417,54 +374,83 @@ export async function handlePanelReview(
     : '';
   const claudeMd = readClaudeMd();
   const claudeMdPrefix = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
-  const prompt = buildPanelReviewPrompt({
-    taskId,
-    prNumber,
-    branch,
-    baseBranch,
-    changedFiles,
-    diffShortstat,
-    originalPrompt,
-    prTitle,
-    prBody,
-    projectContext: projectContext ? `${projectContext}\n\n` : '',
-    playbookSection,
-    buildConfig,
-    claudeMdPrefix,
-  });
 
-  statusRef.value = 'Running fixed panel review lenses...';
   const promptFingerprint = computePromptFingerprint('panel_review', buildConfig);
   setCurrentPromptFingerprint(promptFingerprint);
-  sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
 
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(
-    prompt,
-    ws,
-    statusRef,
-    model,
-    effort,
-    disallowedTools,
-  );
+  // Genuine multi-agent fan-out: each declared lens runs as its OWN independent
+  // runClaudeCode pass from a clean single-lens perspective over the same PR
+  // diff. A code-side synthesis then aggregates the per-lens verdicts into the
+  // single structured object the backend gate consumes. Fan-out is bounded to
+  // the four declared lenses (no unbounded recursion). Fail closed: if any lens
+  // pass crashes (exitCode!==0) or yields no normalizable verdict, the whole
+  // panel FAILS — overall_verdict must never claim success when a lens never
+  // produced a real verdict.
+  const lensVerdicts = {} as Record<PanelReviewLensId, PanelReviewLensVerdict>;
+  for (const [index, lens] of PANEL_REVIEW_LENSES.entries()) {
+    statusRef.value = `Panel review lens ${index + 1}/${PANEL_REVIEW_LENSES.length}: ${lens.label}...`;
+    sendLog(ws, `Running panel review lens '${lens.id}' (${index + 1}/${PANEL_REVIEW_LENSES.length})\n`);
+    sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
+
+    const lensPrompt = buildPanelReviewLensPrompt({
+      lens,
+      taskId,
+      prNumber,
+      branch,
+      baseBranch,
+      changedFiles,
+      diffShortstat,
+      originalPrompt,
+      prTitle,
+      prBody,
+      projectContext: projectContext ? `${projectContext}\n\n` : '',
+      playbookSection,
+      buildConfig,
+      claudeMdPrefix,
+    });
+
+    const { exitCode, allOutput, lastResultText } = await runClaudeCode(
+      lensPrompt,
+      ws,
+      statusRef,
+      model,
+      effort,
+      disallowedTools,
+    );
+
+    const rawLensVerdict = readHandlerOutput(taskId, panelReviewLensOutputType(lens.id), ws);
+    const normalizedLens = normalizeLensVerdict(rawLensVerdict, lens.id);
+    if (exitCode !== 0 || !normalizedLens) {
+      const reason = exitCode !== 0
+        ? `lens '${lens.id}' agent pass exited ${exitCode}`
+        : `lens '${lens.id}' produced no usable verdict`;
+      sendLog(ws, `Panel review failing closed: ${reason}\n`);
+      const failLogs = sanitize(
+        `Panel review fan-out failed: ${reason}.\n` +
+        (lastResultText || allOutput.slice(-20_000)),
+      );
+      await persistAndPostStatus(taskId, {
+        task_id: taskId,
+        status: 'FAILED',
+        artifact_type: 'ERROR_LOG',
+        logs: failLogs,
+        failure_category: 'panel_review_lens_failed',
+        ...(changedFileList.length > 0 ? { changed_files: changedFileList.slice(0, 50) } : {}),
+      });
+      return;
+    }
+    lensVerdicts[lens.id] = normalizedLens;
+  }
 
   const investigatedFiles = extractInvestigatedFiles(snapshotToolTrace());
-  const fileVerdict = readHandlerOutput(taskId, PANEL_REVIEW_OUTPUT_TYPE, ws);
-  const normalizedVerdict = normalizePanelReviewVerdict(fileVerdict, investigatedFiles);
-
-  let logs = '';
-  if (normalizedVerdict) {
-    logs = JSON.stringify(normalizedVerdict);
-    sendLog(ws, `Panel review verdict read from file: ${normalizedVerdict.overall_verdict}\n`);
-  } else {
-    logs = sanitize(lastResultText || allOutput.slice(-50_000));
-  }
+  const synthesized = synthesizePanelReviewVerdict(lensVerdicts, investigatedFiles);
+  const logs = JSON.stringify(synthesized);
+  sendLog(ws, `Panel review synthesized verdict: ${synthesized.overall_verdict}\n`);
 
   await persistAndPostStatus(taskId, {
     task_id: taskId,
-    status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
-    ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : {}),
+    status: 'COMPLETED',
     logs,
-    ...(exitCode !== 0 ? { failure_category: 'claude_code_failed' } : {}),
     ...(changedFileList.length > 0 ? { changed_files: changedFileList.slice(0, 50) } : {}),
   });
 }

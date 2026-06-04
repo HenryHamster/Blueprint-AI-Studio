@@ -25,11 +25,12 @@ vi.mock('../index.js', () => ({
     'admin-ui/src/components/TaskDetailDrawerMeta.tsx',
   ]),
   resolveBaseBranch: vi.fn((payload: Record<string, unknown>) => payload.base_branch || 'main'),
-  readHandlerOutput: vi.fn().mockReturnValue({
-    overall_verdict: 'REQUEST_CHANGES',
-    summary: 'Two blocking findings across the fixed review lenses.',
-    lenses: {
-      correctness: {
+  // Each lens reads its OWN output file via readHandlerOutput(taskId, outputType, ws).
+  // The mock returns a distinct per-lens verdict keyed on the outputType arg so
+  // the test exercises genuine per-lens fan-out, not a single combined file.
+  readHandlerOutput: vi.fn((_taskId: string, outputType: string) => {
+    if (outputType === 'panel_review_lens_correctness') {
+      return {
         verdict: 'REQUEST_CHANGES',
         summary: 'A caller compatibility issue remains.',
         issues: [
@@ -40,23 +41,26 @@ vi.mock('../index.js', () => ({
             line: 120,
           },
         ],
-      },
-      security: {
-        verdict: 'APPROVE',
-        summary: 'No security regressions were found.',
-        issues: [],
-      },
-      code_quality: {
+      };
+    }
+    if (outputType === 'panel_review_lens_security') {
+      return { verdict: 'APPROVE', summary: 'No security regressions were found.', issues: [] };
+    }
+    if (outputType === 'panel_review_lens_code_quality') {
+      return {
         verdict: 'APPROVE',
         summary: 'The workflow stays inside the existing review infrastructure.',
         issues: [],
-      },
-      test_coverage: {
+      };
+    }
+    if (outputType === 'panel_review_lens_test_coverage') {
+      return {
         verdict: 'APPROVE',
         summary: 'Targeted tests cover the new workflow and UI rendering.',
         issues: [],
-      },
-    },
+      };
+    }
+    return null;
   }),
 }));
 
@@ -93,8 +97,29 @@ vi.mock('child_process', () => ({
 
 import { execFileSync } from 'child_process';
 import { persistAndPostStatus, readHandlerOutput, runClaudeCode } from '../index.js';
-import { expectCalledWith } from '../utils/typed-mock-call.js';
 import { handlePanelReview, PANEL_REVIEW_LENSES } from './panel-review.js';
+
+const PAYLOAD = {
+  pr_number: 42,
+  branch: 'feature/panel-review',
+  base_branch: 'automain',
+  original_prompt: 'Run the multi-lens panel review.',
+};
+
+async function runHandler() {
+  await handlePanelReview(
+    'task-panel-1',
+    { ...PAYLOAD },
+    { project_metadata: {}, playbook: {}, context: {} },
+    'gh-token',
+    'owner',
+    'repo',
+    null,
+    { value: '' },
+    'gpt-5',
+    'medium',
+  );
+}
 
 describe('handlePanelReview', () => {
   beforeEach(() => {
@@ -115,59 +140,101 @@ describe('handlePanelReview', () => {
     ]);
   });
 
-  it('runs the fixed-lens prompt and posts the structured verdict payload', async () => {
-    await handlePanelReview(
-      'task-panel-1',
-      {
-        pr_number: 42,
-        branch: 'feature/panel-review',
-        base_branch: 'automain',
-        original_prompt: 'Run the multi-lens panel review.',
-      },
-      { project_metadata: {}, playbook: {}, context: {} },
-      'gh-token',
-      'owner',
-      'repo',
-      null,
-      { value: '' },
-      'gpt-5',
-      'medium',
-    );
+  it('runs one independent agent pass per lens (genuine fan-out)', async () => {
+    await runHandler();
 
-    const launchedPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0] ?? '';
-    expect(launchedPrompt).toContain('/tmp/panel_review_verdict_task-panel-1.json');
-    expect(launchedPrompt).toContain('correctness');
-    expect(launchedPrompt).toContain('security');
-    expect(launchedPrompt).toContain('code_quality');
-    expect(launchedPrompt).toContain('test_coverage');
+    // Four lenses → four independent runClaudeCode passes.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(PANEL_REVIEW_LENSES.length);
 
-    expectCalledWith(
-      readHandlerOutput,
-      'task-panel-1',
-      'panel_review_verdict',
-      null,
-    );
+    // Each launched prompt is scoped to exactly ONE lens: it contains that
+    // lens's unique focus string and its lens-specific output path, and does
+    // NOT contain the other lenses' focus strings.
+    PANEL_REVIEW_LENSES.forEach((lens, index) => {
+      const prompt = vi.mocked(runClaudeCode).mock.calls[index]?.[0] ?? '';
+      expect(prompt).toContain(lens.focus);
+      expect(prompt).toContain(`/tmp/panel_review_lens_${lens.id}_task-panel-1.json`);
+      for (const other of PANEL_REVIEW_LENSES) {
+        if (other.id !== lens.id) expect(prompt).not.toContain(other.focus);
+      }
+    });
 
-    expectCalledWith(
-      persistAndPostStatus,
-      'task-panel-1',
-      expect.objectContaining({
-        task_id: 'task-panel-1',
-        status: 'COMPLETED',
-        changed_files: [
-          'agent/src/handlers/panel-review.ts',
-          'admin-ui/src/components/TaskDetailDrawerMeta.tsx',
-        ],
-      }),
-    );
+    // Each lens reads its own output file.
+    for (const lens of PANEL_REVIEW_LENSES) {
+      expect(vi.mocked(readHandlerOutput)).toHaveBeenCalledWith(
+        'task-panel-1',
+        `panel_review_lens_${lens.id}`,
+        null,
+      );
+    }
+  });
 
-    const logs = vi.mocked(persistAndPostStatus).mock.calls[0]?.[1]?.logs;
+  it('synthesizes one aggregated verdict that still passes the gate shape', async () => {
+    await runHandler();
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.changed_files).toEqual([
+      'agent/src/handlers/panel-review.ts',
+      'admin-ui/src/components/TaskDetailDrawerMeta.tsx',
+    ]);
+
+    const logs = call.logs;
     expect(typeof logs).toBe('string');
     const parsed = JSON.parse(logs as string) as Record<string, unknown>;
+    // overall REQUEST_CHANGES because the correctness lens requested changes.
     expect(parsed.overall_verdict).toBe('REQUEST_CHANGES');
+    // All four lens keys present in the aggregated object.
+    expect(Object.keys(parsed.lenses as Record<string, unknown>).sort()).toEqual(
+      ['code_quality', 'correctness', 'security', 'test_coverage'],
+    );
+    // Each lens carries a non-empty summary (the backend gate requires this).
+    for (const lens of PANEL_REVIEW_LENSES) {
+      const lensVerdict = (parsed.lenses as Record<string, { summary: string }>)[lens.id];
+      expect(lensVerdict.summary.length).toBeGreaterThan(0);
+    }
+    // The correctness lens's issue is carried into the aggregated issue list.
+    expect(parsed.issues).toEqual([
+      expect.objectContaining({
+        description: 'Caller still expects the old payload shape.',
+        lens: 'correctness',
+      }),
+    ]);
     expect(parsed.investigated_files).toEqual([
       'agent/src/handlers/panel-review.ts',
       'admin-ui/src/components/TaskDetailDrawerMeta.tsx',
     ]);
+  });
+
+  it('fails closed when a lens produces no usable verdict', async () => {
+    // security lens returns null → fail closed, no silent APPROVE.
+    vi.mocked(readHandlerOutput).mockImplementation((_taskId: string, outputType: string) => {
+      if (outputType === 'panel_review_lens_correctness') {
+        return { verdict: 'APPROVE', summary: 'Correctness is fine.', issues: [] };
+      }
+      return null;
+    });
+
+    await runHandler();
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.artifact_type).toBe('ERROR_LOG');
+    expect(call.failure_category).toBe('panel_review_lens_failed');
+    // Fan-out stops at the first unusable lens (correctness ok, security null).
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails closed when a lens agent pass exits non-zero', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 1,
+      allOutput: 'crash',
+      lastResultText: '',
+    });
+
+    await runHandler();
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('panel_review_lens_failed');
   });
 });
