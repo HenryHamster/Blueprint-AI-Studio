@@ -308,7 +308,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
 
         {/* Add direction form */}
         {selectedProjectId && (
-          <DirectionsAddForm form={form} addDirection={data.addDirection} />
+          <DirectionsAddForm form={form} addDirection={data.addDirection} stageTargetVersion={data.openVersionNumber} />
         )}
 
         {/* Error banner */}

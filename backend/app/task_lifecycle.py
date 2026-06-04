@@ -363,6 +363,7 @@ async def _resolve_quality_grader_completion(
         parse_grader_verdict,
     )
     from app.research_completion import _handle_research_completion
+    from app.task_completion import _handle_security_audit_completion
 
     completed = payload.status == TaskStatus.COMPLETED
     grader_logs = payload.logs or grader.latest_status_message or ""
@@ -415,7 +416,13 @@ async def _resolve_quality_grader_completion(
     await session.commit()
 
     # Re-dispatch the source to its registry completion handler so it resolves.
-    _resume_handlers = {"research": _handle_research_completion}
+    # Registry-driven (keyed by TaskCapability.completion_handler) so any
+    # blast-radius knowledge type can opt into the same escalation/resume path
+    # without another hardcoded entry.
+    _resume_handlers = {
+        "research": _handle_research_completion,
+        "security_audit": _handle_security_audit_completion,
+    }
     source_type = (source.first_payload or {}).get("type")
     cap = get_task_capability(source_type)
     handler = (
@@ -425,12 +432,18 @@ async def _resolve_quality_grader_completion(
     )
     if handler is not None:
         # Reconstruct the artifact text from the stored findings so the handler
-        # resumes from the same parsed state it had on the first pass.
-        resume_logs = (
-            json.dumps(source.plan_output)
-            if isinstance(source.plan_output, list)
-            else (source.latest_status_message or "")
-        )
+        # resumes from the same parsed state it had on the first pass. research
+        # stores plan_output as a bare list; security_audit wraps it as
+        # ``{"findings": [...]}`` — reconstruct either to the JSON findings array
+        # the handler's parser expects, rather than dropping to the status line.
+        if isinstance(source.plan_output, list):
+            resume_logs = json.dumps(source.plan_output)
+        elif isinstance(source.plan_output, dict) and isinstance(
+            source.plan_output.get("findings"), list
+        ):
+            resume_logs = json.dumps(source.plan_output["findings"])
+        else:
+            resume_logs = source.latest_status_message or ""
         await handler(source, resume_logs, session)
     else:
         logger.warning(

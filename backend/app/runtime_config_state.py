@@ -85,6 +85,17 @@ runtime_config: Dict = {
         "RESEARCH_QUALITY_GRADER_ENABLED", "false"
     ).lower()
     in ("1", "true", "yes"),
+    # Same forward-quality escalation for security_audit findings: a critical/high
+    # audit finding spawns code-change (create) PRs, the same blast radius as a
+    # research finding, so the audit output must clear an INDEPENDENT grader before
+    # any fix tasks spawn. Ships DARK (default OFF) — OFF preserves the legacy
+    # trust-the-findings spawn path exactly. Audits with no critical/high findings
+    # are never escalated regardless of this flag (the gate is proportional to
+    # blast radius).
+    "security_audit_quality_grader_enabled": os.getenv(
+        "SECURITY_AUDIT_QUALITY_GRADER_ENABLED", "false"
+    ).lower()
+    in ("1", "true", "yes"),
     # Long-EVALUATING parents stop blocking new research on the same direction
     # once their pipeline-side merge cycle exceeds this threshold. Set above
     # the typical PR lifecycle (CI + review + fix + re-review + merge) so new

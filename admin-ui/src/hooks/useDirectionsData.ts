@@ -154,6 +154,11 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       const body: Record<string, unknown> = { text: form.newText.trim(), priority: form.newPriority, paths: form.newPathTags };
       if (form.newCategory) body.category = form.newCategory;
       body.completion_criteria = form.newCompletionCriteria.trim() || null;
+      // Atomic born-staged create: when the operator opted to stage for the next
+      // version, the backend stamps staged_for_version from the open version in a
+      // single create call (404s if none is open), so the direction never passes
+      // through a research-eligible active state (no create-then-edit race).
+      if (form.newStaged && openVersionNumber != null) body.staged = true;
       const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions`, {
         method: 'POST',
         body: JSON.stringify(body),

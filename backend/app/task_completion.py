@@ -1246,7 +1246,57 @@ async def _maybe_release_safeguard_gate(
 async def _handle_security_audit_completion(
     task: Task, logs: str, session: AsyncSession
 ):
-    """Parse security audit findings and spawn create tasks for critical/high severity issues."""
+    """Parse security audit findings and spawn create tasks for critical/high severity issues.
+
+    Forward-quality gate (escalated path, mirrors _handle_research_completion):
+    a critical/high audit finding spawns code-change (create) PRs — the same
+    blast radius as a research finding — so when the security-audit quality
+    grader is enabled and the audit would spawn implementation work, this
+    handler does NOT spawn children on the first pass. It stands up an
+    INDEPENDENT grader and parks itself EVALUATING. The grader's verdict returns
+    via the re-entrant completion path (task_lifecycle._resolve_quality_grader_completion),
+    which re-invokes this handler with ``context['quality_grader']`` set:
+      * verdict PASS -> proceed to the normal spawn-on-findings path;
+      * verdict FAIL -> mark FAILED and spawn NOTHING (an ungrounded or
+        hallucinated audit must never launch fix PRs on its unverified say-so).
+    Audits with no critical/high findings spawn nothing and never escalate — the
+    gate is proportional to blast radius.
+    """
+    from app.task_evaluators import (
+        QUALITY_GRADER_VERDICT_KEY,
+        spawn_forward_quality_grader,
+    )
+
+    # Re-entry signal: the independent grader has returned its verdict.
+    _grader_verdict = (task.context or {}).get(QUALITY_GRADER_VERDICT_KEY)
+    if _grader_verdict is not None and not _grader_verdict.get("passed", False):
+        # FAILED forward-quality gate: fail closed — do NOT spawn fix tasks and
+        # do NOT complete clean. Record the verdict for observability +
+        # direction-health accounting, release any safeguard gate, end terminal.
+        record_failed_gate(
+            task,
+            EvaluationVerdict(
+                False,
+                str(_grader_verdict.get("reason") or "forward-quality grade failed"),
+                "forward-quality",
+            ),
+        )
+        session.add(task)
+        await session.commit()
+        await _maybe_release_safeguard_gate(task, None, session)
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": TaskStatus.FAILED},
+        )
+        logger.info(
+            "[SECURITY AUDIT] Task %s failed the forward-quality gate; spawned "
+            "no fix tasks: %s",
+            task.id,
+            _grader_verdict.get("reason"),
+        )
+        return
+
     # Parse the JSON findings array from logs
     findings = None
     try:
@@ -1290,6 +1340,28 @@ async def _handle_security_audit_completion(
         await session.commit()
         await _maybe_release_safeguard_gate(task, findings, session)
         return
+
+    # Forward-quality ESCALATION gate (blast-radius-proportional). When enabled
+    # and these critical/high findings would spawn downstream fix PRs, do not
+    # spawn anything yet: stand up an INDEPENDENT grader and park EVALUATING. The
+    # grader's verdict returns via the re-entrant completion path, which
+    # re-invokes this handler with the verdict in context (the `_grader_verdict
+    # is None` guard lets the resume pass fall through to the spawn loop instead
+    # of escalating again).
+    if _grader_verdict is None and _runtime_config.get(
+        "security_audit_quality_grader_enabled", False
+    ):
+        grader = await spawn_forward_quality_grader(
+            task, json.dumps(findings), session
+        )
+        if grader is not None:
+            logger.info(
+                "[SECURITY AUDIT] Task %s parked awaiting forward-quality grade "
+                "(grader %s) before spawning fix tasks",
+                task.id,
+                grader.id,
+            )
+            return
 
     create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
     child_tasks = []
