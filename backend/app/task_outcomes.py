@@ -74,6 +74,7 @@ KIND_AUDIT_FINDINGS = "audit_findings"
 KIND_MEMO_ARTIFACT = "memo_artifact"
 KIND_VERIFICATION_VERDICT = "verification_verdict"
 KIND_COMPUTE_RESULT = "compute_result"
+KIND_REVIEW_VERDICT = "review_verdict"
 KIND_KNOWLEDGE_DOCUMENT = "knowledge_document"
 # Read-only types that have no type-specific honest signal yet (review, plan,
 # strategic_review, design_doc_update, smoketest, debug, investigate). They are
@@ -288,6 +289,45 @@ def _evaluate_compute_experiment(task: Task) -> TaskOutcome:
     return TaskOutcome("neutral", KIND_COMPUTE_RESULT)
 
 
+def _panel_review_verdict(task: Task) -> dict | None:
+    """Best-effort read of a panel_review task's parsed verdict dict.
+
+    A clean panel_review completion stores the normalized verdict on
+    ``plan_output`` with ``overall_verdict`` ('APPROVE' or 'REQUEST_CHANGES'),
+    ``summary``, and ``lenses`` structure. Returns ``None`` when no usable
+    verdict is present (parsing failed, gate rejected the task, etc.).
+    """
+    raw_plan_output = _task_local_attr(task, "plan_output")
+    if not isinstance(raw_plan_output, dict):
+        return None
+    overall_verdict = str(raw_plan_output.get("overall_verdict") or "").strip()
+    if overall_verdict in {"APPROVE", "REQUEST_CHANGES"}:
+        return raw_plan_output
+    return None
+
+
+def _evaluate_panel_review(task: Task) -> TaskOutcome:
+    """Outcome for a panel_review task — judged on its structured verdict.
+
+    A panel_review task carries a terminal verdict grading the reviewed PR:
+    ``APPROVE`` (success) signals approval, ``REQUEST_CHANGES`` signals
+    non-approval but not a failure (output was produced, gate passed), and
+    no verdict (parsing failed or gate rejected) is ``neutral``. A
+    FAILED/CANCELLED panel_review task is a ``failure``.
+    """
+    if _counts_as_failure(task):
+        return TaskOutcome("failure", KIND_REVIEW_VERDICT)
+    verdict = _panel_review_verdict(task)
+    if verdict is None:
+        return TaskOutcome("neutral", KIND_REVIEW_VERDICT)
+    overall = str(verdict.get("overall_verdict") or "").strip().upper()
+    if overall == "APPROVE":
+        return TaskOutcome("success", KIND_REVIEW_VERDICT)
+    if overall == "REQUEST_CHANGES":
+        return TaskOutcome("neutral", KIND_REVIEW_VERDICT)
+    return TaskOutcome("neutral", KIND_REVIEW_VERDICT)
+
+
 def _knowledge_document(task: Task) -> dict | None:
     """Best-effort read of a web_research task's durable knowledge-document mirror.
 
@@ -336,6 +376,7 @@ _READ_ONLY_EVALUATORS: dict[str, Callable[[Task], TaskOutcome]] = {
     "memo": _evaluate_memo,
     "verify_tests": _evaluate_verify_tests,
     "compute_experiment": _evaluate_compute_experiment,
+    "panel_review": _evaluate_panel_review,
     "web_research": _evaluate_web_research,
 }
 

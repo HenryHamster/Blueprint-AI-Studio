@@ -325,6 +325,54 @@ def test_structured_verdict_valid_panel_review_passes():
     assert v.strategy == "structured-verdict"
 
 
+def _panel_lenses(*, drop_field: tuple[str, str] | None = None) -> dict:
+    lenses = {
+        "correctness": {"verdict": "APPROVE", "summary": "Logic checks clean."},
+        "security": {"verdict": "APPROVE", "summary": "No auth or injection regressions."},
+        "code_quality": {"verdict": "APPROVE", "summary": "Patterns remain consistent."},
+        "test_coverage": {"verdict": "APPROVE", "summary": "Changed behavior is covered."},
+    }
+    if drop_field is not None:
+        lens_name, field_name = drop_field
+        lenses[lens_name].pop(field_name, None)
+    return lenses
+
+
+def test_structured_verdict_present_lens_missing_verdict_fails():
+    payload = json.dumps(
+        {
+            "overall_verdict": "APPROVE",
+            "summary": "All four review lenses present.",
+            "lenses": _panel_lenses(drop_field=("correctness", "verdict")),
+        }
+    )
+    v = StructuredVerdictStrategy().evaluate(_task("panel_review"), payload)
+    assert v.passed is False
+    assert "structured verdict" in v.reason.lower()
+
+
+def test_structured_verdict_present_lens_missing_summary_fails():
+    payload = json.dumps(
+        {
+            "overall_verdict": "APPROVE",
+            "summary": "All four review lenses present.",
+            "lenses": _panel_lenses(drop_field=("security", "summary")),
+        }
+    )
+    v = StructuredVerdictStrategy().evaluate(_task("panel_review"), payload)
+    assert v.passed is False
+    assert "structured verdict" in v.reason.lower()
+
+
+def test_structured_verdict_non_json_garbage_fails():
+    v = StructuredVerdictStrategy().evaluate(
+        _task("panel_review"), "This PR looks fine to me, approving!"
+    )
+    assert v.passed is False
+    assert "structured verdict" in v.reason.lower()
+    assert "empty" not in v.reason.lower()
+
+
 # ── record_failed_gate ──────────────────────────────────────────────────────
 
 

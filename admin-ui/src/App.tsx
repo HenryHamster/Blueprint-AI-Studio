@@ -1002,7 +1002,7 @@ export default function App() {
 
           {s.viewMode === 'home' ? (
             <>
-              <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} projects={s.projects} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onCategoryClick={(cat) => { setSrMissedCategory(cat); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} onScopeClick={(scope) => { setSrMissedScope(scope); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} onConfigureTargets={handleConfigureTargets} onSpawnOrphanFix={(pr) => s.openPrefilledTaskModal({ taskType: 'fix', title: pr.pr_title, prompt: `PR #${pr.pr_number} is open but has no active task — investigate and either close or push remediation. PR: ${pr.pr_url}`, prNumber: pr.pr_number, prBranch: pr.pr_branch })} /></ErrorBoundary>
+              <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} projects={s.projects} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onCategoryClick={(cat) => { setSrMissedCategory(cat); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} onScopeClick={(scope) => { setSrMissedScope(scope); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} onConfigureTargets={handleConfigureTargets} onSpawnOrphanFix={(pr) => s.openPrefilledTaskModal({ taskType: 'fix', title: pr.pr_title, prompt: `PR #${pr.pr_number} is open but has no active task — investigate and either close or push remediation. PR: ${pr.pr_url}`, prNumber: pr.pr_number, prBranch: pr.pr_branch })} onPanelReviewPr={(pr) => s.openPrefilledTaskModal({ taskType: 'panel_review', title: `Panel review PR #${pr.pr_number}`, prompt: '', prNumber: pr.pr_number, prBranch: pr.pr_branch, baseBranch: pr.pr_base_branch })} /></ErrorBoundary>
               {s.userRole === 'admin' && s.selectedProjectId && (
                 <ErrorBoundary level="panel">
                   <SrMissedRetrospectivesPanel selectedProjectId={s.selectedProjectId} onSelectTask={handleViewTask} activeCategory={srMissedCategory} activeScope={srMissedScope} activeInvestigationTaskIds={srInvestigationTaskIds} />
@@ -1223,6 +1223,18 @@ export default function App() {
           onEditPrompt={s.handleEditPrompt}
           onDismiss={s.handleDismiss}
           onDuplicate={s.openDuplicateTaskModal}
+          onPanelReview={(task) => {
+            const payload = (task.payloads?.[0] ?? {}) as Record<string, unknown>;
+            const prNumber = payload.pr_number as number | undefined;
+            s.openPrefilledTaskModal({
+              taskType: 'panel_review',
+              title: `Panel review PR #${prNumber ?? ''}`,
+              prompt: '',
+              prNumber,
+              prBranch: payload.branch as string | undefined,
+              baseBranch: payload.base_branch as string | undefined,
+            });
+          }}
           onWidthChange={setDrawerWidth}
           onNavigateToTask={(taskId) => {
             const target = s.tasks.find(t => t.id === taskId);

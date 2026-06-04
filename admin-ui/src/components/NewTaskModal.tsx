@@ -285,10 +285,12 @@ export function NewTaskModal({
             </div>
           </div>
           <div className="mb-4">
-            <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Task Title</label>
+            <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
+              Task Title{newTaskType === 'panel_review' && <span className="ml-1 text-neutral-600 normal-case font-normal tracking-normal">(optional)</span>}
+            </label>
             <input
               type="text"
-              required
+              required={newTaskType !== 'panel_review'}
               autoFocus
               value={newTaskTitle}
               onChange={e => setNewTaskTitle(e.target.value)}
@@ -297,10 +299,12 @@ export function NewTaskModal({
             />
           </div>
           <div className="mb-6">
-            <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Prompt / Instructions</label>
+            <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
+              Prompt / Instructions{newTaskType === 'panel_review' && <span className="ml-1 text-neutral-600 normal-case font-normal tracking-normal">(optional — fixed workflow)</span>}
+            </label>
             <div className="relative">
               <textarea
-                required
+                required={newTaskType !== 'panel_review'}
                 value={newTaskPrompt}
                 onChange={e => setNewTaskPrompt(e.target.value)}
                 className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[160px] max-h-[400px] transition-all placeholder:text-neutral-600"

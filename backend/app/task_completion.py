@@ -28,6 +28,7 @@ from app.github import (
     create_pr_comment,
     get_branch_sha,
     get_open_pull_requests,
+    submit_pr_review,
 )
 from app.models import (
     Project,
@@ -2021,6 +2022,188 @@ async def _handle_panel_review_completion(
     logger.info(
         "[PANEL_REVIEW] Persisted verdict artifact for task %s", task.id
     )
+
+    # Surface the verdict on the PR (and raise an operator signal for
+    # REQUEST_CHANGES). Best-effort — the durable artifact and COMPLETED
+    # status above are the source of truth and must never be undone by a
+    # transient posting failure.
+    await _post_panel_review_to_pr(task, parsed, session)
+
+
+def _build_panel_review_pr_body(parsed: Dict[str, Any]) -> str:
+    """Render a panel-review verdict into a Markdown PR-review body.
+
+    Clearly labelled "Blueprint Panel Review" so it does not read as a
+    duplicate of the ordinary single-reviewer "Blueprint Code Review"
+    posted by the ``review`` task type.
+    """
+
+    def _render_issues(issues: List[Any]) -> List[str]:
+        rendered: List[str] = []
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            sev = str(issue.get("severity", "minor")).upper()
+            desc = issue.get("description") or issue.get("summary") or ""
+            loc = ""
+            if issue.get("file"):
+                loc = f" (`{issue['file']}`"
+                if issue.get("line"):
+                    loc += f":{issue['line']}"
+                loc += ")"
+            rendered.append(f"- [{sev}] {desc}{loc}")
+        return rendered
+
+    overall = parsed.get("overall_verdict", "")
+    lines: List[str] = [f"## Blueprint Panel Review — {overall}", ""]
+    summary = str(parsed.get("summary") or "").strip()
+    if summary:
+        lines.extend([summary, ""])
+
+    lenses = parsed.get("lenses") or {}
+    for lens, data in lenses.items():
+        if not isinstance(data, dict):
+            continue
+        label = lens.replace("_", " ").title()
+        lines.append(f"### {label} — {data.get('verdict', '')}")
+        lens_summary = str(data.get("summary") or "").strip()
+        if lens_summary:
+            lines.append(lens_summary)
+        lines.extend(_render_issues(data.get("issues") or []))
+        lines.append("")
+
+    top_issues = parsed.get("issues") or []
+    if top_issues:
+        lines.append("### Cross-cutting issues")
+        lines.extend(_render_issues(top_issues))
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+async def _post_panel_review_to_pr(
+    task: Task, parsed: Dict[str, Any], session: AsyncSession
+) -> None:
+    """Best-effort: surface a completed panel-review verdict on its PR.
+
+    Posts the verdict as a real GitHub review (parity with the ordinary
+    ``review`` task type, reusing ``submit_pr_review``) and, for a
+    REQUEST_CHANGES overall verdict, raises an operator ``Alert`` so a
+    blocking panel outcome is visible rather than an indistinguishable
+    COMPLETED. Every failure is swallowed and logged — the durable
+    artifact and COMPLETED status are authoritative and must survive any
+    GitHub/posting error.
+    """
+    from app.models import Alert, AlertSeverity  # noqa: PLC0415
+
+    # Greenlet-safe PR-number fetch. ``task.first_payload`` reads
+    # ``task.payloads``, which is a deferred-loadable column in some dispatch
+    # paths (recovery sweep / load_only projections); touching it implicitly
+    # here would trigger lazy IO outside a greenlet and raise MissingGreenlet
+    # (which previously crashed the reaper). An explicit awaited query is
+    # safe regardless of how the task was loaded.
+    try:
+        row = (
+            await session.execute(select(Task.payloads).where(Task.id == task.id))
+        ).first()
+    except Exception as exc:  # noqa: BLE001 — best-effort surfacing
+        logger.warning(
+            "[PANEL_REVIEW] could not load payload for task %s: %s", task.id, exc
+        )
+        return
+
+    payloads = row[0] if row else None
+    first = (payloads or [{}])[0] if isinstance(payloads, list) and payloads else {}
+    pr_number = first.get("pr_number") if isinstance(first, dict) else None
+    if not pr_number:
+        logger.info(
+            "[PANEL_REVIEW] task %s has no pr_number; skipping PR post", task.id
+        )
+        return
+
+    overall = parsed.get("overall_verdict")
+    event = "APPROVE" if overall == "APPROVE" else "REQUEST_CHANGES"
+
+    # Split located issues into inline comments vs the review body, mirroring
+    # the `review` task type's posting path. Both per-lens issues and any
+    # top-level issues are considered.
+    all_issues: List[Dict[str, Any]] = []
+    for lens_data in (parsed.get("lenses") or {}).values():
+        if isinstance(lens_data, dict):
+            all_issues.extend(
+                i for i in (lens_data.get("issues") or []) if isinstance(i, dict)
+            )
+    all_issues.extend(
+        i for i in (parsed.get("issues") or []) if isinstance(i, dict)
+    )
+    inline_comments: List[Dict[str, Any]] = []
+    for issue in all_issues:
+        if issue.get("file") and issue.get("line"):
+            sev = str(issue.get("severity", "minor")).upper()
+            desc = issue.get("description") or issue.get("summary") or ""
+            inline_comments.append(
+                {
+                    "path": issue["file"],
+                    "line": issue["line"],
+                    "body": f"[{sev}] {desc}",
+                }
+            )
+
+    body = _build_panel_review_pr_body(parsed)
+
+    try:
+        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+        await submit_pr_review(
+            gh_token, owner, repo, int(pr_number), event, body, inline_comments
+        )
+        logger.info(
+            "[PANEL_REVIEW] posted %s review to PR #%s for task %s",
+            event,
+            pr_number,
+            task.id,
+        )
+    except Exception as exc:  # noqa: BLE001 — posting is best-effort
+        logger.warning(
+            "[PANEL_REVIEW] failed to post review to PR #%s for task %s: %s",
+            pr_number,
+            task.id,
+            exc,
+        )
+
+    if event != "REQUEST_CHANGES":
+        return
+
+    # REQUEST_CHANGES → visible, actionable operator signal (parity with other
+    # blocking review outcomes, which raise a WARNING Alert).
+    try:
+        alert = Alert(
+            project_id=task.project_id,
+            severity=AlertSeverity.WARNING,
+            title=f"Panel review requested changes on PR #{pr_number}",
+            message=(
+                f"The multi-lens panel review for PR #{pr_number} returned "
+                "REQUEST_CHANGES. Review the per-lens findings in the task "
+                "detail drawer and on the PR before merging."
+            ),
+            task_id=task.id,
+        )
+        session.add(alert)
+        await session.commit()
+        await broadcast_to_project(
+            str(task.project_id),
+            "alert_created",
+            {
+                "alert_id": str(alert.id),
+                "severity": "WARNING",
+                "title": alert.title,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — surfacing is best-effort
+        logger.warning(
+            "[PANEL_REVIEW] failed to raise REQUEST_CHANGES alert for task %s: %s",
+            task.id,
+            exc,
+        )
 
 
 # ---------------------------------------------------------------------------

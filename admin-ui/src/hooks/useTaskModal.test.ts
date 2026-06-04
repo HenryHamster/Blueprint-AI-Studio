@@ -632,6 +632,91 @@ describe('useTaskModal', () => {
     expect(result.current.newTaskRepo).toBe('owner/repo');
   });
 
+  it('openPrefilledTaskModal sets panel_review type and base branch from baseBranch', async () => {
+    const defaultTaskBranchRef = { current: 'automain' };
+    const selectedProjectRepoRef = { current: 'owner/repo' };
+    const { result } = renderHook(() =>
+      useTaskModal('create', vi.fn(), { current: vi.fn() }, defaultTaskBranchRef, selectedProjectRepoRef),
+    );
+    await act(async () => {
+      result.current.openPrefilledTaskModal({
+        taskType: 'panel_review',
+        title: 'Panel review PR #99',
+        prompt: '',
+        prNumber: 99,
+        prBranch: 'feature/panel',
+        baseBranch: 'release/1.2',
+      });
+    });
+    expect(result.current.newTaskType).toBe('panel_review');
+    expect(result.current.newTaskPrNumber).toBe('99');
+    expect(result.current.newTaskPrBranch).toBe('feature/panel');
+    // The PR's own base branch wins over the project default.
+    expect(result.current.newTaskBranch).toBe('release/1.2');
+  });
+
+  it('openPrefilledTaskModal falls back to the project default branch when baseBranch is absent', async () => {
+    const defaultTaskBranchRef = { current: 'automain' };
+    const selectedProjectRepoRef = { current: 'owner/repo' };
+    const { result } = renderHook(() =>
+      useTaskModal('create', vi.fn(), { current: vi.fn() }, defaultTaskBranchRef, selectedProjectRepoRef),
+    );
+    await act(async () => {
+      result.current.openPrefilledTaskModal({
+        taskType: 'panel_review',
+        title: 'Panel review PR #1',
+        prompt: '',
+        prNumber: 1,
+        prBranch: 'feature/x',
+      });
+    });
+    expect(result.current.newTaskBranch).toBe('automain');
+  });
+
+  it('handleCreateTask defaults blank title/prompt for panel_review and POSTs a valid body', async () => {
+    fetchSpy.mockResolvedValue({ ok: true, json: vi.fn().mockResolvedValue({ id: 'task-pr-1' }) });
+    const { result } = renderHook(() =>
+      useTaskModal('panel_review', vi.fn(), { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskType('panel_review');
+      result.current.setNewTaskPrNumber('123');
+      result.current.setNewTaskPrBranch('feature/panel');
+      // Title and prompt intentionally left blank — the fixed workflow needs no
+      // operator-authored prompt.
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    const body = JSON.parse(String(fetchSpy.mock.calls[0]?.[1]?.body ?? '{}')) as Record<string, unknown>;
+    expect(body.task_type).toBe('panel_review');
+    expect(body.pr_number).toBe(123);
+    expect(body.branch).toBe('feature/panel');
+    // Backend requires non-empty title/prompt — the hook fills sensible defaults.
+    expect(String(body.title).length).toBeGreaterThan(0);
+    expect(String(body.prompt).length).toBeGreaterThan(0);
+    expect(String(body.title)).toContain('123');
+  });
+
+  it('handleCreateTask does NOT default title/prompt for non-panel_review types', async () => {
+    fetchSpy.mockResolvedValue({ ok: true, json: vi.fn().mockResolvedValue({ id: 'task-c-1' }) });
+    const { result } = renderHook(() =>
+      useTaskModal('create', vi.fn(), { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskTitle('Real title');
+      result.current.setNewTaskPrompt('Real prompt');
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    const body = JSON.parse(String(fetchSpy.mock.calls[0]?.[1]?.body ?? '{}')) as Record<string, unknown>;
+    expect(body.title).toBe('Real title');
+    expect(body.prompt).toBe('Real prompt');
+  });
+
   it('openPrefilledTaskModal does NOT autosave the prefilled title/prompt as a draft', async () => {
     const selectedProjectRepoRef = { current: 'owner/repo' };
     const { result } = renderHook(() =>

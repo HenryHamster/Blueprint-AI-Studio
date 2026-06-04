@@ -23,6 +23,7 @@ from app.task_outcomes import (
     KIND_MEMO_ARTIFACT,
     KIND_READ_ONLY_UNCLASSIFIED,
     KIND_RESEARCH_QUALITY,
+    KIND_REVIEW_VERDICT,
     KIND_UNKNOWN,
     KIND_VERIFICATION_VERDICT,
     OUTCOME_EVALUATORS,
@@ -312,6 +313,58 @@ def test_compute_experiment_missing_result_completed_is_neutral():
     # Completed but no compute_result and not a genuine failure → neutral.
     task = _make_compute_task(None, status=TaskStatus.COMPLETED)
     assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_COMPUTE_RESULT)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Panel-review family
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_panel_review_approve_verdict_is_success():
+    task = _make_task(
+        "panel_review",
+        plan_output={
+            "overall_verdict": "APPROVE",
+            "summary": "PR looks good",
+            "lenses": {
+                "correctness": {"verdict": "pass", "summary": "Logic is correct"},
+                "security": {"verdict": "pass", "summary": "No security issues"},
+                "style": {"verdict": "pass", "summary": "Code style is good"},
+                "testing": {"verdict": "pass", "summary": "Tests are adequate"},
+            },
+        },
+    )
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_REVIEW_VERDICT)
+    assert is_successful_outcome(task) is True
+
+
+def test_panel_review_request_changes_verdict_is_neutral():
+    task = _make_task(
+        "panel_review",
+        plan_output={
+            "overall_verdict": "REQUEST_CHANGES",
+            "summary": "Needs minor fixes",
+            "lenses": {
+                "correctness": {"verdict": "fail", "summary": "Logic issue"},
+                "security": {"verdict": "pass", "summary": "No security issues"},
+                "style": {"verdict": "pass", "summary": "Code style is good"},
+                "testing": {"verdict": "pass", "summary": "Tests are adequate"},
+            },
+        },
+    )
+    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_REVIEW_VERDICT)
+    assert is_successful_outcome(task) is False
+
+
+def test_panel_review_no_verdict_is_neutral():
+    # COMPLETED panel_review with no usable verdict → neutral.
+    task = _make_task("panel_review", plan_output={})
+    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_REVIEW_VERDICT)
+
+
+def test_panel_review_failed_is_failure():
+    task = _make_task("panel_review", status=TaskStatus.FAILED, plan_output={})
+    assert evaluate_task_outcome(task) == TaskOutcome("failure", KIND_REVIEW_VERDICT)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

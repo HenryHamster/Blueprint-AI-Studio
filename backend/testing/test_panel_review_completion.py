@@ -12,10 +12,11 @@ from httpx import AsyncClient
 from sqlmodel import select
 
 from app.auth import create_agent_token
-from app.models import Artifact, Project, Task, TaskStatus
+from app.models import Alert, Artifact, Project, Task, TaskStatus
 from app.task_completion import (
     _PANEL_REVIEW_ARTIFACT_TYPE,
     _PANEL_REVIEW_REQUIRED_LENSES,
+    _build_panel_review_pr_body,
     _handle_panel_review_completion,
     _parse_panel_review_output,
 )
@@ -27,6 +28,7 @@ def _panel_review_payload(
     *,
     overall_verdict: str = "APPROVE",
     drop_lens: str | None = None,
+    drop_lens_field: tuple[str, str] | None = None,
 ) -> dict:
     lenses = {
         "correctness": {
@@ -48,6 +50,9 @@ def _panel_review_payload(
     }
     if drop_lens is not None:
         lenses.pop(drop_lens, None)
+    if drop_lens_field is not None:
+        lens_name, field_name = drop_lens_field
+        lenses[lens_name].pop(field_name, None)
     return {
         "overall_verdict": overall_verdict,
         "summary": "All declared review lenses completed.",
@@ -85,6 +90,28 @@ class TestParsePanelReviewOutput:
         out = _parse_panel_review_output(
             json.dumps(_panel_review_payload(drop_lens="security"))
         )
+        assert out is None
+
+    def test_present_lens_missing_verdict_returns_none(self):
+        out = _parse_panel_review_output(
+            json.dumps(
+                _panel_review_payload(
+                    drop_lens_field=("correctness", "verdict")
+                )
+            )
+        )
+        assert out is None
+
+    def test_present_lens_missing_summary_returns_none(self):
+        out = _parse_panel_review_output(
+            json.dumps(
+                _panel_review_payload(drop_lens_field=("security", "summary"))
+            )
+        )
+        assert out is None
+
+    def test_non_json_garbage_returns_none(self):
+        out = _parse_panel_review_output("This PR looks fine to me, approving!")
         assert out is None
 
 
@@ -135,7 +162,17 @@ async def test_panel_review_completion_persists_artifact_and_plan_output(
     await db_session.refresh(task)
 
     logs = json.dumps(_panel_review_payload(overall_verdict="REQUEST_CHANGES"))
-    await _handle_panel_review_completion(task, logs, db_session)
+    with (
+        patch(
+            "app.task_completion.get_github_token_for_task",
+            new=AsyncMock(return_value=("tok", "acme", "repo")),
+        ),
+        patch(
+            "app.task_completion.submit_pr_review",
+            new=AsyncMock(return_value={"id": 1}),
+        ),
+    ):
+        await _handle_panel_review_completion(task, logs, db_session)
 
     artifacts = (
         (await db_session.execute(select(Artifact).where(Artifact.task_id == task.id)))
@@ -152,6 +189,196 @@ async def test_panel_review_completion_persists_artifact_and_plan_output(
     assert set(task.plan_output["lenses"]) == set(_PANEL_REVIEW_REQUIRED_LENSES)
 
 
+async def _run_panel_completion_with_mocks(task, db_session, logs):
+    """Drive ``_handle_panel_review_completion`` with the GitHub posting path
+    stubbed, returning the ``submit_pr_review`` mock for assertions."""
+    submit_mock = AsyncMock(return_value={"id": 1})
+    with (
+        patch(
+            "app.task_completion.get_github_token_for_task",
+            new=AsyncMock(return_value=("tok", "acme", "repo")),
+        ),
+        patch("app.task_completion.submit_pr_review", new=submit_mock),
+    ):
+        await _handle_panel_review_completion(task, logs, db_session)
+    return submit_mock
+
+
+def _make_panel_task(project_id, pr_number=55):
+    return make_task(
+        project_id=project_id,
+        title="Panel review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "panel_review",
+                "pr_number": pr_number,
+                "branch": "feature/panel-review",
+                "base_branch": "automain",
+            }
+        ],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+
+
+@pytest.mark.asyncio
+async def test_panel_review_completion_posts_request_changes_review_to_pr(
+    db_session, _quiet_broadcast
+):
+    project = make_project(name="PanelReviewPostRC")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_panel_task(project.id, pr_number=42)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(_panel_review_payload(overall_verdict="REQUEST_CHANGES"))
+    submit_mock = await _run_panel_completion_with_mocks(task, db_session, logs)
+
+    submit_mock.assert_awaited_once()
+    args = submit_mock.await_args.args
+    # (token, owner, repo, pr_number, event, body, comments)
+    assert args[3] == 42
+    assert args[4] == "REQUEST_CHANGES"
+    body = args[5]
+    assert "Blueprint Panel Review" in body
+    assert "REQUEST_CHANGES" in body
+    # Per-lens summaries are rendered into the body.
+    assert "Logic and edge-case review passed." in body
+
+    # REQUEST_CHANGES raises a visible operator alert.
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "42" in alerts[0].title
+
+
+@pytest.mark.asyncio
+async def test_panel_review_completion_posts_approve_review_to_pr(
+    db_session, _quiet_broadcast
+):
+    project = make_project(name="PanelReviewPostApprove")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_panel_task(project.id, pr_number=43)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(_panel_review_payload(overall_verdict="APPROVE"))
+    submit_mock = await _run_panel_completion_with_mocks(task, db_session, logs)
+
+    submit_mock.assert_awaited_once()
+    assert submit_mock.await_args.args[4] == "APPROVE"
+
+    # APPROVE does not raise a blocking operator alert.
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert alerts == []
+
+
+@pytest.mark.asyncio
+async def test_panel_review_completion_inline_comments_from_located_issues(
+    db_session, _quiet_broadcast
+):
+    project = make_project(name="PanelReviewInline")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_panel_task(project.id, pr_number=44)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    payload = _panel_review_payload(overall_verdict="REQUEST_CHANGES")
+    payload["lenses"]["security"]["issues"] = [
+        {
+            "severity": "major",
+            "description": "Unvalidated input reaches the query.",
+            "file": "backend/app/foo.py",
+            "line": 12,
+        },
+        {
+            "severity": "minor",
+            "description": "Consider documenting this contract.",
+        },
+    ]
+    logs = json.dumps(payload)
+    submit_mock = await _run_panel_completion_with_mocks(task, db_session, logs)
+
+    submit_mock.assert_awaited_once()
+    comments = submit_mock.await_args.args[6]
+    body = submit_mock.await_args.args[5]
+    # The located issue becomes an inline comment.
+    assert len(comments) == 1
+    assert comments[0]["path"] == "backend/app/foo.py"
+    assert comments[0]["line"] == 12
+    assert "Unvalidated input" in comments[0]["body"]
+    # The file-less issue stays in the body, not as an inline comment.
+    assert "Consider documenting this contract." in body
+
+
+@pytest.mark.asyncio
+async def test_panel_review_pr_post_failure_does_not_fail_completed_task(
+    db_session, _quiet_broadcast
+):
+    project = make_project(name="PanelReviewPostFails")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_panel_task(project.id, pr_number=45)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(_panel_review_payload(overall_verdict="REQUEST_CHANGES"))
+    with (
+        patch(
+            "app.task_completion.get_github_token_for_task",
+            new=AsyncMock(return_value=("tok", "acme", "repo")),
+        ),
+        patch(
+            "app.task_completion.submit_pr_review",
+            new=AsyncMock(side_effect=RuntimeError("github exploded")),
+        ),
+    ):
+        await _handle_panel_review_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    # The posting failure is swallowed: the task stays COMPLETED and the
+    # durable artifact survives.
+    assert task.status == TaskStatus.COMPLETED
+    artifacts = (
+        (await db_session.execute(select(Artifact).where(Artifact.task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(artifacts) == 1
+    assert artifacts[0].artifact_type == _PANEL_REVIEW_ARTIFACT_TYPE
+
+
+def test_build_panel_review_pr_body_is_labelled_and_includes_lenses():
+    parsed = _panel_review_payload(overall_verdict="REQUEST_CHANGES")
+    body = _build_panel_review_pr_body(parsed)
+    assert body.startswith("## Blueprint Panel Review — REQUEST_CHANGES")
+    for lens in _PANEL_REVIEW_REQUIRED_LENSES:
+        label = lens.replace("_", " ").title()
+        assert f"### {label}" in body
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("logs", "reason_fragment"),
@@ -162,6 +389,19 @@ async def test_panel_review_completion_persists_artifact_and_plan_output(
             json.dumps(_panel_review_payload(drop_lens="test_coverage")),
             "structured verdict",
         ),
+        (
+            json.dumps(
+                _panel_review_payload(drop_lens_field=("correctness", "verdict"))
+            ),
+            "structured verdict",
+        ),
+        (
+            json.dumps(
+                _panel_review_payload(drop_lens_field=("security", "summary"))
+            ),
+            "structured verdict",
+        ),
+        ("This PR looks fine to me, approving!", "structured verdict"),
     ],
 )
 async def test_panel_review_completion_invalid_output_fails_gate(
@@ -269,6 +509,13 @@ async def test_panel_review_status_endpoint_routes_via_registry_handler(
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch(
         "app.task_completion.broadcast_to_project", new=AsyncMock(return_value=None)
+    )
+    mocker.patch(
+        "app.task_completion.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "acme", "repo")),
+    )
+    mocker.patch(
+        "app.task_completion.submit_pr_review", new=AsyncMock(return_value={"id": 1})
     )
 
     project = Project(name="PanelReviewEndpoint", user_id="test-user-panel")

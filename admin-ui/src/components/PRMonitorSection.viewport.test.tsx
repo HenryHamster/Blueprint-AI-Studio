@@ -170,6 +170,31 @@ describe('PRMonitorSection — viewport regression', () => {
     });
   });
 
+  test('panel-review control renders without horizontal overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <PRMonitorSection
+            openPRs={openPRs}
+            loading={false}
+            refreshing={false}
+            onRefresh={() => {}}
+            hasProject={true}
+            tasks={tasks}
+            onViewTask={() => {}}
+            onSpawnFixTask={() => {}}
+            onPanelReviewPr={() => {}}
+          />,
+        );
+      });
+    });
+  });
+
   test('empty state renders without horizontal overflow at 375px', async () => {
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');

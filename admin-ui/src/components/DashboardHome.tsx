@@ -86,6 +86,7 @@ export interface DashboardHomeProps {
   onScopeClick?: (scope: string) => void;
   onConfigureTargets?: () => void;
   onSpawnOrphanFix?: (pr: OpenPR) => void;
+  onPanelReviewPr?: (pr: OpenPR) => void;
 }
 
 // ---------- component ----------
@@ -98,7 +99,7 @@ const WINDOW_OPTIONS = [
   { label: '7d', value: 168 },
 ];
 
-export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, onDirectionClick, onCategoryClick, onScopeClick, onConfigureTargets, onSpawnOrphanFix }: DashboardHomeProps) {
+export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, onDirectionClick, onCategoryClick, onScopeClick, onConfigureTargets, onSpawnOrphanFix, onPanelReviewPr }: DashboardHomeProps) {
   const [digest, setDigest] = useState<DigestData | null>(null);
   const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
   const [openPRsIntegrationBranch, setOpenPRsIntegrationBranch] = useState<string | null>(null);
@@ -775,6 +776,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
             integrationBranch={openPRsIntegrationBranch}
             promotionTarget={openPRsPromotionTarget}
             onSpawnFixTask={onSpawnOrphanFix}
+            onPanelReviewPr={onPanelReviewPr}
           />
         </div>
       </div>
