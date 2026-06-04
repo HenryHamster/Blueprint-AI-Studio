@@ -2,11 +2,12 @@
 
 import re
 import uuid
+from datetime import datetime
 from typing import List, Dict, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.models import TaskStatus, ArtifactType
+from app.models import ArtifactType, ComputeJobOutcome, ComputeJobStatus, TaskStatus
 
 
 class DeployPayload(BaseModel):
@@ -161,6 +162,42 @@ class HeartbeatRequest(BaseModel):
     llm_call_count: int | None = Field(None, ge=0)
     total_input_tokens: int | None = Field(None, ge=0)
     total_output_tokens: int | None = Field(None, ge=0)
+
+
+class ComputeJobResponse(BaseModel):
+    """Agent-facing serialization for persisted compute jobs."""
+
+    model_config = ConfigDict(from_attributes=True, use_enum_values=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    task_id: uuid.UUID | None = None
+    backend: str
+    external_compute_id: str | None = None
+    machine_type: str | None = None
+    status: ComputeJobStatus
+    terminal_reason: str | None = None
+    outcome: ComputeJobOutcome | None = None
+    spend_cap_usd: float | None = None
+    wall_clock_deadline: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    last_polled_at: datetime | None = None
+    next_poll_at: datetime | None = None
+    poll_attempt_count: int = 0
+    accrued_cost_usd: float | None = None
+    final_cost_usd: float | None = None
+    result_reference: str | None = None
+    artifact_id: uuid.UUID | None = None
+    polling_metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+def serialize_compute_job_response(job: object) -> Dict[str, Any]:
+    """Return a JSON-ready compute-job response payload."""
+
+    return ComputeJobResponse.model_validate(job).model_dump(mode="json")
 
 
 class SpawnTaskRequest(BaseModel):

@@ -22,6 +22,16 @@ VM_COST_RATES: dict[str, Tuple[float, float]] = {
 }
 
 
+def supported_machine_types() -> tuple[str, ...]:
+    """Return the explicitly priced machine types the platform accepts."""
+    return tuple(sorted(VM_COST_RATES))
+
+
+def is_supported_machine_type(machine_type: str | None) -> bool:
+    """True when ``machine_type`` has an explicit pricing entry."""
+    return machine_type in VM_COST_RATES
+
+
 def _resolve_rate_entry(machine_type: str | None) -> tuple[str, Tuple[float, float]]:
     if machine_type in VM_COST_RATES:
         return machine_type, VM_COST_RATES[machine_type]

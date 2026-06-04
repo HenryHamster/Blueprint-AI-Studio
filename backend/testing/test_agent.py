@@ -15,6 +15,7 @@ from app.main import app
 from app.models import (
     Artifact,
     ArtifactType,
+    ComputeJob,
     LLMAuthMode,
     LLMProviderName,
     MaxPlanAccount,
@@ -25,6 +26,7 @@ from app.models import (
 )
 from app.auth import create_agent_token
 from app.schemas import AgentStatusPayload
+from app.task_capabilities import TaskType
 
 
 def _resolve_sr_recent_miss_examples_contract_fixture() -> Path:
@@ -228,6 +230,184 @@ async def test_agent_status_update_persists_runtime_identity(
         .all()
     )
     assert any(t.id == task.id for t in provider_tasks)
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_job_launch_creates_pending_row(client: AsyncClient, db_session):
+    import app.compute_jobs as compute_jobs_module
+
+    project = Project(name="Agent Compute Launch", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": TaskType.compute_experiment.value}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-compute-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-compute-1")
+    resp = await client.post(
+        "/api/agent/compute-jobs",
+        headers={"x-agent-token": token},
+        json={
+            "command": "echo ready",
+            "machine_type": "e2-standard-2",
+            "spend_cap_usd": 9999,
+            "deadline_seconds": 999999,
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()["data"]
+    job = await db_session.get(ComputeJob, uuid.UUID(body["id"]))
+    assert job is not None
+    assert job.task_id == task.id
+    assert job.status == compute_jobs_module.ComputeJobStatus.QUEUED
+    assert job.spend_cap_usd == pytest.approx(
+        compute_jobs_module.MAX_COMPUTE_JOB_SPEND_CAP_USD
+    )
+    deadline_delta = (job.wall_clock_deadline - datetime.utcnow()).total_seconds()
+    assert deadline_delta <= compute_jobs_module.MAX_COMPUTE_JOB_DEADLINE_SECONDS + 5
+    assert body["status"] == compute_jobs_module.ComputeJobStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_job_launch_reuses_existing_active_job(
+    client: AsyncClient, db_session
+):
+    project = Project(name="Agent Compute Launch Idempotent", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": TaskType.compute_experiment.value}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-compute-idempotent",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-compute-idempotent")
+    payload = {
+        "command": "echo ready",
+        "machine_type": "e2-standard-2",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+    }
+
+    first = await client.post(
+        "/api/agent/compute-jobs",
+        headers={"x-agent-token": token},
+        json=payload,
+    )
+    second = await client.post(
+        "/api/agent/compute-jobs",
+        headers={"x-agent-token": token},
+        json=payload,
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["data"]["id"] == second.json()["data"]["id"]
+    jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
+    assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_job_launch_rejects_non_compute_task_type(
+    client: AsyncClient, db_session
+):
+    project = Project(name="Agent Compute Launch Authz", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": TaskType.research.value}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-compute-authz",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-compute-authz")
+    resp = await client.post(
+        "/api/agent/compute-jobs",
+        headers={"x-agent-token": token},
+        json={
+            "command": "echo ready",
+            "machine_type": "e2-standard-2",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+        },
+    )
+
+    assert resp.status_code == 403
+    assert resp.json()["error"] == {
+        "code": 403,
+        "message": {
+        "error": "task_type_not_allowed_for_compute_jobs",
+        "task_type": TaskType.research.value,
+        "allowed_task_types": [TaskType.compute_experiment.value],
+        },
+    }
+    jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
+    assert jobs == []
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_job_poll_is_task_scoped(client: AsyncClient, db_session):
+    import app.compute_jobs as compute_jobs_module
+
+    project = Project(name="Agent Compute Poll Scope", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    owner_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-owner",
+    )
+    other_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-other",
+    )
+    db_session.add(owner_task)
+    db_session.add(other_task)
+    await db_session.commit()
+    await db_session.refresh(owner_task)
+    await db_session.refresh(other_task)
+
+    job = await compute_jobs_module.create_compute_job(
+        db_session,
+        owner_task,
+        command="echo scoped",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    token = create_agent_token(str(other_task.id), "agent-vm-other")
+    resp = await client.get(
+        f"/api/agent/compute-jobs/{job.id}",
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 404
 
 
 @pytest.mark.asyncio

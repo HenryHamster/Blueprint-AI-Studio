@@ -4,6 +4,7 @@ import type { Task } from './TaskCard';
 import { formatAbsolute, parseTimestamp } from '../utils/time';
 import { projectStatusBadge } from '../utils/projectStatus';
 import { ProjectApprovalGateSection } from './ProjectApprovalGateSection';
+import { ComputeJobsPanel } from './ComputeJobsPanel';
 import { fetchApprovalGateConfig, updateApprovalGateConfig, deleteProject, resetProject, setProjectPaused, archiveProject, unarchiveProject, fetchArchivedProjects, type ApprovalGateConfigResponse } from '../api';
 
 export type { Project } from '../types/project';
@@ -710,6 +711,7 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
               />
             </div>
           )}
+          {selectedProject && <ComputeJobsPanel projectId={selectedProject.id} />}
         </>
       )}
 

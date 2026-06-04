@@ -57,10 +57,11 @@ EXPECTED_TYPES = {
     "release_audit",
     "memo",
     "verify_tests",
+    "compute_experiment",
 }
 
 
-def test_task_type_enum_has_all_21_types():
+def test_task_type_enum_has_all_22_types():
     values = {t.value for t in TaskType}
     assert values == EXPECTED_TYPES
 
@@ -76,10 +77,10 @@ def test_model_for_type_covers_all_task_types():
     assert set(_MODEL_FOR_TYPE.keys()) == set(TaskType)
 
 
-def test_model_for_type_count_is_21():
+def test_model_for_type_count_is_22():
     from app.payload_schemas import _MODEL_FOR_TYPE
 
-    assert len(_MODEL_FOR_TYPE) == 21
+    assert len(_MODEL_FOR_TYPE) == 22
 
 
 # ---------------------------------------------------------------------------
@@ -132,11 +133,45 @@ def test_fix_passes():
         "perf",
         "self_audit",
         "verify_tests",
+        "compute_experiment",
     ],
 )
 def test_system_populated_types_pass_with_no_extra_fields(task_type):
     result = _valid({"type": task_type})
     assert result["type"] == task_type
+
+
+def test_compute_experiment_payload_carries_launch_and_benchmark_fields():
+    raw = {
+        "type": "compute_experiment",
+        "command": "python bench.py --suite full",
+        "machine_type": "e2-standard-8",
+        "spend_cap_usd": 2.5,
+        "deadline_seconds": 1800,
+        "experiment": "perf-sweep-v3",
+        "benchmark": "throughput",
+        "metric": "tokens_per_sec",
+    }
+    result = _valid(raw)
+    assert result["type"] == "compute_experiment"
+    assert result["command"] == "python bench.py --suite full"
+    assert result["spend_cap_usd"] == 2.5
+    assert result["deadline_seconds"] == 1800
+    assert result["experiment"] == "perf-sweep-v3"
+
+
+def test_compute_experiment_payload_tolerates_extra_benchmark_fields():
+    # Backward-compatible extra-field tolerance: a new benchmark field that the
+    # schema does not declare must round-trip rather than be rejected/dropped.
+    raw = {
+        "type": "compute_experiment",
+        "command": "run-eval",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 600,
+        "dataset_shards": [1, 2, 3],
+    }
+    result = _valid(raw)
+    assert result["dataset_shards"] == [1, 2, 3]
 
 
 def test_verify_tests_payload_with_branch_and_pr_number():

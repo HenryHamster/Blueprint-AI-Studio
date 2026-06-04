@@ -60,18 +60,60 @@ Coverage:
 """
 
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import text, update
 from sqlmodel import select
 
-from app.models import MaxPlanAccount, Project, SystemMaturity, Task, TaskStatus
+from app.models import (
+    ComputeJob,
+    ComputeJobOutcome,
+    ComputeJobStatus,
+    MaxPlanAccount,
+    Project,
+    SystemMaturity,
+    Task,
+    TaskStatus,
+)
+from app.schemas import serialize_compute_job_response
 
 
 USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
     "DATABASE_URL", ""
 ).startswith("postgresql")
+
+
+def test_compute_job_response_serializes_status_outcome_and_result_reference():
+    job = ComputeJob(
+        project_id=uuid.uuid4(),
+        backend="gcp",
+        external_compute_id="vm-blueprint-123",
+        machine_type="e2-standard-4",
+        status=ComputeJobStatus.RUNNING,
+        outcome=ComputeJobOutcome.SUCCESS,
+        spend_cap_usd=12.5,
+        accrued_cost_usd=1.25,
+        result_reference="gs://blueprint-artifacts/jobs/123/result.json",
+        polling_metadata={"zone": "us-central1-a", "operation": "op-123"},
+        poll_attempt_count=2,
+    )
+
+    payload = serialize_compute_job_response(job)
+
+    assert payload["status"] == "RUNNING"
+    assert payload["outcome"] == "SUCCESS"
+    assert payload["external_compute_id"] == "vm-blueprint-123"
+    assert (
+        payload["result_reference"] == "gs://blueprint-artifacts/jobs/123/result.json"
+    )
+    assert payload["polling_metadata"] == {
+        "zone": "us-central1-a",
+        "operation": "op-123",
+    }
+    assert payload["poll_attempt_count"] == 2
+    assert isinstance(payload["created_at"], str)
 
 
 # ── NaiveUTCDateTime process_bind_param ────────────────────────────────────

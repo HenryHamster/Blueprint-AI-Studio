@@ -2,7 +2,7 @@
 Pydantic-based payload validation for all supported task types.
 
 Provides:
-  - TaskType enum listing all 21 handler types
+  - TaskType enum listing all 22 handler types
   - ALL_TASK_TYPES frozenset for backward-compat consumers
   - Per-type payload models with required-field enforcement
   - validate_task_payload()  — strict, raises ValueError on bad input
@@ -323,6 +323,37 @@ class MemoPayload(BasePayload):
     prompt: str | None = None
 
 
+class ComputeExperimentPayload(_SystemPopulated):
+    """Reference compute-heavy task (benchmark/evaluation style).
+
+    The agent forwards the launch fields below to ``POST /api/agent/compute-jobs``
+    and then only monitors the job to terminal state — it never holds the heavy
+    VM. The shape is intentionally minimal and inherits ``extra='allow'`` from
+    BasePayload, so new benchmark/evaluation fields can be added without a schema
+    bump (backward-compatible extra-field tolerance).
+
+    All fields are optional + system-populated; the *agent* handler validates the
+    launch requirements (command + a positive spend cap + a positive deadline)
+    and fails loudly on misconfiguration rather than silently spending. The
+    backend launch endpoint re-validates and clamps cap/deadline to safe bounds.
+    """
+
+    # Launch spec — forwarded to the compute-job launch endpoint.
+    command: str | None = None
+    machine_type: str | None = None
+    spend_cap_usd: float | None = None
+    deadline_seconds: int | None = None
+    cwd: str | None = None
+    env: dict[str, str] | None = None
+    backend_name: str | None = None
+    provisioning_model: str | None = None
+    # Benchmark/evaluation metadata — informational; echoed back into the result
+    # artifact so operators can correlate a job with the experiment that ran it.
+    experiment: str | None = None
+    benchmark: str | None = None
+    metric: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
@@ -349,6 +380,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.release_audit: ReleaseAuditPayload,
     TaskType.memo: MemoPayload,
     TaskType.verify_tests: VerifyTestsPayload,
+    TaskType.compute_experiment: ComputeExperimentPayload,
 }
 
 

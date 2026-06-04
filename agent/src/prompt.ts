@@ -147,6 +147,7 @@ export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'design_doc_update', // Uses design-doc.ts bespoke prompt assembly
   'memo',             // Uses memo.ts bespoke prompt assembly (no-clone reasoning artifact)
   'verify_tests',     // Uses verify-tests.ts; runs the detected suite directly, no Claude prompt
+  'compute_experiment', // Uses compute-experiment.ts; launches+polls a compute job, no Claude prompt
 ]);
 
 // ── Dynamic Task Type Hints (based on project build configuration) ───────────

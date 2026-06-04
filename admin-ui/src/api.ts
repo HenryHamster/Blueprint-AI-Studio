@@ -1591,3 +1591,59 @@ export async function fetchSrReviewerDisagreementTasks(
   if (!res.ok) throw new Error(`Failed to fetch SR reviewer disagreement tasks: ${res.status}`);
   return res.json();
 }
+
+// ── Compute jobs ────────────────────────────────────────────────────────────
+
+export interface ComputeJob {
+  id: string;
+  project_id: string;
+  task_id: string | null;
+  backend: string;
+  external_compute_id: string | null;
+  machine_type: string | null;
+  status: 'QUEUED' | 'STARTING' | 'RUNNING' | 'POLLING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | 'TIMED_OUT';
+  terminal_reason: string | null;
+  outcome: 'SUCCESS' | 'FAILURE' | 'CANCELLED' | 'TIMED_OUT' | 'SPEND_CAP_EXCEEDED' | null;
+  spend_cap_usd: number | null;
+  wall_clock_deadline: string | null;
+  created_at: string;
+  updated_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  last_polled_at: string | null;
+  accrued_cost_usd: number | null;
+  final_cost_usd: number | null;
+  // Augmented by the admin list endpoint from the launching Task.
+  task_title: string | null;
+  task_type: string | null;
+}
+
+export async function fetchComputeJobs(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ComputeJob[]> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/compute-jobs`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch compute jobs: ${res.status}`);
+  const data = await res.json();
+  return Array.isArray(data.compute_jobs) ? data.compute_jobs : [];
+}
+
+export async function killComputeJob(jobId: string): Promise<ComputeJob> {
+  const res = await apiFetch(
+    `/api/admin/compute-jobs/${encodeURIComponent(jobId)}/kill`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.error?.message || data?.detail || `Failed to kill compute job: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to kill compute job: ${res.status}`);
+  }
+  const data = await res.json();
+  return data.compute_job;
+}

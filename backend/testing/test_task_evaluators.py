@@ -68,6 +68,7 @@ def test_evaluation_declarations_match_expected_assignment():
         "release_audit": "forward-quality",
         "memo": "forward-quality",
         "verify_tests": "none",
+        "compute_experiment": "none",
     }
 
 

@@ -119,6 +119,25 @@ class TaskStatus(str, Enum):
     CANCELLED = "CANCELLED"
 
 
+class ComputeJobStatus(str, Enum):
+    QUEUED = "QUEUED"
+    STARTING = "STARTING"
+    RUNNING = "RUNNING"
+    POLLING = "POLLING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    TIMED_OUT = "TIMED_OUT"
+
+
+class ComputeJobOutcome(str, Enum):
+    SUCCESS = "SUCCESS"
+    FAILURE = "FAILURE"
+    CANCELLED = "CANCELLED"
+    TIMED_OUT = "TIMED_OUT"
+    SPEND_CAP_EXCEEDED = "SPEND_CAP_EXCEEDED"
+
+
 class ArtifactType(str, Enum):
     GIT_COMMIT = "GIT_COMMIT"
     PULL_REQUEST = "PULL_REQUEST"
@@ -137,6 +156,11 @@ class ArtifactType(str, Enum):
     # suite run on a PR head, consulted by the no-CI merge gate. ArtifactType is
     # a plain String column (sa_column=Column(String)) so no migration is needed.
     MERGE_TEST_RESULT = "MERGE_TEST_RESULT"
+    # Result of a compute_experiment task: the terminal outcome (success / spend
+    # cap / deadline / failure) and final cost of a budgeted compute job the
+    # agent launched and monitored. Like MERGE_TEST_RESULT, the column is a plain
+    # String so no migration is needed.
+    COMPUTE_RESULT = "COMPUTE_RESULT"
 
 
 class LLMProviderName(str, Enum):
@@ -587,6 +611,10 @@ class Project(SQLModel, table=True):
         return cls.archived.is_(False)
 
     tasks: List["Task"] = Relationship(
+        back_populates="project",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
+    compute_jobs: List["ComputeJob"] = Relationship(
         back_populates="project",
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},
     )
@@ -1223,6 +1251,15 @@ class Task(SQLModel, table=True):
     history: List["TaskHistory"] = Relationship(
         back_populates="task", sa_relationship_kwargs={"cascade": "all, delete-orphan"}
     )
+    # ComputeJob is durable, first-class persistence decoupled from Task: a
+    # task delete/reset must PRESERVE the compute-job history (task_id is
+    # detached via the DB-level ``ondelete="SET NULL"`` FK), so this link uses
+    # NEITHER delete-orphan NOR an ORM null-out — ``passive_deletes`` leaves the
+    # detach to the database, which also keeps bulk ``delete(Task)`` paths
+    # (e.g. ``admin_projects.reset_project_admin``) from FK-violating.
+    compute_jobs: List["ComputeJob"] = Relationship(
+        back_populates="task", sa_relationship_kwargs={"passive_deletes": True}
+    )
 
     def _get_context_backed_value(self, key: str) -> Any:
         return (self.context or {}).get(key)
@@ -1480,6 +1517,128 @@ def bank_task_current_attempt(
         task.api_call_summary = None
 
     return snapshot
+
+
+class ComputeJob(SQLModel, table=True):
+    """Durable compute-job record for budgeted work decoupled from ``Task``.
+
+    A compute job represents external execution capacity (VM, process, hosted
+    backend job, or similar) with its own budget/deadline/cost/result lifecycle.
+    It is always owned by a project and may be associated with a Task, but the
+    nullable task link lets future budgeted work be tracked independently.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    # Detach-on-delete (SET NULL), NOT cascade: a compute job is durable history
+    # that must outlive its originating task. Mirrors Alert.task_id /
+    # SystemMaturity.source_task_id so bulk task cleanup never FK-violates.
+    task_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("task.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
+
+    backend: str = Field(sa_column=Column(String(64), nullable=False))
+    external_compute_id: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+    machine_type: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+
+    status: ComputeJobStatus = Field(
+        default=ComputeJobStatus.QUEUED,
+        sa_column=Column(
+            String,
+            nullable=False,
+            server_default=ComputeJobStatus.QUEUED.value,
+        ),
+    )
+    terminal_reason: str | None = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    outcome: ComputeJobOutcome | None = Field(
+        default=None, sa_column=Column(String, nullable=True)
+    )
+
+    spend_cap_usd: float | None = Field(
+        default=None, sa_column=Column(Float, nullable=True)
+    )
+    wall_clock_deadline: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+    started_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    completed_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    last_polled_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    next_poll_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    poll_attempt_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+
+    accrued_cost_usd: float | None = Field(
+        default=None, sa_column=Column(Float, nullable=True)
+    )
+    final_cost_usd: float | None = Field(
+        default=None, sa_column=Column(Float, nullable=True)
+    )
+    result_reference: str | None = Field(
+        default=None, sa_column=Column(String(1024), nullable=True)
+    )
+    # Artifacts are task-owned and CASCADE-deleted with their task; this
+    # reference must therefore detach (SET NULL) rather than block task cleanup
+    # or be deleted out from under us.
+    artifact_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("artifact.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
+    polling_metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+
+    __table_args__ = (
+        Index("ix_computejob_project_status", "project_id", "status"),
+        Index("ix_computejob_task_status", "task_id", "status"),
+        Index("ix_computejob_backend_external", "backend", "external_compute_id"),
+        Index("ix_computejob_status_deadline", "status", "wall_clock_deadline"),
+        Index("ix_computejob_next_poll", "next_poll_at"),
+    )
+
+    project: Project = Relationship(back_populates="compute_jobs")
+    task: Task | None = Relationship(back_populates="compute_jobs")
 
 
 class PoolVm(SQLModel, table=True):
@@ -2042,9 +2201,7 @@ class DigestCacheEntry(SQLModel, table=True):
     __tablename__ = "digestcache"
 
     cache_key: str = Field(sa_column=Column(String, primary_key=True))
-    payload: dict = Field(
-        default_factory=dict, sa_column=Column(JSONB, nullable=False)
-    )
+    payload: dict = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False))
     computed_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False),

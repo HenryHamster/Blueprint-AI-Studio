@@ -3,7 +3,8 @@ import { Copy, Check, ChevronDown, ChevronRight, ExternalLink, Hash } from 'luci
 import { getHeartbeatStatus, isSafeUrl, useElapsedTime, linkifyStatusMessage, ResearchFindings, useDurationStats } from './TaskCard';
 import { formatAbsolute, parseTimestamp } from '../utils/time';
 import { hasTransitiveCycle } from '../utils/taskGraph';
-import { authGet, API_BASE_URL } from '../api';
+import { authGet, API_BASE_URL, fetchComputeJobs, type ComputeJob } from '../api';
+import { isComputeJobActive, computeJobTerminalLabel } from './ComputeJobsPanel.utils';
 import { TaskFixLoopPanel } from './TaskFixLoopPanel';
 import { SelfReviewPanel } from './TaskDetailDrawerSelfReview';
 import { TaskDiagnosticsPanel, TaskErrorLogsPanel, getLogEntryColor } from './TaskDetailDrawerDiagnostics';
@@ -142,6 +143,49 @@ function DependencyItem({ dep, depTask, hasCycle, onNavigateToTask }: { dep: str
     </div>
   );
 }
+/** Surface any compute jobs this task launched, linking the non-code compute
+ *  work into the task detail view. Active jobs are managed (kill, live budget)
+ *  from the dashboard's Compute Jobs panel; here we show a compact status link. */
+function TaskComputeJobsSection({ task }: { task: Task }) {
+  const [jobs, setJobs] = useState<ComputeJob[]>([]);
+  const projectId = task.project_id;
+  const taskId = task.id;
+  useEffect(() => {
+    if (!projectId) return;
+    let cancelled = false;
+    fetchComputeJobs(projectId)
+      .then(all => {
+        if (!cancelled) setJobs(all.filter(j => j.task_id === taskId));
+      })
+      .catch(() => { /* compute jobs are optional context */ });
+    return () => { cancelled = true; };
+  }, [projectId, taskId]);
+
+  if (jobs.length === 0) return null;
+  return (
+    <>
+      <SectionHeader>Compute Jobs</SectionHeader>
+      {jobs.map(job => {
+        const active = isComputeJobActive(job);
+        const cap = job.spend_cap_usd ?? 0;
+        const spent = (active ? job.accrued_cost_usd : job.final_cost_usd ?? job.accrued_cost_usd) ?? 0;
+        return (
+          <DetailRow key={job.id} label={job.backend}>
+            <span className="inline-flex flex-wrap items-center gap-1.5 min-w-0">
+              <span className={`text-xs px-1.5 py-0.5 rounded ${active ? 'bg-sky-900/40 text-sky-300' : job.outcome === 'SUCCESS' ? 'bg-emerald-900/40 text-emerald-400' : 'bg-red-900/40 text-red-400'}`}>
+                {active ? job.status : computeJobTerminalLabel(job)}
+              </span>
+              <span className="text-xs text-neutral-400 font-mono break-words">
+                ${spent.toFixed(2)} / ${cap.toFixed(2)}
+              </span>
+            </span>
+          </DetailRow>
+        );
+      })}
+    </>
+  );
+}
+
 function ResearchOriginSection({ task, tasks, onNavigateToTask }: { task: Task; tasks?: Task[]; onNavigateToTask?: (taskId: string) => void }) {
   const ctx = task.context as Record<string, unknown> | undefined;
   const researchTaskId = ctx?.research_task_id as string | undefined;
@@ -341,6 +385,7 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         );
       })()}
       <ResearchOriginSection task={task} tasks={tasks} onNavigateToTask={onNavigateToTask} />
+      <TaskComputeJobsSection task={task} />
       {task.project_id && <DetailRow label="Project ID"><span className="font-mono text-sm break-all min-w-0">{task.project_id}</span></DetailRow>}
       {task.vm_instance_id && (
         <DetailRow label="VM Instance">

@@ -20,6 +20,7 @@ export const TASK_CAPABILITIES = [
   { id: 'release_audit', label: 'Release Audit', agentMode: 'read_only' },
   { id: 'memo', label: 'Memo', agentMode: 'read_only' },
   { id: 'verify_tests', label: 'Verify Tests', agentMode: 'read_only' },
+  { id: 'compute_experiment', label: 'Compute Experiment', agentMode: 'read_only' },
 ] as const;
 
 export type TaskCapability = (typeof TASK_CAPABILITIES)[number];

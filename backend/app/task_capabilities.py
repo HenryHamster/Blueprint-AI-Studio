@@ -35,6 +35,7 @@ class TaskType(str, Enum):
     release_audit = "release_audit"
     memo = "memo"
     verify_tests = "verify_tests"
+    compute_experiment = "compute_experiment"
 
 
 AgentMode = Literal["write", "read_only"]
@@ -442,6 +443,23 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         evaluation_strategy="metric",
         cost_ceiling_usd=3.0,
         evaluation="none",
+    ),
+    TaskCapability(
+        TaskType.compute_experiment,
+        "Compute Experiment",
+        "read_only",
+        default_category="ops",
+        user_launchable=False,
+        # No LLM provider runs — the handler is a programmatic launch+poll loop,
+        # so it never selects a model/account.
+        provider_configurable=False,
+        description=(
+            "Reference compute-heavy task: launch a budgeted, auto-torn-down "
+            "compute job on the compute substrate and monitor it to terminal "
+            "state. The agent only launches and polls — it never holds the heavy "
+            "VM. Reports the job outcome and final cost; budget/deadline kills "
+            "are intentional terminal outcomes, not crashes."
+        ),
     ),
 )
 

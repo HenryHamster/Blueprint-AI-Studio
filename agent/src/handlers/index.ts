@@ -9,6 +9,7 @@ import { handleMigrate, handleSmoketest, handleDebug, handlePerf, handleInvestig
 import { handleDesignDocUpdate } from './design-doc.js';
 import { handleMemo } from './memo.js';
 import { handleVerifyTests } from './verify-tests.js';
+import { handleComputeExperiment } from './compute-experiment.js';
 
 export type Handler = (
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -48,4 +49,5 @@ export const handlers: Record<AgentTaskType, Handler> = {
   release_audit: handleReleaseAudit,
   memo: handleMemo,
   verify_tests: handleVerifyTests,
+  compute_experiment: handleComputeExperiment,
 };

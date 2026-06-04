@@ -143,8 +143,15 @@ async def gcp_cleanup_service():
                 # off, this generic cleanup reclaims the now-unmanaged members.
                 from app.warm_pool import pool_vm_cleanup_exemptions
 
+                # Compute-job VMs (compute-job-vm-*) have NO Task row; the orphan
+                # sweep now inventories them, so a RUNNING job's VM must be held
+                # active here or it would be deleted out from under the monitor.
+                from app.compute_jobs import active_compute_job_vm_ids
+
                 active_vm_ids = list(
-                    set(active_vm_ids) | await pool_vm_cleanup_exemptions(session)
+                    set(active_vm_ids)
+                    | await pool_vm_cleanup_exemptions(session)
+                    | await active_compute_job_vm_ids(session)
                 )
 
                 # Run cleanup with hard timeout (2 minutes)

@@ -6,15 +6,39 @@ Covers:
 - Zone success-rate tracking (rolling window, zone ordering, reset, summary).
 """
 
+import asyncio
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
+import os
+import signal
 import uuid
 
 import pytest
 from google.api_core.exceptions import Aborted
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlmodel import select
 
 from app import compute
+from app import compute_backends as compute_backends_module
+from app import compute_jobs
+from app.compute_backends import (
+    ComputeCostResult,
+    GcpComputeBackend,
+    ComputeLaunchResult,
+    ComputeLaunchSpec,
+    LocalSubprocessComputeBackend,
+    ComputeStatusResult,
+)
+from app.database import resolve_async_engine
+from app.models import (
+    ComputeJob,
+    ComputeJobOutcome,
+    ComputeJobStatus,
+    Project,
+    Task,
+    TaskStatus,
+)
 
 
 class _FakeBinding:
@@ -160,9 +184,8 @@ class TestStoreAgentSecretIamRetry:
 
         with patch(
             "google.cloud.secretmanager.SecretManagerServiceClient", return_value=client
-        ):
-            with pytest.raises(Aborted):
-                compute._store_agent_secret("vm123", '{"token": "abc"}')
+        ), pytest.raises(Aborted):
+            compute._store_agent_secret("vm123", '{"token": "abc"}')
 
         assert client.set_iam_policy.call_count == 5
         assert client.get_iam_policy.call_count == 5
@@ -263,6 +286,620 @@ class TestAgentSecretManifest:
         assert manifest["env"]["LLM_SETTINGS"] == "{}"
         assert "LLM_CLI_TRANSLATION" in manifest["env"]
         assert manifest["metadata"]["model"] == "claude-opus-4-8"
+
+
+@pytest.mark.asyncio
+async def test_local_compute_backend_recovers_running_pid_after_restart():
+    backend = LocalSubprocessComputeBackend()
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="sleep 30",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+    )
+    result = await backend.launch(spec)
+    pid = result.metadata["pid"]
+    compute_job = ComputeJob(
+        id=spec.job_id,
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id=result.external_id,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"pid": pid},
+    )
+
+    try:
+        backend._processes.clear()
+        status = await backend.poll_status(compute_job)
+        assert status.status == ComputeJobStatus.RUNNING
+    finally:
+        os.killpg(pid, signal.SIGTERM)
+
+
+@pytest.mark.asyncio
+async def test_local_compute_backend_recovers_completed_success_after_restart():
+    backend = LocalSubprocessComputeBackend()
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="exit 0",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+    )
+    result = await backend.launch(spec)
+    pid = result.metadata["pid"]
+    compute_job = ComputeJob(
+        id=spec.job_id,
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id=result.external_id,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"pid": pid},
+    )
+
+    for _ in range(40):
+        if compute_backends_module._read_local_terminal_status(compute_job) is not None:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("expected local terminal marker for completed subprocess")
+
+    backend._processes.clear()
+    status = await backend.poll_status(compute_job)
+
+    assert status.status == ComputeJobStatus.SUCCEEDED
+    assert status.exit_code == 0
+    assert status.message == "local subprocess exited 0"
+    assert status.finished_at is not None
+
+
+@pytest.mark.asyncio
+async def test_local_compute_backend_terminates_persisted_pid_after_restart():
+    backend = LocalSubprocessComputeBackend()
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="sleep 30",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+    )
+    result = await backend.launch(spec)
+    pid = result.metadata["pid"]
+    compute_job = ComputeJob(
+        id=spec.job_id,
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id=result.external_id,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"pid": pid},
+    )
+
+    backend._processes.clear()
+    assert await backend.terminate(compute_job, reason="budget") is True
+    for _ in range(20):
+        if not compute_backends_module._is_pid_running(pid):
+            break
+        await asyncio.sleep(0.05)
+    else:
+        os.killpg(pid, signal.SIGKILL)
+        raise AssertionError("terminate should kill the persisted local subprocess pid")
+
+
+@pytest.mark.asyncio
+async def test_local_compute_backend_idempotent_launch_preserves_started_at():
+    backend = LocalSubprocessComputeBackend()
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="sleep 30",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+    )
+    first = await backend.launch(spec)
+    second = await backend.launch(
+        ComputeLaunchSpec(
+            job_id=spec.job_id,
+            command=spec.command,
+            machine_type=spec.machine_type,
+            spend_cap_usd=spec.spend_cap_usd,
+            deadline_at=spec.deadline_at,
+            external_id=first.external_id,
+        )
+    )
+
+    try:
+        assert second.external_id == first.external_id
+        assert second.started_at == first.started_at
+    finally:
+        await backend.terminate(
+            ComputeJob(
+                id=spec.job_id,
+                project_id=uuid.uuid4(),
+                backend=backend.name,
+                external_compute_id=first.external_id,
+                status=ComputeJobStatus.RUNNING,
+                polling_metadata={"pid": first.metadata["pid"]},
+            ),
+            reason="cleanup",
+        )
+
+
+@pytest.mark.asyncio
+async def test_gcp_compute_backend_uses_persisted_zone_for_restart_serial_recovery(
+    monkeypatch,
+):
+    backend = GcpComputeBackend()
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id="compute-job-vm-abcd1234",
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"zone": "us-central1-f"},
+    )
+
+    def fake_get_vm_serial_output(vm_instance_id: str, zone: str | None = None) -> str:
+        assert vm_instance_id == "compute-job-vm-abcd1234"
+        assert zone == "us-central1-f"
+        return "\n".join(
+            [
+                "noise",
+                "BLUEPRINT_COMPUTE_REASON=completed",
+                "BLUEPRINT_COMPUTE_STATUS=SUCCEEDED",
+                "BLUEPRINT_COMPUTE_EXIT_CODE=0",
+            ]
+        )
+
+    def fail_get_vm_status(*args, **kwargs):
+        raise AssertionError("serial marker should finalize the job before VM status lookup")
+
+    monkeypatch.setattr(compute, "get_vm_serial_output", fake_get_vm_serial_output)
+    monkeypatch.setattr(compute, "get_vm_status", fail_get_vm_status)
+
+    status = await backend.poll_status(job)
+
+    assert status.status == ComputeJobStatus.SUCCEEDED
+    assert status.exit_code == 0
+    assert status.message == "completed"
+
+
+@pytest.mark.asyncio
+async def test_gcp_compute_backend_adopts_existing_vm_with_original_started_at(
+    monkeypatch,
+):
+    backend = GcpComputeBackend()
+    started_at = datetime(2026, 1, 2, 3, 4, 5)
+
+    monkeypatch.setattr(compute, "find_vm_zone", lambda _vm_name: "us-central1-f")
+    monkeypatch.setattr(compute, "get_vm_created_at", lambda *_args: started_at)
+
+    result = await backend.launch(
+        ComputeLaunchSpec(
+            job_id=uuid.uuid4(),
+            command="echo ok",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_at=None,
+        )
+    )
+
+    assert result.started_at == started_at
+    assert result.metadata["zone"] == "us-central1-f"
+
+
+@pytest.mark.asyncio
+async def test_process_compute_jobs_once_launches_and_records_terminal_success(
+    db_session, monkeypatch
+):
+    project = Project(name="Compute Job Success", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute parent",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "research"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo ok",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    assert job.status == ComputeJobStatus.QUEUED
+
+    started_at = datetime.utcnow() - timedelta(seconds=30)
+
+    class FakeBackend:
+        def external_id_for(self, persisted_job):
+            return "fake-job-1"
+
+        async def launch(self, spec):
+            # The monitor reserves the external id (durable STARTING commit)
+            # before launch — the spec carries it so launch is idempotent.
+            assert spec.external_id == "fake-job-1"
+            return ComputeLaunchResult(
+                external_id="fake-job-1",
+                started_at=started_at,
+                cost_rate_per_second=0.001,
+                message="launched",
+            )
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(
+                total_cost_usd=0.03,
+                measured_at=as_of,
+            )
+
+        async def poll_status(self, persisted_job):
+            return ComputeStatusResult(
+                status=ComputeJobStatus.SUCCEEDED,
+                exit_code=0,
+                finished_at=datetime.utcnow(),
+                message="completed",
+            )
+
+        async def terminate(self, persisted_job, *, reason):
+            raise AssertionError("terminate should not be called")
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.SUCCEEDED
+    assert job.outcome == ComputeJobOutcome.SUCCESS
+    assert job.external_compute_id == "fake-job-1"
+    assert job.accrued_cost_usd == pytest.approx(0.03)
+    assert job.final_cost_usd == pytest.approx(0.03)
+    assert job.polling_metadata["exit_code"] == 0
+    assert job.polling_metadata["terminal_status"] == ComputeJobStatus.SUCCEEDED.value
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_reuses_matching_active_job_for_task(db_session):
+    project = Project(name="Compute Job Idempotent Create", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    first = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo idempotent",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    second = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo idempotent",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
+    assert first.id == second.id
+    assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_process_compute_jobs_once_kills_on_spend_cap(db_session, monkeypatch):
+    project = Project(name="Compute Job Budget Kill", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="sleep 10",
+        machine_type="e2-standard-2",
+        spend_cap_usd=0.02,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.RUNNING
+    job.external_compute_id = "fake-job-2"
+    job.started_at = datetime.utcnow() - timedelta(seconds=60)
+    db_session.add(job)
+    await db_session.commit()
+
+    terminate_reasons: list[str] = []
+
+    class FakeBackend:
+        async def launch(self, spec):
+            raise AssertionError("launch should not be called")
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(
+                total_cost_usd=0.05,
+                measured_at=as_of,
+            )
+
+        async def poll_status(self, persisted_job):
+            return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+
+        async def terminate(self, persisted_job, *, reason):
+            terminate_reasons.append(reason)
+            return True
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    assert terminate_reasons == ["budget"]
+    assert job.status == ComputeJobStatus.FAILED
+    assert job.outcome == ComputeJobOutcome.SPEND_CAP_EXCEEDED
+    assert "spend cap" in (job.terminal_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_process_compute_jobs_once_kills_on_deadline(db_session, monkeypatch):
+    project = Project(name="Compute Job Deadline Kill", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="sleep 10",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=60,
+    )
+    job.status = ComputeJobStatus.RUNNING
+    job.external_compute_id = "fake-job-3"
+    job.started_at = datetime.utcnow() - timedelta(seconds=60)
+    job.wall_clock_deadline = datetime.utcnow() - timedelta(seconds=1)
+    db_session.add(job)
+    await db_session.commit()
+
+    terminate_reasons: list[str] = []
+
+    class FakeBackend:
+        async def launch(self, spec):
+            raise AssertionError("launch should not be called")
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(
+                total_cost_usd=0.01,
+                measured_at=as_of,
+            )
+
+        async def poll_status(self, persisted_job):
+            return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+
+        async def terminate(self, persisted_job, *, reason):
+            terminate_reasons.append(reason)
+            return True
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    assert terminate_reasons == ["deadline"]
+    assert job.status == ComputeJobStatus.TIMED_OUT
+    assert job.outcome == ComputeJobOutcome.TIMED_OUT
+    assert "deadline" in (job.terminal_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_kill_compute_job_cancels_active_and_terminates(db_session, monkeypatch):
+    project = Project(name="Compute Job Operator Kill", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="sleep 100",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.RUNNING
+    job.external_compute_id = "fake-job-kill"
+    db_session.add(job)
+    await db_session.commit()
+
+    terminate_reasons: list[str] = []
+
+    class FakeBackend:
+        async def terminate(self, persisted_job, *, reason):
+            terminate_reasons.append(reason)
+            return True
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+
+    killed = await compute_jobs.kill_compute_job(
+        db_session,
+        job_id=job.id,
+        project_id=project.id,
+        killed_by="operator@example.com",
+    )
+
+    assert terminate_reasons == ["operator"]
+    assert killed.status == ComputeJobStatus.CANCELLED
+    assert killed.outcome == ComputeJobOutcome.CANCELLED
+    assert "operator" in (killed.terminal_reason or "")
+    assert "operator@example.com" in (killed.terminal_reason or "")
+    assert killed.final_cost_usd == killed.accrued_cost_usd
+
+
+@pytest.mark.asyncio
+async def test_kill_compute_job_rejects_terminal_job(db_session):
+    project = Project(name="Compute Job Kill Terminal", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo done",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    db_session.add(job)
+    await db_session.commit()
+
+    with pytest.raises(ValueError):
+        await compute_jobs.kill_compute_job(
+            db_session, job_id=job.id, project_id=project.id
+        )
+
+
+@pytest.mark.asyncio
+async def test_kill_compute_job_rejects_wrong_project(db_session):
+    project = Project(name="Compute Job Kill Scope A", user_id="test-user")
+    other = Project(name="Compute Job Kill Scope B", user_id="test-user")
+    db_session.add_all([project, other])
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(other)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="sleep 100",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    with pytest.raises(ValueError):
+        await compute_jobs.kill_compute_job(
+            db_session, job_id=job.id, project_id=other.id
+        )
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_returns_active_and_recent_excludes_others(db_session):
+    project = Project(name="Compute Job List", user_id="test-user")
+    other = Project(name="Compute Job List Other", user_id="test-user")
+    db_session.add_all([project, other])
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(other)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    other_task = Task(project_id=other.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add_all([task, other_task])
+    await db_session.commit()
+    await db_session.refresh(task)
+    await db_session.refresh(other_task)
+
+    now = datetime.utcnow()
+
+    active = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        accrued_cost_usd=0.1,
+    )
+    recent_done = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        completed_at=now - timedelta(minutes=10),
+    )
+    stale_done = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        completed_at=now - timedelta(hours=48),
+    )
+    other_active = ComputeJob(
+        task_id=other_task.id,
+        project_id=other.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+    )
+    db_session.add_all([active, recent_done, stale_done, other_active])
+    await db_session.commit()
+
+    jobs = await compute_jobs.list_compute_jobs(
+        db_session, project_id=project.id, include_finished_within=timedelta(hours=6)
+    )
+    job_ids = {j.id for j in jobs}
+    assert active.id in job_ids
+    assert recent_done.id in job_ids
+    assert stale_done.id not in job_ids  # finished outside the window
+    assert other_active.id not in job_ids  # different project
 
 
 # ─── Zone success-rate tracking tests ────────────────────────────────────────

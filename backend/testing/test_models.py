@@ -8,6 +8,8 @@ import pytest
 from app.models import (
     CYCLE_META_MEMOS_AVAILABLE,
     CYCLE_META_MEMOS_CITED,
+    ComputeJob,
+    ComputeJobStatus,
     MaxPlanAccount,
     Project,
     StrategicCycle,
@@ -30,6 +32,57 @@ def _make_cycle(cycle_metadata=None):
 def test_cycle_meta_constants_have_expected_values():
     assert CYCLE_META_MEMOS_AVAILABLE == "memos_available"
     assert CYCLE_META_MEMOS_CITED == "memos_cited"
+
+
+def test_compute_job_table_metadata_tracks_budgeted_compute_lifecycle():
+    table = ComputeJob.__table__
+
+    assert table.name == "computejob"
+    assert set(table.columns) >= {
+        table.c.id,
+        table.c.project_id,
+        table.c.task_id,
+        table.c.backend,
+        table.c.external_compute_id,
+        table.c.machine_type,
+        table.c.status,
+        table.c.terminal_reason,
+        table.c.outcome,
+        table.c.spend_cap_usd,
+        table.c.wall_clock_deadline,
+        table.c.accrued_cost_usd,
+        table.c.final_cost_usd,
+        table.c.result_reference,
+        table.c.artifact_id,
+        table.c.polling_metadata,
+    }
+    assert table.c.project_id.foreign_keys
+    assert table.c.task_id.foreign_keys
+    assert table.c.artifact_id.foreign_keys
+
+    # ComputeJob is durable history decoupled from Task: the task and artifact
+    # links must DETACH (SET NULL) on parent delete, never block or cascade, so
+    # bulk task cleanup (reset_project_admin) cannot FK-violate and job history
+    # survives. Mirrors Alert.task_id / SystemMaturity.source_task_id.
+    task_fk = next(iter(table.c.task_id.foreign_keys))
+    artifact_fk = next(iter(table.c.artifact_id.foreign_keys))
+    assert task_fk.ondelete == "SET NULL"
+    assert artifact_fk.ondelete == "SET NULL"
+
+    assert table.c.status.default is None
+    assert str(table.c.status.server_default.arg) == ComputeJobStatus.QUEUED.value
+
+    index_names = {idx.name for idx in table.indexes}
+    assert {
+        "ix_computejob_project_id",
+        "ix_computejob_task_id",
+        "ix_computejob_artifact_id",
+        "ix_computejob_project_status",
+        "ix_computejob_task_status",
+        "ix_computejob_backend_external",
+        "ix_computejob_status_deadline",
+        "ix_computejob_next_poll",
+    } <= index_names
 
 
 def test_memo_stats_returns_zeros_when_metadata_empty():
@@ -68,7 +121,6 @@ def test_memo_stats_coerces_to_int():
     stats = cycle.memo_stats()
     assert stats[CYCLE_META_MEMOS_AVAILABLE] == 4
     assert stats[CYCLE_META_MEMOS_CITED] == 1
-
 
 
 _T0 = datetime(2026, 1, 1, 12, 0, 0)
@@ -177,8 +229,6 @@ def test_is_in_rate_limit_cooldown_quota_exhausted_uses_24h():
         acct.is_in_rate_limit_cooldown(at_time=disabled_at + timedelta(hours=25))
         is False
     )
-
-
 
 
 # task_branch_prefix (project-level branch namespace)
