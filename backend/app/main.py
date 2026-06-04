@@ -222,6 +222,36 @@ async def _verify_schema_drift():
         raise RuntimeError(msg)
 
 
+async def _best_effort_deploy_state_commit(session) -> bool:
+    """Commit a DeploymentState bookkeeping change, degrading on DB contention.
+
+    Deploy-detection (revision-change / rollback / new-deploy monitoring) writes
+    the singleton ``DeploymentState`` row. Under a multi-instance deploy or general
+    DB contention that row UPDATE can hit a lock timeout — and committing it
+    UNGUARDED in lifespan startup crashed the boot ("Application startup failed.
+    Exiting."), which FAILED the deploy and pinned prod on the old revision
+    (incident 2026-06-04). This bookkeeping is non-critical for serving and
+    reconciles on the next boot / health tick, so a contended write degrades (log
+    + rollback + continue) instead of aborting startup. Returns True on success.
+    """
+    from sqlalchemy.exc import SQLAlchemyError
+
+    try:
+        await session.commit()
+        return True
+    except SQLAlchemyError:
+        logger.warning(
+            "[DEPLOY] deploy-state write skipped (DB contention?) — starting anyway; "
+            "deploy state reconciles on the next boot / health tick",
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except SQLAlchemyError:
+            logger.exception("[DEPLOY] rollback after failed deploy-state write failed")
+        return False
+
+
 async def _init_deployment_state():
     """Check/initialize deployment state on startup. Detects new deploys and rollbacks."""
     async with AsyncSessionLocal() as session:
@@ -553,6 +583,19 @@ async def _init_deployment_state():
                 f"Set max VMs > 0 in settings to resume."
             )
 
+        # The deploy-detection writes below touch the DeploymentState singleton.
+        # Fail FAST on a contended row (multi-instance deploy / DB stress) so a lock
+        # wait can't blow the startup-probe deadline; paired with the best-effort
+        # commit below, a contended boot degrades quickly instead of hanging then
+        # crashing. Transaction-scoped (reverts on the next commit); the common
+        # new-deploy path commits once, so this covers it. No-op off Postgres.
+        try:
+            from sqlalchemy import text as _sa_text
+
+            await session.execute(_sa_text("SET LOCAL lock_timeout = '2s'"))
+        except Exception:
+            logger.debug("[DEPLOY] could not set boot lock_timeout (non-postgres?)")
+
         if state.current_revision == _current_revision:
             # Same revision — normal restart (cold start, scale event, etc.)
             logger.info(
@@ -577,7 +620,7 @@ async def _init_deployment_state():
             state.current_sha = _current_sha
             state.deployed_at = _utcnow()
             session.add(state)
-            await session.commit()
+            await _best_effort_deploy_state_commit(session)
 
             logger.warning(
                 f"[DEPLOY] ROLLBACK DETECTED — reverted from {state.rolled_back_from_sha[:8]} to {_current_sha[:8]} "
@@ -587,13 +630,13 @@ async def _init_deployment_state():
             await _create_rollback_alerts(
                 session, state.rolled_back_from_sha or "", _current_sha
             )
-            await session.commit()
+            await _best_effort_deploy_state_commit(session)
 
             if state.rollback_count >= 3:
                 state.status = DeploymentStatus.HALTED
                 state.halted_at = _utcnow()
                 session.add(state)
-                await session.commit()
+                await _best_effort_deploy_state_commit(session)
                 logger.error(
                     f"[DEPLOY] HALTED — {state.rollback_count} consecutive rollbacks, manual intervention required"
                 )
@@ -604,7 +647,7 @@ async def _init_deployment_state():
                     state.last_known_good_revision,
                     state.halted_at,
                 )
-                await session.commit()
+                await _best_effort_deploy_state_commit(session)
             return
 
         # New deploy detected — update revision tracking. Capture the prior
@@ -669,7 +712,7 @@ async def _init_deployment_state():
             deploy_monitoring["window_start"] = _utcnow()
             state.status = DeploymentStatus.MONITORING
         session.add(state)
-        await session.commit()
+        await _best_effort_deploy_state_commit(session)
         logger.info(
             f"[DEPLOY] New deploy detected — revision={_current_revision}, status={state.status}, starting monitoring window"
         )
