@@ -4260,29 +4260,31 @@ async def _process_post_commit(
             )
             new_project_status = None
             if all_terminal:
-                if all(s == TaskStatus.COMPLETED for s in executable_statuses):
-                    new_project_status = ProjectStatus.COMPLETED
-                elif any(
-                    s in (TaskStatus.FAILED, TaskStatus.BLOCKED)
-                    for s in executable_statuses
-                ):
-                    new_project_status = ProjectStatus.FAILED
-                elif all(
-                    s in [TaskStatus.COMPLETED, TaskStatus.CANCELLED]
-                    for s in executable_statuses
-                ):
-                    new_project_status = ProjectStatus.CANCELLED
+                # The pipeline never auto-sets CANCELLED: a cancelled child is
+                # benign (dedup / scope-empty / supersession / reassignment), not
+                # a project cancellation. An all-terminal mix completes unless a
+                # genuine failure (FAILED, or a stuck BLOCKED child that can no
+                # longer un-block) is present. CANCELLED stays an explicit
+                # operator decision (the /cancel endpoint).
+                new_project_status = (
+                    ProjectStatus.FAILED
+                    if any(
+                        s in (TaskStatus.FAILED, TaskStatus.BLOCKED)
+                        for s in executable_statuses
+                    )
+                    else ProjectStatus.COMPLETED
+                )
 
             if new_project_status:
                 project.status = new_project_status
                 session.add(project)
-                # Update parent/logical tasks to match the project outcome
+                # Update parent/logical tasks to match the project outcome.
+                # new_project_status is only COMPLETED or FAILED — the pipeline
+                # never auto-sets CANCELLED.
                 terminal_task_status = (
                     TaskStatus.COMPLETED
                     if new_project_status == ProjectStatus.COMPLETED
                     else TaskStatus.FAILED
-                    if new_project_status == ProjectStatus.FAILED
-                    else TaskStatus.CANCELLED
                 )
                 for pt in parent_tasks:
                     pt.status = terminal_task_status
@@ -4290,10 +4292,8 @@ async def _process_post_commit(
                         pt.latest_status_message = (
                             "Project aggregation: child task failed"
                         )
-                    elif terminal_task_status == TaskStatus.COMPLETED:
-                        pt.latest_status_message = "Project completed"
                     else:
-                        pt.latest_status_message = "Project cancelled"
+                        pt.latest_status_message = "Project completed"
                     session.add(pt)
                 await session.commit()
                 await broadcast_to_project(

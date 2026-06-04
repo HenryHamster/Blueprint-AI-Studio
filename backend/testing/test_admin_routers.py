@@ -738,6 +738,39 @@ class TestUpdateProject:
         assert resp.json()["autonomous_enabled"] is True
 
     @pytest.mark.asyncio
+    async def test_update_status_reactivates_project(
+        self, client: AsyncClient, db_session
+    ):
+        """Owner can correct a wrongly-terminal status back to active — the
+        recovery path for a project that was auto-terminalized."""
+        from app.models import ProjectStatus
+
+        project = await _make_project(db_session)
+        project.status = ProjectStatus.CANCELLED
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}", json={"status": "DEPLOYING"}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == ProjectStatus.DEPLOYING
+
+    @pytest.mark.asyncio
+    async def test_patch_status_cancelled_is_rejected(
+        self, client: AsyncClient, db_session
+    ):
+        """Cancelling via PATCH is rejected — it must go through /cancel (which
+        also tears down VMs), so a bare flip can't strand live VMs."""
+        project = await _make_project(db_session)
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}", json={"status": "CANCELLED"}
+        )
+        assert resp.status_code == 400
+        assert "/cancel" in resp.json()["error"]["message"]
+
+    @pytest.mark.asyncio
     async def test_create_task_auto_backfills_branch_columns_before_base_branch(
         self, client: AsyncClient, db_session
     ):
@@ -991,6 +1024,18 @@ class TestUpdateProjectOwnerOnlyFields:
         resp = await client.patch(
             f"/api/admin/projects/{project.id}",
             json={"design_doc": {"summary": "hacked"}},
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_member_cannot_update_status(
+        self, client: AsyncClient, db_session
+    ):
+        """Member gets 403 when trying to change project status."""
+        project = await self._make_member_project(db_session)
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"status": "DEPLOYING"},
         )
         assert resp.status_code == 403
 

@@ -203,6 +203,11 @@ async def get_project(
 
 class ProjectUpdate(BaseModel):
     name: str | None = None
+    # Project lifecycle status. Mainly for correcting a wrongly-terminal status
+    # (e.g. reactivating a project that was auto-terminalized). Setting CANCELLED
+    # here is rejected — cancellation must go through the dedicated /cancel
+    # endpoint, which also tears down running VMs.
+    status: ProjectStatus | None = None
     directions: List[Dict[str, Any]] | None = None
     vision: Dict[str, Any] | None = None
     # Optimistic concurrency: supply the _meta.revision value the client
@@ -236,6 +241,7 @@ _OWNER_ONLY_UPDATE_FIELDS = frozenset(
         "design_doc",
         "vision",
         "approval_gate_config",
+        "status",
     }
 )
 
@@ -305,6 +311,15 @@ async def update_project(
 
     if payload.name is not None:
         project.name = payload.name
+    if payload.status is not None:
+        # Cancellation must go through POST /api/projects/{id}/cancel, which also
+        # terminates running VMs; a bare status flip here would strand live VMs.
+        if payload.status == ProjectStatus.CANCELLED:
+            raise HTTPException(
+                status_code=400,
+                detail="Use the /cancel endpoint to cancel a project (it also tears down VMs).",
+            )
+        project.status = payload.status
     if payload.autonomous_enabled is not None:
         project.autonomous_enabled = payload.autonomous_enabled
     if payload.directions is not None:
@@ -732,7 +747,7 @@ async def delete_project_admin(
         # Emit cross-instance NOTIFY before commit so sibling instances see the
         # revocation only after the bulk UPDATE is durable.  The post-commit
         # notify_tasks_terminated call still fires for in-process callback fanout.
-        from app.jwt_revocation import emit_bulk_task_terminated_notify  # noqa: PLC0415
+        from app.jwt_revocation import emit_bulk_task_terminated_notify
 
         await emit_bulk_task_terminated_notify(session, all_cancelled_ids)
         await session.commit()
@@ -856,7 +871,7 @@ async def reset_project_admin(
         cancelled_count = result.rowcount
         for task in active_tasks:
             await _ensure_vm_deleted(task, reason="project_reset")
-        from app.jwt_revocation import emit_bulk_task_terminated_notify  # noqa: PLC0415
+        from app.jwt_revocation import emit_bulk_task_terminated_notify
 
         await emit_bulk_task_terminated_notify(session, all_cancelled_ids)
         await session.commit()
