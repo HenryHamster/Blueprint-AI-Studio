@@ -6566,7 +6566,16 @@ async def test_unblock_sweep_requeues_conflict_blocker(reaper_db, mocker):
     """A due BLOCKED task with no dependency edge is optimistically requeued."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
-    t = await _blocked_task(reaper_db, project, depends_on=[])
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        depends_on=[],
+        context={
+            "blocker": {"source": "agent", "waiting_on": "file conflict"},
+            "failure_class": "BLOCKED_PRECONDITION",
+            "failure_category": "BLOCKED_PRECONDITION",
+        },
+    )
 
     requeued = await sweep_unblock_blocked_tasks(reaper_db, _utcnow())
 
@@ -6576,6 +6585,12 @@ async def test_unblock_sweep_requeues_conflict_blocker(reaper_db, mocker):
     assert t.blocker_kind is None
     assert t.blocked_at is None
     assert t.recheck_after is None
+    # Recovery must leave NO residual blocker metadata — neither the structured
+    # record nor the BLOCKED_PRECONDITION compat tags.
+    ctx = t.context or {}
+    assert "blocker" not in ctx
+    assert "failure_class" not in ctx
+    assert "failure_category" not in ctx
 
 
 @pytest.mark.asyncio
@@ -6698,7 +6713,9 @@ async def test_unblock_sweep_moves_parent_blocker_to_evaluating_past_deadline(
                 "source": "parent",
                 "waiting_on": "subtask precondition",
                 "reason": "All 1 subtask(s) blocked on upstream precondition — awaiting recheck",
-            }
+            },
+            "failure_class": "BLOCKED_PRECONDITION",
+            "failure_category": "BLOCKED_PRECONDITION",
         },
         blocked_at=now - _BLOCKED_ESCALATE_AFTER - timedelta(minutes=5),
         recheck_after=now - timedelta(minutes=1),
@@ -6727,6 +6744,10 @@ async def test_unblock_sweep_moves_parent_blocker_to_evaluating_past_deadline(
     assert parent.blocked_at is None
     assert parent.recheck_after is None
     assert parent.context.get("_blocked_escalated") is None
+    # Parent re-evaluation must also strip residual blocker metadata.
+    assert "blocker" not in (parent.context or {})
+    assert "failure_class" not in (parent.context or {})
+    assert "failure_category" not in (parent.context or {})
     alerts = (
         await reaper_db.execute(
             _select(Alert).where(
@@ -6968,6 +6989,84 @@ async def test_unblock_sweep_wipes_first_blocked_on_genuine_dep_clear(
     await reaper_db.refresh(t)
     assert t.status == TaskStatus.QUEUED
     assert "_blocked_first_at" not in (t.context or {})
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_clears_failure_class_so_later_genuine_failure_reclassifies(
+    reaper_db, mocker
+):
+    """A recovered task must not carry the stale BLOCKED_PRECONDITION tag: a
+    later, genuinely different failure must classify on its own merits instead
+    of being short-circuited as the budget-exempt blocked class."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    from app.failure_classification import classify_failure
+
+    project = await _make_project(reaper_db)
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        depends_on=[],
+        context={
+            "blocker": {"source": "agent", "waiting_on": "file conflict"},
+            "failure_class": "BLOCKED_PRECONDITION",
+            "failure_category": "BLOCKED_PRECONDITION",
+        },
+    )
+
+    # Pre-fix sanity: while the stale tag is present the classifier
+    # short-circuits to the blocked class regardless of the real reason.
+    assert classify_failure(t) == "BLOCKED_PRECONDITION"
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, _utcnow())
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+
+    # Simulate a subsequent, genuinely different failure on the recovered task.
+    ctx = dict(t.context or {})
+    ctx["failure_category"] = "test_failed"
+    t.context = ctx
+    assert classify_failure(t) == "CODE_ERROR", (
+        "recovered task must reclassify a real failure, not report the stale "
+        "BLOCKED_PRECONDITION class"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_escalation_marks_structured_record_escalated(
+    reaper_db, mocker
+):
+    """Terminal deadline escalation must mark the structured blocker record as
+    escalated so its state reflects reality (not a stale escalated=False)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "file conflict",
+                "escalated": False,
+            },
+            "failure_class": "BLOCKED_PRECONDITION",
+            "failure_category": "BLOCKED_PRECONDITION",
+        },
+        blocked_at=now - _BLOCKED_ESCALATE_AFTER - timedelta(minutes=5),
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    assert t.context.get("_blocked_escalated") is True
+    blocker = (t.context or {}).get("blocker") or {}
+    assert blocker.get("escalated") is True
+    assert blocker.get("escalated_at")
 
 
 @pytest.mark.asyncio

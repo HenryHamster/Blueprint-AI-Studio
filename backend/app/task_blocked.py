@@ -163,15 +163,33 @@ def mark_blocker_escalated(
 
 
 def clear_blocker_metadata(task: Task) -> None:
-    """Drop the structured blocker metadata from the task context."""
+    """Drop the structured blocker metadata from the task context.
+
+    Removes the structured ``blocker`` record AND the backward-compat
+    ``failure_class`` / ``failure_category`` tags that ``enter_blocked_state``
+    wrote — but only when those tags still equal ``BLOCKED_PRECONDITION``. A
+    later authoritative verdict (e.g. ``persist_authoritative_verdict`` writing
+    ``RATE_LIMIT``) is therefore never clobbered. This guarantees a recovered
+    task carries no residual ``BLOCKED_PRECONDITION`` classification (which the
+    failure classifier short-circuits on, exempting the work from the retry
+    budget) into its next run.
+    """
     task.blocker_kind = None
     task.blocked_reason = None
     task.blocked_at = None
     task.recheck_after = None
-    if BLOCKER_CONTEXT_KEY not in (task.context or {}):
+    ctx_src = task.context or {}
+    has_blocker = BLOCKER_CONTEXT_KEY in ctx_src
+    stale_class = ctx_src.get("failure_class") == BLOCKED_PRECONDITION
+    stale_category = ctx_src.get("failure_category") == BLOCKED_PRECONDITION
+    if not (has_blocker or stale_class or stale_category):
         return
-    ctx = dict(task.context or {})
+    ctx = dict(ctx_src)
     ctx.pop(BLOCKER_CONTEXT_KEY, None)
+    if stale_class:
+        ctx.pop("failure_class", None)
+    if stale_category:
+        ctx.pop("failure_category", None)
     task.context = ctx
 
 

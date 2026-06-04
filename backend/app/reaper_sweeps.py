@@ -584,16 +584,23 @@ async def _blocked_precondition_state(task, session, verify_pr_merged) -> str:
 def _clear_blocked_fields(task, *, preserve_first_blocked: bool = False) -> None:
     """Reset a task's durable blocker metadata and defer bookkeeping on unblock.
 
+    Delegates the structured ``blocker`` record and the BLOCKED_PRECONDITION
+    compat-tag clearing to ``task_blocked.clear_blocker_metadata`` — the single
+    source of truth for "what a clean out-transition drops" — so the reaper's
+    recovery path and the canonical out-transition cannot drift. This sweep
+    then clears its own recheck/escalation bookkeeping keys on top.
+
     ``preserve_first_blocked`` keeps the ``_blocked_first_at`` onset stamp so a
     blocker that is only *optimistically* requeued — a conflict/rollup blocker
     with no dependency edge, which dispatch may immediately re-block — still
     measures its escalation deadline from the true onset rather than restarting
     each requeue episode. A genuine dependency clear wipes everything.
     """
-    task.blocker_kind = None
-    task.blocked_reason = None
-    task.blocked_at = None
-    task.recheck_after = None
+    from app.task_blocked import clear_blocker_metadata
+
+    # Drops blocker columns, the structured blocker record, and the stale
+    # BLOCKED_PRECONDITION failure_class/failure_category tags.
+    clear_blocker_metadata(task)
     ctx = task.context or {}
     keys = [
         "_precondition_defer",
@@ -655,6 +662,8 @@ async def sweep_unblock_blocked_tasks(
         blocker_kind: str,
         detail: str,
     ) -> None:
+        from app.task_blocked import mark_blocker_escalated
+
         await _maybe_create_blocked_escalation_alert(
             task,
             session,
@@ -663,6 +672,10 @@ async def sweep_unblock_blocked_tasks(
         )
         ctx["_blocked_escalated"] = True
         task.context = ctx
+        # Terminal escalation keeps the task parked in BLOCKED for the operator,
+        # so reflect that in the structured record (escalated -> True) rather
+        # than leaving the in-transition's escalated=False stale.
+        mark_blocker_escalated(task, detail=detail, now=now)
         flag_modified(task, "context")
         task.recheck_after = now + _BLOCKED_ESCALATED_PARK
         session.add(task)

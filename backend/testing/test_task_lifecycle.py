@@ -1064,14 +1064,44 @@ def test_unblock_to_queued_clears_metadata_and_requeues():
     )
     enter_blocked_state(task, waiting_on="dep", reason="blocked")
     assert task.status == TaskStatus.BLOCKED
+    # In-transition wrote the BLOCKED_PRECONDITION compat tags.
+    assert (task.context or {}).get("failure_class") == "BLOCKED_PRECONDITION"
+    assert (task.context or {}).get("failure_category") == "BLOCKED_PRECONDITION"
 
     unblock_to_queued(task)
     assert task.status == TaskStatus.QUEUED
     assert "blocker" not in (task.context or {})
+    # The out-transition must also drop the stale BLOCKED_PRECONDITION tags so a
+    # recovered task does not carry them into its next run.
+    assert "failure_class" not in (task.context or {})
+    assert "failure_category" not in (task.context or {})
     assert task.blocker_kind is None
     assert task.blocked_reason is None
     assert task.blocked_at is None
     assert task.recheck_after is None
+
+
+def test_clear_blocker_metadata_preserves_authoritative_verdict():
+    """An authoritative non-blocked verdict written after the block must survive
+    clearing — only the stale BLOCKED_PRECONDITION tags are dropped."""
+    from app.task_blocked import clear_blocker_metadata, enter_blocked_state
+
+    task = Task(
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    enter_blocked_state(task, waiting_on="dep", reason="blocked")
+    # A later authoritative classifier overwrites the failure class.
+    ctx = dict(task.context or {})
+    ctx["failure_class"] = "RATE_LIMIT"
+    ctx["failure_category"] = "RATE_LIMIT"
+    task.context = ctx
+
+    clear_blocker_metadata(task)
+    assert "blocker" not in (task.context or {})
+    assert (task.context or {}).get("failure_class") == "RATE_LIMIT"
+    assert (task.context or {}).get("failure_category") == "RATE_LIMIT"
 
 
 def test_mark_blocker_escalated_sets_marker():
