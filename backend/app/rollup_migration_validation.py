@@ -2,6 +2,7 @@
 
 import app.github as github
 from app.migration_chain import (
+    _filename_revision_prefix,
     plan_integration_side_renumber,
     plan_migration_reconciliation,
     validate_added_migrations,
@@ -170,6 +171,76 @@ async def enforce_premerge_migration_guard(
     if verdict == "ok":
         return (True, None)
     return (False, reason)
+
+
+async def _validate_migration_chain_post_merge(
+    gh_token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    target_branch: str,
+) -> tuple[str, str | None]:
+    """Post-merge Alembic chain health check for the release-reconcile paths.
+
+    Unlike the pre-merge guard (:func:`_validate_rollup_migration_chain`), this
+    is safe to call AFTER the candidate has already merged onto *target_branch*.
+    The pre-merge guard uses an added-vs-existing collision set that always
+    reports a false self-collision at this point (the candidate's own revisions
+    are now in both the "added" set and the "existing" set).
+
+    Instead, this check lists the current migration filenames on *target_branch*
+    and looks for any revision id (NNNN filename prefix) that appears in more
+    than one file — a genuine third-party duplicate that the pre-merge guard
+    should have prevented but may have slipped through.  A clean target (every
+    revision id appears exactly once) returns ``("ok", None)``.
+
+    Returns ``("defer", reason)`` on GitHub I/O failure (consistent with the
+    pre-merge guard's fail-safe semantics) and ``("block", reason)`` when a
+    genuine duplicate revision id is found.  When the PR does not touch Alembic
+    migrations, returns ``("ok", None)`` immediately.
+    """
+    try:
+        files = await github.get_pr_files(gh_token, owner, repo, pr_number)
+    except Exception as e:
+        return (
+            "defer",
+            f"could not list PR #{pr_number} files to check Alembic migrations: "
+            f"{type(e).__name__}: {e}",
+        )
+    if not any(_touches_alembic_versions(f.get("filename", "")) for f in files):
+        return ("ok", None)
+
+    try:
+        existing_filenames = await github.list_versions_at_ref(
+            gh_token, owner, repo, target_branch
+        )
+    except Exception as e:
+        return (
+            "defer",
+            f"could not list target branch '{target_branch}' migrations for "
+            f"post-merge chain health check: {type(e).__name__}: {e}",
+        )
+
+    # Detect genuine third-party duplicates: any NNNN revision-id prefix that
+    # appears in more than one migration file on the target branch.  The
+    # candidate's own just-merged revisions are expected to appear exactly once;
+    # a second occurrence of the same id means a different PR independently used
+    # the same slot — a genuine collision the pre-merge guard should have caught.
+    seen: dict[str, str] = {}
+    for fn in existing_filenames:
+        rev = _filename_revision_prefix(fn)
+        if rev is None:
+            continue
+        if rev in seen:
+            return (
+                "block",
+                f"Alembic revision id '{rev}' appears in multiple migration files "
+                f"on '{target_branch}': {seen[rev]!r} and {fn!r}; genuine "
+                f"third-party revision collision — chain needs manual resolution",
+            )
+        seen[rev] = fn
+
+    return ("ok", None)
 
 
 async def _plan_rollup_migration_reconciliation(

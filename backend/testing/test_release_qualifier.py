@@ -11817,9 +11817,10 @@ async def test_promotion_failed_candidate_on_main_reconciled(db_session, mocker)
         "app.github.is_ancestor_of",
         new=AsyncMock(return_value=True),
     )
+    # PR has no migration files — post-merge check returns "ok" immediately.
     mocker.patch(
-        "app.release_reconciliation._validate_rollup_migration_chain",
-        new=AsyncMock(return_value=("ok", None)),
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[{"filename": "backend/app/foo.py"}]),
     )
     mocker.patch(
         "app.github.get_branch_sha",
@@ -11928,9 +11929,10 @@ async def test_promotion_failed_reconcile_idempotent(db_session, mocker):
         "app.github.is_ancestor_of",
         new=AsyncMock(return_value=True),
     )
+    # PR has no migration files — post-merge check returns "ok" immediately.
     mocker.patch(
-        "app.release_reconciliation._validate_rollup_migration_chain",
-        new=AsyncMock(return_value=("ok", None)),
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[{"filename": "backend/app/foo.py"}]),
     )
     mocker.patch(
         "app.github.get_branch_sha",
@@ -13143,9 +13145,10 @@ async def test_reconcile_promotion_failed_uses_project_promotion_target(
     )
     # Candidate is now on the promotion_target branch (operator merged it).
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
+    # PR has no migration files — post-merge check returns "ok" immediately.
     mocker.patch(
-        "app.release_reconciliation._validate_rollup_migration_chain",
-        new=AsyncMock(return_value=("ok", None)),
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[{"filename": "backend/app/foo.py"}]),
     )
 
     branch_sha_calls: list[str] = []
@@ -13504,9 +13507,10 @@ async def test_reconcile_pending_auto_merge_uses_project_promotion_target(
     )
     # Candidate is now on the promotion_target branch (auto-merge landed).
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
+    # PR has no migration files — post-merge check returns "ok" immediately.
     mocker.patch(
-        "app.release_reconciliation._validate_rollup_migration_chain",
-        new=AsyncMock(return_value=("ok", None)),
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[{"filename": "backend/app/foo.py"}]),
     )
 
     branch_sha_calls: list[str] = []

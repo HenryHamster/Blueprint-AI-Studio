@@ -24,7 +24,7 @@ from app.release_promotion import (
     _record_promotion_success,
     _resolve_github_with_session,
 )
-from app.rollup_migration_validation import _validate_rollup_migration_chain
+from app.rollup_migration_validation import _validate_migration_chain_post_merge
 from app.release_scoring import _CI_RED, _classify_check_runs
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
@@ -190,7 +190,7 @@ async def _reconcile_if_promotion_failed_landed(
                 )
                 return False
 
-            alembic_status, alembic_reason = await _validate_rollup_migration_chain(
+            alembic_status, alembic_reason = await _validate_migration_chain_post_merge(
                 token,
                 owner,
                 repo,
@@ -200,7 +200,7 @@ async def _reconcile_if_promotion_failed_landed(
             if alembic_status == "defer":
                 logger.warning(
                     "[RELEASE_QUALIFIER] reconcile: candidate %s for v%d is "
-                    "on main, but live target Alembic validation is deferred: %s",
+                    "on main, but post-merge Alembic health check is deferred: %s",
                     candidate_sha[:8],
                     version.version_number,
                     alembic_reason,
@@ -209,8 +209,8 @@ async def _reconcile_if_promotion_failed_landed(
             if alembic_status == "block":
                 logger.warning(
                     "[RELEASE_QUALIFIER] reconcile: candidate %s for v%d is "
-                    "on main, but the live target Alembic chain is invalid — "
-                    "recording promotion_failed: %s",
+                    "on main, but the live target Alembic chain has a genuine "
+                    "third-party collision — recording promotion_failed: %s",
                     candidate_sha[:8],
                     version.version_number,
                     alembic_reason,
@@ -379,7 +379,7 @@ async def _reconcile_if_pending_auto_merge_landed(
             if await _candidate_already_on_main(
                 token, owner, repo, candidate_sha, version, project=project
             ):
-                alembic_status, alembic_reason = await _validate_rollup_migration_chain(
+                alembic_status, alembic_reason = await _validate_migration_chain_post_merge(
                     token,
                     owner,
                     repo,
@@ -389,8 +389,8 @@ async def _reconcile_if_pending_auto_merge_landed(
                 if alembic_status == "defer":
                     logger.warning(
                         "[RELEASE_QUALIFIER] reconcile pending_auto_merge: "
-                        "candidate %s for v%d is on main, but live target "
-                        "Alembic validation is deferred: %s",
+                        "candidate %s for v%d is on main, but post-merge "
+                        "Alembic health check is deferred: %s",
                         candidate_sha[:8],
                         version.version_number,
                         alembic_reason,
@@ -400,7 +400,8 @@ async def _reconcile_if_pending_auto_merge_landed(
                     logger.warning(
                         "[RELEASE_QUALIFIER] reconcile pending_auto_merge: "
                         "candidate %s for v%d is on main, but the live target "
-                        "Alembic chain is invalid — recording promotion_failed: %s",
+                        "Alembic chain has a genuine third-party collision — "
+                        "recording promotion_failed: %s",
                         candidate_sha[:8],
                         version.version_number,
                         alembic_reason,
