@@ -2,7 +2,7 @@
 Pydantic-based payload validation for all supported task types.
 
 Provides:
-  - TaskType enum listing all 22 handler types
+  - TaskType enum listing all 23 handler types
   - ALL_TASK_TYPES frozenset for backward-compat consumers
   - Per-type payload models with required-field enforcement
   - validate_task_payload()  — strict, raises ValueError on bad input
@@ -354,6 +354,23 @@ class ComputeExperimentPayload(_SystemPopulated):
     metric: str | None = None
 
 
+class WebResearchPayload(BasePayload):
+    """Payload for a web-first research task that produces a knowledge document.
+
+    The task runs read-only with web access and emits a structured document
+    (title/summary/body/citations/tags/topic) that the forward-quality gate
+    grades before it is persisted as a ``KnowledgeDocument``. ``prompt`` is the
+    research question; the remaining fields are optional routing/labeling
+    context stamped by the spawner (operator or strategic loop).
+    """
+
+    prompt: str | None = None
+    topic: str | None = None
+    tags: list[str] | None = None
+    direction_id: str | None = None
+    project_name: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
@@ -381,6 +398,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.memo: MemoPayload,
     TaskType.verify_tests: VerifyTestsPayload,
     TaskType.compute_experiment: ComputeExperimentPayload,
+    TaskType.web_research: WebResearchPayload,
 }
 
 

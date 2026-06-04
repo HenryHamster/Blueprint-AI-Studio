@@ -55,6 +55,7 @@ def test_task_capability_ui_subsets_only_reference_known_types():
         "research",
         "migrate",
         "refactor",
+        "web_research",
     )
 
 
@@ -105,6 +106,7 @@ def test_completion_handler_declarations_match_legacy_dispatch():
         "perf": "perf",
         "self_audit": "self_audit",
         "memo": "memo",
+        "web_research": "web_research",
     }
     # Only the two strategic completion handlers consume the pre-locked Project.
     needs_project = {

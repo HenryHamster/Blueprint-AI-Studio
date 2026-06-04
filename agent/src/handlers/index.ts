@@ -10,6 +10,7 @@ import { handleDesignDocUpdate } from './design-doc.js';
 import { handleMemo } from './memo.js';
 import { handleVerifyTests } from './verify-tests.js';
 import { handleComputeExperiment } from './compute-experiment.js';
+import { handleWebResearch } from './web-research.js';
 import {
   resolveTaskCapabilityContract,
   resolveGenericRunner,
@@ -62,6 +63,7 @@ export const handlers: Record<AgentTaskType, Handler> = {
   memo: handleMemo,
   verify_tests: handleVerifyTests,
   compute_experiment: handleComputeExperiment,
+  web_research: handleWebResearch,
 };
 
 // ── Contract-driven handler resolution ───────────────────────────────────────

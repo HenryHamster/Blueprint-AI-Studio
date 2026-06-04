@@ -2700,6 +2700,97 @@ class Artifact(SQLModel, table=True):
     task: Task = Relationship(back_populates="artifacts")
 
 
+class KnowledgeDocument(SQLModel, table=True):
+    """Durable, queryable home for ``output_kind='knowledge'`` work.
+
+    Blueprint declares ``output_kind='knowledge'`` on several read-only task
+    types, but historically that output lived only as ephemeral
+    ``Task.plan_output`` read back through a narrow recent-findings window. A
+    web-first ``web_research`` task instead persists ONE first-class
+    ``KnowledgeDocument`` row here: a titled, summarized markdown document with
+    web/file citations that the operator can list and full-text search, and
+    that the forward-quality evaluator gated before it was stored.
+
+    This is a PARALLEL lane to ``findings_index`` / the findings→spawn-code-task
+    path — it does not replace or disturb them. ``source_task_id`` records the
+    provenance of the producing task; ``forward_quality_verdict`` captures the
+    gate verdict that admitted the document.
+
+    Search: trigram GIN indexes on ``title`` and ``body`` (same precedent as
+    ``Artifact.pr_url``) back project-scoped ILIKE / similarity search; a plain
+    index on ``topic`` supports topic filtering. No new search dependency is
+    introduced.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    # Project scope — every read path filters on this.
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+
+    # Provenance: the task whose terminal output produced this document.
+    source_task_id: uuid.UUID = Field(foreign_key="task.id", index=True)
+
+    title: str = Field(sa_column=Column(String, nullable=False))
+    summary: str = Field(sa_column=Column(Text, nullable=False))
+    body: str = Field(sa_column=Column(Text, nullable=False))
+
+    # Optional free-form topic for filtering / grouping.
+    topic: str | None = Field(default=None, sa_column=Column(String, nullable=True))
+
+    # Free-form tag list and citation list (web URLs plus any file refs).
+    tags: List[str] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
+    )
+    source_citations: List[Any] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
+    )
+
+    # The forward-quality gate verdict that admitted this document:
+    # {passed, reason, strategy, grader_task_id}. Always set on stored docs
+    # (a failing verdict never reaches persistence), but nullable for safety.
+    forward_quality_verdict: Dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+
+    # Trigram GIN indexes mirror the Artifact.pr_url precedent so project-scoped
+    # ILIKE / similarity search over title + body is index-backed on Postgres;
+    # the topic b-tree index supports exact/prefix topic filtering. The
+    # ``postgresql_*`` kwargs are dialect-scoped — SQLite create_all emits plain
+    # indexes — so the test suite is unaffected.
+    __table_args__ = (
+        Index(
+            "ix_knowledge_document_title_trgm",
+            "title",
+            postgresql_using="gin",
+            postgresql_ops={"title": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_knowledge_document_body_trgm",
+            "body",
+            postgresql_using="gin",
+            postgresql_ops={"body": "gin_trgm_ops"},
+        ),
+        Index("ix_knowledge_document_topic", "topic"),
+    )
+
+
 class SystemMaturity(SQLModel, table=True):
     """Per-system maturity snapshot written by self_audit tasks.
 

@@ -69,6 +69,7 @@ def test_evaluation_declarations_match_expected_assignment():
         "memo": "forward-quality",
         "verify_tests": "none",
         "compute_experiment": "none",
+        "web_research": "forward-quality",
     }
 
 

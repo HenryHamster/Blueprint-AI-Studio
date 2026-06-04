@@ -1647,3 +1647,58 @@ export async function killComputeJob(jobId: string): Promise<ComputeJob> {
   const data = await res.json();
   return data.compute_job;
 }
+
+// --- Knowledge documents (durable, queryable home for web_research output) ---
+
+/** A single knowledge document. List responses omit `body`; get-by-id includes it. */
+export interface KnowledgeDocument {
+  id: string;
+  title: string;
+  summary: string | null;
+  topic: string | null;
+  tags: string[];
+  source_citations: unknown[];
+  source_task_id: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  forward_quality_verdict: Record<string, unknown> | null;
+  /** Only present on get-by-id (the full markdown body). */
+  body?: string;
+}
+
+export interface KnowledgeDocumentsResponse {
+  documents: KnowledgeDocument[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+/** List / search a project's knowledge documents, newest-first. `q` drives full-text/tag/topic search. */
+export async function fetchKnowledgeDocuments(
+  projectId: string,
+  params?: { q?: string; topic?: string; tag?: string; limit?: number; offset?: number },
+): Promise<KnowledgeDocumentsResponse> {
+  const sp = new URLSearchParams();
+  if (params?.q) sp.set('q', params.q);
+  if (params?.topic) sp.set('topic', params.topic);
+  if (params?.tag) sp.set('tag', params.tag);
+  if (params?.limit !== undefined) sp.set('limit', String(params.limit));
+  if (params?.offset !== undefined) sp.set('offset', String(params.offset));
+  const query = sp.toString();
+  const url = `/api/admin/projects/${encodeURIComponent(projectId)}/knowledge-documents${query ? `?${query}` : ''}`;
+  const res = await apiFetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch knowledge documents: ${res.status}`);
+  return res.json();
+}
+
+/** Fetch a single knowledge document including its markdown body. */
+export async function fetchKnowledgeDocument(
+  projectId: string,
+  documentId: string,
+): Promise<KnowledgeDocument> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/knowledge-documents/${encodeURIComponent(documentId)}`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch knowledge document: ${res.status}`);
+  return res.json();
+}

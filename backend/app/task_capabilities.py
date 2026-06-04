@@ -36,6 +36,7 @@ class TaskType(str, Enum):
     memo = "memo"
     verify_tests = "verify_tests"
     compute_experiment = "compute_experiment"
+    web_research = "web_research"
 
 
 AgentMode = Literal["write", "read_only"]
@@ -460,6 +461,24 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
             "VM. Reports the job outcome and final cost; budget/deadline kills "
             "are intentional terminal outcomes, not crashes."
         ),
+    ),
+    TaskCapability(
+        TaskType.web_research,
+        "Web Research",
+        "read_only",
+        default_category="strategic",
+        user_launchable=True,
+        description=(
+            "Web-first research that produces a durable, queryable knowledge "
+            "document (with web citations) into the knowledge-document store."
+        ),
+        output_kind="knowledge",
+        requires_code=False,
+        requires_web=True,
+        evaluation_strategy="forward_quality",
+        cost_ceiling_usd=4.0,
+        completion_handler="web_research",
+        evaluation="forward-quality",
     ),
 )
 

@@ -93,13 +93,13 @@ import { expectCalledWith } from '../utils/typed-mock-call.js';
 describe('handlers registry', () => {
   const EXPECTED_TYPES = ALL_AGENT_TASK_TYPES;
 
-  // 22 BESPOKE handlers are hand-registered today. This is no longer the
+  // 23 BESPOKE handlers are hand-registered today. This is no longer the
   // launchability gate — dispatch falls back to contract-driven GENERIC runners
   // for registered types with no bespoke handler (see the contract-driven
   // dispatch suite below). The count still documents the bespoke set so a
   // dropped/duplicated bespoke entry is caught.
-  it('has exactly 22 bespoke handler entries', () => {
-    expect(Object.keys(handlers)).toHaveLength(22);
+  it('has exactly 23 bespoke handler entries', () => {
+    expect(Object.keys(handlers)).toHaveLength(23);
   });
 
   it.each(EXPECTED_TYPES)('contains bespoke handler for task type "%s"', (taskType) => {
@@ -318,12 +318,13 @@ const TASK_CLASS_MAP = {
   investigate:       'read-only',
   verify_tests:      'read-only',
   compute_experiment:'read-only',
-  // Research / planning (5): read-heavy, no code shipped
+  // Research / planning (6): read-heavy, no code shipped
   plan:              'research',
   research:          'research',
   strategic_review:  'research',
   design_doc_update: 'research',
   memo:              'research',
+  web_research:      'research',
 } as const satisfies Record<AgentTaskType, TaskClass>;
 
 describe('task type class classification — cross-cutting invariants', () => {
@@ -340,12 +341,12 @@ describe('task type class classification — cross-cutting invariants', () => {
     }
   });
 
-  it('class distribution is 7 code-change + 10 read-only + 5 research = 22 total', () => {
+  it('class distribution is 7 code-change + 10 read-only + 6 research = 23 total', () => {
     const counts: Record<TaskClass, number> = { 'code-change': 0, 'read-only': 0, research: 0 };
     for (const cls of Object.values(TASK_CLASS_MAP)) counts[cls]++;
     expect(counts['code-change']).toBe(7);
     expect(counts['read-only']).toBe(10);
-    expect(counts['research']).toBe(5);
+    expect(counts['research']).toBe(6);
   });
 
   it('no task type belongs to more than one class', () => {

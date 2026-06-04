@@ -9,6 +9,7 @@ import { usePoller, DEFAULT_POLL_MS } from './hooks/usePoller';
 import { DirectionsPanel } from './components/DirectionsPanel';
 import TaskStreamPanel from './components/TaskStreamPanel';
 import { ResearchBrowser } from './components/ResearchBrowser';
+import { KnowledgeBrowser } from './components/KnowledgeBrowser';
 import { PipelineView } from './components/PipelineView';
 import { ProjectDashboard } from './components/ProjectDashboard';
 import { auth, signInWithGoogle, signOut } from './firebase';
@@ -557,6 +558,8 @@ export default function App() {
         onSetViewMode={s.setViewMode}
         showResearchBrowser={s.showResearchBrowser}
         onToggleResearchBrowser={() => s.setShowResearchBrowser(prev => !prev)}
+        showKnowledgeBrowser={s.showKnowledgeBrowser}
+        onToggleKnowledgeBrowser={() => s.setShowKnowledgeBrowser(prev => !prev)}
         showArchive={s.showArchive}
         onToggleArchive={() => s.setShowArchive(!s.showArchive)}
         showMessages={s.showMessages}
@@ -1165,6 +1168,24 @@ export default function App() {
           onNavigateToTask={(taskId) => {
             s.setShowResearchBrowser(false);
             setResearchBrowserDirectionId(null);
+            const target = s.tasks.find(t => t.id === taskId);
+            if (target) {
+              s.handleViewLogs(target);
+            } else {
+              fetchTask(taskId).then(s.handleViewLogs).catch(() => {
+                s.addToast('Could not load task — it may have been deleted', 'error');
+              });
+            }
+          }}
+        />
+      )}
+
+      {s.showKnowledgeBrowser && (
+        <KnowledgeBrowser
+          selectedProjectId={s.selectedProjectId}
+          onClose={() => s.setShowKnowledgeBrowser(false)}
+          onNavigateToTask={(taskId) => {
+            s.setShowKnowledgeBrowser(false);
             const target = s.tasks.find(t => t.id === taskId);
             if (target) {
               s.handleViewLogs(target);

@@ -83,6 +83,7 @@ export function useAppState() {
 
   const {
     showResearchBrowser, setShowResearchBrowser,
+    showKnowledgeBrowser, setShowKnowledgeBrowser,
     showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
     showMessages, setShowMessages,
     showSettings, setShowSettings,
@@ -537,6 +538,7 @@ export function useAppState() {
     logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason, handleViewLogs, closeLogViewer,
     // Research browser
     showResearchBrowser, setShowResearchBrowser,
+    showKnowledgeBrowser, setShowKnowledgeBrowser,
     researchFeed,
     // Activity feed
     showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,

@@ -79,7 +79,8 @@
     "strategic_spawning.py": 4050,
     "failure_classification.py": 2400,
     "notification_dispatch.py": 2250,
-    "ci_completion.py": 1850
+    "ci_completion.py": 1850,
+    "routers/admin_debug.py": 1850
   },
   "agent": {
     "index.ts": 4600,
