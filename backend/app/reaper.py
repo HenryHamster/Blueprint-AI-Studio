@@ -745,6 +745,7 @@ from app.reaper_sweeps import (  # noqa: E402
     sweep_routine_message_retention,
     sweep_unblock_blocked_tasks,
     sweep_activate_staged_directions,
+    sweep_stale_staged_directions,
 )
 
 # Zero-cycle starvation: a project that should be running the strategic loop but
@@ -3539,6 +3540,21 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Staged-direction activation sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 14: Stale-staged-direction alerting — surface staged
+                # work whose target version has stalled (not promoted) past the
+                # configurable staleness threshold so an operator can retarget,
+                # force-activate, or cancel it. Alerting only.
+                _mark_reaper_progress()
+                try:
+                    await sweep_stale_staged_directions(session)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Stale-staged-direction sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

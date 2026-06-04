@@ -42,7 +42,7 @@
     "rollup_management.py": 3550,
     "rollup_migration_validation.py": 600,
     "reaper.py": 4200,
-    "reaper_sweeps.py": 1000,
+    "reaper_sweeps.py": 1300,
     "reaper_infra_recovery.py": 850,
     "agent_status_spawn.py": 650,
     "admin_task_mutations.py": 1350,

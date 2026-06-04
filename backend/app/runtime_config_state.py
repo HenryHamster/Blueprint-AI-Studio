@@ -311,6 +311,20 @@ runtime_config: Dict = {
     "strategic_max_interval_minutes": 180,
     "architecture_review_frequency": 3,  # Every Nth strategic cycle includes architecture (design doc) review
     "max_active_directions": 10,
+    # Staleness threshold (days) for staged directions whose target version has
+    # NOT yet promoted. A staged direction is inert work that only begins when
+    # its target version opens; a version can stay open far longer than the
+    # ~14-day build-to-stabilize gate (deferred by repeated qualification
+    # failures or operator inaction), stranding staged work indefinitely. When a
+    # staged direction has waited beyond this age (anchored on its staging
+    # timestamp), the reaper raises a per-direction operator alert so the work
+    # can be retargeted, force-activated, or cancelled. Default 21 (> the
+    # ~14-day stall gate so a normally-stabilizing version never trips it).
+    "staged_direction_stale_alert_days": 21,
+    # Fail-safe age (days) applied when a staged direction is missing or has an
+    # unparseable staging timestamp, so a malformed/legacy staged row can still
+    # be surfaced as stale rather than waiting silently forever.
+    "staged_direction_stale_fallback_days": 21,
     "max_parallel_research_per_project": 6,
     "max_retained_images": 10,  # Agent VM image family pruning (keep N most recent; GCP per-project image quota is tight)
     "require_approval_gates": True,
@@ -978,6 +992,8 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "max_rollup_retries",
                     "architecture_review_frequency",
                     "max_active_directions",
+                    "staged_direction_stale_alert_days",
+                    "staged_direction_stale_fallback_days",
                     "max_parallel_research_per_project",
                     "auto_archive_terminal_after_days",
                     "auto_archive_max_terminal_tasks_per_project",

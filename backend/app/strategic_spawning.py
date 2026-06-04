@@ -49,7 +49,7 @@ from app.shared_state import (
     get_project_promotion_target,
     runtime_config as _runtime_config,
 )
-from app.time_utils import _utcnow
+from app.time_utils import _utcnow, _coerce_naive_utc
 from app.vision_merge import REJECTED_EDITS_KEY
 
 logger = logging.getLogger(__name__)
@@ -666,23 +666,42 @@ def _build_staged_directions_summary(project: Project) -> list[dict]:
     this block the strategist has no view of what is already queued for the next
     version and would re-propose the same work.
 
-    Each entry is ``{id, text, priority, staged_for_version}``. Returns ``[]``
-    when no directions are staged so the caller can omit the field on the common
-    (nothing-staged) path, keeping the schema additive/backward-compatible.
+    Each entry is ``{id, text, priority, staged_for_version, staged_at,
+    staged_age_days}``. ``staged_at`` (the staging timestamp) and the derived
+    ``staged_age_days`` let the strategist see HOW LONG each item has waited so it
+    can self-correct stale staged work (retarget / cancel) instead of leaving it
+    to rot — the same stall the reaper raises an operator alert for. Both are
+    additive: ``staged_at`` is ``None`` and ``staged_age_days`` is ``None`` when
+    the timestamp is absent or unparseable, keeping the schema backward-compatible.
+    Returns ``[]`` when no directions are staged so the caller can omit the field
+    on the common (nothing-staged) path.
     """
     staged = [
         d
         for d in (project.directions or [])
         if isinstance(d, dict) and d.get("status") == "staged"
     ]
+    now = _utcnow()
     out: list[dict] = []
     for d in staged[:_STAGED_DIRECTIONS_KEEP]:
+        staged_at_raw = d.get("staged_at")
+        staged_age_days: int | None = None
+        if staged_at_raw:
+            try:
+                staged_at = _coerce_naive_utc(
+                    datetime.fromisoformat(str(staged_at_raw))
+                )
+                staged_age_days = max(0, (now - staged_at).days)
+            except (TypeError, ValueError):
+                staged_age_days = None
         out.append(
             {
                 "id": d.get("id"),
                 "text": d.get("text"),
                 "priority": d.get("priority"),
                 "staged_for_version": d.get("staged_for_version"),
+                "staged_at": staged_at_raw,
+                "staged_age_days": staged_age_days,
             }
         )
     return out

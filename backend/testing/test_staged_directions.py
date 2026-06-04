@@ -25,9 +25,20 @@ from app.directions_repo import (
     activate_eligible_staged_directions,
     sync_directions,
 )
-from app.models import Direction, Project, ProjectMember, Task, TaskStatus
-from app.reaper_sweeps import sweep_activate_staged_directions
+from app.models import Alert, Direction, Project, ProjectMember, Task, TaskStatus
+from app.reaper_sweeps import (
+    sweep_activate_staged_directions,
+    sweep_stale_staged_directions,
+)
 from app.strategic_spawning import _build_staged_directions_summary
+from app.time_utils import _utcnow
+
+
+def _make_noop():
+    """An AsyncMock stand-in for broadcast_to_project (swallows the emit)."""
+    from unittest.mock import AsyncMock
+
+    return AsyncMock()
 
 
 def _staged_direction(did: str, staged_for_version: int, **extra) -> dict:
@@ -273,6 +284,133 @@ async def test_reaper_backstop_noop_without_open_version(db_session):
 
 
 # ---------------------------------------------------------------------------
+# 3b. The reaper staleness sweep alerts on stalled staged work
+# ---------------------------------------------------------------------------
+
+
+async def _stale_project(db_session, directions):
+    project = Project(
+        name="Staged-Stale",
+        user_id="staged-user",
+        autonomous_enabled=True,
+        directions=directions,
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await sync_directions(db_session, project.id, project.directions)
+    # v2 is open → v2-staged work has NOT promoted (target version still open).
+    await rv.open_version(db_session, project.id, version_number=2)
+    await db_session.commit()
+    return project
+
+
+async def _stale_alerts(db_session, project_id):
+    rows = (
+        await db_session.execute(
+            select(Alert).where(Alert.project_id == project_id)
+        )
+    ).scalars().all()
+    return [a for a in rows if a.title.startswith("Stale staged direction")]
+
+
+@pytest.mark.asyncio
+async def test_stale_sweep_alerts_on_long_staged(db_session, monkeypatch):
+    """A staged direction waiting past the threshold (target version still open)
+    fires exactly one alert; a second sweep dedups."""
+    monkeypatch.setattr(
+        "app.alert_dispatch.broadcast_to_project", _make_noop()
+    )
+    old = (_utcnow() - timedelta(days=30)).isoformat()
+    project = await _stale_project(
+        db_session,
+        [_staged_direction("d-stale", staged_for_version=2, staged_at=old)],
+    )
+
+    assert await sweep_stale_staged_directions(db_session) == 1
+    alerts = await _stale_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert "d-stale" in alerts[0].title
+    assert "30 day" in alerts[0].message
+
+    # Idempotent: a second sweep raises no duplicate.
+    assert await sweep_stale_staged_directions(db_session) == 0
+    assert len(await _stale_alerts(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_sweep_ignores_fresh_staged(db_session, monkeypatch):
+    """A freshly staged direction (recent timestamp) is NOT flagged."""
+    monkeypatch.setattr(
+        "app.alert_dispatch.broadcast_to_project", _make_noop()
+    )
+    recent = (_utcnow() - timedelta(days=1)).isoformat()
+    project = await _stale_project(
+        db_session,
+        [_staged_direction("d-fresh", staged_for_version=2, staged_at=recent)],
+    )
+    assert await sweep_stale_staged_directions(db_session) == 0
+    assert await _stale_alerts(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_stale_sweep_fail_safe_when_timestamp_missing(
+    db_session, monkeypatch
+):
+    """A staged direction with NO staging timestamp is fail-safe-flagged via the
+    fallback age (default 21 >= threshold 21)."""
+    monkeypatch.setattr(
+        "app.alert_dispatch.broadcast_to_project", _make_noop()
+    )
+    d = _staged_direction("d-nots", staged_for_version=2)
+    d.pop("staged_at", None)  # no staged_at at all
+    project = await _stale_project(db_session, [d])
+    assert await sweep_stale_staged_directions(db_session) == 1
+    assert len(await _stale_alerts(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_sweep_skips_already_promoted_target(
+    db_session, monkeypatch
+):
+    """A staged direction whose target version has ALREADY promoted fires NO
+    stale alert — that is the activation path's job, not staleness."""
+    monkeypatch.setattr(
+        "app.alert_dispatch.broadcast_to_project", _make_noop()
+    )
+    old = (_utcnow() - timedelta(days=30)).isoformat()
+    # target v1 has promoted (open is v2) → not stalled, eligible for activation.
+    project = await _stale_project(
+        db_session,
+        [_staged_direction("d-promoted", staged_for_version=1, staged_at=old)],
+    )
+    assert await sweep_stale_staged_directions(db_session) == 0
+    assert await _stale_alerts(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_stale_sweep_respects_threshold_config(db_session, monkeypatch):
+    """The staleness threshold is read from runtime config: raising it above the
+    waited age suppresses the alert."""
+    monkeypatch.setattr(
+        "app.alert_dispatch.broadcast_to_project", _make_noop()
+    )
+    monkeypatch.setitem(
+        __import__("app.shared_state", fromlist=["runtime_config"]).runtime_config,
+        "staged_direction_stale_alert_days",
+        90,
+    )
+    old = (_utcnow() - timedelta(days=30)).isoformat()
+    project = await _stale_project(
+        db_session,
+        [_staged_direction("d-young", staged_for_version=2, staged_at=old)],
+    )
+    assert await sweep_stale_staged_directions(db_session) == 0
+    assert await _stale_alerts(db_session, project.id) == []
+
+
+# ---------------------------------------------------------------------------
 # 4. The stage_direction thinker op (HTTP) round-trips through the mirror table
 # ---------------------------------------------------------------------------
 
@@ -400,7 +538,8 @@ async def test_stage_direction_op_no_open_version_skips(client: AsyncClient, db_
 
 def test_build_staged_directions_summary_filters_and_shapes():
     """Only staged directions are surfaced, each as {id,text,priority,
-    staged_for_version}; active/paused/proposed are excluded."""
+    staged_for_version, staged_at, staged_age_days}; active/paused/proposed are
+    excluded."""
     project = Project(
         name="Staged-Payload",
         user_id="stage-user",
@@ -418,6 +557,27 @@ def test_build_staged_directions_summary_filters_and_shapes():
     assert by_id["d-staged-2"]["priority"] == "high"
     assert by_id["d-staged-3"]["staged_for_version"] == 3
     assert by_id["d-staged-2"]["text"] == "Staged work d-staged-2"
+    # Additive waiting-age fields present on every entry; None when no timestamp.
+    assert by_id["d-staged-2"]["staged_at"] is None
+    assert by_id["d-staged-2"]["staged_age_days"] is None
+
+
+def test_build_staged_directions_summary_includes_staged_age():
+    """A staged direction with a staging timestamp surfaces a derived
+    ``staged_age_days`` so the strategist sees how long it has waited."""
+    staged_at = (_utcnow() - timedelta(days=30)).isoformat()
+    project = Project(
+        name="Staged-Age",
+        user_id="stage-user",
+        directions=[
+            _staged_direction("d-old", staged_for_version=2, staged_at=staged_at),
+        ],
+    )
+    summary = _build_staged_directions_summary(project)
+    assert len(summary) == 1
+    entry = summary[0]
+    assert entry["staged_at"] == staged_at
+    assert entry["staged_age_days"] == 30
 
 
 def test_build_staged_directions_summary_empty_when_none_staged():
@@ -814,3 +974,35 @@ async def test_add_direction_staged_no_open_version_404(
 
     await db_session.refresh(project)
     assert project.directions == []
+
+
+@pytest.mark.asyncio
+async def test_patch_direction_to_staged_stamps_staged_at(
+    client: AsyncClient, db_session
+):
+    """Operator PATCH direction status to 'staged' records staged_at timestamp,
+    symmetrically with the other staging paths (add_direction, agent create_direction,
+    and agent stage_direction)."""
+    project = await _member_project(db_session, "PatchStaged")
+    project.directions = [_active_direction("d-patch-test")]
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await rv.open_version(db_session, project.id, version_number=4)
+    await db_session.commit()
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/directions/d-patch-test",
+        json={"status": "staged"},
+    )
+    assert resp.status_code == 200, resp.text
+    patched = resp.json()["direction"]
+    assert patched["status"] == "staged"
+    assert patched["staged_for_version"] == 4
+    assert "staged_at" in patched, "PATCH to staged must record staged_at timestamp"
+
+    await db_session.refresh(project)
+    assert project.directions[0]["status"] == "staged"
+    assert project.directions[0]["staged_for_version"] == 4
+    assert "staged_at" in project.directions[0]

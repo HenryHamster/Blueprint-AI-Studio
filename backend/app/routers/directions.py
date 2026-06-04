@@ -688,6 +688,7 @@ async def update_direction(
                         _clear_direction_reactivation_state(d)
                     if payload["status"] == "staged":
                         d["staged_for_version"] = staged_for_version
+                        d["staged_at"] = _utcnow().isoformat()
                     # When reviving from expired back to proposed, clear expired_at
                     if payload["status"] == "proposed":
                         d.pop("expired_at", None)

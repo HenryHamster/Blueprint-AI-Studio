@@ -928,3 +928,130 @@ async def sweep_activate_staged_directions(session) -> int:
             len(project_ids),
         )
     return total_activated
+
+
+# ── Step 14: stale-staged-direction staleness alerting ─────────────────────
+#
+# Step 13 solves the HAPPY path: a staged direction auto-activates the moment
+# its target version promotes.  The UNHAPPY path is that the target version can
+# stay open far longer than the ~14-day build-to-stabilize stall gate (deferred
+# by repeated qualification failures or operator inaction).  When that happens
+# the staged direction waits indefinitely and invisibly — the "perpetually
+# deferred" failure mode the staging spine set out to eliminate, merely
+# relocated from the strategist's head into a forever-staged row.  This sweep
+# makes that stall VISIBLE and ACTIONABLE: for every project that still has a
+# staged direction whose target version has NOT promoted, it computes how long
+# the work has waited (anchored on ``staged_at``, fail-safe to a config age when
+# absent) and, past a configurable threshold, raises ONE deduplicated operator
+# alert per direction.  Alerting only — it never changes activation semantics.
+async def sweep_stale_staged_directions(session) -> int:
+    """Step 14: alert on staged directions stalled past the staleness threshold.
+
+    For every project with at least one ``staged`` direction, reads the current
+    open version and, for each staged direction whose target version has NOT yet
+    promoted (``staged_for_version >= current_open_version``), computes the days
+    waited from ``staged_at`` (fail-safe to ``staged_direction_stale_fallback_days``
+    when the timestamp is missing or unparseable). When that age is at or beyond
+    ``staged_direction_stale_alert_days`` it raises a deduplicated operator alert
+    via :func:`alert_dispatch._maybe_create_stale_staged_direction_alert`.
+
+    Best-effort per project (a failure on one project never aborts the sweep).
+    Returns the total number of NEW stale alerts created across all projects.
+    """
+    from app.alert_dispatch import _maybe_create_stale_staged_direction_alert
+    from app.models import Direction
+    from app.release_version import current_open_version
+    from app.shared_state import runtime_config
+    from app.time_utils import _coerce_naive_utc
+
+    stale_days = int(runtime_config.get("staged_direction_stale_alert_days", 21))
+    fallback_days = int(
+        runtime_config.get("staged_direction_stale_fallback_days", 21)
+    )
+
+    # Same prefilter as the activation sweep: candidate projects via the
+    # normalised direction table. We read the staged rows' ``data`` blobs here
+    # (verbatim ``Project.directions`` shape) rather than the project blob.
+    rows = (
+        (
+            await session.execute(
+                select(Direction).where(Direction.status == "staged")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return 0
+
+    # Group staged rows by project so each project reads its open version once.
+    by_project: dict = {}
+    for r in rows:
+        by_project.setdefault(r.project_id, []).append(r)
+
+    now = _utcnow()
+    total_alerts = 0
+    for pid, staged_rows in by_project.items():
+        try:
+            open_version = await current_open_version(session, pid)
+            open_n = open_version.version_number if open_version else None
+            for row in staged_rows:
+                d = row.data or {}
+                target = d.get("staged_for_version")
+                try:
+                    target_n = int(target)
+                except (TypeError, ValueError):
+                    # Unparseable marker is fail-OPEN-activated by Step 13, so it
+                    # is never genuinely stranded — don't alert on it here.
+                    continue
+                # Only directions whose target version has NOT promoted are
+                # stalled. The activation condition is target < open_version
+                # (i.e. target <= open-1); its complement is target >= open.
+                if open_n is not None and target_n < open_n:
+                    continue
+                # Days waited, anchored on the staging timestamp. A missing or
+                # unparseable timestamp is fail-safe: assume the fallback age so
+                # malformed/legacy staged rows still surface rather than waiting
+                # silently forever.
+                staged_at_raw = d.get("staged_at")
+                waited_days: int
+                if staged_at_raw:
+                    try:
+                        staged_at = _coerce_naive_utc(
+                            datetime.fromisoformat(str(staged_at_raw))
+                        )
+                        waited_days = max(0, (now - staged_at).days)
+                    except (TypeError, ValueError):
+                        waited_days = fallback_days
+                else:
+                    waited_days = fallback_days
+                if waited_days < stale_days:
+                    continue
+                created = await _maybe_create_stale_staged_direction_alert(
+                    session,
+                    pid,
+                    direction_id=str(d.get("id") or row.direction_key),
+                    direction_text=d.get("text"),
+                    waited_days=waited_days,
+                    staged_for_version=target_n,
+                    open_version=open_n,
+                )
+                if created:
+                    total_alerts += 1
+        except Exception as e:
+            logger.error(
+                "[REAPER] Stale-staged-direction sweep error for project %s: %s",
+                pid,
+                e,
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
+    if total_alerts:
+        logger.info(
+            "[REAPER] Step 14: raised %d stale-staged-direction alert(s) across "
+            "%d candidate project(s)",
+            total_alerts,
+            len(by_project),
+        )
+    return total_alerts

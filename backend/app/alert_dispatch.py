@@ -674,6 +674,101 @@ async def _maybe_create_precondition_blocker_alert(
     return True
 
 
+# Stable title prefix for stale-staged-direction alerts. The title encodes the
+# direction id so dedup is per-direction: a single stalled staged direction
+# raises exactly ONE alert across many reaper sweeps, while distinct stalled
+# directions each get their own. Keep the prefix stable.
+_STALE_STAGED_DIRECTION_TITLE_PREFIX = "Stale staged direction"
+
+
+async def _maybe_create_stale_staged_direction_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    *,
+    direction_id: str,
+    direction_text: "str | None",
+    waited_days: int,
+    staged_for_version: "int | None",
+    open_version: "int | None",
+    severity: AlertSeverity = AlertSeverity.WARNING,
+) -> bool:
+    """Create a deduplicated operator Alert for a staged direction that has
+    waited past the staleness threshold while its target version has NOT yet
+    promoted.
+
+    A *staged* direction (``status == "staged"``, ``staged_for_version=N``) is
+    inert work that only begins once version ``N`` promotes/opens. The single
+    thing that un-stages it is that promotion — but a version can stay open far
+    longer than the ~14-day stall gate (deferred by repeated qualification
+    failures or operator inaction), stranding the staged direction indefinitely
+    and invisibly. This surfaces that stall so an operator can retarget,
+    force-activate, or cancel the work. Alerting only — it never mutates the
+    direction or its staging state.
+
+    Deduplicated by ``(project_id, title, dismissed_at IS NULL)`` where the title
+    encodes ``direction_id`` — so a staged direction that stays stale across many
+    reaper sweeps raises exactly ONE alert, and a genuinely *different* stalled
+    direction gets its own. ``project_id``-scoped with ``task_id=None`` (mirrors
+    the warm-pool payoff / strategic alerts). The waited age lives in the message
+    so a creeping age never defeats dedup. Returns ``True`` when it inserted a new
+    alert, ``False`` when dedup short-circuited.
+
+    Commits ONLY its own ``Alert`` row and broadcasts ``alert_created``; callers
+    (the reaper staleness sweep) wrap it best-effort so an alert failure can never
+    abort the sweep.
+    """
+    title = (
+        f"{_STALE_STAGED_DIRECTION_TITLE_PREFIX}: {str(direction_id)[:64]}"
+    )[:200]
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return False
+    label = (direction_text or "(no description)").strip()
+    if len(label) > 200:
+        label = label[:197] + "…"
+    target = (
+        f"v{staged_for_version}"
+        if staged_for_version is not None
+        else "an unknown version"
+    )
+    open_desc = (
+        f"the current open version is v{open_version}"
+        if open_version is not None
+        else "no open version is recorded"
+    )
+    message = (
+        f"Staged direction {direction_id} (\"{label}\") has waited "
+        f"{waited_days} day(s) for its target version ({target}) to promote, "
+        f"but {open_desc} — the version has not promoted, so the staged work "
+        f"is stalled. Retarget, force-activate, or cancel it."
+    )[:1000]
+    alert = Alert(
+        project_id=project_id,
+        severity=severity,
+        title=title,
+        message=message,
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": severity.value,
+            "title": alert.title,
+        },
+    )
+    return True
+
+
 async def _maybe_create_blocked_escalation_alert(
     task: "Task",
     session: AsyncSession,
