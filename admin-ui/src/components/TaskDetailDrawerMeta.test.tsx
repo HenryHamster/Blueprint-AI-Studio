@@ -126,4 +126,26 @@ describe('DetailsTab — Merge Test Gate', () => {
     expect(screen.getByText('Test Output')).toBeInTheDocument();
     expect(screen.getByText(/No test runner detected/)).toBeInTheDocument();
   });
+
+  it('renders the normalized evaluation summary alongside legacy task details', () => {
+    const task = makeTask({
+      evaluation_summary: {
+        status: 'COMPLETED',
+        verdict: 'pass',
+        evidence: [
+          { label: 'Tests', value: '23 passed, 0 failed' },
+          { label: 'Gate', value: 'verified on PR head' },
+        ],
+        highlights: [
+          { label: 'Top', value: 'full suite green' },
+        ],
+      },
+      artifacts: [mergeTestArtifact({ detected: true, passed: true, tests: [], output: '' })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Evaluation Summary')).toBeInTheDocument();
+    expect(screen.getByText('pass')).toBeInTheDocument();
+    expect(screen.getByText(/verified on PR head/)).toBeInTheDocument();
+    expect(screen.getByText('Merge Test Gate')).toBeInTheDocument();
+  });
 });

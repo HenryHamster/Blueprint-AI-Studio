@@ -282,6 +282,35 @@ describe('TaskDetailDrawerMeta DetailsTab — viewport regression', () => {
     });
   });
 
+  test('evaluation summary card renders without overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <DetailsTab
+            task={{
+              ...mergeTestTask,
+              evaluation_summary: {
+                status: 'COMPLETED',
+                verdict: 'pass',
+                evidence: [
+                  { label: 'Tests', value: '23 passed, 0 failed' },
+                  { label: 'Gate', value: 'verified on PR head' },
+                ],
+                highlights: [
+                  { label: 'Top', value: 'full suite green' },
+                ],
+              },
+            }}
+          />,
+        );
+      });
+    });
+  });
+
   test('shows LLM provider and model when present and hides them otherwise', async () => {
     host = document.createElement('div');
     document.body.appendChild(host);

@@ -5738,9 +5738,10 @@ async def test_type_distribution_and_product_ratio(db_session):
     assert type_dist.get("fix") == 1, f"Expected 1 fix task, got {type_dist}"
     assert type_dist.get("refactor") == 1, f"Expected 1 refactor task, got {type_dist}"
 
-    # product_ratio: 2 product (create) out of 4 total = 0.5
+    # product_ratio now follows PRODUCT_TASK_TYPES: create/create/fix are
+    # product, refactor is structural.
     product_ratio = entry.get("product_ratio")
-    assert product_ratio == 0.5, f"Expected product_ratio=0.5, got {product_ratio}"
+    assert product_ratio == 0.75, f"Expected product_ratio=0.75, got {product_ratio}"
 
     # type_breakdown: per-type created/merged/failed counts so research agents
     # can see which finding types ship vs fail.

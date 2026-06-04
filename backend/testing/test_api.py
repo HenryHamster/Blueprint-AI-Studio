@@ -1,7 +1,18 @@
+import json
 import uuid
+
 import pytest
 from httpx import AsyncClient
-from app.models import Project, ProjectMember, ProjectStatus, Task, TaskStatus
+
+from app.models import (
+    Artifact,
+    ArtifactType,
+    Project,
+    ProjectMember,
+    ProjectStatus,
+    Task,
+    TaskStatus,
+)
 from app.auth import create_agent_token
 
 
@@ -561,6 +572,145 @@ async def test_admin_tasks_expose_unverified_merge_reason(
     detail_normal = await client.get(f"/api/admin/tasks/{normal_task.id}")
     assert detail_normal.status_code == 200
     assert detail_normal.json()["unverified_merge_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_admin_tasks_expose_evaluation_summary(
+    client: AsyncClient, db_session
+):
+    """Both admin task endpoints expose normalized evaluation summaries for
+    merge-gate, memo, self-audit, and audit-style task outputs."""
+    project = await _make_project_with_member(db_session)
+
+    verify_task = Task(
+        project_id=project.id,
+        title="Verify tests",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "verify_tests"}],
+    )
+    db_session.add(verify_task)
+    await db_session.flush()
+    db_session.add(
+        Artifact(
+            task_id=verify_task.id,
+            artifact_type=ArtifactType.MERGE_TEST_RESULT,
+            logs=json.dumps(
+                {
+                    "detected": True,
+                    "passed": True,
+                    "tests": [
+                        {"name": "pytest", "status": "pass", "message": "ok"},
+                    ],
+                    "output": "PASS all tests",
+                }
+            ),
+        )
+    )
+
+    memo_task = Task(
+        project_id=project.id,
+        title="Memo task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "memo"}],
+        plan_output={
+            "memo": {
+                "summary": "Cache strategy summary",
+                "reasoning": "Long-form reasoning about the chosen cache strategy.",
+                "citations": ["task:123", "direction:cache"],
+                "tags": ["memo", "strategy"],
+            }
+        },
+    )
+    self_audit_task = Task(
+        project_id=project.id,
+        title="Self audit task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "self_audit"}],
+        plan_output=[
+            {
+                "system_id": "auth",
+                "score": 45,
+                "recommended_mode": "audit",
+                "top_issues": ["Missing tests"],
+                "evidence": [],
+                "components": {
+                    "test_coverage": 20,
+                    "friction_density": 40,
+                    "claim_consistency": 50,
+                    "failure_mix": 30,
+                },
+            },
+            {
+                "system_id": "billing",
+                "score": 80,
+                "recommended_mode": "ship",
+                "top_issues": [],
+                "evidence": [],
+                "components": {
+                    "test_coverage": 80,
+                    "friction_density": 80,
+                    "claim_consistency": 80,
+                    "failure_mix": 80,
+                },
+            },
+        ],
+    )
+    audit_task = Task(
+        project_id=project.id,
+        title="Security audit task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "security_audit"}],
+        plan_output={
+            "findings": [
+                {
+                    "severity": "high",
+                    "title": "Missing auth check",
+                    "description": "Endpoint is missing authorization.",
+                },
+                {
+                    "severity": "low",
+                    "title": "Verbose logging",
+                    "description": "Logs are noisy.",
+                },
+            ]
+        },
+    )
+    db_session.add_all([memo_task, self_audit_task, audit_task])
+    await db_session.commit()
+    for t in (verify_task, memo_task, self_audit_task, audit_task):
+        await db_session.refresh(t)
+
+    list_resp = await client.get("/api/admin/tasks", params={"limit": 100})
+    assert list_resp.status_code == 200
+    by_id = {t["id"]: t for t in list_resp.json()["tasks"]}
+
+    verify_summary = by_id[str(verify_task.id)]["evaluation_summary"]
+    assert verify_summary["verdict"] == "pass"
+    assert verify_summary["evidence"][0]["label"] == "Detected suite"
+    assert verify_summary["highlights"][0]["label"] == "pytest"
+
+    memo_summary = by_id[str(memo_task.id)]["evaluation_summary"]
+    assert memo_summary["verdict"] == "memo"
+    assert memo_summary["highlights"][0]["label"] == "Citations"
+    assert memo_summary["evidence"][0]["value"] == "Cache strategy summary"
+
+    self_audit_summary = by_id[str(self_audit_task.id)]["evaluation_summary"]
+    assert self_audit_summary["verdict"] == "audit"
+    assert self_audit_summary["evidence"][0]["label"] == "Systems"
+    assert self_audit_summary["highlights"][0]["label"] == "auth"
+
+    audit_summary = by_id[str(audit_task.id)]["evaluation_summary"]
+    assert audit_summary["verdict"] == "actionable"
+    assert audit_summary["evidence"][1]["value"] == "1"
+    assert audit_summary["highlights"][0]["label"] == "Missing auth check"
+
+    detail_resp = await client.get(f"/api/admin/tasks/{verify_task.id}")
+    assert detail_resp.status_code == 200
+    assert detail_resp.json()["evaluation_summary"]["verdict"] == "pass"
+
+    detail_memo = await client.get(f"/api/admin/tasks/{memo_task.id}")
+    assert detail_memo.status_code == 200
+    assert detail_memo.json()["evaluation_summary"]["highlights"][0]["label"] == "Citations"
 
 
 @pytest.mark.asyncio

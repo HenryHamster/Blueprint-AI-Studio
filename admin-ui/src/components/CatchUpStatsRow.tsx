@@ -192,7 +192,7 @@ export function CatchUpStatsRow({ digest }: CatchUpStatsRowProps) {
         const pct = Math.round(opr * 100);
         const tone = opr >= 0.6 ? 'text-emerald-400' : opr >= 0.4 ? 'text-amber-400' : 'text-slate-400';
         return (
-          <span className={tone} title="Fraction of tasks targeting product features vs structural work">
+          <span className={tone} title="Fraction of tasks shipping user-facing product value vs structural/overhead work">
             {pct}% product focus
           </span>
         );

@@ -246,6 +246,15 @@ def _build_outcome_evaluation(
         rejected = sum(h.get("prs_rejected", 0) for h in window_history)
         failed = sum(h.get("tasks_failed", 0) for h in window_history)
         failed_infra = sum(h.get("tasks_failed_infra", 0) for h in window_history)
+        # Generalized successes: code merges PLUS non-code evaluation successes
+        # (research quality, audit findings, memo artifacts, verify verdicts).
+        # Legacy entries without the field fall back to prs_merged so code-only
+        # directions remain unchanged; non-code contributions appear on entries
+        # written after the generalized-outcome rollout.
+        generalized_successes = sum(
+            h.get("generalized_successes", h.get("prs_merged", 0))
+            for h in window_history
+        )
         taxonomy_summary: dict[str, int] = {}
         for h in window_history:
             for tkey, tval in (h.get("taxonomy_summary") or {}).items():
@@ -301,6 +310,15 @@ def _build_outcome_evaluation(
         if avg_time_to_merge_hours is not None:
             outcome["avg_time_to_merge_hours"] = avg_time_to_merge_hours
         outcome["difficulty_index"] = round(_compute_difficulty_index(d), 2)
+        # Generalized health — ADDITIVE. Present when non-code successes exist
+        # so mixed-portfolio directions show positive health even with zero PRs.
+        if generalized_successes > 0:
+            outcome["generalized_successes"] = generalized_successes
+            _gen_total = generalized_successes + failed
+            if _gen_total > 0:
+                outcome["generalized_health_rate"] = round(
+                    generalized_successes / _gen_total, 3
+                )
         # Estimated cost — prefer recorded spend per entry; fall back to the
         # tasks_created * avg_time_to_merge_hours proxy for legacy entries.
         estimated_cost_usd = round(
@@ -507,6 +525,16 @@ def _build_outcome_evaluation(
     total_merged = sum(d["merged"] for d in direction_outcomes)
     total_failed = sum(d["failed"] for d in direction_outcomes)
     success_rate = round(total_merged / max(total_merged + total_failed, 1), 2)
+    # Generalized success rate — code merges PLUS non-code evaluation successes.
+    # Falls back to prs_merged for directions without the new field so legacy
+    # data produces the same rate as the PR-based metric.
+    total_generalized_successes = sum(
+        d.get("generalized_successes", d["merged"]) for d in direction_outcomes
+    )
+    generalized_success_rate = round(
+        total_generalized_successes / max(total_generalized_successes + total_failed, 1),
+        2,
+    )
 
     # Trend: compare first half vs second half of all window history entries
     all_window_entries = []
@@ -582,6 +610,12 @@ def _build_outcome_evaluation(
         "success_rate": success_rate,
         "trend": trend,
     }
+    # generalized_success_rate is the mixed-portfolio comparator — includes code
+    # merges AND non-code evaluation successes. Differs from success_rate only
+    # when directions include research/audit/memo/verify work.
+    if total_generalized_successes != total_merged:
+        overall_summary["generalized_successes"] = total_generalized_successes
+        overall_summary["generalized_success_rate"] = generalized_success_rate
     if overall_type_dist:
         overall_summary["type_distribution"] = overall_type_dist
     if overall_product_ratio is not None:
@@ -658,6 +692,18 @@ def _build_decision_accuracy(directions: list, cycle_history: list) -> dict:
             agg.get("total_prs_merged") or 0
         )
 
+    def _lifetime_generalized_successes(d: dict) -> int:
+        """Lifetime generalized successes — code merges + non-code eval successes.
+
+        Falls back to prs_merged for legacy entries that predate the
+        generalized_successes field so code-only directions remain unchanged.
+        """
+        history = d.get("research_history") or []
+        agg = d.get("history_aggregate") or {}
+        return sum(
+            h.get("generalized_successes", h.get("prs_merged", 0)) for h in history
+        ) + (agg.get("total_generalized_successes") or agg.get("total_prs_merged") or 0)
+
     quality_scores = [
         round(_compute_direction_quality_score(d), 3) for d in directions if d.get("id")
     ]
@@ -674,30 +720,44 @@ def _build_decision_accuracy(directions: list, cycle_history: list) -> dict:
 
     created_breakdown: list = []
     successes = 0
+    generalized_successes_count = 0
     for cid in target.get("created_direction_ids") or []:
         d = dir_by_id.get(cid)
         if d is None:
             created_breakdown.append(
-                {"direction_id": cid, "status": "missing", "success": False}
+                {
+                    "direction_id": cid,
+                    "status": "missing",
+                    "success": False,
+                    "generalized_success": False,
+                }
             )
             continue
         merged = _lifetime_merged(d)
+        gen_successes = _lifetime_generalized_successes(d)
         auto_paused = bool(d.get("auto_paused"))
         qscore = round(_compute_direction_quality_score(d), 3)
         above_median = qscore > median_quality
+        # Code-based success: merged >= 1 (PR-based, labeled sub-metric).
         success = merged >= 1 and not auto_paused
+        # Generalized success: any terminal evaluation success, not just PR merges.
+        generalized_success = gen_successes >= 1 and not auto_paused
         if success:
             successes += 1
-        created_breakdown.append(
-            {
-                "direction_id": cid,
-                "prs_merged": merged,
-                "auto_paused": auto_paused,
-                "quality_score": qscore,
-                "above_median_quality": above_median,
-                "success": success,
-            }
-        )
+        if generalized_success:
+            generalized_successes_count += 1
+        entry: dict = {
+            "direction_id": cid,
+            "prs_merged": merged,
+            "auto_paused": auto_paused,
+            "quality_score": qscore,
+            "above_median_quality": above_median,
+            "success": success,
+            "generalized_success": generalized_success,
+        }
+        if gen_successes != merged:
+            entry["generalized_successes"] = gen_successes
+        created_breakdown.append(entry)
 
     retired_breakdown: list = []
     retired_good = 0
@@ -727,6 +787,9 @@ def _build_decision_accuracy(directions: list, cycle_history: list) -> dict:
     decision_accuracy_rate = (
         round(successes / created_total, 2) if created_total else None
     )
+    generalized_decision_accuracy_rate = (
+        round(generalized_successes_count / created_total, 2) if created_total else None
+    )
     retired_accuracy_rate = (
         round(retired_good / retired_total, 2) if retired_total else None
     )
@@ -740,6 +803,11 @@ def _build_decision_accuracy(directions: list, cycle_history: list) -> dict:
         "median_quality_score": round(median_quality, 3),
         "created": created_breakdown,
     }
+    # generalized_decision_accuracy_rate is additive — only present when it
+    # differs from decision_accuracy_rate (i.e. non-code successes exist).
+    if generalized_successes_count != successes:
+        result["created_generalized_successful"] = generalized_successes_count
+        result["generalized_decision_accuracy_rate"] = generalized_decision_accuracy_rate
     if retired_breakdown:
         result["retired"] = retired_breakdown
         result["retired_accuracy_rate"] = retired_accuracy_rate
@@ -779,6 +847,14 @@ def _build_strategic_effectiveness(
             agg.get("total_prs_merged") or 0
         )
 
+    def _direction_lifetime_generalized(d: dict) -> int:
+        """Lifetime generalized successes — falls back to prs_merged for legacy."""
+        history = d.get("research_history") or []
+        agg = d.get("history_aggregate") or {}
+        return sum(
+            h.get("generalized_successes", h.get("prs_merged", 0)) for h in history
+        ) + (agg.get("total_generalized_successes") or agg.get("total_prs_merged") or 0)
+
     recent = completed[-5:]
     cycle_metrics: list = []
     for entry in recent:
@@ -788,6 +864,13 @@ def _build_strategic_effectiveness(
             1
             for cid in created_ids
             if cid in dir_by_id and _direction_lifetime_merged(dir_by_id[cid]) > 0
+        )
+        # Generalized: a direction is a success when it produced ANY evaluation
+        # success — not just a code merge (includes research quality, audits, memos).
+        created_with_successes = sum(
+            1
+            for cid in created_ids
+            if cid in dir_by_id and _direction_lifetime_generalized(dir_by_id[cid]) > 0
         )
         retired_still_retired = sum(
             1
@@ -800,18 +883,25 @@ def _build_strategic_effectiveness(
         conversion_rate = (
             round(successful / decisions_total, 2) if decisions_total else None
         )
-        cycle_metrics.append(
-            {
-                "cycle_id": entry.get("cycle_id"),
-                "completed_at": entry.get("phase2_completed_at"),
-                "directions_created": len(created_ids),
-                "directions_retired": len(retired_ids),
-                "created_with_merges": created_with_merges,
-                "retired_still_retired": retired_still_retired,
-                "vision_updated": bool(entry.get("vision_updated")),
-                "decision_conversion_rate": conversion_rate,
-            }
+        gen_successful = created_with_successes + retired_still_retired
+        gen_conversion_rate = (
+            round(gen_successful / decisions_total, 2) if decisions_total else None
         )
+        cycle_entry: dict = {
+            "cycle_id": entry.get("cycle_id"),
+            "completed_at": entry.get("phase2_completed_at"),
+            "directions_created": len(created_ids),
+            "directions_retired": len(retired_ids),
+            "created_with_merges": created_with_merges,
+            "retired_still_retired": retired_still_retired,
+            "vision_updated": bool(entry.get("vision_updated")),
+            "decision_conversion_rate": conversion_rate,
+        }
+        # generalized_decision_conversion_rate is additive — only when it differs.
+        if created_with_successes != created_with_merges:
+            cycle_entry["created_with_successes"] = created_with_successes
+            cycle_entry["generalized_decision_conversion_rate"] = gen_conversion_rate
+        cycle_metrics.append(cycle_entry)
 
     # Trend across cycles: average decision_conversion_rate, first half vs second half.
     rates = [

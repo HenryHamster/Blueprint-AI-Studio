@@ -50,6 +50,11 @@ class TaskCapability:
     provider_configurable: bool = True
     filter_visible: bool = True
     description: str = ""
+    # Whether this task type directly ships user-facing product value (as opposed
+    # to structural / overhead work). This is a NEW, independent analytics
+    # dimension — intentionally distinct from agent_mode and WRITE_TASK_TYPES.
+    # See PRODUCT_TASK_TYPES below for the derived single source of truth.
+    delivers_product: bool = False
 
 
 TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
@@ -59,6 +64,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "write",
         default_category="build",
         user_launchable=True,
+        delivers_product=True,
         description="Implement new functionality and open a PR.",
     ),
     TaskCapability(
@@ -75,6 +81,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "write",
         default_category="review",
         user_launchable=True,
+        delivers_product=True,
         description="Fix a PR from review feedback or CI failures.",
     ),
     TaskCapability(
@@ -141,6 +148,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "write",
         default_category="build",
         user_launchable=True,
+        delivers_product=True,
         description="Create or update database migrations.",
     ),
     TaskCapability(
@@ -248,6 +256,23 @@ WRITE_TASK_TYPES: frozenset[str] = frozenset(
     capability.id.value
     for capability in TASK_CAPABILITIES
     if capability.agent_mode == "write"
+)
+# Canonical registry of task types that directly ship user-facing PRODUCT value
+# (as opposed to structural / overhead work). This is the SINGLE source of truth
+# for the product/structural split used by direction-outcome analytics
+# (direction_outcomes.py product_ratio / structural_count) and the digest /
+# dashboard surfaces that read those pre-computed values. A new task type — code
+# or non-code — becomes "product" simply by declaring delivers_product=True on
+# its capability; no edit at any metric call site is required. Unknown /
+# unregistered task types (get_task_capability() -> None) are NOT in this set and
+# therefore default to STRUCTURAL, which is the conservative, documented default.
+# NOTE: this is a deliberately independent dimension from agent_mode /
+# WRITE_TASK_TYPES — a write task (e.g. refactor, qa, docs) is not necessarily
+# product-shipping.
+PRODUCT_TASK_TYPES: frozenset[str] = frozenset(
+    capability.id.value
+    for capability in TASK_CAPABILITIES
+    if capability.delivers_product
 )
 USER_LAUNCHABLE_TASK_TYPES: tuple[str, ...] = tuple(
     capability.id.value

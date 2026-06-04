@@ -1,7 +1,6 @@
 import { useState, useEffect, useMemo, type ReactNode } from 'react';
 import { Copy, Check, ChevronDown, ChevronRight, ExternalLink, Hash } from 'lucide-react';
 import { getHeartbeatStatus, isSafeUrl, useElapsedTime, linkifyStatusMessage, ResearchFindings, useDurationStats } from './TaskCard';
-import type { Task } from './TaskCard';
 import { formatAbsolute, parseTimestamp } from '../utils/time';
 import { hasTransitiveCycle } from '../utils/taskGraph';
 import { authGet, API_BASE_URL } from '../api';
@@ -9,6 +8,7 @@ import { TaskFixLoopPanel } from './TaskFixLoopPanel';
 import { SelfReviewPanel } from './TaskDetailDrawerSelfReview';
 import { TaskDiagnosticsPanel, TaskErrorLogsPanel, getLogEntryColor } from './TaskDetailDrawerDiagnostics';
 import { FailureDetailPanel } from './TaskDetailDrawerFailureDetail';
+import type { Task, TaskEvaluationSummary } from '../types/task';
 
 // Human-readable labels for the no-CI UNVERIFIED-merge reason keys. Mirrors
 // backend _UNVERIFIED_REASON_LABELS (backend/app/alert_dispatch.py) — keep keys
@@ -169,6 +169,66 @@ function ResearchOriginSection({ task, tasks, onNavigateToTask }: { task: Task; 
         </DetailRow>
       )}
       {originFinding?.direction_id && <DetailRow label="Direction"><span className="font-mono text-xs text-neutral-400">{originFinding.direction_id}</span></DetailRow>}
+    </>
+  );
+}
+
+function EvaluationSummarySection({ summary }: { summary: TaskEvaluationSummary }) {
+  const evidence = summary.evidence ?? [];
+  const highlights = summary.highlights ?? [];
+
+  const badgeClass =
+    summary.verdict === 'pass'
+      ? 'bg-emerald-900/40 text-emerald-300 border-emerald-800/40'
+      : summary.verdict === 'fail' || summary.verdict === 'actionable'
+        ? 'bg-red-900/40 text-red-300 border-red-800/40'
+        : summary.verdict === 'undetected'
+          ? 'bg-neutral-800/50 text-neutral-300 border-neutral-700/50'
+          : 'bg-cyan-900/40 text-cyan-300 border-cyan-800/40';
+
+  return (
+    <>
+      <SectionHeader>Evaluation Summary</SectionHeader>
+      <div className="space-y-3 bg-cyan-950/10 rounded-lg p-3 border border-cyan-900/30">
+        <div className="flex items-start gap-2">
+          <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Status</span>
+          <span className="text-xs font-semibold uppercase tracking-wider px-2 py-0.5 rounded border bg-neutral-900/70 text-neutral-200 border-neutral-700/50">
+            {summary.status}
+          </span>
+        </div>
+        <div className="flex items-start gap-2">
+          <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Verdict</span>
+          <span className={`text-xs font-semibold uppercase tracking-wider px-2 py-0.5 rounded border ${badgeClass}`}>
+            {summary.verdict}
+          </span>
+        </div>
+        {evidence.length > 0 && (
+          <div className="flex items-start gap-2">
+            <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Evidence</span>
+            <div className="min-w-0 flex-1 space-y-1">
+              {evidence.map((item, i) => (
+                <div key={i} className="flex flex-wrap gap-x-2 gap-y-0.5 text-xs text-neutral-300">
+                  <span className="text-neutral-500 shrink-0">{item.label}</span>
+                  <span className="break-words min-w-0">{item.value}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        {highlights.length > 0 && (
+          <div className="flex items-start gap-2">
+            <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Highlights</span>
+            <div className="min-w-0 flex-1 flex flex-wrap gap-1.5">
+              {highlights.map((item, i) => (
+                <span key={i} className="inline-flex max-w-full flex-wrap gap-x-1 rounded bg-neutral-900/70 px-2 py-1 text-[11px] text-neutral-200 border border-neutral-800">
+                  <span className="text-neutral-500">{item.label}</span>
+                  <span className="break-words">{item.value}</span>
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
     </>
   );
 }
@@ -503,6 +563,8 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
           </>
         );
       })()}
+
+      {task.evaluation_summary && <EvaluationSummarySection summary={task.evaluation_summary} />}
 
       {task.plan_output && (() => {
         const planOut = task.plan_output as Record<string, unknown> | undefined;

@@ -142,6 +142,46 @@ def _build_direction_remediation_state(
     return entries
 
 
+def _build_direction_portfolio_summary(project: Project) -> List[dict]:
+    """Surface per-direction generalized health for the diagnostics endpoint.
+
+    Returns entries for active/paused directions that have non-code evaluation
+    successes in their recent research_history — i.e. directions whose positive
+    signal would be invisible to PR-only metrics. Only included when the
+    generalized_successes field exceeds prs_merged, so pure code-change
+    directions produce no extra noise in the response.
+
+    Limited to the 3 most recent cycles per direction for a compact summary.
+    """
+    results: list = []
+    for d in project.directions or []:
+        if d.get("status") not in ("active", "paused"):
+            continue
+        history = d.get("research_history") or []
+        if not history:
+            continue
+        recent = history[-3:]
+        gen_successes = sum(
+            h.get("generalized_successes", h.get("prs_merged", 0)) for h in recent
+        )
+        prs_merged = sum(h.get("prs_merged", 0) for h in recent)
+        if gen_successes <= prs_merged:
+            # No non-code contribution beyond PR merges — skip to keep compact.
+            continue
+        results.append(
+            {
+                "direction_id": d.get("id", ""),
+                "direction_text": (d.get("text") or "")[:100],
+                "status": d.get("status", "active"),
+                "recent_cycles": len(recent),
+                "prs_merged_recent": prs_merged,
+                "generalized_successes_recent": gen_successes,
+                "non_code_successes_recent": gen_successes - prs_merged,
+            }
+        )
+    return results
+
+
 def _classify_stuck_failure(task: Task) -> Optional[str]:
     """Classify stuck tasks using the canonical classifier.
 
@@ -1052,8 +1092,9 @@ async def get_project_diagnostics(
         zone_health = {"available": 0, "exhausted": []}
 
     direction_remediation = _build_direction_remediation_state(project)
+    direction_portfolio = _build_direction_portfolio_summary(project)
 
-    return {
+    response: dict = {
         "project_id": str(project_id),
         "stuck_tasks": stuck_tasks,
         "circuit_breaker": circuit_breaker,
@@ -1067,6 +1108,11 @@ async def get_project_diagnostics(
         "active_tasks_truncated": active_tasks_truncated,
         "active_tasks_cap": max_active_tasks,
     }
+    # direction_portfolio_summary is ADDITIVE — only present when non-code work
+    # exists so the response stays compact for code-only portfolios.
+    if direction_portfolio:
+        response["direction_portfolio_summary"] = direction_portfolio
+    return response
 
 
 # ---------------------------------------------------------------------------

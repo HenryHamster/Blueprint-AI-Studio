@@ -172,6 +172,33 @@ describe('ResearchBrowser evidence panel', () => {
     expect(screen.queryByText(/^Claims$/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/^Sources$/i)).not.toBeInTheDocument();
   });
+
+  it('surfaces a child task evaluation summary on the outcome row', async () => {
+    const user = userEvent.setup();
+    const implementation = makeImplementationTask({
+      evaluation_summary: {
+        status: 'COMPLETED',
+        verdict: 'pass',
+        evidence: [
+          { label: 'Tests', value: '23 passed, 0 failed' },
+        ],
+        highlights: [
+          { label: 'Top', value: 'full suite green' },
+        ],
+      },
+    });
+    render(
+      <ResearchBrowser
+        tasks={[makeResearchTask([makeFinding({ title: 'Finding A' })]), implementation]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+
+    await user.click(screen.getByText('Finding A'));
+    expect(screen.getByText('pass')).toBeInTheDocument();
+    expect(screen.getByText(/full suite green/)).toBeInTheDocument();
+  });
 });
 
 describe('ResearchBrowser findings_documented filter', () => {

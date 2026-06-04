@@ -55,8 +55,8 @@ from app.research_completion import lookup_findings_by_source_ref
 from app.playbook_learning import resolve_sr_miss_human_truth
 from app.research_actionability import (
     _MAX_ACTIONABILITY_CYCLES,
-    _aggregate_actionability_bucket,
-    _compute_actionability_rates,
+    _aggregate_actionability_extended,
+    _compute_actionability_rates_extended,
 )
 
 router = APIRouter()
@@ -1508,15 +1508,25 @@ async def get_research_actionability(
     )
     followon_tasks = followon_result.scalars().all()
 
-    # Global aggregation across the full window.
-    grade_counts, grade_tasked, grade_merged = _aggregate_actionability_bucket(
-        research_tasks,
-        followon_tasks,
-        research_task_ids,
+    # Global aggregation across the full window. The extended form additionally
+    # tracks grade_succeeded (findings whose follow-on achieved ANY terminal
+    # evaluation success, not merge-only) so research calibration reflects
+    # forward quality, not merge-only conversion.
+    grade_counts, grade_tasked, grade_merged, grade_succeeded = (
+        _aggregate_actionability_extended(
+            research_tasks,
+            followon_tasks,
+            research_task_ids,
+        )
     )
-    grade_merge_rate, grade_merge_rate_of_tasked, calibration_score = (
-        _compute_actionability_rates(grade_counts, grade_tasked, grade_merged)
+    rates = _compute_actionability_rates_extended(
+        grade_counts, grade_tasked, grade_merged, grade_succeeded
     )
+    grade_merge_rate = rates["grade_merge_rate"]
+    grade_merge_rate_of_tasked = rates["grade_merge_rate_of_tasked"]
+    calibration_score = rates["calibration_score"]
+    grade_success_rate = rates["grade_success_rate"]
+    generalized_calibration_score = rates["generalized_calibration_score"]
 
     # Per-cycle bucketing. Each cycle window = [cycle.created_at, next_newer_cycle.created_at);
     # the newest cycle has an open upper bound.
@@ -1539,15 +1549,16 @@ async def get_research_actionability(
             and t.created_at >= lo
             and (hi is None or t.created_at < hi)
         ]
-        b_counts, b_tasked, b_merged = _aggregate_actionability_bucket(
+        b_counts, b_tasked, b_merged, b_succeeded = _aggregate_actionability_extended(
             bucket_tasks,
             followon_tasks,
             research_task_ids,
         )
-        b_rate, _b_rate_t, b_calib = _compute_actionability_rates(
+        b_rates = _compute_actionability_rates_extended(
             b_counts,
             b_tasked,
             b_merged,
+            b_succeeded,
         )
         cycle_history.append(
             {
@@ -1563,8 +1574,15 @@ async def get_research_actionability(
                 ),
                 "grade_distribution": b_counts,
                 "grade_merged": b_merged,
-                "grade_merge_rate": b_rate,
-                "calibration_score": b_calib,
+                "grade_merge_rate": b_rates["grade_merge_rate"],
+                "calibration_score": b_rates["calibration_score"],
+                # Generalized forward-quality sub-metrics (additive; non-code
+                # follow-on successes count alongside merges).
+                "grade_succeeded": b_succeeded,
+                "grade_success_rate": b_rates["grade_success_rate"],
+                "generalized_calibration_score": b_rates[
+                    "generalized_calibration_score"
+                ],
             }
         )
 
@@ -1578,5 +1596,13 @@ async def get_research_actionability(
         "grade_merge_rate": grade_merge_rate,
         "grade_merge_rate_of_tasked": grade_merge_rate_of_tasked,
         "calibration_score": calibration_score,
+        # Generalized forward-quality calibration (additive). grade_succeeded
+        # counts findings whose follow-on achieved ANY terminal evaluation
+        # success (PR merge OR successful audit/memo/research/verification),
+        # so research calibration is not merge-only. grade_merge_* above
+        # remain the code-task sub-metric.
+        "grade_succeeded": grade_succeeded,
+        "grade_success_rate": grade_success_rate,
+        "generalized_calibration_score": generalized_calibration_score,
         "cycle_history": cycle_history,
     }

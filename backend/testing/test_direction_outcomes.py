@@ -3846,3 +3846,185 @@ async def test_tasks_completed_no_pr_counts_only_genuine_no_pr(
     assert entry["prs_merged"] == 1
     assert entry["prs_rejected"] == 1
     assert entry["tasks_completed"] == 4
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Generalized (mixed-portfolio) outcome aggregates — ADDITIVE to PR metrics.
+# A direction whose cycle merged 0 PRs but produced successful research +
+# audit + memo outcomes must show positive generalized health, while code-only
+# portfolios keep identical merge metrics.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _set_plan_output(session: AsyncSession, task: Task, plan_output) -> None:
+    """Attach a plan_output payload to an already-flushed child task."""
+    task.plan_output = plan_output
+    session.add(task)
+    await session.flush()
+
+
+@pytest.mark.asyncio
+async def test_generalized_health_non_code_portfolio(db_session: AsyncSession):
+    """A 0-PR cycle of research/audit/memo successes shows positive health."""
+    direction_id = "d-noncode"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    rtid = str(research_task.id)
+    project.directions = [_make_direction(direction_id, rtid, tasks_created=3)]
+    await db_session.flush()
+
+    # Successful research: a titled, graded finding.
+    research_child = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        title="research",
+    )
+    await _set_plan_output(
+        db_session,
+        research_child,
+        [{"title": "Investigate X", "actionability_grade": "HIGH"}],
+    )
+    # Successful audit: structured findings present.
+    audit_child = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "security_audit"}],
+        title="audit",
+    )
+    await _set_plan_output(
+        db_session, audit_child, {"findings": [{"severity": "high"}]}
+    )
+    # Successful memo: a reasoning artifact mirrored onto plan_output.
+    memo_child = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "memo"}],
+        title="memo",
+    )
+    await _set_plan_output(db_session, memo_child, {"memo": "Reasoning text"})
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=rtid,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+
+    # Existing merge metrics are intact and honestly zero (no PR-merging task).
+    assert entry["prs_merged"] == 0
+    assert entry["conversion_rate"] == 0.0
+    # Generalized signal: all three read-only successes counted.
+    assert entry["generalized_successes"] == 3
+    assert entry["generalized_health_rate"] == 1.0
+    breakdown = entry["outcome_kind_breakdown"]
+    assert breakdown["research_quality"]["success"] == 1
+    assert breakdown["audit_findings"]["success"] == 1
+    assert breakdown["memo_artifact"]["success"] == 1
+
+
+@pytest.mark.asyncio
+async def test_generalized_health_code_only_unchanged(db_session: AsyncSession):
+    """Code-only portfolio: merge metrics AND generalized successes both equal
+    the merged count (a code merge is a generalized success of kind code_merge)."""
+    direction_id = "d-codeonly"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    rtid = str(research_task.id)
+    project.directions = [_make_direction(direction_id, rtid, tasks_created=2)]
+    await db_session.flush()
+
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "scope": "small"}],
+        title="merged",
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "create", "scope": "small"}],
+        title="failed",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=rtid,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+
+    assert entry["prs_merged"] == 1
+    assert entry["conversion_rate"] == 0.5
+    # One code merge → one generalized success of kind code_merge.
+    assert entry["generalized_successes"] == 1
+    assert entry["outcome_kind_breakdown"]["code_merge"]["success"] == 1
+    assert entry["outcome_kind_breakdown"]["code_merge"]["failure"] == 1
+    # 1 success / 2 terminal children.
+    assert entry["generalized_health_rate"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_product_vs_structural_classification_registry_driven(
+    db_session: AsyncSession,
+):
+    """product_ratio / structural_count classify child tasks via the task-type
+    registry (PRODUCT_TASK_TYPES), not the stale {create, feature, improvement}
+    set. create + fix + migrate count as product; refactor + research count as
+    structural; an unknown/future type defaults to structural."""
+    direction_id = "d-product-split"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    rtid = str(research_task.id)
+    project.directions = [_make_direction(direction_id, rtid, tasks_created=6)]
+    await db_session.flush()
+
+    # Product types (3): create, fix, migrate.
+    for ttype in ("create", "fix", "migrate"):
+        await _create_child_task(
+            db_session,
+            research_task.id,
+            project.id,
+            payloads=[{"type": ttype, "scope": "small"}],
+            title=f"product-{ttype}",
+        )
+    # Structural types (3): refactor (write but overhead), research (read-only),
+    # and an unknown/future type that defaults to structural.
+    for ttype in ("refactor", "research", "future_unknown_type"):
+        await _create_child_task(
+            db_session,
+            research_task.id,
+            project.id,
+            payloads=[{"type": ttype, "scope": "small"}],
+            title=f"structural-{ttype}",
+        )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=rtid,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    # 3 product / 6 total = 0.5, 3 structural.
+    assert entry["product_ratio"] == 0.5
+    assert entry["structural_count"] == 3

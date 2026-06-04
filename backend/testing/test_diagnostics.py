@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 from app.routers.admin_debug import (
     _classify_stuck_failure,
     _build_stuck_tasks,
+    _build_direction_portfolio_summary,
     _build_direction_remediation_state,
     get_global_diagnostics,
     get_project_diagnostics,
@@ -1026,3 +1027,69 @@ class TestProjectDiagnosticsActiveTaskCap:
 
         assert result["active_tasks_truncated"] is False
         assert result["active_tasks_cap"] == _MAX_ACTIVE_TASKS_DEFAULT
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _build_direction_portfolio_summary — surfaces non-code direction health
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_portfolio_summary_surfaces_non_code_direction():
+    """A 0-PR direction with non-code generalized successes is surfaced with
+    its non-code contribution computed as generalized - merged."""
+    project = Project(name="p", user_id="u")
+    project.directions = [
+        {
+            "id": "dir-noncode",
+            "text": "Audit the auth subsystem",
+            "status": "active",
+            "research_history": [
+                {
+                    "cycle": 1,
+                    "prs_merged": 0,
+                    "generalized_successes": 3,
+                }
+            ],
+        }
+    ]
+    summary = _build_direction_portfolio_summary(project)
+    assert len(summary) == 1
+    entry = summary[0]
+    assert entry["direction_id"] == "dir-noncode"
+    assert entry["prs_merged_recent"] == 0
+    assert entry["generalized_successes_recent"] == 3
+    assert entry["non_code_successes_recent"] == 3
+
+
+def test_portfolio_summary_skips_code_only_direction():
+    """A direction whose generalized successes equal its merges (pure code) is
+    omitted to keep the diagnostics payload compact."""
+    project = Project(name="p", user_id="u")
+    project.directions = [
+        {
+            "id": "dir-code",
+            "text": "Ship features",
+            "status": "active",
+            "research_history": [
+                {"cycle": 1, "prs_merged": 2, "generalized_successes": 2},
+            ],
+        }
+    ]
+    assert _build_direction_portfolio_summary(project) == []
+
+
+def test_portfolio_summary_skips_inactive_and_empty():
+    """Archived directions and directions with no history produce no entries."""
+    project = Project(name="p", user_id="u")
+    project.directions = [
+        {
+            "id": "dir-archived",
+            "text": "Old",
+            "status": "archived",
+            "research_history": [
+                {"cycle": 1, "prs_merged": 0, "generalized_successes": 5}
+            ],
+        },
+        {"id": "dir-empty", "text": "New", "status": "active", "research_history": []},
+    ]
+    assert _build_direction_portfolio_summary(project) == []

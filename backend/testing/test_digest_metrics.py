@@ -12,6 +12,7 @@ from app.models import (
 from app.digest_metrics import (
     _FAILURE_CLASS_LABELS,
     _compute_first_review_approval_breakdowns,
+    _compute_non_code_outcomes,
     compute_churn_direction,
     compute_digest_cost_economics,
     compute_digest_trend_history,
@@ -1281,6 +1282,93 @@ def test_parallel_review_effectiveness_none_when_insufficient_sample():
     ]
     result = compute_review_quality_metrics(tasks)
     assert result["parallel_review_effectiveness"] is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _compute_non_code_outcomes — generalized outcomes for tasks outside PR chains
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_compute_non_code_outcomes_mixed_portfolio():
+    """Research/audit/memo successes (no PR chain) are surfaced by kind."""
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+    in_window = now - timedelta(hours=1)
+
+    research = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        plan_output=[{"title": "Investigate", "actionability_grade": "HIGH"}],
+        created_at=in_window,
+    )
+    audit = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "security_audit"}],
+        plan_output={"findings": [{"severity": "high"}]},
+        created_at=in_window,
+    )
+    memo = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "memo"}],
+        plan_output={"memo": "Reasoning"},
+        created_at=in_window,
+    )
+
+    result = _compute_non_code_outcomes([research, audit, memo], window_start)
+    assert result["total"] == 3
+    assert result["successes"] == 3
+    assert result["neutrals"] == 0
+    assert result["failures"] == 0
+    assert result["by_kind"]["research_quality"]["success"] == 1
+    assert result["by_kind"]["audit_findings"]["success"] == 1
+    assert result["by_kind"]["memo_artifact"]["success"] == 1
+
+
+def test_compute_non_code_outcomes_excludes_review_chain_and_inflight():
+    """Review-chain tasks and in-flight (non-terminal) tasks are excluded so
+    neutrals/total are not inflated."""
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+    in_window = now - timedelta(hours=1)
+
+    # Part of a PR review chain → excluded by review_loop context.
+    review_chain = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"review_loop": {"iteration": 1}},
+        created_at=in_window,
+    )
+    # In-flight non-review task → must NOT be counted as a neutral.
+    inflight = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "research"}],
+        created_at=in_window,
+    )
+    # One genuine terminal success keeps the dict non-empty.
+    audit = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "security_audit"}],
+        plan_output={"findings": [{"severity": "low"}]},
+        created_at=in_window,
+    )
+
+    result = _compute_non_code_outcomes([review_chain, inflight, audit], window_start)
+    # Only the audit is counted: review_chain excluded, inflight excluded.
+    assert result["total"] == 1
+    assert result["successes"] == 1
+    assert result["neutrals"] == 0
+
+
+def test_compute_non_code_outcomes_empty_when_no_qualifying_tasks():
+    """Returns an empty dict when only review-chain/in-flight tasks exist."""
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+    inflight = make_task(
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "memo"}],
+        created_at=now - timedelta(hours=1),
+    )
+    assert _compute_non_code_outcomes([inflight], window_start) == {}
 
 
 class TestComputeRetryAnalytics:

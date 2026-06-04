@@ -4,6 +4,7 @@ from app.payload_schemas import TaskType, validate_task_payload
 from app.task_capabilities import (
     ALL_TASK_TYPES,
     FILTER_VISIBLE_TASK_TYPES,
+    PRODUCT_TASK_TYPES,
     PROVIDER_CONFIGURABLE_TASK_TYPES,
     READ_ONLY_TASK_TYPES,
     TASK_CAPABILITIES,
@@ -74,6 +75,29 @@ def test_recovery_paths_source_write_allowlist_from_registry():
     assert ((WRITE_TASK_TYPES - {"fix"}) | {""}) == (
         task_lifecycle._PR_OPENING_COMPLETION_TYPES
     )
+
+
+def test_product_task_types_derived_from_registry():
+    """PRODUCT_TASK_TYPES is the single source of truth for the product/structural
+    split. It must be derived from the registry's delivers_product flag, contain
+    only known types, include current value-shipping types, and exclude pure
+    overhead/read-only types as well as the stale legacy {feature, improvement}."""
+    expected = {
+        cap.id.value for cap in TASK_CAPABILITIES if cap.delivers_product
+    }
+    assert frozenset(expected) == PRODUCT_TASK_TYPES
+    assert PRODUCT_TASK_TYPES.issubset(ALL_TASK_TYPES)
+
+    # Current value-shipping types count as product.
+    assert {"create", "fix", "migrate"}.issubset(PRODUCT_TASK_TYPES)
+
+    # Overhead / read-only types must NOT be product.
+    for structural in ("review", "plan", "research", "refactor", "qa", "deps", "docs"):
+        assert structural not in PRODUCT_TASK_TYPES
+
+    # The stale hardcoded legacy set referenced task types that no longer exist.
+    assert "feature" not in PRODUCT_TASK_TYPES
+    assert "improvement" not in PRODUCT_TASK_TYPES
 
 
 def test_task_capability_lookup_is_metadata_only():

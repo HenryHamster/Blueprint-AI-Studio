@@ -16,6 +16,18 @@ class DeployPayload(BaseModel):
     github_repo: str | None = Field(None, pattern="^[a-zA-Z0-9_.-]+$")
 
 
+class TaskEvaluationSummaryItem(BaseModel):
+    label: str
+    value: str
+
+
+class TaskEvaluationSummary(BaseModel):
+    status: str
+    verdict: str
+    evidence: List[TaskEvaluationSummaryItem] = Field(default_factory=list)
+    highlights: List[TaskEvaluationSummaryItem] = Field(default_factory=list)
+
+
 class AgentStatusPayload(BaseModel):
     model_config = ConfigDict(extra="ignore")
     task_id: uuid.UUID

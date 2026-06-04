@@ -18,6 +18,18 @@ export interface ResearchFinding {
   _provenance_warnings?: { broken_source_ref_count: number; broken_refs: string[] };
 }
 
+export interface TaskEvaluationSummaryItem {
+  label: string;
+  value: string;
+}
+
+export interface TaskEvaluationSummary {
+  status: string;
+  verdict: string;
+  evidence?: TaskEvaluationSummaryItem[];
+  highlights?: TaskEvaluationSummaryItem[];
+}
+
 export interface Task {
   id: string;
   project_id?: string;
@@ -64,6 +76,7 @@ export interface Task {
   // Detail drawer's Merge Test Gate section reads this to render the UNVERIFIED
   // verdict + human-readable reason when no MERGE_TEST_RESULT artifact exists.
   unverified_merge_reason?: string | null;
+  evaluation_summary?: TaskEvaluationSummary | null;
   payloads?: Record<string, unknown>[];
   artifacts?: Array<{artifact_type: string; pr_url?: string; commit_hash?: string; repo_url?: string; logs?: string; iteration: number; created_at?: string}>;
   pr_url?: string;

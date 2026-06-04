@@ -54,6 +54,7 @@ from app.payload_schemas import (
     TaskType,
     validate_task_payload,
 )
+from app.schemas import TaskEvaluationSummary, TaskEvaluationSummaryItem
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
 from app.admin_helpers import (  # noqa: F401
     _ROLE_LEVEL,
@@ -108,6 +109,162 @@ def _fix_loop_summary(
                 }
             )
     return flagged if flagged else None
+
+
+def _task_status_label(task: Task) -> str:
+    status = getattr(task.status, "value", task.status)
+    return str(status)
+
+
+def _trim_summary_text(value: Any, limit: int = 200) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _summary_item(label: str, value: Any) -> Dict[str, str]:
+    return {"label": label, "value": _trim_summary_text(value)}
+
+
+def _build_task_evaluation_summary(
+    task: Task,
+    *,
+    merge_test_result: Dict[str, Any] | None = None,
+) -> Dict[str, Any] | None:
+    task_type = (task.first_payload or {}).get("type", "")
+    raw_plan_output = task.plan_output
+    plan_output = raw_plan_output if isinstance(raw_plan_output, dict) else None
+    status = _task_status_label(task)
+
+    if task_type == "verify_tests":
+        verdict = "undetected"
+        evidence: list[Dict[str, str]] = []
+        highlights: list[Dict[str, str]] = []
+        result = merge_test_result or {}
+        tests = result.get("tests") if isinstance(result.get("tests"), list) else []
+        output = _trim_summary_text(result.get("output"), 240)
+        detected = result.get("detected")
+        passed = result.get("passed")
+        if detected is False:
+            verdict = "undetected"
+        elif passed:
+            verdict = "pass"
+        elif detected is True:
+            verdict = "fail"
+
+        if detected is not None:
+            evidence.append(_summary_item("Detected suite", "yes" if detected else "no"))
+        if isinstance(tests, list) and tests:
+            pass_count = sum(1 for t in tests if isinstance(t, dict) and t.get("status") == "pass")
+            fail_count = sum(1 for t in tests if isinstance(t, dict) and t.get("status") == "fail")
+            evidence.append(_summary_item("Tests", f"{len(tests)} total, {pass_count} passed, {fail_count} failed"))
+            for test in tests[:3]:
+                if not isinstance(test, dict):
+                    continue
+                name = str(test.get("name") or test.get("suite") or "test").strip()
+                status_text = str(test.get("status") or "unknown").strip()
+                message = _trim_summary_text(test.get("message") or "", 80)
+                highlights.append(
+                    _summary_item(name, f"{status_text}{f' - {message}' if message else ''}")
+                )
+        if output:
+            evidence.append(_summary_item("Output", output))
+        if not evidence and result:
+            evidence.append(_summary_item("Result", "MERGE_TEST_RESULT captured"))
+        if not highlights and output:
+            highlights.append(_summary_item("Output", output))
+        return TaskEvaluationSummary(
+            status=status,
+            verdict=verdict,
+            evidence=[TaskEvaluationSummaryItem(**item) for item in evidence[:4]],
+            highlights=[TaskEvaluationSummaryItem(**item) for item in highlights[:3]],
+        ).model_dump()
+
+    if task_type == "memo":
+        memo = plan_output.get("memo") if isinstance(plan_output, dict) else None
+        if not isinstance(memo, dict):
+            return None
+        summary = _trim_summary_text(memo.get("summary"), 200)
+        reasoning = _trim_summary_text(memo.get("reasoning"), 240)
+        citations = memo.get("citations") if isinstance(memo.get("citations"), list) else []
+        tags = memo.get("tags") if isinstance(memo.get("tags"), list) else []
+        evidence = []
+        if summary:
+            evidence.append(_summary_item("Summary", summary))
+        if reasoning:
+            evidence.append(_summary_item("Reasoning", reasoning))
+        highlights = []
+        if citations:
+            highlights.append(_summary_item("Citations", ", ".join(str(c) for c in citations[:3])))
+        if tags:
+            highlights.append(_summary_item("Tags", ", ".join(str(t) for t in tags[:4])))
+        verdict = "memo"
+        return TaskEvaluationSummary(
+            status=status,
+            verdict=verdict,
+            evidence=[TaskEvaluationSummaryItem(**item) for item in evidence[:4]],
+            highlights=[TaskEvaluationSummaryItem(**item) for item in highlights[:3]],
+        ).model_dump()
+
+    if task_type == "self_audit":
+        findings = raw_plan_output if isinstance(raw_plan_output, list) else []
+        normalized = [f for f in findings if isinstance(f, dict)]
+        if not normalized:
+            return None
+        severity_order = {"ship": 0, "fundamentals": 1, "audit": 2, "pause": 3}
+
+        def _rank(finding: Dict[str, Any]) -> int:
+            mode = str(finding.get("recommended_mode") or "ship").strip().lower()
+            return severity_order.get(mode, 0)
+
+        worst = max(normalized, key=_rank)
+        verdict = str(worst.get("recommended_mode") or "ship").strip().lower() or "ship"
+        evidence = [
+            _summary_item("Systems", len(normalized)),
+            _summary_item("Worst score", worst.get("score", "n/a")),
+            _summary_item("Worst mode", verdict),
+        ]
+        highlights = []
+        for finding in sorted(normalized, key=lambda f: (int(f.get("score", 0)) if str(f.get("score", "")).isdigit() else 0))[:3]:
+            system_id = str(finding.get("system_id") or "system").strip()
+            score = finding.get("score", "n/a")
+            mode = str(finding.get("recommended_mode") or "ship").strip().lower() or "ship"
+            highlights.append(_summary_item(system_id, f"{mode} · score {score}"))
+        return TaskEvaluationSummary(
+            status=status,
+            verdict=verdict,
+            evidence=[TaskEvaluationSummaryItem(**item) for item in evidence[:4]],
+            highlights=[TaskEvaluationSummaryItem(**item) for item in highlights[:3]],
+        ).model_dump()
+
+    findings = None
+    if isinstance(plan_output, dict):
+        findings = plan_output.get("findings") or plan_output.get("issues")
+    if not isinstance(findings, list) or not findings:
+        return None
+    normalized_findings = [f for f in findings if isinstance(f, dict)]
+    if not normalized_findings:
+        return None
+    actionable = [
+        f for f in normalized_findings if str(f.get("severity") or "").lower() in {"critical", "high"}
+    ]
+    verdict = "clean" if not actionable else "actionable"
+    evidence = [
+        _summary_item("Findings", len(normalized_findings)),
+        _summary_item("Actionable", len(actionable)),
+    ]
+    highlights = []
+    for finding in normalized_findings[:3]:
+        severity = str(finding.get("severity") or "info").strip().lower()
+        title = str(finding.get("title") or finding.get("description") or "finding").strip()
+        highlights.append(_summary_item(title, severity))
+    return TaskEvaluationSummary(
+        status=status,
+        verdict=verdict,
+        evidence=[TaskEvaluationSummaryItem(**item) for item in evidence[:4]],
+        highlights=[TaskEvaluationSummaryItem(**item) for item in highlights[:3]],
+    ).model_dump()
 
 
 logger = logging.getLogger(__name__)
@@ -206,6 +363,7 @@ async def get_all_tasks(
     pr_map: Dict[str, str] = {}
     logs_map: Dict[str, str] = {}
     research_map: Dict[str, str] = {}
+    merge_test_map: Dict[str, Dict[str, Any]] = {}
     commit_map: Dict[str, Dict[str, Any]] = {}
     if task_ids:
         artifact_stmt = (
@@ -253,9 +411,14 @@ async def get_all_tasks(
             .where(
                 Artifact.task_id.in_(task_ids),
                 Artifact.artifact_type.in_(
-                    [ArtifactType.ERROR_LOG, ArtifactType.RESEARCH_FINDINGS]
+                    [
+                        ArtifactType.ERROR_LOG,
+                        ArtifactType.RESEARCH_FINDINGS,
+                        ArtifactType.MERGE_TEST_RESULT,
+                    ]
                 ),
             )
+            .order_by(Artifact.created_at.asc())
         )
         logs_artifacts = (await session.execute(logs_stmt)).scalars().all()
         for a in logs_artifacts:
@@ -271,6 +434,13 @@ async def get_all_tasks(
                         logs = parsed.get("logs", [])
                         if isinstance(logs, list):
                             research_map[tid] = logs
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+            if a.artifact_type == ArtifactType.MERGE_TEST_RESULT and a.logs:
+                try:
+                    parsed = await asyncio.to_thread(json.loads, a.logs[:100000])
+                    if isinstance(parsed, dict):
+                        merge_test_map[tid] = parsed
                 except (json.JSONDecodeError, AttributeError):
                     pass
 
@@ -373,6 +543,9 @@ async def get_all_tasks(
             "pr_url": pr_map.get(str(t.id)),
             "error_logs": logs_map.get(str(t.id)),
             "research_findings": research_map.get(str(t.id)),
+            "evaluation_summary": _build_task_evaluation_summary(
+                t, merge_test_result=merge_test_map.get(str(t.id))
+            ),
             "commit_hash": commit_map.get(str(t.id), {}).get("commit_hash"),
             "repo_url": commit_map.get(str(t.id), {}).get("repo_url"),
             "history": history_map.get(str(t.id), []),
@@ -912,6 +1085,7 @@ async def get_task(
     pr_url = None
     error_logs = None
     research_findings = None
+    merge_test_result = None
     commit_hash = None
     repo_url = None
     for a in artifacts:
@@ -931,6 +1105,13 @@ async def get_task(
             error_logs = a.logs
         if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
             research_findings = a.logs[:100000]
+        if a.artifact_type == ArtifactType.MERGE_TEST_RESULT and a.logs:
+            try:
+                parsed = json.loads(a.logs[:100000])
+                if isinstance(parsed, dict):
+                    merge_test_result = parsed
+            except (json.JSONDecodeError, AttributeError):
+                pass
         if a.artifact_type == ArtifactType.GIT_COMMIT and a.commit_hash:
             commit_hash = a.commit_hash
             repo_url = a.repo_url
@@ -1015,6 +1196,9 @@ async def get_task(
         "commit_hash": commit_hash,
         "repo_url": repo_url,
         "research_findings": research_findings,
+        "evaluation_summary": _build_task_evaluation_summary(
+            task, merge_test_result=merge_test_result
+        ),
         "history": history,
         "child_task_ids": child_task_ids,
         "estimated_cost_usd": get_task_total_vm_cost_usd_or_none(task),

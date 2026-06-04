@@ -1061,7 +1061,68 @@ def compute_outer_loop_convergence(
         "convergence_rate": convergence_rate,
         "non_converged_total": non_converged_total,
         "dominant_blocker": dominant_blocker,
+        # Non-code outcomes — ADDITIVE. Tasks without a review_loop context
+        # (research, audit, memo, verify_tests, etc.) are not part of the PR
+        # review chain and are absent from convergence_rate. This sub-dict
+        # surfaces their generalized outcome so they are visible alongside the
+        # PR-chain metrics rather than silently excluded from the digest view.
+        "non_code_outcomes": _compute_non_code_outcomes(all_tasks, window_start),
     }
+
+
+def _compute_non_code_outcomes(
+    all_tasks: List[Task], window_start: "datetime"
+) -> Dict[str, Any]:
+    """Summarize terminal outcomes of tasks that are NOT part of PR review chains.
+
+    Uses evaluate_task_outcome so each task type contributes its own honest
+    success signal rather than appearing as a zero-output in the PR-based view.
+    Returns an empty dict when no qualifying tasks exist in the window.
+    """
+    from app.task_outcomes import evaluate_task_outcome  # noqa: PLC0415
+
+    success = 0
+    neutral = 0
+    failure = 0
+    by_kind: Dict[str, Dict[str, int]] = {}
+    for t in all_tasks:
+        # Only terminal tasks have an honest evaluation outcome — in-flight
+        # (RUNNING/PENDING/BLOCKED) tasks would otherwise be scored 'neutral'
+        # and inflate total/neutrals. Mirrors the terminal filter in
+        # direction_outcomes._update_direction_research_outcomes.
+        if t.status not in (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        ):
+            continue
+        if isinstance((t.context or {}).get("review_loop"), dict):
+            continue
+        if t.created_at is not None and t.created_at < window_start:
+            continue
+        outcome = evaluate_task_outcome(t)
+        kind = outcome.kind
+        if kind not in by_kind:
+            by_kind[kind] = {"success": 0, "neutral": 0, "failure": 0}
+        by_kind[kind][outcome.status] += 1
+        if outcome.status == "success":
+            success += 1
+        elif outcome.status == "failure":
+            failure += 1
+        else:
+            neutral += 1
+    total = success + neutral + failure
+    if total == 0:
+        return {}
+    result: Dict[str, Any] = {
+        "total": total,
+        "successes": success,
+        "neutrals": neutral,
+        "failures": failure,
+    }
+    if by_kind:
+        result["by_kind"] = by_kind
+    return result
 
 
 def compute_resurrection_outcome_summary(
