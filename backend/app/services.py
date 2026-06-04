@@ -589,5 +589,6 @@ from app.recovery_sweeps import (  # noqa: F401
     _check_evaluating_timeouts,
     _post_commit_retry_is_transient,
     _sweep_post_commit_pending,
+    _recover_childless_evaluating_without_marker,
     _recover_orphaned_tasks,
 )

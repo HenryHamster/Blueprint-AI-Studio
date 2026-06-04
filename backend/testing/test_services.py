@@ -37,6 +37,7 @@ from app.models import (
 from app.routers.agent_status import _check_daily_cost_ceiling
 from app.services import (
     _derive_task_branch,
+    _recover_childless_evaluating_without_marker,
     _recover_orphaned_tasks,
     _run_auto_archive_cycle,
     _sweep_post_commit_pending,
@@ -1825,6 +1826,160 @@ async def test_post_commit_sweep_skips_childed_evaluating_task(svc_db, mocker):
     assert "_post_commit_pending_meta" not in (parent.context or {}), (
         "stale pending meta must be cleared alongside the flag"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _recover_childless_evaluating_without_marker — marker-LESS childless recovery
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_markerless_childless_evaluating_recovered(svc_db, mocker):
+    """A plan parent stranded childless in EVALUATING with NO pending marker (the
+    write-ahead marker was absent/cleared) must still be recovered: it reported
+    COMPLETED (plan_output with subtasks is persisted), is EVALUATING with zero
+    children, and is past the in-flight-spawn grace → re-run the handler."""
+    import uuid as _uuid
+
+    project = await _make_project(svc_db)
+    task_id = _uuid.uuid4()
+    task = Task(
+        id=task_id,
+        project_id=project.id,
+        payloads=[{"type": "plan", "prompt": "decompose"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=False,  # NO marker — the gap this guard closes
+        plan_output={"subtasks": [{"type": "create", "prompt": "do x"}]},
+        # Past the 600s in-flight-spawn grace so it is provably stranded.
+        updated_at=_naive_utc_ago(minutes=20),
+    )
+    svc_db.add(task)
+    await svc_db.commit()
+
+    mock_process = AsyncMock()  # succeed silently
+    mocker.patch("app.routers.agent_status._process_post_commit", mock_process)
+
+    await _recover_childless_evaluating_without_marker()
+
+    mock_process.assert_called_once()
+    assert mock_process.call_args.args[0] == task_id
+    # The synthetic payload re-runs the COMPLETED completion path with the
+    # persisted plan_output round-tripped through logs.
+    synthetic_payload = mock_process.call_args.args[1]
+    assert synthetic_payload.status == TaskStatus.COMPLETED
+    assert "subtasks" in (synthetic_payload.logs or "")
+
+
+@pytest.mark.asyncio
+async def test_markerless_childless_skips_childed_parent(svc_db, mocker):
+    """ZERO-children guard (load-bearing): a marker-less EVALUATING plan parent
+    that ALREADY has a child must NOT be re-run — child creation is atomic, so
+    re-running would duplicate children."""
+    import uuid as _uuid
+
+    project = await _make_project(svc_db)
+    parent_id = _uuid.uuid4()
+    parent = Task(
+        id=parent_id,
+        project_id=project.id,
+        payloads=[{"type": "plan", "prompt": "decompose"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=False,
+        plan_output={"subtasks": [{"type": "create", "prompt": "do x"}]},
+        updated_at=_naive_utc_ago(minutes=20),
+    )
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent_id,
+        payloads=[{"type": "create", "prompt": "do x"}],
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    svc_db.add_all([parent, child])
+    await svc_db.commit()
+
+    mock_process = AsyncMock(
+        side_effect=AssertionError(
+            "must not re-run a childed parent (would duplicate children)"
+        )
+    )
+    mocker.patch("app.routers.agent_status._process_post_commit", mock_process)
+
+    await _recover_childless_evaluating_without_marker()
+    mock_process.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_markerless_childless_skips_within_grace(svc_db, mocker):
+    """Age guard: a parent that JUST flipped to EVALUATING (within the in-flight-
+    spawn grace) must NOT be re-run — the original spawn may still be running and
+    re-running would race it into duplicate children."""
+    import uuid as _uuid
+
+    project = await _make_project(svc_db)
+    task_id = _uuid.uuid4()
+    task = Task(
+        id=task_id,
+        project_id=project.id,
+        payloads=[{"type": "plan", "prompt": "decompose"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=False,
+        plan_output={"subtasks": [{"type": "create", "prompt": "do x"}]},
+        updated_at=_naive_utc_ago(seconds=10),  # fresh — within grace
+    )
+    svc_db.add(task)
+    await svc_db.commit()
+
+    mock_process = AsyncMock(
+        side_effect=AssertionError("must not re-run within the in-flight-spawn grace")
+    )
+    mocker.patch("app.routers.agent_status._process_post_commit", mock_process)
+
+    await _recover_childless_evaluating_without_marker()
+    mock_process.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_markerless_childless_skips_marked_and_no_plan_output(svc_db, mocker):
+    """A row WITH a pending marker is owned by the marker-based loop (skip here, no
+    double-run); a row with NO plan_output never reported a non-empty plan and is
+    skipped (not the COMPLETED-spawn signal)."""
+    import uuid as _uuid
+
+    project = await _make_project(svc_db)
+    marked = Task(
+        id=_uuid.uuid4(),
+        project_id=project.id,
+        payloads=[{"type": "plan", "prompt": "decompose"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=True,  # owned by the marker-based loop
+        plan_output={"subtasks": [{"type": "create", "prompt": "do x"}]},
+        updated_at=_naive_utc_ago(minutes=20),
+    )
+    no_plan = Task(
+        id=_uuid.uuid4(),
+        project_id=project.id,
+        payloads=[{"type": "plan", "prompt": "decompose"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=False,
+        plan_output=None,  # never reported a plan → not a COMPLETED-spawn signal
+        updated_at=_naive_utc_ago(minutes=20),
+    )
+    svc_db.add_all([marked, no_plan])
+    await svc_db.commit()
+
+    mock_process = AsyncMock(
+        side_effect=AssertionError("must not re-run marked or plan-less rows")
+    )
+    mocker.patch("app.routers.agent_status._process_post_commit", mock_process)
+
+    await _recover_childless_evaluating_without_marker()
+    mock_process.assert_not_called()
 
 
 # ══════════════════════════════════════════════════════════════════════════════

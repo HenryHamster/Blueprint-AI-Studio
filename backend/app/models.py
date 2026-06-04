@@ -2055,6 +2055,37 @@ class DigestCacheEntry(SQLModel, table=True):
     )
 
 
+class VmContact(SQLModel, table=True):
+    """Uncontended liveness signal: the last time the orchestrator heard from a VM.
+
+    This exists ONLY to break the false-reap interaction between the heartbeat
+    endpoint and the rollup. The heartbeat handler updates the contended Task
+    row under ``with_for_update(skip_locked=True)``; when the rollup
+    (``rollup_management`` locks all sibling children FOR UPDATE) holds that
+    row, the heartbeat is skipped → ``Task.last_heartbeat`` never advances even
+    though the agent IS alive and calling in. The reaper reads only
+    ``Task.last_heartbeat``, so a lock-starved-but-live VM is misclassified as
+    dead and reaped (AGENT_TIMEOUT) while its work is mid-flight.
+
+    The fix records every backend contact from a VM onto its OWN row here,
+    keyed on ``vm_instance_id`` — never the contended Task row — so the write
+    can never be blocked by the rollup's task-row lock. The reaper then treats
+    a ``last_contact_at`` within the SAME heartbeat-stale cutoff as proof the
+    agent is alive and suppresses the reap; a genuinely dead agent (crashed /
+    preempted / OOM — sends no requests) leaves this row stale or absent and is
+    reaped on the existing schedule. One row per VM, upserted on every contact.
+
+    Created on Postgres by alembic 0142 and on the SQLite test fixture by
+    ``SQLModel.metadata.create_all``.
+    """
+
+    vm_instance_id: str = Field(sa_column=Column(String, primary_key=True))
+    last_contact_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+
+
 class MessageType(str, Enum):
     QUESTION = "QUESTION"
     FEEDBACK = "FEEDBACK"
