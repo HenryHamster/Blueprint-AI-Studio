@@ -160,6 +160,12 @@ async def query_findings_index(
                     "verification_basis": finding.get(
                         "verification_basis", "pattern_inferred"
                     ),
+                    "verification_basis_downgraded_from": finding.get(
+                        "verification_basis_downgraded_from"
+                    ),
+                    "verification_basis_downgrade_reason": finding.get(
+                        "verification_basis_downgrade_reason"
+                    ),
                     "claims": finding.get("claims") or [],
                     "sources": finding.get("sources") or [],
                 }

@@ -745,6 +745,10 @@ def _summarize_outcome_evaluation(oe: dict) -> dict:
 # total carried in ``counts`` (the renderer shows "+N more"). Twelve is enough
 # to surface the conflicts that matter without ever bloating the payload.
 _RECON_LIST_CAP = 12
+# Prompt-facing sample cap for per-direction recent merges. Keep this bounded so
+# the recent-work section stays compact; exact verdict counts are carried
+# separately for reconciliation.
+_RECENT_MERGED_TITLES_CAP = 10
 # Char cap for any direction/gap/capability label echoed into the block.
 _RECON_LABEL_MAXLEN = 120
 
@@ -753,6 +757,7 @@ def _build_cycle_start_reconciliation(
     direction_stats: list[dict],
     problem_model: dict | None,
     active_by_direction: dict[str, int] | None,
+    per_direction_delta: list[dict] | None = None,
 ) -> dict | None:
     """Compute one authoritative cycle-start reconciliation of the strategic surfaces.
 
@@ -783,6 +788,19 @@ def _build_cycle_start_reconciliation(
       * ``direction_pipeline`` — per active direction, whether its research is
         ``research_waiting_on_action`` (findings surfaced but no task in flight),
         ``tasks_in_progress`` (work already moving), or ``idle``.
+      * ``merge_accounting`` — per active direction, where the merge BADGE
+        (which asserts a PR shipped) disagrees with ancestry verification over
+        the same recent merged-title window used for recent-work. Built from the
+        tri-state ``merge_verdict`` already stamped on each
+        ``per_direction_delta[*].recent_merged_titles`` entry, plus the exact
+        verdict counts/sample emitted alongside that visible list (no second
+        GitHub/ancestry pass): ``verified_landed`` (on the integration branch),
+        ``verified_not_landed`` (badge-asserted but ancestry says NOT reachable —
+        the real accounting conflict), and ``unverifiable`` (ancestry could not
+        be confirmed — reported as unknown, NEVER manufactured into a
+        contradiction). Only directions with at least one ``verified_not_landed``
+        title are surfaced as conflicts; the landed/unverifiable tallies ride in
+        ``counts`` so nothing is silently truncated.
 
     Returns ``None`` when there is nothing to reconcile (no active directions and
     no conflicts), so the caller omits the field for cold-start projects. Pure
@@ -794,6 +812,12 @@ def _build_cycle_start_reconciliation(
 
     def _label(text: Any) -> str:
         return str(text or "")[:_RECON_LABEL_MAXLEN]
+
+    def _count_field(container: dict[str, Any], key: str) -> int | None:
+        value = container.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return max(0, value)
 
     # Active directions and the set of gap_ids they reference (forward linkage).
     active_dirs = [
@@ -920,12 +944,92 @@ def _build_cycle_start_reconciliation(
         )
     )
 
+    # 5. Merge-accounting drift: badge-asserted-shipped vs ancestry-verified.
+    # Reuses the tri-state ``merge_verdict`` already stamped on each
+    # ``recent_merged_titles`` entry, plus the exact per-direction verdict
+    # counts/sample carried alongside that visible list (no second GitHub/
+    # ancestry pass). Only a ``verified_not_landed`` title is a real
+    # accounting conflict; ``unverifiable`` is tallied as unknown, never
+    # manufactured into a contradiction.
+    merge_accounting: list[dict] = []
+    merge_landed_total = 0
+    merge_not_landed_total = 0
+    merge_unverifiable_total = 0
+    for delta in per_direction_delta or []:
+        if not isinstance(delta, dict):
+            continue
+        titles = delta.get("recent_merged_titles")
+        titles_list = titles if isinstance(titles, list) else []
+        count_block = (
+            delta.get("recent_merge_verdict_counts")
+            if isinstance(delta.get("recent_merge_verdict_counts"), dict)
+            else None
+        )
+        sampled_titles = delta.get("recent_not_landed_titles")
+        not_landed = (
+            [_label(title) for title in sampled_titles if title is not None]
+            if isinstance(sampled_titles, list)
+            else []
+        )
+        landed_n = (
+            _count_field(count_block, "verified_landed") if count_block else None
+        )
+        not_landed_n = (
+            _count_field(count_block, "verified_not_landed") if count_block else None
+        )
+        unverifiable_n = (
+            _count_field(count_block, "unverifiable") if count_block else None
+        )
+        if landed_n is None or not_landed_n is None or unverifiable_n is None:
+            not_landed = []
+            landed_n = 0
+            not_landed_n = 0
+            unverifiable_n = 0
+            for entry in titles_list:
+                if not isinstance(entry, dict):
+                    continue
+                verdict = entry.get("merge_verdict")
+                if verdict == "verified_not_landed":
+                    not_landed.append(_label(entry.get("title")))
+                    not_landed_n += 1
+                elif verdict == "verified_landed":
+                    landed_n += 1
+                else:
+                    # Absent/unknown verdict → unverifiable, NOT a conflict.
+                    unverifiable_n += 1
+        elif not not_landed:
+            for entry in titles_list:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("merge_verdict") == "verified_not_landed":
+                    not_landed.append(_label(entry.get("title")))
+        merge_landed_total += landed_n
+        merge_not_landed_total += not_landed_n
+        merge_unverifiable_total += unverifiable_n
+        # Surface only directions with a genuine verified-not-landed conflict.
+        if not_landed_n <= 0:
+            continue
+        merge_accounting.append(
+            {
+                "direction_id": delta.get("direction_id"),
+                "direction_text": _label(delta.get("direction_text")),
+                "not_landed_titles": not_landed,
+                "landed": landed_n,
+                "not_landed": not_landed_n,
+                "unverifiable": unverifiable_n,
+            }
+        )
+    merge_accounting.sort(
+        key=lambda m: (-int(m.get("not_landed") or 0), str(m.get("direction_text") or ""))
+    )
+
     # Nothing to reconcile (e.g. a cold-start project): let the caller omit it.
     if (
         not active_dirs
         and not capability_contradictions
         and not orphaned_gaps
         and not deferred_gap_count
+        and not merge_accounting
     ):
         return None
 
@@ -938,12 +1042,24 @@ def _build_cycle_start_reconciliation(
     capped_orphans, orphans_total = _cap(orphaned_gaps)
     capped_ungrounded, ungrounded_total = _cap(ungrounded_directions)
     capped_pipeline, pipeline_dropped = _cap(direction_pipeline)
+    capped_merge, merge_dropped = _cap(merge_accounting)
+    # Cap each surfaced direction's not-landed title list too, preserving the
+    # true count (``not_landed``) so the renderer can show "+N more".
+    for m in capped_merge:
+        full_titles = m["not_landed_titles"]
+        if len(full_titles) > _RECON_LIST_CAP:
+            m["not_landed_titles"] = full_titles[:_RECON_LIST_CAP]
+        shown_titles = m["not_landed_titles"]
+        m["not_landed_titles_overflow"] = max(
+            0, int(m.get("not_landed") or 0) - len(shown_titles)
+        )
 
     return {
         "capability_contradictions": capped_caps,
         "orphaned_gaps": capped_orphans,
         "ungrounded_directions": capped_ungrounded,
         "direction_pipeline": capped_pipeline,
+        "merge_accounting": capped_merge,
         "counts": {
             # True totals (shown + overflow) so the renderer can say "+N more".
             "capability_contradictions": len(capped_caps) + caps_total,
@@ -958,6 +1074,12 @@ def _build_cycle_start_reconciliation(
             ],
             "pipeline_tasks_in_progress": pipeline_counts["tasks_in_progress"],
             "pipeline_idle": pipeline_counts["idle"],
+            # Merge-accounting drift: true direction-with-conflict total (shown +
+            # overflow) plus aggregate landed/not-landed/unverifiable tallies.
+            "merge_accounting": len(capped_merge) + merge_dropped,
+            "merge_landed": merge_landed_total,
+            "merge_not_landed": merge_not_landed_total,
+            "merge_unverifiable": merge_unverifiable_total,
         },
     }
 
@@ -1834,6 +1956,22 @@ async def _build_recent_interventions(
         # work must never be reported as deployed.
         return _on_main_verified.get(task.id, False)
 
+    def _merge_verdict(task: Task) -> str:
+        """Tri-state ancestry verdict for the recent merged-title window.
+
+        ``_on_automain`` is fail-closed: it collapses "ancestry-verified NOT
+        landed" and "ancestry could not be confirmed" into a single ``False``.
+        Cycle-start merge-accounting reconciliation needs to keep these apart —
+        only a verified-not-landed merge is a real accounting conflict, while an
+        unverifiable one must NOT manufacture a contradiction. This reads only
+        the already-populated ``_automain_verified`` map (present True = landed,
+        present False = verified-not-landed, absent = unverifiable), so it adds
+        no second GitHub/ancestry pass.
+        """
+        if task.id in _automain_verified:
+            return "verified_landed" if _automain_verified[task.id] else "verified_not_landed"
+        return "unverifiable"
+
     # For rollups: look up child titles so the agent sees what actually
     # shipped instead of "Rollup of 4 subtasks" + a title.
     merged_parent_ids = {str(t.id) for t in merged_tasks[:limit]}
@@ -1914,20 +2052,49 @@ async def _build_recent_interventions(
         # Each entry is a dict so the agent can distinguish automain-landed from
         # staging-only merges (on_automain=False means rollup not yet merged).
         recent_cutoff = _strategic_cutoff or _24h_ago
-        recent_merges_dicts = [
-            {"title": (t.title or "")[:160], "on_automain": _on_automain(t)}
-            for t in d_tasks
-            if t.status == TaskStatus.COMPLETED
-            and (t.context or {}).get("pr_merged")
-            and (
-                t.updated_at
-                or t.created_at
-                or datetime.min.replace(tzinfo=timezone.utc)
+        recent_merges_dicts: list[dict[str, Any]] = []
+        recent_not_landed_titles: list[str] = []
+        recent_merge_verdict_counts = {
+            "verified_landed": 0,
+            "verified_not_landed": 0,
+            "unverifiable": 0,
+        }
+        for t in d_tasks:
+            if (
+                t.status != TaskStatus.COMPLETED
+                or not (t.context or {}).get("pr_merged")
+                or (
+                    t.updated_at
+                    or t.created_at
+                    or datetime.min.replace(tzinfo=timezone.utc)
+                )
+                < recent_cutoff
+            ):
+                continue
+            merge_verdict = _merge_verdict(t)
+            title = (t.title or "")[:160]
+            recent_merges_dicts.append(
+                {
+                    "title": title,
+                    "on_automain": _on_automain(t),
+                    "merge_verdict": merge_verdict,
+                }
             )
-            >= recent_cutoff
-        ]
+            if merge_verdict not in recent_merge_verdict_counts:
+                merge_verdict = "unverifiable"
+            recent_merge_verdict_counts[merge_verdict] += 1
+            if (
+                merge_verdict == "verified_not_landed"
+                and len(recent_not_landed_titles) < _RECON_LIST_CAP
+            ):
+                recent_not_landed_titles.append(title)
         if recent_merges_dicts:
-            entry["recent_merged_titles"] = recent_merges_dicts[:10]
+            entry["recent_merged_titles"] = recent_merges_dicts[
+                :_RECENT_MERGED_TITLES_CAP
+            ]
+            entry["recent_merge_verdict_counts"] = recent_merge_verdict_counts
+            if recent_not_landed_titles:
+                entry["recent_not_landed_titles"] = recent_not_landed_titles
         per_direction_delta.append(entry)
 
     # Active-by-scope: tasks currently in flight per scope. Surfaced so the
@@ -3596,6 +3763,7 @@ async def _spawn_strategic_review(
         direction_stats,
         _verified_problem_model,
         (recent_interventions or {}).get("active_by_direction"),
+        (recent_interventions or {}).get("per_direction_delta"),
     )
     # Soft size/health signal from the DURABLE pre-trim model so counts are honest
     # (the agent view above is trimmed). Fail-open: None when the durable model

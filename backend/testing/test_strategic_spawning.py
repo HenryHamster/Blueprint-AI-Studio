@@ -6453,6 +6453,170 @@ async def test_on_automain_false_for_root_task_ancestry_api_exception(
     assert merges[0]["on_automain"] is False
 
 
+@pytest.mark.asyncio
+async def test_recent_merged_titles_carry_tristate_merge_verdict(db_session, mocker):
+    """Each recent_merged_titles entry carries a tri-state merge_verdict.
+
+    on_automain is fail-closed (collapses verified-not-landed and unverifiable
+    into False); merge_verdict keeps them apart so cycle-start merge-accounting
+    can flag only the genuine not-landed conflict. Two merged tasks on the same
+    active direction: one ancestry-verified landed, one ancestry-verified NOT
+    landed — both have pr_number, so both are verifiable.
+    """
+    direction_id = "dir-merge-acct"
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[
+            {"id": direction_id, "text": "merge accounting dir", "status": "active"}
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    landed = Task(
+        project_id=project.id,
+        title="Landed on automain",
+        description="ancestor of integration branch",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "pr_number": 301, "direction_id": direction_id},
+    )
+    stranded = Task(
+        project_id=project.id,
+        title="Badge says merged but stranded",
+        description="merge commit NOT an ancestor",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "pr_number": 302, "direction_id": direction_id},
+    )
+    db_session.add_all([landed, stranded])
+    await db_session.commit()
+
+    def _pr_side_effect(token, owner, repo, pr_num, project_id=None):
+        return {
+            301: {"merge_commit_sha": "landed-sha", "head": {"sha": "h1"}},
+            302: {"merge_commit_sha": "stranded-sha", "head": {"sha": "h2"}},
+        }[pr_num]
+
+    def _anc_side_effect(token, owner, repo, sha, ref, project_id=None):
+        return sha == "landed-sha"
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(side_effect=_pr_side_effect),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(side_effect=_anc_side_effect),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+    delta = next(
+        d for d in result["per_direction_delta"] if d["direction_id"] == direction_id
+    )
+    verdicts = {
+        t["title"]: t["merge_verdict"] for t in delta["recent_merged_titles"]
+    }
+    assert verdicts["Landed on automain"] == "verified_landed"
+    assert verdicts["Badge says merged but stranded"] == "verified_not_landed"
+
+
+@pytest.mark.asyncio
+async def test_recent_merged_titles_cap_preserves_full_merge_accounting_counts(
+    db_session, mocker
+):
+    """The visible merge sample stays capped, but reconciliation metadata keeps
+    exact verdict counts and a conflict-title sample from the full window."""
+
+    from app.strategic_spawning import _RECON_LIST_CAP, _RECENT_MERGED_TITLES_CAP
+
+    direction_id = "dir-merge-cap"
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[
+            {"id": direction_id, "text": "merge accounting dir", "status": "active"}
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    base_time = datetime.utcnow()
+    tasks = []
+    for i in range(_RECENT_MERGED_TITLES_CAP + 3):
+        tasks.append(
+            Task(
+                project_id=project.id,
+                title=f"{'landed' if i < _RECENT_MERGED_TITLES_CAP else 'stranded'} {i}",
+                description="merge accounting sample",
+                payloads=[{"type": "create"}],
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                context={
+                    "pr_merged": True,
+                    "pr_number": 400 + i,
+                    "direction_id": direction_id,
+                },
+                created_at=base_time - timedelta(minutes=i + 1),
+                updated_at=base_time - timedelta(minutes=i + 1),
+            )
+        )
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    def _pr_side_effect(token, owner, repo, pr_num, project_id=None):
+        return {
+            "merge_commit_sha": (
+                f"landed-sha-{pr_num}"
+                if pr_num < 400 + _RECENT_MERGED_TITLES_CAP
+                else f"stranded-sha-{pr_num}"
+            ),
+            "head": {"sha": f"h-{pr_num}"},
+        }
+
+    def _anc_side_effect(token, owner, repo, sha, ref, project_id=None):
+        return sha.startswith("landed-sha-")
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(side_effect=_pr_side_effect),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(side_effect=_anc_side_effect),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+    delta = next(
+        d for d in result["per_direction_delta"] if d["direction_id"] == direction_id
+    )
+    assert len(delta["recent_merged_titles"]) == _RECENT_MERGED_TITLES_CAP
+    assert {
+        t["merge_verdict"] for t in delta["recent_merged_titles"]
+    } == {"verified_landed"}
+    assert delta["recent_merge_verdict_counts"] == {
+        "verified_landed": _RECENT_MERGED_TITLES_CAP,
+        "verified_not_landed": 3,
+        "unverifiable": 0,
+    }
+    assert delta["recent_not_landed_titles"] == ["stranded 10", "stranded 11", "stranded 12"]
+    assert len(delta["recent_not_landed_titles"]) <= _RECON_LIST_CAP
+
+
 # ── Per-project integration_branch resolution (column-based) ─────────────────
 
 
@@ -6897,6 +7061,154 @@ class TestBuildCycleStartReconciliation:
         assert out["counts"]["pipeline_waiting_on_action"] == _RECON_LIST_CAP + 3
         assert out["counts"]["pipeline_tasks_in_progress"] == 2
         assert out["counts"]["pipeline_idle"] == 0
+
+    def test_merge_accounting_flags_only_verified_not_landed(self):
+        # Three merged titles within the recent window for one active direction:
+        # one ancestry-verified landed, one badge-asserted-but-NOT-landed, one
+        # unverifiable. Only the verified-not-landed one is a real conflict; the
+        # unverifiable one must NOT manufacture a contradiction.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        # Clean gap linkage so the four pre-existing classes stay empty and the
+        # only signal is merge-accounting drift.
+        pm = {"gaps": [{"id": "g-1", "name": "x", "status": "active"}]}
+        direction_stats = [
+            {"id": "d-1", "status": "active", "text": "shipping dir", "gap_id": "g-1"},
+        ]
+        per_direction_delta = [
+            {
+                "direction_id": "d-1",
+                "direction_text": "shipping dir",
+                "recent_merged_titles": [
+                    {"title": "landed feat", "merge_verdict": "verified_landed"},
+                    {"title": "ghost feat", "merge_verdict": "verified_not_landed"},
+                    {"title": "maybe feat", "merge_verdict": "unverifiable"},
+                ],
+            },
+        ]
+        out = _build_cycle_start_reconciliation(
+            direction_stats, pm, {}, per_direction_delta
+        )
+        assert out is not None
+        acct = out["merge_accounting"]
+        assert len(acct) == 1
+        entry = acct[0]
+        assert entry["direction_id"] == "d-1"
+        assert entry["not_landed"] == 1
+        assert entry["landed"] == 1
+        assert entry["unverifiable"] == 1
+        assert entry["not_landed_titles"] == ["ghost feat"]
+        # The four pre-existing classes are unchanged by the extension.
+        assert out["capability_contradictions"] == []
+        assert out["orphaned_gaps"] == []
+        assert out["ungrounded_directions"] == []
+        # Aggregate tallies carry every bucket so nothing is silently truncated.
+        assert out["counts"]["merge_accounting"] == 1
+        assert out["counts"]["merge_not_landed"] == 1
+        assert out["counts"]["merge_landed"] == 1
+        assert out["counts"]["merge_unverifiable"] == 1
+
+    def test_merge_accounting_landed_and_unverifiable_only_no_conflict(self):
+        # A direction whose recent merges are all verified-landed or unverifiable
+        # has NO accounting conflict — it must not appear in merge_accounting,
+        # though its tallies still ride in counts.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-1", "status": "active", "text": "clean dir"},
+        ]
+        per_direction_delta = [
+            {
+                "direction_id": "d-1",
+                "direction_text": "clean dir",
+                "recent_merged_titles": [
+                    {"title": "a", "merge_verdict": "verified_landed"},
+                    {"title": "b", "merge_verdict": "unverifiable"},
+                    {"title": "c", "merge_verdict": "unverifiable"},
+                ],
+            },
+        ]
+        out = _build_cycle_start_reconciliation(
+            direction_stats, {}, {}, per_direction_delta
+        )
+        assert out is not None
+        assert out["merge_accounting"] == []
+        assert out["counts"]["merge_accounting"] == 0
+        assert out["counts"]["merge_not_landed"] == 0
+        assert out["counts"]["merge_landed"] == 1
+        assert out["counts"]["merge_unverifiable"] == 2
+
+    def test_merge_accounting_absent_when_no_delta(self):
+        # Back-compatible: omitting per_direction_delta yields an empty
+        # merge_accounting list and zero tallies (no second pass invented).
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [{"id": "d-1", "status": "active", "text": "x"}]
+        out = _build_cycle_start_reconciliation(direction_stats, {}, {})
+        assert out is not None
+        assert out["merge_accounting"] == []
+        assert out["counts"]["merge_accounting"] == 0
+        assert out["counts"]["merge_not_landed"] == 0
+
+    def test_merge_accounting_caps_titles_with_true_overflow(self):
+        # A direction with more not-landed titles than the list cap keeps the
+        # true count and reports the overflow on the entry.
+        from app.strategic_spawning import (
+            _build_cycle_start_reconciliation,
+            _RECON_LIST_CAP,
+        )
+
+        titles = [
+            {"title": f"ghost {i}", "merge_verdict": "verified_not_landed"}
+            for i in range(_RECON_LIST_CAP + 4)
+        ]
+        per_direction_delta = [
+            {
+                "direction_id": "d-1",
+                "direction_text": "noisy dir",
+                "recent_merged_titles": titles,
+            },
+        ]
+        out = _build_cycle_start_reconciliation([], {}, {}, per_direction_delta)
+        assert out is not None
+        entry = out["merge_accounting"][0]
+        assert entry["not_landed"] == _RECON_LIST_CAP + 4
+        assert len(entry["not_landed_titles"]) == _RECON_LIST_CAP
+        assert entry["not_landed_titles_overflow"] == 4
+        assert out["counts"]["merge_not_landed"] == _RECON_LIST_CAP + 4
+
+    def test_merge_accounting_uses_exact_counts_beyond_visible_merge_sample(self):
+        from app.strategic_spawning import (
+            _build_cycle_start_reconciliation,
+            _RECENT_MERGED_TITLES_CAP,
+        )
+
+        per_direction_delta = [
+            {
+                "direction_id": "d-1",
+                "direction_text": "noisy dir",
+                "recent_merged_titles": [
+                    {"title": f"landed {i}", "merge_verdict": "verified_landed"}
+                    for i in range(_RECENT_MERGED_TITLES_CAP)
+                ],
+                "recent_merge_verdict_counts": {
+                    "verified_landed": _RECENT_MERGED_TITLES_CAP,
+                    "verified_not_landed": 3,
+                    "unverifiable": 0,
+                },
+                "recent_not_landed_titles": ["ghost 10", "ghost 11", "ghost 12"],
+            },
+        ]
+        out = _build_cycle_start_reconciliation([], {}, {}, per_direction_delta)
+        assert out is not None
+        entry = out["merge_accounting"][0]
+        assert entry["landed"] == _RECENT_MERGED_TITLES_CAP
+        assert entry["not_landed"] == 3
+        assert entry["unverifiable"] == 0
+        assert entry["not_landed_titles"] == ["ghost 10", "ghost 11", "ghost 12"]
+        assert entry["not_landed_titles_overflow"] == 0
+        assert out["counts"]["merge_landed"] == _RECENT_MERGED_TITLES_CAP
+        assert out["counts"]["merge_not_landed"] == 3
 
 
 # ── _build_prune_candidates: concrete cleanup list when the model is heavy ─────
@@ -8292,4 +8604,3 @@ async def test_arm_operator_refresh_persists_excerpt_and_replaces_on_coalesce(
     assert marker2.get("excerpt") == "newer steering content wins"
     # Coalesced into the same single slot (not stacked into a second marker).
     assert marker2.get("count") == 2
-

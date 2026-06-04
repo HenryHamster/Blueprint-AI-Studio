@@ -756,6 +756,8 @@ def format_findings_for_prompt(
     for r in rows[:max_rows]:
         grade = r.get("actionability_grade") or "MEDIUM"
         basis = r.get("verification_basis") or "pattern_inferred"
+        downgraded_from = r.get("verification_basis_downgraded_from")
+        downgrade_reason = r.get("verification_basis_downgrade_reason")
         title = r.get("finding_title") or ""
         desc = (r.get("finding_description") or "")[:_FINDINGS_DESCRIPTION_MAX]
         claims = [str(c) for c in (r.get("claims") or [])[:_FINDINGS_CLAIM_MAX]]
@@ -765,7 +767,12 @@ def format_findings_for_prompt(
             for s in sources[:_FINDINGS_SOURCE_MAX]
             if isinstance(s, dict) and s.get("ref")
         ]
-        line = f"[{grade}/{basis}] {title}: {desc}"
+        prefix = f"[{grade}/{basis}]"
+        if downgraded_from:
+            prefix = f"[{grade}/{basis} downgraded-from={downgraded_from}]"
+        line = f"{prefix} {title}: {desc}"
+        if downgrade_reason:
+            line += f" | downgrade: {downgrade_reason}"
         if claims:
             line += f" | claims: {'; '.join(claims)}"
         if refs:

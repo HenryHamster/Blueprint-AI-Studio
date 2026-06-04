@@ -5329,6 +5329,35 @@ class TestFormatFindingsForPrompt:
         # basis is folded into the grade prefix, not appended as a separate field
         assert "[HIGH/code_verified]" in result
 
+    def test_downgraded_basis_rendered_distinctly(self):
+        from app.strategic_completion import format_findings_for_prompt
+
+        downgraded = self._row(
+            "Stale finding",
+            grade="HIGH",
+            desc="Backed by code reading once",
+            verification_basis="pattern_inferred",
+        )
+        downgraded["verification_basis_downgraded_from"] = "code_verified"
+        downgraded["verification_basis_downgrade_reason"] = (
+            "HEAD validation failed: 1 broken source ref, 0 ungrounded claims"
+        )
+        honest = self._row(
+            "Honest inference",
+            grade="HIGH",
+            desc="Deduction only",
+            verification_basis="pattern_inferred",
+        )
+
+        result = format_findings_for_prompt([downgraded, honest])
+        assert (
+            "[HIGH/pattern_inferred downgraded-from=code_verified] Stale finding:"
+            in result
+        )
+        assert "downgrade: HEAD validation failed: 1 broken source ref, 0 ungrounded claims" in result
+        assert "[HIGH/pattern_inferred] Honest inference:" in result
+        assert "Honest inference" in result and "downgraded-from" not in result.splitlines()[-1]
+
     def test_verification_basis_defaults_when_missing(self):
         from app.strategic_completion import format_findings_for_prompt
 

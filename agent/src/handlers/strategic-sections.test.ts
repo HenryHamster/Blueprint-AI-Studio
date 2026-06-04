@@ -304,6 +304,73 @@ describe('buildCycleStartReconciliationSection', () => {
     expect(result).toContain('+2 more in-progress direction(s) not shown');
     expect(result).toContain('Idle (no findings, no tasks in flight): +5 direction(s) not shown');
   });
+
+  it('surfaces merge-accounting drift, flagging only verified-not-landed titles', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      direction_pipeline: [],
+      merge_accounting: [{
+        direction_id: 'd-drift',
+        direction_text: 'shipping dir',
+        not_landed_titles: ['ghost feat'],
+        not_landed_titles_overflow: 0,
+        landed: 2,
+        not_landed: 1,
+        unverifiable: 1,
+      }],
+      counts: {
+        merge_accounting: 1,
+        merge_landed: 2,
+        merge_not_landed: 1,
+        merge_unverifiable: 1,
+      },
+    });
+    expect(result).toContain('Merge-accounting drift — badge says shipped, ancestry says NOT landed (1 direction(s), 1 title(s); 1 unverifiable)');
+    expect(result).toContain('shipping dir (id: d-drift) — 1 NOT landed, 2 landed, 1 unverifiable');
+    expect(result).toContain('✗ ghost feat');
+  });
+
+  it('does not render merge-accounting when there are no not-landed conflicts', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      direction_pipeline: [],
+      merge_accounting: [],
+      // Only landed + unverifiable tallies — no conflict to surface.
+      counts: { merge_accounting: 0, merge_landed: 3, merge_not_landed: 0, merge_unverifiable: 2 },
+    });
+    expect(result).not.toContain('Merge-accounting drift');
+  });
+
+  it('shows "+N more" tails for capped merge-accounting titles and directions', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      direction_pipeline: [],
+      merge_accounting: [{
+        direction_id: 'd-1',
+        direction_text: 'noisy dir',
+        not_landed_titles: ['ghost 0', 'ghost 1'],
+        not_landed_titles_overflow: 3,
+        landed: 0,
+        not_landed: 5,
+        unverifiable: 0,
+      }],
+      counts: {
+        merge_accounting: 4,
+        merge_landed: 0,
+        merge_not_landed: 5,
+        merge_unverifiable: 0,
+      },
+    });
+    expect(result).toContain('noisy dir (id: d-1) — 5 NOT landed, 0 landed, 0 unverifiable');
+    expect(result).toContain('+3 more not-landed title(s) not shown');
+    expect(result).toContain('+3 more direction(s) with drift not shown');
+  });
 });
 
 describe('buildPruneCandidatesSection', () => {

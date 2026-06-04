@@ -178,6 +178,14 @@ def _reconcile_verification_basis(
         return False
     if not broken_provenance and not ungrounded:
         return False
+    broken_count = int((broken_provenance or {}).get("broken_source_ref_count", 0) or 0)
+    ungrounded_count = int((ungrounded or {}).get("ungrounded_claim_count", 0) or 0)
+    finding["verification_basis_downgraded_from"] = current
+    finding["verification_basis_downgrade_reason"] = (
+        "HEAD validation failed: "
+        f"{broken_count} broken source ref{'s' if broken_count != 1 else ''}, "
+        f"{ungrounded_count} ungrounded claim{'s' if ungrounded_count != 1 else ''}"
+    )
     finding["verification_basis"] = _DOWNGRADED_VERIFICATION_BASIS
     logger.info(
         "[RESEARCH] Capping verification_basis %s→%s for '%s' "
@@ -185,8 +193,8 @@ def _reconcile_verification_basis(
         current,
         _DOWNGRADED_VERIFICATION_BASIS,
         finding.get("title", "<untitled>"),
-        int((broken_provenance or {}).get("broken_source_ref_count", 0) or 0),
-        int((ungrounded or {}).get("ungrounded_claim_count", 0) or 0),
+        broken_count,
+        ungrounded_count,
     )
     return True
 

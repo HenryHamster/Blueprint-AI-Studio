@@ -424,12 +424,20 @@ class TestVerificationBasisHeadReconciliation:
         broken = {"broken_source_ref_count": 1, "broken_refs": ["app/gone.py"]}
         assert _reconcile_verification_basis(f, broken, None) is True
         assert f["verification_basis"] == "pattern_inferred"
+        assert f["verification_basis_downgraded_from"] == "code_verified"
+        assert f["verification_basis_downgrade_reason"] == (
+            "HEAD validation failed: 1 broken source ref, 0 ungrounded claims"
+        )
 
     def test_path_verified_with_ungrounded_claim_downgrades(self):
         f = {"title": "ungrounded", "verification_basis": "path_verified"}
         ungrounded = {"ungrounded_claim_count": 2, "ungrounded_refs": ["app/x.py:foo"]}
         assert _reconcile_verification_basis(f, None, ungrounded) is True
         assert f["verification_basis"] == "pattern_inferred"
+        assert f["verification_basis_downgraded_from"] == "path_verified"
+        assert f["verification_basis_downgrade_reason"] == (
+            "HEAD validation failed: 0 broken source refs, 2 ungrounded claims"
+        )
 
     def test_clean_citations_preserve_high_basis(self):
         f = {"title": "clean", "verification_basis": "code_verified"}

@@ -232,6 +232,40 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     }
   }
 
+  // Merge-accounting drift: the merge badge asserts a PR shipped, but ancestry
+  // verification over the same recent window says the merge commit is NOT
+  // reachable from the integration branch. Only verified-not-landed surfaces as
+  // a conflict; unverifiable items are counted (so nothing is silently dropped)
+  // but never treated as a contradiction.
+  const mergeAccounting = Array.isArray(recon.merge_accounting)
+    ? recon.merge_accounting as Array<Record<string, unknown>> : [];
+  const mergeNotLandedTotal = countOr(counts.merge_not_landed, 0);
+  const mergeUnverifiableTotal = countOr(counts.merge_unverifiable, 0);
+  const mergeDirTotal = countOr(counts.merge_accounting, mergeAccounting.length);
+  if (mergeAccounting.length > 0 || mergeNotLandedTotal > 0) {
+    lines.push(`\n### Merge-accounting drift — badge says shipped, ancestry says NOT landed (${mergeDirTotal} direction(s), ${mergeNotLandedTotal} title(s); ${mergeUnverifiableTotal} unverifiable)`);
+    lines.push('The merge badge marked these PRs shipped, but an ancestry check against the integration branch shows the merge commit is NOT reachable — the work did not actually land. Reconcile before crediting these directions. Unverifiable items (ancestry could not be confirmed) are tallied but are NOT treated as conflicts.');
+    for (const m of mergeAccounting) {
+      const text = strVal(m.direction_text as string, '?');
+      const did = strVal(m.direction_id as string, '?');
+      const notLanded = countOr(m.not_landed, 0);
+      const landed = countOr(m.landed, 0);
+      const unverifiable = countOr(m.unverifiable, 0);
+      const titles = Array.isArray(m.not_landed_titles) ? m.not_landed_titles as string[] : [];
+      const titlesOverflow = countOr(m.not_landed_titles_overflow, 0);
+      lines.push(`- ${text} (id: ${did}) — ${notLanded} NOT landed, ${landed} landed, ${unverifiable} unverifiable`);
+      for (const t of titles) {
+        lines.push(`  - ✗ ${strVal(t, '?')}`);
+      }
+      if (titlesOverflow > 0) {
+        lines.push(`  - +${titlesOverflow} more not-landed title(s) not shown`);
+      }
+    }
+    if (mergeDirTotal > mergeAccounting.length) {
+      lines.push(`- +${mergeDirTotal - mergeAccounting.length} more direction(s) with drift not shown`);
+    }
+  }
+
   return lines.join('\n');
 }
 
