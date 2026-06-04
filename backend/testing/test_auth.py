@@ -252,3 +252,54 @@ class TestLastLoginThrottleAndBestEffort:
 
         session.commit.assert_awaited_once()
         session.rollback.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_set_local_lock_timeout_is_a_literal_not_a_bind_param(self):
+        """Regression: asyncpg cannot bind a parameter into SET LOCAL (it is not a
+        preparable statement), so a bound ``:t`` rendered as ``$1`` 500-flooded
+        EVERY authenticated request on Postgres ("syntax error at or near $1").
+        The lock_timeout must be inlined as a literal, and only on Postgres."""
+        session = MagicMock()
+        session.execute = AsyncMock()
+        session.add = MagicMock()
+        session.commit = AsyncMock()
+        session.rollback = AsyncMock()
+        user = AllowedUser(email="pg@example.com", role="user")
+
+        with patch("app.auth.resolve_dialect_name", return_value="postgresql"):
+            await _persist_auth_metadata_best_effort(session, user)
+
+        # The SET LOCAL statement must have been issued with NO bound parameters
+        # and the timeout inlined as a quoted literal.
+        set_local_calls = [
+            call.args[0]
+            for call in session.execute.call_args_list
+            if "SET LOCAL" in str(call.args[0])
+        ]
+        assert set_local_calls, "expected a SET LOCAL lock_timeout on Postgres"
+        stmt = set_local_calls[0]
+        assert "'1s'" in str(stmt.text)
+        assert ":t" not in str(stmt.text) and "$1" not in str(stmt.text)
+        # No second positional (the bound-params dict) was passed.
+        for call in session.execute.call_args_list:
+            assert len(call.args) == 1, "SET LOCAL must carry no bind params"
+
+    @pytest.mark.asyncio
+    async def test_set_local_skipped_on_non_postgres_dialect(self):
+        """On SQLite (and other test dialects) there is no lock_timeout GUC, so
+        the SET LOCAL is skipped entirely — the metadata write still commits."""
+        session = MagicMock()
+        session.execute = AsyncMock()
+        session.add = MagicMock()
+        session.commit = AsyncMock()
+        session.rollback = AsyncMock()
+        user = AllowedUser(email="sqlite@example.com", role="user")
+
+        with patch("app.auth.resolve_dialect_name", return_value="sqlite"):
+            await _persist_auth_metadata_best_effort(session, user)
+
+        assert not any(
+            "SET LOCAL" in str(call.args[0])
+            for call in session.execute.call_args_list
+        ), "SET LOCAL must not be issued on non-Postgres dialects"
+        session.commit.assert_awaited_once()
