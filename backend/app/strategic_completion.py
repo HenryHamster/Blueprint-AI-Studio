@@ -739,15 +739,22 @@ def format_findings_for_prompt(
 ) -> str:
     """Format query_findings_index rows as a compact prompt block.
 
-    Returns a newline-separated string with one finding per line: grade, title,
-    truncated description, top claims, and source refs.  Empty string when rows
-    is empty.  Suitable for embedding in a strategic synthesis prompt.
+    Returns a newline-separated string with one finding per line: grade,
+    verification basis, title, truncated description, top claims, and source
+    refs.  Empty string when rows is empty.  Suitable for embedding in a
+    strategic synthesis prompt.
+
+    The verification_basis (e.g. code_verified vs pattern_inferred) is rendered
+    alongside the actionability grade so the strategist can weight a finding
+    verified against HEAD differently from one merely asserted.  It is a
+    weighting signal only — rows are never filtered out by basis.
     """
     if not rows:
         return ""
     lines: list[str] = []
     for r in rows[:max_rows]:
         grade = r.get("actionability_grade") or "MEDIUM"
+        basis = r.get("verification_basis") or "pattern_inferred"
         title = r.get("finding_title") or ""
         desc = (r.get("finding_description") or "")[:_FINDINGS_DESCRIPTION_MAX]
         claims = [str(c) for c in (r.get("claims") or [])[:_FINDINGS_CLAIM_MAX]]
@@ -757,7 +764,7 @@ def format_findings_for_prompt(
             for s in sources[:_FINDINGS_SOURCE_MAX]
             if isinstance(s, dict) and s.get("ref")
         ]
-        line = f"[{grade}] {title}: {desc}"
+        line = f"[{grade}/{basis}] {title}: {desc}"
         if claims:
             line += f" | claims: {'; '.join(claims)}"
         if refs:

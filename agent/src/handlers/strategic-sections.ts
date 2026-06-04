@@ -78,41 +78,6 @@ export function buildDriftSection(driftSignals: Record<string, unknown> | null):
   return lines.join('\n');
 }
 
-export function buildGapDirectionLinkageSection(linkageAudit: Record<string, unknown> | undefined): string {
-  if (!linkageAudit || typeof linkageAudit !== 'object') return '';
-  const orphanedGaps = Array.isArray(linkageAudit.orphaned_gaps)
-    ? linkageAudit.orphaned_gaps as Array<Record<string, unknown>>
-    : [];
-  const ungroundedDirections = Array.isArray(linkageAudit.ungrounded_directions)
-    ? linkageAudit.ungrounded_directions as Array<Record<string, unknown>>
-    : [];
-  if (orphanedGaps.length === 0 && ungroundedDirections.length === 0) return '';
-
-  const lines: string[] = ['\n## Gap-Direction Alignment'];
-  lines.push('A single-pass audit of the linkage between problem-model gaps and active directions. **Orphaned gaps** are known problems with no active direction working on them — the strategy has stopped pushing on them. **Ungrounded directions** are active effort with no documented gap behind them — work without a stated problem. This is advisory, not a defect list.');
-  lines.push('STEERING: For each orphaned gap, either create a direction targeting it or explicitly acknowledge (in your reasoning / the gap history) that it is intentionally on hold. For each ungrounded direction, either link it to an existing gap (set its gap_id) or propose a new gap that captures the problem it addresses.');
-
-  if (orphanedGaps.length > 0) {
-    lines.push('\n### Orphaned gaps (no active direction)');
-    for (const g of orphanedGaps) {
-      const gid = strVal(g.id as string, '?');
-      const name = strVal(g.name as string, '(unnamed)');
-      lines.push(`- ${gid}: ${name}`);
-    }
-  }
-
-  if (ungroundedDirections.length > 0) {
-    lines.push('\n### Ungrounded directions (no documented gap)');
-    for (const d of ungroundedDirections) {
-      const did = strVal(d.id as string, '?');
-      const text = strVal(d.text as string, '(no text)');
-      lines.push(`- ${did}: ${text}`);
-    }
-  }
-
-  return lines.join('\n');
-}
-
 export function buildCapabilityVerificationSection(problemModel: Record<string, unknown> | undefined): string {
   if (!problemModel || typeof problemModel !== 'object') return '';
   const capabilities = Array.isArray(problemModel.capabilities)
@@ -188,20 +153,25 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
       const stored = strVal(c.stored_status as string, '?');
       const effective = strVal(c.effective_status as string, '?');
       const missing = Array.isArray(c.missing) ? c.missing as string[] : [];
+      const missingTotal = typeof c.missing_total === 'number' ? c.missing_total : missing.length;
+      const missingOverflow = Math.max(0, missingTotal - missing.length);
       const missTail = missing.length > 0 ? ` — missing: ${missing.join(', ')}` : '';
-      lines.push(`- **${name}**: stored=${stored} but code shows ${effective.toUpperCase()}${missTail}`);
+      const overflowTail = missingOverflow > 0 ? ` (+${missingOverflow} more not shown)` : '';
+      lines.push(`- **${name}**: stored=${stored} but code shows ${effective.toUpperCase()}${missTail}${overflowTail}`);
     }
   }
 
-  // Active gaps with no direction working them and no intentional deferral.
+  // Open gaps (active or blocked) with no direction working them and no
+  // intentional deferral. Blocked orphans are flagged so they read distinctly.
   if (orphanedGaps.length > 0) {
-    lines.push(`\n### Orphaned active gaps — open, unstaffed, not deferred (${fmtScalar(counts.orphaned_gaps, String(orphanedGaps.length))})`);
+    lines.push(`\n### Orphaned open gaps — unstaffed, not deferred (${fmtScalar(counts.orphaned_gaps, String(orphanedGaps.length))})`);
     lines.push('No active direction advances these and no deferral is recorded. Open a direction, defer the gap explicitly, or close it.');
     for (const g of orphanedGaps) {
       const name = strVal(g.name as string, 'Unnamed gap');
       const gid = strVal(g.gap_id as string, '?');
       const priority = strVal(g.priority as string, 'medium');
-      lines.push(`- **${name}** [${priority}] (gap ${gid})`);
+      const statusTail = strVal(g.status as string, 'active') === 'blocked' ? ' — BLOCKED' : '';
+      lines.push(`- **${name}** [${priority}] (gap ${gid})${statusTail}`);
     }
   }
 
@@ -263,6 +233,85 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
   }
 
   return lines.join('\n');
+}
+
+export function buildPruneCandidatesSection(prune: Record<string, unknown> | undefined): string {
+  if (!prune || typeof prune !== 'object') return '';
+
+  const resolvedGaps = Array.isArray(prune.resolved_gaps)
+    ? prune.resolved_gaps as Array<Record<string, unknown>> : [];
+  const absentCaps = Array.isArray(prune.absent_capabilities)
+    ? prune.absent_capabilities as Array<Record<string, unknown>> : [];
+  const expiredHolds = Array.isArray(prune.expired_holds)
+    ? prune.expired_holds as Array<Record<string, unknown>> : [];
+  if (resolvedGaps.length === 0 && absentCaps.length === 0 && expiredHolds.length === 0) return '';
+
+  const counts = (prune.counts && typeof prune.counts === 'object')
+    ? prune.counts as Record<string, unknown> : {};
+  const status = strVal(prune.model_size_status as string, 'large');
+
+  const lines: string[] = ['\n## Concrete prune candidates (model is ' + status + ')'];
+  lines.push(
+    'The problem model is **' + status + '** and only shrinks when you explicitly close/archive entries. ' +
+    'These specific entries are resolved-in-fact-but-still-open, drawn from signals the backend already has. ' +
+    'This is an advisory suggestion list — never an auto-deletion. Closing/consolidating these is a one-cycle move to shrink the model.'
+  );
+
+  // Active gaps whose work landed or stopped, yet the gap is still open.
+  if (resolvedGaps.length > 0) {
+    lines.push(`\n### Resolved-yet-open gaps (${fmtScalar(counts.resolved_gaps, String(resolvedGaps.length))})`);
+    lines.push('Active gaps whose direction has retired or shipped merged PRs — the work is done or abandoned but the gap is still open. Close or archive these.');
+    for (const g of resolvedGaps) {
+      const name = strVal(g.name as string, 'Unnamed gap');
+      const gid = strVal(g.gap_id as string, '?');
+      const reason = strVal(g.reason as string) === 'direction_shipped'
+        ? 'its direction shipped merged PRs'
+        : 'its direction was retired';
+      const dirs = Array.isArray(g.directions) ? (g.directions as string[]).join(', ') : '';
+      const dirTail = dirs ? ` [${dirs}]` : '';
+      lines.push(`- **${name}** (gap ${gid}) — ${reason}${dirTail}`);
+    }
+    if (resolvedGaps.length > 0 && countOrLocal(counts.resolved_gaps, resolvedGaps.length) > resolvedGaps.length) {
+      lines.push(`- +${countOrLocal(counts.resolved_gaps, resolvedGaps.length) - resolvedGaps.length} more not shown`);
+    }
+  }
+
+  // Capabilities the grounded file-tree check says are gone.
+  if (absentCaps.length > 0) {
+    lines.push(`\n### Claimed-but-absent capabilities (${fmtScalar(counts.absent_capabilities, String(absentCaps.length))})`);
+    lines.push('The grounded file-tree check shows the backing code does not exist. These are stale assertions safe to consolidate or drop.');
+    for (const c of absentCaps) {
+      const name = strVal(c.name as string, 'Unnamed capability');
+      const stored = strVal(c.stored_status as string, '?');
+      lines.push(`- **${name}** (stored status=${stored}) — code is absent`);
+    }
+    if (countOrLocal(counts.absent_capabilities, absentCaps.length) > absentCaps.length) {
+      lines.push(`- +${countOrLocal(counts.absent_capabilities, absentCaps.length) - absentCaps.length} more not shown`);
+    }
+  }
+
+  // Gaps whose deferral hold has elapsed — due for a decision.
+  if (expiredHolds.length > 0) {
+    lines.push(`\n### Expired deferral holds (${fmtScalar(counts.expired_holds, String(expiredHolds.length))})`);
+    lines.push('Active gaps whose deferral hold_until has already passed — the hold you set has elapsed, so each is due for a decision (resume, re-defer, or close).');
+    for (const g of expiredHolds) {
+      const name = strVal(g.name as string, 'Unnamed gap');
+      const gid = strVal(g.gap_id as string, '?');
+      const until = strVal(g.hold_until as string, '?');
+      lines.push(`- **${name}** (gap ${gid}) — hold expired ${until}`);
+    }
+    if (countOrLocal(counts.expired_holds, expiredHolds.length) > expiredHolds.length) {
+      lines.push(`- +${countOrLocal(counts.expired_holds, expiredHolds.length) - expiredHolds.length} more not shown`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+function countOrLocal(value: unknown, fallback: number): number {
+  if (typeof value === 'number') return value;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 export function buildOutcomeSection(outcomeEval: Record<string, unknown> | undefined): string {

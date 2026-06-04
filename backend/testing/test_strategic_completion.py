@@ -5276,14 +5276,25 @@ class TestBuildOutcomeEvaluationEvidence:
 class TestFormatFindingsForPrompt:
     """format_findings_for_prompt: compact prompt block from query_findings_index rows."""
 
-    def _row(self, title, grade="MEDIUM", desc="", claims=None, sources=None):
-        return {
+    def _row(
+        self,
+        title,
+        grade="MEDIUM",
+        desc="",
+        claims=None,
+        sources=None,
+        verification_basis="pattern_inferred",
+    ):
+        row = {
             "finding_title": title,
             "finding_description": desc,
             "actionability_grade": grade,
             "claims": claims or [],
             "sources": sources or [],
         }
+        if verification_basis is not None:
+            row["verification_basis"] = verification_basis
+        return row
 
     def test_empty_rows_returns_empty_string(self):
         from app.strategic_completion import format_findings_for_prompt
@@ -5293,11 +5304,40 @@ class TestFormatFindingsForPrompt:
     def test_single_row_no_claims_no_sources(self):
         from app.strategic_completion import format_findings_for_prompt
 
-        row = self._row("Title A", grade="HIGH", desc="Some description")
+        row = self._row(
+            "Title A",
+            grade="HIGH",
+            desc="Some description",
+            verification_basis="code_verified",
+        )
         result = format_findings_for_prompt([row])
-        assert "[HIGH] Title A: Some description" in result
+        assert "[HIGH/code_verified] Title A: Some description" in result
         assert "claims" not in result
         assert "sources" not in result
+
+    def test_verification_basis_rendered(self):
+        from app.strategic_completion import format_findings_for_prompt
+
+        row = self._row(
+            "Verified finding",
+            grade="HIGH",
+            desc="Backed by code reading",
+            verification_basis="code_verified",
+        )
+        result = format_findings_for_prompt([row])
+        assert "code_verified" in result
+        # basis is folded into the grade prefix, not appended as a separate field
+        assert "[HIGH/code_verified]" in result
+
+    def test_verification_basis_defaults_when_missing(self):
+        from app.strategic_completion import format_findings_for_prompt
+
+        # A row without the verification_basis key falls back to pattern_inferred,
+        # mirroring the findings-index default.
+        row = self._row("No basis", grade="LOW", verification_basis=None)
+        assert "verification_basis" not in row
+        result = format_findings_for_prompt([row])
+        assert "[LOW/pattern_inferred]" in result
 
     def test_row_with_claims_and_sources(self):
         from app.strategic_completion import format_findings_for_prompt

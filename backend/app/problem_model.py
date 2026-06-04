@@ -523,11 +523,15 @@ ModelSizeStatus = Literal["healthy", "growing", "large", "oversized"]
 # the estimate exists only to give the thinker a rough sense of how heavy the
 # model is to read, never as a precise budget. A gap costs a base (name +
 # description + evidence) plus a per-history-event increment; capabilities and
-# friction items each cost a flat approximate amount.
+# friction items each cost a flat approximate amount. Text content in free-form
+# fields (descriptions, evidence, notes) is approximated by dividing byte count
+# by TEXT_BYTES_PER_TOKEN to avoid models with verbose entries masquerading as
+# healthy.
 _TOKENS_PER_GAP_BASE = 60
 _TOKENS_PER_GAP_HISTORY_ENTRY = 20
 _TOKENS_PER_CAPABILITY = 25
 _TOKENS_PER_FRICTION = 30
+_TEXT_BYTES_PER_TOKEN = 4  # Rough estimate: 1 token ≈ 4 characters
 
 
 def _dimension_status(count: int, healthy: int) -> ModelSizeStatus:
@@ -550,7 +554,7 @@ def compute_model_size_signal(model: ProblemModel) -> dict[str, Any]:
     DURABLE model, not the trimmed agent view, so counts are honest) and
     returns a small dict the strategic payload injects under ``model_health``:
 
-      - ``active_gap_count`` — number of active gaps (``archived_gaps`` excluded)
+      - ``active_gap_count`` — number of active gaps (status=='active', archived_gaps excluded)
       - ``capability_count`` — number of capabilities
       - ``active_friction_count`` — friction items with ``status == 'active'``
       - ``estimated_token_footprint`` — an EXPLICITLY APPROXIMATE estimate of how
@@ -564,19 +568,30 @@ def compute_model_size_signal(model: ProblemModel) -> dict[str, Any]:
     healthy thresholds and multipliers are exported as module constants so the
     agent prompt can cite the same numbers.
     """
-    active_gaps = model.gaps  # gaps already excludes archived_gaps
+    active_gaps = [g for g in model.gaps if g.status == "active"]
     active_gap_count = len(active_gaps)
     capability_count = len(model.capabilities)
     active_friction_count = sum(1 for f in model.friction if f.status == "active")
 
-    # Approximate token footprint — monotonic in gap count via the per-gap base.
+    # Approximate token footprint — includes both entry count and text content.
+    # Text content is approximated via byte length divided by TEXT_BYTES_PER_TOKEN
+    # so a model with verbose entries scores higher than one with terse entries.
     estimated_token_footprint = (
         sum(
-            _TOKENS_PER_GAP_BASE + len(g.history) * _TOKENS_PER_GAP_HISTORY_ENTRY
+            _TOKENS_PER_GAP_BASE
+            + len(g.history) * _TOKENS_PER_GAP_HISTORY_ENTRY
+            + (len(g.description) + len(g.evidence)) // _TEXT_BYTES_PER_TOKEN
             for g in active_gaps
         )
-        + capability_count * _TOKENS_PER_CAPABILITY
-        + active_friction_count * _TOKENS_PER_FRICTION
+        + sum(
+            _TOKENS_PER_CAPABILITY + (len(c.notes or "") // _TEXT_BYTES_PER_TOKEN)
+            for c in model.capabilities
+        )
+        + sum(
+            _TOKENS_PER_FRICTION + (len(f.description) // _TEXT_BYTES_PER_TOKEN)
+            for f in model.friction
+            if f.status == "active"
+        )
     )
 
     statuses = (

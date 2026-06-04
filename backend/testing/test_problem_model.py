@@ -1976,6 +1976,19 @@ def test_model_size_signal_excludes_archived_gaps():
     assert sig["model_size_status"] == "healthy"
 
 
+def test_model_size_signal_excludes_blocked_gaps():
+    """Blocked gaps are intentionally parked work, not active load — they must not
+    inflate the active_gap_count or drive the status toward large/oversized."""
+    active = [Gap(id=f"g-active-{i}", name=f"active {i}", status="active") for i in range(3)]
+    blocked = [Gap(id=f"g-blocked-{i}", name=f"blocked {i}", status="blocked") for i in range(10)]
+    model = ProblemModel(gaps=active + blocked)
+    sig = compute_model_size_signal(model)
+    # Only the 3 active gaps count; the 10 blocked are excluded.
+    assert sig["active_gap_count"] == 3
+    # Status should be healthy based on 3 active gaps, not large based on 13 total.
+    assert sig["model_size_status"] == "healthy"
+
+
 def test_model_size_signal_counts_only_active_friction():
     model = ProblemModel(friction=_friction(n_active=2, n_other=40))
     sig = compute_model_size_signal(model)
@@ -2034,3 +2047,52 @@ def test_model_size_signal_footprint_positive_and_monotonic():
     big = compute_model_size_signal(ProblemModel(gaps=_gaps(10)))["estimated_token_footprint"]
     assert small > 0
     assert big > small
+
+
+def test_model_size_signal_footprint_includes_text_content():
+    terse_gap = Gap(id="g-terse", name="x", description="brief", evidence="")
+    verbose_gap = Gap(
+        id="g-verbose",
+        name="x",
+        description="This is a detailed description with lots of context about the gap. " * 5,
+        evidence="Additional evidence and supporting details that provide substantive information. " * 5,
+    )
+    terse_model = ProblemModel(gaps=[terse_gap])
+    verbose_model = ProblemModel(gaps=[verbose_gap])
+
+    terse_footprint = compute_model_size_signal(terse_model)["estimated_token_footprint"]
+    verbose_footprint = compute_model_size_signal(verbose_model)["estimated_token_footprint"]
+    # Same gap count (1), but verbose has much more text — footprint must reflect it.
+    assert verbose_footprint > terse_footprint
+
+
+def test_model_size_signal_footprint_includes_capability_notes():
+    terse_cap = Capability(name="cap-terse", status="working", notes="brief")
+    verbose_cap = Capability(
+        name="cap-verbose",
+        status="working",
+        notes="Detailed notes about this capability including implementation details "
+        "and architectural considerations. " * 5,
+    )
+    terse_model = ProblemModel(capabilities=[terse_cap])
+    verbose_model = ProblemModel(capabilities=[verbose_cap])
+
+    terse_footprint = compute_model_size_signal(terse_model)["estimated_token_footprint"]
+    verbose_footprint = compute_model_size_signal(verbose_model)["estimated_token_footprint"]
+    assert verbose_footprint > terse_footprint
+
+
+def test_model_size_signal_footprint_includes_friction_description():
+    terse_friction = Friction(id="f-terse", name="x", description="brief")
+    verbose_friction = Friction(
+        id="f-verbose",
+        name="x",
+        description="Detailed friction description explaining the blocker and its impact "
+        "on the project. " * 5,
+    )
+    terse_model = ProblemModel(friction=[terse_friction])
+    verbose_model = ProblemModel(friction=[verbose_friction])
+
+    terse_footprint = compute_model_size_signal(terse_model)["estimated_token_footprint"]
+    verbose_footprint = compute_model_size_signal(verbose_model)["estimated_token_footprint"]
+    assert verbose_footprint > terse_footprint

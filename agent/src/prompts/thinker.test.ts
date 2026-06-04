@@ -64,7 +64,6 @@ describe('buildThinkerPrompt', () => {
     modelHealthSection: '',
     systemMaturitySection: '',
     driftSection: '',
-    linkageAuditSection: '',
     recentWorkSection: '',
     feedbackSection: '',
     threadSection: '',
@@ -135,6 +134,20 @@ describe('buildThinkerPrompt', () => {
   it('omits cycleStartReconciliationSection when empty', () => {
     const prompt = buildThinkerPrompt({ ...base, cycleStartReconciliationSection: '' });
     expect(prompt).not.toContain('## Cycle-start reconciliation');
+  });
+
+  it('renders pruneCandidatesSection content when provided', () => {
+    const prompt = buildThinkerPrompt({
+      ...base,
+      pruneCandidatesSection: '\n## Concrete prune candidates (model is oversized)\nclose g-ret\n',
+    });
+    expect(prompt).toContain('## Concrete prune candidates (model is oversized)');
+    expect(prompt).toContain('close g-ret');
+  });
+
+  it('omits pruneCandidatesSection when absent or empty', () => {
+    expect(buildThinkerPrompt(base)).not.toContain('## Concrete prune candidates');
+    expect(buildThinkerPrompt({ ...base, pruneCandidatesSection: '' })).not.toContain('## Concrete prune candidates');
   });
 
   it('problem_model section uses bootstrap text when problemModelSection signals empty', () => {
@@ -268,14 +281,6 @@ describe('buildThinkerPrompt', () => {
 
     const without = buildThinkerPrompt({ ...base, driftSection: '' });
     expect(without).not.toContain('## Drift Signals');
-  });
-
-  it('gap-direction linkage section rendered only when linkageAuditSection is non-empty', () => {
-    const with_ = buildThinkerPrompt({ ...base, linkageAuditSection: '\n## Gap-Direction Alignment\norphaned\n' });
-    expect(with_).toContain('## Gap-Direction Alignment');
-
-    const without = buildThinkerPrompt({ ...base, linkageAuditSection: '' });
-    expect(without).not.toContain('## Gap-Direction Alignment');
   });
 
   it('running_update superseded note rendered only when runningUpdateSupersededSection is non-empty', () => {
@@ -581,7 +586,6 @@ describe('buildThinkerPrompt on_automain annotation', () => {
     modelHealthSection: '',
     systemMaturitySection: '',
     driftSection: '',
-    linkageAuditSection: '',
     recentWorkSection: '',
     feedbackSection: '',
     threadSection: '',
@@ -640,7 +644,6 @@ describe('buildThinkerPrompt + renderStrategicPromptSuffix (strategic handler co
     modelHealthSection: '',
     systemMaturitySection: '',
     driftSection: '',
-    linkageAuditSection: '',
     recentWorkSection: '',
     feedbackSection: '',
     threadSection: '',

@@ -133,6 +133,63 @@ MEDIUM_EXPLORATION_FLOOR = 0.05
 # than stampeding memo creation.
 MEMO_SPAWN_CAP_PER_CYCLE = 5
 
+# Verification-basis tiers, ordered from highest evidence (the finding's claim
+# was checked against real code) to lowest (asserted/deduced). Defined once here
+# so the normalization and the HEAD-reconciliation below share a single source
+# of truth instead of repeating the literal tier strings.
+VERIFICATION_BASIS_TIERS = (
+    "code_verified",
+    "path_verified",
+    "pattern_inferred",
+    "deduced",
+)
+VALID_VERIFICATION_BASES = frozenset(VERIFICATION_BASIS_TIERS)
+# Tiers that assert the finding was verified against real code. A self-reported
+# value in this set is only honest if the finding's own citations resolve at
+# HEAD; when they don't, it is capped to _DOWNGRADED_VERIFICATION_BASIS.
+_HIGH_EVIDENCE_BASES = frozenset({"code_verified", "path_verified"})
+# Honest fallback when a high-evidence self-claim is contradicted by broken
+# citations: the highest tier that does NOT assert verification-against-code.
+_DOWNGRADED_VERIFICATION_BASIS = "pattern_inferred"
+
+
+def _reconcile_verification_basis(
+    finding: Dict[str, Any],
+    broken_provenance: Optional[Dict[str, Any]],
+    ungrounded: Optional[Dict[str, Any]],
+) -> bool:
+    """Cap a self-reported high-evidence verification_basis against HEAD truth.
+
+    The tiers in :data:`_HIGH_EVIDENCE_BASES` assert the finding was checked
+    against real code. When the already-computed ingestion validation marks the
+    finding's file sources invalid (``broken_provenance`` from
+    :func:`summarize_broken_refs`) or finds ungrounded ``path:symbol`` claims
+    (``ungrounded`` from :func:`_summarize_ungrounded_claims_grounded`), that
+    self-assertion is contradicted by ground truth, so the stored basis is
+    downgraded to :data:`_DOWNGRADED_VERIFICATION_BASIS` — an honest tier that
+    makes no verified-against-code claim.
+
+    Findings with no citations, or whose citations validate cleanly, keep their
+    reported basis (both args are None). Mutates ``finding`` in place; returns
+    True when a downgrade occurred.
+    """
+    current = finding.get("verification_basis")
+    if current not in _HIGH_EVIDENCE_BASES:
+        return False
+    if not broken_provenance and not ungrounded:
+        return False
+    finding["verification_basis"] = _DOWNGRADED_VERIFICATION_BASIS
+    logger.info(
+        "[RESEARCH] Capping verification_basis %s→%s for '%s' "
+        "(citations unresolved at HEAD: broken_refs=%d, ungrounded_claims=%d)",
+        current,
+        _DOWNGRADED_VERIFICATION_BASIS,
+        finding.get("title", "<untitled>"),
+        int((broken_provenance or {}).get("broken_source_ref_count", 0) or 0),
+        int((ungrounded or {}).get("ungrounded_claim_count", 0) or 0),
+    )
+    return True
+
 
 def _trim_finding_for_memo(finding: Dict[str, Any]) -> Dict[str, Any]:
     """Trim a dropped finding to a bounded dict for embedding in a MemoPayload.
@@ -930,15 +987,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Any missing or invalid value defaults to the lowest-evidence tier
     # (pattern_inferred) so legacy findings are never mis-promoted. A non-missing
     # invalid value is logged just like the grade path.
-    _valid_bases = {
-        "code_verified",
-        "path_verified",
-        "pattern_inferred",
-        "deduced",
-    }
     for _f in findings:
         _vb = _f.get("verification_basis")
-        if _vb not in _valid_bases:
+        if _vb not in VALID_VERIFICATION_BASES:
             if _vb is not None:
                 logger.warning(
                     "[RESEARCH] Finding '%s' has invalid verification_basis=%r; "
@@ -1011,6 +1062,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _f["_provenance_warnings"] = {**_broken_provenance, **_ungrounded}
         elif _broken_provenance or _ungrounded:
             _f["_provenance_warnings"] = _broken_provenance or _ungrounded
+        # Reconcile the self-reported verification_basis against the validation
+        # just computed: a finding cannot honestly claim a verified-against-code
+        # tier while its own citations are absent at HEAD. Reuses the broken-ref
+        # and ungrounded-claim signals already in hand (no new I/O).
+        _reconcile_verification_basis(_f, _broken_provenance, _ungrounded)
 
     _structural_downgrades = _apply_structural_actionability_downgrade(findings)
 

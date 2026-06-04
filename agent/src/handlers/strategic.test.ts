@@ -92,9 +92,10 @@ vi.mock('./strategic-sections.js', () => ({
   // payload.cycle_start_reconciliation through to this builder.
   buildCycleStartReconciliationSection: (recon: Record<string, unknown> | undefined) =>
     recon ? `RECON(${Object.keys(recon).length})` : '',
+  buildPruneCandidatesSection: (prune: Record<string, unknown> | undefined) =>
+    prune ? `PRUNE(${Object.keys(prune).length})` : '',
   buildModelHealthSection: () => '',
   buildDriftSection: () => '',
-  buildGapDirectionLinkageSection: () => '',
   buildOutcomeSection: () => '',
   buildClockAndRecentWorkSection: () => ({ clockHeader: '', recentWorkSection: '' }),
   buildConversationThreadSection: () => '',

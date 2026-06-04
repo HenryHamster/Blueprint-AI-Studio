@@ -232,11 +232,6 @@ class StrategicReviewPayload(_SystemPopulated):
     # direction_text, consecutive_failures, last_failure_class,
     # dominant_error_fingerprint, recent_failure_messages}.
     held_directions: list[dict[str, Any]] | None = None
-    # Bidirectional gap↔direction linkage audit (advisory, informational). Keys:
-    # orphaned_gaps ([{id, name}] — active gaps no active direction targets) and
-    # ungrounded_directions ([{id, text}] — active directions with no documented
-    # gap). Optional + default-None; absent when both lists are empty.
-    linkage_audit: dict[str, Any] | None = None
 
 
 class DesignDocUpdatePayload(_SystemPopulated):

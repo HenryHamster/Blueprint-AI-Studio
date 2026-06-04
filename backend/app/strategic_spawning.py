@@ -769,9 +769,11 @@ def _build_cycle_start_reconciliation(
         or only partly present (``partial``). The grounding is advisory (see
         :func:`_verify_capability_backing_paths`); a contradiction means the
         stored status is not backed by code that currently exists.
-      * ``orphaned_gaps`` — ``active`` gaps with no active direction pointing
-        back via ``gap_id`` AND no intentional
-        :class:`~app.problem_model.GapDeferral`.
+      * ``orphaned_gaps`` — open (``active`` or ``blocked``) gaps with no active
+        direction pointing back via ``gap_id`` AND no intentional
+        :class:`~app.problem_model.GapDeferral`. Each entry carries the gap's
+        ``status`` so a drifted active gap is distinguishable from an orphaned
+        blocked one.
         A gap carrying a ``deferral`` is *deliberately* unstaffed and is NOT an
         orphan — it is excluded and counted separately so the agent can tell a
         drifted gap from a parked one.
@@ -834,14 +836,17 @@ def _build_cycle_start_reconciliation(
                     "stored_status": stored,
                     "effective_status": effective,
                     "missing": missing[:6],
+                    "missing_total": len(missing),
                 }
             )
 
-    # 2. Orphaned active gaps (excluding intentionally-deferred ones).
+    # 2. Orphaned open gaps (active or blocked, excluding deferred ones).
+    # Blocked gaps are still open problems with no direction working them, so
+    # they are orphan-eligible too — just flagged with their status.
     orphaned_gaps: list[dict] = []
     deferred_gap_count = 0
     for g in gaps:
-        if not isinstance(g, dict) or g.get("status") != "active":
+        if not isinstance(g, dict) or g.get("status") not in ("active", "blocked"):
             continue
         gid = str(g.get("id") or "")
         staffed = bool(gid and gid in referenced_gap_ids)
@@ -855,6 +860,7 @@ def _build_cycle_start_reconciliation(
                 "gap_id": gid,
                 "name": _label(g.get("name")),
                 "priority": g.get("priority"),
+                "status": g.get("status"),
             }
         )
 
@@ -952,6 +958,170 @@ def _build_cycle_start_reconciliation(
             ],
             "pipeline_tasks_in_progress": pipeline_counts["tasks_in_progress"],
             "pipeline_idle": pipeline_counts["idle"],
+        },
+    }
+
+
+# Direction statuses that mean the direction is no longer live work, so an active
+# gap still pointing at it (via ``active_moves``) is resolved-in-fact-but-open.
+# Mirrors the retired set used in research_direction_state / strategic_analysis.
+_PRUNABLE_DIRECTION_STATUSES = frozenset(
+    {"retired", "completed", "superseded", "expired"}
+)
+
+
+def _build_prune_candidates(
+    problem_model: dict | None,
+    directions: list | None,
+    model_health: dict | None,
+    now_iso: str,
+) -> dict | None:
+    """Concrete, named cleanup candidates — surfaced ONLY when the model is heavy.
+
+    The problem model only grows unless the strategist explicitly closes entries;
+    the size signal is advisory and there is no structural backstop. When the
+    model reaches ``large`` or ``oversized`` the strategist is told to prune, but
+    is given no concrete list of WHICH entries are prunable. This reuses signals
+    the backend already computes to name specific entries that are resolved in
+    fact but still open:
+
+      * ``resolved_gaps`` — ``active`` gaps whose ``active_moves`` resolve to a
+        direction that is retired/completed/superseded/expired (the work is done
+        or abandoned) or to a direction with merged PRs (shipped). The gap was
+        worked and the work landed/stopped, yet the gap is still open.
+      * ``absent_capabilities`` — capabilities the grounded file-tree check marks
+        ``absent`` (claimed-but-absent): the backing code does not exist, so the
+        capability is a stale assertion safe to consolidate/drop.
+      * ``expired_holds`` — ``active`` gaps carrying a deferral whose
+        ``hold_until`` has already passed (parsed against ``now_iso``): the hold
+        the strategist set has elapsed, so the gap is due for a decision.
+
+    Returns ``None`` unless ``model_health["model_size_status"]`` is ``large`` or
+    ``oversized`` (the nudge is only actionable when the model is actually heavy),
+    or when no candidates surface. Strictly advisory — a suggestion list, never an
+    auto-deletion. Pure and side-effect free, so it is directly unit-testable.
+    Complements :func:`_build_cycle_start_reconciliation`, which surfaces
+    orphaned/ungrounded items but not resolved-yet-still-open ones.
+    """
+    status = (model_health or {}).get("model_size_status")
+    if status not in ("large", "oversized"):
+        return None
+
+    pm = problem_model if isinstance(problem_model, dict) else {}
+    directions = directions or []
+
+    def _label(text: Any) -> str:
+        return str(text or "")[:_RECON_LABEL_MAXLEN]
+
+    def _hold_expired(hold_until: Any) -> bool:
+        # Tolerate missing/malformed values: only an ISO timestamp strictly
+        # earlier than now counts as expired; anything unparseable is ignored.
+        if not isinstance(hold_until, str) or not hold_until:
+            return False
+        try:
+            held = datetime.fromisoformat(hold_until.replace("Z", "+00:00"))
+            now = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return False
+        # Compare in a tz-consistent frame (treat naive as UTC).
+        if held.tzinfo is None:
+            held = held.replace(tzinfo=timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return held < now
+
+    # direction_id -> status, and whether it has any merged PRs (shipped work).
+    dir_status: dict[str, str] = {}
+    dir_shipped: dict[str, bool] = {}
+    for d in directions:
+        if not isinstance(d, dict):
+            continue
+        did = str(d.get("id") or "")
+        if not did:
+            continue
+        dir_status[did] = str(d.get("status") or "active")
+        history = d.get("research_history") or []
+        merged = sum(
+            int(h.get("prs_merged", 0) or 0)
+            for h in history
+            if isinstance(h, dict)
+        )
+        agg = d.get("history_aggregate") or {}
+        merged += int(agg.get("total_prs_merged") or 0)
+        dir_shipped[did] = merged > 0
+
+    gaps = pm.get("gaps") if isinstance(pm.get("gaps"), list) else []
+
+    # 1. Resolved-yet-open gaps + 3. expired-hold gaps (single active-gap pass).
+    resolved_gaps: list[dict] = []
+    expired_holds: list[dict] = []
+    for g in gaps:
+        if not isinstance(g, dict) or g.get("status") != "active":
+            continue
+        moves = [str(m) for m in (g.get("active_moves") or []) if m]
+        retired_moves = [
+            m for m in moves if dir_status.get(m) in _PRUNABLE_DIRECTION_STATUSES
+        ]
+        shipped_moves = [m for m in moves if dir_shipped.get(m)]
+        if retired_moves or shipped_moves:
+            resolved_gaps.append(
+                {
+                    "gap_id": str(g.get("id") or ""),
+                    "name": _label(g.get("name")),
+                    "reason": (
+                        "direction_retired" if retired_moves else "direction_shipped"
+                    ),
+                    "directions": (retired_moves or shipped_moves)[:6],
+                }
+            )
+        deferral = g.get("deferral")
+        if isinstance(deferral, dict) and _hold_expired(deferral.get("hold_until")):
+            expired_holds.append(
+                {
+                    "gap_id": str(g.get("id") or ""),
+                    "name": _label(g.get("name")),
+                    "hold_until": deferral.get("hold_until"),
+                }
+            )
+
+    # 2. Claimed-but-absent capabilities (grounded check says the code is gone).
+    absent_capabilities: list[dict] = []
+    for cap in pm.get("capabilities") or []:
+        if not isinstance(cap, dict):
+            continue
+        verification = cap.get("verification")
+        if not isinstance(verification, dict):
+            continue
+        if verification.get("effective_status") == "absent":
+            absent_capabilities.append(
+                {
+                    "name": _label(cap.get("name")),
+                    "stored_status": cap.get("status"),
+                }
+            )
+
+    if not resolved_gaps and not absent_capabilities and not expired_holds:
+        return None
+
+    def _cap(items: list) -> tuple[list, int]:
+        if len(items) <= _RECON_LIST_CAP:
+            return items, 0
+        return items[:_RECON_LIST_CAP], len(items) - _RECON_LIST_CAP
+
+    capped_resolved, _ = _cap(resolved_gaps)
+    capped_absent, _ = _cap(absent_capabilities)
+    capped_holds, _ = _cap(expired_holds)
+
+    return {
+        "model_size_status": status,
+        "resolved_gaps": capped_resolved,
+        "absent_capabilities": capped_absent,
+        "expired_holds": capped_holds,
+        "counts": {
+            # True totals (uncapped) so the renderer can say "+N more".
+            "resolved_gaps": len(resolved_gaps),
+            "absent_capabilities": len(absent_capabilities),
+            "expired_holds": len(expired_holds),
         },
     }
 
@@ -1135,6 +1305,10 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # problem_model (honest counts, not the trimmed agent view). High priority,
     # no summarize_fn — it should only drop under genuine budget exhaustion.
     "model_health": {"priority": "high"},
+    # Concrete cleanup candidates surfaced only when the model is large/oversized.
+    # Medium priority with no summarize_fn: already capped at build time, so the
+    # packer drops it whole under budget rather than trimming. Advisory.
+    "prune_candidates": {"priority": "medium"},
     "design_doc": {"priority": "medium", "summarize": _agent_view_design_doc},
     "outcome_evaluation": {
         "priority": "medium",
@@ -1187,11 +1361,6 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # hold threshold. Low priority — purely observational planning context the
     # strategic agent reads to decide whether to refine/retire a stuck direction.
     "held_directions": {"priority": "low"},
-    # Bidirectional gap↔direction linkage audit (orphaned gaps / ungrounded
-    # directions). Low priority with no summarize_fn: it is already capped +
-    # truncated at build time, so the packer drops it whole first under budget.
-    # Purely informational — the thinker uses it to spot strategic drift.
-    "linkage_audit": {"priority": "low"},
 }
 
 
@@ -2086,12 +2255,6 @@ def _build_playbook_summary(project: Project) -> dict[str, Any] | None:
     return {"entries": candidates[:10]}
 
 
-_LINKAGE_AUDIT_LIST_CAP = 20
-"""Defensive cap on each linkage-audit list — keeps the advisory block bounded."""
-
-_LINKAGE_DIRECTION_TEXT_CAP = 160
-"""Truncate ungrounded-direction text in the linkage audit for prompt budget."""
-
 _IN_FLIGHT_TASK_STATUSES = (
     TaskStatus.QUEUED,
     TaskStatus.PROVISIONING,
@@ -2099,72 +2262,6 @@ _IN_FLIGHT_TASK_STATUSES = (
     TaskStatus.EVALUATING,
 )
 """Statuses treated as live in-flight work for strategic pipeline summaries."""
-
-
-def _build_gap_direction_linkage_audit(project: Project) -> dict[str, Any] | None:
-    """Cheap single-pass bidirectional gap↔direction linkage audit.
-
-    Surfaces strategic drift the thinker would otherwise have to cross-reference
-    by hand between the problem-model and directions sections:
-
-      - ORPHANED GAPS: active gaps (``status`` ``active`` or ``blocked``) that
-        no currently *active* direction points back to via ``gap_id`` — a known
-        problem the strategy has stopped working on.
-      - UNGROUNDED DIRECTIONS: active directions whose ``gap_id`` is null or
-        references a gap that is absent from / not active in the problem model —
-        strategic effort with no documented problem statement.
-
-    Directions are read from the ``project.directions`` JSONB list (NOT the
-    Direction DB table); a direction is active only when ``status == 'active'``
-    (paused/proposed/retired/etc. do not count for grounding). Parsing is
-    fail-open: a malformed problem model yields no audit rather than raising,
-    since this is purely informational and must never block cycle assembly.
-
-    Returns a compact dict ``{"orphaned_gaps": [...], "ungrounded_directions":
-    [...]}`` or ``None`` when both lists are empty, so the key is omitted from
-    cold-start payloads (keeping them byte-identical).
-    """
-    from app.problem_model import parse_problem_model
-
-    try:
-        model = parse_problem_model(project.problem_model)
-    except Exception:  # pragma: no cover - defensive: never block on bad model
-        return None
-
-    active_gaps = [g for g in model.gaps if g.status in ("active", "blocked")]
-    active_gap_ids = {g.id for g in active_gaps}
-
-    directions = project.directions or []
-    active_directions = [
-        d for d in directions if isinstance(d, dict) and d.get("status") == "active"
-    ]
-    referenced_gap_ids = {
-        str(d["gap_id"]) for d in active_directions if d.get("gap_id")
-    }
-
-    orphaned_gaps: list[dict[str, Any]] = []
-    for gap in active_gaps:
-        if gap.id not in referenced_gap_ids:
-            orphaned_gaps.append({"id": gap.id, "name": gap.name})
-
-    ungrounded_directions: list[dict[str, Any]] = []
-    for d in active_directions:
-        gap_id = d.get("gap_id")
-        if not gap_id or gap_id not in active_gap_ids:
-            ungrounded_directions.append(
-                {
-                    "id": d.get("id"),
-                    "text": (d.get("text") or "")[:_LINKAGE_DIRECTION_TEXT_CAP],
-                }
-            )
-
-    if not orphaned_gaps and not ungrounded_directions:
-        return None
-
-    return {
-        "orphaned_gaps": orphaned_gaps[:_LINKAGE_AUDIT_LIST_CAP],
-        "ungrounded_directions": ungrounded_directions[:_LINKAGE_AUDIT_LIST_CAP],
-    }
 
 
 async def _find_last_strategic_cycle_time(
@@ -3503,6 +3600,19 @@ async def _spawn_strategic_review(
         _verified_problem_model,
         (recent_interventions or {}).get("active_by_direction"),
     )
+    # Soft size/health signal from the DURABLE pre-trim model so counts are honest
+    # (the agent view above is trimmed). Fail-open: None when the durable model
+    # fails strict validation. Hoisted above the payload so the prune-candidate
+    # helper can reuse it (it only fires when the model is large/oversized).
+    _sr_model_health = _compute_model_health(project.problem_model)
+    # Concrete cleanup candidates, surfaced ONLY when the model is heavy — reuses
+    # the grounded verification + direction linkage already computed. Advisory.
+    _prune_candidates = _build_prune_candidates(
+        _verified_problem_model,
+        project.directions,
+        _sr_model_health,
+        _utcnow().isoformat(),
+    )
     payload: dict = pack_under_budget(
         {
             "type": "strategic_review",
@@ -3519,12 +3629,11 @@ async def _spawn_strategic_review(
             ),
             # Soft size/health signal from the DURABLE pre-trim model so counts
             # are honest (the agent view above is trimmed). Fail-open: omitted
-            # when the durable model fails strict validation.
-            **(
-                {"model_health": _sr_model_health}
-                if (_sr_model_health := _compute_model_health(project.problem_model))
-                else {}
-            ),
+            # when the durable model fails strict validation (computed above).
+            **({"model_health": _sr_model_health} if _sr_model_health else {}),
+            # Concrete prune candidates — present only when the model is
+            # large/oversized AND something is actually prunable. Advisory list.
+            **({"prune_candidates": _prune_candidates} if _prune_candidates else {}),
             "running_update": project.running_update or "",
             "running_update_acknowledged_at": (
                 project.running_update_acknowledged_at.isoformat()
@@ -3613,11 +3722,6 @@ async def _spawn_strategic_review(
             **(
                 {"held_directions": _held_directions_block}
                 if _held_directions_block
-                else {}
-            ),
-            **(
-                {"linkage_audit": _linkage_audit}
-                if (_linkage_audit := _build_gap_direction_linkage_audit(project))
                 else {}
             ),
             "base_branch": get_project_integration_branch(project),

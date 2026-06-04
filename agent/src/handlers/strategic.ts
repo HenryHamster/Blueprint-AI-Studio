@@ -41,9 +41,9 @@ import {
 import {
   buildSystemMaturitySection,
   buildCycleStartReconciliationSection,
+  buildPruneCandidatesSection,
   buildModelHealthSection,
   buildDriftSection,
-  buildGapDirectionLinkageSection,
   buildOutcomeSection,
   buildClockAndRecentWorkSection,
   buildConversationThreadSection,
@@ -147,11 +147,6 @@ export async function handleStrategic(
 
     const systemMaturitySection = buildSystemMaturitySection(systemMaturity);
     const driftSection = buildDriftSection(driftSignals);
-    const linkageAuditSection = buildGapDirectionLinkageSection(
-      payload.linkage_audit && typeof payload.linkage_audit === 'object'
-        ? payload.linkage_audit as Record<string, unknown>
-        : undefined,
-    );
 
     const efficiencySnapshotSection = buildEfficiencySnapshotSection(payload.efficiency_snapshot);
 
@@ -397,6 +392,9 @@ export async function handleStrategic(
     const cycleStartReconciliationSection = buildCycleStartReconciliationSection(
       payload.cycle_start_reconciliation as Record<string, unknown> | undefined,
     );
+    const pruneCandidatesSection = buildPruneCandidatesSection(
+      payload.prune_candidates as Record<string, unknown> | undefined,
+    );
 
     const runningUpdateSection = `## Running update (living document — rewrite, don't append)\n${renderRunningUpdateDoc(runningUpdateDoc)}\n\n_This is the document the user currently sees. Refine it this cycle — remove stale content, integrate what's new, keep it coherent and short. It's a current snapshot, not a log._`;
 
@@ -460,9 +458,9 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       operatorOverridesSection: buildOperatorOverridesSection(Array.isArray(payload.operator_overrides) ? payload.operator_overrides as Array<Record<string, unknown>> : []),
       portfolioCompositionText,
       modelHealthSection,
+      pruneCandidatesSection,
       systemMaturitySection,
       driftSection,
-      linkageAuditSection,
       recentWorkSection,
       feedbackSection,
       threadSection,

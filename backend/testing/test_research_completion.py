@@ -24,8 +24,12 @@ from app.source_ref_validation import (
     validate_source_refs,
 )
 from app.research_completion import (
+    _DOWNGRADED_VERIFICATION_BASIS,
+    _HIGH_EVIDENCE_BASES,
+    VALID_VERIFICATION_BASES,
     _apply_structural_actionability_downgrade,
     _handle_research_completion,
+    _reconcile_verification_basis,
     _research_findings_would_spawn,
     _summarize_ungrounded_claims_grounded,
 )
@@ -398,6 +402,59 @@ class TestVerificationBasisNormalization:
         assert normalized[2]["verification_basis"] == "path_verified"
         assert normalized[3]["verification_basis"] == "pattern_inferred"
         assert normalized[4]["verification_basis"] == "deduced"
+
+
+class TestVerificationBasisHeadReconciliation:
+    """_reconcile_verification_basis: a self-claimed verified-against-code tier
+    is capped to an honest tier when the finding's own citations fail to resolve
+    at HEAD; clean or absent citations preserve the reported basis."""
+
+    def test_shared_tier_constant_matches_normalization_set(self):
+        assert VALID_VERIFICATION_BASES == {
+            "code_verified",
+            "path_verified",
+            "pattern_inferred",
+            "deduced",
+        }
+        assert _HIGH_EVIDENCE_BASES == {"code_verified", "path_verified"}
+        assert _DOWNGRADED_VERIFICATION_BASIS == "pattern_inferred"
+
+    def test_code_verified_with_broken_citation_downgrades(self):
+        f = {"title": "broken-cite", "verification_basis": "code_verified"}
+        broken = {"broken_source_ref_count": 1, "broken_refs": ["app/gone.py"]}
+        assert _reconcile_verification_basis(f, broken, None) is True
+        assert f["verification_basis"] == "pattern_inferred"
+
+    def test_path_verified_with_ungrounded_claim_downgrades(self):
+        f = {"title": "ungrounded", "verification_basis": "path_verified"}
+        ungrounded = {"ungrounded_claim_count": 2, "ungrounded_refs": ["app/x.py:foo"]}
+        assert _reconcile_verification_basis(f, None, ungrounded) is True
+        assert f["verification_basis"] == "pattern_inferred"
+
+    def test_clean_citations_preserve_high_basis(self):
+        f = {"title": "clean", "verification_basis": "code_verified"}
+        assert _reconcile_verification_basis(f, None, None) is False
+        assert f["verification_basis"] == "code_verified"
+
+    def test_no_citations_preserve_high_basis(self):
+        f = {"title": "no-cites", "verification_basis": "path_verified"}
+        assert _reconcile_verification_basis(f, None, None) is False
+        assert f["verification_basis"] == "path_verified"
+
+    def test_low_evidence_basis_not_touched_even_with_broken_refs(self):
+        # A finding that already self-reports a low-evidence tier is honest; a
+        # broken citation does not push it further down (no negative tier).
+        f = {"title": "already-low", "verification_basis": "deduced"}
+        broken = {"broken_source_ref_count": 3, "broken_refs": ["a.py", "b.py"]}
+        assert _reconcile_verification_basis(f, broken, None) is False
+        assert f["verification_basis"] == "deduced"
+
+    def test_both_signals_downgrade_once(self):
+        f = {"title": "both", "verification_basis": "code_verified"}
+        broken = {"broken_source_ref_count": 1, "broken_refs": ["a.py"]}
+        ungrounded = {"ungrounded_claim_count": 1, "ungrounded_refs": ["a.py:fn"]}
+        assert _reconcile_verification_basis(f, broken, ungrounded) is True
+        assert f["verification_basis"] == "pattern_inferred"
 
 
 class TestSourceRefParsing:

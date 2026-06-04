@@ -92,9 +92,14 @@ export interface ThinkerPromptParams {
   operatorOverridesSection: string;
   portfolioCompositionText: string;
   modelHealthSection: string;
+  /**
+   * Concrete prune candidates — present only when the model is large/oversized
+   * and something is actually prunable. Optional so existing constructions that
+   * omit it still compile.
+   */
+  pruneCandidatesSection?: string;
   systemMaturitySection: string;
   driftSection: string;
-  linkageAuditSection: string;
   recentWorkSection: string;
   feedbackSection: string;
   threadSection: string;
@@ -167,7 +172,7 @@ ${p.dirHealthSummary}
 ${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
 ## Portfolio Composition
 ${p.portfolioCompositionText}
-${p.modelHealthSection}${p.systemMaturitySection}${p.driftSection}${p.linkageAuditSection}${p.efficiencySnapshotSection}
+${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}
 ${p.recentWorkSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 
