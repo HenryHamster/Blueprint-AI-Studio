@@ -562,7 +562,7 @@ class StrategicOp(BaseModel):
     """Incremental strategic review operation from an agent."""
 
     task_id: uuid.UUID
-    op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "create_message", "resolve_message", "spawn_task"
+    op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "stage_direction", "create_message", "resolve_message", "spawn_task"
     data: Any = {}
 
 
@@ -1046,6 +1046,94 @@ async def strategic_operation(
                 f"{MIN_HEALTHY_ACTIVE_DIRECTIONS} active)."
             )
         return _resp({"status": "ok", "op": "retire_direction", "direction_id": dir_id})
+
+    elif payload.op == "stage_direction":
+        # Stage an EXISTING direction for the NEXT version: flip status to
+        # "staged" and stamp ``staged_for_version`` to the CURRENT open
+        # version_number (the version that was open when staging happened). A
+        # staged direction is inert — direction_lifecycle never researches it —
+        # until that version promotes, at which point
+        # ``activate_eligible_staged_directions`` flips it back to "active" at
+        # the version-open transition (with a reaper backstop). To stage a
+        # genuinely next-version idea that does not exist yet, the strategist
+        # creates the direction first (``create_direction``) and then stages it
+        # by id — staging is itself the DECISION that the work belongs to the
+        # next version's scope, not a way to defer a within-cycle call.
+        dir_id = data.get("direction_id")
+        if not dir_id:
+            raise HTTPException(status_code=400, detail="direction_id required")
+        rationale = _cap_str(
+            data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
+        )
+        # Resolve the current open version to stamp the marker. Lazy import so
+        # the common (non-staging) op paths don't pull in release_version.
+        from app.release_version import current_open_version
+
+        open_version = await current_open_version(session, project.id)
+        if open_version is None:
+            # No open version to gate against — staging would have no target to
+            # auto-activate at, so surface a 409 rather than stranding the work.
+            ctx = task.context or {}
+            task.context = {**ctx, "_strategic_api_called": True}
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            return JSONResponse(
+                content=_resp(
+                    {
+                        "status": "skipped",
+                        "reason": "No open version to stage against",
+                    }
+                ),
+                status_code=409,
+            )
+        staged_for_version = open_version.version_number
+        directions = list(project.directions or [])
+        target = next((d for d in directions if d.get("id") == dir_id), None)
+        if not target:
+            raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
+        target["status"] = "staged"
+        target["staged_for_version"] = staged_for_version
+        target["staged_at"] = _utcnow().isoformat()
+        notes = target.get("notes", [])
+        notes.append(
+            {
+                "text": (
+                    f"Staged to begin after v{staged_for_version} promotes"
+                    + (f": {rationale}" if rationale else "")
+                ),
+                "added_at": _utcnow().isoformat(),
+            }
+        )
+        target["notes"] = _cap_list(
+            notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
+        )
+        _d = directions
+        await _with_directions_locked(session, project.id, lambda _: _d)
+        ctx = task.context or {}
+        staged_ids = list(ctx.get("_strategic_staged_ids", []))
+        staged_ids.append(dir_id)
+        task.context = {
+            **ctx,
+            "_strategic_dirs_staged": ctx.get("_strategic_dirs_staged", 0) + 1,
+            "_strategic_staged_ids": staged_ids,
+        }
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
+        logger.info(
+            f"[STRATEGIC API] Staged direction {dir_id} for v{staged_for_version} "
+            f"(project {project.id})"
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "stage_direction",
+                "direction_id": dir_id,
+                "staged_for_version": staged_for_version,
+            }
+        )
 
     elif payload.op == "approve_direction":
         # Approve a proposal from an anomaly detector or research agent:

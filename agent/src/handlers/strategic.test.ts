@@ -99,7 +99,23 @@ vi.mock('./strategic-sections.js', () => ({
   buildDirHealthSummary: () => '',
 }));
 
-import { renderStrategicPromptSuffix, handleStrategic } from './strategic.js';
+import { renderStrategicPromptSuffix, buildStagedDirectionsSection, handleStrategic } from './strategic.js';
+
+describe('buildStagedDirectionsSection', () => {
+  it('returns empty string when nothing is staged', () => {
+    expect(buildStagedDirectionsSection([])).toBe('');
+    expect(buildStagedDirectionsSection(undefined as unknown as Array<Record<string, unknown>>)).toBe('');
+  });
+
+  it('renders staged entries with their target version and the no-defer framing', () => {
+    const out = buildStagedDirectionsSection([
+      { id: 'd-1', text: 'next-version feature', priority: 'high', staged_for_version: 4 },
+    ]);
+    expect(out).toContain('## Staged for next version');
+    expect(out).toContain('d-1 [high] — next-version feature (auto-activates when v4 promotes)');
+    expect(out).toContain('not a way to defer');
+  });
+});
 
 describe('renderStrategicPromptSuffix', () => {
   it('renders prompt_suffix as an "Additional instructions" block', () => {

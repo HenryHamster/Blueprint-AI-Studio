@@ -1564,6 +1564,51 @@ async def _record_promotion_success(
         next_version.version_number,
     )
 
+    # Best-effort: auto-activate staged directions gated on the version that
+    # just promoted (begin-after-current-version-promotes work). Fully isolated
+    # in its OWN session + try/except so a sweep failure can NEVER abort or fail
+    # the promotion — exactly mirroring the best-effort release-tag step below.
+    # A separate session is required because the promotion's own writes ride the
+    # caller's later commit (nothing is durable here yet), so this must not share
+    # that transaction. The reaper sweep is the self-healing backstop if this
+    # path fails.
+    try:
+        from app.database import AsyncSessionLocal
+        from app.directions_repo import activate_eligible_staged_directions
+        from app.strategic_trigger import request_strategic_refresh
+
+        _promoted_n = version.version_number
+        _staged_pid = version.project_id
+        async with AsyncSessionLocal() as _staged_session:
+            _activated = await activate_eligible_staged_directions(
+                _staged_session, _staged_pid, _promoted_n
+            )
+            if _activated:
+                # Arm a strategic refresh so the strategist immediately re-plans
+                # with the newly-active directions instead of waiting out the
+                # normal cadence (the post-promotion refresh is otherwise wired
+                # via the qualification-resolved trigger; this guarantees it).
+                await request_strategic_refresh(
+                    _staged_session,
+                    _staged_pid,
+                    f"staged_directions_activated:v{_promoted_n}",
+                )
+                await _staged_session.commit()
+                logger.info(
+                    "[RELEASE_QUALIFIER] v%d promotion activated %d staged "
+                    "direction(s); armed strategic refresh for project %s",
+                    _promoted_n,
+                    len(_activated),
+                    _staged_pid,
+                )
+    except Exception as exc:  # noqa: BLE001 — staged activation must not abort promotion
+        logger.warning(
+            "[RELEASE_QUALIFIER] staged-direction activation failed after v%d "
+            "promotion (non-fatal; reaper backstop will retry): %s",
+            version.version_number,
+            exc,
+        )
+
     # Best-effort: create a git tag v{version_number} on the promoted SHA.
     # A tag-creation failure must NEVER abort or fail the promotion — the merge
     # already succeeded and the tag is cosmetic convenience only.

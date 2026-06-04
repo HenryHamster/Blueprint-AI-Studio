@@ -70,7 +70,7 @@ export interface DirectionCardProps {
   editingId: string | null;
   editText: string;
   editPriority: 'high' | 'medium' | 'low';
-  editStatus: 'active' | 'completed' | 'paused' | 'proposed' | 'expired';
+  editStatus: 'active' | 'completed' | 'paused' | 'proposed' | 'expired' | 'staged';
   editCategory: DirectionCategory;
   editPathTags: string[];
   editPathInput: string;
@@ -79,7 +79,7 @@ export interface DirectionCardProps {
   setEditingId: React.Dispatch<React.SetStateAction<string | null>>;
   setEditText: React.Dispatch<React.SetStateAction<string>>;
   setEditPriority: React.Dispatch<React.SetStateAction<'high' | 'medium' | 'low'>>;
-  setEditStatus: React.Dispatch<React.SetStateAction<'active' | 'completed' | 'paused' | 'proposed' | 'expired'>>;
+  setEditStatus: React.Dispatch<React.SetStateAction<'active' | 'completed' | 'paused' | 'proposed' | 'expired' | 'staged'>>;
   setEditCategory: React.Dispatch<React.SetStateAction<DirectionCategory>>;
   setEditPathTags: React.Dispatch<React.SetStateAction<string[]>>;
   setEditPathInput: React.Dispatch<React.SetStateAction<string>>;
@@ -92,6 +92,8 @@ export interface DirectionCardProps {
   rejectProposal: (id: string) => Promise<void>;
   reviveProposal: (id: string) => Promise<void>;
   reactivateDirection: (id: string) => Promise<void>;
+  activateStagedDirection: (id: string) => Promise<void>;
+  cancelStagedDirection: (id: string) => Promise<void>;
   unholdDirection: (id: string) => Promise<void>;
   markDirectionComplete: (id: string) => Promise<void>;
   quickToggleStatus: (id: string, status: 'active' | 'paused') => Promise<void>;
@@ -122,7 +124,7 @@ function DirectionCardImpl({
   setEditingId, setEditText, setEditPriority, setEditStatus, setEditCategory, setEditPathTags, setEditPathInput, setEditCompletionCriteria, setEditCostBudget,
   startEdit,
   updateDirection, approveProposal, rejectProposal, reviveProposal,
-  reactivateDirection, unholdDirection, markDirectionComplete, quickToggleStatus, deleteDirection,
+  reactivateDirection, activateStagedDirection, cancelStagedDirection, unholdDirection, markDirectionComplete, quickToggleStatus, deleteDirection,
   applyDirectionUpdate, dismissDirectionUpdate, triggerResearch, reorderDirections,
   taskCounts, activeTasks, cooldownMinutes, researchingIds, researchSuccessIds,
   forceConfirmId, setForceConfirmId,
@@ -245,7 +247,7 @@ function DirectionCardImpl({
   }, [forceConfirmId, d.id, setForceConfirmId]);
 
   return (
-    <div className={`border rounded-lg p-2 ${d.status === 'proposed' ? 'bg-purple-950/20 border-purple-900/40' : d.status === 'expired' ? 'bg-neutral-900/30 border-neutral-800/40 opacity-70' : 'bg-neutral-900/50 border-neutral-800/50'}`}>
+    <div className={`border rounded-lg p-2 ${d.status === 'proposed' ? 'bg-purple-950/20 border-purple-900/40' : d.status === 'expired' ? 'bg-neutral-900/30 border-neutral-800/40 opacity-70' : d.status === 'staged' ? 'bg-sky-950/20 border-sky-900/40' : 'bg-neutral-900/50 border-neutral-800/50'}`}>
       {d.status === 'proposed' ? (
         /* Proposed direction — approve or reject */
         <div>
@@ -344,6 +346,55 @@ function DirectionCardImpl({
             {d.proposed_at && (
               <span className="text-[10px] text-neutral-600 ml-auto">
                 proposed {formatRelativeTime(d.proposed_at)}
+              </span>
+            )}
+          </div>
+        </div>
+      ) : d.status === 'staged' ? (
+        /* Staged direction — waiting for the next version; activate now or cancel */
+        <div>
+          <div className="flex items-start gap-2">
+            <p className="text-sm text-neutral-200 flex-1">{d.text}</p>
+            <div className="flex items-center gap-1 shrink-0">
+              {/* reason: inline direction action button in dense card; text-[10px] py-0.5 matches card density */}
+              <button
+                data-viewport-allow-small-target
+                onClick={() => activateStagedDirection(d.id)}
+                title="Activate now — start this direction immediately instead of waiting for the next version"
+                className="text-[10px] px-2 py-0.5 rounded border font-medium transition-colors bg-emerald-950/60 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/50"
+              >
+                Activate now
+              </button>
+              {/* reason: inline direction action button in dense card; text-[10px] py-0.5 matches card density */}
+              <button
+                data-viewport-allow-small-target
+                onClick={() => cancelStagedDirection(d.id)}
+                title="Cancel — remove this staged direction so it will not auto-activate"
+                className="text-[10px] px-2 py-0.5 rounded border font-medium transition-colors bg-red-950/60 border-red-900/50 text-red-400 hover:bg-red-900/50"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+          {d.completion_criteria && (
+            <p className="mt-1.5 text-[11px] text-neutral-500 leading-relaxed">
+              <span className="font-medium text-neutral-600">Done when: </span>
+              <span className="italic">{d.completion_criteria}</span>
+            </p>
+          )}
+          <div className="flex flex-wrap items-center gap-2 mt-2 min-w-0">
+            <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${priorityColors[d.priority]}`}>
+              {d.priority}
+            </span>
+            <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${statusColors.staged}`}>
+              Staged
+            </span>
+            {d.staged_for_version != null && (
+              <span
+                className="text-[10px] text-sky-400/80"
+                title={`Auto-activates when version ${d.staged_for_version} promotes and the next version opens`}
+              >
+                Waiting for v{d.staged_for_version} to promote
               </span>
             )}
           </div>

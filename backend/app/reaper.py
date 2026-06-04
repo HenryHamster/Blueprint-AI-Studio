@@ -744,6 +744,7 @@ from app.reaper_sweeps import (  # noqa: E402
     sweep_stuck_qualifications,
     sweep_routine_message_retention,
     sweep_unblock_blocked_tasks,
+    sweep_activate_staged_directions,
 )
 
 # Zero-cycle starvation: a project that should be running the strategic loop but
@@ -3525,6 +3526,20 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Unblock sweep error: {e}", exc_info=True
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 13: Staged-direction auto-activation backstop — self-heal
+                # any staged direction whose target version already promoted/opened
+                # in case the promotion-path activation hook failed once.
+                _mark_reaper_progress()
+                try:
+                    await sweep_activate_staged_directions(session)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Staged-direction activation sweep error: {e}",
+                        exc_info=True,
                     )
                     with contextlib.suppress(Exception):
                         await session.rollback()

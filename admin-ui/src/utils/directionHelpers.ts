@@ -32,4 +32,5 @@ export const statusColors: Record<string, string> = {
   paused: 'bg-amber-950/40 text-amber-400 border-amber-900/50',
   proposed: 'bg-purple-950/40 text-purple-400 border-purple-900/50',
   expired: 'bg-neutral-800/40 text-neutral-500 border-neutral-700/50',
+  staged: 'bg-sky-950/40 text-sky-400 border-sky-900/50',
 };

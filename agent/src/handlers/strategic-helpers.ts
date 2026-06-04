@@ -12,7 +12,7 @@ function generateStrategicScript(taskIdRaw: string): string {
   return `#!/bin/bash
 # Strategic review tool — updates problem_model, running_update, directions,
 # messages via API. Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env.
-OP="\${1:?Usage: strategic set-problem-model|set-running-update|reflect|pending-confirm|set-vision|create-direction|update-direction|retire-direction|create-message|resolve-message|spawn-task|set-retirement-critiques|set-evidence-progress <json-or-file>}"
+OP="\${1:?Usage: strategic set-problem-model|set-running-update|reflect|pending-confirm|set-vision|create-direction|update-direction|retire-direction|stage-direction|create-message|resolve-message|spawn-task|set-retirement-critiques|set-evidence-progress <json-or-file>}"
 shift
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
@@ -66,6 +66,7 @@ case "$OP" in
   create-direction)     _call "create_direction" ;;
   update-direction)     _call "update_direction" ;;
   retire-direction)     _call "retire_direction" ;;
+  stage-direction)      _call "stage_direction" ;;
   create-message)            _call "create_message" ;;
   resolve-message)           _call "resolve_message" ;;
   spawn-task)                _call "spawn_task" ;;

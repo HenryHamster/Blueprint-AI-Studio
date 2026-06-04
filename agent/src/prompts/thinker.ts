@@ -28,6 +28,7 @@ export function computeResearchPlanPromptFingerprint(mode: 'plan' | 'research'):
       './strategic set-problem-model',
       './strategic set-running-update',
       './strategic create-direction',
+      './strategic stage-direction',
       './strategic set-retirement-critiques',
     );
   }
@@ -78,6 +79,14 @@ export interface ThinkerPromptParams {
   retiredDirectionsSummarySection: string;
   dirSummaryText: string;
   dirHealthSummary: string;
+  /**
+   * Rendered block listing directions already STAGED for the next version
+   * (status=staged, with their staged_for_version). Built from the payload's
+   * `staged_directions` block. Empty string when nothing is staged. Surfaced so
+   * the strategist sees what is already queued for the next version and does NOT
+   * re-propose the same work.
+   */
+  stagedDirectionsSection?: string;
   userPausedSection: string;
   rejectedProposalsSection: string;
   operatorOverridesSection: string;
@@ -153,7 +162,7 @@ ${p.dirSummaryText}
 
 ## Direction Health
 ${p.dirHealthSummary}
-${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
+${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
 ## Portfolio Composition
 ${p.portfolioCompositionText}
 ${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}
@@ -234,6 +243,12 @@ For each existing gap: open, progressing, or closed? For each new gap you're ope
 
 ## 3. Moves
 Directions to retire (one-sentence reason each) and to create (name the gap_id each closes, a \`success_evidence\` string describing the observable outcome that proves the direction is done, a \`retirement_condition\` string describing the measurable trigger for retirement, and a \`dedup_reasoning\` object naming the 0–3 closest existing or retired directions you considered and a one-line justification why the new direction is distinct). Parallel moves are fine and encouraged when non-clashing.
+
+**Staging (next-version work).** A fourth move exists alongside create/update/retire: you can **stage** a direction to begin only after the current version promotes and the next one opens. A staged direction is inert — it spawns no work — until that version-open transition auto-activates it. The "Staged for next version" block above lists what is already staged; **do not re-propose work that is already staged there.**
+
+Staging is NOT deferral, and it is not an escape from the "you're not allowed to defer" rule. Staging is itself a DECISION — a hard call that the work genuinely belongs to the NEXT version's scope, not this one. The natural case: the project is in its stabilize/hardening phase (see the version-phase section, when present) and a strong *build-phase* idea appears that would pollute the current version's scope if started now — stage it so it activates cleanly when the next build phase opens. Use it for genuinely next-version-scoped work. Do NOT use it to dodge a within-cycle call: if work belongs to THIS version, create it active now; if it's not worth doing, retire/don't-create it. "I'm not sure, I'll stage it" is deferral wearing staging's clothes — make the call instead.
+
+To stage a genuinely new next-version idea, create the direction first, then stage it (the Executor will create-then-stage). To stage an existing active direction whose work you've decided belongs to the next version, stage it by id.
 
 ## 3.5. Retired-direction critique (REQUIRED)
 

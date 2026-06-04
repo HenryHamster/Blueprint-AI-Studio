@@ -195,6 +195,40 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     }
   }
 
+  // Activate a staged direction immediately instead of waiting for the next
+  // version to open. Reuses the PATCH status:'active' transition.
+  async function activateStagedDirection(id: string) {
+    setError(null);
+    try {
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status: 'active' }),
+      });
+      if (!res.ok) throw new Error('Failed to activate staged direction');
+      addToast('Staged direction activated', 'success');
+      fetchDirections();
+    } catch {
+      setError('Failed to activate staged direction. Please try again.');
+    }
+  }
+
+  // Cancel a staged direction. DELETE leaves a tombstone (handled backend-side)
+  // so the strategist won't immediately re-stage the same idea.
+  async function cancelStagedDirection(id: string) {
+    if (!window.confirm('Cancel this staged direction? It will not auto-activate at the next version.')) return;
+    setError(null);
+    try {
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'DELETE',
+      });
+      if (!res.ok) throw new Error('Failed to cancel staged direction');
+      addToast('Staged direction cancelled', 'info');
+      fetchDirections();
+    } catch {
+      setError('Failed to cancel staged direction. Please try again.');
+    }
+  }
+
   async function unholdDirection(id: string) {
     setError(null);
     try {
@@ -396,6 +430,8 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     updateDirection,
     quickToggleStatus,
     reactivateDirection,
+    activateStagedDirection,
+    cancelStagedDirection,
     unholdDirection,
     markDirectionComplete,
     approveProposal,

@@ -16,7 +16,7 @@ export function useDirectionForm() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editText, setEditText] = useState('');
   const [editPriority, setEditPriority] = useState<'high' | 'medium' | 'low'>('medium');
-  const [editStatus, setEditStatus] = useState<'active' | 'completed' | 'paused' | 'proposed' | 'expired'>('active');
+  const [editStatus, setEditStatus] = useState<'active' | 'completed' | 'paused' | 'proposed' | 'expired' | 'staged'>('active');
   const [editCategory, setEditCategory] = useState<DirectionCategory>(null);
   const [editPathTags, setEditPathTags] = useState<string[]>([]);
   const [editPathInput, setEditPathInput] = useState('');

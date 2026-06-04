@@ -623,6 +623,46 @@ def _summarize_directions(stats: list) -> list:
     return sorted_stats[:_DIRECTIONS_SUMMARY_KEEP]
 
 
+# Cap on staged-direction entries surfaced to the strategist. Staged directions
+# are inert next-version work; the strategist needs to see what is already queued
+# so it does not re-propose the same work, but the list must stay bounded under
+# the payload budget.
+_STAGED_DIRECTIONS_KEEP = 12
+
+
+def _build_staged_directions_summary(project: Project) -> list[dict]:
+    """Bounded list of the project's currently-staged directions.
+
+    A *staged* direction (``status == "staged"``) is inert work the strategist
+    or an operator marked to begin only after the version that was open when it
+    was staged has promoted — the per-direction ``staged_for_version`` marker
+    records that version number. Staged directions are deliberately EXCLUDED from
+    ``directions_summary`` (which ships only active/paused/proposed), so without
+    this block the strategist has no view of what is already queued for the next
+    version and would re-propose the same work.
+
+    Each entry is ``{id, text, priority, staged_for_version}``. Returns ``[]``
+    when no directions are staged so the caller can omit the field on the common
+    (nothing-staged) path, keeping the schema additive/backward-compatible.
+    """
+    staged = [
+        d
+        for d in (project.directions or [])
+        if isinstance(d, dict) and d.get("status") == "staged"
+    ]
+    out: list[dict] = []
+    for d in staged[:_STAGED_DIRECTIONS_KEEP]:
+        out.append(
+            {
+                "id": d.get("id"),
+                "text": d.get("text"),
+                "priority": d.get("priority"),
+                "staged_for_version": d.get("staged_for_version"),
+            }
+        )
+    return out
+
+
 def _summarize_outcome_evaluation(oe: dict) -> dict:
     """Trim an outcome_evaluation payload to the strategic agent's working set.
 
@@ -818,6 +858,11 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "operator_overrides": {"priority": "medium"},
     # Core working set (the big stuff) — summarize when over budget
     "directions_summary": {"priority": "high", "summarize": _summarize_directions},
+    # Directions already queued for the NEXT version (status=staged). Medium
+    # priority with no summarize_fn: it is already capped at build time, so the
+    # packer drops it whole under budget rather than trimming. Surfaced so the
+    # strategist knows what is already staged and does NOT re-propose it.
+    "staged_directions": {"priority": "medium"},
     "problem_model": {"priority": "high", "summarize": _agent_view_problem_model},
     "design_doc": {"priority": "medium", "summarize": _agent_view_design_doc},
     "outcome_evaluation": {
@@ -3075,6 +3120,11 @@ async def _spawn_strategic_review(
             "self_reflection_log": (project.self_reflection_log or [])[-5:],
             "enable_self_improvement": project.enable_self_improvement,
             "directions_summary": direction_stats,
+            **(
+                {"staged_directions": _staged_directions}
+                if (_staged_directions := _build_staged_directions_summary(project))
+                else {}
+            ),
             "outcome_evaluation": _build_outcome_evaluation(project, cycle_history),
             "recent_interventions": recent_interventions,
             "prediction_calibration_factor": calibration_factor,

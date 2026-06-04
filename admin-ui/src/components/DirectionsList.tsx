@@ -8,7 +8,7 @@ import type { useDirectionForm } from '../hooks/useDirectionForm';
 export type DirectionCategoryFilter = 'all' | 'product' | 'structural' | 'mixed';
 
 export interface DirectionGroup {
-  key: 'proposed' | 'active' | 'paused' | 'completed' | 'expired';
+  key: 'proposed' | 'active' | 'staged' | 'paused' | 'completed' | 'expired';
   label: string;
   items: Direction[];
 }
@@ -30,6 +30,8 @@ export interface DirectionsListProps {
   rejectProposal: (id: string) => Promise<void>;
   reviveProposal: (id: string) => Promise<void>;
   reactivateDirection: (id: string) => Promise<void>;
+  activateStagedDirection: (id: string) => Promise<void>;
+  cancelStagedDirection: (id: string) => Promise<void>;
   unholdDirection: (id: string) => Promise<void>;
   markDirectionComplete: (id: string) => Promise<void>;
   quickToggleStatus: (id: string, currentStatus: 'active' | 'paused') => Promise<void>;
@@ -157,6 +159,8 @@ export function DirectionsList(props: DirectionsListProps) {
                         rejectProposal={props.rejectProposal}
                         reviveProposal={props.reviveProposal}
                         reactivateDirection={props.reactivateDirection}
+                        activateStagedDirection={props.activateStagedDirection}
+                        cancelStagedDirection={props.cancelStagedDirection}
                         unholdDirection={props.unholdDirection}
                         markDirectionComplete={props.markDirectionComplete}
                         quickToggleStatus={props.quickToggleStatus}

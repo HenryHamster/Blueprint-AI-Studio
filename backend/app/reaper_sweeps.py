@@ -7,6 +7,7 @@ and commit/error-handling behaviour.
 """
 
 import asyncio
+import contextlib
 import logging
 import uuid
 from datetime import datetime, timedelta
@@ -847,3 +848,83 @@ async def sweep_unblock_blocked_tasks(
     if requeued:
         logger.info(f"[REAPER] Step 12: unblocked {requeued} task(s) → QUEUED")
     return requeued
+
+
+# ── Step 13: staged-direction auto-activation backstop ─────────────────────
+#
+# A "staged" direction (status="staged", staged_for_version=N) is inert work
+# marked to begin only after the version that was OPEN when it was staged
+# promotes.  The promotion success path activates eligible staged directions at
+# the version-open transition, but a single failure there must never strand
+# staged work forever.  This periodic sweep mirrors the proven BLOCKED-task
+# pattern (apply at the event AND self-heal via a periodic sweep): for every
+# project that still has a staged direction, it re-checks whether the target
+# version has already promoted and activates via the SAME shared idempotent
+# helper.  Idempotent — re-running on an already-active direction is a no-op.
+async def sweep_activate_staged_directions(session) -> int:
+    """Step 13: activate staged directions whose target version already opened.
+
+    For every project with at least one ``staged`` direction, reads the current
+    open version and activates any staged direction whose ``staged_for_version``
+    is at or below the most-recently-promoted version (``current_open_version -
+    1``) via :func:`directions_repo.activate_eligible_staged_directions`.
+
+    Best-effort per project (a failure on one project never aborts the sweep).
+    Returns the total number of directions activated across all projects.
+    """
+    from app.directions_repo import activate_eligible_staged_directions
+    from app.models import Direction
+    from app.release_version import current_open_version
+
+    # Prefilter candidate projects via the normalised direction table (dual-
+    # written under the same project lock as the authoritative blob).  The
+    # helper re-reads the blob under the lock, so a momentarily-stale table only
+    # affects which projects are visited, not correctness.
+    project_ids = (
+        (
+            await session.execute(
+                select(Direction.project_id)
+                .where(Direction.status == "staged")
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not project_ids:
+        return 0
+
+    total_activated = 0
+    for pid in project_ids:
+        try:
+            open_version = await current_open_version(session, pid)
+            if open_version is None:
+                continue
+            # The most-recently-promoted version is one below the open version.
+            # A staged_for_version equal to the open version stays staged (its
+            # target version has not promoted yet).
+            promoted_n = open_version.version_number - 1
+            if promoted_n < 1:
+                continue  # no version has promoted yet
+            activated = await activate_eligible_staged_directions(
+                session, pid, promoted_n
+            )
+            total_activated += len(activated)
+        except Exception as e:
+            logger.error(
+                "[REAPER] Staged-direction activation sweep error for project "
+                "%s: %s",
+                pid,
+                e,
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
+    if total_activated:
+        logger.info(
+            "[REAPER] Step 13: activated %d staged direction(s) across %d "
+            "candidate project(s)",
+            total_activated,
+            len(project_ids),
+        )
+    return total_activated

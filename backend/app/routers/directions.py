@@ -40,13 +40,14 @@ COMPLETION_CRITERIA_MAX = 500
 DIRECTION_CONTEXT_FIELD_MAX = 500
 
 
-def _compute_direction_merge_rate(d: dict) -> float:
+def _compute_direction_merge_rate(d: dict) -> Any:
     """Return merged-PRs-per-cycle for a direction. Returns 0.5 (neutral) if never researched."""
-    history = d.get("research_history", [])
-    agg = d.get("history_aggregate", {})
-    total_cycles = len(history) + (agg.get("total_cycles") or 0)
-    total_merged = sum(e.get("prs_merged", 0) for e in history) + (
-        agg.get("total_prs_merged") or 0
+    history: list[dict[str, Any]] = list(d.get("research_history") or [])
+    agg: dict[str, Any] = dict(d.get("history_aggregate") or {})
+    total_cycles = float(len(history) + int(agg.get("total_cycles") or 0))
+    total_merged = float(
+        sum(float(e.get("prs_merged", 0) or 0) for e in history)
+        + float(agg.get("total_prs_merged") or 0)
     )
     if total_cycles == 0:
         return 0.5
@@ -54,6 +55,25 @@ def _compute_direction_merge_rate(d: dict) -> float:
 
 
 VALID_CATEGORIES = {"product", "structural", "mixed"}
+
+
+def _clear_direction_reactivation_state(direction: dict) -> None:
+    """Drop transient status residue so active/staged transitions start clean."""
+    for key in (
+        "paused_reason",
+        "paused_at",
+        "auto_paused",
+        "expired_at",
+        "needs_manual_intervention",
+        "needs_manual_intervention_at",
+        "escalation_notification_pending",
+        "escalation_notification_retries",
+        "last_researched_at",
+        "staged_activated_at",
+        "staged_for_version",
+    ):
+        direction.pop(key, None)
+    direction["remediation_attempts"] = 0
 
 
 class DirectionPayload(BaseModel):
@@ -344,8 +364,9 @@ async def remove_direction(
         if len(remaining) == len(directions):
             raise HTTPException(status_code=404, detail="Direction not found")
 
-        # If this was a proposed direction, keep a tombstone to prevent re-proposal
-        if removed and removed[0].get("status") == "proposed":
+        # If this was a proposed or staged direction, keep a tombstone to prevent
+        # re-proposal / re-staging.
+        if removed and removed[0].get("status") in {"proposed", "staged"}:
             from datetime import datetime, timezone
 
             rejected_text = (removed[0].get("text") or "")[:200]
@@ -468,13 +489,16 @@ async def update_direction(
     if "status" in payload and payload["status"] not in (
         "active",
         "completed",
+        "staged",
         "paused",
         "proposed",
         "expired",
     ):
         raise HTTPException(
             status_code=400,
-            detail="status must be active, completed, paused, proposed, or expired",
+            detail=(
+                "status must be active, completed, staged, paused, proposed, or expired"
+            ),
         )
     if "text" in payload and (
         not isinstance(payload["text"], str)
@@ -569,6 +593,18 @@ async def update_direction(
                 detail="system_id must be a string of at most 100 characters",
             )
 
+    staged_for_version: int | None = None
+    if payload.get("status") == "staged":
+        from app.release_version import current_open_version  # noqa: PLC0415
+
+        open_version = await current_open_version(session, project.id)
+        if open_version is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No open release version found for this project.",
+            )
+        staged_for_version = open_version.version_number
+
     updated_direction: list = []  # [d] populated by mutate_fn
 
     def _mutate_update(directions: list) -> None:
@@ -616,22 +652,10 @@ async def update_direction(
                     d["priority"] = payload["priority"]
                 if "status" in payload:
                     d["status"] = payload["status"]
-                    # When reactivating from paused, clear auto-pause fields
-                    if payload["status"] == "active":
-                        d.pop("paused_reason", None)
-                        d.pop("paused_at", None)
-                        d.pop("auto_paused", None)
-                        d.pop("expired_at", None)
-                        # Operator reactivation acknowledges any escalation — clear
-                        # manual-intervention flag, pending notification state, and
-                        # reset remediation attempts so spawn calibration no longer
-                        # penalizes the direction.
-                        d.pop("needs_manual_intervention", None)
-                        d.pop("needs_manual_intervention_at", None)
-                        d.pop("escalation_notification_pending", None)
-                        d.pop("escalation_notification_retries", None)
-                        d.pop("last_researched_at", None)
-                        d["remediation_attempts"] = 0
+                    if payload["status"] in ("active", "staged"):
+                        _clear_direction_reactivation_state(d)
+                    if payload["status"] == "staged":
+                        d["staged_for_version"] = staged_for_version
                     # When reviving from expired back to proposed, clear expired_at
                     if payload["status"] == "proposed":
                         d.pop("expired_at", None)

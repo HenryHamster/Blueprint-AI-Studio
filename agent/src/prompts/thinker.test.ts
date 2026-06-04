@@ -199,6 +199,21 @@ describe('buildThinkerPrompt', () => {
     expect(without).not.toContain('## System Maturity');
   });
 
+  it('staged directions section rendered only when stagedDirectionsSection is non-empty', () => {
+    const with_ = buildThinkerPrompt({ ...base, stagedDirectionsSection: '## Staged for next version\n- d-x [high] — work (auto-activates when v3 promotes)' });
+    expect(with_).toContain('## Staged for next version');
+    expect(with_).toContain('auto-activates when v3 promotes');
+
+    const without = buildThinkerPrompt({ ...base, stagedDirectionsSection: '' });
+    expect(without).not.toContain('## Staged for next version');
+  });
+
+  it('always includes the Section 3 staging guidance reconciling staging with no-defer', () => {
+    const prompt = buildThinkerPrompt(base);
+    expect(prompt).toContain('**Staging (next-version work).**');
+    expect(prompt).toContain('Staging is NOT deferral');
+  });
+
   it('operator overrides section rendered only when operatorOverridesSection is non-empty', () => {
     const with_ = buildThinkerPrompt({ ...base, operatorOverridesSection: '\n## Operator Overrides Since Last Cycle\nentry\n' });
     expect(with_).toContain('## Operator Overrides Since Last Cycle');

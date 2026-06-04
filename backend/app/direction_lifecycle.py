@@ -271,11 +271,14 @@ async def _process_direction_lifecycle_locked(
     )
 
     directions_modified = False
-    # Prune dead directions (expired/completed/rejected) to prevent JSON bloat
+    # Prune dead directions (expired/completed/rejected) to prevent JSON bloat.
+    # "staged" directions are inert-by-design (begin-after-current-version-
+    # promotes) and MUST survive the prune so they remain to be auto-activated
+    # at the next version-open transition — they are not dead.
     live_dirs = [
         d
         for d in (project.directions or [])
-        if d.get("status") in ("active", "proposed", "paused")
+        if d.get("status") in ("active", "proposed", "paused", "staged")
     ]
     if len(live_dirs) < len(project.directions or []):
         logger.info(

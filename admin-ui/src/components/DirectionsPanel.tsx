@@ -46,8 +46,11 @@ export interface Direction {
   text: string;
   priority: 'high' | 'medium' | 'low';
   added_at: string;
-  status: 'active' | 'completed' | 'paused' | 'proposed' | 'expired';
+  status: 'active' | 'completed' | 'paused' | 'proposed' | 'expired' | 'staged';
   category?: 'product' | 'structural' | 'mixed' | null;
+  // When status is 'staged', the version_number this direction is waiting to be
+  // promoted past; it auto-activates when that version promotes and the next opens.
+  staged_for_version?: number | null;
   completion_criteria?: string | null;
   paths?: string[];
   last_researched_at?: string | null;
@@ -161,9 +164,10 @@ export interface Direction {
 }
 
 
-const STATUS_GROUPS: Array<{ key: 'proposed' | 'active' | 'paused' | 'completed' | 'expired'; label: string }> = [
+const STATUS_GROUPS: Array<{ key: 'proposed' | 'active' | 'staged' | 'paused' | 'completed' | 'expired'; label: string }> = [
   { key: 'proposed', label: 'Proposed by Agent' },
   { key: 'active', label: 'Active' },
+  { key: 'staged', label: 'Staged for next version' },
   { key: 'paused', label: 'Paused' },
   { key: 'completed', label: 'Completed' },
   { key: 'expired', label: 'Expired' },
@@ -341,6 +345,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
             rejectProposal={data.rejectProposal}
             reviveProposal={data.reviveProposal}
             reactivateDirection={data.reactivateDirection}
+            activateStagedDirection={data.activateStagedDirection}
+            cancelStagedDirection={data.cancelStagedDirection}
             unholdDirection={data.unholdDirection}
             markDirectionComplete={data.markDirectionComplete}
             quickToggleStatus={data.quickToggleStatus}

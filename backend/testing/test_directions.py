@@ -17,7 +17,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 
-from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
+from app.models import Alert, AlertSeverity, Direction, Project, Task, TaskStatus
 from app.autonomous_research import _spawn_research_task
 from app.direction_lifecycle import _process_direction_lifecycle
 from app.research_completion import (
@@ -94,6 +94,12 @@ async def _add_direction(
     )
     assert resp.status_code == 200
     return resp.json()["direction"]
+
+
+async def _load_project_and_direction(db_session, project_id: str, direction_id: str):
+    project = (await db_session.execute(select(Project).where(Project.id == uuid.UUID(project_id)))).scalar_one()
+    direction_row = (await db_session.execute(select(Direction).where(Direction.project_id == uuid.UUID(project_id), Direction.direction_key == direction_id))).scalar_one_or_none()
+    return project, direction_row
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -482,17 +488,134 @@ async def test_update_direction_priority(client: AsyncClient, mocker):
 
 
 @pytest.mark.asyncio
-async def test_update_direction_status(client: AsyncClient, mocker):
-    """PATCH updates direction status to paused."""
+async def test_update_direction_status_stage_sets_version_marker(
+    client: AsyncClient, db_session, mocker
+):
+    """PATCH status='staged' stamps the current open version onto the direction."""
     project_id = await _deploy_project(client, mocker)
+    project_uuid = uuid.UUID(project_id)
+    from app import release_version as rv
+    from app.task_locking import with_directions_locked
+
+    await rv.open_version(db_session, project_uuid, version_number=7)
+    await db_session.commit()
+
     direction = await _add_direction(client, project_id)
+    direction_id = direction["id"]
+
+    def _seed_residue(dirs):
+        dirs[0].update(
+            {
+                "paused_reason": "cooldown residue",
+                "paused_at": "2026-06-01T00:00:00",
+                "auto_paused": True,
+                "expired_at": "2026-06-01T01:00:00",
+                "needs_manual_intervention": True,
+                "needs_manual_intervention_at": "2026-06-01T02:00:00",
+                "escalation_notification_pending": True,
+                "escalation_notification_retries": 2,
+                "last_researched_at": "2026-06-01T03:00:00",
+                "staged_activated_at": "2026-06-01T04:00:00",
+                "remediation_attempts": 4,
+            }
+        )
+
+    await with_directions_locked(db_session, project_uuid, _seed_residue)
+    await db_session.commit()
 
     resp = await client.patch(
         f"/api/admin/projects/{project_id}/directions/{direction['id']}",
-        json={"status": "paused"},
+        json={"status": "staged"},
     )
     assert resp.status_code == 200
-    assert resp.json()["direction"]["status"] == "paused"
+    body = resp.json()["direction"]
+    assert body["status"] == "staged"
+    assert body["staged_for_version"] == 7
+    assert "staged_activated_at" not in body
+    for field in (
+        "paused_reason",
+        "needs_manual_intervention",
+        "escalation_notification_pending",
+        "last_researched_at",
+    ):
+        assert field not in body
+    assert body["remediation_attempts"] == 0
+
+    project, row = await _load_project_and_direction(db_session, project_id, direction_id)
+    blob = next(d for d in project.directions or [] if d.get("id") == direction_id)
+    assert blob["status"] == "staged"
+    assert blob["staged_for_version"] == 7
+    assert "staged_activated_at" not in blob
+    assert row is not None
+    assert row.status == "staged"
+    assert row.data["staged_for_version"] == 7
+
+
+@pytest.mark.asyncio
+async def test_update_direction_status_activate_now_clears_stage_marker(
+    client: AsyncClient, db_session, mocker
+):
+    """PATCH status='active' reactivates a staged direction and clears staging residue."""
+    project_id = await _deploy_project(client, mocker)
+    project_uuid = uuid.UUID(project_id)
+    from app import release_version as rv
+    from app.task_locking import with_directions_locked
+
+    await rv.open_version(db_session, project_uuid, version_number=8)
+    await db_session.commit()
+
+    direction = await _add_direction(client, project_id)
+    direction_id = direction["id"]
+
+    await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"status": "staged"},
+    )
+
+    def _seed_staged_residue(dirs):
+        dirs[0].update(
+            {
+                "paused_reason": "stale pause",
+                "paused_at": "2026-06-01T05:00:00",
+                "auto_paused": True,
+                "needs_manual_intervention": True,
+                "needs_manual_intervention_at": "2026-06-01T06:00:00",
+                "escalation_notification_pending": True,
+                "escalation_notification_retries": 1,
+                "last_researched_at": "2026-06-01T07:00:00",
+                "staged_activated_at": "2026-06-01T08:00:00",
+                "remediation_attempts": 5,
+            }
+        )
+
+    await with_directions_locked(db_session, project_uuid, _seed_staged_residue)
+    await db_session.commit()
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"status": "active"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()["direction"]
+    assert body["status"] == "active"
+    assert "staged_for_version" not in body
+    assert "staged_activated_at" not in body
+    for field in (
+        "paused_reason",
+        "needs_manual_intervention",
+        "escalation_notification_pending",
+        "last_researched_at",
+    ):
+        assert field not in body
+    assert body["remediation_attempts"] == 0
+
+    project, row = await _load_project_and_direction(db_session, project_id, direction_id)
+    blob = next(d for d in project.directions or [] if d.get("id") == direction_id)
+    assert blob["status"] == "active"
+    assert "staged_for_version" not in blob
+    assert row is not None
+    assert row.status == "active"
+    assert "staged_for_version" not in row.data
 
 
 @pytest.mark.asyncio
@@ -524,20 +647,37 @@ async def test_update_direction_paths(client: AsyncClient, mocker):
 
 
 @pytest.mark.asyncio
-async def test_delete_direction_removes_it(client: AsyncClient, mocker):
-    """DELETE removes the direction from the project."""
+async def test_delete_direction_removes_it(client: AsyncClient, db_session, mocker):
+    """DELETE tombstones a staged direction to prevent re-staging."""
     project_id = await _deploy_project(client, mocker)
+    project_uuid = uuid.UUID(project_id)
+    from app import release_version as rv
+
+    await rv.open_version(db_session, project_uuid, version_number=9)
+    await db_session.commit()
     direction = await _add_direction(client, project_id)
+    direction_id = direction["id"]
+
+    stage_resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"status": "staged"},
+    )
+    assert stage_resp.status_code == 200
+    assert stage_resp.json()["direction"]["status"] == "staged"
 
     resp = await client.delete(
-        f"/api/admin/projects/{project_id}/directions/{direction['id']}"
+        f"/api/admin/projects/{project_id}/directions/{direction_id}"
     )
     assert resp.status_code == 200
     assert resp.json()["message"] == "Direction removed"
 
-    get_resp = await client.get(f"/api/admin/projects/{project_id}/directions")
-    ids = [d["id"] for d in get_resp.json()["directions"]]
-    assert direction["id"] not in ids
+    project, row = await _load_project_and_direction(db_session, project_id, direction_id)
+    tombstone = next(d for d in project.directions or [] if d.get("id") == direction_id)
+    assert tombstone["status"] == "rejected"
+    assert "staged_for_version" not in tombstone
+    assert row is not None
+    assert row.status == "rejected"
+    assert row.data["status"] == "rejected"
 
 
 @pytest.mark.asyncio

@@ -66,6 +66,30 @@ export function renderStrategicPromptSuffix(payload: Record<string, unknown>): s
     : '';
 }
 
+/**
+ * Render the backend-supplied `staged_directions` block as a prompt section so
+ * the strategist sees what work is already STAGED for the next version (inert
+ * until that version promotes) and does NOT re-propose it. Returns '' when
+ * nothing is staged so the section is omitted on the common path. Defined here
+ * (not in strategic-sections.ts) so it does not have to be threaded through that
+ * module's exhaustive vi.mock in strategic.test.ts.
+ */
+export function buildStagedDirectionsSection(staged: Array<Record<string, unknown>>): string {
+  if (!Array.isArray(staged) || staged.length === 0) return '';
+  const lines = staged.map(d => {
+    const id = strVal(d.id, '?');
+    const text = strVal(d.text, '(no text)');
+    const priority = strVal(d.priority, 'medium');
+    const v = typeof d.staged_for_version === 'number' ? d.staged_for_version : '?';
+    return `- ${id} [${priority}] — ${text} (auto-activates when v${v} promotes)`;
+  });
+  return [
+    '## Staged for next version',
+    '_These directions are STAGED — inert until the version they are waiting on promotes, then they auto-activate. Do NOT re-propose work already staged here. Staging is a decision that work belongs to the next version, not a way to defer._',
+    ...lines,
+  ].join('\n');
+}
+
 export async function handleStrategic(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
@@ -141,6 +165,13 @@ export async function handleStrategic(
     const openMessagesText = buildOpenMessagesText(openMessages);
 
     const dirSummaryText = buildDirSummaryText(directionsSummary);
+
+    // Directions already staged for the next version (inert until their target
+    // version promotes). Surfaced so the strategist does not re-propose them.
+    const stagedDirections = Array.isArray(payload.staged_directions)
+      ? payload.staged_directions as Array<Record<string, unknown>>
+      : [];
+    const stagedDirectionsSection = buildStagedDirectionsSection(stagedDirections);
 
     // Reconcile the design doc's systems/* and capabilities/* statuses against
     // the cloned file tree BEFORE serializing into the thinker prompt: any
@@ -404,6 +435,7 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       retiredDirectionsSummarySection: formatRetiredDirectionsSummary(payload.retired_directions_summary),
       dirSummaryText,
       dirHealthSummary,
+      stagedDirectionsSection,
       userPausedSection: buildUserPausedSection(directionsSummary),
       rejectedProposalsSection: buildRejectedProposalsSection(Array.isArray(payload.rejected_proposals) ? payload.rejected_proposals as Array<Record<string, unknown>> : []),
       operatorOverridesSection: buildOperatorOverridesSection(Array.isArray(payload.operator_overrides) ? payload.operator_overrides as Array<Record<string, unknown>> : []),
@@ -517,6 +549,12 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 ./strategic create-direction '{"text": "outcome statement", "priority": "high|medium|low", "category": "product|structural", "gap_id": "g-xxx", "rationale": "...", "conflicts_with": ["d-xxx"], "recommended_mode": "ship", "success_evidence": "observable outcome that proves this direction is done (required)", "retirement_condition": "measurable condition that triggers retirement (required)", "implementation_constraints": "optional constraints for implementors", "dedup_reasoning": {"closest_directions": ["d-xxx"], "distinction": "one-line justification why this is distinct in scope or mechanism"}}'
 ./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "...", "text": "...", "conflicts_with": [...], "recommended_mode": "audit"}, "rationale": "..."}'
 ./strategic retire-direction '{"direction_id": "d-xxx", "rationale": "..."}'
+# Stage a direction for the NEXT version: it goes inert (no work spawned) and
+# auto-activates when the current version promotes and the next one opens. Use
+# ONLY for work the Thinker DECIDED belongs to the next version (Section 3
+# "Staging") — never to defer a within-cycle call. To stage a NEW next-version
+# idea, create-direction first, then stage it by the returned id.
+./strategic stage-direction '{"direction_id": "d-xxx", "rationale": "why this belongs to the next version"}'
 
 # REQUIRED: Submit the retired-direction critique from Section 3.5.
 # Pass a JSON array of critique objects (or the no-eligible sentinel).
@@ -574,6 +612,7 @@ ${analysisText.slice(0, 50_000)}
 
    - Does an existing direction already cover this? → UPDATE it; don't duplicate.
    - Does this depend on another direction being done first? → Keep it paused or don't create yet.
+   - Did the Thinker's Section 3 "Staging" decide this work belongs to the NEXT version? → For an existing direction, \`./strategic stage-direction\`. For a new idea, \`./strategic create-direction\` first, then \`./strategic stage-direction\` with the returned id. Stage ONLY what the analysis explicitly staged — never to defer a call the analysis left open.
    - Direction text describes OUTCOME ("users can X", "the system handles Y"), not implementation. Implementation details go in rationale.
 
    Priority is scarce:
