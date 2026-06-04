@@ -17,6 +17,7 @@ import uuid
 from datetime import timedelta
 
 import pytest
+from sqlalchemy.exc import SQLAlchemyError
 from sqlmodel import select
 
 import app.shared_state as _shared_state
@@ -212,6 +213,55 @@ async def test_idle_reaper_retires_stale_image_member(db_session, warm_pool_on, 
     retired = await sweep_idle_pool_vms(db_session, _utcnow(), runtime_config=_runtime_config)
     assert retired == 1
     assert await db_session.get(PoolVm, member.id) is None
+
+
+@pytest.mark.asyncio
+async def test_idle_reaper_continues_after_retire_failure(
+    db_session, warm_pool_on, mocker
+):
+    """A per-member retire failure rolls back, logs, and the sweep CONTINUES to
+    the next member — it must not crash with a MissingGreenlet reading an
+    instance the rollback expired (regression for the 2026-06-04 incident triage:
+    the except handler read member.vm_instance_id after session.rollback(),
+    masking the real error and aborting the whole sweep)."""
+    mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+    )
+    mocker.patch("app.compute.get_stale_image_vms", return_value=[])
+    _runtime_config["warm_pool_idle_ttl_seconds"] = 1800
+
+    project = await _make_project(db_session)
+    # created_at order = scan/iteration order: the failing member is reaped first.
+    m_fail = await _register(db_session, project, "agent-vm-fail", PoolVmState.IDLE)
+    m_ok = await _register(db_session, project, "agent-vm-ok", PoolVmState.IDLE)
+    for m in (m_fail, m_ok):
+        m.idle_since = _utcnow() - timedelta(seconds=4000)  # over TTL
+        db_session.add(m)
+        _shared_state.record_vm_heartbeat(m.vm_instance_id)  # alive → idle-TTL only
+    await db_session.commit()
+
+    real_retire = _wpm.retire_and_delete_pool_vm
+    attempted: list[str] = []
+
+    async def flaky_retire(session, member, **kw):
+        attempted.append(member.vm_instance_id)
+        if member.vm_instance_id == "agent-vm-fail":
+            raise SQLAlchemyError("simulated lock timeout")
+        return await real_retire(session, member, **kw)
+
+    mocker.patch(
+        "app.warm_pool_maintainer.retire_and_delete_pool_vm", new=flaky_retire
+    )
+
+    # Must not raise (no MissingGreenlet), and the healthy member is still reaped.
+    retired = await sweep_idle_pool_vms(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+    assert retired == 1
+    # Both candidates were attempted in order — the failure did not abort the loop.
+    assert attempted == ["agent-vm-fail", "agent-vm-ok"]
+    assert await db_session.get(PoolVm, m_ok.id) is None  # the OK one was deleted
+    assert await db_session.get(PoolVm, m_fail.id) is not None  # failed one survives
 
 
 @pytest.mark.asyncio
