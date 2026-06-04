@@ -5010,6 +5010,79 @@ async def test_post_promote_handoff_hint_fires_on_fresh_version(
     )
     assert "intent.current_focus" in suffix
     assert "v2" in suffix and "v1" in suffix
+    # The hint must ASSERT the prior version promoted and FORBID re-promoting it,
+    # not merely flag the carried goal as stale — otherwise the agent re-qualifies
+    # an already-shipped version (incident 2026-06-03).
+    assert "PROMOTED" in suffix
+    assert "do NOT" in suffix
+    assert "STALE CARRY-OVER" in suffix
+
+
+@pytest.mark.asyncio
+async def test_post_promote_handoff_hint_grounds_in_prior_promoted_record(
+    db_session, mocker, _lts_split_active
+):
+    """When the prior version's promoted record is readable, the handoff hint
+    states the concrete promotion — its date and final confidence — so the agent
+    gets a positive 'it shipped' signal rather than only a 'stale text' warning,
+    and is explicitly forbidden from re-qualifying the already-shipped version."""
+    from datetime import datetime, timedelta
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    promoted_at = now - timedelta(hours=3)
+    prior = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="promoted",
+        opened_at=now - timedelta(days=5),
+        promoted_at=promoted_at,
+        last_qualification={"status": "promoted", "confidence": 0.93},
+    )
+    db_session.add(prior)
+    fresh = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="build",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification=None,
+        qualification_attempts=0,
+        goal="Promote v1: re-requesting qualification now that findings are fixed",
+    )
+    db_session.add(fresh)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    suffix = tasks[0].payloads[0].get("prompt_suffix", "")
+
+    assert "Version handoff" in suffix
+    # Grounded in the real promoted record: concrete date + final verdict.
+    assert promoted_at.date().isoformat() in suffix, (
+        f"Expected the prior version's promotion date in the hint; got: {suffix}"
+    )
+    assert "confidence 0.93" in suffix
+    # And the binding instruction: do not re-qualify the already-shipped version.
+    assert "re-qualify v1" in suffix
 
 
 @pytest.mark.asyncio

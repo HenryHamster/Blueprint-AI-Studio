@@ -2676,16 +2676,20 @@ async def _spawn_strategic_review(
                 )
     except Exception:
         logger.exception("[STRATEGIC] held-directions block build failed; continuing")
-    # Post-promotion handoff — when a fresh version has just opened from a
-    # successful promotion, its `goal` field was snapshotted verbatim from
-    # `problem_model.intent.current_focus` at the moment the prior version
-    # promoted, so it typically describes the prior version's milestone rather
-    # than the new version's mission. Without an explicit prompt the agent
-    # tends to read the carried narrative as current status (e.g. quoting the
-    # prior version's qualification score as if it were this version's). This
-    # hint fires only on the first cycles after promotion (never qualified +
-    # not the bootstrap version) so the agent refreshes the free-form text
-    # fields once; it self-clears as soon as the first verdict lands.
+    # Post-promotion handoff — when a fresh version has just opened, it was
+    # opened by the PROMOTION of the prior version: open_version() is only ever
+    # called from _record_promotion_success and the v1 bootstrap, so a version
+    # with number > 1 that has never been qualified ⇒ v{N-1} shipped to the
+    # promotion target. Two things then mislead the agent into re-doing finished
+    # work: (1) the `goal` field is a frozen snapshot of `current_focus` taken at
+    # the promotion instant, which reliably still reads as v{N-1}'s own "get me
+    # promoted" mission; and (2) v{N}'s null verdict reads as "not promoted yet".
+    # The agent then plans to re-promote/re-qualify an already-live version
+    # (incident 2026-06-03: a clean re-audit + research + multiple strategic
+    # reviews all burned on a version already merged to main). So this hint
+    # asserts the promotion POSITIVELY and forbids re-promotion, rather than only
+    # flagging the carried text as stale. Fires only on the first cycles after
+    # promotion (never qualified); self-clears once the first verdict lands.
     if (
         _open_version is not None
         and _open_version.version_number > 1
@@ -2693,23 +2697,52 @@ async def _spawn_strategic_review(
         and (_open_version.qualification_attempts or 0) == 0
     ):
         _prior_n = _open_version.version_number - 1
+        _cur_n = _open_version.version_number
+        _target = _promotion_target or "main"
+        # Ground the assertion in the prior version's actual promoted record
+        # (promoted_at + final confidence) when readable — best-effort; the
+        # positive "it promoted" framing holds regardless because a version with
+        # number > 1 is only reachable via a promotion. Local import keeps this
+        # resilient to back-merge refactors of release_version.
+        _promoted_when = ""
+        _verdict_txt = ""
+        try:
+            from app.release_version import recent_closed_versions as _rcv
+
+            for _v in await _rcv(
+                session, project.id, limit=_VERSION_PHASE_RECENT_VERSIONS_CAP
+            ):
+                if _v.version_number == _prior_n and _v.status == "promoted":
+                    if _v.promoted_at is not None:
+                        _promoted_when = f" at {_v.promoted_at.isoformat()}"
+                    _conf = (_v.last_qualification or {}).get("confidence")
+                    if _conf is not None:
+                        _verdict_txt = f" (final qualification confidence {_conf})"
+                    break
+        except Exception:
+            logger.exception(
+                "[STRATEGIC] post-promote prior-version lookup failed; continuing"
+            )
         _post_promote_hint = (
-            f"Version handoff: v{_open_version.version_number} just opened from "
-            f"the promotion of v{_prior_n} and has never been qualified. The "
-            f"`goal` field and other free-form text in `problem_model` carry "
-            f"forward from v{_prior_n}'s final state — they may still describe "
-            f"that milestone or cite its scores, SHAs, and candidates as if "
-            f"current. As your first action this cycle, refresh the problem "
-            f"model for v{_open_version.version_number}: rewrite "
-            f"`intent.current_focus` to state what v{_open_version.version_number} "
-            f"is for (not what v{_prior_n} achieved); review active directions — "
-            f"retire those v{_prior_n} already satisfied, update wording that "
-            f"references superseded work, propose new directions the next "
-            f"milestone needs. The `goal` field itself is an immutable "
-            f"version-open snapshot by design; `version_phase.last_qualification` "
-            f"is the source of truth for current qualification state (null = "
-            f"unqualified). Free-form text is valuable — it just needs to stay "
-            f"current."
+            f"Version handoff — READ THIS FIRST. v{_prior_n} was SUCCESSFULLY "
+            f"PROMOTED to {_target}{_promoted_when}{_verdict_txt} and is now live; "
+            f"v{_cur_n} opened from that promotion. v{_prior_n}'s mission is "
+            f"COMPLETE — do NOT plan, research, audit, or spawn work to promote, "
+            f"qualify, re-audit, or re-qualify v{_prior_n}; that is already done "
+            f"and merged to {_target} (cross-check `version_phase.recent_versions` "
+            f"and `deployment_state` — v{_prior_n} is recorded there with "
+            f"status='promoted'). The `goal` field on v{_cur_n} is a frozen "
+            f"version-open snapshot that still reads as v{_prior_n}'s promotion "
+            f"mission — treat it as STALE CARRY-OVER, not a live directive, and "
+            f"disregard its promote/qualify framing. A null "
+            f"`version_phase.last_qualification` on v{_cur_n} means this fresh "
+            f"version has not yet begun its OWN qualification (expected for a "
+            f"just-opened version) — it does NOT mean v{_prior_n}'s promotion is "
+            f"pending or failed. As your first action this cycle, set v{_cur_n}'s "
+            f"real mission: rewrite `intent.current_focus` to state what v{_cur_n} "
+            f"is for (not what v{_prior_n} achieved), retire directions v{_prior_n} "
+            f"already satisfied, and propose the directions the next milestone "
+            f"needs."
         )
         prompt_suffix = (
             f"{prompt_suffix}\n{_post_promote_hint}"
