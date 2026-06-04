@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 import firebase_admin
 from firebase_admin import auth as firebase_auth
 
-from app.database import get_session
+from app.database import get_session, resolve_dialect_name
 from app.models import AllowedUser, _utcnow
 
 logger = logging.getLogger(__name__)
@@ -219,11 +219,16 @@ async def _persist_auth_metadata_best_effort(
     """
     try:
         # Fail fast rather than parking a pooled connection on a contended row.
-        await session.execute(
-            text("SET LOCAL lock_timeout = :t").bindparams(
-                t=_AUTH_METADATA_LOCK_TIMEOUT
+        # SET LOCAL is Postgres-only and asyncpg CANNOT bind a parameter into it
+        # (it is not a preparable statement, so a bound ``:t`` becomes a literal
+        # ``$1`` → "syntax error at or near $1" on EVERY authenticated request).
+        # Gate on the dialect and inline the trusted module constant as a literal.
+        # SQLite/other test dialects have no lock_timeout GUC, so skipping it
+        # there also keeps the best-effort metadata write working under tests.
+        if resolve_dialect_name(session) == "postgresql":
+            await session.execute(
+                text(f"SET LOCAL lock_timeout = '{_AUTH_METADATA_LOCK_TIMEOUT}'")
             )
-        )
         session.add(allowed_user)
         await session.commit()
     except SQLAlchemyError:

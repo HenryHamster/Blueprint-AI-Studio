@@ -505,6 +505,15 @@ _BLOCKED_ESCALATE_AFTER = timedelta(hours=6)
 # were re-locked every cycle and could crowd genuinely-due rechecks out of the
 # batch-size window. Recovery has given up on these; an operator re-queues them.
 _BLOCKED_ESCALATED_PARK = timedelta(days=3650)
+# A no-dependency agent/lifecycle blocker is often a TRANSIENT infra failure
+# (orchestrator ./pr open 5xx, git push stale-lease) that clears on its own, but
+# can also be a durable precondition (missing base branch/file). We can't tell
+# them apart, so we optimistically requeue such a blocker up to this many times —
+# a transient blip recovers on retry; a durable blocker re-blocks and, once the
+# budget is spent, parks for the normal backoff + 6h operator escalation. The cap
+# is deliberately small: re-dispatch costs a full agent VM run, so this trades a
+# few wasted runs for auto-recovery instead of a multi-hour operator wedge.
+_BLOCKED_OPTIMISTIC_RETRY_CAP = 3
 
 
 def _next_recheck_delay(attempts: int) -> timedelta:
@@ -520,6 +529,9 @@ async def _blocked_precondition_state(task, session, verify_pr_merged) -> str:
       - ``"clear"``   — the precondition is satisfied (or is a transient conflict
                         with no dependency edge); requeue and let dispatch run/
                         re-judge it.
+      - ``"retry"``   — a no-dependency agent/lifecycle blocker that may be a
+                        transient infra failure; the driver optimistically
+                        requeues it a bounded number of times before parking.
       - ``"waiting"`` — an upstream dependency is still in flight; stay BLOCKED.
       - ``"dead"``    — an upstream dependency genuinely failed / was cancelled,
                         so this work is impossible; escalate terminally.
@@ -564,10 +576,22 @@ async def _blocked_precondition_state(task, session, verify_pr_merged) -> str:
             return "re_evaluate"
         if verify_pr_merged is None:
             return "waiting"
-        # Agent/lifecycle blockers with no explicit dependency edge are durable
-        # preconditions (missing base branch/file, upstream PR not yet landed).
-        # Keep them parked and back off; the deadline escalation path surfaces
-        # long-lived blockers for operator intervention.
+        # AGENT-surfaced "BLOCKER:" with no explicit dependency edge (source set
+        # by agent_status.py): these are often TRANSIENT infra failures
+        # (orchestrator ./pr open 5xx, git push stale-lease) that clear on their
+        # own, but can also be durable preconditions (missing base branch/file).
+        # We can't reliably tell them apart from here, so signal a BOUNDED
+        # optimistic requeue: the driver retries up to
+        # _BLOCKED_OPTIMISTIC_RETRY_CAP times before parking + escalating. A
+        # transient blip recovers on retry; a durable blocker re-blocks and is
+        # parked once the retry budget is spent. (Previously this returned
+        # "waiting" unconditionally, which left a transient infra blip wedging
+        # its EVALUATING rollup parent for hours until an operator manually
+        # requeued — incident 2026-06-04, tasks 87ddb2a4/18c8c195.) Scoped to
+        # source=="agent" so parent-source blockers and metadata-less blocked
+        # subtasks keep their existing "wait for explicit recovery" semantics.
+        if blocker_source == "agent":
+            return "retry"
         return "waiting"
     if verify_pr_merged is None:
         return "waiting"
@@ -626,6 +650,11 @@ def _clear_blocked_fields(task, *, preserve_first_blocked: bool = False) -> None
     ]
     if not preserve_first_blocked:
         keys.append("_blocked_first_at")
+        # The optimistic-retry budget is preserved across an onset-preserving
+        # requeue (so a transient agent/lifecycle blocker keeps counting toward
+        # its cap), but wiped on a genuine dependency clear so a later, unrelated
+        # block starts with a fresh budget.
+        keys.append("_blocked_optimistic_retries")
     for k in keys:
         ctx.pop(k, None)
     task.context = ctx
@@ -805,13 +834,52 @@ async def sweep_unblock_blocked_tasks(
                 ),
             )
             changed = True
-        else:  # "waiting" — re-arm a later recheck with backoff.
-            # Deadline escalation stays active for blockers that are still
-            # genuinely unresolved at the 6h mark.
-            if (
+        else:  # "retry" or "waiting"
+            past_deadline = (
                 task.blocked_at is not None
                 and (now - task.blocked_at) >= _BLOCKED_ESCALATE_AFTER
+            )
+            optimistic_used = int(ctx.get("_blocked_optimistic_retries", 0))
+            # "retry": a no-dep agent/lifecycle blocker that may be a transient
+            # infra failure — optimistically requeue (bounded) so a passing blip
+            # auto-recovers instead of wedging its rollup parent until an operator
+            # intervenes. Preserve the first-blocked onset so the 6h deadline
+            # still measures from true onset across the requeue episodes.
+            if (
+                state == "retry"
+                and not past_deadline
+                and optimistic_used < _BLOCKED_OPTIMISTIC_RETRY_CAP
             ):
+                ctx["_blocked_optimistic_retries"] = optimistic_used + 1
+                task.context = ctx
+                # _clear_blocked_fields preserves _blocked_optimistic_retries on
+                # an onset-preserving requeue (it is only wiped on a genuine
+                # dependency clear), so the budget keeps counting across re-blocks.
+                _clear_blocked_fields(task, preserve_first_blocked=True)
+                task.status = TaskStatus.QUEUED
+                task.latest_status_message = (
+                    f"Unblocked — optimistic infra-precondition retry "
+                    f"{optimistic_used + 1}/{_BLOCKED_OPTIMISTIC_RETRY_CAP}"
+                )
+                flag_modified(task, "context")
+                session.add(task)
+                requeued += 1
+                changed = True
+                pending_broadcasts.append(
+                    (
+                        str(task.project_id),
+                        {
+                            "task_id": str(task.id),
+                            "status": "QUEUED",
+                            "message": task.latest_status_message,
+                        },
+                    )
+                )
+                continue
+            # "waiting" (or a retry that exhausted its budget): re-arm a later
+            # recheck with backoff. Deadline escalation stays active for blockers
+            # still genuinely unresolved at the 6h mark.
+            if past_deadline:
                 await _escalate_blocked_task(
                     task,
                     ctx,

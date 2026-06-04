@@ -7116,6 +7116,7 @@ class TestMarkLandedParentDependents:
 from app.reaper_sweeps import (  # noqa: E402
     sweep_unblock_blocked_tasks,
     _BLOCKED_ESCALATE_AFTER,
+    _BLOCKED_OPTIMISTIC_RETRY_CAP,
 )
 from app.time_utils import _utcnow  # noqa: E402
 
@@ -7256,11 +7257,51 @@ async def test_unblock_sweep_does_not_broadcast_on_commit_failure(
 
 
 @pytest.mark.asyncio
-async def test_unblock_sweep_keeps_agent_precondition_without_dep_edge_blocked(
+async def test_unblock_sweep_optimistically_retries_agent_precondition_without_dep_edge(
     reaper_db, mocker
 ):
-    """A generic agent BLOCKER: with no dependency edge must stay BLOCKED until
-    an explicit recovery path clears it; it must not auto-requeue immediately."""
+    """A generic agent BLOCKER: with no dependency edge is OFTEN a transient infra
+    failure (orchestrator ./pr open 5xx, push stale-lease). The sweep now
+    optimistically requeues it a bounded number of times so a passing blip
+    auto-recovers instead of wedging its rollup parent until an operator
+    intervenes (incident 2026-06-04, tasks 87ddb2a4/18c8c195)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: orchestrator ./pr open returned HTTP 500",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "precondition",
+                "reason": "BLOCKER: orchestrator ./pr open returned HTTP 500",
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    # First optimistic retry consumed; budget survives the requeue so re-blocks
+    # keep counting toward the cap.
+    assert t.context.get("_blocked_optimistic_retries") == 1
+    assert "optimistic" in (t.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_parks_agent_precondition_after_retry_budget_spent(
+    reaper_db, mocker
+):
+    """Once the optimistic-retry budget is exhausted, a durable no-dep agent
+    precondition blocker stops thrashing: it stays BLOCKED and backs off (the 6h
+    deadline escalation then surfaces it for the operator)."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
     now = _utcnow()
@@ -7270,12 +7311,14 @@ async def test_unblock_sweep_keeps_agent_precondition_without_dep_edge_blocked(
         blocker_kind="precondition",
         blocked_reason="BLOCKER: backend/app/foo.py does not exist on main",
         depends_on=[],
+        blocked_at=now - timedelta(minutes=20),  # well short of the 6h deadline
         context={
             "blocker": {
                 "source": "agent",
                 "waiting_on": "precondition",
                 "reason": "BLOCKER: backend/app/foo.py does not exist on main",
-            }
+            },
+            "_blocked_optimistic_retries": _BLOCKED_OPTIMISTIC_RETRY_CAP,
         },
         recheck_after=now - timedelta(minutes=1),
     )
