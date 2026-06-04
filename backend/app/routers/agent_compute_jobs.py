@@ -13,11 +13,24 @@ from app.models import Task
 from app.routers.agent import verify_agent_token
 from app.schemas import serialize_compute_job_response
 from app.shared_state import limiter
+from app.task_capabilities import TASK_CAPABILITIES
 from app.vm_cost_rates import DEFAULT_MACHINE_TYPE, supported_machine_types
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
-_COMPUTE_JOB_CAPABLE_TASK_TYPES = frozenset({"compute_experiment"})
+_COMPUTE_JOB_CAPABLE_TASK_TYPES = frozenset(
+    capability.id.value
+    for capability in TASK_CAPABILITIES
+    if (
+        capability.run_shape == "experiment_loop"
+        and capability.requires_compute
+        and not capability.requires_code
+        and not capability.requires_web
+        and capability.output_kind == "verdict"
+        and capability.evaluation_strategy == "metric"
+        and capability.cost_ceiling_usd is not None
+    )
+)
 
 
 class LaunchComputeJobRequest(BaseModel):

@@ -101,10 +101,9 @@ StrategicPhase = Literal["phase1", "phase2"]
 #       analyses: research, plan, review, audits, memo, etc.).
 #   workflow       — a fixed multi-step agent workflow (the existing
 #       create→review→fix pipeline that PR-producing code types pass through).
-#   experiment_loop— a long-running, iterated experiment loop. DECLARABLE but
-#       currently UNUSED: no task type runs this shape yet, but the experiment
-#       proof direction will register one against this value. Keeping it in the
-#       vocabulary now lets that future type declare its shape with no edit here.
+#   experiment_loop— a long-running, iterated experiment loop (the reference
+#       compute_experiment task runs here). The closed vocabulary keeps the
+#       shape declarable without requiring a new enum value later.
 RunShape = Literal["single_agent", "workflow", "experiment_loop"]
 
 
@@ -179,7 +178,7 @@ class TaskCapability:
     # HOW this task type runs (its execution shape). Defaults to "single_agent"
     # so a newly-registered terminal type needs no edit; the PR-producing code
     # types declare "workflow" (the create→review→fix pipeline) explicitly.
-    # "experiment_loop" is a valid declarable value with no current user yet.
+    # "experiment_loop" is the compute-job loop used by compute_experiment.
     # Surfaced in the operator catalog and resolved via ``run_shape_for``.
     run_shape: RunShape = "single_agent"
 
@@ -724,15 +723,7 @@ def agent_capability_slice(task_type: str | TaskType) -> dict | None:
     capability = get_task_capability(task_type)
     if capability is None:
         return None
-    return {
-        "run_shape": capability.run_shape,
-        "agent_mode": capability.agent_mode,
-        "output_kind": capability.output_kind,
-        "requires_code": capability.requires_code,
-        "requires_web": capability.requires_web,
-        "requires_compute": capability.requires_compute,
-        "is_bespoke_dispatch": False,
-    }
+    return _capability_to_catalog_entry(capability)
 
 
 def _capability_to_catalog_entry(capability: TaskCapability) -> dict:

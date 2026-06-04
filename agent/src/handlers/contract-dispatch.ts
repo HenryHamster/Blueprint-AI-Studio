@@ -4,15 +4,34 @@ import { isReadOnlyTaskType } from '../taskCapabilities.js';
 import type { Handler } from './index.js';
 
 // ── Contract-driven dispatch ─────────────────────────────────────────────────
-// The backend ships the agent-relevant slice of the claimed task's capability
-// in the claim response under `task_capability` (see backend/app/routers/agent.py
-// → agent_capability_slice). It carries run_shape, agent_mode, output_kind, and
-// the requires_* flags. The agent dispatches from this contract so a task type
-// the backend REGISTERS becomes runnable WITHOUT an agent code edit: a bespoke
-// handler is used when one exists for the exact type, otherwise a GENERIC runner
-// is resolved from run_shape × agent_mode × output_kind.
+// The backend ships the claimed task's capability contract in the claim
+// response under `task_capability` (see backend/app/routers/agent.py →
+// agent_capability_slice). It is the same catalog-shaped object that the
+// operator registry publishes, with the agent resolving only the runtime
+// dispatch keys it needs. The agent dispatches from this contract so a task
+// type the backend REGISTERS becomes runnable WITHOUT an agent code edit: a
+// bespoke handler is used when one exists for the exact type, otherwise a
+// GENERIC runner is resolved from run_shape × agent_mode × output_kind.
 
-export interface TaskCapabilityContract {
+export interface PublishedTaskCapabilityContract {
+  id?: string;
+  label?: string;
+  description?: string;
+  agent_mode?: 'write' | 'read_only';
+  default_category?: string | null;
+  user_launchable?: boolean;
+  provider_configurable?: boolean;
+  filter_visible?: boolean;
+  output_kind?: string;
+  requires_code?: boolean;
+  requires_web?: boolean;
+  requires_compute?: boolean;
+  evaluation_strategy?: string;
+  cost_ceiling_usd?: number | null;
+  run_shape?: string;
+}
+
+export interface TaskCapabilityContract extends PublishedTaskCapabilityContract {
   run_shape: string;
   agent_mode: 'write' | 'read_only';
   output_kind: string;
@@ -59,6 +78,7 @@ export function resolveTaskCapabilityContract(
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
     const c = raw as Record<string, unknown>;
     return {
+      ...(c as PublishedTaskCapabilityContract),
       run_shape: normalizeRunShape(c.run_shape),
       agent_mode: c.agent_mode === 'read_only' ? 'read_only' : 'write',
       output_kind: asString(c.output_kind, 'none'),

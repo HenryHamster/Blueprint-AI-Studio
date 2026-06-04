@@ -348,25 +348,10 @@ def test_task_capability_lookup_is_metadata_only():
 def test_agent_capability_slice_exposes_agent_contract_fields():
     research = agent_capability_slice("research")
     create = agent_capability_slice("create")
+    catalog = {entry["id"]: entry for entry in task_type_catalog()}
 
-    assert research == {
-        "run_shape": "single_agent",
-        "agent_mode": "read_only",
-        "output_kind": "knowledge",
-        "requires_code": True,
-        "requires_web": True,
-        "requires_compute": False,
-        "is_bespoke_dispatch": False,
-    }
-    assert create == {
-        "run_shape": "workflow",
-        "agent_mode": "write",
-        "output_kind": "pr",
-        "requires_code": True,
-        "requires_web": False,
-        "requires_compute": False,
-        "is_bespoke_dispatch": False,
-    }
+    assert research == catalog["research"]
+    assert create == catalog["create"]
     assert agent_capability_slice("future_fundamental_type") is None
 
 
@@ -444,6 +429,25 @@ def test_task_type_catalog_launchable_flags_and_output_kinds():
     assert by_id["memo"]["evaluation_strategy"] == "none"
     # Research is judged by forward quality, not a merged PR.
     assert by_id["research"]["evaluation_strategy"] == "forward_quality"
+    # The reference compute-loop task is a compute-only verdict producer with a
+    # declared ceiling and metric-style evaluation metadata.
+    assert by_id["compute_experiment"] == {
+        "id": "compute_experiment",
+        "label": "Compute Experiment",
+        "description": by_id["compute_experiment"]["description"],
+        "agent_mode": "read_only",
+        "default_category": "ops",
+        "user_launchable": False,
+        "provider_configurable": False,
+        "filter_visible": True,
+        "output_kind": "verdict",
+        "requires_code": False,
+        "requires_web": False,
+        "requires_compute": True,
+        "evaluation_strategy": "metric",
+        "cost_ceiling_usd": 5.0,
+        "run_shape": "experiment_loop",
+    }
 
 
 def test_enrichment_leaves_agent_mode_derived_sets_consistent():

@@ -151,12 +151,21 @@ describe('handlers registry', () => {
 // and graded by the type's evaluator with NO bespoke completion handler required.
 describe('contract-driven generic dispatch', () => {
   const knowledgeContract: TaskCapabilityContract = {
+    id: 'research',
+    label: 'Research',
+    description: 'Analyze the codebase and produce findings.',
+    default_category: 'strategic',
+    user_launchable: true,
+    provider_configurable: true,
+    filter_visible: true,
     run_shape: 'single_agent',
     agent_mode: 'read_only',
     output_kind: 'knowledge',
     requires_code: true,
     requires_web: false,
     requires_compute: false,
+    evaluation_strategy: 'forward_quality',
+    cost_ceiling_usd: 4,
     is_bespoke_dispatch: false,
   };
   // The backend emits run_shape='workflow' for every PR-producing write type
@@ -164,12 +173,21 @@ describe('contract-driven generic dispatch', () => {
   // backend/app/task_capabilities.py. The generic write/PR runner keys off that
   // exact shape, so this fixture mirrors what the backend actually publishes.
   const writeContract: TaskCapabilityContract = {
+    id: 'create',
+    label: 'Create',
+    description: 'Implement new functionality and open a PR.',
+    default_category: 'build',
+    user_launchable: true,
+    provider_configurable: true,
+    filter_visible: true,
     run_shape: 'workflow',
     agent_mode: 'write',
     output_kind: 'pr',
     requires_code: true,
     requires_web: false,
     requires_compute: false,
+    evaluation_strategy: 'ci_and_review',
+    cost_ceiling_usd: 8,
     is_bespoke_dispatch: false,
   };
 
@@ -205,6 +223,37 @@ describe('contract-driven generic dispatch', () => {
     const resolution = resolveHandler('knowledge_probe', task, payload);
     expect(resolution.dispatch).toBe('generic');
     expect(resolution.handler).toBe(handlers.investigate);
+  });
+
+  it('preserves extra backend-published catalog fields while normalizing dispatch keys', () => {
+    const payload = { type: 'research', prompt: 'findings' };
+    const task = {
+      task_capability: {
+        ...knowledgeContract,
+        run_shape: 'single-agent',
+        description: 'Analyze the codebase and produce findings.',
+      },
+    };
+    const contract = resolveTaskCapabilityContract(task, payload);
+
+    expect(contract).toMatchObject({
+      id: 'research',
+      label: 'Research',
+      description: 'Analyze the codebase and produce findings.',
+      default_category: 'strategic',
+      user_launchable: true,
+      provider_configurable: true,
+      filter_visible: true,
+      agent_mode: 'read_only',
+      output_kind: 'knowledge',
+      requires_code: true,
+      requires_web: false,
+      requires_compute: false,
+      evaluation_strategy: 'forward_quality',
+      cost_ceiling_usd: 4,
+      run_shape: 'single_agent',
+      is_bespoke_dispatch: false,
+    });
   });
 
   it('treats output_kind in {none, verdict} as generic knowledge too', () => {

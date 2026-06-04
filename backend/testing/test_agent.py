@@ -26,7 +26,7 @@ from app.models import (
 )
 from app.auth import create_agent_token
 from app.schemas import AgentStatusPayload
-from app.task_capabilities import TaskType
+from app.task_capabilities import TaskType, task_type_catalog
 
 
 def _resolve_sr_recent_miss_examples_contract_fixture() -> Path:
@@ -146,15 +146,35 @@ async def test_agent_claim_includes_task_capability_slice(client: AsyncClient, d
 
     assert resp.status_code == 200
     data = resp.json()
-    assert data["task_capability"] == {
-        "run_shape": "workflow",
-        "agent_mode": "write",
-        "output_kind": "pr",
-        "requires_code": True,
-        "requires_web": False,
-        "requires_compute": False,
-        "is_bespoke_dispatch": False,
-    }
+    expected = {entry["id"]: entry for entry in task_type_catalog()}["create"]
+    assert data["task_capability"] == expected
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_includes_compute_experiment_capability_slice(
+    client: AsyncClient, db_session
+):
+    project = Project(name="Agent Claim Compute Capability Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": TaskType.compute_experiment.value}],
+        vm_instance_id="agent-vm-compute-capability",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-compute-capability")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    expected = {entry["id"]: entry for entry in task_type_catalog()}["compute_experiment"]
+    assert data["task_capability"] == expected
 
 
 @pytest.mark.smoketest
@@ -387,12 +407,18 @@ async def test_agent_compute_job_launch_rejects_non_compute_task_type(
     )
 
     assert resp.status_code == 403
+    # Only compute_experiment satisfies the compute-job capability gate
+    # (experiment_loop + verdict + requires_compute, no code/web, metric eval
+    # with a cost ceiling). Assert the concrete allow-list rather than
+    # recomputing the production filter, so a regression in either the filter
+    # or the capability registry is actually caught here.
+    expected_allowed = ["compute_experiment"]
     assert resp.json()["error"] == {
         "code": 403,
         "message": {
-        "error": "task_type_not_allowed_for_compute_jobs",
-        "task_type": TaskType.research.value,
-        "allowed_task_types": [TaskType.compute_experiment.value],
+            "error": "task_type_not_allowed_for_compute_jobs",
+            "task_type": TaskType.research.value,
+            "allowed_task_types": expected_allowed,
         },
     }
     jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
