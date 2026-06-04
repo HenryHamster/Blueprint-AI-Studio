@@ -2865,6 +2865,79 @@ async def test_step6_precondition_defer_sets_likely_cause(
     assert "all accounts healthy but VM slot limit reached" not in alerts[0].message
 
 
+@pytest.mark.asyncio
+async def test_step6_alert_broadcasts_after_commit(reaper_db, mocker):
+    """Queued-age alerts must broadcast only after the alert rows are committed."""
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="stalled-task",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        created_at=datetime.utcnow() - timedelta(hours=2, minutes=30),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+
+    events: list = []
+    real_commit = reaper_db.commit
+
+    async def _tracking_commit(*a, **k):
+        events.append("commit")
+        return await real_commit(*a, **k)
+
+    mocker.patch.object(reaper_db, "commit", side_effect=_tracking_commit)
+
+    async def _tracking_broadcast(project_id, event, payload):
+        events.append(("broadcast", event, payload.get("severity")))
+
+    mocker.patch("app.broadcast.broadcast_to_project", side_effect=_tracking_broadcast)
+
+    alerted = await _rs.sweep_queued_age_alerts(
+        reaper_db,
+        _utcnow(),
+        runtime_config={"queued_age_alert_hours": 2},
+        batch_size=5000,
+    )
+
+    assert alerted == 1
+    assert "commit" in events
+    assert ("broadcast", "alert_created", "INFO") in events
+    assert events.index("commit") < events.index(("broadcast", "alert_created", "INFO"))
+
+
+@pytest.mark.asyncio
+async def test_step6_alert_does_not_broadcast_on_commit_failure(reaper_db, mocker):
+    """If the batch commit fails, queued-age alerts must not be broadcast."""
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="stalled-task",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        created_at=datetime.utcnow() - timedelta(hours=2, minutes=30),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+
+    broadcast = mocker.patch(
+        "app.broadcast.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch.object(
+        reaper_db, "commit", side_effect=RuntimeError("queued-age commit boom")
+    )
+
+    with pytest.raises(RuntimeError, match="queued-age commit boom"):
+        await _rs.sweep_queued_age_alerts(
+            reaper_db,
+            _utcnow(),
+            runtime_config={"queued_age_alert_hours": 2},
+            batch_size=5000,
+        )
+
+    broadcast.assert_not_called()
+
+
 # ── Terminal failure finalization (non-provision budget exhausted) ────────
 
 
@@ -5300,6 +5373,101 @@ async def test_step7_stalled_cycle_already_terminal_task_untouched(
         "task message must not be overwritten"
     )
     assert cycle.outcome == "stalled_phase1", "cycle must be declared stalled"
+
+
+@pytest.mark.asyncio
+async def test_step7_stalled_cycle_broadcasts_after_commit(reaper_db, mocker):
+    """Stalled-cycle alerts must broadcast only after the batch commit succeeds."""
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase1",
+        payloads=[{"type": "design_doc_update", "scope": "medium"}],
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=datetime.utcnow() - timedelta(hours=1),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase1_running",
+        phase1_task_id=task.id,
+        phase1_started_at=datetime.utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    events: list = []
+    real_commit = reaper_db.commit
+
+    async def _tracking_commit(*a, **k):
+        events.append("commit")
+        return await real_commit(*a, **k)
+
+    mocker.patch.object(reaper_db, "commit", side_effect=_tracking_commit)
+
+    async def _tracking_broadcast(project_id, event, payload):
+        events.append(("broadcast", event, payload.get("severity")))
+
+    mocker.patch("app.broadcast.broadcast_to_project", side_effect=_tracking_broadcast)
+
+    stalled = await _rs.sweep_stalled_strategic_cycles(
+        reaper_db,
+        _utcnow(),
+        heartbeat_stale_cutoff_fn=lambda _task, now: now - timedelta(minutes=5),
+    )
+
+    assert stalled == 1
+    assert "commit" in events
+    assert ("broadcast", "alert_created", "WARNING") in events
+    assert events.index("commit") < events.index(("broadcast", "alert_created", "WARNING"))
+
+
+@pytest.mark.asyncio
+async def test_step7_stalled_cycle_does_not_broadcast_on_commit_failure(
+    reaper_db, mocker
+):
+    """If the batch commit fails, stalled-cycle alerts must not be broadcast."""
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase1",
+        payloads=[{"type": "design_doc_update", "scope": "medium"}],
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=datetime.utcnow() - timedelta(hours=1),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase1_running",
+        phase1_task_id=task.id,
+        phase1_started_at=datetime.utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    broadcast = mocker.patch(
+        "app.broadcast.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch.object(
+        reaper_db, "commit", side_effect=RuntimeError("stalled-cycle commit boom")
+    )
+
+    with pytest.raises(RuntimeError, match="stalled-cycle commit boom"):
+        await _rs.sweep_stalled_strategic_cycles(
+            reaper_db,
+            _utcnow(),
+            heartbeat_stale_cutoff_fn=lambda _task, now: now - timedelta(minutes=5),
+        )
+
+    broadcast.assert_not_called()
 
 
 # ── Orphan reap crash isolation & quarantine ─────────────────────────────

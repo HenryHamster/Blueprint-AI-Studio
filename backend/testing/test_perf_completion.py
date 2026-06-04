@@ -144,6 +144,89 @@ async def test_perf_completion_high_severity_spawns_children_and_evaluates(
 
 
 @pytest.mark.asyncio
+async def test_perf_completion_broadcasts_children_after_commit(
+    db_session, _quiet_perf_io, mocker
+):
+    """Child task updates must broadcast only after the final perf commit."""
+    task = await _make_perf_task(db_session)
+
+    findings = [
+        {
+            "severity": "high",
+            "area": "provisioning",
+            "title": "VM cold-start blocks claim",
+            "description": "Synchronous provision on the hot path.",
+            "fix_prompt": "Provision asynchronously and reuse warm VMs.",
+        }
+    ]
+
+    events: list = []
+    commit_count = 0
+    real_commit = db_session.commit
+
+    async def _tracking_commit(*a, **k):
+        nonlocal commit_count
+        commit_count += 1
+        events.append(f"commit-{commit_count}")
+        return await real_commit(*a, **k)
+
+    mocker.patch.object(db_session, "commit", side_effect=_tracking_commit)
+
+    async def _tracking_broadcast(project_id, event_name, payload):
+        events.append(("broadcast", event_name, payload.get("task_id")))
+
+    mocker.patch(
+        "app.task_completion.broadcast_to_project", side_effect=_tracking_broadcast
+    )
+
+    await _handle_perf_completion(task, json.dumps(findings), db_session)
+
+    children = await _children_of(db_session, task)
+    assert len(children) == 1
+    assert events.index("commit-2") < events.index(
+        ("broadcast", "task_updated", str(children[0].id))
+    )
+
+
+@pytest.mark.asyncio
+async def test_perf_completion_does_not_broadcast_children_on_commit_failure(
+    db_session, _quiet_perf_io, mocker
+):
+    """If the final perf commit fails, queued child broadcasts must not fire."""
+    task = await _make_perf_task(db_session)
+
+    findings = [
+        {
+            "severity": "high",
+            "area": "provisioning",
+            "title": "VM cold-start blocks claim",
+            "description": "Synchronous provision on the hot path.",
+            "fix_prompt": "Provision asynchronously and reuse warm VMs.",
+        }
+    ]
+
+    broadcast = mocker.patch(
+        "app.task_completion.broadcast_to_project", new_callable=AsyncMock
+    )
+    commit_count = 0
+    real_commit = db_session.commit
+
+    async def _failing_commit(*a, **k):
+        nonlocal commit_count
+        commit_count += 1
+        if commit_count == 2:
+            raise RuntimeError("perf commit boom")
+        return await real_commit(*a, **k)
+
+    mocker.patch.object(db_session, "commit", side_effect=_failing_commit)
+
+    with pytest.raises(RuntimeError, match="perf commit boom"):
+        await _handle_perf_completion(task, json.dumps(findings), db_session)
+
+    broadcast.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_perf_completion_no_findings_stays_terminal(db_session, _quiet_perf_io):
     """Unparseable / empty findings → no children, and the handler leaves the
     incoming terminal status untouched (does not flip to EVALUATING)."""

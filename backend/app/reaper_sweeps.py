@@ -193,6 +193,7 @@ async def sweep_queued_age_alerts(
     ]
 
     _alerted = 0
+    pending_broadcasts: list[tuple[str, dict]] = []
     for _qt in _stale_queued:
         _qctx = _qt.context or {}
         _prev_tier = _qctx.get("queued_age_alert_tier") or (
@@ -282,20 +283,16 @@ async def sweep_queued_age_alerts(
         _qt.context = _new_qctx
         session.add(_qt)
 
-        try:
-            await _bcast(
+        pending_broadcasts.append(
+            (
                 str(_qt.project_id),
-                "alert_created",
                 {
                     "alert_id": str(_alert.id),
                     "severity": _target_label,
                     "title": _alert.title,
                 },
             )
-        except Exception as _bcast_err:  # noqa: BLE001
-            logger.warning(
-                f"[REAPER] Queued age alert broadcast failed for {_qt.id}: {_bcast_err}"
-            )
+        )
 
         _alerted += 1
         logger.info(
@@ -305,6 +302,14 @@ async def sweep_queued_age_alerts(
 
     if _alerted:
         await session.commit()
+        for project_id, payload in pending_broadcasts:
+            try:
+                await _bcast(project_id, "alert_created", payload)
+            except Exception as _bcast_err:  # noqa: BLE001
+                logger.warning(
+                    f"[REAPER] Queued age alert broadcast failed for "
+                    f"{payload.get('alert_id')}: {_bcast_err}"
+                )
         logger.info(
             f"[REAPER] Fired queued age alerts for {_alerted} stale task(s)"
         )
@@ -329,6 +334,7 @@ async def sweep_stalled_strategic_cycles(
     stalled = await strategic_cycle.find_stalled(session)
     _step7_now = _utcnow()
     actually_stalled: list = []
+    pending_broadcasts: list[tuple[str, dict]] = []
     for c in stalled:
         if c.outcome in (
             strategic_cycle.OUTCOME_IN_PROGRESS,
@@ -389,14 +395,15 @@ async def sweep_stalled_strategic_cycles(
                 ),
             )
             session.add(alert)
-            await _bcast(
-                str(c.project_id),
-                "alert_created",
-                {
-                    "alert_id": str(alert.id),
-                    "severity": "WARNING",
-                    "title": alert.title,
-                },
+            pending_broadcasts.append(
+                (
+                    str(c.project_id),
+                    {
+                        "alert_id": str(alert.id),
+                        "severity": "WARNING",
+                        "title": alert.title,
+                    },
+                )
             )
         except Exception:
             logger.exception(
@@ -404,6 +411,14 @@ async def sweep_stalled_strategic_cycles(
             )
     if actually_stalled:
         await session.commit()
+        for project_id, payload in pending_broadcasts:
+            try:
+                await _bcast(project_id, "alert_created", payload)
+            except Exception as _bcast_err:  # noqa: BLE001
+                logger.warning(
+                    f"[REAPER] Stalled-cycle alert broadcast failed for "
+                    f"{payload.get('alert_id')}: {_bcast_err}"
+                )
         logger.info(
             f"[REAPER] Marked {len(actually_stalled)} strategic cycle(s) stalled"
         )

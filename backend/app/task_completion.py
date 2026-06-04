@@ -1503,6 +1503,7 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
         child_tasks.append(new_task)
 
     await session.flush()
+    pending_broadcasts: list[tuple[str, str, dict]] = []
     for ct in child_tasks:
         history = TaskHistory(
             task_id=ct.id,
@@ -1510,10 +1511,12 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
             details={"spawned_by": "PERF_AUDIT", "parent_perf_id": str(task.id)},
         )
         session.add(history)
-        await broadcast_to_project(
-            str(task.project_id),
-            "task_updated",
-            {"task_id": str(ct.id), "status": TaskStatus.QUEUED},
+        pending_broadcasts.append(
+            (
+                str(task.project_id),
+                "task_updated",
+                {"task_id": str(ct.id), "status": TaskStatus.QUEUED},
+            )
         )
 
     # Post a summary comment on open PRs for medium/low findings
@@ -1574,11 +1577,22 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
     session.add(task)
     await session.commit()
 
-    await broadcast_to_project(
-        str(task.project_id),
-        "autonomous_activity",
-        {"perf_task_id": str(task.id), "tasks_created": len(child_tasks)},
-    )
+    for project_id, event_name, payload in pending_broadcasts:
+        try:
+            await broadcast_to_project(project_id, event_name, payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"[PERF] Failed to broadcast {event_name} for {payload.get('task_id')}: {exc}"
+            )
+
+    try:
+        await broadcast_to_project(
+            str(task.project_id),
+            "autonomous_activity",
+            {"perf_task_id": str(task.id), "tasks_created": len(child_tasks)},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[PERF] Failed to broadcast autonomous activity: {exc}")
     logger.info(
         f"[PERF] Created 1 bundled fix task from perf analysis {task.id} "
         f"(findings={len(actionable)})"
