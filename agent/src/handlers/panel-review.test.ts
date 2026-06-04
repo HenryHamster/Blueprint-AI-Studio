@@ -98,6 +98,7 @@ vi.mock('child_process', () => ({
 import { execFileSync } from 'child_process';
 import { persistAndPostStatus, readHandlerOutput, runClaudeCode } from '../index.js';
 import { handlePanelReview, PANEL_REVIEW_LENSES } from './panel-review.js';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 
 const PAYLOAD = {
   pr_number: 42,
@@ -160,7 +161,8 @@ describe('handlePanelReview', () => {
 
     // Each lens reads its own output file.
     for (const lens of PANEL_REVIEW_LENSES) {
-      expect(vi.mocked(readHandlerOutput)).toHaveBeenCalledWith(
+      expectCalledWith(
+        readHandlerOutput,
         'task-panel-1',
         `panel_review_lens_${lens.id}`,
         null,

@@ -611,6 +611,107 @@ def _build_compute_experiment_summary(
     return _summary_dict(task, verdict, evidence, highlights)
 
 
+_PANEL_REVIEW_LENS_LABELS = {
+    "correctness": "Correctness",
+    "security": "Security",
+    "code_quality": "Code Quality",
+    "test_coverage": "Test Coverage",
+}
+
+# The full panel-review severity vocabulary — critical/major/minor (NOT the
+# critical/high that the generic findings fallback recognizes). Counting all
+# three is the whole point of the dedicated builder.
+_PANEL_REVIEW_SEVERITIES = ("critical", "major", "minor")
+
+
+def _panel_lens_passed(lens_verdict: Any) -> bool | None:
+    """Normalize a per-lens verdict to pass/fail, or ``None`` when unreadable.
+
+    Production lens verdicts are ``APPROVE``/``REQUEST_CHANGES`` (synthesized in
+    panel-review.ts); tolerant of ``pass``/``fail`` shorthands too.
+    """
+    text = str(lens_verdict or "").strip().lower()
+    if text in {"approve", "pass", "passed", "ok"}:
+        return True
+    if text in {"request_changes", "fail", "failed"}:
+        return False
+    return None
+
+
+def _build_panel_review_summary(
+    task: Task, ctx: SummaryContext
+) -> dict[str, Any] | None:
+    """Operator summary for a panel_review task — the structured multi-lens verdict.
+
+    Reads the normalized verdict (``overall_verdict`` ∈ {APPROVE, REQUEST_CHANGES},
+    ``lenses``, ``issues``, ``investigated_files``) via :func:`_panel_review_verdict`.
+    The overall decision drives the verdict (``approve``/``request_changes``) so the
+    operator chip colors correctly; per-lens pass/fail tally, the issue count across
+    ALL panel severities (critical/major/minor), and the investigated-file count
+    become evidence, with per-lens results as highlights. Always returns a dict on a
+    valid verdict — a clean APPROVE with no issues is itself the signal, never
+    ``None`` — and ``None`` only when no usable verdict is present.
+    """
+    verdict_dict = _panel_review_verdict(task)
+    if verdict_dict is None:
+        return None
+    overall = str(verdict_dict.get("overall_verdict") or "").strip().upper()
+    verdict = "approve" if overall == "APPROVE" else "request_changes"
+
+    raw_lenses = verdict_dict.get("lenses")
+    lenses = raw_lenses if isinstance(raw_lenses, dict) else {}
+    lens_states: list[tuple[str, bool | None]] = []
+    for lens_id, lens in lenses.items():
+        if not isinstance(lens, dict):
+            continue
+        label = _PANEL_REVIEW_LENS_LABELS.get(
+            lens_id, str(lens_id).replace("_", " ").title()
+        )
+        lens_states.append((label, _panel_lens_passed(lens.get("verdict"))))
+    passed_count = sum(1 for _, passed in lens_states if passed is True)
+
+    # Prefer the top-level deduped issues; fall back to flattening the per-lens
+    # issues so the count is honest even when only lens-scoped issues are present.
+    raw_issues = verdict_dict.get("issues")
+    issues = raw_issues if isinstance(raw_issues, list) else []
+    if not issues:
+        issues = [
+            issue
+            for lens in lenses.values()
+            if isinstance(lens, dict)
+            for issue in (lens.get("issues") or [])
+        ]
+    severity_counts = {sev: 0 for sev in _PANEL_REVIEW_SEVERITIES}
+    total_issues = 0
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        total_issues += 1
+        sev = str(issue.get("severity") or "").strip().lower()
+        if sev in severity_counts:
+            severity_counts[sev] += 1
+
+    raw_files = verdict_dict.get("investigated_files")
+    files_count = len(raw_files) if isinstance(raw_files, list) else 0
+
+    evidence = [_summary_item("Decision", overall or "UNKNOWN")]
+    if lens_states:
+        evidence.append(
+            _summary_item("Lenses", f"{passed_count}/{len(lens_states)} passed")
+        )
+    severity_text = ", ".join(
+        f"{sev}: {severity_counts[sev]}" for sev in _PANEL_REVIEW_SEVERITIES
+    )
+    evidence.append(_summary_item("Issues", f"{total_issues} total ({severity_text})"))
+    evidence.append(_summary_item("Files reviewed", files_count))
+
+    highlights: list[dict[str, str]] = []
+    for label, passed in lens_states[:3]:
+        state = "pass" if passed is True else "fail" if passed is False else "n/a"
+        highlights.append(_summary_item(label, state))
+    return _summary_dict(task, verdict, evidence, highlights)
+
+
 def _build_findings_summary(task: Task, ctx: SummaryContext) -> dict[str, Any] | None:
     """Shared builder for the structured-findings task types (security_audit,
     perf, release_audit, …) and the fallback for any unregistered type whose
@@ -693,6 +794,7 @@ SUMMARY_BUILDERS: dict[str, Callable[[Task, SummaryContext], dict[str, Any] | No
     "release_audit": _build_findings_summary,
     "compute_experiment": _build_compute_experiment_summary,
     "web_research": _build_web_research_summary,
+    "panel_review": _build_panel_review_summary,
 }
 
 

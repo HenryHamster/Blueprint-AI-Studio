@@ -151,6 +151,38 @@ describe('DetailsTab — Merge Test Gate', () => {
     expect(screen.getByText('Merge Test Gate')).toBeInTheDocument();
   });
 
+  it('colors an approve panel verdict as a positive (emerald) badge', () => {
+    const task = makeTask({
+      task_type: 'panel_review',
+      evaluation_summary: {
+        status: 'COMPLETED',
+        verdict: 'approve',
+        evidence: [{ label: 'Decision', value: 'APPROVE' }],
+        highlights: [{ label: 'Correctness', value: 'pass' }],
+      },
+    });
+    render(<DetailsTab task={task} />);
+    const badge = screen.getByText('approve');
+    expect(badge.className).toContain('emerald');
+    expect(badge.className).not.toContain('cyan');
+  });
+
+  it('colors a request_changes panel verdict as a blocking (red) badge', () => {
+    const task = makeTask({
+      task_type: 'panel_review',
+      evaluation_summary: {
+        status: 'COMPLETED',
+        verdict: 'request_changes',
+        evidence: [{ label: 'Decision', value: 'REQUEST_CHANGES' }],
+        highlights: [{ label: 'Correctness', value: 'fail' }],
+      },
+    });
+    render(<DetailsTab task={task} />);
+    const badge = screen.getByText('request_changes');
+    expect(badge.className).toContain('red');
+    expect(badge.className).not.toContain('cyan');
+  });
+
   it('renders the terminal compute result reference when present', async () => {
     vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
       {

@@ -241,9 +241,9 @@ function EvaluationSummarySection({ summary }: { summary: TaskEvaluationSummary 
   const highlights = summary.highlights ?? [];
 
   const badgeClass =
-    summary.verdict === 'pass'
+    summary.verdict === 'pass' || summary.verdict === 'approve'
       ? 'bg-emerald-900/40 text-emerald-300 border-emerald-800/40'
-      : summary.verdict === 'fail' || summary.verdict === 'actionable'
+      : summary.verdict === 'fail' || summary.verdict === 'actionable' || summary.verdict === 'request_changes'
         ? 'bg-red-900/40 text-red-300 border-red-800/40'
         : summary.verdict === 'undetected'
           ? 'bg-neutral-800/50 text-neutral-300 border-neutral-700/50'
