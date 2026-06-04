@@ -269,7 +269,14 @@ async def _lock_dispatchable_task_for_mutation(
             Project.paused.is_(False),
             Project.not_archived(),
         )
-        .with_for_update(skip_locked=True)
+        # of=Task: lock ONLY the Task row. The Project join is a pause/archive
+        # filter, never mutated here — a plain FOR UPDATE would also lock the
+        # Project row, which deadlocks against the FK child-inserts that take
+        # FOR KEY SHARE on the same Project (project_lock FK deadlock) and lets
+        # skip_locked silently drop a claimable task whenever a sibling claim in
+        # the same project holds the shared Project row. Mirrors
+        # agent_warm_continuity.py:750.
+        .with_for_update(skip_locked=True, of=Task)
         .execution_options(populate_existing=True)
     )
     result = await session.execute(stmt)

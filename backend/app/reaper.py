@@ -462,11 +462,40 @@ def _vm_contact_within_cutoff(
     return last_contact is not None and last_contact >= hb_cutoff
 
 
+def _vm_tool_use_within_cutoff(
+    task, progress_cutoff: datetime, vm_tool_use_lookup: dict | None
+) -> bool:
+    """True iff the orchestrator heard a tool-use from this VM after ``progress_cutoff``.
+
+    Fix 3b: the PROGRESS-stall branch reaps a fresh-heartbeating agent whose
+    on-row ``Task.last_tool_use_at`` is stale. But that on-row write shares the
+    contended task row with ``last_heartbeat`` — a lock-starved heartbeat (the
+    rollup holding the task row FOR UPDATE) drops BOTH, so an agent that IS
+    making tool calls can read as stalled. The heartbeat handler upserts the
+    most-recent tool-use OFF the task row onto ``vmcontact.last_tool_use_at``
+    (keyed on ``vm_instance_id``), so a tool-use within the SAME progress-stale
+    cutoff proves the agent is progressing (its on-row stamp was merely
+    lock-dropped) and the stall reap is suppressed. A genuinely stalled agent
+    (no tool calls anywhere) leaves this stale/absent and is still reaped.
+    Unlike the heartbeat-stale ``_vm_contact_within_cutoff`` override, this does
+    NOT key on the mere fact of contact (a hung agent still heartbeats) — it
+    keys on actual TOOL-USE recency, so genuine stall detection is preserved.
+    """
+    if not vm_tool_use_lookup:
+        return False
+    vm_id = getattr(task, "vm_instance_id", None)
+    if not vm_id:
+        return False
+    last_tool_use = vm_tool_use_lookup.get(vm_id)
+    return last_tool_use is not None and last_tool_use >= progress_cutoff
+
+
 def _classify_orphan(
     task,
     now: datetime,
     has_open_pr: bool,
     vm_contact_lookup: dict | None = None,
+    vm_tool_use_lookup: dict | None = None,
 ) -> bool:
     """Single source of truth for the orphan-detection state machine.
 
@@ -486,6 +515,15 @@ def _classify_orphan(
     heartbeat-stale branch that would reap, a contact within the SAME
     ``hb_cutoff`` overrides the reap (the agent is alive; its ``last_heartbeat``
     write was lock-starved). Absent / stale contact → existing behaviour.
+
+    ``vm_tool_use_lookup`` is an optional ``{vm_instance_id: last_tool_use_at}``
+    map (batch-fetched from the SAME query, Fix 3b). On the PROGRESS-stall
+    branches that would reap (``agent_stalled``), a tool-use within the
+    ``_progress_stale_cutoff`` overrides the reap — the agent IS making tool
+    calls; its on-row ``last_tool_use_at`` write was lock-starved together with
+    the heartbeat. Unlike ``vm_contact_lookup`` it keys on tool-use recency, NOT
+    mere contact (a hung agent still heartbeats), so genuine stall detection is
+    preserved. Absent / stale tool-use → existing behaviour (reap).
 
     State machine (unchanged):
       PROVISIONING:
@@ -569,12 +607,22 @@ def _classify_orphan(
             # the scope-aware progress threshold. Indicates a hung LLM
             # call, a spinning retry loop, or a wedged tool invocation.
             #
-            # NO vm_contact override here (or in the zero-tool-calls branch
-            # below): this is a PROGRESS-stale reap, not a heartbeat-stale one —
-            # the heartbeat IS fresh (last_heartbeat >= hb_cutoff). vm_contact
-            # would likewise be fresh, so suppressing on it would defeat the
-            # genuine stall detection. The override only covers the
-            # last_heartbeat-staleness false-reap (lock-starved write).
+            # NO vm_contact (last_contact_at) override here: this is a
+            # PROGRESS-stale reap, not a heartbeat-stale one — the heartbeat IS
+            # fresh (last_heartbeat >= hb_cutoff), so a mere contact would
+            # likewise be fresh and suppressing on it would defeat genuine stall
+            # detection. The contact override only covers the last_heartbeat
+            # false-reap (lock-starved write).
+            #
+            # Fix 3b: a TOOL-USE override IS valid here. The on-row
+            # ``last_tool_use_at`` write shares the contended task row with
+            # ``last_heartbeat``, so a lock-starved heartbeat drops it too — an
+            # agent that IS calling tools can read as stalled. The off-row
+            # ``vmcontact.last_tool_use_at`` carries the real progress signal:
+            # if it's within the progress-stale cutoff the agent is progressing,
+            # so don't reap. Keyed on tool-use recency (not mere contact), so a
+            # genuinely stalled-but-heartbeating agent (no recent tool use
+            # anywhere) is still reaped.
             #
             # Cross-attempt stale-tool guard (8c8cf973 incident):
             # last_tool_use_at carries forward across retries — if
@@ -583,8 +631,10 @@ def _classify_orphan(
             # 22s after starting because tool_use_at was 11min old
             # from attempt 1). The started_at check ensures the
             # current attempt has actually had time to call tools.
-            return True
-        if (  # noqa: SIM103 — keep the explanatory comment, don't inline
+            return not _vm_tool_use_within_cutoff(
+                task, _progress_stale_cutoff(task, now), vm_tool_use_lookup
+            )
+        if (
             task.last_heartbeat
             and task.last_heartbeat >= hb_cutoff
             and task.last_tool_use_at is None
@@ -603,7 +653,14 @@ def _classify_orphan(
             # reaps healthy non-anthropic work after 8 min.
             # TODO: parse Codex --json events / Gemini events
             # to populate tool_trace, then drop the gate.
-            return True
+            #
+            # Fix 3b: even with on-row last_tool_use_at NULL, an off-row
+            # ``vmcontact.last_tool_use_at`` within the progress cutoff means
+            # the agent DID record a tool use that the lock-starved heartbeat
+            # failed to land on the task row — it is progressing, don't reap.
+            return not _vm_tool_use_within_cutoff(
+                task, _progress_stale_cutoff(task, now), vm_tool_use_lookup
+            )
         return False
 
     # Any other status (degenerate row left in an active-scan status): catch-all.
@@ -1131,6 +1188,13 @@ async def reaper_service():
                     t.vm_instance_id for t in active_tasks if t.vm_instance_id
                 }
                 vm_contact_lookup: dict[str, datetime] = {}
+                # Fix 3b: also build a {vm_instance_id: last_tool_use_at} map from
+                # the SAME query. The progress-stall branch consults it so a
+                # lock-starved-but-PROGRESSING agent (its on-row last_tool_use_at
+                # write was skipped by the rollup task-row lock) is spared, while
+                # a genuinely stalled agent (no recent tool use anywhere) is still
+                # reaped. Distinct from the heartbeat-stale override above.
+                vm_tool_use_lookup: dict[str, datetime] = {}
                 if candidate_vm_ids:
                     contact_rows = (
                         (
@@ -1138,6 +1202,7 @@ async def reaper_service():
                                 select(
                                     VmContact.vm_instance_id,
                                     VmContact.last_contact_at,
+                                    VmContact.last_tool_use_at,
                                 ).where(
                                     VmContact.vm_instance_id.in_(candidate_vm_ids)
                                 )
@@ -1147,8 +1212,13 @@ async def reaper_service():
                     )
                     vm_contact_lookup = {
                         vm_id: last_contact
-                        for vm_id, last_contact in contact_rows
+                        for vm_id, last_contact, _last_tool in contact_rows
                         if last_contact is not None
+                    }
+                    vm_tool_use_lookup = {
+                        vm_id: last_tool
+                        for vm_id, _last_contact, last_tool in contact_rows
+                        if last_tool is not None
                     }
 
                 # State-machine invariants after the clock-separation fix:
@@ -1179,6 +1249,7 @@ async def reaper_service():
                         now,
                         has_open_pr=has_pr,
                         vm_contact_lookup=vm_contact_lookup,
+                        vm_tool_use_lookup=vm_tool_use_lookup,
                     ):
                         continue
                     orphaned_ids.append(task.id)
@@ -1306,19 +1377,26 @@ async def reaper_service():
                         t.vm_instance_id for t in orphaned_tasks if t.vm_instance_id
                     }
                     step2_contact_lookup: dict[str, datetime] = {}
+                    step2_tool_use_lookup: dict[str, datetime] = {}
                     if step2_vm_ids:
                         step2_contact_rows = (
                             await session.execute(
                                 select(
                                     VmContact.vm_instance_id,
                                     VmContact.last_contact_at,
+                                    VmContact.last_tool_use_at,
                                 ).where(VmContact.vm_instance_id.in_(step2_vm_ids))
                             )
                         ).all()
                         step2_contact_lookup = {
                             vm_id: last_contact
-                            for vm_id, last_contact in step2_contact_rows
+                            for vm_id, last_contact, _last_tool in step2_contact_rows
                             if last_contact is not None
+                        }
+                        step2_tool_use_lookup = {
+                            vm_id: last_tool
+                            for vm_id, _last_contact, last_tool in step2_contact_rows
+                            if last_tool is not None
                         }
                     verified = [
                         t
@@ -1328,6 +1406,7 @@ async def reaper_service():
                             now,
                             has_open_pr=(t.id in tasks_with_pr),
                             vm_contact_lookup=step2_contact_lookup,
+                            vm_tool_use_lookup=step2_tool_use_lookup,
                         )
                     ]
                     orphaned_tasks = verified
@@ -1974,10 +2053,35 @@ async def reaper_service():
                         # by the rollup's task-row lock). Computed at relock time
                         # with the current clock + the same scope/effort/PR
                         # awareness _classify_orphan used.
-                        _relock_hb_cutoff = _heartbeat_stale_cutoff(
-                            fresh_task,
-                            _utcnow(),
-                            has_open_pr=_has_pr_artifact,
+                        #
+                        # Fix 3a: the vm_contact override is ONLY valid for
+                        # heartbeat-stale reap codes. A PROGRESS-stall reap
+                        # (``agent_stalled``: fresh heartbeat but no tool calls)
+                        # is a different signal — a hung-but-heartbeating agent
+                        # ALWAYS has a fresh vm_contact (it's still calling the
+                        # heartbeat endpoint), so passing the override here would
+                        # defeat genuine stall detection entirely. Mirror
+                        # _classify_orphan, which deliberately withholds the
+                        # override on its progress-stall branches. Pass None for
+                        # ``agent_stalled``; the lock-starved-but-progressing case
+                        # is handled separately off-row in _classify_orphan via
+                        # vmcontact.last_tool_use_at (Fix 3b).
+                        _HEARTBEAT_STALE_REAP_CODES = frozenset(
+                            {
+                                "heartbeat_timeout_post_claim",
+                                "provision_timeout_pre_claim",
+                                "absolute_timeout",
+                                "never_started",
+                            }
+                        )
+                        _relock_liveness_cutoff = (
+                            _heartbeat_stale_cutoff(
+                                fresh_task,
+                                _utcnow(),
+                                has_open_pr=_has_pr_artifact,
+                            )
+                            if reap_reason_code in _HEARTBEAT_STALE_REAP_CODES
+                            else None
                         )
                         relocked = await _relock_orphan_task(
                             session,
@@ -1985,7 +2089,7 @@ async def reaper_service():
                             fresh_task,
                             pre_io_status,
                             pre_io_last_hb,
-                            vm_liveness_cutoff=_relock_hb_cutoff,
+                            vm_liveness_cutoff=_relock_liveness_cutoff,
                         )
                         if relocked is None:
                             # Peer is finalizing this task or agent revived; skip safely.
