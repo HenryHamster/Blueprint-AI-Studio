@@ -4,6 +4,7 @@ import app.github as github
 from app.migration_chain import (
     _filename_revision_prefix,
     build_migration_chain,
+    find_filename_revision_mismatches,
     find_heads,
     plan_integration_side_renumber,
     plan_migration_reconciliation,
@@ -197,17 +198,34 @@ async def _validate_migration_chain_post_merge(
     target-branch migration's source, builds the in-file revision/down_revision
     chain over the WHOLE set as one (NOT an added-vs-existing comparison, which
     would falsely flag the candidate's own just-merged revisions — see #7731),
-    and blocks on a genuine third-party dual head (more than one Alembic head
-    built from distinct revision ids) or a broken chain (a ``down_revision``
-    pointing at a revision absent from the branch).  A clean target (every
-    revision id appears exactly once and the chain has a single head with no
-    dangling anchor) returns ``("ok", None)``.
+    and blocks on the SAME migration-corruption taxonomy the pre-merge guard
+    enforces (reusing the shared chain helpers rather than a second rule set):
+
+      * a duplicate IN-FILE revision id — two distinct migration files declaring
+        the same ``revision = '...'`` (a copy-paste where the filename ``NNNN``
+        was bumped but the in-file id was not).  Chain-building collapses the two
+        into one node, so the filename-prefix pass cannot see it;
+      * an UNPARSEABLE migration source — a numeric-prefixed file with no
+        parseable in-file ``revision``, silently dropped from the analyzed chain;
+      * a filename/revision DESYNC — the ``NNNN`` filename prefix disagrees with
+        the in-file ``revision`` id;
+      * a genuine third-party dual head (more than one Alembic head built from
+        distinct revision ids), or a broken chain (a ``down_revision`` pointing at
+        a revision absent from the branch).
+
+    The first two classes are weighted ahead of the dual-head / broken-chain
+    checks: a collapsed (duplicate-id) or dropped (unparseable) node can MASK a
+    genuine dual head or broken chain that would otherwise be detected, so the
+    reconciler would record a spurious promotion of a target that actually fails
+    the schema-revision startup gate — the exact failure the guard prevents.  A
+    clean target (every revision id unique and parseable, filenames matching, the
+    chain a single head with no dangling anchor) returns ``("ok", None)``.
 
     Returns ``("defer", reason)`` on GitHub I/O failure — including any per-file
     source fetch failure or empty body — consistent with the pre-merge guard's
-    fail-safe semantics, and ``("block", reason)`` when a genuine duplicate
-    revision id, dual head, or broken chain is found.  When the PR does not touch
-    Alembic migrations, returns ``("ok", None)`` immediately.
+    fail-safe semantics, and ``("block", reason)`` when any corruption class above
+    is found.  When the PR does not touch Alembic migrations, returns
+    ``("ok", None)`` immediately.
     """
     try:
         files = await github.get_pr_files(gh_token, owner, repo, pr_number)
@@ -289,7 +307,40 @@ async def _validate_migration_chain_post_merge(
         sources[fn] = text
 
     if sources:
-        chain, _duplicates, _unparseable = build_migration_chain(sources)
+        chain, duplicates, unparseable = build_migration_chain(sources)
+
+        # Weight the unambiguously chain-breaking classes first: a collapsed
+        # (duplicate in-file id) or dropped (unparseable) node can MASK a genuine
+        # dual head / broken chain below, so surface them before the head/dangling
+        # checks. This mirrors the pre-merge guard's corruption taxonomy
+        # (validate_added_migrations) exactly, reusing the same chain helpers.
+        if unparseable:
+            return (
+                "block",
+                f"migration file(s) on '{target_branch}' have no parseable in-file "
+                f"revision and were dropped from the chain: "
+                f"{', '.join(sorted(unparseable))} — an unparseable migration makes "
+                f"the target unbootable and can mask a dual head; chain needs "
+                f"manual resolution.",
+            )
+        if duplicates:
+            dup = sorted(set(duplicates))[0]
+            return (
+                "block",
+                f"in-file Alembic revision id '{dup}' is declared by more than one "
+                f"migration file on '{target_branch}' — distinct files collapsing to "
+                f"one chain node can mask a dual head and the schema-revision startup "
+                f"gate would fail; chain needs manual resolution.",
+            )
+        mismatches = find_filename_revision_mismatches(sources)
+        if mismatches:
+            return (
+                "block",
+                f"migration filename prefix disagrees with its in-file revision on "
+                f"'{target_branch}': {'; '.join(sorted(mismatches))} — chain needs "
+                f"manual resolution.",
+            )
+
         heads = find_heads(chain)
         if len(heads) > 1:
             return (

@@ -60,6 +60,35 @@ def _file_text_from_map(by_revision: dict[str, str | None]):
     return _get
 
 
+def _file_text_from_explicit_map(by_prefix: dict[str, tuple[str | None, str | None]]):
+    """An ``app.github.get_file_text_at_ref`` mock that DECOUPLES the filename
+    ``NNNN`` prefix from the in-file ``revision`` id.
+
+    ``by_prefix`` maps each target-branch filename prefix to a
+    ``(revision, down_revision)`` tuple, where ``revision`` is the in-file
+    ``revision = '...'`` value (which may DIFFER from the filename prefix, or be
+    ``None`` to emit a body with no parseable ``revision`` assignment at all —
+    the unparseable case).  Unlike ``_file_text_from_map`` (which always keys the
+    in-file revision to the filename prefix), this lets a test build the
+    duplicate-in-file-revision, unparseable, and filename/revision-desync
+    corruption classes the post-merge guard must detect.
+    """
+
+    async def _get(path, *, token, owner, repo, ref, project_id=None):
+        basename = path.rsplit("/", 1)[-1]
+        prefix = basename.split("_")[0]
+        if prefix not in by_prefix:
+            return None
+        revision, down_revision = by_prefix[prefix]
+        if revision is None:
+            # Unparseable: a numeric-prefixed file with no `revision = '...'`.
+            down = "None" if down_revision is None else f"'{down_revision}'"
+            return f"down_revision = {down}\n"
+        return _mig_source(revision, down_revision)
+
+    return _get
+
+
 def _shared_session_factory(db_session):
     """Hand the reconciler the test's shared session (no-op __aexit__).
 
@@ -647,6 +676,236 @@ async def test_reconcile_dangling_down_revision_blocks(db_session, mocker):
         await db_session.refresh(version)
         assert version.status == "open", (
             f"Expected status=open (not promoted) for broken chain, "
+            f"got {version.status!r}"
+        )
+        assert version.last_qualification["status"] == "promotion_failed"
+        assert version.last_qualification["error"] == "migration_guard_blocked"
+        branch_sha_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_duplicate_in_file_revision_blocks(db_session, mocker):
+    """Regression: two distinct migration files declaring the SAME in-file
+    revision id (a copy-paste where the filename NNNN was bumped but the in-file
+    `revision` was not) must block.  The filename-prefix pass cannot see this
+    (the prefixes 0100/0101 are distinct), and chain-building COLLAPSES the two
+    into a single node — which here masks what would otherwise be a dual head, so
+    the un-guarded check would spuriously promote a target that fails the
+    schema-revision startup gate."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[
+                {"filename": "backend/alembic/versions/0100_add_widget.py"}
+            ]
+        ),
+    )
+    # Distinct filename prefixes (0099/0100/0101) — the filename-prefix dup pass
+    # sees nothing — but 0100_add_widget and 0101_add_gadget BOTH declare in-file
+    # revision '0100'.  They collapse to one node {0100: 0099}, masking the fact
+    # that two files both claim the single slot after 0099.
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=AsyncMock(
+            return_value=["0099_prev.py", "0100_add_widget.py", "0101_add_gadget.py"]
+        ),
+    )
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(
+            side_effect=_file_text_from_explicit_map(
+                {
+                    "0099": ("0099", None),
+                    "0100": ("0100", "0099"),
+                    "0101": ("0100", "0099"),  # duplicate in-file revision
+                }
+            )
+        ),
+    )
+    branch_sha_mock = mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="release0" * 5),
+    )
+    mocker.patch("app.github.create_tag", new=AsyncMock(return_value={}))
+
+    for status, pending_data in _blocking_full_chain_test_params():
+        _project, version = await _make_project_and_version(
+            db_session, integration_branch="trunk", promotion_target="release"
+        )
+        version.last_qualification = pending_data
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        if status == "promotion_failed":
+            reconciled = await _reconcile_if_promotion_failed_landed(
+                version.id, session_factory=_shared_session_factory(db_session)
+            )
+        else:
+            reconciled = await _reconcile_if_pending_auto_merge_landed(
+                version.id, session_factory=_shared_session_factory(db_session)
+            )
+
+        assert reconciled is True, f"Expected reconciled=True for status={status!r}"
+        await db_session.refresh(version)
+        assert version.status == "open", (
+            f"Expected status=open (not promoted) for duplicate in-file revision, "
+            f"got {version.status!r}"
+        )
+        assert version.last_qualification["status"] == "promotion_failed"
+        assert version.last_qualification["error"] == "migration_guard_blocked"
+        branch_sha_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_unparseable_revision_blocks(db_session, mocker):
+    """Regression: a numeric-prefixed target-branch migration whose source has no
+    parseable in-file `revision` is silently DROPPED from the analyzed chain.
+    Here the dropped file would otherwise be a second head (anchored at 0099), so
+    dropping it masks a dual head — the guard must block on the unparseable file
+    rather than promote on the truncated chain."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[
+                {"filename": "backend/alembic/versions/0100_add_widget.py"}
+            ]
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=AsyncMock(
+            return_value=["0099_prev.py", "0100_add_widget.py", "0101_add_gadget.py"]
+        ),
+    )
+    # 0101_add_gadget has no `revision = '...'` (revision=None) — unparseable, so
+    # it is dropped from the chain.  Had it parsed (distinct id anchored at 0099)
+    # it would be a second head; dropping it masks that dual head.
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(
+            side_effect=_file_text_from_explicit_map(
+                {
+                    "0099": ("0099", None),
+                    "0100": ("0100", "0099"),
+                    "0101": (None, "0099"),  # no in-file revision -> unparseable
+                }
+            )
+        ),
+    )
+    branch_sha_mock = mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="release0" * 5),
+    )
+    mocker.patch("app.github.create_tag", new=AsyncMock(return_value={}))
+
+    for status, pending_data in _blocking_full_chain_test_params():
+        _project, version = await _make_project_and_version(
+            db_session, integration_branch="trunk", promotion_target="release"
+        )
+        version.last_qualification = pending_data
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        if status == "promotion_failed":
+            reconciled = await _reconcile_if_promotion_failed_landed(
+                version.id, session_factory=_shared_session_factory(db_session)
+            )
+        else:
+            reconciled = await _reconcile_if_pending_auto_merge_landed(
+                version.id, session_factory=_shared_session_factory(db_session)
+            )
+
+        assert reconciled is True, f"Expected reconciled=True for status={status!r}"
+        await db_session.refresh(version)
+        assert version.status == "open", (
+            f"Expected status=open (not promoted) for unparseable migration, "
+            f"got {version.status!r}"
+        )
+        assert version.last_qualification["status"] == "promotion_failed"
+        assert version.last_qualification["error"] == "migration_guard_blocked"
+        branch_sha_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_filename_prefix_mismatch_blocks(db_session, mocker):
+    """Regression: a migration whose NNNN filename prefix disagrees with its
+    in-file revision id (filename 0101, in-file revision '0100') must block.  The
+    in-file chain alone looks single-headed and unbroken, but the filename/revision
+    desync means the file Alembic stores under 0101 actually advances the schema to
+    0100 — a parity-with-pre-merge corruption class that fails the startup gate."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[
+                {"filename": "backend/alembic/versions/0101_add_gadget.py"}
+            ]
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=AsyncMock(
+            return_value=["0099_prev.py", "0101_add_gadget.py"]
+        ),
+    )
+    # 0101_add_gadget declares in-file revision '0100' (not '0101'): a unique,
+    # parseable id and a single-head chain {0099: None, 0100: 0099} — only the
+    # filename/revision desync betrays the corruption.
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(
+            side_effect=_file_text_from_explicit_map(
+                {
+                    "0099": ("0099", None),
+                    "0101": ("0100", "0099"),  # prefix 0101 vs in-file 0100
+                }
+            )
+        ),
+    )
+    branch_sha_mock = mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="release0" * 5),
+    )
+    mocker.patch("app.github.create_tag", new=AsyncMock(return_value={}))
+
+    for status, pending_data in _blocking_full_chain_test_params():
+        _project, version = await _make_project_and_version(
+            db_session, integration_branch="trunk", promotion_target="release"
+        )
+        version.last_qualification = pending_data
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        if status == "promotion_failed":
+            reconciled = await _reconcile_if_promotion_failed_landed(
+                version.id, session_factory=_shared_session_factory(db_session)
+            )
+        else:
+            reconciled = await _reconcile_if_pending_auto_merge_landed(
+                version.id, session_factory=_shared_session_factory(db_session)
+            )
+
+        assert reconciled is True, f"Expected reconciled=True for status={status!r}"
+        await db_session.refresh(version)
+        assert version.status == "open", (
+            f"Expected status=open (not promoted) for filename/revision desync, "
             f"got {version.status!r}"
         )
         assert version.last_qualification["status"] == "promotion_failed"
