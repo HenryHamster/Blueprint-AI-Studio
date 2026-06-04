@@ -48,6 +48,17 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # Idempotent guard. This migration was originally authored as revision 0138
+    # on ``main`` (where it CREATEd ``digestcache``); the ``main -> automain``
+    # back-merge renumbered it to 0140, so on prod the table already exists while
+    # ``alembic_version`` is still 0139. A bare ``CREATE TABLE`` then raises
+    # ``DuplicateTableError`` and wedges every deploy (the migrate job exits 1, so
+    # the schema never advances and all 0140-expecting code boot-crashes). Skip
+    # the create when the table is already present so the revision can advance; on
+    # a fresh DB the table doesn't exist and it is created normally.
+    bind = op.get_bind()
+    if sa.inspect(bind).has_table("digestcache"):
+        return
     op.create_table(
         "digestcache",
         sa.Column("cache_key", sa.String(), primary_key=True, nullable=False),
