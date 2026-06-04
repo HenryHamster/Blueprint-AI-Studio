@@ -227,9 +227,13 @@ async def test_perf_completion_does_not_broadcast_children_on_commit_failure(
 
 
 @pytest.mark.asyncio
-async def test_perf_completion_no_findings_stays_terminal(db_session, _quiet_perf_io):
-    """Unparseable / empty findings → no children, and the handler leaves the
-    incoming terminal status untouched (does not flip to EVALUATING)."""
+async def test_perf_completion_no_measurement_fails_metric_gate(
+    db_session, _quiet_perf_io
+):
+    """Metric gate: unparseable / empty output means the perf report produced no
+    structured measurement, so it must NOT complete clean. No children spawn and
+    the task is marked FAILED (a perf task opens no PR and spawns no children, so
+    EVALUATING would hang forever)."""
     task = await _make_perf_task(db_session)
 
     await _handle_perf_completion(task, "not a findings array at all", db_session)
@@ -238,8 +242,10 @@ async def test_perf_completion_no_findings_stays_terminal(db_session, _quiet_per
     assert children == []
 
     await db_session.refresh(task)
-    assert task.status == TaskStatus.COMPLETED
-    assert "no parseable findings" in (task.latest_status_message or "").lower()
+    assert task.status == TaskStatus.FAILED
+    assert "gate" in (task.latest_status_message or "").lower()
+    assert task.context["evaluation_gate"]["passed"] is False
+    assert task.context["evaluation_gate"]["strategy"] == "metric"
 
 
 @pytest.mark.asyncio

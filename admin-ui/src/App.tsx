@@ -49,6 +49,7 @@ import { VersionMismatchBanner } from './components/VersionMismatchBanner';
 import { DiagnosticsPanel } from './components/DiagnosticsPanel';
 import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPanel';
 import { PlaybookPanel } from './components/PlaybookPanel';
+import { TaskTypeCatalogPanel } from './components/TaskTypeCatalogPanel';
 import { WarmVmPanel } from './components/WarmVmPanel';
 import { FILTER_TASK_TYPE_IDS } from './taskCapabilities';
 import { parseTimestamp } from './utils/time';
@@ -1000,6 +1001,7 @@ export default function App() {
                 </ErrorBoundary>
               )}
               <PlaybookPanel selectedProjectId={s.selectedProjectId} />
+              <TaskTypeCatalogPanel />
               {s.selectedProjectId && (
                 <div ref={srMissedRef} className="shrink-0 mt-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
                   <button

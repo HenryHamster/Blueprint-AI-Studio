@@ -39,7 +39,7 @@ from app.shared_state import (
     runtime_config as _runtime_config,
     derive_task_branch as _derive_task_branch,
 )
-from app.task_capabilities import WRITE_TASK_TYPES
+from app.task_capabilities import WRITE_TASK_TYPES, get_task_capability
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project  # noqa: F401 — re-exported for test patching
 from app.payload_schemas import validate_internal_payload
@@ -337,6 +337,124 @@ async def _mark_dependents_warm_claimable(landed_task: Task) -> None:
         )
 
 
+async def _resolve_quality_grader_completion(
+    grader: Task, payload: AgentStatusPayload, session: AsyncSession
+) -> None:
+    """Route an independent forward-quality grader's verdict back to its source.
+
+    The grader (spawned by ``task_evaluators.spawn_forward_quality_grader``)
+    graded an upstream artifact whose findings would otherwise spawn downstream
+    work. Here we parse its pass/fail verdict, write it onto the parked source
+    task, and re-dispatch the source to its registry completion handler so the
+    spawn-on-findings path runs (PASS) or the source fails without spawning
+    (FAIL). This is the artifact analogue of a code-review verdict returning
+    through the re-entrant completion path. Resolves BOTH a COMPLETED and a
+    FAILED grader (a FAILED grader fails closed) so the source never strands
+    EVALUATING.
+    """
+    from app.task_evaluators import (
+        QUALITY_GRADER_SOURCE_KEY,
+        QUALITY_GRADER_VERDICT_KEY,
+        parse_grader_verdict,
+    )
+    from app.research_completion import _handle_research_completion
+
+    completed = payload.status == TaskStatus.COMPLETED
+    grader_logs = payload.logs or grader.latest_status_message or ""
+    verdict = parse_grader_verdict(grader_logs, completed=completed)
+    grader.latest_status_message = (
+        f"Forward-quality grade: {'PASS' if verdict.passed else 'FAIL'} — "
+        f"{verdict.reason}"
+    )[:500]
+    session.add(grader)
+
+    source_id = (grader.context or {}).get(QUALITY_GRADER_SOURCE_KEY)
+    try:
+        source_uuid = uuid.UUID(str(source_id))
+    except (ValueError, TypeError):
+        await session.commit()
+        return
+
+    source = (
+        (
+            await session.execute(
+                select(Task).where(Task.id == source_uuid).with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if source is None:
+        await session.commit()
+        logger.warning(
+            "[GRADER] Source task %s for grader %s is gone; verdict dropped",
+            source_id,
+            grader.id,
+        )
+        return
+
+    ctx = dict(source.context or {})
+    ctx[QUALITY_GRADER_VERDICT_KEY] = {
+        "passed": verdict.passed,
+        "reason": verdict.reason,
+        "grader_task_id": str(grader.id),
+        "strategy": "forward-quality",
+    }
+    ctx.pop("awaiting_quality_grader", None)
+    source.context = ctx
+    flag_modified(source, "context")
+    # Re-establish the terminal status the source originally reported before it
+    # parked; the resume handler flips it to FAILED if the grade failed.
+    source.status = TaskStatus.COMPLETED
+    session.add(source)
+    await session.commit()
+
+    # Re-dispatch the source to its registry completion handler so it resolves.
+    _resume_handlers = {"research": _handle_research_completion}
+    source_type = (source.first_payload or {}).get("type")
+    cap = get_task_capability(source_type)
+    handler = (
+        _resume_handlers.get(cap.completion_handler)
+        if cap and cap.completion_handler
+        else None
+    )
+    if handler is not None:
+        # Reconstruct the artifact text from the stored findings so the handler
+        # resumes from the same parsed state it had on the first pass.
+        resume_logs = (
+            json.dumps(source.plan_output)
+            if isinstance(source.plan_output, list)
+            else (source.latest_status_message or "")
+        )
+        await handler(source, resume_logs, session)
+    else:
+        logger.warning(
+            "[GRADER] No resume handler for source type %r (task %s); verdict "
+            "recorded but source not re-dispatched",
+            source_type,
+            source.id,
+        )
+    await session.commit()
+
+    # Source is now terminal — propagate to its parent rollup and broadcast.
+    if source.parent_task_id:
+        try:
+            await _check_and_trigger_rollup(source, session)
+        except Exception:
+            logger.error(
+                "[GRADER] rollup after grade failed for %s", source.id, exc_info=True
+            )
+            await session.rollback()
+    try:
+        await broadcast_to_project(
+            str(source.project_id),
+            "task_updated",
+            {"task_id": str(source.id), "status": source.status},
+        )
+    except Exception:
+        logger.debug("[GRADER] broadcast after grade failed", exc_info=True)
+
+
 async def _process_post_commit(
     task_id: uuid.UUID,
     payload: AgentStatusPayload,
@@ -509,6 +627,19 @@ async def _process_post_commit(
             task.context = ctx
             flag_modified(task, "context")
             session.add(task)
+
+        # Forward-quality grader side-car: an independent grader spawned by the
+        # forward-quality escalation carries QUALITY_GRADER_SOURCE_KEY pointing
+        # at the source task it grades. Its completion does NOT flow through the
+        # normal review-pipeline / completion-handler path. Resolve the verdict
+        # and route it back to the parked source, then return. Handled here —
+        # before the COMPLETED-gated pipeline — so even a FAILED grader resolves
+        # the source (fail-closed) rather than stranding it EVALUATING forever.
+        from app.task_evaluators import QUALITY_GRADER_SOURCE_KEY
+
+        if (task.context or {}).get(QUALITY_GRADER_SOURCE_KEY):
+            await _resolve_quality_grader_completion(task, payload, session)
+            return {"status": "accepted"}
 
         # Immediately unblock dependents when task terminally fails (retries exhausted).
         # Uses the same session (not a separate one) to avoid self-deadlock: a second
@@ -3879,54 +4010,46 @@ async def _process_post_commit(
             # delete_agent_vm) won't run on a 500 response. We catch, log, and ensure
             # VM cleanup via asyncio.create_task as a fallback.
             try:
-                if task_type == "plan":
-                    plan_logs = payload.logs or task.latest_status_message or ""
-                    await _handle_plan_completion(task, plan_logs, session)
-
-                elif task_type == "design_doc_update":
-                    doc_logs = payload.logs or task.latest_status_message or ""
-                    # Round 3 C3 + C4: ``locked_project`` was acquired in
-                    # canonical Project → Task order at the top of
-                    # _process_post_commit via ``lock_project_then_task``.
-                    # The handler skips its own re-acquisition when given
-                    # a pre-locked Project. None propagates the legacy
-                    # bounded-retry path inside the handler (defensive
-                    # only — the canonical pair-lock should have produced
-                    # a non-None project for design_doc_update tasks).
-                    # Canonical order is Project before Task — see
-                    # docs/concurrency.md.
-                    await _handle_design_doc_completion(
-                        task, doc_logs, session, project=locked_project
-                    )
-
-                elif task_type == "strategic_review":
-                    review_logs = payload.logs or task.latest_status_message or ""
-                    # Round 3 C3 + C4: see _handle_design_doc_completion above.
-                    # ``locked_project`` was acquired in canonical
-                    # Project → Task order at the top of _process_post_commit.
-                    await _handle_strategic_completion(
-                        task, review_logs, session, project=locked_project
-                    )
-
-                elif task_type == "research":
-                    research_logs = payload.logs or task.latest_status_message or ""
-                    await _handle_research_completion(task, research_logs, session)
-
-                elif task_type == "security_audit":
-                    audit_logs = payload.logs or task.latest_status_message or ""
-                    await _handle_security_audit_completion(task, audit_logs, session)
-
-                elif task_type == "perf":
-                    perf_logs = payload.logs or task.latest_status_message or ""
-                    await _handle_perf_completion(task, perf_logs, session)
-
-                elif task_type == "self_audit":
-                    self_audit_logs = payload.logs or task.latest_status_message or ""
-                    await _handle_self_audit_completion(task, self_audit_logs, session)
-
-                elif task_type == "memo":
-                    memo_logs = payload.logs or task.latest_status_message or ""
-                    await _handle_memo_completion(task, memo_logs, session)
+                # Registry-driven completion dispatch. The task-type registry
+                # DECLARES which logical completion handler each type routes to
+                # (TaskCapability.completion_handler); this map binds each
+                # logical name to its concrete handler function. Adding a type
+                # with a completion handler is therefore a single registry edit
+                # plus a binding here — no new if/elif branch. This replaces the
+                # former hand-maintained if/elif cascade; behaviour is identical
+                # (each task type still routes to exactly the same handler with
+                # the same log/project arguments).
+                _completion_handlers = {
+                    "plan": _handle_plan_completion,
+                    "design_doc": _handle_design_doc_completion,
+                    "strategic": _handle_strategic_completion,
+                    "research": _handle_research_completion,
+                    "security_audit": _handle_security_audit_completion,
+                    "perf": _handle_perf_completion,
+                    "self_audit": _handle_self_audit_completion,
+                    "memo": _handle_memo_completion,
+                }
+                _capability = get_task_capability(task_type)
+                _handler_name = (
+                    _capability.completion_handler if _capability else None
+                )
+                if _handler_name:
+                    _handler = _completion_handlers[_handler_name]
+                    _handler_logs = payload.logs or task.latest_status_message or ""
+                    # Round 3 C3 + C4: the strategic completion handlers
+                    # (design_doc_update, strategic_review) require the
+                    # canonically pre-locked Project. ``locked_project`` was
+                    # acquired in Project → Task order at the top of
+                    # _process_post_commit via ``lock_project_then_task`` (see
+                    # docs/concurrency.md); passing it lets the handler skip its
+                    # own re-acquisition. None propagates the legacy
+                    # bounded-retry path inside the handler (defensive only).
+                    if _capability.completion_needs_locked_project:
+                        await _handler(
+                            task, _handler_logs, session, project=locked_project
+                        )
+                    else:
+                        await _handler(task, _handler_logs, session)
             except Exception as handler_exc:
                 logger.error(
                     f"[STATUS] Completion handler failed for {task_type} task {task.id}: {handler_exc!r}",

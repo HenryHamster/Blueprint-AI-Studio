@@ -1,8 +1,13 @@
 """Tests for the task capability registry."""
 
+import pytest
+from httpx import ASGITransport, AsyncClient
+
 from app.payload_schemas import TaskType, validate_task_payload
 from app.task_capabilities import (
     ALL_TASK_TYPES,
+    COMPLETION_HANDLER_BY_TASK_TYPE,
+    EVALUATION_STRATEGY_BY_TASK_TYPE,
     FILTER_VISIBLE_TASK_TYPES,
     PRODUCT_TASK_TYPES,
     PROVIDER_CONFIGURABLE_TASK_TYPES,
@@ -12,6 +17,7 @@ from app.task_capabilities import (
     USER_LAUNCHABLE_TASK_TYPES,
     WRITE_TASK_TYPES,
     get_task_capability,
+    task_type_catalog,
 )
 
 
@@ -77,6 +83,72 @@ def test_recovery_paths_source_write_allowlist_from_registry():
     )
 
 
+def test_completion_handler_declarations_match_legacy_dispatch():
+    """The registry's completion-handler declarations must reproduce exactly the
+    type→handler routing the old if/elif cascade encoded, so the registry-driven
+    dispatch in task_lifecycle is behaviour-preserving."""
+    assert COMPLETION_HANDLER_BY_TASK_TYPE == {
+        "plan": "plan",
+        "design_doc_update": "design_doc",
+        "strategic_review": "strategic",
+        "research": "research",
+        "security_audit": "security_audit",
+        "perf": "perf",
+        "self_audit": "self_audit",
+        "memo": "memo",
+    }
+    # Only the two strategic completion handlers consume the pre-locked Project.
+    needs_project = {
+        cap.id.value
+        for cap in TASK_CAPABILITIES
+        if cap.completion_needs_locked_project
+    }
+    assert needs_project == {"design_doc_update", "strategic_review"}
+    # A capability can only require the locked project if it has a handler.
+    for cap in TASK_CAPABILITIES:
+        if cap.completion_needs_locked_project:
+            assert cap.completion_handler is not None
+
+
+def test_task_lifecycle_binds_every_declared_completion_handler():
+    """task_lifecycle must bind a concrete function for every logical handler
+    name the registry declares — a declared-but-unbound name would raise KeyError
+    at dispatch time. This keeps the registry and its bindings in lockstep."""
+    import inspect
+
+    from app import task_lifecycle
+
+    source = inspect.getsource(task_lifecycle._process_post_commit)
+    for handler_name in set(COMPLETION_HANDLER_BY_TASK_TYPE.values()):
+        assert f'"{handler_name}":' in source, (
+            f"completion handler {handler_name!r} declared in the registry is "
+            "not bound in task_lifecycle._process_post_commit"
+        )
+
+
+def test_every_capability_declares_a_valid_evaluation_strategy():
+    """The additive `evaluation` field is present on every capability with a
+    value from the closed strategy vocabulary, and the derived map covers all
+    types. Selection of the forward gate is registry-driven via this field."""
+    valid = {"code-ci-review", "forward-quality", "metric", "none"}
+    for cap in TASK_CAPABILITIES:
+        assert cap.evaluation in valid, (cap.id, cap.evaluation)
+    assert set(EVALUATION_STRATEGY_BY_TASK_TYPE) == ALL_TASK_TYPES
+
+
+def test_code_pr_types_keep_code_ci_review_gate():
+    """Code / PR-producing types MUST declare code-ci-review so the existing
+    CI + review merge gate is preserved exactly — they are never routed through
+    the new forward-evaluation module."""
+    for t in ("create", "fix", "refactor", "qa", "migrate", "deps", "docs"):
+        assert EVALUATION_STRATEGY_BY_TASK_TYPE[t] == "code-ci-review"
+    # Knowledge/audit types get the forward-quality gate; perf gets metric.
+    for t in ("research", "memo", "security_audit", "self_audit", "investigate"):
+        assert EVALUATION_STRATEGY_BY_TASK_TYPE[t] == "forward-quality"
+    assert EVALUATION_STRATEGY_BY_TASK_TYPE["perf"] == "metric"
+    assert EVALUATION_STRATEGY_BY_TASK_TYPE["plan"] == "none"
+
+
 def test_product_task_types_derived_from_registry():
     """PRODUCT_TASK_TYPES is the single source of truth for the product/structural
     split. It must be derived from the registry's delivers_product flag, contain
@@ -115,3 +187,103 @@ def test_registry_does_not_constrain_payload_extension_fields():
     )
 
     assert payload["future_capability_field"] == {"nested": ["still", "allowed"]}
+
+
+# ── Enriched declarative fields + operator catalog ──────────────────────────────
+
+_CATALOG_FIELDS = {
+    "id",
+    "label",
+    "description",
+    "agent_mode",
+    "default_category",
+    "user_launchable",
+    "provider_configurable",
+    "filter_visible",
+    "output_kind",
+    "requires_code",
+    "requires_web",
+    "requires_compute",
+    "evaluation_strategy",
+    "cost_ceiling_usd",
+}
+_VALID_OUTPUT_KINDS = {"pr", "artifact", "knowledge", "verdict", "none"}
+_VALID_EVAL_STRATEGIES = {
+    "ci_and_review",
+    "review_only",
+    "forward_quality",
+    "metric",
+    "none",
+}
+
+
+def test_task_type_catalog_covers_every_capability_with_all_fields():
+    catalog = task_type_catalog()
+    assert len(catalog) == len(TASK_CAPABILITIES)
+    assert {e["id"] for e in catalog} == {t.value for t in TaskType}
+    for entry in catalog:
+        assert set(entry.keys()) == _CATALOG_FIELDS, entry["id"]
+        assert entry["agent_mode"] in {"write", "read_only"}
+        assert entry["output_kind"] in _VALID_OUTPUT_KINDS, entry["id"]
+        assert entry["evaluation_strategy"] in _VALID_EVAL_STRATEGIES, entry["id"]
+        assert isinstance(entry["requires_code"], bool)
+        assert isinstance(entry["requires_web"], bool)
+        assert isinstance(entry["requires_compute"], bool)
+        assert entry["cost_ceiling_usd"] is None or isinstance(
+            entry["cost_ceiling_usd"], (int, float)
+        )
+
+
+def test_task_type_catalog_launchable_flags_and_output_kinds():
+    catalog = task_type_catalog()
+    launchable = {e["id"] for e in catalog if e["user_launchable"]}
+    assert launchable == set(USER_LAUNCHABLE_TASK_TYPES)
+    by_id = {e["id"]: e for e in catalog}
+    # Code-change types open a PR and are CI+review gated.
+    assert by_id["create"]["output_kind"] == "pr"
+    assert by_id["create"]["evaluation_strategy"] == "ci_and_review"
+    # The reference non-code type produces an artifact and is not gated.
+    assert by_id["memo"]["output_kind"] == "artifact"
+    assert by_id["memo"]["requires_code"] is False
+    assert by_id["memo"]["evaluation_strategy"] == "none"
+    # Research is judged by forward quality, not a merged PR.
+    assert by_id["research"]["evaluation_strategy"] == "forward_quality"
+
+
+def test_enrichment_leaves_agent_mode_derived_sets_consistent():
+    for entry in task_type_catalog():
+        if entry["agent_mode"] == "write":
+            assert entry["id"] in WRITE_TASK_TYPES
+        else:
+            assert entry["id"] in READ_ONLY_TASK_TYPES
+
+
+@pytest.mark.asyncio
+async def test_task_types_endpoint_returns_full_catalog(client: AsyncClient):
+    resp = await client.get("/api/admin/task-types")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["task_types"] == task_type_catalog()
+    assert len(body["task_types"]) == len(TaskType)
+
+
+@pytest.mark.asyncio
+async def test_task_types_endpoint_requires_auth():
+    """Router-level get_current_user dependency must reject an unauthorized call."""
+    from fastapi import HTTPException
+
+    from app.auth import get_current_user
+    from app.main import app
+
+    async def _reject():
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    app.dependency_overrides[get_current_user] = _reject
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.get("/api/admin/task-types")
+        assert resp.status_code == 401
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)

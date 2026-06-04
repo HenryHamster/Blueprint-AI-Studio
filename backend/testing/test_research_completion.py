@@ -5,7 +5,10 @@ import uuid
 from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock
 
-from app.models import TaskStatus
+import pytest as _pytest
+from sqlmodel import select as _select
+
+from app.models import Project as _Project, Task as _Task, TaskStatus
 from app.spawn_calibration import (
     MEDIUM_ANALYSIS_PLAN_FILE_LIMIT,
     SCOPE_FILE_BUDGETS,
@@ -22,7 +25,15 @@ from app.source_ref_validation import (
 )
 from app.research_completion import (
     _apply_structural_actionability_downgrade,
+    _handle_research_completion,
+    _research_findings_would_spawn,
     _summarize_ungrounded_claims_grounded,
+)
+from app.task_evaluators import (
+    QUALITY_GRADER_SOURCE_KEY,
+    QUALITY_GRADER_VERDICT_KEY,
+    parse_grader_verdict,
+    spawn_forward_quality_grader,
 )
 from app.time_utils import _utcnow
 
@@ -2121,3 +2132,336 @@ class TestShelveFindingsForNextCycle:
         assert len(deferred) == 2
         assert deferred[0]["title"] == "prior"
         assert deferred[1]["title"] == "new"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Forward-quality grader: escalation + spawn-on-findings gate
+#
+# Research findings can spawn implementation work. When the research-quality
+# grader is enabled, those findings must clear an INDEPENDENT grader before any
+# child spawns: the research task parks EVALUATING, a fresh grader task scores
+# the artifact, and only a PASS verdict lets the findings spawn children (a FAIL
+# fails the research task and spawns nothing). The gate is proportional —
+# findings that would spawn nothing are never escalated.
+# ─────────────────────────────────────────────────────────────────────────────
+def _enable_grader(mocker):
+    """Flip the dark-shipped research-quality-grader flag ON for one test."""
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"research_quality_grader_enabled": True},
+    )
+
+
+async def _grader_project_and_task(db_session, direction_id="d-grade01"):
+    """A minimal autonomous project + a research task ready to complete."""
+    from test_autonomous_research import _active_direction, _make_research_task
+
+    direction = _active_direction(direction_id, "Grader gate direction")
+    project = _Project(
+        name=f"Grader Gate {direction_id}",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = await _make_research_task(project, direction, db_session)
+    return project, direction, task
+
+
+class TestForwardQualityWouldSpawnPredicate:
+    """_research_findings_would_spawn: blast-radius predicate (pure)."""
+
+    def test_actionable_finding_would_spawn(self):
+        assert _research_findings_would_spawn(
+            [{"type": "improvement", "prompt": "do x", "actionability_grade": "HIGH"}]
+        )
+
+    def test_observation_types_do_not_spawn(self):
+        for t in (
+            "design_doc_observation",
+            "direction_update",
+            "direction_proposal",
+            "direction_note",
+            "note",
+        ):
+            assert not _research_findings_would_spawn(
+                [{"type": t, "prompt": "do x", "actionability_grade": "HIGH"}]
+            ), t
+
+    def test_low_actionability_and_empty_prompt_do_not_spawn(self):
+        assert not _research_findings_would_spawn(
+            [{"type": "improvement", "prompt": "do x", "actionability_grade": "LOW"}]
+        )
+        assert not _research_findings_would_spawn(
+            [{"type": "improvement", "prompt": "   "}]
+        )
+        assert not _research_findings_would_spawn(
+            [{"type": "improvement", "prompt": "do x", "already_spawned": True}]
+        )
+        assert not _research_findings_would_spawn([])
+
+
+class TestParseGraderVerdict:
+    """parse_grader_verdict: structured + anchored parse, fail-closed defaults."""
+
+    def test_structured_pass(self):
+        v = parse_grader_verdict('reasoning...\n{"verdict": "pass", "reasoning": "ok"}')
+        assert v.passed is True
+        assert v.strategy == "forward-quality"
+
+    def test_structured_fail(self):
+        v = parse_grader_verdict('{"verdict": "fail", "reasoning": "thin"}')
+        assert v.passed is False
+
+    def test_anchored_fallback(self):
+        assert parse_grader_verdict('the VERDICT: pass overall').passed is True
+        assert parse_grader_verdict('VERDICT: fail — ungrounded').passed is False
+
+    def test_not_completed_fails_closed(self):
+        assert parse_grader_verdict("looks great", completed=False).passed is False
+
+    def test_unparseable_fails_closed(self):
+        assert parse_grader_verdict("no machine verdict in here").passed is False
+        assert parse_grader_verdict("").passed is False
+
+
+@_pytest.mark.asyncio
+async def test_spawn_forward_quality_grader_is_single_shot(db_session):
+    """spawn_forward_quality_grader parks the source once; a second call no-ops."""
+    _project, _direction, task = await _grader_project_and_task(db_session, "d-single")
+
+    g1 = await spawn_forward_quality_grader(task, "artifact text", db_session)
+    assert g1 is not None
+    assert (g1.first_payload or {}).get("type") == "investigate"
+    assert (g1.context or {}).get(QUALITY_GRADER_SOURCE_KEY) == str(task.id)
+    assert g1.parent_task_id is None
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+    assert task.context.get("awaiting_quality_grader")
+
+    # Second call must NOT spawn another grader (single-shot convergence).
+    g2 = await spawn_forward_quality_grader(task, "artifact text", db_session)
+    assert g2 is None
+    graders = (
+        (
+            await db_session.execute(
+                _select(_Task).where(
+                    _Task.project_id == _project.id, _Task.id != task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(graders) == 1
+
+
+@_pytest.mark.asyncio
+async def test_actionable_findings_escalate_to_grader_and_park(db_session, mocker):
+    """Enabled + spawnable findings → grader spawned, research parked, 0 children."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-esc01")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(direction_id=direction["id"])],
+    )
+    _enable_grader(mocker)
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # No implementation children yet — the source is parked awaiting the grade.
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert children == [], "spawnable findings must NOT spawn before the grade"
+
+    # Exactly one independent grader task, linked back to the research task.
+    others = (
+        (
+            await db_session.execute(
+                _select(_Task).where(
+                    _Task.project_id == _project.id, _Task.id != task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(others) == 1
+    grader = others[0]
+    assert (grader.context or {}).get(QUALITY_GRADER_SOURCE_KEY) == str(task.id)
+    assert (grader.first_payload or {}).get("type") == "investigate"
+    assert task.status == TaskStatus.EVALUATING
+    assert task.context.get("awaiting_quality_grader")
+
+
+@_pytest.mark.asyncio
+async def test_flag_off_spawns_children_without_grader(db_session, mocker):
+    """Non-regression: with the flag OFF, findings spawn children immediately."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-off01")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(direction_id=direction["id"])],
+    )
+    # Flag intentionally NOT enabled.
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, "legacy spawn path must be unchanged when flag is off"
+    # No grader anywhere in the project.
+    all_tasks = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == _project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert all(
+        not (t.context or {}).get(QUALITY_GRADER_SOURCE_KEY) for t in all_tasks
+    ), "no grader may spawn when the gate is disabled"
+
+
+@_pytest.mark.asyncio
+async def test_failed_grade_blocks_spawn_and_fails_research(db_session, mocker):
+    """A FAILED grader verdict spawns NO children and fails the research task."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-fail01")
+    _patch_research_externals(mocker)
+
+    # Simulate the grader having returned a FAIL verdict on the re-entrant pass.
+    task.plan_output = [_make_finding(direction_id=direction["id"])]
+    task.context = {
+        **(task.context or {}),
+        QUALITY_GRADER_VERDICT_KEY: {
+            "passed": False,
+            "reason": "findings are ungrounded; load-bearing claim absent at HEAD",
+        },
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert children == [], "a failing grade must spawn NO implementation tasks"
+    assert task.status == TaskStatus.FAILED
+    assert (task.context or {}).get("evaluation_gate", {}).get("passed") is False
+
+
+@_pytest.mark.asyncio
+async def test_passing_grade_resumes_and_spawns_children(db_session, mocker):
+    """A PASSING grader verdict resumes the research task and spawns children."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-pass01")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(direction_id=direction["id"])],
+    )
+
+    # Simulate the verdict the grader-completion resolver writes before re-dispatch.
+    task.plan_output = [_make_finding(direction_id=direction["id"])]
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        QUALITY_GRADER_VERDICT_KEY: {"passed": True, "reason": "well-grounded"},
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, "a passing grade must let the findings spawn as before"
+    # The verdict pass does NOT re-spawn a grader (single-shot).
+    assert not any(
+        (c.context or {}).get(QUALITY_GRADER_SOURCE_KEY) for c in children
+    )
+    # With children spawned, the research task takes the normal post-spawn
+    # EVALUATING state (awaiting child rollup) — NOT FAILED, and no longer
+    # parked awaiting a grade.
+    assert task.status == TaskStatus.EVALUATING
+
+
+@_pytest.mark.asyncio
+async def test_non_spawning_findings_skip_grader_even_when_enabled(db_session, mocker):
+    """Proportional gate: pure-observation findings never escalate to a grader."""
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-obs01")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[
+            {
+                "title": "design observation",
+                "description": "An observation about the design doc",
+                "prompt": "noted",
+                "type": "design_doc_observation",
+                "direction_id": direction["id"],
+            }
+        ],
+    )
+    _enable_grader(mocker)
+
+    await _handle_research_completion(task, "", db_session)
+
+    all_tasks = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == _project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert all(
+        not (t.context or {}).get(QUALITY_GRADER_SOURCE_KEY) for t in all_tasks
+    ), "observation-only findings must not escalate to an independent grader"
+    await db_session.refresh(task)
+    assert task.status != TaskStatus.EVALUATING, "must not park when nothing would spawn"

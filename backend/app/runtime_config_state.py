@@ -71,6 +71,20 @@ runtime_config: Dict = {
         "COCHANGE_DECOMPOSITION_ENABLED", "false"
     ).lower()
     in ("1", "true", "yes"),
+    # Forward-quality grader for research findings. When True, a research task
+    # whose findings would SPAWN downstream implementation work is gated on an
+    # INDEPENDENT grader (task_evaluators.spawn_forward_quality_grader): the
+    # research task parks EVALUATING, a fresh grader agent scores the findings
+    # against a rubric, and only a PASS verdict lets the findings spawn children
+    # (a FAIL fails the research task and spawns nothing). Ships DARK (default
+    # OFF) — flip on (settable via PATCH /api/admin/settings, no deploy) behind
+    # spawn-quality monitoring. OFF preserves the legacy trust-the-findings
+    # spawn path exactly. Findings that would spawn nothing are never escalated
+    # regardless of this flag (the gate is proportional to blast radius).
+    "research_quality_grader_enabled": os.getenv(
+        "RESEARCH_QUALITY_GRADER_ENABLED", "false"
+    ).lower()
+    in ("1", "true", "yes"),
     # Long-EVALUATING parents stop blocking new research on the same direction
     # once their pipeline-side merge cycle exceeds this threshold. Set above
     # the typical PR lifecycle (CI + review + fix + re-review + merge) so new

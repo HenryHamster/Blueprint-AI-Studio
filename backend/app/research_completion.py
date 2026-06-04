@@ -767,8 +767,97 @@ async def _summarize_ungrounded_claims_grounded(
     }
 
 
+# Finding ``type`` values that are processed separately and never spawn an
+# implementation/child task (direction proposals/notes, design-doc observations,
+# direction updates). Used by the blast-radius predicate below.
+_NON_SPAWNING_FINDING_TYPES = frozenset(
+    {
+        "direction_proposal",
+        "direction_note",
+        "design_doc_observation",
+        "direction_update",
+        "note",
+    }
+)
+
+
+def _research_findings_would_spawn(findings: List[Dict[str, Any]]) -> bool:
+    """True if at least one finding would spawn downstream implementation work.
+
+    This is a blast-radius predicate, not the exact spawn decision (dedup and
+    confidence gating still run in the spawn loop). It deliberately over-counts
+    rather than under-counts: it is better to grade a research artifact that
+    later dedups to zero children than to let an ungraded finding spawn a PR.
+    """
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        if (f.get("type") or "") in _NON_SPAWNING_FINDING_TYPES:
+            continue
+        if not str(f.get("prompt") or "").strip():
+            continue
+        if f.get("already_spawned"):
+            continue
+        if f.get("actionability_grade") == "LOW":
+            continue
+        return True
+    return False
+
+
 async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
-    """Parse research findings and create tasks from them."""
+    """Parse research findings and create tasks from them.
+
+    Forward-quality gate (escalated path): when the research-quality grader is
+    enabled and the parsed findings would spawn downstream implementation work,
+    this handler does NOT spawn children on the first pass. It instead spawns an
+    INDEPENDENT grader task and parks itself EVALUATING. The grader's verdict
+    returns through the re-entrant completion path, which re-invokes this
+    handler with ``context['quality_grader']`` set:
+      * verdict PASS  -> proceed to the normal spawn-on-findings path;
+      * verdict FAIL  -> fail the research task and spawn NOTHING (unverified
+        findings must never launch work).
+    Findings that would not spawn anything (pure observations) keep the cheap
+    synchronous check and never escalate — the gate is proportional to blast
+    radius, as the framework intends.
+    """
+    from app.task_evaluators import (
+        QUALITY_GRADER_VERDICT_KEY,
+        EvaluationVerdict,
+        record_failed_gate,
+        spawn_forward_quality_grader,
+    )
+
+    # Re-entry signal: the independent grader has returned its verdict.
+    _grader_verdict = (task.context or {}).get(QUALITY_GRADER_VERDICT_KEY)
+    if _grader_verdict is not None and not _grader_verdict.get("passed", False):
+        # FAILED forward-quality gate: do NOT spawn implementation tasks and do
+        # NOT complete clean. Mark FAILED so the research is not trusted, and
+        # record the verdict for observability + direction-health accounting.
+        record_failed_gate(
+            task,
+            EvaluationVerdict(
+                False,
+                str(_grader_verdict.get("reason") or "forward-quality grade failed"),
+                "forward-quality",
+            ),
+        )
+        session.add(task)
+        await session.commit()
+        try:
+            await _record_research_task_failure(task, session)
+        except Exception:  # noqa: BLE001 — failure accounting must not crash the gate
+            logger.debug(
+                "[RESEARCH] failure accounting after failed quality gate raised",
+                exc_info=True,
+            )
+        logger.info(
+            "[RESEARCH] Task %s failed the forward-quality gate; spawned no "
+            "implementation tasks: %s",
+            task.id,
+            _grader_verdict.get("reason"),
+        )
+        return
+
     # Increment _research_spawn_count on completion (variable name is legacy;
     # see autonomous_research.py:837 — semantic is "completed research cycles
     # since last strategic refresh"). The strategic_research_frequency gate
@@ -781,7 +870,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     def _increment_research_spawn_count(vision: dict) -> None:
         vision["_research_spawn_count"] = (vision.get("_research_spawn_count") or 0) + 1
 
-    if project_obj is not None:
+    # Only on the FIRST pass — a re-entrant resume after grading must not
+    # re-count the cycle (the grader verdict is already present in context).
+    if project_obj is not None and _grader_verdict is None:
         await with_vision_locked(
             session, task.project_id, _increment_research_spawn_count
         )
@@ -807,6 +898,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # actually completed. Drop them here.
     if findings:
         findings = [f for f in findings if isinstance(f, dict)]
+    if not findings and _grader_verdict is not None and isinstance(task.plan_output, list):
+        # Grader resume: the re-dispatch reconstructs the artifact from the
+        # findings stored on the first pass. If that reconstruction does not
+        # round-trip through the findings parser, fall back to the stored
+        # findings directly so a PASSING grade can never silently spawn nothing.
+        findings = [f for f in task.plan_output if isinstance(f, dict)]
     if not findings:
         task.latest_status_message = "Research completed with no actionable findings"
         task.plan_output = []
@@ -925,6 +1022,29 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     }
     session.add(task)
     await session.commit()
+
+    # Forward-quality ESCALATION gate (blast-radius-proportional). When enabled
+    # and these findings would spawn downstream implementation work, do not
+    # spawn anything yet: stand up an INDEPENDENT grader and park this task
+    # EVALUATING. The grader's verdict returns via the re-entrant completion
+    # path, which re-invokes this handler with the verdict in context (the
+    # `_grader_verdict is None` guard below is what lets the resume pass fall
+    # through to the spawn loop instead of escalating again). Findings that
+    # would spawn nothing keep the cheap synchronous check and never escalate.
+    if (
+        _grader_verdict is None
+        and _runtime_config.get("research_quality_grader_enabled", False)
+        and _research_findings_would_spawn(findings)
+    ):
+        grader = await spawn_forward_quality_grader(task, json.dumps(findings), session)
+        if grader is not None:
+            logger.info(
+                "[RESEARCH] Task %s parked awaiting forward-quality grade "
+                "(grader %s) before spawning implementation tasks",
+                task.id,
+                grader.id,
+            )
+            return
 
     # Separate direction proposals and notes from actionable findings — these are processed
     # separately and must not enter the hash-based deduplication loop (they never create tasks,

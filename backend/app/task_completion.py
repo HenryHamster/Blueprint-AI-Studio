@@ -36,6 +36,11 @@ from app.models import (
     TaskStatus,
 )
 from app.task_capabilities import WRITE_TASK_TYPES
+from app.task_evaluators import (
+    EvaluationVerdict,
+    evaluate_terminal_output,
+    record_failed_gate,
+)
 from app.plan_completion import (
     # Re-exports — task_completion is the canonical completion-API import surface
     # for downstream modules (task_lifecycle, research_completion, tests). The
@@ -1414,6 +1419,30 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
     (which previously spawned one task per finding, each with its own VM, PR, and review).
     Medium/low findings are surfaced as an informational PR comment.
     """
+    # Forward evaluation gate (registry-resolved 'metric' strategy): a perf
+    # report that produced no parseable structured measurement must NOT complete
+    # clean. Mark it FAILED (terminal) — a perf task spawns no children and opens
+    # no PR of its own, so EVALUATING would hang forever. A measurement that
+    # legitimately found zero high-severity issues is still a parseable result
+    # and passes the gate; only a missing/unparseable measurement fails.
+    verdict = evaluate_terminal_output(task, logs)
+    if not verdict.passed:
+        record_failed_gate(task, verdict)
+        task.plan_output = {"findings": []}
+        session.add(task)
+        await session.commit()
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": TaskStatus.FAILED},
+        )
+        logger.info(
+            "[PERF] Task %s did not clear the metric gate: %s",
+            task.id,
+            verdict.reason,
+        )
+        return
+
     findings = None
     try:
         json_str = _extract_json_array(logs, "severity")
@@ -1425,6 +1454,9 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
         pass
 
     if not findings:
+        # The metric gate passed, so a structured measurement exists; this
+        # branch now only covers the defensive empty-list edge. Keep the
+        # terminal-COMPLETED behavior for a genuinely empty parseable result.
         task.latest_status_message = (
             "Perf analysis completed with no parseable findings"
         )
@@ -1796,12 +1828,40 @@ async def _handle_memo_completion(task: Task, logs: str, session: AsyncSession):
     # chain (other handlers use the same lazy-import pattern).
     from app.models import Artifact, ArtifactType  # noqa: PLC0415
 
+    # Forward evaluation gate (registry-resolved 'forward-quality' strategy):
+    # an unparseable or empty memo must NOT complete clean. Marking it FAILED
+    # (terminal) is the honest outcome — a memo spawns no children and opens no
+    # PR, so EVALUATING would hang forever. The FAILED-memo error-log recovery
+    # in task_lifecycle still gets a chance on the FAILED payload path; this
+    # gate only catches the case where the COMPLETED-reported output is itself
+    # not a valid memo.
+    verdict = evaluate_terminal_output(task, logs)
+    if not verdict.passed:
+        record_failed_gate(task, verdict)
+        session.add(task)
+        await session.commit()
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": TaskStatus.FAILED},
+        )
+        logger.info(
+            "[MEMO] Task %s did not clear the forward-quality gate: %s",
+            task.id,
+            verdict.reason,
+        )
+        return
+
     parsed = _parse_memo_output(logs)
     if parsed is None:
-        task.latest_status_message = (
-            "Memo task completed with no parseable reasoning JSON"
+        # Defensive: the gate passed, so this should be unreachable. Treat any
+        # residual parse failure as a gate failure rather than completing clean.
+        record_failed_gate(
+            task,
+            EvaluationVerdict(
+                False, "memo output not parseable after gate", "forward-quality"
+            ),
         )
-        task.status = TaskStatus.COMPLETED
         session.add(task)
         await session.commit()
         return

@@ -1118,6 +1118,25 @@ async def set_project_paused(
     return {"paused": project.paused}
 
 
+@router.get("/task-types")
+@limiter.limit("30/minute")
+async def get_task_types(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the enriched task-type registry as an operator catalog.
+
+    Project-agnostic and static (the registry lives in code), so this performs
+    no DB query — it serializes ``task_type_catalog()`` directly. It is the
+    single backend source of truth the admin-ui catalog and task launcher read
+    so the frontend capability list cannot drift from the backend registry.
+    Gated by the router-level ``Depends(get_current_user)`` like its siblings.
+    """
+    from app.task_capabilities import task_type_catalog
+
+    return {"task_types": task_type_catalog()}
+
+
 @router.get("/autonomous-status")
 @limiter.limit("30/minute")
 async def get_autonomous_status(

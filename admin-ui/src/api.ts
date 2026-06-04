@@ -130,6 +130,44 @@ export async function apiFetch(
   return dedupKey ? res.clone() : res;
 }
 
+/**
+ * One entry of the backend task-type registry catalog. Mirrors the dict shape
+ * emitted by `task_type_catalog()` in backend/app/task_capabilities.py — keep
+ * the field names in sync with `_capability_to_catalog_entry` there. This is
+ * the single backend source of truth for the operator catalog and the task
+ * launcher, so the admin-ui static `taskCapabilities.ts` list cannot drift.
+ */
+export interface TaskTypeCatalogEntry {
+  id: string;
+  label: string;
+  description: string;
+  agent_mode: 'write' | 'read_only';
+  default_category: string | null;
+  user_launchable: boolean;
+  provider_configurable: boolean;
+  filter_visible: boolean;
+  output_kind: 'pr' | 'artifact' | 'knowledge' | 'verdict' | 'none';
+  requires_code: boolean;
+  requires_web: boolean;
+  requires_compute: boolean;
+  evaluation_strategy: 'ci_and_review' | 'review_only' | 'forward_quality' | 'metric' | 'none';
+  cost_ceiling_usd: number | null;
+}
+
+/**
+ * Fetch the enriched task-type registry catalog from the backend. The endpoint
+ * is static and project-agnostic; consumers can render the catalog or derive
+ * the launchable-type allowlist from it.
+ */
+export async function fetchTaskTypeCatalog(
+  signal?: AbortSignal,
+): Promise<TaskTypeCatalogEntry[]> {
+  const res = await apiFetch('/api/admin/task-types', undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch task-type catalog: ${res.status}`);
+  const data = await res.json();
+  return Array.isArray(data?.task_types) ? data.task_types : [];
+}
+
 export async function fetchTask(taskId: string): Promise<import('./components/TaskCard').Task> {
   const res = await apiFetch(`/api/admin/tasks/${encodeURIComponent(taskId)}`);
   if (!res.ok) throw new Error(`Failed to fetch task: ${res.status}`);
