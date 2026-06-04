@@ -619,8 +619,11 @@ async def test_unscoped_project_idle_members_are_drained(db_session, warm_pool_o
 
 @pytest.mark.asyncio
 async def test_evaluate_cost_guard_engages_on_low_hit_rate(db_session, warm_pool_on, mocker):
-    """Guard engages when there is real idle spend, enough dispatches, and a hit
-    rate below the floor — and disengages once the hit rate recovers."""
+    """Guard engages when there is real idle spend, enough ELIGIBLE dispatches,
+    and an eligible hit rate below the floor — and disengages once it recovers.
+    The guard gates on the eligible rate (hits + pool-serviceable misses), NOT
+    the raw fleet-wide rate, so a deliberately raw-low value here is paired with
+    a matching eligible value to drive engagement."""
     mocker.patch(
         "app.efficiency_snapshot.compute_pool_idle_cost",
         new_callable=mocker.AsyncMock,
@@ -628,8 +631,13 @@ async def test_evaluate_cost_guard_engages_on_low_hit_rate(db_session, warm_pool
     )
     snap = mocker.patch("app.warm_backlog_reuse.get_pool_funnel_snapshot")
 
-    # Low hit rate (2%) over 50 dispatches with $5 idle spend → engage.
-    snap.return_value = {"pool_hit_rate": 0.02, "total_dispatches": 50}
+    # Low eligible hit rate (2%) over 50 eligible dispatches with $5 idle → engage.
+    snap.return_value = {
+        "eligible_hit_rate": 0.02,
+        "eligible_dispatches": 50,
+        "pool_hit_rate": 0.02,
+        "total_dispatches": 50,
+    }
     engaged = await evaluate_pool_cost_guard(db_session, runtime_config=_runtime_config)
     assert engaged["engaged"] is True
     assert "below" in engaged["reason"]
@@ -638,16 +646,22 @@ async def test_evaluate_cost_guard_engages_on_low_hit_rate(db_session, warm_pool
     assert engaged["min_hit_rate"] == pytest.approx(0.10)
     assert engaged["min_idle_cost_usd"] == pytest.approx(1.0)
 
-    # Healthy hit rate (40%) → disengage, provisioning resumes next tick.
-    snap.return_value = {"pool_hit_rate": 0.40, "total_dispatches": 50}
+    # Healthy eligible hit rate (40%) → disengage, provisioning resumes next tick.
+    snap.return_value = {
+        "eligible_hit_rate": 0.40,
+        "eligible_dispatches": 50,
+        "pool_hit_rate": 0.40,
+        "total_dispatches": 50,
+    }
     recovered = await evaluate_pool_cost_guard(db_session, runtime_config=_runtime_config)
     assert recovered["engaged"] is False
 
 
 @pytest.mark.asyncio
 async def test_evaluate_cost_guard_holds_below_min_dispatches(db_session, warm_pool_on, mocker):
-    """Guard stays disengaged on a thin sample even at a 0% hit rate — it must not
-    drain on noise before enough dispatches accumulate."""
+    """Guard stays disengaged on a thin sample even at a 0% eligible hit rate — it
+    must not drain on noise before enough ELIGIBLE dispatches accumulate. A large
+    raw fleet-wide volume must NOT substitute for eligible volume here."""
     mocker.patch(
         "app.efficiency_snapshot.compute_pool_idle_cost",
         new_callable=mocker.AsyncMock,
@@ -655,10 +669,66 @@ async def test_evaluate_cost_guard_holds_below_min_dispatches(db_session, warm_p
     )
     mocker.patch(
         "app.warm_backlog_reuse.get_pool_funnel_snapshot",
-        return_value={"pool_hit_rate": 0.0, "total_dispatches": 3},
+        return_value={
+            "eligible_hit_rate": 0.0,
+            "eligible_dispatches": 3,
+            # Raw fleet-wide volume is well over the floor, but it's mostly
+            # out-of-scope noise — the guard must ignore it and hold.
+            "pool_hit_rate": 0.0,
+            "total_dispatches": 50,
+        },
     )
     result = await evaluate_pool_cost_guard(db_session, runtime_config=_runtime_config)
     assert result["engaged"] is False
+
+
+@pytest.mark.asyncio
+async def test_evaluate_cost_guard_ignores_out_of_scope_noise(db_session, warm_pool_on):
+    """The live regression: a pool scoped to one project sees its RAW fleet-wide
+    hit rate crushed by other projects' dispatches, but its ELIGIBLE rate is
+    healthy. The guard must read the eligible rate and stay disengaged — not
+    drain a productive pool on out-of-scope noise. Exercises the real funnel
+    end-to-end (no snapshot mock)."""
+    from app.warm_backlog_reuse import (
+        _pool_cold_dispatch_events,
+        _pool_lease_hit_events,
+        _pool_lease_miss_events,
+        record_pool_cold_dispatch,
+        record_pool_lease_hit,
+        record_pool_lease_miss,
+    )
+
+    _pool_lease_hit_events.clear()
+    _pool_cold_dispatch_events.clear()
+    _pool_lease_miss_events.clear()
+
+    # Idle spend above the floor so only the hit-rate gate decides engagement.
+    project = await _make_project(db_session)
+    member = await _register(db_session, project, "agent-vm-noise", PoolVmState.IDLE)
+    member.idle_since = _utcnow() - timedelta(hours=2)
+    db_session.add(member)
+    await db_session.commit()
+
+    # 9 in-scope warm hits + 1 serviceable miss → eligible rate 90% (healthy).
+    for _ in range(9):
+        record_pool_lease_hit("acct-in-scope")
+    record_pool_lease_miss("no_idle_member", "acct-in-scope")
+    # 100 out-of-scope dispatches (other projects) crush the RAW rate to ~8%
+    # (9 / 109), well below the 10% floor, while the eligible rate stays 90%.
+    for _ in range(100):
+        record_pool_lease_miss("out_of_scope", "acct-other")
+        record_pool_cold_dispatch("acct-other")
+
+    _runtime_config["warm_pool_cost_guard_min_dispatches"] = 20
+    _runtime_config["warm_pool_cost_guard_min_hit_rate"] = 0.10
+    _runtime_config["warm_pool_cost_guard_min_idle_cost_usd"] = 0.0
+
+    guard = await evaluate_pool_cost_guard(db_session, runtime_config=_runtime_config)
+    # Raw rate is below the 10% floor, but the eligible rate (90%) is not, so the
+    # guard stays disengaged — the whole point of the fix.
+    assert guard["raw_hit_rate"] is not None and guard["raw_hit_rate"] < 0.10
+    assert guard["hit_rate"] == 0.9
+    assert guard["engaged"] is False
 
 
 @pytest.mark.asyncio
@@ -899,7 +969,7 @@ async def test_bootstrap_respects_dispatch_slot_budget(db_session, warm_pool_on)
         provision_fn=_stub_provision,
         session_factory=_factory_for(db_session),
     )
-    # max_concurrent 2 − 1 active task − 0 idle pool = 1 dispatch slot → cap at 1.
+    # max_concurrent 2 - 1 active task - 0 idle pool = 1 dispatch slot -> cap at 1.
     assert totals["provisioned"] == 1
     assert calls["n"] == 1
 
@@ -925,7 +995,7 @@ async def test_bootstrap_respects_pool_max_budget(db_session, warm_pool_on):
         provision_fn=_stub_provision,
         session_factory=_factory_for(db_session),
     )
-    # pool budget = 1 − 0 live = 1 → cap at 1 even though deficit is 3.
+    # pool budget = 1 - 0 live = 1 -> cap at 1 even though deficit is 3.
     assert totals["provisioned"] == 1
 
 

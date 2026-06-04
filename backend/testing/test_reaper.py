@@ -6328,6 +6328,7 @@ class _FakeClassifyTask:
         created_at=None,
         context=None,
         first_payload=None,
+        vm_instance_id=None,
     ):
         self.status = status
         self.started_at = started_at
@@ -6339,6 +6340,7 @@ class _FakeClassifyTask:
         self.created_at = created_at if created_at is not None else datetime.utcnow()
         self.context = context or {}
         self.first_payload = first_payload or {"type": "create"}
+        self.vm_instance_id = vm_instance_id
 
 
 def test_classify_orphan_provisioning_absolute_ceiling():
@@ -6475,6 +6477,131 @@ def test_classify_orphan_step1_and_step2_predicate_agree():
         v2 = _classify_orphan(t, now, has_open_pr=False)
         assert isinstance(v1, bool)
         assert v1 == v2  # deterministic / pure
+
+
+# ── vm_contact liveness override (heartbeat false-reap fix, option B) ────────
+
+
+def test_classify_orphan_fresh_vm_contact_suppresses_stale_heartbeat_reap():
+    """(a) An otherwise-stale IN_PROGRESS task is NOT reaped when the orchestrator
+    heard from its VM within the same heartbeat-stale cutoff — the agent is alive
+    and its last_heartbeat write was lock-starved by the rollup's task-row lock."""
+    now = datetime.utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(minutes=10),  # past 5min small cutoff
+        started_at=now - timedelta(minutes=12),
+        vm_instance_id="vm-alive-1",
+    )
+    # Without the lookup it reaps (back-compat sanity).
+    assert _classify_orphan(t, now, has_open_pr=False) is True
+    # Fresh contact (30s ago, well within the 5min small cutoff) suppresses it.
+    lookup = {"vm-alive-1": now - timedelta(seconds=30)}
+    assert (
+        _classify_orphan(t, now, has_open_pr=False, vm_contact_lookup=lookup) is False
+    )
+
+
+def test_classify_orphan_stale_vm_contact_still_reaps_genuine_death():
+    """(b) A stale heartbeat AND a stale/absent vm_contact still reap — genuine
+    death (crashed/preempted VM that sends no requests) is preserved. Gated on the
+    SAME cutoff so an old contact row never suppresses a real reap."""
+    now = datetime.utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(minutes=10),
+        started_at=now - timedelta(minutes=12),
+        vm_instance_id="vm-dead-1",
+    )
+    # Contact is 9min old — past the 5min small heartbeat-stale cutoff → no
+    # suppression, the dead VM is still reaped exactly as today.
+    stale_lookup = {"vm-dead-1": now - timedelta(minutes=9)}
+    assert (
+        _classify_orphan(t, now, has_open_pr=False, vm_contact_lookup=stale_lookup)
+        is True
+    )
+    # A contact for a DIFFERENT vm (not this task's) must also not suppress.
+    other_lookup = {"vm-someone-else": now - timedelta(seconds=10)}
+    assert (
+        _classify_orphan(t, now, has_open_pr=False, vm_contact_lookup=other_lookup)
+        is True
+    )
+
+
+def test_classify_orphan_no_vm_contact_row_is_backcompat():
+    """(c) No vm_contact lookup (or an empty one) → unchanged behaviour: the stale
+    heartbeat reaps exactly as it did before the fix."""
+    now = datetime.utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(minutes=10),
+        started_at=now - timedelta(minutes=12),
+        vm_instance_id="vm-x",
+    )
+    # None lookup (default), empty lookup, and lookup without this vm all reap.
+    assert _classify_orphan(t, now, has_open_pr=False) is True
+    assert (
+        _classify_orphan(t, now, has_open_pr=False, vm_contact_lookup={}) is True
+    )
+    assert (
+        _classify_orphan(
+            t, now, has_open_pr=False, vm_contact_lookup={"unrelated": now}
+        )
+        is True
+    )
+    # A fresh contact override does NOT fire when the task has no vm_instance_id
+    # (defensive: nothing to key the liveness signal on).
+    t_no_vm = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(minutes=10),
+        started_at=now - timedelta(minutes=12),
+        vm_instance_id=None,
+    )
+    assert (
+        _classify_orphan(
+            t_no_vm, now, has_open_pr=False, vm_contact_lookup={None: now}
+        )
+        is True
+    )
+
+
+def test_classify_orphan_fresh_contact_does_not_suppress_progress_stall():
+    """A fresh vm_contact must NOT suppress the PROGRESS-stale reap (stalled-but-
+    heartbeating): there the heartbeat is fresh and the reap is on tool-use
+    staleness, not heartbeat staleness. The override only covers the
+    last_heartbeat-staleness false-reap, never a genuine hung-agent stall."""
+    now = datetime.utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(seconds=30),  # FRESH heartbeat
+        last_tool_use_at=None,
+        started_at=now - timedelta(minutes=10),  # past progress cutoff
+        context={"llm_provider": "anthropic"},
+        vm_instance_id="vm-stalled",
+    )
+    lookup = {"vm-stalled": now - timedelta(seconds=5)}  # very fresh contact
+    # Still reaped — fresh contact is expected (it IS heartbeating); the stall is
+    # genuine (no tool use past the progress cutoff).
+    assert (
+        _classify_orphan(t, now, has_open_pr=False, vm_contact_lookup=lookup) is True
+    )
+
+
+def test_classify_orphan_fresh_contact_suppresses_provisioning_preclaim_death():
+    """The override also covers the PROVISIONING silent-pre-claim-death branch: a
+    VM that is demonstrably contacting the orchestrator is not a silent death."""
+    now = datetime.utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.PROVISIONING,
+        vm_provisioned_at=now - timedelta(minutes=7),  # past 6min preclaim cutoff
+        last_heartbeat=None,
+        vm_instance_id="vm-provisioning",
+    )
+    assert _classify_orphan(t, now, has_open_pr=False) is True
+    lookup = {"vm-provisioning": now - timedelta(seconds=20)}
+    assert (
+        _classify_orphan(t, now, has_open_pr=False, vm_contact_lookup=lookup) is False
+    )
 
 
 # ── Per-cycle orphan-loop wall-time budget (FIX c) ──────────────────────────

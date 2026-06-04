@@ -22,6 +22,7 @@ module object so that test patches against ``app.services.<name>`` (e.g.
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import uuid
@@ -2286,6 +2287,177 @@ async def _sweep_post_commit_pending():
                         # admin PATCH (admin.py modify_task).
     except Exception as e:
         logger.error(f"[POST_COMMIT SWEEP] Sweep failed: {e}", exc_info=True)
+
+    # Marker-LESS childless-EVALUATING recovery. Runs after the marker-based
+    # loop above (same 60s cadence). See the helper docstring for the gap it
+    # closes; isolated in its own try so a failure here never aborts the
+    # marker-based recovery and vice-versa.
+    try:
+        await _recover_childless_evaluating_without_marker()
+    except Exception as e:
+        logger.error(
+            f"[POST_COMMIT SWEEP] Marker-less childless-EVALUATING recovery "
+            f"failed: {e}",
+            exc_info=True,
+        )
+
+
+# A childless EVALUATING plan parent younger than this may still be mid-spawn:
+# _handle_plan_completion flips the parent COMPLETED→EVALUATING, releases the
+# lock inside _ensure_branch, makes GitHub calls, then spawns children — a
+# window that can legitimately last tens of seconds. Re-running before this
+# grace elapses would race the in-flight spawn and risk duplicate children, so
+# only a parent that has been childless+EVALUATING for longer than this is
+# treated as genuinely stranded. Comfortably exceeds the _process_post_commit
+# call budget (260s) so an in-flight pass has provably ended.
+_CHILDLESS_EVALUATING_NO_MARKER_GRACE_S = 600
+
+
+async def _recover_childless_evaluating_without_marker():
+    """Recover a plan parent stranded childless in EVALUATING with NO pending marker.
+
+    Gap (related to incident 2026-05-27, marker-based variant handled in
+    ``_sweep_post_commit_pending`` above): ``_handle_plan_completion`` flips its
+    parent COMPLETED→EVALUATING, persists ``plan_output`` (the parsed
+    ``{"subtasks": [...]}``), and releases the row lock inside ``_ensure_branch``
+    BEFORE the child-spawn loop runs. The status endpoint sets a write-ahead
+    ``_post_commit_pending`` marker for this, so most hard kills at that boundary
+    ARE recovered by the marker-based loop. But the marker can be absent —
+    cleared by a partially-successful pass, or a flip-to-EVALUATING path that
+    never set it — leaving a childless EVALUATING parent that the reaper cannot
+    rescue: reaper Step 3 needs a COMPLETED child and Step 4 explicitly skips
+    childless parents (reaper.py ``if not children_snap: continue``).
+
+    This guard finds such parents by their PERSISTED state — the agent reported
+    COMPLETED (``plan_output`` with subtasks is persisted only on that path) and
+    the row is EVALUATING with ZERO children — and re-runs the completion handler
+    (via ``_process_post_commit`` on a synthetic COMPLETED payload reconstructed
+    from ``plan_output``) to spawn the missing children.
+
+    SAFETY (mirrors the marker-based childless guard):
+      * ZERO-children only. ``_handle_plan_completion`` spawns all children in
+        one atomic commit, so a non-zero child count means the spawn already ran
+        and re-running would DUPLICATE children — those parents are skipped.
+      * CANCELLED parents are excluded (status filter EVALUATING only) so an
+        admin cancel is never zombied back into spawning children.
+      * Age guard: only parents childless+EVALUATING for longer than
+        ``_CHILDLESS_EVALUATING_NO_MARKER_GRACE_S`` are touched, so a normal
+        in-flight spawn (which legitimately runs lock-released for tens of
+        seconds) is never raced into duplicate children.
+      * Marker present → skip (the marker-based loop owns it; no double-run).
+    """
+    # Import from agent_status (which re-exports the task_lifecycle impl) so a
+    # test patching ``app.routers.agent_status._process_post_commit`` — the
+    # canonical patch target used by the marker-based sweep tests — also
+    # intercepts this re-run path.
+    from app.routers.agent_status import _process_post_commit
+    from app.orchestrator import _mark_orchestrator_progress
+    from app.schemas import AgentStatusPayload
+
+    now = _utcnow()
+    grace_cutoff = now - timedelta(seconds=_CHILDLESS_EVALUATING_NO_MARKER_GRACE_S)
+    try:
+        async with services.AsyncSessionLocal() as session:
+            # Candidate parents: EVALUATING, not archived, NO pending marker
+            # (the marker-based loop owns marked rows), updated long enough ago
+            # to clear the in-flight-spawn grace. ``plan_output`` must be loaded
+            # — it is the COMPLETED-report signal and the re-run source. Bounded.
+            candidates = (
+                (
+                    await session.execute(
+                        select(Task)
+                        .where(
+                            Task.status == TaskStatus.EVALUATING,
+                            Task.archived.is_(False),
+                            Task.post_commit_pending.is_(False),
+                            Task.updated_at < grace_cutoff,
+                        )
+                        .limit(50)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if not candidates:
+                return
+
+            for task in candidates:
+                _mark_orchestrator_progress()
+                # Only plan parents that actually reported a non-empty plan.
+                # ``plan_output`` is persisted at the COMPLETED→EVALUATING flip
+                # (plan_completion.py) and only for the spawn path; its presence
+                # with subtasks is the "saved payload.status == COMPLETED" signal
+                # for a marker-less row.
+                plan_output = task.plan_output
+                if not (
+                    isinstance(plan_output, dict)
+                    and isinstance(plan_output.get("subtasks"), list)
+                    and plan_output.get("subtasks")
+                ):
+                    continue
+                task_type = (task.first_payload or {}).get("type", "") or ""
+                if task_type != "plan":
+                    continue
+                # ZERO-children-only guard (load-bearing — avoids duplicates).
+                child_count = (
+                    await session.execute(
+                        select(func.count())
+                        .select_from(Task)
+                        .where(Task.parent_task_id == task.id)
+                    )
+                ).scalar_one()
+                if child_count:
+                    continue
+
+                logger.warning(
+                    f"[POST_COMMIT SWEEP] Marker-less childless EVALUATING plan "
+                    f"{str(task.id)[:8]} (reported COMPLETED, plan_output present, "
+                    f"0 children, EVALUATING > "
+                    f"{_CHILDLESS_EVALUATING_NO_MARKER_GRACE_S}s) — re-running "
+                    f"completion handler to spawn missing children"
+                )
+                # Reconstruct a synthetic COMPLETED payload from the persisted
+                # plan_output. ``_handle_plan_completion`` re-parses
+                # ``payload.logs`` via ``_parse_plan_output`` (string-aware JSON
+                # extraction), so a JSON-serialized plan_output round-trips.
+                try:
+                    synthetic = AgentStatusPayload(
+                        task_id=task.id,
+                        status=TaskStatus.COMPLETED,
+                        logs=json.dumps(plan_output),
+                    )
+                except Exception as build_exc:
+                    logger.warning(
+                        f"[POST_COMMIT SWEEP] Could not build synthetic payload "
+                        f"for plan {str(task.id)[:8]}: {build_exc}"
+                    )
+                    continue
+                try:
+                    await services._bounded(
+                        _process_post_commit(task.id, synthetic),
+                        services._POST_COMMIT_CALL_TIMEOUT_S,
+                        what=f"childless-eval re-run {str(task.id)[:8]}",
+                    )
+                    logger.info(
+                        f"[POST_COMMIT SWEEP] Marker-less childless EVALUATING "
+                        f"plan {str(task.id)[:8]} re-run completed"
+                    )
+                except Exception as rerun_exc:
+                    # Best-effort: next sweep retries (the parent stays childless
+                    # EVALUATING until children spawn). The age guard means it is
+                    # already past the in-flight window, so a retry can't race a
+                    # live spawn.
+                    logger.warning(
+                        f"[POST_COMMIT SWEEP] Marker-less childless EVALUATING "
+                        f"plan {str(task.id)[:8]} re-run failed (will retry next "
+                        f"sweep): {type(rerun_exc).__name__}: {rerun_exc}"
+                    )
+    except Exception as e:
+        logger.error(
+            f"[POST_COMMIT SWEEP] Marker-less childless-EVALUATING sweep query "
+            f"failed: {e}",
+            exc_info=True,
+        )
 
 
 async def _recover_orphaned_tasks():

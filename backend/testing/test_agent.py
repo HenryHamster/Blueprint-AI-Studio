@@ -454,6 +454,56 @@ async def test_agent_heartbeat_updates_last_heartbeat(client: AsyncClient, db_se
 
 
 @pytest.mark.asyncio
+async def test_agent_heartbeat_upserts_vm_contact(client: AsyncClient, db_session):
+    """Heartbeat false-reap fix (option B): a heartbeat upserts an uncontended
+    vmcontact row keyed on vm_instance_id, independent of the contended task-row
+    write. A second heartbeat advances last_contact_at in place (one row/VM)."""
+    from app.models import VmContact
+
+    project = Project(name="VM Contact Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-contact"
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # No vm_contact row before the first heartbeat.
+    assert await db_session.get(VmContact, vm_id) is None
+
+    token = create_agent_token(str(task.id), vm_id)
+    headers = {"x-agent-token": token}
+    payload = {"task_id": str(task.id), "status_message": "still running"}
+
+    resp = await client.post("/api/agent/heartbeat", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    # vm_contact row exists with a fresh last_contact_at.
+    contact = await db_session.get(VmContact, vm_id)
+    assert contact is not None
+    first_contact_at = contact.last_contact_at
+    assert first_contact_at is not None
+    assert first_contact_at > datetime.utcnow() - timedelta(minutes=5)
+
+    # Second heartbeat upserts in place (still exactly one row for this VM) and
+    # advances last_contact_at.
+    db_session.expire(contact)
+    resp2 = await client.post("/api/agent/heartbeat", json=payload, headers=headers)
+    assert resp2.status_code == 200
+    contact2 = await db_session.get(VmContact, vm_id)
+    assert contact2 is not None
+    assert contact2.last_contact_at >= first_contact_at
+
+
+@pytest.mark.asyncio
 async def test_agent_heartbeat_persists_valid_prompt_fingerprint(
     client: AsyncClient, db_session
 ):

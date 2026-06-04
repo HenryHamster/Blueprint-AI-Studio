@@ -43,6 +43,7 @@ from app.models import (
     Project,
     Task,
     TaskStatus,
+    VmContact,
     bank_task_current_attempt,
 )
 from app.compute import (
@@ -87,6 +88,8 @@ async def _relock_orphan_task(
     cached_task: Task | None,
     expected_status,
     expected_last_heartbeat,
+    *,
+    vm_liveness_cutoff: datetime | None = None,
 ) -> Task | None:
     """Re-acquire FOR UPDATE on an orphan task and validate the pre-IO snapshot.
 
@@ -97,7 +100,11 @@ async def _relock_orphan_task(
     Returns the freshly-loaded Task if:
       - the row is still ours (not held by another writer), AND
       - status is unchanged (still PROVISIONING or IN_PROGRESS, not COMPLETED/FAILED), AND
-      - last_heartbeat hasn't advanced (agent didn't revive during the unlocked window)
+      - last_heartbeat hasn't advanced (agent didn't revive during the unlocked window), AND
+      - no fresh ``vmcontact`` landed during the unlocked window (heartbeat
+        false-reap fix: the agent's last_heartbeat write may be lock-starved, so
+        a contact within ``vm_liveness_cutoff`` proves the VM is alive even
+        though ``last_heartbeat`` is unchanged).
 
     Returns None on any of those conditions failing — caller should ``continue``
     to the next orphan task.
@@ -133,6 +140,37 @@ async def _relock_orphan_task(
             f"— agent revived, skipping reap"
         )
         return None
+    # Heartbeat false-reap fix (option B): a contact that landed during the
+    # unlocked I/O window aborts the reap even when last_heartbeat is unchanged
+    # (the agent's contended last_heartbeat write was skipped by the rollup
+    # lock). Gated on the same cutoff: a genuinely dead VM has no fresh contact
+    # and is still reaped. Best-effort — never let a lookup error block the reap.
+    if vm_liveness_cutoff is not None and fresh.vm_instance_id:
+        try:
+            _contact_at = (
+                await session.execute(
+                    select(VmContact.last_contact_at).where(
+                        VmContact.vm_instance_id == fresh.vm_instance_id
+                    )
+                )
+            ).scalar_one_or_none()
+        except Exception as _vc_exc:  # noqa: BLE001
+            logger.warning(
+                "[REAPER] vm_contact re-lock lookup failed for task %s vm=%s "
+                "(non-fatal, proceeding with reap): %s",
+                task_id,
+                fresh.vm_instance_id,
+                _vc_exc,
+            )
+            _contact_at = None
+        if _contact_at is not None and _contact_at >= vm_liveness_cutoff:
+            logger.info(
+                f"[REAPER] Orphan re-lock found task {task_id} vm "
+                f"{fresh.vm_instance_id} contacted the orchestrator at "
+                f"{_contact_at} (>= cutoff {vm_liveness_cutoff}) during external "
+                f"I/O — agent alive (lock-starved heartbeat), skipping reap"
+            )
+            return None
     if fresh.status != expected_status:
         # Defensive: status changed within the (PROVISIONING, IN_PROGRESS) set
         # — e.g. claim_task flipped PROVISIONING → IN_PROGRESS. Not the same as
@@ -400,7 +438,36 @@ def _select_orphans_for_cycle(tasks: list, cap: int) -> tuple[list, int]:
     return ordered[:cap], len(ordered) - cap
 
 
-def _classify_orphan(task, now: datetime, has_open_pr: bool) -> bool:
+def _vm_contact_within_cutoff(
+    task, hb_cutoff: datetime, vm_contact_lookup: dict | None
+) -> bool:
+    """True iff the orchestrator heard from this task's VM within ``hb_cutoff``.
+
+    Heartbeat false-reap fix (option B): the heartbeat handler upserts an
+    uncontended ``vmcontact`` row keyed on ``vm_instance_id`` BEFORE it touches
+    the contended Task row, so a VM that is alive-but-lock-starved (its
+    ``Task.last_heartbeat`` write was skipped while the rollup held the task row
+    FOR UPDATE) still leaves a fresh ``last_contact_at``. This override is gated
+    on the SAME heartbeat-stale cutoff used for ``last_heartbeat``: a genuinely
+    dead agent (crashed / preempted / OOM — sends no requests) has a stale or
+    absent contact row and is reaped exactly as before. Old / absent rows fall
+    back to the existing ``last_heartbeat`` behaviour (no regression).
+    """
+    if not vm_contact_lookup:
+        return False
+    vm_id = getattr(task, "vm_instance_id", None)
+    if not vm_id:
+        return False
+    last_contact = vm_contact_lookup.get(vm_id)
+    return last_contact is not None and last_contact >= hb_cutoff
+
+
+def _classify_orphan(
+    task,
+    now: datetime,
+    has_open_pr: bool,
+    vm_contact_lookup: dict | None = None,
+) -> bool:
     """Single source of truth for the orphan-detection state machine.
 
     Returns ``True`` iff ``task`` (a PROVISIONING / IN_PROGRESS row that already
@@ -413,6 +480,12 @@ def _classify_orphan(task, now: datetime, has_open_pr: bool) -> bool:
     silently change recovery outcomes, so both call sites now route through here.
     Pure + side-effect-free (no logging, no queries) so it is unit-testable and so
     the caller owns any per-site logging.
+
+    ``vm_contact_lookup`` is an optional ``{vm_instance_id: last_contact_at}`` map
+    (batch-fetched ONCE per cycle by the caller, never one query per task). On any
+    heartbeat-stale branch that would reap, a contact within the SAME
+    ``hb_cutoff`` overrides the reap (the agent is alive; its ``last_heartbeat``
+    write was lock-starved). Absent / stale contact → existing behaviour.
 
     State machine (unchanged):
       PROVISIONING:
@@ -437,21 +510,27 @@ def _classify_orphan(task, now: datetime, has_open_pr: bool) -> bool:
         if task.last_heartbeat and task.last_heartbeat < hb_cutoff:
             # Rare: agent claimed during PROVISIONING (shouldn't happen since
             # claim_task also flips status to IN_PROGRESS), then went silent.
-            return True
-        if (  # noqa: SIM103 — keep the explanatory comment, don't inline
+            # vm_contact override: a fresh contact within hb_cutoff means the VM
+            # is alive (lock-starved last_heartbeat write) — don't reap.
+            return not _vm_contact_within_cutoff(task, hb_cutoff, vm_contact_lookup)
+        if (
             task.vm_provisioned_at
             and task.vm_provisioned_at < _preclaim_stale_cutoff(task, now)
             and task.last_heartbeat is None
         ):
             # Silent pre-claim death: VM was dispatched long enough ago
             # (scope-aware: small 6min, medium 8min, large 10min) and the
-            # agent never claimed. Charge provision budget.
-            return True
+            # agent never claimed. Charge provision budget. vm_contact override:
+            # if the agent has actually been calling in within hb_cutoff it is
+            # NOT a silent death — suppress the reap.
+            return not _vm_contact_within_cutoff(task, hb_cutoff, vm_contact_lookup)
         return False
 
     if task.status == TaskStatus.IN_PROGRESS:
         if task.last_heartbeat and task.last_heartbeat < hb_cutoff:
-            return True
+            # Agent crashed mid-run — UNLESS we heard from the VM within the
+            # same cutoff (lock-starved last_heartbeat write); then it's alive.
+            return not _vm_contact_within_cutoff(task, hb_cutoff, vm_contact_lookup)
         if (
             task.last_heartbeat is None
             and task.started_at
@@ -460,8 +539,10 @@ def _classify_orphan(task, now: datetime, has_open_pr: bool) -> bool:
             # Defensive: IN_PROGRESS without any heartbeat shouldn't happen
             # (claim_task sets last_heartbeat at agent.py:312) but if we hit
             # it, treat as a post-claim crash. Use scope-aware cutoff so
-            # large/high-effort tasks aren't reaped prematurely.
-            return True
+            # large/high-effort tasks aren't reaped prematurely. vm_contact
+            # override: a fresh contact within hb_cutoff proves the VM is alive
+            # (its last_heartbeat write was lock-starved), so don't reap.
+            return not _vm_contact_within_cutoff(task, hb_cutoff, vm_contact_lookup)
         if (
             task.last_heartbeat is None
             and task.started_at is None
@@ -469,8 +550,10 @@ def _classify_orphan(task, now: datetime, has_open_pr: bool) -> bool:
         ):
             # Fully-degenerate IN_PROGRESS row (no heartbeat, no started_at)
             # that's been alive for >10 min — data corruption or a path that
-            # forgot to set started_at. Reap as a catch-all.
-            return True
+            # forgot to set started_at. Reap as a catch-all. vm_contact override:
+            # if the VM is demonstrably alive (fresh contact within hb_cutoff)
+            # this is not a dead-VM orphan — suppress the reap.
+            return not _vm_contact_within_cutoff(task, hb_cutoff, vm_contact_lookup)
         if (
             task.last_heartbeat
             and task.last_heartbeat >= hb_cutoff
@@ -485,6 +568,13 @@ def _classify_orphan(task, now: datetime, has_open_pr: bool) -> bool:
             # heartbeat) but has made no tool/LLM calls for longer than
             # the scope-aware progress threshold. Indicates a hung LLM
             # call, a spinning retry loop, or a wedged tool invocation.
+            #
+            # NO vm_contact override here (or in the zero-tool-calls branch
+            # below): this is a PROGRESS-stale reap, not a heartbeat-stale one —
+            # the heartbeat IS fresh (last_heartbeat >= hb_cutoff). vm_contact
+            # would likewise be fresh, so suppressing on it would defeat the
+            # genuine stall detection. The override only covers the
+            # last_heartbeat-staleness false-reap (lock-starved write).
             #
             # Cross-attempt stale-tool guard (8c8cf973 incident):
             # last_tool_use_at carries forward across retries — if
@@ -1028,6 +1118,41 @@ async def reaper_service():
                 )
                 tasks_with_pr = {a.task_id for a in pr_artifacts}
 
+                # Heartbeat false-reap fix (option B): batch-fetch the
+                # uncontended ``vmcontact`` liveness rows for THIS sweep's
+                # candidate VMs ONCE (not one query per task) and build a
+                # {vm_instance_id: last_contact_at} lookup. _classify_orphan
+                # consults it to suppress a heartbeat-stale reap when the
+                # orchestrator demonstrably heard from the VM within the same
+                # cutoff — covering the case where the agent's last_heartbeat
+                # write was lock-starved by the rollup's task-row lock. A
+                # genuinely dead VM (no requests) has a stale/absent row and is
+                # still reaped on the existing schedule. Both the Step-1 scan
+                # and the Step-2 post-lock re-verify pass this SAME lookup.
+                candidate_vm_ids = {
+                    t.vm_instance_id for t in active_tasks if t.vm_instance_id
+                }
+                vm_contact_lookup: dict[str, datetime] = {}
+                if candidate_vm_ids:
+                    contact_rows = (
+                        (
+                            await session.execute(
+                                select(
+                                    VmContact.vm_instance_id,
+                                    VmContact.last_contact_at,
+                                ).where(
+                                    VmContact.vm_instance_id.in_(candidate_vm_ids)
+                                )
+                            )
+                        )
+                        .all()
+                    )
+                    vm_contact_lookup = {
+                        vm_id: last_contact
+                        for vm_id, last_contact in contact_rows
+                        if last_contact is not None
+                    }
+
                 # State-machine invariants after the clock-separation fix:
                 #   - vm_provisioned_at: written by orchestrator when the VM is dispatched
                 #     and when GCE confirms it's running. Never written by the agent.
@@ -1051,7 +1176,12 @@ async def reaper_service():
                     # state machine (see helper). Step 2's post-lock
                     # re-verification calls the identical predicate, so the two
                     # passes can never drift.
-                    if not _classify_orphan(task, now, has_open_pr=has_pr):
+                    if not _classify_orphan(
+                        task,
+                        now,
+                        has_open_pr=has_pr,
+                        vm_contact_lookup=vm_contact_lookup,
+                    ):
                         continue
                     orphaned_ids.append(task.id)
                     # Step-1-only operator breadcrumb for the most common stuck
@@ -1169,11 +1299,37 @@ async def reaper_service():
                     # the downstream reap-reason classifier reads fifteen_minutes_ago.
                     ten_minutes_ago = now - timedelta(minutes=10)
                     fifteen_minutes_ago = now - timedelta(minutes=15)
+                    # Re-fetch the vm_contact lookup with the REFRESHED clock so a
+                    # contact that landed during the lock-acquisition window
+                    # (between Step 1 and Step 2) also aborts the reap — exactly
+                    # the lock-starved-heartbeat case this fix targets. Scoped to
+                    # the verified-candidate VMs only (small set).
+                    step2_vm_ids = {
+                        t.vm_instance_id for t in orphaned_tasks if t.vm_instance_id
+                    }
+                    step2_contact_lookup: dict[str, datetime] = {}
+                    if step2_vm_ids:
+                        step2_contact_rows = (
+                            await session.execute(
+                                select(
+                                    VmContact.vm_instance_id,
+                                    VmContact.last_contact_at,
+                                ).where(VmContact.vm_instance_id.in_(step2_vm_ids))
+                            )
+                        ).all()
+                        step2_contact_lookup = {
+                            vm_id: last_contact
+                            for vm_id, last_contact in step2_contact_rows
+                            if last_contact is not None
+                        }
                     verified = [
                         t
                         for t in orphaned_tasks
                         if _classify_orphan(
-                            t, now, has_open_pr=(t.id in tasks_with_pr)
+                            t,
+                            now,
+                            has_open_pr=(t.id in tasks_with_pr),
+                            vm_contact_lookup=step2_contact_lookup,
                         )
                     ]
                     orphaned_tasks = verified
@@ -1812,12 +1968,26 @@ async def reaper_service():
                         # row is held by a peer (e.g. concurrent reaper, finalize
                         # path) or status changed during the unlocked window,
                         # _relock_orphan_task returns None and we skip this iter.
+                        # Heartbeat false-reap fix (option B): also pass the
+                        # heartbeat-stale cutoff so a vmcontact that landed during
+                        # the (potentially 30-120s) unlocked external-I/O window
+                        # aborts the reap even though last_heartbeat is unchanged
+                        # (the agent's contended last_heartbeat write was skipped
+                        # by the rollup's task-row lock). Computed at relock time
+                        # with the current clock + the same scope/effort/PR
+                        # awareness _classify_orphan used.
+                        _relock_hb_cutoff = _heartbeat_stale_cutoff(
+                            fresh_task,
+                            _utcnow(),
+                            has_open_pr=_has_pr_artifact,
+                        )
                         relocked = await _relock_orphan_task(
                             session,
                             task.id,
                             fresh_task,
                             pre_io_status,
                             pre_io_last_hb,
+                            vm_liveness_cutoff=_relock_hb_cutoff,
                         )
                         if relocked is None:
                             # Peer is finalizing this task or agent revived; skip safely.

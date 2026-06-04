@@ -32,6 +32,7 @@ from app.models import (
     TaskHistory,
     Artifact,
     ArtifactType,
+    VmContact,
     _on_task_terminal_callbacks,
     _on_task_revive_callbacks,
     _utcnow,
@@ -3315,6 +3316,68 @@ _COLD_START_BEACON_MAP: dict[str, str] = {
 }
 
 
+async def _record_vm_contact(vm_instance_id: str | None) -> None:
+    """Record an uncontended liveness signal that the orchestrator heard from a VM.
+
+    This is the heartbeat false-reap fix (option B). The heartbeat handler
+    updates the contended ``Task`` row under
+    ``with_for_update(skip_locked=True)``; while the rollup holds that row FOR
+    UPDATE the heartbeat is skipped (409) and ``Task.last_heartbeat`` never
+    advances even though the agent is alive. The reaper reads only
+    ``Task.last_heartbeat`` so the live-but-lock-starved VM is falsely reaped.
+
+    We upsert ``vmcontact(vm_instance_id, last_contact_at=now())`` on its OWN
+    row, on a fresh session committed independently of the request session, so
+    this write:
+      * never contends with the rollup's task-row lock (different row), and
+      * persists even if the later task-row update 409s / rolls back.
+
+    The reaper reads this row and suppresses a reap only when ``last_contact_at``
+    is within the SAME heartbeat-stale cutoff — so a genuinely dead agent (no
+    requests) is still reaped on the existing schedule. A failure here must NEVER
+    break the heartbeat response: it is best-effort liveness, the existing
+    ``Task.last_heartbeat`` path is unchanged, and the worst case on failure is
+    falling back to today's behaviour.
+    """
+    if not vm_instance_id:
+        return
+    now = _utcnow()
+    try:
+        async with AsyncSessionLocal() as contact_session:
+            dialect = resolve_dialect_name(contact_session)
+            if dialect == "postgresql":
+                from sqlalchemy.dialects.postgresql import insert as _pg_insert
+
+                stmt = _pg_insert(VmContact).values(
+                    vm_instance_id=vm_instance_id, last_contact_at=now
+                )
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[VmContact.vm_instance_id],
+                    set_={"last_contact_at": now},
+                )
+                await contact_session.execute(stmt)
+            else:
+                # SQLite (test fixture) has no shared on_conflict helper here;
+                # emulate the upsert with a get-then-write on the primary key.
+                existing = await contact_session.get(VmContact, vm_instance_id)
+                if existing is None:
+                    contact_session.add(
+                        VmContact(
+                            vm_instance_id=vm_instance_id, last_contact_at=now
+                        )
+                    )
+                else:
+                    existing.last_contact_at = now
+            await contact_session.commit()
+    except Exception as exc:  # noqa: BLE001 — best-effort, never break heartbeat
+        logger.warning(
+            "[VM_CONTACT] upsert failed for vm=%s (non-fatal, falling back to "
+            "last_heartbeat): %s",
+            vm_instance_id,
+            exc,
+        )
+
+
 @router.post("/heartbeat")
 @limiter.limit("600/minute")
 async def agent_heartbeat(
@@ -3359,6 +3422,18 @@ async def agent_heartbeat(
     # first /vm-heartbeat call lands (~200-700 ms after spawn). Source the
     # vm_instance_id from the trusted JWT, never from the request body.
     _shared_state.record_vm_heartbeat(token.get("vm_instance_id"))
+
+    # Heartbeat false-reap fix (option B): record an UNCONTENDED durable
+    # liveness signal BEFORE the contended task-row read below. The
+    # ``with_for_update(skip_locked=True)`` task-row update can be skipped (409)
+    # while the rollup holds the row, leaving ``Task.last_heartbeat`` frozen on
+    # a live VM — which the reaper then false-reaps. ``vmcontact`` is keyed on
+    # ``vm_instance_id`` (its own row, never the task row) and committed on its
+    # own session, so it persists regardless of whether the task-row write below
+    # succeeds, 409s, or rolls back. Best-effort: a failure here never breaks the
+    # heartbeat response and the reaper degrades to the existing last_heartbeat
+    # behaviour. The vm_instance_id is sourced from the trusted JWT.
+    await _record_vm_contact(token.get("vm_instance_id"))
 
     # SKIP LOCKED: if the status endpoint holds FOR UPDATE on this row
     # (processing completion/pipeline), skip instead of blocking.  Blocking
