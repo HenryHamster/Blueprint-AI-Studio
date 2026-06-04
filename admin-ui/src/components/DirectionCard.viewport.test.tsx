@@ -90,6 +90,7 @@ const stagedDirection: Direction = {
   category: 'structural',
   added_at: '2026-06-01T00:00:00Z',
   staged_for_version: 42,
+  staged_at: '2026-06-01T00:00:00Z',
   completion_criteria:
     'A new task type can be added by registering its run-shape, produces, needs, and evaluator-slot — proven end-to-end for one reference non-code type.',
 };
@@ -271,6 +272,56 @@ describe('DirectionCard — viewport regression', () => {
     expect(host.textContent).toContain('Waiting for v42');
     expect(host.textContent).toContain('Activate now');
     expect(host.textContent).toContain('Cancel');
+  });
+
+  test('staged direction surfaces how long it has been waiting', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<DirectionCard {...noopProps} statusKey="staged" direction={stagedDirection} />);
+    });
+    // Reuses timeAgo => "staged Nd ago" / "staged Nh Mm ago" depending on age.
+    expect(host.textContent).toMatch(/staged .* ago/);
+  });
+
+  test('long-waiting staged direction is visually emphasized', async () => {
+    const staleDirection: Direction = {
+      ...stagedDirection,
+      id: 'dir-staged-stale',
+      // Far past the STAGED_STALE_DAYS threshold (and well before the run date).
+      staged_at: '2026-01-01T00:00:00Z',
+    };
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<DirectionCard {...noopProps} statusKey="staged" direction={staleDirection} />);
+    });
+    // The stale badge carries red emphasis classes the fresh badge does not.
+    const staleBadge = Array.from(host.querySelectorAll('span')).find(
+      el => el.textContent?.startsWith('staged') && el.className.includes('text-red-400'),
+    );
+    expect(staleBadge).toBeTruthy();
+  });
+
+  test('staged direction without a staging timestamp shows no waiting badge', async () => {
+    const noTimestamp: Direction = { ...stagedDirection, staged_at: null };
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<DirectionCard {...noopProps} statusKey="staged" direction={noTimestamp} />);
+    });
+    expect(host.textContent).not.toMatch(/staged .* ago/);
+    // The version-waiting chip still renders — only the age badge is gated.
+    expect(host.textContent).toContain('Waiting for v42');
   });
 
   test('edit mode offers an enabled Staged option when a version is open', async () => {

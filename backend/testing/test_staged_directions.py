@@ -737,6 +737,203 @@ async def test_activation_survives_notification_failure(db_session, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
+# 6b. Activation resolves the open stale-staged alert when the stall clears.
+# ---------------------------------------------------------------------------
+
+
+async def _open_stale_alert(db_session, project_id, direction_id: str) -> Alert:
+    """Create the WARNING alert the reaper raises for a stalled staged direction,
+    using the exact same helper (so the deterministic title is byte-identical)."""
+    from unittest.mock import AsyncMock
+    import app.alert_dispatch as ad
+
+    # Patch the broadcast so creation doesn't touch the websocket layer.
+    orig = ad.broadcast_to_project
+    ad.broadcast_to_project = AsyncMock()  # type: ignore[assignment]
+    try:
+        created = await ad._maybe_create_stale_staged_direction_alert(
+            db_session,
+            project_id,
+            direction_id=direction_id,
+            direction_text="stalled staged work",
+            waited_days=30,
+            staged_for_version=1,
+            open_version=2,
+        )
+    finally:
+        ad.broadcast_to_project = orig  # type: ignore[assignment]
+    assert created is True
+    alerts = await _stale_alerts(db_session, project_id)
+    match = [a for a in alerts if direction_id in a.title]
+    assert len(match) == 1 and match[0].dismissed_at is None
+    return match[0]
+
+
+@pytest.mark.asyncio
+async def test_activation_resolves_open_stale_alert(db_session, monkeypatch):
+    """When a staged direction auto-activates, its open stale-staged alert is
+    dismissed — and only that direction's alert."""
+    monkeypatch.setattr("app.alert_dispatch.broadcast_to_project", _make_noop())
+    project = Project(
+        name="Staged-ResolveAlert",
+        user_id="staged-user",
+        autonomous_enabled=True,
+        directions=[
+            _staged_direction("d-stalled", staged_for_version=1),  # will activate
+            _staged_direction("d-other", staged_for_version=5),    # stays staged
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Two open stale alerts — one for each direction.
+    alert_stalled = await _open_stale_alert(db_session, project.id, "d-stalled")
+    alert_other = await _open_stale_alert(db_session, project.id, "d-other")
+
+    activated = await activate_eligible_staged_directions(
+        db_session, project.id, promoted_version_number=1
+    )
+    assert activated == ["d-stalled"]
+
+    await db_session.refresh(alert_stalled)
+    await db_session.refresh(alert_other)
+    # The activated direction's alert is resolved; the still-staged one is not.
+    assert alert_stalled.dismissed_at is not None
+    assert alert_other.dismissed_at is None
+
+
+@pytest.mark.asyncio
+async def test_activation_resolves_stale_alert_via_reaper_backstop(
+    db_session, monkeypatch
+):
+    """The reaper backstop shares the activation path, so it too resolves the
+    open stale alert when it activates the direction."""
+    monkeypatch.setattr("app.alert_dispatch.broadcast_to_project", _make_noop())
+    project = Project(
+        name="Staged-ResolveViaReaper",
+        user_id="staged-user",
+        autonomous_enabled=True,
+        directions=[_staged_direction("d-reaper", staged_for_version=1)],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await sync_directions(db_session, project.id, project.directions)
+    await rv.open_version(db_session, project.id, version_number=2)
+    await db_session.commit()
+
+    alert = await _open_stale_alert(db_session, project.id, "d-reaper")
+
+    assert await sweep_activate_staged_directions(db_session) == 1
+    await db_session.refresh(alert)
+    assert alert.dismissed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_activation_alert_resolution_idempotent(db_session, monkeypatch):
+    """Resolving twice is a safe no-op: a second resolver call finds nothing
+    open to dismiss and the dismissal timestamp is unchanged."""
+    monkeypatch.setattr("app.alert_dispatch.broadcast_to_project", _make_noop())
+    from app.alert_dispatch import _resolve_stale_staged_direction_alerts
+
+    project = Project(
+        name="Staged-ResolveIdempotent",
+        user_id="staged-user",
+        autonomous_enabled=True,
+        directions=[_staged_direction("d-idem", staged_for_version=1)],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    alert = await _open_stale_alert(db_session, project.id, "d-idem")
+
+    first = await _resolve_stale_staged_direction_alerts(
+        db_session, project.id, ["d-idem"]
+    )
+    assert first == 1
+    await db_session.refresh(alert)
+    first_stamp = alert.dismissed_at
+    assert first_stamp is not None
+
+    # Second call: alert already dismissed → no match, no change.
+    second = await _resolve_stale_staged_direction_alerts(
+        db_session, project.id, ["d-idem"]
+    )
+    assert second == 0
+    await db_session.refresh(alert)
+    assert alert.dismissed_at == first_stamp
+
+
+@pytest.mark.asyncio
+async def test_activation_alert_resolution_noop_when_absent(db_session, monkeypatch):
+    """Activation with no pre-existing stale alert dismisses nothing and does not
+    error — the resolver is a safe no-op."""
+    monkeypatch.setattr("app.alert_dispatch.broadcast_to_project", _make_noop())
+    from app.alert_dispatch import _resolve_stale_staged_direction_alerts
+
+    project = Project(
+        name="Staged-ResolveNoop",
+        user_id="staged-user",
+        autonomous_enabled=True,
+        directions=[_staged_direction("d-clean", staged_for_version=1)],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # No alert exists — activation still works and resolves nothing.
+    activated = await activate_eligible_staged_directions(
+        db_session, project.id, promoted_version_number=1
+    )
+    assert activated == ["d-clean"]
+    assert await _stale_alerts(db_session, project.id) == []
+    # Direct resolver call with no matching alert returns 0.
+    assert (
+        await _resolve_stale_staged_direction_alerts(
+            db_session, project.id, ["d-clean"]
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_activation_survives_alert_resolution_failure(db_session, monkeypatch):
+    """If alert resolution raises, the activation (status flip) must still commit —
+    proving the best-effort isolation contract."""
+    monkeypatch.setattr("app.alert_dispatch.broadcast_to_project", _make_noop())
+    import app.alert_dispatch as ad
+
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("alert backend down")
+
+    monkeypatch.setattr(ad, "_resolve_stale_staged_direction_alerts", _boom)
+
+    project = Project(
+        name="Staged-ResolveFail",
+        user_id="staged-user",
+        autonomous_enabled=True,
+        directions=[_staged_direction("d-rfail", staged_for_version=1)],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    activated = await activate_eligible_staged_directions(
+        db_session, project.id, promoted_version_number=1
+    )
+    assert activated == ["d-rfail"]
+    await db_session.refresh(project)
+    assert project.directions[0]["status"] == "active"
+
+
+# ---------------------------------------------------------------------------
 # 7. Atomic create-staged: a next-version direction is born staged in one op
 #    (closes the create→stage race where a brand-new active direction is
 #    immediately research-eligible).

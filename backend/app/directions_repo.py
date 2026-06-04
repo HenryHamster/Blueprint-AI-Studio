@@ -312,6 +312,33 @@ async def activate_eligible_staged_directions(
             project_id,
             exc,
         )
+    # Best-effort: resolve any open "stale staged direction" alert for the
+    # directions we just activated. This is exactly the moment a long-stalled
+    # staged direction finally activates, so a lingering WARNING alert is most
+    # likely there — clear it so the operator UI doesn't show a phantom stall.
+    # Placed AFTER the commit above and wrapped in try/except (log-and-swallow)
+    # so a resolution failure can never affect the already-committed activation.
+    # Lazy import preserves this module's documented cycle avoidance.
+    try:
+        from app.alert_dispatch import _resolve_stale_staged_direction_alerts
+
+        dismissed = await _resolve_stale_staged_direction_alerts(
+            session, project_id, activated
+        )
+        if dismissed:
+            logger.info(
+                "[directions_repo] resolved %d stale-staged-direction alert(s) "
+                "for project %s on activation",
+                dismissed,
+                project_id,
+            )
+    except Exception as exc:  # noqa: BLE001 — alert resolution is strictly best-effort
+        logger.warning(
+            "[directions_repo] staged-activation alert resolution failed for "
+            "project %s (activation committed): %s",
+            project_id,
+            exc,
+        )
     logger.info(
         "[directions_repo] activated %d staged direction(s) for project %s "
         "(promoted_version=%d): %s",

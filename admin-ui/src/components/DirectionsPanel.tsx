@@ -51,6 +51,9 @@ export interface Direction {
   // When status is 'staged', the version_number this direction is waiting to be
   // promoted past; it auto-activates when that version promotes and the next opens.
   staged_for_version?: number | null;
+  // ISO timestamp stamped when the direction entered the 'staged' status (set on
+  // every staging path: operator add, status-change-to-staged, agent create/stage).
+  staged_at?: string | null;
   completion_criteria?: string | null;
   paths?: string[];
   last_researched_at?: string | null;

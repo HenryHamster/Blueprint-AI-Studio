@@ -769,6 +769,67 @@ async def _maybe_create_stale_staged_direction_alert(
     return True
 
 
+async def _resolve_stale_staged_direction_alerts(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    direction_ids,
+) -> int:
+    """Dismiss any open stale-staged-direction alert for the given directions.
+
+    The companion to :func:`_maybe_create_stale_staged_direction_alert`. When a
+    staged direction's stall finally clears — most importantly when its target
+    version promotes and the direction auto-activates — the WARNING alert that
+    flagged the stall no longer describes a real condition and must be resolved,
+    mirroring how the deployment-HALTED recovery path stamps ``dismissed_at`` on
+    its alert once recovery happens.
+
+    The stale-staged alert title deterministically encodes the direction id, so
+    the matching open alert is looked up directly per direction. We rebuild the
+    lookup title with the SAME construction the create path uses (same prefix,
+    same truncation), so the comparison is byte-identical. Only open
+    (``dismissed_at IS NULL``), project-scoped (``task_id IS NULL``) alerts are
+    touched, so this is a safe no-op when no such alert exists and idempotent
+    across repeated calls (a second call finds nothing open to dismiss).
+
+    Stamps ``dismissed_at`` on each match, commits its own rows, and broadcasts
+    one ``alert_dismissed`` event per dismissed alert so the operator UI drops it
+    without waiting for the next poll. Returns the number of alerts dismissed.
+
+    Best-effort contract: callers wrap this in try/except so a resolution failure
+    can never abort the activation that triggered it.
+    """
+    titles = {
+        (f"{_STALE_STAGED_DIRECTION_TITLE_PREFIX}: {str(did)[:64]}")[:200]
+        for did in (direction_ids or [])
+        if did
+    }
+    if not titles:
+        return 0
+    result = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title.in_(titles),
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(open_alerts)
+
+
 async def _maybe_create_blocked_escalation_alert(
     task: "Task",
     session: AsyncSession,

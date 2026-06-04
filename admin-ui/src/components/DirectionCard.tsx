@@ -4,7 +4,7 @@ import { AlertTriangle, Check, ChevronDown, ChevronRight, ChevronUp, Loader2, Pe
 import { BarChart, Bar, Cell, ResponsiveContainer, Tooltip as RechartsTooltip } from 'recharts';
 import type { Direction } from './DirectionsPanel';
 import type { DirectionCategory } from '../hooks/useDirectionForm';
-import { formatRelativeTime, formatTimeRemaining, getCooldownStatus, priorityColors, statusColors } from '../utils/directionHelpers';
+import { formatRelativeTime, formatTimeRemaining, getCooldownStatus, getStagedWaitingInfo, STAGED_STALE_DAYS, priorityColors, statusColors } from '../utils/directionHelpers';
 import { parseTimestamp } from '../utils/time';
 
 const TAXONOMY_ORDER = ['scope_related', 'review_quality', 'infra_related', 'code_defect'] as const;
@@ -402,6 +402,26 @@ function DirectionCardImpl({
                 Waiting for v{d.staged_for_version} to promote
               </span>
             )}
+            {(() => {
+              const waiting = getStagedWaitingInfo(d);
+              if (!waiting) return null;
+              return (
+                <span
+                  className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${
+                    waiting.isStale
+                      ? 'bg-red-950/40 text-red-400 border-red-900/50'
+                      : 'bg-neutral-800/40 text-neutral-400 border-neutral-700/50'
+                  }`}
+                  title={
+                    waiting.isStale
+                      ? `Stalling — waiting ${waiting.days}d for promotion, past the ${STAGED_STALE_DAYS}d threshold (operator alert fires ~21d)`
+                      : `Waiting ${waiting.days}d since staged`
+                  }
+                >
+                  {waiting.label}
+                </span>
+              );
+            })()}
           </div>
         </div>
       ) : editingId === d.id ? (
