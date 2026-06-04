@@ -270,6 +270,7 @@ async def lifespan(app):
     # Late imports to avoid circular dependency with app.main
     from app.main import (
         _verify_schema_version,
+        _verify_schema_drift,
         _init_deployment_state,
     )
     from app.notification import _send_webhook_notification
@@ -292,6 +293,12 @@ async def lifespan(app):
 
     # Verify schema version matches expected migration
     await _verify_schema_version()
+
+    # Verify the live schema actually has every table/column the models require
+    # (the version number can be correct while the real schema is short — the
+    # back-merge renumber class). Loud, specific failure instead of a cryptic
+    # UndefinedColumnError deep in a later query.
+    await _verify_schema_drift()
 
     # Seed initial admin if AllowedUser table is empty
     await _seed_initial_admin()
