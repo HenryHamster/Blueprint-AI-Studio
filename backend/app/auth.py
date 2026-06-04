@@ -11,6 +11,8 @@ resolve the caller against the ``AllowedUser`` table.
 
 from fastapi import Security, HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 import os
@@ -31,7 +33,7 @@ logger = logging.getLogger(__name__)
 # Locally, it uses the GOOGLE_APPLICATION_CREDENTIALS environment variable.
 try:
     firebase_admin.initialize_app()
-except (ValueError, Exception) as e:
+except Exception as e:  # noqa: BLE001 — module-load init must never crash the import
     # App already initialized, or Firebase not configured yet (placeholder secrets)
     logger.warning(f"Firebase Admin SDK init: {e}")
 
@@ -76,9 +78,9 @@ def verify_ws_ticket(ticket: str) -> dict:
             raise HTTPException(status_code=401, detail="Invalid ticket type")
         return payload
     except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Ticket expired")
+        raise HTTPException(status_code=401, detail="Ticket expired") from None
     except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid ticket")
+        raise HTTPException(status_code=401, detail="Invalid ticket") from None
 
 
 # 1h is the maximum replay window for any path that lacks per-request
@@ -179,9 +181,63 @@ def verify_agent_jwt(token: str) -> dict:
         payload = jwt.decode(token, AGENT_JWT_SECRET, algorithms=[AGENT_JWT_ALGORITHM])
         return payload
     except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Agent token expired")
+        raise HTTPException(status_code=401, detail="Agent token expired") from None
     except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid agent token")
+        raise HTTPException(status_code=401, detail="Invalid agent token") from None
+
+
+# How stale ``last_login_at`` may get before we refresh it. The timestamp is
+# cosmetic (operator visibility), so a coarse cadence is fine — and it keeps the
+# auth dependency from writing+committing on EVERY authenticated request. See
+# _persist_auth_metadata_best_effort.
+_LAST_LOGIN_UPDATE_INTERVAL = timedelta(minutes=15)
+
+# Short, per-statement lock timeout for the best-effort auth-metadata write so it
+# fails fast instead of blocking the auth hot path on a contended row (the global
+# default is 30s). On timeout we degrade — skip the write — rather than 500.
+_AUTH_METADATA_LOCK_TIMEOUT = "1s"
+
+
+async def _persist_auth_metadata_best_effort(
+    session: AsyncSession, allowed_user: AllowedUser
+) -> None:
+    """Commit non-critical AllowedUser session metadata, degrading on contention.
+
+    ``last_login_at`` / ``display_name`` / first-sign-in ``firebase_uid`` linking
+    are all non-critical. Previously they were written and committed on EVERY
+    authenticated request, which made ``get_current_user`` a write on the auth
+    hot path: when the DB was contended (a lock-wedged ``task`` row + connection
+    pool starvation, incident 2026-06-04) this commit timed out and 500'd EVERY
+    authenticated request, taking the whole admin UI down.
+
+    Now the caller only invokes this when something actually changed, and the
+    write runs behind a short ``lock_timeout`` and swallows DB errors: a contended
+    row simply skips the update (it self-heals on the next request) instead of
+    failing authentication. The caller MUST snapshot anything it needs off
+    ``allowed_user`` BEFORE calling this — a rollback here expires the instance,
+    and a later attribute read would lazy-load under async (MissingGreenlet).
+    """
+    try:
+        # Fail fast rather than parking a pooled connection on a contended row.
+        await session.execute(
+            text("SET LOCAL lock_timeout = :t").bindparams(
+                t=_AUTH_METADATA_LOCK_TIMEOUT
+            )
+        )
+        session.add(allowed_user)
+        await session.commit()
+    except SQLAlchemyError:
+        logger.warning(
+            "[AUTH] best-effort AllowedUser metadata persist skipped "
+            "(DB contention / transient error); authentication proceeds",
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except SQLAlchemyError:
+            logger.exception(
+                "[AUTH] rollback after failed metadata persist also failed"
+            )
 
 
 async def get_current_user(
@@ -230,13 +286,13 @@ async def get_current_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication credentials",
             headers={"WWW-Authenticate": "Bearer"},
-        )
+        ) from e
     except Exception as e:
         logger.error(f"Unexpected auth error: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Authentication service error",
-        )
+        ) from e
 
     uid = decoded_token.get("uid")
     email = decoded_token.get("email")
@@ -259,23 +315,44 @@ async def get_current_user(
             detail="Not authorized. Contact an administrator to request access.",
         )
 
+    # Maintain non-critical session metadata, but only commit when something
+    # actually changed and only as a best effort — this runs on EVERY
+    # authenticated request, so an unconditional write+commit here turns any DB
+    # contention into a total auth/UI outage (incident 2026-06-04). The common
+    # request changes nothing and skips the write entirely.
+    needs_persist = False
     # Link Firebase UID on first sign-in
     if not allowed_user.firebase_uid:
         allowed_user.firebase_uid = uid
+        needs_persist = True
     # Update display name from Firebase if available
     display_name = decoded_token.get("name")
     if display_name and allowed_user.display_name != display_name:
         allowed_user.display_name = display_name
-    # Track last login
-    allowed_user.last_login_at = _utcnow()
-    session.add(allowed_user)
-    await session.commit()
+        needs_persist = True
+    # Track last login, throttled — minute-granularity is irrelevant for this
+    # cosmetic timestamp, and throttling keeps the hot path write-free.
+    now = _utcnow()
+    if (
+        allowed_user.last_login_at is None
+        or (now - allowed_user.last_login_at) >= _LAST_LOGIN_UPDATE_INTERVAL
+    ):
+        allowed_user.last_login_at = now
+        needs_persist = True
+
+    # Snapshot the role BEFORE any commit/rollback: get_current_user must still
+    # return it even if the best-effort persist below rolls back (a rollback
+    # expires the instance, and a later read would lazy-load -> MissingGreenlet).
+    role = allowed_user.role
+
+    if needs_persist:
+        await _persist_auth_metadata_best_effort(session, allowed_user)
 
     return {
         "user_id": uid,
         "email": email,
         "email_verified": decoded_token.get("email_verified", False),
-        "role": allowed_user.role,
+        "role": role,
     }
 
 
