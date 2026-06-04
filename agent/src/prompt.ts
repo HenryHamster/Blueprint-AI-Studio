@@ -140,6 +140,7 @@ export const TASK_TYPE_HINTS: Record<string, string> = {
 // TASK_TYPE_HINTS or be explicitly opted-out here with justification.
 export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'review',           // Uses review-fix.ts bespoke prompt assembly
+  'panel_review',     // Uses panel-review.ts bespoke fixed-lens review assembly
   'plan',             // Uses research-plan.ts bespoke prompt assembly
   'research',         // Uses research-plan.ts bespoke prompt assembly
   'strategic_review', // Reuses research handler with research_mode branch; uses bespoke assembly

@@ -106,7 +106,7 @@ function CatalogCard({
       </p>
 
       <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]">
-        <dt className="text-neutral-500">Runs as</dt>
+        <dt className="text-neutral-500">Run shape</dt>
         <dd className="text-neutral-300 truncate text-right">{RUN_SHAPE_LABELS[entry.run_shape]}</dd>
         <dt className="text-neutral-500">Output</dt>
         <dd className="text-neutral-300 truncate text-right">{OUTPUT_KIND_LABELS[entry.output_kind]}</dd>

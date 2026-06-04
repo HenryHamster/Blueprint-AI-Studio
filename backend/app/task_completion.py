@@ -1814,6 +1814,216 @@ async def _handle_compute_experiment_completion(
 
 
 # ---------------------------------------------------------------------------
+# Panel-review completion — persist a structured verdict artifact, no PR, no children
+# ---------------------------------------------------------------------------
+
+
+_PANEL_REVIEW_REQUIRED_LENSES = (
+    "correctness",
+    "security",
+    "code_quality",
+    "test_coverage",
+)
+_PANEL_REVIEW_ARTIFACT_TYPE = "PANEL_REVIEW_VERDICT"
+
+
+def _extract_json_object(text: str, *required_keys: str) -> Optional[str]:
+    """Find the first balanced JSON object in ``text`` containing ``required_keys``."""
+    text = text[:500_000]
+    for key in required_keys:
+        if f'"{key}"' not in text:
+            return None
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escape_next = False
+        for i in range(start, len(text)):
+            c = text[i]
+            if escape_next:
+                escape_next = False
+                continue
+            if c == "\\" and in_string:
+                escape_next = True
+                continue
+            if c == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : i + 1]
+                    if all(f'"{key}"' in candidate for key in required_keys):
+                        return candidate
+                    break
+        start = text.find("{", start + 1)
+    return None
+
+
+def _normalize_panel_review_verdict(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalize a panel-review verdict and require every declared lens."""
+    overall_verdict = str(raw.get("overall_verdict") or "").strip()
+    if overall_verdict not in {"APPROVE", "REQUEST_CHANGES"}:
+        return None
+
+    raw_lenses = raw.get("lenses")
+    lens_map: Dict[str, Dict[str, Any]] = {}
+    if isinstance(raw_lenses, dict):
+        for name, payload in raw_lenses.items():
+            if isinstance(name, str) and isinstance(payload, dict):
+                lens_map[name] = payload
+    elif isinstance(raw_lenses, list):
+        for item in raw_lenses:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("lens") or item.get("name") or item.get("id")
+            if isinstance(name, str):
+                lens_map[name] = item
+    else:
+        return None
+
+    if any(lens not in lens_map for lens in _PANEL_REVIEW_REQUIRED_LENSES):
+        return None
+
+    normalized_lenses: Dict[str, Dict[str, Any]] = {}
+    for lens in _PANEL_REVIEW_REQUIRED_LENSES:
+        payload = lens_map.get(lens)
+        if not isinstance(payload, dict):
+            return None
+        lens_verdict = str(payload.get("verdict") or "").strip()
+        if not lens_verdict:
+            return None
+        summary = str(
+            payload.get("summary")
+            or payload.get("feedback")
+            or payload.get("reasoning")
+            or ""
+        ).strip()
+        if not summary:
+            return None
+        issues = payload.get("issues")
+        normalized_lenses[lens] = {
+            "verdict": lens_verdict,
+            "summary": summary,
+            "issues": issues if isinstance(issues, list) else [],
+        }
+
+    normalized: Dict[str, Any] = {
+        "overall_verdict": overall_verdict,
+        "summary": str(raw.get("summary") or raw.get("feedback") or "").strip(),
+        "lenses": normalized_lenses,
+    }
+    overall_issues = raw.get("issues")
+    if isinstance(overall_issues, list):
+        normalized["issues"] = overall_issues
+    investigated_files = raw.get("investigated_files")
+    if isinstance(investigated_files, list):
+        normalized["investigated_files"] = [
+            str(path).strip()
+            for path in investigated_files
+            if str(path).strip()
+        ]
+    return normalized
+
+
+def _parse_panel_review_output(text: str | None) -> Optional[Dict[str, Any]]:
+    """Best-effort extract the structured panel-review verdict from agent output."""
+    if not text:
+        return None
+    snippet = text[:500_000]
+    candidates: List[str] = []
+    try:
+        parsed = json.loads(snippet)
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict) and "overall_verdict" in parsed:
+        candidates.append(snippet)
+
+    candidate = _extract_json_object(snippet, "lenses")
+    if candidate and candidate not in candidates:
+        candidates.append(candidate)
+
+    for candidate_text in candidates:
+        try:
+            obj = json.loads(candidate_text)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(obj, dict):
+            normalized = _normalize_panel_review_verdict(obj)
+            if normalized is not None:
+                return normalized
+    return None
+
+
+async def _handle_panel_review_completion(
+    task: Task, logs: str, session: AsyncSession
+):
+    """Persist a terminal structured verdict for ``panel_review`` tasks."""
+    from app.models import Artifact  # noqa: PLC0415
+
+    verdict = evaluate_terminal_output(task, logs)
+    if not verdict.passed:
+        record_failed_gate(task, verdict)
+        session.add(task)
+        await session.commit()
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": TaskStatus.FAILED},
+        )
+        logger.info(
+            "[PANEL_REVIEW] Task %s did not clear the structured-verdict gate: %s",
+            task.id,
+            verdict.reason,
+        )
+        return
+
+    parsed = _parse_panel_review_output(logs)
+    if parsed is None:
+        record_failed_gate(
+            task,
+            EvaluationVerdict(
+                False,
+                "structured verdict output not parseable after gate",
+                "structured-verdict",
+            ),
+        )
+        session.add(task)
+        await session.commit()
+        return
+
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=_PANEL_REVIEW_ARTIFACT_TYPE,
+        logs=json.dumps(parsed),
+    )
+    session.add(artifact)
+
+    task.plan_output = parsed
+    flag_modified(task, "plan_output")
+    task.status = TaskStatus.COMPLETED
+    task.latest_status_message = (
+        f"Panel review verdict recorded ({parsed['overall_verdict']}; "
+        f"{len(parsed['lenses'])} lenses)"
+    )
+    session.add(task)
+    await session.commit()
+
+    await broadcast_to_project(
+        str(task.project_id),
+        "task_updated",
+        {"task_id": str(task.id), "status": TaskStatus.COMPLETED},
+    )
+    logger.info(
+        "[PANEL_REVIEW] Persisted verdict artifact for task %s", task.id
+    )
+
+
+# ---------------------------------------------------------------------------
 # Memo completion — persist a terminal reasoning artifact, no PR, no children
 # ---------------------------------------------------------------------------
 
@@ -1846,37 +2056,10 @@ def _parse_memo_output(text: str) -> Optional[Dict[str, Any]]:
 
     # Fallback: scan for a balanced JSON object containing "summary"
     # and "reasoning" keys.
-    if not candidates and '"summary"' in snippet and '"reasoning"' in snippet:
-        start = snippet.find("{")
-        while start != -1:
-            depth = 0
-            in_string = False
-            escape_next = False
-            for i in range(start, len(snippet)):
-                c = snippet[i]
-                if escape_next:
-                    escape_next = False
-                    continue
-                if c == "\\" and in_string:
-                    escape_next = True
-                    continue
-                if c == '"':
-                    in_string = not in_string
-                    continue
-                if in_string:
-                    continue
-                if c == "{":
-                    depth += 1
-                elif c == "}":
-                    depth -= 1
-                    if depth == 0:
-                        candidate = snippet[start : i + 1]
-                        if all(f'"{k}"' in candidate for k in ("summary", "reasoning")):
-                            candidates.append(candidate)
-                        break
-            start = snippet.find("{", start + 1)
-            if candidates:
-                break
+    if not candidates:
+        candidate = _extract_json_object(snippet, "summary", "reasoning")
+        if candidate:
+            candidates.append(candidate)
 
     for candidate in candidates:
         try:

@@ -232,14 +232,20 @@ export function useTaskModal(
 
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (newTaskType === 'review' || newTaskType === 'fix') {
+    const normalizedPrBranch = newTaskPrBranch.trim();
+    if (newTaskType === 'review' || newTaskType === 'panel_review' || newTaskType === 'fix') {
       const prNum = parseInt(newTaskPrNumber, 10);
       if (!newTaskPrNumber || isNaN(prNum) || prNum < 1) {
         addToast('PR number must be a positive integer', 'error');
         return;
       }
-      if (newTaskType === 'fix' && !newTaskPrBranch) {
-        addToast('PR branch is required for fix tasks', 'error');
+      if (!normalizedPrBranch) {
+        const taskLabel = newTaskType === 'fix'
+          ? 'fix'
+          : newTaskType === 'panel_review'
+            ? 'panel review'
+            : 'review';
+        addToast(`PR branch is required for ${taskLabel} tasks`, 'error');
         return;
       }
     }
@@ -253,9 +259,9 @@ export function useTaskModal(
           prompt: newTaskPrompt,
           base_branch: newTaskBranch,
           task_type: newTaskType,
-          ...(newTaskType === 'review' || newTaskType === 'fix' ? {
+          ...(newTaskType === 'review' || newTaskType === 'panel_review' || newTaskType === 'fix' ? {
             pr_number: parseInt(newTaskPrNumber, 10),
-            branch: newTaskPrBranch || undefined,
+            branch: normalizedPrBranch || undefined,
           } : {}),
           ...(newTaskModel ? { model: newTaskModel } : {}),
           ...(newTaskEffort ? { effort: newTaskEffort } : {}),

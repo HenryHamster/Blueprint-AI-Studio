@@ -2,7 +2,7 @@
 Pydantic-based payload validation for all supported task types.
 
 Provides:
-  - TaskType enum listing all 23 handler types
+  - TaskType enum listing all supported handler types
   - ALL_TASK_TYPES frozenset for backward-compat consumers
   - Per-type payload models with required-field enforcement
   - validate_task_payload()  — strict, raises ValueError on bad input
@@ -144,6 +144,10 @@ class ReviewPayload(BasePayload):
     @classmethod
     def _check_branch(cls, v: str) -> str:
         return _validate_branch_name(v)  # type: ignore[return-value]
+
+
+class PanelReviewPayload(ReviewPayload):
+    """Read-only PR review payload for the fixed multi-agent panel workflow."""
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +386,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.migrate: MigratePayload,
     TaskType.investigate: InvestigatePayload,
     TaskType.review: ReviewPayload,
+    TaskType.panel_review: PanelReviewPayload,
     TaskType.fix: FixPayload,
     TaskType.research: ResearchPayload,
     TaskType.strategic_review: StrategicReviewPayload,

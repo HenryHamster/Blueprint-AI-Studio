@@ -34,6 +34,11 @@ describe('task capability registry', () => {
     expect(PROVIDER_ROUTABLE_TASK_TYPE_IDS).toContain('investigate');
   });
 
+  it('surfaces panel_review as a launchable operator task', () => {
+    expect(USER_LAUNCHABLE_TASK_TYPE_IDS).toContain('panel_review');
+    expect(getTaskTypeLabel('panel_review')).toBe('Panel Review');
+  });
+
   it('does not invent labels for unknown future task types', () => {
     expect(getTaskTypeLabel('future_capability')).toBe('future_capability');
   });

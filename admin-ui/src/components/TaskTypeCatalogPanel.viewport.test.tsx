@@ -15,13 +15,13 @@ const ENTRIES: TaskTypeCatalogEntry[] = [
     user_launchable: true,
     provider_configurable: true,
     filter_visible: true,
+    run_shape: 'workflow',
     output_kind: 'pr',
     requires_code: true,
     requires_web: false,
     requires_compute: false,
     evaluation_strategy: 'ci_and_review',
     cost_ceiling_usd: 8.0,
-    run_shape: 'workflow',
   },
   {
     id: 'research',
@@ -32,13 +32,13 @@ const ENTRIES: TaskTypeCatalogEntry[] = [
     user_launchable: true,
     provider_configurable: true,
     filter_visible: true,
+    run_shape: 'single_agent',
     output_kind: 'knowledge',
     requires_code: true,
     requires_web: true,
     requires_compute: false,
     evaluation_strategy: 'forward_quality',
     cost_ceiling_usd: 4.0,
-    run_shape: 'single_agent',
   },
   {
     id: 'memo',
@@ -49,13 +49,13 @@ const ENTRIES: TaskTypeCatalogEntry[] = [
     user_launchable: false,
     provider_configurable: true,
     filter_visible: true,
+    run_shape: 'single_agent',
     output_kind: 'artifact',
     requires_code: false,
     requires_web: false,
     requires_compute: false,
     evaluation_strategy: 'none',
     cost_ceiling_usd: null,
-    run_shape: 'single_agent',
   },
 ];
 
@@ -100,13 +100,16 @@ describe('TaskTypeCatalogPanel — viewport regression', () => {
   test('renders one card per injected entry with a launchable badge only on launchable types', async () => {
     localStorage.setItem('blueprint-admin:taskTypeCatalogCollapsed', 'false');
     await render(ENTRIES);
-    const cards = host!.querySelectorAll('[data-testid="task-type-card"]');
+    const mountedHost = host;
+    expect(mountedHost).not.toBeNull();
+    if (!mountedHost) throw new Error('expected viewport test host to be mounted');
+    const cards = mountedHost.querySelectorAll('[data-testid="task-type-card"]');
     expect(cards.length).toBe(ENTRIES.length);
-    const badges = host!.querySelectorAll('[data-testid="launchable-badge"]');
+    const badges = mountedHost.querySelectorAll('[data-testid="launchable-badge"]');
     // create + research are launchable; memo is not.
     expect(badges.length).toBe(2);
     // Cost ceiling and evaluation strategy surface for the create card.
-    const createCard = host!.querySelector('[data-task-type="create"]');
+    const createCard = mountedHost.querySelector('[data-task-type="create"]');
     expect(createCard?.textContent).toContain('$8.00');
     expect(createCard?.textContent).toContain('CI + review');
     // The run-shape axis surfaces "how it runs" alongside the other axes.

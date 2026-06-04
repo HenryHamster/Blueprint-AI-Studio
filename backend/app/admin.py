@@ -1252,10 +1252,22 @@ class CreateTaskPayload(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def validate_pr_required_for_review_fix(self) -> "CreateTaskPayload":
-        if self.task_type in (TaskType.review, TaskType.fix) and self.pr_number is None:
+    def validate_pr_metadata_required_for_pr_tasks(self) -> "CreateTaskPayload":
+        if self.task_type in (
+            TaskType.review,
+            TaskType.panel_review,
+            TaskType.fix,
+        ) and self.pr_number is None:
             raise ValueError(
                 f"pr_number is required for task_type '{self.task_type.value}'"
+            )
+        if self.task_type in (
+            TaskType.review,
+            TaskType.panel_review,
+            TaskType.fix,
+        ) and not self.branch:
+            raise ValueError(
+                f"branch is required for task_type '{self.task_type.value}'"
             )
         return self
 
@@ -1365,11 +1377,15 @@ async def create_task_manually(
         task_payload["effort"] = payload.effort
     if payload.hotfix:
         task_payload["hotfix"] = True
-    # Review/fix tasks need pr_number and branch
-    if payload.task_type in ("review", "fix") and payload.pr_number:
+    # PR-based read-only/write review tasks need pr_number and branch
+    if payload.task_type in (
+        TaskType.review,
+        TaskType.panel_review,
+        TaskType.fix,
+    ) and payload.pr_number is not None and payload.branch is not None:
         task_payload["pr_number"] = payload.pr_number
-        task_payload["branch"] = payload.branch or ""
-        if payload.task_type == "review":
+        task_payload["branch"] = payload.branch
+        if payload.task_type in (TaskType.review, TaskType.panel_review):
             task_payload["original_prompt"] = payload.prompt
     # Research tasks auto-include project directions. For ad-hoc manual
     # spawns we ship lightweight direction summaries (id/text/priority/

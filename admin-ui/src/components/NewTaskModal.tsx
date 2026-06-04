@@ -1,5 +1,5 @@
 import { useState, useRef } from 'react';
-import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, AlertCircle, Loader2, ChevronDown, ArrowUpDown, Wrench, Boxes } from 'lucide-react';
+import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, CheckSquare, AlertCircle, Loader2, ChevronDown, ArrowUpDown, Wrench, Boxes } from 'lucide-react';
 import type { LaunchableTaskTypeOption, UserLaunchableTaskType } from '../taskCapabilities';
 
 const TASK_TYPE_OPTION_ICONS: Record<string, typeof Plus> = {
@@ -8,6 +8,7 @@ const TASK_TYPE_OPTION_ICONS: Record<string, typeof Plus> = {
   plan: GitFork,
   research: Microscope,
   review: CheckCircle,
+  panel_review: CheckSquare,
   fix: AlertCircle,
   migrate: ArrowUpDown,
 };
@@ -118,7 +119,7 @@ export function NewTaskModal({
     setSubmitAttempted(true);
     if (repoError || branchError) return;
     if (!taskBranchDefaultsReady) return;
-    if ((newTaskType === 'review' || newTaskType === 'fix') && !isPrNumberValid(newTaskPrNumber)) {
+    if ((newTaskType === 'review' || newTaskType === 'panel_review' || newTaskType === 'fix') && !isPrNumberValid(newTaskPrNumber)) {
       setPrNumberError(true);
       prNumberRef.current?.focus();
       return;
@@ -255,7 +256,7 @@ export function NewTaskModal({
               })}
             </div>
           </div>
-          <div className={`transition-all duration-150 ${(newTaskType === 'review' || newTaskType === 'fix') ? 'opacity-100 h-auto mb-4' : 'opacity-0 h-0 overflow-hidden'}`}>
+          <div className={`transition-all duration-150 ${(newTaskType === 'review' || newTaskType === 'panel_review' || newTaskType === 'fix') ? 'opacity-100 h-auto mb-4' : 'opacity-0 h-0 overflow-hidden'}`}>
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">PR Number</label>

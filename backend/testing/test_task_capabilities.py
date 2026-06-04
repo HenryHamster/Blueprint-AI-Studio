@@ -53,6 +53,7 @@ def test_task_capability_ui_subsets_only_reference_known_types():
     assert USER_LAUNCHABLE_TASK_TYPES == (
         "create",
         "review",
+        "panel_review",
         "fix",
         "plan",
         "research",
@@ -103,6 +104,7 @@ def test_completion_handler_declarations_match_legacy_dispatch():
     task_lifecycle is behaviour-preserving."""
     assert COMPLETION_HANDLER_BY_TASK_TYPE == {
         "plan": "plan",
+        "panel_review": "panel_review",
         "design_doc_update": "design_doc",
         "strategic_review": "strategic",
         "research": "research",
@@ -184,6 +186,7 @@ def test_every_capability_declares_a_valid_evaluation_strategy():
     value from the closed strategy vocabulary, and the derived map covers all
     types. Selection of the forward gate is registry-driven via this field."""
     valid = {"code-ci-review", "forward-quality", "metric", "none"}
+    valid.add("structured-verdict")
     for cap in TASK_CAPABILITIES:
         assert cap.evaluation in valid, (cap.id, cap.evaluation)
     assert set(EVALUATION_STRATEGY_BY_TASK_TYPE) == ALL_TASK_TYPES
@@ -199,6 +202,7 @@ def test_code_pr_types_keep_code_ci_review_gate():
     for t in ("research", "memo", "security_audit", "self_audit", "investigate"):
         assert EVALUATION_STRATEGY_BY_TASK_TYPE[t] == "forward-quality"
     assert EVALUATION_STRATEGY_BY_TASK_TYPE["perf"] == "metric"
+    assert EVALUATION_STRATEGY_BY_TASK_TYPE["panel_review"] == "structured-verdict"
     assert EVALUATION_STRATEGY_BY_TASK_TYPE["plan"] == "none"
 
 
@@ -378,13 +382,13 @@ _CATALOG_FIELDS = {
     "user_launchable",
     "provider_configurable",
     "filter_visible",
+    "run_shape",
     "output_kind",
     "requires_code",
     "requires_web",
     "requires_compute",
     "evaluation_strategy",
     "cost_ceiling_usd",
-    "run_shape",
 }
 _VALID_OUTPUT_KINDS = {"pr", "artifact", "knowledge", "verdict", "none"}
 _VALID_RUN_SHAPES = {"single_agent", "workflow", "experiment_loop"}
@@ -404,8 +408,8 @@ def test_task_type_catalog_covers_every_capability_with_all_fields():
     for entry in catalog:
         assert set(entry.keys()) == _CATALOG_FIELDS, entry["id"]
         assert entry["agent_mode"] in {"write", "read_only"}
-        assert entry["output_kind"] in _VALID_OUTPUT_KINDS, entry["id"]
         assert entry["run_shape"] in _VALID_RUN_SHAPES, entry["id"]
+        assert entry["output_kind"] in _VALID_OUTPUT_KINDS, entry["id"]
         assert entry["evaluation_strategy"] in _VALID_EVAL_STRATEGIES, entry["id"]
         assert isinstance(entry["requires_code"], bool)
         assert isinstance(entry["requires_web"], bool)
@@ -420,6 +424,7 @@ def test_task_type_catalog_launchable_flags_and_output_kinds():
     launchable = {e["id"] for e in catalog if e["user_launchable"]}
     assert launchable == set(USER_LAUNCHABLE_TASK_TYPES)
     by_id = {e["id"]: e for e in catalog}
+    assert by_id["create"]["run_shape"] == "workflow"
     # Code-change types open a PR and are CI+review gated.
     assert by_id["create"]["output_kind"] == "pr"
     assert by_id["create"]["evaluation_strategy"] == "ci_and_review"
@@ -428,6 +433,7 @@ def test_task_type_catalog_launchable_flags_and_output_kinds():
     assert by_id["memo"]["requires_code"] is False
     assert by_id["memo"]["evaluation_strategy"] == "none"
     # Research is judged by forward quality, not a merged PR.
+    assert by_id["research"]["run_shape"] == "single_agent"
     assert by_id["research"]["evaluation_strategy"] == "forward_quality"
     # The reference compute-loop task is a compute-only verdict producer with a
     # declared ceiling and metric-style evaluation metadata.
@@ -448,6 +454,15 @@ def test_task_type_catalog_launchable_flags_and_output_kinds():
         "cost_ceiling_usd": 5.0,
         "run_shape": "experiment_loop",
     }
+    # Panel review is a multi-agent workflow producing a verdict artifact with a
+    # higher cost ceiling than the normal review path and is now launchable
+    # because the executable workflow is live.
+    assert by_id["panel_review"]["run_shape"] == "workflow"
+    assert by_id["panel_review"]["output_kind"] == "verdict"
+    assert by_id["panel_review"]["user_launchable"] is True
+    assert by_id["panel_review"]["cost_ceiling_usd"] > by_id["review"][
+        "cost_ceiling_usd"
+    ]
 
 
 def test_enrichment_leaves_agent_mode_derived_sets_consistent():
@@ -458,6 +473,18 @@ def test_enrichment_leaves_agent_mode_derived_sets_consistent():
             assert entry["id"] in READ_ONLY_TASK_TYPES
 
 
+def test_every_capability_declares_valid_run_shape_and_catalog_round_trips():
+    expected_by_id = {}
+    for capability in TASK_CAPABILITIES:
+        assert capability.run_shape in _VALID_RUN_SHAPES, capability.id.value
+        expected_by_id[capability.id.value] = capability.run_shape
+
+    assert expected_by_id["panel_review"] == "workflow"
+    assert {
+        entry["id"]: entry["run_shape"] for entry in task_type_catalog()
+    } == expected_by_id
+
+
 @pytest.mark.asyncio
 async def test_task_types_endpoint_returns_full_catalog(client: AsyncClient):
     resp = await client.get("/api/admin/task-types")
@@ -465,6 +492,11 @@ async def test_task_types_endpoint_returns_full_catalog(client: AsyncClient):
     body = resp.json()
     assert body["task_types"] == task_type_catalog()
     assert len(body["task_types"]) == len(TaskType)
+    assert {
+        entry["id"]: entry["run_shape"] for entry in body["task_types"]
+    } == {
+        capability.id.value: capability.run_shape for capability in TASK_CAPABILITIES
+    }
 
 
 @pytest.mark.asyncio

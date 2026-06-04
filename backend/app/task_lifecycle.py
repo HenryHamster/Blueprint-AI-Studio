@@ -503,6 +503,7 @@ async def _process_post_commit(
     from app.task_completion import (
         _handle_plan_completion,
         _handle_design_doc_completion,
+        _handle_panel_review_completion,
         _handle_security_audit_completion,
         _handle_perf_completion,
         _handle_compute_experiment_completion,
@@ -4046,6 +4047,7 @@ async def _process_post_commit(
                     "design_doc": _handle_design_doc_completion,
                     "strategic": _handle_strategic_completion,
                     "research": _handle_research_completion,
+                    "panel_review": _handle_panel_review_completion,
                     "security_audit": _handle_security_audit_completion,
                     "perf": _handle_perf_completion,
                     "compute_experiment": _handle_compute_experiment_completion,

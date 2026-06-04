@@ -8,12 +8,12 @@ perf report that measured nothing, was parsed, stored, and marked COMPLETED on
 the agent's say-so.
 
 This module provides the FOUNDATION of a per-type forward gate. A small closed
-set of strategies (``none``, ``forward-quality``, ``metric``, plus the
-``code-ci-review`` sentinel) each implement a cheap synchronous ``evaluate``
-check, and ``resolve_evaluation_strategy`` picks the right one by reading the
-``evaluation`` field DECLARED on each ``TaskCapability`` in the task-type
-registry. Selection is therefore registry-driven — there is no hardwired
-type→strategy if/elif anywhere.
+set of strategies (``none``, ``forward-quality``, ``metric``,
+``structured-verdict``, plus the ``code-ci-review`` sentinel) each implement a
+cheap synchronous ``evaluate`` check, and ``resolve_evaluation_strategy`` picks
+the right one by reading the ``evaluation`` field DECLARED on each
+``TaskCapability`` in the task-type registry. Selection is therefore
+registry-driven — there is no hardwired type→strategy if/elif anywhere.
 
 The ``code-ci-review`` strategy is a recognized sentinel only: code tasks keep
 their existing CI + review merge gate and are NEVER routed through this module.
@@ -230,6 +230,32 @@ class MetricStrategy:
         )
 
 
+class StructuredVerdictStrategy:
+    """Strict structural gate for multi-lens verdict artifacts."""
+
+    key = "structured-verdict"
+
+    def evaluate(self, task: Task, artifact_text: str | None) -> EvaluationVerdict:
+        text = (artifact_text or "").strip()
+        if not text:
+            return EvaluationVerdict(
+                False, "empty terminal artifact — no structured verdict produced", self.key
+            )
+
+        from app.task_completion import _parse_panel_review_output  # noqa: PLC0415
+
+        parsed = _parse_panel_review_output(artifact_text)
+        if parsed is None:
+            return EvaluationVerdict(
+                False,
+                "structured verdict output is unparseable or missing required fields",
+                self.key,
+            )
+        return EvaluationVerdict(
+            True, "structured verdict parsed with all declared lenses", self.key
+        )
+
+
 # Registry of concrete strategy instances, keyed by their declared strategy key.
 # Strategies are stateless, so module-level singletons are safe to share.
 _STRATEGIES: dict[str, EvaluationStrategy] = {
@@ -239,6 +265,7 @@ _STRATEGIES: dict[str, EvaluationStrategy] = {
         CodeCiReviewStrategy(),
         ForwardQualityStrategy(),
         MetricStrategy(),
+        StructuredVerdictStrategy(),
     )
 }
 

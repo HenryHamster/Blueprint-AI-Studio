@@ -146,13 +146,13 @@ export interface TaskTypeCatalogEntry {
   user_launchable: boolean;
   provider_configurable: boolean;
   filter_visible: boolean;
+  run_shape: 'single_agent' | 'workflow' | 'experiment_loop';
   output_kind: 'pr' | 'artifact' | 'knowledge' | 'verdict' | 'none';
   requires_code: boolean;
   requires_web: boolean;
   requires_compute: boolean;
   evaluation_strategy: 'ci_and_review' | 'review_only' | 'forward_quality' | 'metric' | 'none';
   cost_ceiling_usd: number | null;
-  run_shape: 'single_agent' | 'workflow' | 'experiment_loop';
 }
 
 /**

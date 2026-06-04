@@ -16,8 +16,8 @@ describe('agent task-type coverage tuple', () => {
     expect(new Set(AGENT_TASK_TYPE_IDS).size).toBe(AGENT_TASK_TYPE_IDS.length);
   });
 
-  it('covers the 23 dispatchable task types', () => {
-    expect(ALL_AGENT_TASK_TYPES.length).toBe(23);
+  it('covers the 24 dispatchable task types', () => {
+    expect(ALL_AGENT_TASK_TYPES.length).toBe(24);
   });
 });
 
@@ -52,6 +52,7 @@ describe('task-capability contract loading', () => {
 
     expect(isReadOnlyTaskType('self_audit')).toBe(true);
     expect(isReadOnlyTaskType('review')).toBe(true);
+    expect(isReadOnlyTaskType('panel_review')).toBe(true);
     expect(isReadOnlyTaskType('create')).toBe(false);
     expect(isReadOnlyTaskType('fix')).toBe(false);
     // Unknown types are not read-only (preserved fallback; dispatch rejects them first).

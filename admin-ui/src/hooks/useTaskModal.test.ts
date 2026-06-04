@@ -434,6 +434,53 @@ describe('useTaskModal', () => {
     expect(addToast).toHaveBeenCalledWith('PR number must be a positive integer', 'error');
   });
 
+  it('handleCreateTask requires a PR number for panel_review tasks', async () => {
+    const addToast = vi.fn();
+    const { result } = renderHook(() =>
+      useTaskModal('panel_review', addToast, { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.setNewTaskType('panel_review');
+      result.current.setNewTaskPrNumber('');
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(addToast).toHaveBeenCalledWith('PR number must be a positive integer', 'error');
+  });
+
+  it('handleCreateTask rejects review task with missing PR branch', async () => {
+    const addToast = vi.fn();
+    const { result } = renderHook(() =>
+      useTaskModal('review', addToast, { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.setNewTaskType('review');
+      result.current.setNewTaskPrNumber('42');
+      result.current.setNewTaskPrBranch('');
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(addToast).toHaveBeenCalledWith('PR branch is required for review tasks', 'error');
+  });
+
+  it('handleCreateTask rejects panel_review task with missing PR branch', async () => {
+    const addToast = vi.fn();
+    const { result } = renderHook(() =>
+      useTaskModal('panel_review', addToast, { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.setNewTaskType('panel_review');
+      result.current.setNewTaskPrNumber('42');
+      result.current.setNewTaskPrBranch('   ');
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(addToast).toHaveBeenCalledWith('PR branch is required for panel review tasks', 'error');
+  });
+
   it('handleCreateTask rejects fix task with missing PR branch', async () => {
     const addToast = vi.fn();
     const { result } = renderHook(() =>
@@ -477,6 +524,28 @@ describe('useTaskModal', () => {
       expect.stringContaining('not operator-launchable'),
       'error',
     );
+  });
+
+  it('handleCreateTask includes PR metadata for panel_review tasks', async () => {
+    fetchSpy.mockResolvedValue({ ok: true, json: vi.fn().mockResolvedValue({ id: 'task-panel-1' }) });
+    const { result } = renderHook(() =>
+      useTaskModal('panel_review', vi.fn(), { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskTitle('Panel review');
+      result.current.setNewTaskPrompt('Run the fixed panel review');
+      result.current.setNewTaskType('panel_review');
+      result.current.setNewTaskPrNumber('77');
+      result.current.setNewTaskPrBranch('feature/panel-review');
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    const body = JSON.parse(String(fetchSpy.mock.calls[0]?.[1]?.body ?? '{}')) as Record<string, unknown>;
+    expect(body.task_type).toBe('panel_review');
+    expect(body.pr_number).toBe(77);
+    expect(body.branch).toBe('feature/panel-review');
   });
 
   // --- Duplicate-task flow: non-launchable types must not be re-emitted ---

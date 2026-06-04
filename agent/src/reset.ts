@@ -48,6 +48,7 @@ const execFileAsync = promisify(execFile);
 // shutdown cleanup loop). Keep them in sync if either list grows.
 const TMP_OUTPUT_NAMES = [
   'review_verdict',
+  'panel_review_verdict',
   'plan_output',
   'research_findings',
   'security_findings',

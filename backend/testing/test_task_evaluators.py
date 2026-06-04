@@ -3,7 +3,8 @@
 Covers the registry-driven strategy resolver and the synchronous strategy
 implementations (none / forward-quality / metric / code-ci-review sentinel).
 The completion-path integration (memo/perf handlers acting on a failed gate)
-is exercised in test_memo_completion.py and test_perf_completion.py.
+is exercised in test_memo_completion.py, test_perf_completion.py, and
+test_panel_review_completion.py.
 """
 
 import json
@@ -21,6 +22,7 @@ from app.task_evaluators import (
     ForwardQualityStrategy,
     MetricStrategy,
     NoneStrategy,
+    StructuredVerdictStrategy,
     evaluate_terminal_output,
     record_failed_gate,
     resolve_evaluation_strategy,
@@ -36,7 +38,7 @@ def _task(task_type: str) -> Task:
 
 def test_every_task_type_declares_an_evaluation_strategy():
     """Each TaskType has an explicit, in-vocabulary evaluation declaration."""
-    valid = {"code-ci-review", "forward-quality", "metric", "none"}
+    valid = {"code-ci-review", "forward-quality", "metric", "structured-verdict", "none"}
     assert set(EVALUATION_STRATEGY_BY_TASK_TYPE) == {t.value for t in TaskType}
     for cap in TASK_CAPABILITIES:
         assert cap.evaluation in valid, (cap.id, cap.evaluation)
@@ -49,6 +51,7 @@ def test_evaluation_declarations_match_expected_assignment():
     assert EVALUATION_STRATEGY_BY_TASK_TYPE == {
         "create": "code-ci-review",
         "review": "none",
+        "panel_review": "structured-verdict",
         "fix": "code-ci-review",
         "plan": "none",
         "research": "forward-quality",
@@ -293,6 +296,33 @@ def test_metric_compute_experiment_does_not_use_perf_array_path():
     findings = json.dumps([{"severity": "high", "title": "x"}])
     v = MetricStrategy().evaluate(_task("compute_experiment"), findings)
     assert v.passed is False
+
+
+# ── StructuredVerdictStrategy ───────────────────────────────────────────────
+
+
+def test_structured_verdict_missing_contract_fails():
+    v = StructuredVerdictStrategy().evaluate(_task("panel_review"), '{"verdict":"APPROVE"}')
+    assert v.passed is False
+    assert "structured verdict" in v.reason.lower()
+
+
+def test_structured_verdict_valid_panel_review_passes():
+    payload = json.dumps(
+        {
+            "overall_verdict": "APPROVE",
+            "summary": "All four review lenses passed.",
+            "lenses": {
+                "correctness": {"verdict": "APPROVE", "summary": "Logic checks clean."},
+                "security": {"verdict": "APPROVE", "summary": "No auth or injection regressions."},
+                "code_quality": {"verdict": "APPROVE", "summary": "Patterns remain consistent."},
+                "test_coverage": {"verdict": "APPROVE", "summary": "Changed behavior is covered."},
+            },
+        }
+    )
+    v = StructuredVerdictStrategy().evaluate(_task("panel_review"), payload)
+    assert v.passed is True
+    assert v.strategy == "structured-verdict"
 
 
 # ── record_failed_gate ──────────────────────────────────────────────────────

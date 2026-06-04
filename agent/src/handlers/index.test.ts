@@ -93,13 +93,13 @@ import { expectCalledWith } from '../utils/typed-mock-call.js';
 describe('handlers registry', () => {
   const EXPECTED_TYPES = ALL_AGENT_TASK_TYPES;
 
-  // 23 BESPOKE handlers are hand-registered today. This is no longer the
+  // 24 BESPOKE handlers are hand-registered today. This is no longer the
   // launchability gate — dispatch falls back to contract-driven GENERIC runners
   // for registered types with no bespoke handler (see the contract-driven
   // dispatch suite below). The count still documents the bespoke set so a
   // dropped/duplicated bespoke entry is caught.
-  it('has exactly 23 bespoke handler entries', () => {
-    expect(Object.keys(handlers)).toHaveLength(23);
+  it('has exactly 24 bespoke handler entries', () => {
+    expect(Object.keys(handlers)).toHaveLength(24);
   });
 
   it.each(EXPECTED_TYPES)('contains bespoke handler for task type "%s"', (taskType) => {
@@ -274,13 +274,16 @@ describe('contract-driven generic dispatch', () => {
   });
 
   it('fails LOUDLY (clear message, no silent wrong work) for a run-shape with no generic runner yet', () => {
+    // Use a type with NO bespoke handler so dispatch falls through to the
+    // contract-driven generic path (every registered type has a bespoke
+    // handler that would win first — see the precedence test above).
     for (const run_shape of ['multi_agent', 'experiment_loop']) {
       const task = { task_capability: { ...writeContract, run_shape } };
-      const resolution = resolveHandler('panel_review', task, { type: 'panel_review', prompt: 'x' });
+      const resolution = resolveHandler('unmapped_shape_type', task, { type: 'unmapped_shape_type', prompt: 'x' });
       expect(resolution.handler, `${run_shape} must not resolve to a runner yet`).toBeNull();
       if (resolution.handler === null) {
         expect(resolution.reason).toContain(run_shape);
-        expect(resolution.reason).toContain('panel_review');
+        expect(resolution.reason).toContain('unmapped_shape_type');
       }
     }
   });
@@ -358,6 +361,7 @@ const TASK_CLASS_MAP = {
   deps:              'code-change',
   // Read-only / investigative (10): analysis only, must not push code
   review:            'read-only',
+  panel_review:      'read-only',
   security_audit:    'read-only',
   self_audit:        'read-only',
   release_audit:     'read-only',
@@ -390,11 +394,11 @@ describe('task type class classification — cross-cutting invariants', () => {
     }
   });
 
-  it('class distribution is 7 code-change + 10 read-only + 6 research = 23 total', () => {
+  it('class distribution is 7 code-change + 11 read-only + 6 research = 24 total', () => {
     const counts: Record<TaskClass, number> = { 'code-change': 0, 'read-only': 0, research: 0 };
     for (const cls of Object.values(TASK_CLASS_MAP)) counts[cls]++;
     expect(counts['code-change']).toBe(7);
-    expect(counts['read-only']).toBe(10);
+    expect(counts['read-only']).toBe(11);
     expect(counts['research']).toBe(6);
   });
 

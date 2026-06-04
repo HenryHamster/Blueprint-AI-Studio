@@ -28,6 +28,7 @@ import {
 // fixture only — production sources this from the live endpoint.
 const FIXTURE_READ_ONLY: ReadonlySet<string> = new Set([
   'review',
+  'panel_review',
   'plan',
   'research',
   'strategic_review',
@@ -42,6 +43,7 @@ const FIXTURE_READ_ONLY: ReadonlySet<string> = new Set([
   'memo',
   'verify_tests',
   'compute_experiment',
+  'web_research',
 ]);
 
 /** Build a complete, valid capability contract covering every agent task type. */

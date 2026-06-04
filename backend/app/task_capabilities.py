@@ -16,6 +16,7 @@ from typing import Literal
 class TaskType(str, Enum):
     create = "create"
     review = "review"
+    panel_review = "panel_review"
     fix = "fix"
     plan = "plan"
     research = "research"
@@ -55,10 +56,12 @@ AgentMode = Literal["write", "read_only"]
 #   "metric" — a check that the required measurement / structured result was
 #       actually produced and is within declared bounds (measurement-producing
 #       types). A report that produced no measurement fails.
+#   "structured-verdict" — a strict parse/shape gate for multi-lens verdict
+#       artifacts. Empty, unparseable, or incomplete verdicts fail.
 #   "none" — no forward gate (plan and any type with no meaningful artifact
 #       gate). Always passes.
 EvaluationStrategyKey = Literal[
-    "code-ci-review", "forward-quality", "metric", "none"
+    "code-ci-review", "forward-quality", "metric", "structured-verdict", "none"
 ]
 
 # What a task type ultimately produces. This is the declarative answer to
@@ -120,6 +123,7 @@ class TaskCapability:
     # --- Enriched declarative registry fields (operator catalog + eval routing).
     # All default so existing literals and derived frozensets stay valid; each
     # capability below sets them explicitly.
+    run_shape: RunShape = "single_agent"
     output_kind: OutputKind = "none"
     requires_code: bool = True
     requires_web: bool = False
@@ -175,12 +179,6 @@ class TaskCapability:
     # Short presentation badge for compact operator surfaces (task cards, filter
     # chips). Defaults to ``label`` when unset via the published contract.
     badge: str | None = None
-    # HOW this task type runs (its execution shape). Defaults to "single_agent"
-    # so a newly-registered terminal type needs no edit; the PR-producing code
-    # types declare "workflow" (the create→review→fix pipeline) explicitly.
-    # "experiment_loop" is the compute-job loop used by compute_experiment.
-    # Surfaced in the operator catalog and resolved via ``run_shape_for``.
-    run_shape: RunShape = "single_agent"
 
 
 TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
@@ -193,11 +191,11 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         delivers_product=True,
         reservable=True,
         description="Implement new functionality and open a PR.",
+        run_shape="workflow",
         output_kind="pr",
         evaluation_strategy="ci_and_review",
         cost_ceiling_usd=8.0,
         evaluation="code-ci-review",
-        run_shape="workflow",
     ),
     TaskCapability(
         TaskType.review,
@@ -206,10 +204,28 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         default_category="review",
         user_launchable=True,
         description="Review an existing PR.",
+        run_shape="single_agent",
         output_kind="verdict",
         evaluation_strategy="review_only",
         cost_ceiling_usd=3.0,
         evaluation="none",
+    ),
+    TaskCapability(
+        TaskType.panel_review,
+        "Panel Review",
+        "read_only",
+        default_category="review",
+        user_launchable=True,
+        description=(
+            "Run a fixed multi-agent review workflow over an existing PR and "
+            "persist a structured verdict artifact."
+        ),
+        run_shape="workflow",
+        output_kind="verdict",
+        evaluation_strategy="review_only",
+        cost_ceiling_usd=6.0,
+        completion_handler="panel_review",
+        evaluation="structured-verdict",
     ),
     TaskCapability(
         TaskType.fix,
@@ -219,11 +235,11 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         user_launchable=True,
         delivers_product=True,
         description="Fix a PR from review feedback or CI failures.",
+        run_shape="workflow",
         output_kind="pr",
         evaluation_strategy="ci_and_review",
         cost_ceiling_usd=8.0,
         evaluation="code-ci-review",
-        run_shape="workflow",
     ),
     TaskCapability(
         TaskType.plan,
@@ -233,6 +249,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         user_launchable=True,
         reservable=True,
         description="Decompose work into subtasks.",
+        run_shape="single_agent",
         output_kind="knowledge",
         evaluation_strategy="review_only",
         cost_ceiling_usd=3.0,
@@ -247,6 +264,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         user_launchable=True,
         reservable=True,
         description="Analyze the codebase and produce findings.",
+        run_shape="single_agent",
         output_kind="knowledge",
         requires_web=True,
         evaluation_strategy="forward_quality",
@@ -260,6 +278,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "read_only",
         default_category="strategic",
         description="Evaluate project direction and propose strategy updates.",
+        run_shape="single_agent",
         output_kind="knowledge",
         evaluation_strategy="review_only",
         cost_ceiling_usd=4.0,
@@ -274,6 +293,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "read_only",
         default_category="strategic",
         description="Update the living project design document.",
+        run_shape="single_agent",
         output_kind="artifact",
         evaluation_strategy="review_only",
         cost_ceiling_usd=3.0,
@@ -289,6 +309,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         default_category="review",
         periodic_eligible=True,
         description="Audit for security risks without changing code.",
+        run_shape="single_agent",
         output_kind="knowledge",
         evaluation_strategy="review_only",
         cost_ceiling_usd=4.0,
@@ -302,11 +323,11 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         default_category="review",
         periodic_eligible=True,
         description="Add or improve test coverage.",
+        run_shape="workflow",
         output_kind="pr",
         evaluation_strategy="ci_and_review",
         cost_ceiling_usd=6.0,
         evaluation="code-ci-review",
-        run_shape="workflow",
     ),
     TaskCapability(
         TaskType.deps,
@@ -315,11 +336,11 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         default_category="ops",
         periodic_eligible=True,
         description="Update dependencies and verify compatibility.",
+        run_shape="workflow",
         output_kind="pr",
         evaluation_strategy="ci_and_review",
         cost_ceiling_usd=5.0,
         evaluation="code-ci-review",
-        run_shape="workflow",
     ),
     TaskCapability(
         TaskType.docs,
@@ -327,11 +348,11 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "write",
         default_category="ops",
         description="Write or update documentation.",
+        run_shape="workflow",
         output_kind="pr",
         evaluation_strategy="review_only",
         cost_ceiling_usd=4.0,
         evaluation="code-ci-review",
-        run_shape="workflow",
     ),
     TaskCapability(
         TaskType.migrate,
@@ -341,11 +362,11 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         user_launchable=True,
         delivers_product=True,
         description="Create or update database migrations.",
+        run_shape="workflow",
         output_kind="pr",
         evaluation_strategy="ci_and_review",
         cost_ceiling_usd=6.0,
         evaluation="code-ci-review",
-        run_shape="workflow",
     ),
     TaskCapability(
         TaskType.smoketest,
@@ -353,6 +374,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "read_only",
         default_category="ops",
         description="Run smoke checks against a deployment.",
+        run_shape="single_agent",
         output_kind="verdict",
         requires_compute=True,
         evaluation_strategy="metric",
@@ -366,11 +388,11 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         default_category="build",
         user_launchable=True,
         description="Improve code structure without changing behavior.",
+        run_shape="workflow",
         output_kind="pr",
         evaluation_strategy="ci_and_review",
         cost_ceiling_usd=8.0,
         evaluation="code-ci-review",
-        run_shape="workflow",
     ),
     TaskCapability(
         TaskType.debug,
@@ -378,6 +400,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "read_only",
         default_category="review",
         description="Investigate a failure or bug report.",
+        run_shape="single_agent",
         output_kind="knowledge",
         evaluation_strategy="review_only",
         cost_ceiling_usd=4.0,
@@ -389,6 +412,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "read_only",
         default_category="review",
         description="Measure and diagnose performance bottlenecks.",
+        run_shape="single_agent",
         output_kind="knowledge",
         requires_compute=True,
         evaluation_strategy="metric",
@@ -401,6 +425,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "Investigate",
         "read_only",
         description="Open-ended read-only investigation.",
+        run_shape="single_agent",
         output_kind="knowledge",
         evaluation_strategy="review_only",
         cost_ceiling_usd=4.0,
@@ -411,6 +436,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "Self Audit",
         "read_only",
         description="Score system maturity and recommend operating mode.",
+        run_shape="single_agent",
         output_kind="knowledge",
         evaluation_strategy="review_only",
         cost_ceiling_usd=3.0,
@@ -422,6 +448,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "Release Audit",
         "read_only",
         description="Differential audit of the promotion-candidate commit against the base branch for the release qualifier.",
+        run_shape="single_agent",
         output_kind="verdict",
         evaluation_strategy="review_only",
         cost_ceiling_usd=4.0,
@@ -440,6 +467,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
             "topic without opening a PR or spawning follow-up tasks. Strategic "
             "review can cite the resulting Artifact by id."
         ),
+        run_shape="single_agent",
         output_kind="artifact",
         requires_code=False,
         evaluation_strategy="none",
@@ -457,6 +485,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
             "Clone a PR head, run the repo's detected test suite, and post a "
             "structured pass/fail verdict the no-CI merge gate can consult."
         ),
+        run_shape="single_agent",
         output_kind="verdict",
         requires_compute=True,
         evaluation_strategy="metric",
@@ -771,13 +800,13 @@ def _capability_to_catalog_entry(capability: TaskCapability) -> dict:
         "user_launchable": capability.user_launchable,
         "provider_configurable": capability.provider_configurable,
         "filter_visible": capability.filter_visible,
+        "run_shape": capability.run_shape,
         "output_kind": capability.output_kind,
         "requires_code": capability.requires_code,
         "requires_web": capability.requires_web,
         "requires_compute": capability.requires_compute,
         "evaluation_strategy": capability.evaluation_strategy,
         "cost_ceiling_usd": capability.cost_ceiling_usd,
-        "run_shape": capability.run_shape,
     }
 
 

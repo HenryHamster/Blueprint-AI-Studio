@@ -38,6 +38,7 @@ def _invalid(raw: dict) -> str:
 EXPECTED_TYPES = {
     "create",
     "review",
+    "panel_review",
     "fix",
     "plan",
     "research",
