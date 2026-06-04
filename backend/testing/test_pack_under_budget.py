@@ -280,3 +280,244 @@ def test_summarize_returning_larger_value_falls_back_to_original(caplog):
         out = pack_under_budget(payload, schema, budget=10)
     assert "items" not in out
     assert any("grew" in rec.message.lower() for rec in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Invariant: a GC'd, worst-case-but-within-caps durable problem_model survives
+# the real strategic single-pass path (GC -> agent-view trim -> pack_under_budget).
+#
+# gc_problem_model's stated purpose is to keep the durable model "small enough
+# to round-trip in a single pass". That round-trip is:
+#   durable model -> _agent_view_problem_model (trim) -> pack_under_budget
+# at the real default budget under the production _STRATEGIC_REVIEW_SCHEMA.
+# The pieces are tested in isolation elsewhere; these tests prove the whole
+# path holds when the model is populated to the documented GC/health caps.
+#
+# All sizes are pulled from the actual cap constants (never magic numbers), so
+# if a cap is raised without the budget still holding, these tests fail and
+# surface the regression instead of CI staying green while the packer silently
+# drops the entire problem_model section.
+# ---------------------------------------------------------------------------
+
+
+def _worst_case_durable_problem_model():
+    """Build a maximal-within-caps durable ProblemModel for the round-trip proof.
+
+    - ``archived_gaps`` filled PAST :data:`ARCHIVED_GAPS_DURABLE_MAX` so GC has
+      to evict down to the cap (exercises the real eviction path).
+    - :data:`MODEL_SIZE_HEALTHY_GAPS` active gaps, each with ``history`` /
+      ``past_moves`` at their durable caps and a substantial ``evidence`` body.
+    - :data:`MODEL_SIZE_HEALTHY_CAPABILITIES` capabilities and
+      :data:`MODEL_SIZE_HEALTHY_FRICTION` active friction at the healthy thresholds.
+
+    Field text is realistic (non-empty descriptions / evidence / notes) so the
+    byte footprint is honest rather than artificially small.
+    """
+    from app.problem_model import (
+        ARCHIVED_GAPS_DURABLE_MAX,
+        GAP_HISTORY_DURABLE_MAX,
+        GAP_PAST_MOVES_DURABLE_MAX,
+        MODEL_SIZE_HEALTHY_CAPABILITIES,
+        MODEL_SIZE_HEALTHY_FRICTION,
+        MODEL_SIZE_HEALTHY_GAPS,
+        Capability,
+        Friction,
+        Gap,
+        GapHistoryEvent,
+        ProblemModel,
+        Source,
+    )
+
+    def _ts(i: int) -> str:
+        # Monotonic ISO-8601 timestamps so archived-gap eviction has a stable
+        # recency order to sort by.
+        return f"2026-{(i % 12) + 1:02d}-{(i % 27) + 1:02d}T12:00:00Z"
+
+    def _history(n: int) -> list:
+        return [
+            GapHistoryEvent(
+                ts=_ts(j),
+                event="move_attached" if j % 2 else "priority_raised",
+                note=(
+                    f"cycle {j}: attempted direction d-{j:04d}; "
+                    "outcome recorded against HEAD with full provenance and "
+                    "a short human-readable rationale for the next strategist."
+                ),
+            )
+            for j in range(n)
+        ]
+
+    def _evidence(gid: str) -> str:
+        # Gap.evidence is a free-text string (not a list) — give it a realistic
+        # multi-sentence body so the per-gap footprint is honest.
+        return (
+            f"Gap {gid} is backed by repeated direction outcomes and operator "
+            "observations across several cycles: the strategic loop kept "
+            "re-deriving cycle state by hand, the problem_model failed to "
+            "round-trip its own setter, and findings carried no verified-vs-HEAD "
+            "provenance. This evidence body is intentionally substantial so the "
+            "worst-case byte footprint reflects a mature project, not a stub."
+        )
+
+    active_gaps = [
+        Gap(
+            id=f"g-active-{i:04d}",
+            name=f"Active gap {i}: durable problem_model round-trip subsystem {i}",
+            description=(
+                f"Active gap {i} describes a concrete delta between strategic "
+                "intent and current capabilities, retained with full append-only "
+                "history so the strategist sees the whole arc across cycles."
+            ),
+            evidence=_evidence(f"g-active-{i:04d}"),
+            priority="high",
+            status="active",
+            opened=_ts(i),
+            source=Source(type="direction_outcome", direction_id=f"d-{i:04d}"),
+            active_moves=[f"d-active-{i:04d}"],
+            past_moves=[f"d-past-{i:04d}-{k:03d}" for k in range(GAP_PAST_MOVES_DURABLE_MAX)],
+            history=_history(GAP_HISTORY_DURABLE_MAX),
+        )
+        for i in range(MODEL_SIZE_HEALTHY_GAPS)
+    ]
+
+    archived_gaps = [
+        Gap(
+            id=f"g-archived-{i:04d}",
+            name=f"Archived gap {i}",
+            description=f"Closed/abandoned gap {i} retained as reference-only history.",
+            evidence=_evidence(f"g-archived-{i:04d}"),
+            status="closed",
+            opened=_ts(i),
+            closed=_ts(i + 1),
+        )
+        # Overfill past the cap so gc_problem_model has to evict.
+        for i in range(ARCHIVED_GAPS_DURABLE_MAX + 25)
+    ]
+
+    capabilities = [
+        Capability(
+            name=f"Capability {i}: registry-derived task-type subsystem {i}",
+            status="working" if i % 2 else "partial",
+            notes=(
+                f"Capability {i} is backed by integration-branch code and a "
+                "shipped PR; notes describe the current honest status and the "
+                "evidence that established it."
+            ),
+            source=Source(type="shipped_change", pr_number=7000 + i),
+            backing_paths=[
+                f"backend/app/subsystem_{i}.py",
+                f"backend/testing/test_subsystem_{i}.py",
+            ],
+        )
+        for i in range(MODEL_SIZE_HEALTHY_CAPABILITIES)
+    ]
+
+    friction = [
+        Friction(
+            id=f"f-{i:04d}",
+            name=f"Friction {i}: recurring blocker observed across moves",
+            description=(
+                f"Friction {i} is a recurring blocker seen across multiple "
+                "directions; described in enough detail to be actionable."
+            ),
+            seen_in=[f"d-{i:04d}", f"d-{i + 1:04d}"],
+            status="active",
+            mitigations_tried=[f"tried approach {k}" for k in range(3)],
+        )
+        for i in range(MODEL_SIZE_HEALTHY_FRICTION)
+    ]
+
+    return ProblemModel(
+        revision=42,
+        gaps=active_gaps,
+        archived_gaps=archived_gaps,
+        capabilities=capabilities,
+        friction=friction,
+    )
+
+
+def test_gcd_problem_model_round_trips_under_single_pass_budget():
+    """A worst-case-but-within-caps durable problem_model survives the real
+    GC + agent-view trim + pack_under_budget path at the default budget.
+
+    This is the invariant gc_problem_model exists to guarantee: after GC the
+    model is "small enough to round-trip in a single pass". We run the exact
+    production wiring (the real ``_STRATEGIC_REVIEW_SCHEMA`` and the default
+    ``pack_under_budget`` budget) and assert the ``problem_model`` section is
+    present in the output and NOT in ``_packer_meta["dropped"]``.
+    """
+    from app.problem_model import ARCHIVED_GAPS_DURABLE_MAX, gc_problem_model
+    from app.strategic_spawning import (
+        _STRATEGIC_REVIEW_SCHEMA,
+        _agent_view_problem_model,
+    )
+
+    model = _worst_case_durable_problem_model()
+
+    # Real backend GC: evicts archived_gaps down to the cap, mutating in place.
+    summary = gc_problem_model(model)
+    assert summary.get("archived_gaps_evicted"), (
+        "fixture should overfill archived_gaps so GC actually evicts"
+    )
+    assert len(model.archived_gaps) == ARCHIVED_GAPS_DURABLE_MAX
+
+    # Reproduce the production payload wiring: the durable model is dumped,
+    # trimmed by the agent view, and packed under the SAME schema object the
+    # strategic spawn path uses, at the real default budget.
+    payload = {
+        "type": "strategic_review",
+        "research_mode": False,
+        "problem_model": _agent_view_problem_model(model.model_dump()),
+    }
+    # Default budget (120 * 1024) — pass none so the production default applies.
+    out = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA)
+
+    assert out["_packer_meta"]["budget_total"] == 120 * 1024
+    assert "problem_model" in out, (
+        "GC'd worst-case problem_model was dropped under the single-pass budget"
+    )
+    dropped_keys = {d["key"] for d in out["_packer_meta"]["dropped"]}
+    assert "problem_model" not in dropped_keys, (
+        f"problem_model section was dropped by the packer: {out['_packer_meta']['dropped']}"
+    )
+    # The shipped section must still carry the real gaps (not summarized away).
+    assert out["problem_model"].get("gaps"), "packed problem_model lost its active gaps"
+    # archived_gaps is intentionally stripped by the agent view.
+    assert "archived_gaps" not in out["problem_model"]
+
+
+def test_gap_memory_trimmed_surfaced_for_capped_model():
+    """The agent-view per-gap trim (history/past_moves) is surfaced via
+    ``_packer_meta['gap_memory_trimmed']`` for the worst-case model, so the
+    strategist knows a gap's append-only memory was shortened to a window."""
+    from app.problem_model import (
+        GAP_HISTORY_DURABLE_MAX,
+        GAP_PAST_MOVES_DURABLE_MAX,
+        gc_problem_model,
+    )
+    from app.strategic_spawning import (
+        _STRATEGIC_REVIEW_SCHEMA,
+        _GAP_HISTORY_KEEP,
+        _agent_view_problem_model,
+    )
+
+    model = _worst_case_durable_problem_model()
+    gc_problem_model(model)
+
+    payload = {
+        "type": "strategic_review",
+        "research_mode": False,
+        "problem_model": _agent_view_problem_model(model.model_dump()),
+    }
+    out = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA)
+
+    gmt = out["_packer_meta"]["gap_memory_trimmed"]
+    assert gmt, "expected per-gap pre-trim markers to be surfaced"
+    pm_entry = next((e for e in gmt if e["key"] == "problem_model"), None)
+    assert pm_entry is not None
+    # Every active gap had history/past_moves above the keep window, so each
+    # reports a pre-trim total at the durable cap.
+    a_gap = pm_entry["gaps"][0]
+    assert a_gap["fields"]["history"]["shown"] == _GAP_HISTORY_KEEP
+    assert a_gap["fields"]["history"]["total"] == GAP_HISTORY_DURABLE_MAX
+    assert a_gap["fields"]["past_moves"]["total"] == GAP_PAST_MOVES_DURABLE_MAX

@@ -20,6 +20,7 @@ from sqlmodel import select
 
 from app.models import Task, TaskHistory, TaskStatus
 from app.plan_completion import _handle_plan_completion
+from app.task_capabilities import PLAN_SUBTASK_TYPES
 from testing.factories import make_project, make_task
 
 
@@ -324,4 +325,77 @@ async def test_file_overlap_deps_injected_atomically(db_session, mocker, _quiet_
     assert second.depends_on == [str(first.id)], (
         f"Second child should depend on first (file overlap), "
         f"got {second.depends_on!r}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("eligible_type", sorted(PLAN_SUBTASK_TYPES))
+async def test_registry_eligible_subtype_is_honored_not_downgraded(
+    db_session, mocker, _quiet_mocks, eligible_type
+):
+    """Every registry plan-eligible write type is honored as a plan child.
+
+    Previously the eligible set was the hardcoded literal
+    {create, refactor, migrate, qa}; a plan asking for e.g. ``docs`` or
+    ``deps`` was silently rewritten to ``create``. The gate now derives from
+    PLAN_SUBTASK_TYPES, so each declared eligible type is spawned AS ITSELF.
+    """
+    plan_logs = json.dumps(
+        {"subtasks": [{"title": f"Step {eligible_type}", "prompt": "do it", "type": eligible_type}]}
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, f"Expected 1 child for {eligible_type}, got {len(children)}"
+    assert children[0].first_payload.get("type") == eligible_type, (
+        f"Child should keep its declared eligible type {eligible_type!r}, "
+        f"got {children[0].first_payload.get('type')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_eligible_subtask_type_is_skipped_not_rewritten(
+    db_session, mocker, _quiet_mocks
+):
+    """A non-eligible requested child type is SKIPPED with a log, never silently
+    rewritten to ``create``.
+
+    Two non-eligible kinds are exercised: a read-only type (``research``) and a
+    write type that needs a pre-existing PR context (``fix``). Neither may
+    masquerade as a successfully-spawned ``create``, and ``fix`` must not crash
+    the plan (it can't build a valid fix payload). The eligible sibling in the
+    same plan still spawns, proving the skip is per-subtask and observable.
+    """
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {"title": "Valid", "prompt": "implement", "type": "create"},
+                {"title": "Bogus", "prompt": "go research", "type": "research"},
+                {"title": "NeedsPR", "prompt": "patch it", "type": "fix"},
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    # Only the eligible subtask spawned; the non-eligible ones were skipped.
+    assert len(children) == 1, f"Expected 1 spawned child, got {len(children)}"
+    assert children[0].title == "Valid"
+    assert children[0].first_payload.get("type") == "create"
+    # The non-eligible types never masqueraded as a create.
+    assert {c.title for c in children} == {"Valid"}
+    assert not any(
+        c.first_payload.get("type") in {"research", "fix"} for c in children
     )

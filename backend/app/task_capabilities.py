@@ -176,6 +176,14 @@ class TaskCapability:
     # the `autonomous_periodic_tasks` settings map. SINGLE source of truth for
     # periodic eligibility — see PERIODIC_TASK_TYPES.
     periodic_eligible: bool = False
+    # Whether a completing plan task may spawn this type as a fresh implementation
+    # subtask. SINGLE source of truth for the plan-decomposition child allowlist
+    # (plan_completion.py) — see PLAN_SUBTASK_TYPES. This is the PR-producing write
+    # types that can start from a fresh branch with only a prompt; it is
+    # deliberately NARROWER than WRITE_TASK_TYPES because some write types (notably
+    # `fix`) require a pre-existing PR context (pr_number/branch) a plan cannot
+    # supply, so they are not valid fresh plan children.
+    plan_subtask_eligible: bool = False
     # Short presentation badge for compact operator surfaces (task cards, filter
     # chips). Defaults to ``label`` when unset via the published contract.
     badge: str | None = None
@@ -190,6 +198,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         user_launchable=True,
         delivers_product=True,
         reservable=True,
+        plan_subtask_eligible=True,
         description="Implement new functionality and open a PR.",
         run_shape="workflow",
         output_kind="pr",
@@ -322,6 +331,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "write",
         default_category="review",
         periodic_eligible=True,
+        plan_subtask_eligible=True,
         description="Add or improve test coverage.",
         run_shape="workflow",
         output_kind="pr",
@@ -335,6 +345,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "write",
         default_category="ops",
         periodic_eligible=True,
+        plan_subtask_eligible=True,
         description="Update dependencies and verify compatibility.",
         run_shape="workflow",
         output_kind="pr",
@@ -347,6 +358,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "Docs",
         "write",
         default_category="ops",
+        plan_subtask_eligible=True,
         description="Write or update documentation.",
         run_shape="workflow",
         output_kind="pr",
@@ -361,6 +373,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         default_category="build",
         user_launchable=True,
         delivers_product=True,
+        plan_subtask_eligible=True,
         description="Create or update database migrations.",
         run_shape="workflow",
         output_kind="pr",
@@ -387,6 +400,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "write",
         default_category="build",
         user_launchable=True,
+        plan_subtask_eligible=True,
         description="Improve code structure without changing behavior.",
         run_shape="workflow",
         output_kind="pr",
@@ -622,6 +636,19 @@ PERIODIC_TASK_TYPES: frozenset[str] = frozenset(
     for capability in TASK_CAPABILITIES
     if capability.periodic_eligible
 )
+# Canonical registry of task types a completing plan task may spawn as a fresh
+# implementation subtask. SINGLE source of truth for the plan-decomposition child
+# allowlist (plan_completion.py) — the gate derives from this set so a newly
+# registered fresh-startable write type becomes a valid plan child by declaration
+# alone (replacing the hardcoded {create, refactor, migrate, qa} literal). This is
+# intentionally a SUBSET of WRITE_TASK_TYPES: `fix` is a write/PR type but needs a
+# pre-existing PR context (pr_number/branch) a plan cannot supply, so it is not a
+# valid fresh plan child and does not declare plan_subtask_eligible.
+PLAN_SUBTASK_TYPES: frozenset[str] = frozenset(
+    capability.id.value
+    for capability in TASK_CAPABILITIES
+    if capability.plan_subtask_eligible
+)
 # Map of task-type value -> declared completion-handler logical name, derived
 # from the registry. This REPLACES the hand-maintained if/elif completion
 # cascade in task_lifecycle._process_post_commit: that module binds each
@@ -650,6 +677,21 @@ EVALUATION_STRATEGY_BY_TASK_TYPE: dict[str, str] = {
 RUN_SHAPE_BY_TASK_TYPE: dict[str, str] = {
     capability.id.value: capability.run_shape for capability in TASK_CAPABILITIES
 }
+# Canonical registry-derived set of task types that LAUNCH work on the budgeted,
+# auto-torn-down compute-job substrate (the agent only launches and polls; it
+# never holds the heavy VM). This is the SINGLE source of truth for the
+# agent-facing compute-job launch gate (routers/agent_compute_jobs.py) — a type
+# becomes launchable there simply by declaring run_shape="experiment_loop".
+# NOTE: this is intentionally NOT the broader requires_compute flag. smoketest /
+# perf / verify_tests also set requires_compute=True but run their compute INSIDE
+# their own agent VM rather than offloading to the job substrate; the
+# experiment_loop run-shape is precisely the "launches and polls a budgeted job"
+# distinction the gate needs.
+COMPUTE_JOB_LAUNCH_TASK_TYPES: frozenset[str] = frozenset(
+    capability.id.value
+    for capability in TASK_CAPABILITIES
+    if capability.run_shape == "experiment_loop"
+)
 # Canonical registry-derived set of "strategic-style" task types — those whose
 # completion runs the strategic-cycle chain under the canonical Project→Task
 # lock (``completion_needs_locked_project=True``, currently design_doc_update

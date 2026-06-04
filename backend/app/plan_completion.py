@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.broadcast import broadcast_to_project
 from app.models import Project, Task, TaskHistory, TaskStatus
 from app.payload_schemas import validate_internal_payload
+from app.task_capabilities import PLAN_SUBTASK_TYPES
 from app.shared_state import (
     get_project_integration_branch,
     runtime_config as _runtime_config,
@@ -293,6 +294,25 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     parent_research_task_id = (task.context or {}).get("research_task_id")
     child_tasks = []
     for subtask_def in subtasks:
+        # Gate the child type on the registry-derived plan-subtask allowlist
+        # rather than a hardcoded literal. A requested type outside that set is
+        # SKIPPED with an explicit log — never silently rewritten to "create" — so
+        # a plan that asks for a non-eligible child surfaces the misconfiguration
+        # instead of masquerading as a successfully-spawned create. A ``None``
+        # placeholder keeps ``child_tasks`` index-aligned with ``subtasks`` for the
+        # downstream dependency-injection pass.
+        raw_type = subtask_def.get("type", "create")
+        if raw_type not in PLAN_SUBTASK_TYPES:
+            logger.warning(
+                "[PLAN] Skipping subtask %r with non-eligible type %r "
+                "(not a registered plan-spawnable write task type) in plan %s",
+                subtask_def.get("title", "Untitled subtask"),
+                raw_type,
+                task.id,
+            )
+            child_tasks.append(None)
+            continue
+        subtask_type = raw_type
         related_files = subtask_def.get("related_files", [])
         prompt_text = subtask_def.get("prompt", "")
         full_prompt = (
@@ -325,9 +345,6 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         child_approval_reason = (
             subtask_def.get("approval_reason") if child_risk == "high" else None
         )
-        _allowed_types = {"create", "refactor", "migrate", "qa"}
-        raw_type = subtask_def.get("type", "create")
-        subtask_type = raw_type if raw_type in _allowed_types else "create"
         # Ignore subtask_def.model and parent plan model — legacy hints
         # that anchored every child to one provider regardless of the
         # operator's category_routing. Respect operator-level
@@ -407,15 +424,21 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 st.pop("depends_on_indices", None)
 
     for i, subtask_def in enumerate(subtasks):
+        if child_tasks[i] is None:
+            continue
         dep_indices = subtask_def.get("depends_on_indices", [])
         child_tasks[i].depends_on = [
-            str(child_tasks[j].id) for j in dep_indices if 0 <= j < len(child_tasks)
+            str(child_tasks[j].id)
+            for j in dep_indices
+            if 0 <= j < len(child_tasks) and child_tasks[j] is not None
         ]
         session.add(child_tasks[i])
 
     _log_file_overlaps(subtasks, "PLAN")
 
     for ct in child_tasks:
+        if ct is None:
+            continue
         history = TaskHistory(
             task_id=ct.id,
             action="SPAWNED",
@@ -433,10 +456,13 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     await session.commit()
 
     for ct in child_tasks:
+        if ct is None:
+            continue
         await broadcast_to_project(
             str(task.project_id),
             "task_updated",
             {"task_id": str(ct.id), "status": TaskStatus.QUEUED},
         )
 
-    logger.info(f"[PLAN] Created {len(child_tasks)} subtasks from plan {task.id}")
+    spawned_count = sum(1 for ct in child_tasks if ct is not None)
+    logger.info(f"[PLAN] Created {spawned_count} subtasks from plan {task.id}")

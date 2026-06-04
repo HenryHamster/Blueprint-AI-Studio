@@ -13,24 +13,10 @@ from app.models import Task
 from app.routers.agent import verify_agent_token
 from app.schemas import serialize_compute_job_response
 from app.shared_state import limiter
-from app.task_capabilities import TASK_CAPABILITIES
+from app.task_capabilities import COMPUTE_JOB_LAUNCH_TASK_TYPES
 from app.vm_cost_rates import DEFAULT_MACHINE_TYPE, supported_machine_types
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
-
-_COMPUTE_JOB_CAPABLE_TASK_TYPES = frozenset(
-    capability.id.value
-    for capability in TASK_CAPABILITIES
-    if (
-        capability.run_shape == "experiment_loop"
-        and capability.requires_compute
-        and not capability.requires_code
-        and not capability.requires_web
-        and capability.output_kind == "verdict"
-        and capability.evaluation_strategy == "metric"
-        and capability.cost_ceiling_usd is not None
-    )
-)
 
 
 class LaunchComputeJobRequest(BaseModel):
@@ -75,13 +61,13 @@ async def launch_compute_job(
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
     task_type = str(task.first_payload.get("type") or "")
-    if task_type not in _COMPUTE_JOB_CAPABLE_TASK_TYPES:
+    if task_type not in COMPUTE_JOB_LAUNCH_TASK_TYPES:
         raise HTTPException(
             status_code=403,
             detail={
                 "error": "task_type_not_allowed_for_compute_jobs",
                 "task_type": task_type,
-                "allowed_task_types": sorted(_COMPUTE_JOB_CAPABLE_TASK_TYPES),
+                "allowed_task_types": sorted(COMPUTE_JOB_LAUNCH_TASK_TYPES),
             },
         )
 

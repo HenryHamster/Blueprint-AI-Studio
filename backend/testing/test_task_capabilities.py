@@ -11,9 +11,11 @@ from app.task_capabilities import (
     ALL_TASK_TYPES,
     agent_capability_slice,
     COMPLETION_HANDLER_BY_TASK_TYPE,
+    COMPUTE_JOB_LAUNCH_TASK_TYPES,
     EVALUATION_STRATEGY_BY_TASK_TYPE,
     FILTER_VISIBLE_TASK_TYPES,
     PERIODIC_TASK_TYPES,
+    PLAN_SUBTASK_TYPES,
     PRODUCT_TASK_TYPES,
     PROVIDER_CONFIGURABLE_TASK_TYPES,
     READ_ONLY_TASK_TYPES,
@@ -292,6 +294,61 @@ def test_periodic_task_types_derived_from_registry():
     assert frozenset(expected) == PERIODIC_TASK_TYPES
     assert PERIODIC_TASK_TYPES.issubset(ALL_TASK_TYPES)
     assert PERIODIC_TASK_TYPES == {"security_audit", "qa", "deps"}
+
+
+def test_compute_job_launch_types_derived_from_experiment_loop_run_shape():
+    """COMPUTE_JOB_LAUNCH_TASK_TYPES is the single source of truth for the
+    agent-facing compute-job launch gate. It must be derived from the
+    experiment_loop run-shape (the "launches and polls a budgeted job" shape) —
+    NOT the broader requires_compute flag, which smoketest/perf/verify_tests also
+    set despite running their compute inside their own agent VM."""
+    expected = {
+        cap.id.value
+        for cap in TASK_CAPABILITIES
+        if cap.run_shape == "experiment_loop"
+    }
+    assert frozenset(expected) == COMPUTE_JOB_LAUNCH_TASK_TYPES
+    assert COMPUTE_JOB_LAUNCH_TASK_TYPES.issubset(ALL_TASK_TYPES)
+    # compute_experiment is the registered experiment_loop type today.
+    assert COMPUTE_JOB_LAUNCH_TASK_TYPES == {"compute_experiment"}
+    # requires_compute types that run compute INSIDE their own VM must NOT be in
+    # the launch set — they don't offload to the job substrate.
+    for in_vm_compute in ("smoketest", "perf", "verify_tests"):
+        assert in_vm_compute not in COMPUTE_JOB_LAUNCH_TASK_TYPES
+        assert TASK_CAPABILITY_BY_TYPE[TaskType(in_vm_compute)].requires_compute
+    # The agent router gates on this exact registry object (no private copy).
+    from app.routers import agent_compute_jobs
+
+    assert (
+        agent_compute_jobs.COMPUTE_JOB_LAUNCH_TASK_TYPES
+        is COMPUTE_JOB_LAUNCH_TASK_TYPES
+    )
+
+
+def test_plan_subtask_types_derived_from_registry():
+    """PLAN_SUBTASK_TYPES is the single source of truth for the plan-decomposition
+    child allowlist. It must be registry-derived, a SUBSET of WRITE_TASK_TYPES
+    (only PR-producing write types are eligible), preserve the historical
+    {create, refactor, migrate, qa} set, additionally include the now-eligible
+    {deps, docs}, and EXCLUDE `fix` (which needs a pre-existing PR context a plan
+    cannot supply)."""
+    expected = {
+        cap.id.value for cap in TASK_CAPABILITIES if cap.plan_subtask_eligible
+    }
+    assert frozenset(expected) == PLAN_SUBTASK_TYPES
+    assert PLAN_SUBTASK_TYPES.issubset(ALL_TASK_TYPES)
+    # Only write/PR-producing types may be fresh plan children.
+    assert PLAN_SUBTASK_TYPES.issubset(WRITE_TASK_TYPES)
+    # Historical allowlist preserved; deps/docs newly honored.
+    assert {"create", "refactor", "migrate", "qa"}.issubset(PLAN_SUBTASK_TYPES)
+    assert {"deps", "docs"}.issubset(PLAN_SUBTASK_TYPES)
+    # `fix` is a write type but is NOT a valid fresh plan child.
+    assert "fix" not in PLAN_SUBTASK_TYPES
+    assert "fix" in WRITE_TASK_TYPES
+    # The plan-completion handler gates on this exact registry object.
+    from app import plan_completion
+
+    assert plan_completion.PLAN_SUBTASK_TYPES is PLAN_SUBTASK_TYPES
 
 
 def test_task_capability_contract_covers_every_registered_type():
