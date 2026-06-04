@@ -681,6 +681,84 @@ async def test_agent_heartbeat_upserts_vm_contact(client: AsyncClient, db_sessio
     contact2 = await db_session.get(VmContact, vm_id)
     assert contact2 is not None
     assert contact2.last_contact_at >= first_contact_at
+    # A tool-less heartbeat leaves last_tool_use_at untouched (NULL so far).
+    assert contact2.last_tool_use_at is None
+
+
+@pytest.mark.asyncio
+async def test_agent_heartbeat_upserts_vm_contact_tool_use(
+    client: AsyncClient, db_session
+):
+    """Fix 3b: a heartbeat carrying tool_trace also upserts the off-row
+    vmcontact.last_tool_use_at so the reaper's progress-stall branch can spare a
+    lock-starved-but-progressing agent. The stored value advances monotonically:
+    a stale or absent tool_trace tail never regresses a fresher recorded value."""
+    from app.models import VmContact
+
+    project = Project(name="VM Contact Tool Use", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-tooluse"
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), vm_id)
+    headers = {"x-agent-token": token}
+
+    # Heartbeat WITH a tool_trace whose tail is a recent ISO-8601 timestamp.
+    recent = (datetime.utcnow() - timedelta(seconds=20)).isoformat()
+    payload = {
+        "task_id": str(task.id),
+        "status_message": "calling tools",
+        "tool_trace": [
+            {"t": recent, "tool": "Bash", "input_preview": "ls"},
+        ],
+    }
+    resp = await client.post("/api/agent/heartbeat", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    contact = await db_session.get(VmContact, vm_id)
+    assert contact is not None
+    assert contact.last_tool_use_at is not None
+    recorded = contact.last_tool_use_at
+    # Within a few seconds of the supplied tail timestamp (tz stripped to naive).
+    assert recorded > datetime.utcnow() - timedelta(minutes=2)
+
+    # Monotonic: a LATER heartbeat whose tool_trace tail is OLDER than what we
+    # already recorded must NOT regress the stored value.
+    db_session.expire(contact)
+    older = (datetime.utcnow() - timedelta(minutes=10)).isoformat()
+    payload_old = {
+        "task_id": str(task.id),
+        "tool_trace": [{"t": older, "tool": "Read", "input_preview": "x"}],
+    }
+    resp2 = await client.post(
+        "/api/agent/heartbeat", json=payload_old, headers=headers
+    )
+    assert resp2.status_code == 200
+    contact2 = await db_session.get(VmContact, vm_id)
+    assert contact2.last_tool_use_at >= recorded
+
+    # Monotonic: a tool-LESS heartbeat must not blank the stored progress stamp.
+    db_session.expire(contact2)
+    resp3 = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "status_message": "thinking"},
+        headers=headers,
+    )
+    assert resp3.status_code == 200
+    contact3 = await db_session.get(VmContact, vm_id)
+    assert contact3.last_tool_use_at is not None
+    assert contact3.last_tool_use_at >= recorded
 
 
 @pytest.mark.asyncio
