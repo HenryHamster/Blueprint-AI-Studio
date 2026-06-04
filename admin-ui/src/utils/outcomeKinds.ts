@@ -22,18 +22,22 @@ export const OUTCOME_KIND_LABELS: Record<string, string> = {
   audit_findings: 'audit',
   memo_artifact: 'memo',
   verification_verdict: 'verify',
+  compute_result: 'compute',
+  knowledge_document: 'knowledge',
   read_only_unclassified: 'read-only',
   unknown: 'other',
 };
 
 // Stable display order so chips don't reshuffle between renders. Unknown keys
 // sort last (after this list) but are still rendered.
-const OUTCOME_KIND_ORDER = [
+export const OUTCOME_KIND_ORDER = [
   'code_merge',
   'research_quality',
   'audit_findings',
   'memo_artifact',
   'verification_verdict',
+  'compute_result',
+  'knowledge_document',
   'read_only_unclassified',
   'unknown',
 ];

@@ -22,6 +22,12 @@ from app.knowledge_completion import (
     _parse_web_research_document,
 )
 from app.models import KnowledgeDocument, TaskStatus
+from app.task_outcomes import (
+    KIND_KNOWLEDGE_DOCUMENT,
+    TaskOutcome,
+    build_task_evaluation_summary,
+    evaluate_task_outcome,
+)
 from testing.factories import make_membership, make_project, make_task
 
 
@@ -184,6 +190,49 @@ async def test_passing_grade_persists_one_document_and_completes(
     assert isinstance(task.plan_output, dict)
     assert task.plan_output["knowledge_document"]["title"] == document["title"]
     assert "body" not in task.plan_output["knowledge_document"]
+
+
+@pytest.mark.asyncio
+async def test_blank_title_document_still_records_successful_outcome(
+    db_session, _quiet_broadcast
+):
+    project, task = await _make_web_research_task(db_session, project_name="WRblank")
+
+    document = {
+        "title": "",
+        "summary": "A concise survey of X with citations.",
+        "body": "# X\n\nDetailed markdown body explaining X in depth.",
+        "citations": ["https://example.com/x"],
+        "tags": ["survey"],
+        "topic": "X",
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    docs = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(docs) == 1
+    assert docs[0].project_id == project.id
+    assert docs[0].title == ""
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert evaluate_task_outcome(task) == TaskOutcome(
+        "success", KIND_KNOWLEDGE_DOCUMENT
+    )
+    summary = build_task_evaluation_summary(task)
+    assert summary is not None
+    assert summary["verdict"] == "recorded"
+    assert {"label": "Summary", "value": document["summary"]} in summary["evidence"]
+    assert {"label": "Citations", "value": "1"} in summary["evidence"]
 
 
 @pytest.mark.asyncio

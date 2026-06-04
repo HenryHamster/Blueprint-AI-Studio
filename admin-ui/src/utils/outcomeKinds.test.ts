@@ -1,10 +1,15 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import {
   summarizeOutcomeKinds,
   hasNonCodeMergeOutcomes,
   mergeOutcomeKindBreakdowns,
   outcomeKindLabel,
   healthRateColorClass,
+  OUTCOME_KIND_LABELS,
+  OUTCOME_KIND_ORDER,
 } from './outcomeKinds';
 
 describe('summarizeOutcomeKinds', () => {
@@ -82,6 +87,89 @@ describe('outcomeKindLabel', () => {
   it('maps known kinds and falls back to the raw key', () => {
     expect(outcomeKindLabel('verification_verdict')).toBe('verify');
     expect(outcomeKindLabel('some_future_kind')).toBe('some_future_kind');
+  });
+
+  it('labels the knowledge_document lane deliberately', () => {
+    expect(outcomeKindLabel('knowledge_document')).toBe('knowledge');
+  });
+
+  it('labels the compute-experiment lane with deliberate vocabulary', () => {
+    // Regression: compute_result is emitted by the backend
+    // (task_outcomes.py KIND_COMPUTE_RESULT) and must not fall through to the
+    // raw key.
+    expect(outcomeKindLabel('compute_result')).toBe('compute');
+  });
+});
+
+describe('knowledge_document outcome lane', () => {
+  it('sorts the knowledge lane after verification but before unknown', () => {
+    const rows = summarizeOutcomeKinds({
+      unknown: { success: 1, neutral: 0, failure: 0 },
+      knowledge_document: { success: 2, neutral: 0, failure: 0 },
+      verification_verdict: { success: 1, neutral: 0, failure: 0 },
+    });
+    expect(rows.map(r => r.kind)).toEqual([
+      'verification_verdict',
+      'knowledge_document',
+      'unknown',
+    ]);
+  });
+
+  it('treats the knowledge lane as a generalized (non-code) success', () => {
+    expect(
+      hasNonCodeMergeOutcomes({
+        code_merge: { success: 5, neutral: 0, failure: 0 },
+        knowledge_document: { success: 1, neutral: 0, failure: 0 },
+      }),
+    ).toBe(true);
+  });
+});
+
+describe('compute_result ordering', () => {
+  it('sorts the compute lane ahead of read-only/unknown lanes', () => {
+    const rows = summarizeOutcomeKinds({
+      read_only_unclassified: { success: 0, neutral: 1, failure: 0 },
+      compute_result: { success: 1, neutral: 0, failure: 0 },
+      unknown: { success: 0, neutral: 0, failure: 1 },
+    });
+    expect(rows.map(r => r.kind)).toEqual([
+      'compute_result',
+      'read_only_unclassified',
+      'unknown',
+    ]);
+    expect(rows[0]).toMatchObject({ label: 'compute', success: 1, terminal: 1 });
+  });
+});
+
+// Drift guard: the frontend outcome-kind vocabulary must keep pace with the
+// backend's emitted non-code lanes. If a future backend KIND_* is added
+// without a matching frontend label + order entry, this fails — preventing the
+// chip from silently rendering the raw backend key and sorting as "unknown".
+describe('outcome-kind vocabulary parity with backend', () => {
+  const backendPath = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    '../../../backend/app/task_outcomes.py',
+  );
+  const source = readFileSync(backendPath, 'utf8');
+  const kindValues = [...source.matchAll(/^KIND_[A-Z_]+ = "([a-z_]+)"/gm)].map(m => m[1]);
+
+  // code_merge is the legacy PR-merge lane handled by the existing PR metrics;
+  // every other emitted lane is a generalized lane that needs a deliberate
+  // label and a stable sort position.
+  const generalizedLanes = kindValues.filter(v => v !== 'code_merge');
+
+  it('parses the backend KIND_* constants', () => {
+    expect(kindValues).toContain('code_merge');
+    expect(kindValues).toContain('compute_result');
+    expect(kindValues).toContain('knowledge_document');
+  });
+
+  it.each(generalizedLanes)('has a frontend label for %s', lane => {
+    expect(OUTCOME_KIND_LABELS[lane]).toBeTruthy();
+  });
+
+  it.each(generalizedLanes)('has a stable sort position for %s', lane => {
+    expect(OUTCOME_KIND_ORDER).toContain(lane);
   });
 });
 

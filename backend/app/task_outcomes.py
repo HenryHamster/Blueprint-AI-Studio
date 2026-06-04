@@ -74,6 +74,7 @@ KIND_AUDIT_FINDINGS = "audit_findings"
 KIND_MEMO_ARTIFACT = "memo_artifact"
 KIND_VERIFICATION_VERDICT = "verification_verdict"
 KIND_COMPUTE_RESULT = "compute_result"
+KIND_KNOWLEDGE_DOCUMENT = "knowledge_document"
 # Read-only types that have no type-specific honest signal yet (review, plan,
 # strategic_review, design_doc_update, smoketest, debug, investigate). They are
 # terminal but contribute no success/failure signal of their own — neutral.
@@ -287,6 +288,42 @@ def _evaluate_compute_experiment(task: Task) -> TaskOutcome:
     return TaskOutcome("neutral", KIND_COMPUTE_RESULT)
 
 
+def _knowledge_document(task: Task) -> dict | None:
+    """Best-effort read of a web_research task's durable knowledge-document mirror.
+
+    ``knowledge_completion._persist_document`` mirrors a compact copy of the
+    persisted :class:`~app.models.KnowledgeDocument` into
+    ``plan_output['knowledge_document']`` (``title`` / ``summary`` / ``topic`` /
+    ``tags`` / ``citation_count``) on a clean COMPLETED run, and writes it ONLY
+    on that path — a FAILED gate never stores it. Reads task-locally
+    (deferred-column safe) and returns ``None`` when no mirror is present.
+    """
+    raw_plan_output = _task_local_attr(task, "plan_output")
+    if not isinstance(raw_plan_output, dict):
+        return None
+    mirror = raw_plan_output.get("knowledge_document")
+    return mirror if isinstance(mirror, dict) else None
+
+
+def _evaluate_web_research(task: Task) -> TaskOutcome:
+    """Outcome for a web_research task — judged on its durable knowledge document.
+
+    The honest terminal signal is the persisted ``KnowledgeDocument``, mirrored
+    onto ``plan_output['knowledge_document']`` by the completion handler only
+    after the forward-quality gate passes. Presence of that mirror is the
+    success signal — the document cleared the gate and is durable, even if some
+    mirrored text fields are blank. A FAILED/CANCELLED run (the gate fails
+    closed) is a ``failure``; a COMPLETED run with no mirror degrades to
+    ``neutral`` (terminal but no durable artifact).
+    """
+    if _counts_as_failure(task):
+        return TaskOutcome("failure", KIND_KNOWLEDGE_DOCUMENT)
+    mirror = _knowledge_document(task)
+    if mirror is not None:
+        return TaskOutcome("success", KIND_KNOWLEDGE_DOCUMENT)
+    return TaskOutcome("neutral", KIND_KNOWLEDGE_DOCUMENT)
+
+
 # Built-in per-type evaluators for read-only task types that carry an honest
 # terminal signal. Keyed by task-type value (the registry's canonical id). Read
 # only types absent from this map degrade to KIND_READ_ONLY_UNCLASSIFIED.
@@ -299,6 +336,7 @@ _READ_ONLY_EVALUATORS: dict[str, Callable[[Task], TaskOutcome]] = {
     "memo": _evaluate_memo,
     "verify_tests": _evaluate_verify_tests,
     "compute_experiment": _evaluate_compute_experiment,
+    "web_research": _evaluate_web_research,
 }
 
 
@@ -562,6 +600,45 @@ def _build_findings_summary(task: Task, ctx: SummaryContext) -> dict[str, Any] |
     return _summary_dict(task, verdict, evidence, highlights)
 
 
+def _build_web_research_summary(
+    task: Task, ctx: SummaryContext
+) -> dict[str, Any] | None:
+    """Operator summary for a web_research task — the durable knowledge document.
+
+    Reads the compact ``plan_output['knowledge_document']`` mirror (``title`` /
+    ``summary`` / ``topic`` / ``tags`` / ``citation_count``) the completion
+    handler stores on a passing run and surfaces it as a ``recorded`` verdict.
+    Any populated mirrored fields become evidence/highlights; the summary still
+    records the durable document when title is blank because persistence itself
+    is the honest signal. Returns ``None`` only when no mirror is present so
+    the caller falls through to the no-summary contract (the same way the other
+    builders degrade on a missing artifact).
+    """
+    mirror = _knowledge_document(task)
+    if mirror is None:
+        return None
+    evidence: list[dict[str, str]] = []
+    title = _trim_summary_text(mirror.get("title"), 200)
+    if title:
+        evidence.append(_summary_item("Title", title))
+    summary = _trim_summary_text(mirror.get("summary"), 240)
+    if summary:
+        evidence.append(_summary_item("Summary", summary))
+    topic = _trim_summary_text(mirror.get("topic"), 120)
+    if topic:
+        evidence.append(_summary_item("Topic", topic))
+    citation_count = mirror.get("citation_count")
+    if citation_count is not None:
+        evidence.append(_summary_item("Citations", citation_count))
+    tags = mirror.get("tags") if isinstance(mirror.get("tags"), list) else []
+    highlights: list[dict[str, str]] = []
+    if tags:
+        highlights.append(_summary_item("Tags", ", ".join(str(t) for t in tags[:4])))
+    if not evidence:
+        evidence.append(_summary_item("Document", "Persisted"))
+    return _summary_dict(task, "recorded", evidence, highlights)
+
+
 # Per-type summary builders, keyed by task-type value. Types absent from this
 # map fall back to the shared findings builder (which returns ``None`` when the
 # task carries no structured findings) — so security_audit / perf / release_audit
@@ -574,6 +651,7 @@ SUMMARY_BUILDERS: dict[str, Callable[[Task, SummaryContext], dict[str, Any] | No
     "perf": _build_findings_summary,
     "release_audit": _build_findings_summary,
     "compute_experiment": _build_compute_experiment_summary,
+    "web_research": _build_web_research_summary,
 }
 
 

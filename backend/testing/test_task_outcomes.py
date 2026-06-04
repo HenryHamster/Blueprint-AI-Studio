@@ -19,6 +19,7 @@ from app.task_outcomes import (
     KIND_AUDIT_FINDINGS,
     KIND_CODE_MERGE,
     KIND_COMPUTE_RESULT,
+    KIND_KNOWLEDGE_DOCUMENT,
     KIND_MEMO_ARTIFACT,
     KIND_READ_ONLY_UNCLASSIFIED,
     KIND_RESEARCH_QUALITY,
@@ -314,6 +315,73 @@ def test_compute_experiment_missing_result_completed_is_neutral():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Web-research / knowledge-document family
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_web_research_task(
+    mirror: dict | None,
+    *,
+    status: TaskStatus = TaskStatus.COMPLETED,
+) -> Task:
+    """Build a web_research task carrying the compact knowledge-document mirror."""
+    plan_output = None
+    if mirror is not None:
+        plan_output = {"knowledge_document": mirror}
+    return _make_task("web_research", status=status, plan_output=plan_output)
+
+
+def _knowledge_mirror() -> dict:
+    return {
+        "title": "How vector indexes work",
+        "summary": "An overview of ANN indexing tradeoffs.",
+        "topic": "retrieval",
+        "tags": ["search", "ann"],
+        "citation_count": 5,
+    }
+
+
+def test_web_research_with_document_is_success():
+    task = _make_web_research_task(_knowledge_mirror())
+    assert evaluate_task_outcome(task) == TaskOutcome(
+        "success", KIND_KNOWLEDGE_DOCUMENT
+    )
+    assert is_successful_outcome(task) is True
+
+
+def test_web_research_no_mirror_is_neutral():
+    task = _make_web_research_task(None, status=TaskStatus.COMPLETED)
+    assert evaluate_task_outcome(task) == TaskOutcome(
+        "neutral", KIND_KNOWLEDGE_DOCUMENT
+    )
+
+
+def test_web_research_empty_title_is_success():
+    task = _make_web_research_task({"title": "  ", "summary": "x"})
+    assert evaluate_task_outcome(task) == TaskOutcome(
+        "success", KIND_KNOWLEDGE_DOCUMENT
+    )
+
+
+def test_web_research_failed_is_failure():
+    task = _make_web_research_task(None, status=TaskStatus.FAILED)
+    assert evaluate_task_outcome(task) == TaskOutcome(
+        "failure", KIND_KNOWLEDGE_DOCUMENT
+    )
+
+
+def test_web_research_cancelled_is_failure():
+    # A genuinely cancelled run fails closed even if a stale mirror were present.
+    task = _make_web_research_task(
+        _knowledge_mirror(),
+        status=TaskStatus.CANCELLED,
+    )
+    assert evaluate_task_outcome(task) == TaskOutcome(
+        "failure", KIND_KNOWLEDGE_DOCUMENT
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Forward-compatibility & registry seam
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -477,6 +545,32 @@ def test_summary_compute_experiment_spend_cap():
 def test_summary_compute_experiment_without_result_is_none():
     task = _make_compute_task(None)
     assert build_task_evaluation_summary(task) is None
+
+
+def test_summary_web_research_recorded():
+    task = _make_web_research_task(_knowledge_mirror())
+    summary = build_task_evaluation_summary(task)
+    assert summary is not None
+    assert summary["verdict"] == "recorded"
+    assert summary["evidence"][0] == {
+        "label": "Title",
+        "value": "How vector indexes work",
+    }
+    assert summary["evidence"][-1] == {"label": "Citations", "value": "5"}
+    assert summary["highlights"][0]["label"] == "Tags"
+
+
+def test_summary_web_research_without_mirror_is_none():
+    task = _make_web_research_task(None)
+    assert build_task_evaluation_summary(task) is None
+
+
+def test_summary_web_research_empty_title_uses_other_evidence():
+    task = _make_web_research_task({"title": "  ", "summary": "x"})
+    summary = build_task_evaluation_summary(task)
+    assert summary is not None
+    assert summary["verdict"] == "recorded"
+    assert summary["evidence"][0] == {"label": "Summary", "value": "x"}
 
 
 if __name__ == "__main__":
