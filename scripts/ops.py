@@ -11,6 +11,7 @@ Usage:
     python scripts/ops.py settings                  — show runtime settings
     python scripts/ops.py settings --set KEY=VAL    — update a runtime setting
     python scripts/ops.py pool                      — show Max Plan account pool
+    python scripts/ops.py warm                      — warm VM pool funnel (raw+eligible hit rate, cost guard)
     python scripts/ops.py accounts                  — manage accounts (--disable/--enable/--remove ID)
     python scripts/ops.py zones                     — show zone health
     python scripts/ops.py autonomy                  — show autonomous research state
@@ -200,6 +201,83 @@ def cmd_pool(_args):
                         print(f"    {model}: BLOCKED (hit #{hits}, since {at})")
     except Exception as e:
         print(f"Pool: error ({e})")
+
+
+def cmd_warm(_args):
+    """Warm-VM pool health: sizing, dispatch funnel (raw + eligible hit rate +
+    miss reasons), per-account breakdown, idle cost, and the cost guard.
+
+    This is the WARM VM POOL (pre-provisioned idle agent VMs leased to queued
+    tasks) — distinct from `pool`, which shows the Max Plan ACCOUNT pool. The
+    eligible hit rate (hits / hits+serviceable-misses) is what the cost guard
+    acts on; the raw rate is fleet-wide and includes dispatches the pool was
+    never eligible to serve (other projects, never-consulted cold provisions).
+    """
+    try:
+        ov = api("GET", "/api/admin/warm-vm-state")
+    except Exception as e:
+        print(f"Warm pool: error ({e})")
+        return
+    pm = ov.get("pool_metrics") or {}
+    wpm = ov.get("warm_pin_metrics") or {}
+    if not pm:
+        print("=== WARM VM POOL ===\n  (pool_metrics empty — pool disabled or backend error)")
+        return
+
+    print("=== WARM VM POOL ===")
+    print(f"  enabled:        {pm.get('enabled')}")
+    allow = pm.get("project_allowlist") or []
+    print(f"  scope:          {allow if allow else 'fleet-wide (no allowlist)'}")
+    print(f"  target_size:    {pm.get('target_size')}   idle_ttl_secs: {pm.get('idle_ttl_secs')}")
+    print(f"  current_size:   {pm.get('current_size')}   idle_now: {pm.get('idle_count')}")
+    print(f"  idle_cost_usd:  projected={pm.get('projected_idle_cost_usd')} "
+          f"settled={pm.get('settled_idle_cost_usd')} live={pm.get('live_idle_cost_usd')}")
+
+    print("\n=== CLAIM CIRCUIT BREAKER ===")
+    print(f"  suppressed:     {wpm.get('pool_circuit_breaker_suppressed')}"
+          + (f" until {wpm.get('pool_suppressed_until')}" if wpm.get('pool_suppressed_until') else ""))
+    print(f"  failures/1h:    {wpm.get('pool_claim_failures_last_hour')} "
+          f"(threshold {wpm.get('pool_failure_rate_threshold')})")
+    print(f"  active pool-origin claims: {wpm.get('active_pool_origin_claims')}  "
+          f"pool_origin_share: {wpm.get('pool_origin_share')}")
+
+    cg = pm.get("cost_guard")
+    if cg is not None:
+        print("\n=== COST GUARD ===")
+        print(f"  engaged:        {cg.get('engaged')}"
+              + (f"  reason={cg.get('reason')}" if cg.get('reason') else ""))
+        print(f"  eligible_rate:  {cg.get('hit_rate')}  (min {cg.get('min_hit_rate')})  "
+              f"[raw {cg.get('raw_hit_rate')}]")
+        print(f"  eligible_disp:  {cg.get('total_dispatches')}  "
+              f"[raw {cg.get('raw_total_dispatches')}]")
+        print(f"  idle_cost_usd:  {cg.get('idle_cost_usd')}  (min {cg.get('min_idle_cost_usd')})")
+
+    funnel = pm.get("funnel") or {}
+    print(f"\n=== DISPATCH FUNNEL (last {funnel.get('window_hours', '?')}h) ===")
+    er = funnel.get("eligible_hit_rate")
+    rr = funnel.get("pool_hit_rate")
+    print(f"  eligible_rate:  {er if er is not None else 'n/a (no eligible demand)'}"
+          f"  ({funnel.get('pool_lease_hits')} hits / {funnel.get('eligible_dispatches')} eligible)")
+    print(f"  raw_rate:       {rr if rr is not None else 'n/a (no dispatches)'}"
+          f"  ({funnel.get('pool_lease_hits')} hits / {funnel.get('total_dispatches')} total)")
+    print(f"  cold:           {funnel.get('cold_dispatches')}")
+    misses = funnel.get("lease_miss_by_reason") or {}
+    print(f"  lease misses:   {funnel.get('lease_miss_total')} "
+          f"(eligible {funnel.get('eligible_miss_total')})")
+    for reason, n in sorted(misses.items(), key=lambda kv: -kv[1]):
+        print(f"    - {reason:22}: {n}")
+
+    by_acct = funnel.get("by_account") or {}
+    if by_acct:
+        print("\n=== PER-ACCOUNT ===")
+        for acct, b in sorted(by_acct.items(), key=lambda kv: -(kv[1].get('total_dispatches') or 0)):
+            ehr = b.get("eligible_hit_rate")
+            print(f"  {acct:36} elig_rate={ehr if ehr is not None else 'n/a':<8} "
+                  f"raw={b.get('pool_hit_rate')} hits={b.get('pool_lease_hits')} "
+                  f"cold={b.get('cold_dispatches')} misses={b.get('lease_miss_total')}")
+            bm = b.get("lease_miss_by_reason") or {}
+            for reason, n in sorted(bm.items(), key=lambda kv: -kv[1]):
+                print(f"      - {reason}: {n}")
 
 
 def _resolve_account(query):
@@ -1244,6 +1322,7 @@ COMMANDS = {
     'rollback': cmd_rollback,
     'settings': cmd_settings,
     'pool': cmd_pool,
+    'warm': cmd_warm,
     'accounts': cmd_accounts,
     'zones': cmd_zones,
     'autonomy': cmd_autonomy,

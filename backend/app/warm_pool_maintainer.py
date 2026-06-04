@@ -187,20 +187,34 @@ def _cost_guard_config(runtime_config) -> dict:
 async def evaluate_pool_cost_guard(session, *, runtime_config) -> dict:
     """Cheap live cost-regression check on the warm pool.
 
-    Engages when ALL hold over the rolling window: enough dispatches to trust the
-    signal, a pool hit rate below the floor, and fleet idle spend above the floor.
-    Uses the LIVE rolling dispatch funnel (``get_pool_funnel_snapshot``) and the
-    LIVE pool idle-cost accrual (``compute_pool_idle_cost``) — never the
-    once-per-day efficiency snapshot — so it is cheap to evaluate every tick and
-    reverses as soon as a healthy hit rate returns.
+    Engages when ALL hold over the rolling window: enough ELIGIBLE dispatches to
+    trust the signal, an eligible pool hit rate below the floor, and fleet idle
+    spend above the floor. Uses the LIVE rolling dispatch funnel
+    (``get_pool_funnel_snapshot``) and the LIVE pool idle-cost accrual
+    (``compute_pool_idle_cost``) — never the once-per-day efficiency snapshot —
+    so it is cheap to evaluate every tick and reverses as soon as a healthy hit
+    rate returns.
+
+    Gates on ``eligible_hit_rate`` / ``eligible_dispatches`` (hits + only the
+    misses where the pool was genuinely able to serve the task), NOT the raw
+    fleet-wide ``pool_hit_rate``. The raw rate counts dispatches the pool was
+    never eligible to serve — other projects (the pool is per-project scoped),
+    the pool's own breaker/cost-guard pauses, and tasks that never consult the
+    pool — so gating on it let a scoped pool's rate get crushed by out-of-scope
+    traffic, engage the guard, drain the pool, and stay engaged (the guard's own
+    ``cost_guard`` misses fed back into the raw rate). The eligible rate excludes
+    all of that, so the guard only acts on demand the pool could actually serve
+    and can recover once real warm starts resume.
     """
     from app.efficiency_snapshot import compute_pool_idle_cost
     from app.warm_backlog_reuse import get_pool_funnel_snapshot
 
     cfg = _cost_guard_config(runtime_config)
     funnel = get_pool_funnel_snapshot(cfg["window_hours"])
-    hit_rate = funnel.get("pool_hit_rate")
-    total = funnel.get("total_dispatches", 0)
+    hit_rate = funnel.get("eligible_hit_rate")
+    total = funnel.get("eligible_dispatches", 0)
+    raw_hit_rate = funnel.get("pool_hit_rate")
+    raw_total = funnel.get("total_dispatches", 0)
     idle_cost = (await compute_pool_idle_cost(session)).get("total_idle_cost_usd", 0.0)
 
     engaged = (
@@ -213,16 +227,22 @@ async def evaluate_pool_cost_guard(session, *, runtime_config) -> dict:
     reason = None
     if engaged:
         reason = (
-            f"Pool hit rate {hit_rate:.1%} is below the {cfg['min_hit_rate']:.0%} "
-            f"floor over {cfg['window_hours']}h ({total} dispatches) while idle "
-            f"spend is ${idle_cost:.2f} — draining idle members and pausing "
-            f"provisioning until the hit rate recovers."
+            f"Eligible pool hit rate {hit_rate:.1%} is below the "
+            f"{cfg['min_hit_rate']:.0%} floor over {cfg['window_hours']}h "
+            f"({total} eligible dispatches) while idle spend is ${idle_cost:.2f} "
+            f"— draining idle members and pausing provisioning until the hit rate "
+            f"recovers."
         )
     return {
         "engaged": engaged,
         "reason": reason,
+        # The rate/volume the guard acts on (eligible). Field names kept stable so
+        # the operator panel renders the decision values; raw_* carries the
+        # fleet-wide figures for reference.
         "hit_rate": hit_rate,
         "total_dispatches": total,
+        "raw_hit_rate": raw_hit_rate,
+        "raw_total_dispatches": raw_total,
         "idle_cost_usd": idle_cost,
         # Floors the panel renders the current values against (hit-rate-vs-floor,
         # idle-spend-vs-floor) so an operator can see how far the pool is from

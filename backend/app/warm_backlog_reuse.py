@@ -17,7 +17,6 @@ import logging
 import uuid
 from collections import deque
 from datetime import timedelta
-from typing import Optional
 
 from sqlalchemy import or_, select
 
@@ -29,7 +28,7 @@ from app.time_utils import _utcnow
 logger = logging.getLogger("blueprint")
 
 
-def _norm(value) -> Optional[str]:
+def _norm(value) -> str | None:
     """Lowercased, stripped string, or None for empty/non-string values."""
     if isinstance(value, str) and value.strip():
         return value.strip().lower()
@@ -113,9 +112,7 @@ def _vm_boot_incompatible(
         return True
     vm_model = _norm(vm_boot.get("model"))
     task_model_n = _norm(task_model)
-    if vm_model and task_model_n and task_model_n != vm_model:
-        return True
-    return False
+    return bool(vm_model and task_model_n and task_model_n != vm_model)
 
 # Bounded window (seconds) for which a COMPLETED task's VM teardown is held so
 # the agent can poll /api/agent/next-role and claim backlog work before the VM
@@ -232,8 +229,8 @@ async def _eligible_backlog_ids(
     project_id,
     vm_instance_id: str,
     *,
-    in_progress_files: Optional[set[str]] = None,
-    vm_boot: Optional[dict] = None,
+    in_progress_files: set[str] | None = None,
+    vm_boot: dict | None = None,
 ) -> list[uuid.UUID]:
     """QUEUED task ids in *project_id* an idle VM may claim, priority-ordered.
 
@@ -391,8 +388,8 @@ async def has_eligible_backlog_task(
     project_id,
     vm_instance_id: str,
     *,
-    in_progress_files: Optional[set[str]] = None,
-    vm_boot: Optional[dict] = None,
+    in_progress_files: set[str] | None = None,
+    vm_boot: dict | None = None,
 ) -> bool:
     """True iff *project_id* has at least one backlog task this VM could claim.
 
@@ -420,9 +417,9 @@ async def select_backlog_reuse_candidate(
     project_id,
     vm_instance_id: str,
     *,
-    in_progress_files: Optional[set[str]] = None,
-    vm_boot: Optional[dict] = None,
-) -> Optional[Task]:
+    in_progress_files: set[str] | None = None,
+    vm_boot: dict | None = None,
+) -> Task | None:
     """Atomically lock the next claimable backlog task for an idle VM, or None.
 
     Walks the eligible ids in priority order and locks the first one still
@@ -774,12 +771,38 @@ _pool_lease_miss_events: deque = deque(maxlen=500)  # (datetime, reason, account
 # call sites that have not yet been wired to pass identity).
 _UNATTRIBUTED_ACCOUNT = "unattributed"
 
+# Lease-miss reasons that represent a dispatch the pool was genuinely ELIGIBLE to
+# serve but couldn't — the only misses that belong in the hit-rate denominator
+# the cost guard acts on. Everything else is structural non-eligibility, not a
+# pool capability failure, and must be excluded so it never drags the rate down:
+#   - "out_of_scope": the task's project is not in the warm-pool allowlist — the
+#     pool was never eligible (different tenant scope), so it can never "hit".
+#   - "suppressed": the claim-failure circuit breaker paused the pool itself.
+#   - "cost_guard": the cost guard paused leasing — counting its OWN suppression
+#     toward the rate it gates on makes the guard unable to ever disengage
+#     (a self-reinforcing drain spiral).
+# Tasks that never CONSULT the pool (a pinned warm target, dependencies, or no
+# resolved runtime account) record neither a hit nor a miss, so they fall out of
+# this denominator automatically — only ``record_pool_cold_dispatch`` fires for
+# them, which keeps the raw fleet-wide ``pool_hit_rate`` (visibility only).
+POOL_ELIGIBLE_MISS_REASONS = frozenset(
+    {"no_idle_member", "no_compatible_member", "doomed_vm", "lease_error"}
+)
 
-def _account_label(account: Optional[str]) -> str:
+
+def _account_label(account: str | None) -> str:
     return account or _UNATTRIBUTED_ACCOUNT
 
 
-def record_pool_lease_hit(account: Optional[str] = None) -> None:
+def _eligible_miss_count(miss_by_reason: dict) -> int:
+    """Sum the misses that count toward the eligible (pool-was-able-to-serve) rate."""
+    return sum(
+        n for reason, n in miss_by_reason.items()
+        if reason in POOL_ELIGIBLE_MISS_REASONS
+    )
+
+
+def record_pool_lease_hit(account: str | None = None) -> None:
     """A queued task was served warm by leasing an IDLE pool member.
 
     ``account`` is the resolved account id the dispatch was served for; pass it
@@ -788,7 +811,7 @@ def record_pool_lease_hit(account: Optional[str] = None) -> None:
     _pool_lease_hit_events.append((_utcnow(), account))
 
 
-def record_pool_cold_dispatch(account: Optional[str] = None) -> None:
+def record_pool_cold_dispatch(account: str | None = None) -> None:
     """A queued task cold-provisioned a VM (pool disabled, empty, or no match).
 
     ``account`` is the resolved account id the dispatch was served for; pass it
@@ -797,7 +820,7 @@ def record_pool_cold_dispatch(account: Optional[str] = None) -> None:
     _pool_cold_dispatch_events.append((_utcnow(), account))
 
 
-def record_pool_lease_miss(reason: str, account: Optional[str] = None) -> None:
+def record_pool_lease_miss(reason: str, account: str | None = None) -> None:
     """The pool was consulted but no member could be leased.
 
     reason should be one of: "no_idle_member" (pool empty / all leased),
@@ -815,12 +838,22 @@ def get_pool_funnel_snapshot(window_hours: int = 24) -> dict:
     """Return rolling funnel counts for the warm-pool dispatch path.
 
     All counts cover the trailing ``window_hours`` (default 24h). ``pool_hit_rate``
-    is hits / (hits + cold dispatches), or None when no dispatch was recorded.
+    is hits / (hits + cold dispatches), or None when no dispatch was recorded —
+    a fleet-wide, visibility-only figure that includes dispatches the pool was
+    never eligible to serve (other projects, never-consulted cold provisions).
 
-    ``by_account`` breaks the same funnel down by resolved account so an operator
-    can read, per account, the warm-claim / cold-dispatch counts, hit rate, and
-    lease-miss reasons during a controlled enable. Events recorded without an
-    account bucket under ``_UNATTRIBUTED_ACCOUNT``.
+    ``eligible_hit_rate`` is hits / (hits + eligible misses), where eligible
+    misses are only those in :data:`POOL_ELIGIBLE_MISS_REASONS` (the pool was
+    genuinely able to serve the task but couldn't). It excludes out-of-scope,
+    breaker-suppressed, and cost-guard misses, plus never-consulted cold
+    dispatches — so a pool scoped to one project is judged on the demand it could
+    actually serve. ``eligible_dispatches`` is that denominator. This is the rate
+    the cost guard acts on; see :func:`app.warm_pool_maintainer.evaluate_pool_cost_guard`.
+
+    ``by_account`` breaks the same funnel down by resolved account (raw and
+    eligible) so an operator can read, per account, the warm-claim / cold-dispatch
+    counts, hit rates, and lease-miss reasons during a controlled enable. Events
+    recorded without an account bucket under ``_UNATTRIBUTED_ACCOUNT``.
     """
     cutoff = _utcnow() - timedelta(hours=window_hours)
 
@@ -855,7 +888,9 @@ def get_pool_funnel_snapshot(window_hours: int = 24) -> dict:
                 bucket["lease_miss_by_reason"].get(reason, 0) + 1
             )
 
-    # Finalize each account bucket with its own totals + hit rate.
+    # Finalize each account bucket with its own totals + hit rate. The eligible
+    # rate counts only hits + pool-eligible misses (see POOL_ELIGIBLE_MISS_REASONS)
+    # — the raw rate keeps cold dispatches in the denominator for visibility.
     for bucket in by_account.values():
         acct_total = bucket["pool_lease_hits"] + bucket["cold_dispatches"]
         bucket["total_dispatches"] = acct_total
@@ -863,14 +898,35 @@ def get_pool_funnel_snapshot(window_hours: int = 24) -> dict:
             round(bucket["pool_lease_hits"] / acct_total, 4) if acct_total else None
         )
         bucket["lease_miss_total"] = sum(bucket["lease_miss_by_reason"].values())
+        acct_elig_miss = _eligible_miss_count(bucket["lease_miss_by_reason"])
+        acct_elig_total = bucket["pool_lease_hits"] + acct_elig_miss
+        bucket["eligible_miss_total"] = acct_elig_miss
+        bucket["eligible_dispatches"] = acct_elig_total
+        bucket["eligible_hit_rate"] = (
+            round(bucket["pool_lease_hits"] / acct_elig_total, 4)
+            if acct_elig_total
+            else None
+        )
 
     total = hits + cold
+    # Eligible funnel: hits + only the misses where the pool was genuinely able to
+    # serve the task. This is the rate the cost guard gates on, so structural
+    # non-eligibility (other projects, the pool's own breaker/cost-guard pauses,
+    # and never-consulted cold dispatches) can't crush a scoped pool's measured
+    # hit rate and trigger a self-reinforcing drain.
+    eligible_misses = _eligible_miss_count(miss_by_reason)
+    eligible_total = hits + eligible_misses
     return {
         "window_hours": window_hours,
         "pool_lease_hits": hits,
         "cold_dispatches": cold,
         "total_dispatches": total,
         "pool_hit_rate": round(hits / total, 4) if total else None,
+        "eligible_miss_total": eligible_misses,
+        "eligible_dispatches": eligible_total,
+        "eligible_hit_rate": (
+            round(hits / eligible_total, 4) if eligible_total else None
+        ),
         "lease_miss_by_reason": miss_by_reason,
         "lease_miss_total": sum(miss_by_reason.values()),
         "by_account": by_account,

@@ -738,17 +738,20 @@ async def test_cost_guard_engaged_blocks_lease(db_session, warm_pool_on):
         _pool_lease_hit_events,
         _pool_lease_miss_events,
         get_pool_funnel_snapshot,
-        record_pool_cold_dispatch,
+        record_pool_lease_miss,
     )
     from app.warm_pool import is_pool_cost_guard_engaged
 
     _pool_lease_hit_events.clear()
     _pool_cold_dispatch_events.clear()
     _pool_lease_miss_events.clear()
-    # Force engagement on the live signals: one recorded dispatch with a 0% hit
+    # Force engagement on the live signals: one ELIGIBLE dispatch (a no_idle_member
+    # miss — a task the pool was able to serve but couldn't) at a 0% eligible hit
     # rate, a min-hit-rate floor of 100%, and a $0 idle-cost floor (any accrued
-    # idle spend qualifies). Thresholds are configurable — we tighten them here.
-    record_pool_cold_dispatch()
+    # idle spend qualifies). The guard gates on the eligible rate, so a lone cold
+    # dispatch (never-consulted / out-of-scope) would NOT engage it — only real
+    # serviceable demand does. Thresholds are configurable — we tighten them here.
+    record_pool_lease_miss("no_idle_member")
     shared_state.runtime_config["warm_pool_cost_guard_min_dispatches"] = 1
     shared_state.runtime_config["warm_pool_cost_guard_min_hit_rate"] = 1.0
     shared_state.runtime_config["warm_pool_cost_guard_min_idle_cost_usd"] = 0.0

@@ -1209,7 +1209,7 @@ async def test_warm_pool_cost_guard_drains_and_blocks_lease(
     from app.warm_pool_maintainer import run_pool_maintainer_cycle
     from app.warm_backlog_reuse import (
         get_pool_funnel_snapshot,
-        record_pool_cold_dispatch,
+        record_pool_lease_miss,
     )
     from app.efficiency_snapshot import compute_pool_idle_cost
     from app.shared_state import runtime_config as rc
@@ -1249,10 +1249,13 @@ async def test_warm_pool_cost_guard_drains_and_blocks_lease(
         db_session.add(member)
         await db_session.commit()
 
-        # Seed a low-hit-rate funnel: several cold dispatches, zero hits -> the
-        # guard's hit-rate floor is breached.
+        # Seed a low ELIGIBLE-hit-rate funnel: several serviceable misses
+        # (no_idle_member — the pool was able to serve but had no idle member),
+        # zero hits -> the guard's eligible-hit-rate floor is breached. The guard
+        # gates on the eligible rate, so cold dispatches (never-consulted /
+        # out-of-scope) would NOT trip it — only real serviceable demand does.
         for _ in range(3):
-            record_pool_cold_dispatch()
+            record_pool_lease_miss("no_idle_member")
         idle_cost = await compute_pool_idle_cost(db_session)
         assert idle_cost["total_idle_cost_usd"] > 0.0
 

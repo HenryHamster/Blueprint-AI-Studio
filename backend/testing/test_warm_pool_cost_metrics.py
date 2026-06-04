@@ -156,6 +156,105 @@ def test_pool_funnel_cold_dispatch_attributed_with_hit():
     assert snap["pool_hit_rate"] == 0.5
 
 
+def test_eligible_hit_rate_excludes_structural_non_eligibility():
+    """The eligible hit rate counts only hits + pool-serviceable misses, so a pool
+    scoped to one project is judged on demand it could actually serve — not on
+    out-of-scope traffic, the pool's own breaker/cost-guard pauses, or
+    never-consulted cold dispatches that crush the raw fleet-wide rate."""
+    _pool_lease_hit_events.clear()
+    _pool_cold_dispatch_events.clear()
+    _pool_lease_miss_events.clear()
+
+    # 1 warm hit; 1 serviceable miss (no_idle_member) → eligible denominator = 2.
+    record_pool_lease_hit()
+    record_pool_lease_miss("no_idle_member")
+    # Structural non-eligibility that must NOT count toward the eligible rate:
+    record_pool_lease_miss("out_of_scope")  # different project
+    record_pool_lease_miss("cost_guard")  # the guard's own suppression
+    record_pool_lease_miss("suppressed")  # claim-failure breaker
+    # Never-consulted cold provisions (deps / no runtime account): raw-only noise.
+    for _ in range(10):
+        record_pool_cold_dispatch()
+
+    snap = get_pool_funnel_snapshot()
+    # Raw fleet-wide rate is crushed by the 10 cold dispatches: 1 / (1 + 10).
+    assert snap["pool_hit_rate"] == round(1 / 11, 4)
+    # Eligible rate ignores cold dispatches AND the non-serviceable misses:
+    # 1 hit / (1 hit + 1 no_idle_member) = 0.5.
+    assert snap["eligible_miss_total"] == 1
+    assert snap["eligible_dispatches"] == 2
+    assert snap["eligible_hit_rate"] == 0.5
+
+
+def test_eligible_hit_rate_counts_all_serviceable_miss_reasons():
+    """Every reason in POOL_ELIGIBLE_MISS_REASONS is a real pool-capability miss
+    and belongs in the eligible denominator; the excluded reasons never are."""
+    from app.warm_backlog_reuse import POOL_ELIGIBLE_MISS_REASONS
+
+    assert set(POOL_ELIGIBLE_MISS_REASONS) == {
+        "no_idle_member",
+        "no_compatible_member",
+        "doomed_vm",
+        "lease_error",
+    }
+
+    _pool_lease_hit_events.clear()
+    _pool_cold_dispatch_events.clear()
+    _pool_lease_miss_events.clear()
+    for reason in POOL_ELIGIBLE_MISS_REASONS:
+        record_pool_lease_miss(reason)
+
+    snap = get_pool_funnel_snapshot()
+    # No hits, 4 serviceable misses → eligible denominator 4, eligible rate 0.0
+    # (NOT None — there was real serviceable demand the pool failed to serve).
+    assert snap["eligible_dispatches"] == 4
+    assert snap["eligible_miss_total"] == 4
+    assert snap["eligible_hit_rate"] == 0.0
+
+
+def test_eligible_hit_rate_none_without_eligible_volume():
+    """With only out-of-scope misses and cold dispatches (no serviceable demand),
+    the eligible rate is None so the cost guard's `hit_rate is not None` gate keeps
+    it disengaged — there is nothing to judge the pool on yet."""
+    _pool_lease_hit_events.clear()
+    _pool_cold_dispatch_events.clear()
+    _pool_lease_miss_events.clear()
+
+    record_pool_lease_miss("out_of_scope")
+    record_pool_cold_dispatch()
+    record_pool_cold_dispatch()
+
+    snap = get_pool_funnel_snapshot()
+    assert snap["eligible_dispatches"] == 0
+    assert snap["eligible_hit_rate"] is None
+    # Per-account buckets carry the same eligible fields.
+    u = snap["by_account"]["unattributed"]
+    assert u["eligible_dispatches"] == 0
+    assert u["eligible_hit_rate"] is None
+
+
+def test_eligible_hit_rate_per_account():
+    """by_account exposes the eligible rate per account, distinct from the raw one."""
+    _pool_lease_hit_events.clear()
+    _pool_cold_dispatch_events.clear()
+    _pool_lease_miss_events.clear()
+
+    # acct-a: 3 hits, 1 cold, 1 no_idle_member miss, 1 out_of_scope miss.
+    for _ in range(3):
+        record_pool_lease_hit("acct-a")
+    record_pool_cold_dispatch("acct-a")
+    record_pool_lease_miss("no_idle_member", "acct-a")
+    record_pool_lease_miss("out_of_scope", "acct-a")
+
+    a = get_pool_funnel_snapshot()["by_account"]["acct-a"]
+    # Raw: 3 hits / (3 + 1 cold) = 0.75.
+    assert a["pool_hit_rate"] == 0.75
+    # Eligible: 3 hits / (3 + 1 no_idle_member) = 0.75; out_of_scope excluded.
+    assert a["eligible_dispatches"] == 4
+    assert a["eligible_miss_total"] == 1
+    assert a["eligible_hit_rate"] == 0.75
+
+
 # ---------------------------------------------------------------------------
 # Idle-cost accounting
 # ---------------------------------------------------------------------------
