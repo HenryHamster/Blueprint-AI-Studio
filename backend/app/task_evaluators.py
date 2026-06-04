@@ -180,11 +180,23 @@ class MetricStrategy:
     "No measurement" means no structured result could be extracted from the
     artifact at all — distinct from a measurement that legitimately found zero
     issues (a parseable, possibly empty, result), which passes.
+
+    The metric shape is type-aware (mirroring how ``ForwardQualityStrategy``
+    special-cases ``memo``): the perf report is a severity-keyed JSON ARRAY,
+    while a ``compute_experiment`` produces a JSON OBJECT carrying the terminal
+    job outcome plus a final/accrued cost. The gate fails closed for a compute
+    experiment that never reached a terminal job state OR that produced no
+    measured cost — exactly the "did it actually produce a terminal, costed
+    outcome" check the per-type forward gate exists to enforce. Budget/deadline
+    kills are honest terminal outcomes (they carry an ``outcome`` and a cost),
+    so they PASS the gate — the experiment did its measured job.
     """
 
     key = "metric"
 
     def evaluate(self, task: Task, artifact_text: str | None) -> EvaluationVerdict:
+        if _task_type_of(task) == "compute_experiment":
+            return self._evaluate_compute_experiment(artifact_text)
         measurement = _extract_measurement(artifact_text)
         if measurement is None:
             return EvaluationVerdict(
@@ -195,6 +207,25 @@ class MetricStrategy:
         return EvaluationVerdict(
             True,
             f"structured measurement produced ({len(measurement)} item(s))",
+            self.key,
+        )
+
+    def _evaluate_compute_experiment(
+        self, artifact_text: str | None
+    ) -> EvaluationVerdict:
+        result = _extract_compute_measurement(artifact_text)
+        if result is None:
+            return EvaluationVerdict(
+                False,
+                "compute experiment produced no terminal, costed job result "
+                "(missing terminal outcome or measured final/accrued cost)",
+                self.key,
+            )
+        outcome, cost = result
+        return EvaluationVerdict(
+            True,
+            f"compute experiment reached terminal outcome {outcome!r} "
+            f"at measured cost ${cost}",
             self.key,
         )
 
@@ -308,6 +339,90 @@ def _extract_measurement(artifact_text: str | None) -> list | None:
     except (json.JSONDecodeError, ValueError):
         return None
     return parsed if isinstance(parsed, list) else None
+
+
+def _coerce_number(value: Any) -> float | None:
+    """Return ``value`` as a float when it is a real number, else ``None``.
+
+    ``bool`` is a subclass of ``int`` in Python, so it is explicitly rejected —
+    ``True``/``False`` is never a valid cost measurement.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _extract_compute_measurement(
+    artifact_text: str | None,
+) -> tuple[str, float] | None:
+    """Extract a compute-experiment terminal result from a COMPUTE_RESULT artifact.
+
+    The agent's terminal artifact is a JSON OBJECT (see
+    ``agent/src/handlers/compute-experiment.ts``) carrying the terminal job
+    ``outcome`` plus ``final_cost_usd``/``accrued_cost_usd``. Returns
+    ``(outcome, cost)`` only when the result reached a terminal outcome AND
+    carries a measured cost; returns ``None`` (gate fails closed) for an empty,
+    unparseable, outcome-less, or cost-less artifact. ``final_cost_usd`` is
+    preferred; ``accrued_cost_usd`` is the fallback the agent itself uses.
+    """
+    obj = _extract_json_object(artifact_text)
+    if obj is None:
+        return None
+    outcome = obj.get("outcome")
+    if not isinstance(outcome, str) or not outcome.strip():
+        return None
+    cost = _coerce_number(obj.get("final_cost_usd"))
+    if cost is None:
+        cost = _coerce_number(obj.get("accrued_cost_usd"))
+    if cost is None:
+        return None
+    return outcome.strip(), cost
+
+
+def _extract_json_object(artifact_text: str | None) -> dict | None:
+    """Parse the first balanced JSON object from ``artifact_text``, or ``None``.
+
+    Tries a direct parse first (the agent emits a bare ``JSON.stringify``
+    object); falls back to scanning for the first balanced ``{...}`` span so a
+    result wrapped in surrounding log text is still recovered.
+    """
+    text = (artifact_text or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except (json.JSONDecodeError, ValueError):
+        pass
+    obj = _extract_verdict_object_any(text)
+    return obj
+
+
+def _extract_verdict_object_any(text: str) -> dict | None:
+    """Find the first balanced JSON object in ``text`` that parses to a dict."""
+    idx = text.find("{")
+    while idx != -1:
+        depth = 0
+        for j in range(idx, len(text)):
+            c = text[j]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[idx : j + 1]
+                    try:
+                        obj = json.loads(candidate)
+                        if isinstance(obj, dict):
+                            return obj
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                    break
+        idx = text.find("{", idx + 1)
+    return None
 
 
 # ---------------------------------------------------------------------------

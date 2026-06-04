@@ -1,15 +1,38 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act, waitFor } from '@testing-library/react';
 import { useTaskModal } from './useTaskModal';
-import { authGet } from '../api';
+import { authGet, fetchTaskTypeCatalog, type TaskTypeCatalogEntry } from '../api';
 
 vi.mock('../api', () => ({
   authHeaders: vi.fn().mockResolvedValue({ Authorization: 'Bearer ***', 'Content-Type': 'application/json' }),
   authGet: vi.fn(),
+  fetchTaskTypeCatalog: vi.fn(),
   API_BASE_URL: '',
 }));
 
 const mockAuthGet = vi.mocked(authGet);
+const mockFetchTaskTypeCatalog = vi.mocked(fetchTaskTypeCatalog);
+
+function catalogEntry(overrides: Partial<TaskTypeCatalogEntry> & { id: string }): TaskTypeCatalogEntry {
+  return {
+    id: overrides.id,
+    label: overrides.label ?? overrides.id,
+    description: overrides.description ?? '',
+    agent_mode: 'write',
+    default_category: null,
+    user_launchable: true,
+    provider_configurable: true,
+    filter_visible: true,
+    output_kind: 'pr',
+    requires_code: true,
+    requires_web: false,
+    requires_compute: false,
+    evaluation_strategy: 'ci_and_review',
+    cost_ceiling_usd: null,
+    run_shape: 'single_agent',
+    ...overrides,
+  };
+}
 
 function okGet(data: unknown) {
   return Promise.resolve({ ok: true, json: () => Promise.resolve(data) } as Response);
@@ -34,6 +57,8 @@ describe('useTaskModal', () => {
       if (url.includes('/branches')) return okGet({ branches: [] });
       return okGet({});
     });
+    // Default: catalog fetch returns nothing — keeps the static fallback options.
+    mockFetchTaskTypeCatalog.mockResolvedValue([]);
   });
 
   afterEach(() => {
@@ -510,6 +535,52 @@ describe('useTaskModal', () => {
       expect(urls.some(u => u.includes('/api/admin/github/repos'))).toBe(true);
       expect(urls.some(u => u.includes('/api/admin/github/branches'))).toBe(true);
     });
+  });
+
+  // --- launchableTaskTypeOptions (backend catalog derivation) ---
+
+  it('starts with the static launchable options before the modal opens', () => {
+    const { result } = renderHook(() =>
+      useTaskModal('create', vi.fn(), { current: vi.fn() }),
+    );
+    const values = result.current.launchableTaskTypeOptions.map(o => o.value);
+    expect(values).toContain('create');
+    expect(values).toContain('review');
+  });
+
+  it('openNewTaskModal derives launchable options (incl. newly registered types) from the catalog', async () => {
+    mockFetchTaskTypeCatalog.mockResolvedValue([
+      catalogEntry({ id: 'create', label: 'Create', description: 'Write code, open PR' }),
+      catalogEntry({ id: 'panel_review', label: 'Panel Review', description: 'Multi-agent review' }),
+      catalogEntry({ id: 'strategic_review', label: 'Strategic Review', user_launchable: false }),
+    ]);
+    const { result } = renderHook(() =>
+      useTaskModal('create', vi.fn(), { current: vi.fn() }),
+    );
+    await act(async () => {
+      result.current.openNewTaskModal();
+    });
+    await waitFor(() => {
+      const values = result.current.launchableTaskTypeOptions.map(o => o.value);
+      expect(values).toContain('panel_review');
+      expect(values).not.toContain('strategic_review');
+    });
+    const panel = result.current.launchableTaskTypeOptions.find(o => o.value === 'panel_review');
+    expect(panel).toEqual({ value: 'panel_review', label: 'Panel Review', description: 'Multi-agent review' });
+  });
+
+  it('falls back to the static launchable options when the catalog fetch rejects', async () => {
+    mockFetchTaskTypeCatalog.mockRejectedValue(new Error('catalog unreachable'));
+    const { result } = renderHook(() =>
+      useTaskModal('create', vi.fn(), { current: vi.fn() }),
+    );
+    await act(async () => {
+      result.current.openNewTaskModal();
+    });
+    await waitFor(() => expect(mockFetchTaskTypeCatalog).toHaveBeenCalled());
+    const values = result.current.launchableTaskTypeOptions.map(o => o.value);
+    expect(values).toContain('create');
+    expect(values).toContain('review');
   });
 
   it('getDefaultEffortForType reads effort from localStorage', () => {

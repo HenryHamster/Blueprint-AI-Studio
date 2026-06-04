@@ -1,9 +1,8 @@
 import { useState, useRef } from 'react';
-import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, AlertCircle, Loader2, ChevronDown, ArrowUpDown, Wrench } from 'lucide-react';
-import { USER_LAUNCHABLE_TASK_TYPE_OPTIONS } from '../taskCapabilities';
-import type { UserLaunchableTaskType } from '../taskCapabilities';
+import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, AlertCircle, Loader2, ChevronDown, ArrowUpDown, Wrench, Boxes } from 'lucide-react';
+import type { LaunchableTaskTypeOption, UserLaunchableTaskType } from '../taskCapabilities';
 
-const TASK_TYPE_OPTION_ICONS: Record<UserLaunchableTaskType, typeof Plus> = {
+const TASK_TYPE_OPTION_ICONS: Record<string, typeof Plus> = {
   create: Plus,
   refactor: Wrench,
   plan: GitFork,
@@ -12,6 +11,10 @@ const TASK_TYPE_OPTION_ICONS: Record<UserLaunchableTaskType, typeof Plus> = {
   fix: AlertCircle,
   migrate: ArrowUpDown,
 };
+
+// Fallback icon for backend-registered launchable types that have no bespoke
+// frontend icon — keeps a dynamically-registered type renderable with no edit.
+const DEFAULT_TASK_TYPE_ICON = Boxes;
 
 interface NewTaskModalProps {
   newTaskRepo: string;
@@ -45,6 +48,7 @@ interface NewTaskModalProps {
   useManualBranch: boolean;
   setUseManualBranch: React.Dispatch<React.SetStateAction<boolean>>;
   setBranchOptions: React.Dispatch<React.SetStateAction<string[]>>;
+  launchableTaskTypeOptions: LaunchableTaskTypeOption[];
   taskBranchDefaultsReady: boolean;
   taskBranchDefaultsLoading: boolean;
   taskBranchDefaultsError: string | null;
@@ -86,6 +90,7 @@ export function NewTaskModal({
   useManualBranch,
   setUseManualBranch,
   setBranchOptions,
+  launchableTaskTypeOptions,
   taskBranchDefaultsReady,
   taskBranchDefaultsLoading,
   taskBranchDefaultsError,
@@ -227,13 +232,13 @@ export function NewTaskModal({
           <div className="mb-4">
             <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Task Type</label>
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
-              {USER_LAUNCHABLE_TASK_TYPE_OPTIONS.map(opt => {
-                const Icon = TASK_TYPE_OPTION_ICONS[opt.value];
+              {launchableTaskTypeOptions.map(opt => {
+                const Icon = TASK_TYPE_OPTION_ICONS[opt.value] ?? DEFAULT_TASK_TYPE_ICON;
                 return (
                   <button
                     key={opt.value}
                     type="button"
-                    onClick={() => handleTaskTypeChange(opt.value)}
+                    onClick={() => handleTaskTypeChange(opt.value as UserLaunchableTaskType)}
                     className={`min-w-0 min-h-[44px] sm:min-h-0 flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium transition-all ${
                       newTaskType === opt.value
                         ? 'bg-white/5 border-neutral-600 text-neutral-100'

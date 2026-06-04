@@ -397,6 +397,27 @@ GAP_PAST_MOVES_DURABLE_MAX = 200
 see :data:`GAP_HISTORY_DURABLE_MAX`."""
 
 
+ARCHIVED_GAPS_DURABLE_MAX = 200
+"""Hard cap on the durable ``archived_gaps`` collection — the only durable
+collection that grows without limit forever.
+
+Closed/abandoned gaps are moved into ``archived_gaps`` every cycle and the
+prior archive is unioned forward on every agent write (see
+:func:`apply_agent_update`), so without a backstop the JSONB column grows
+unboundedly and eventually the model can no longer round-trip in a single
+payload pass. This cap mirrors the append-log caps
+(:data:`GAP_HISTORY_DURABLE_MAX` / :data:`GAP_PAST_MOVES_DURABLE_MAX`): it is
+generous but finite, and eviction is oldest-first by ``closed``/``opened``
+timestamp. ``archived_gaps`` is pure history — closed/abandoned, reference-only,
+and individually re-fetchable by id — so rolling the oldest off is safe in a
+way that evicting active gaps/capabilities/friction would not be.
+
+This is a STRUCTURAL backstop applied by the backend on every write-back,
+independent of whether the agent voluntarily prunes. Active, semantically
+meaningful state (active gaps, capabilities, pending confirmations) is never
+evicted here — only history/archive."""
+
+
 class SelfReflectionEntry(BaseModel):
     """Agent-written reflection about what was hard this cycle.
 
@@ -455,6 +476,46 @@ def archive_closed_gaps(model: ProblemModel) -> ProblemModel:
             still_active.append(gap)
     model.gaps = still_active
     return model
+
+
+def _archived_gap_recency_key(gap: Gap) -> str:
+    """Sort key for archived-gap eviction — most recent first when sorted
+    descending. Prefers ``closed`` (when it was archived), falling back to
+    ``opened``; a gap with neither timestamp sorts oldest and is evicted
+    first. Empty string sorts below any ISO-8601 timestamp."""
+    return gap.closed or gap.opened or ""
+
+
+def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
+    """Structurally bound the durable model so it round-trips in a single pass.
+
+    Pure backend backstop — mutates ``model`` in place and returns a small
+    summary of what was evicted (empty dict when nothing was dropped, so the
+    caller can keep the diff/output byte-identical on the no-op path).
+
+    Today this caps ``archived_gaps`` (the only durable collection that grows
+    without limit) at :data:`ARCHIVED_GAPS_DURABLE_MAX`, evicting the oldest
+    entries by ``closed``/``opened`` timestamp. It deliberately does NOT touch
+    active gaps, capabilities, friction, or pending confirmations — those are
+    live, semantically meaningful state that the agent owns and merges
+    non-destructively; a structural cap there could drop entries the agent never
+    saw. ``archived_gaps`` is pure history (closed/abandoned, reference-only,
+    re-fetchable by id) so oldest-first eviction is safe.
+
+    Returns a dict like ``{"archived_gaps_evicted": ["g-x", "g-y"]}`` listing
+    the ids rolled off, suitable for folding into the revision-log diff.
+    """
+    summary: dict[str, Any] = {}
+
+    if len(model.archived_gaps) > ARCHIVED_GAPS_DURABLE_MAX:
+        # Stable sort newest-last by recency, then keep the most-recent N.
+        ordered = sorted(model.archived_gaps, key=_archived_gap_recency_key)
+        evicted = ordered[:-ARCHIVED_GAPS_DURABLE_MAX]
+        kept = ordered[-ARCHIVED_GAPS_DURABLE_MAX:]
+        model.archived_gaps = kept
+        summary["archived_gaps_evicted"] = [g.id for g in evicted]
+
+    return summary
 
 
 def append_revision_log(
@@ -695,6 +756,8 @@ def _diff_summary(diff: dict[str, Any]) -> str:
         parts.append("intent updated")
     if caps := diff.get("capabilities_changed"):
         parts.append(f"{len(caps)} capability status changes")
+    if evicted := diff.get("archived_gaps_evicted"):
+        parts.append(f"GC evicted {len(evicted)} archived gap(s)")
     return "; ".join(parts) if parts else "no structural changes"
 
 
@@ -1215,6 +1278,16 @@ def apply_agent_update(
             diff[diff_key] = removed
 
     archive_closed_gaps(proposed)
+
+    # Structural GC backstop: bound the durable history/archive collections so
+    # the model round-trips in a single pass regardless of whether the agent
+    # voluntarily pruned. Runs AFTER archival (so this cycle's just-closed gaps
+    # are eligible) and BEFORE the revision-log append so the eviction is
+    # recorded in the same revision that performed it. Folds the evicted ids
+    # into the diff so the GC is observable in the revision log.
+    gc_summary = gc_problem_model(proposed)
+    if gc_summary:
+        diff.update(gc_summary)
 
     append_revision_log(proposed, summary=_diff_summary(diff), changes=diff)
 

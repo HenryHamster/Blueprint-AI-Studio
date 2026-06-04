@@ -628,6 +628,11 @@ def validate_task_payload(raw: dict) -> dict:
     Returns a plain dict (model_dump).  Raises ValueError on any violation
     (PayloadTooLargeError — a ValueError subclass — on size overflow).
     Extra keys present in *raw* are preserved (extra='allow').
+
+    For task types registered in the capability registry but absent from the
+    payload-model dispatch table, falls back to BasePayload (extra='allow' +
+    shared constraints). This enables a new task type to be runnable by
+    registration alone, without requiring a parallel edit to the dispatch dict.
     """
     type_value = raw.get("type")
     if not type_value:
@@ -641,7 +646,7 @@ def validate_task_payload(raw: dict) -> dict:
             f"Unknown task type {type_value!r}. Valid types: {valid}"
         ) from None
 
-    model_cls = _MODEL_FOR_TYPE[task_type]
+    model_cls = _MODEL_FOR_TYPE.get(task_type, BasePayload)
     try:
         instance = model_cls.model_validate(raw)
     except Exception as exc:

@@ -68,7 +68,7 @@ def test_evaluation_declarations_match_expected_assignment():
         "release_audit": "forward-quality",
         "memo": "forward-quality",
         "verify_tests": "none",
-        "compute_experiment": "none",
+        "compute_experiment": "metric",
         "web_research": "forward-quality",
     }
 
@@ -190,6 +190,109 @@ def test_metric_with_structured_measurement_passes():
     v = MetricStrategy().evaluate(_task("perf"), findings)
     assert v.passed is True
     assert "1 item" in v.reason
+
+
+# ── MetricStrategy: compute_experiment shape-awareness ──────────────────────
+
+
+def _compute_result(**overrides) -> str:
+    base = {
+        "job_id": "job-123",
+        "outcome": "SUCCESS",
+        "final_cost_usd": 0.42,
+        "accrued_cost_usd": 0.42,
+        "status": "SUCCEEDED",
+    }
+    base.update(overrides)
+    return json.dumps(base)
+
+
+def test_metric_compute_experiment_valid_result_passes():
+    """A terminal compute result (outcome + final cost) passes the metric gate."""
+    v = MetricStrategy().evaluate(
+        _task("compute_experiment"), _compute_result()
+    )
+    assert v.passed is True
+    assert "SUCCESS" in v.reason
+
+
+def test_metric_compute_experiment_budget_kill_is_honest_terminal_pass():
+    """A spend-cap kill carries an outcome + cost, so it is an honest terminal
+    outcome that PASSES the gate (the experiment did its measured job)."""
+    v = MetricStrategy().evaluate(
+        _task("compute_experiment"),
+        _compute_result(outcome="SPEND_CAP_EXCEEDED", status="FAILED"),
+    )
+    assert v.passed is True
+
+
+def test_metric_compute_experiment_deadline_kill_is_honest_terminal_pass():
+    v = MetricStrategy().evaluate(
+        _task("compute_experiment"),
+        _compute_result(outcome="TIMED_OUT", status="TIMED_OUT"),
+    )
+    assert v.passed is True
+
+
+def test_metric_compute_experiment_accrued_cost_fallback_passes():
+    """When final_cost_usd is absent, accrued_cost_usd is the fallback measure."""
+    payload = json.dumps(
+        {"job_id": "j", "outcome": "SUCCESS", "accrued_cost_usd": 0.1}
+    )
+    v = MetricStrategy().evaluate(_task("compute_experiment"), payload)
+    assert v.passed is True
+
+
+def test_metric_compute_experiment_zero_cost_passes():
+    """A measured cost of 0.0 is a real measurement (not 'no measurement')."""
+    v = MetricStrategy().evaluate(
+        _task("compute_experiment"), _compute_result(final_cost_usd=0.0)
+    )
+    assert v.passed is True
+
+
+def test_metric_compute_experiment_missing_outcome_fails():
+    """No terminal outcome → no terminal job state → gate fails closed."""
+    payload = json.dumps({"job_id": "j", "final_cost_usd": 0.4})
+    v = MetricStrategy().evaluate(_task("compute_experiment"), payload)
+    assert v.passed is False
+    assert "terminal" in v.reason.lower()
+
+
+def test_metric_compute_experiment_null_outcome_fails():
+    v = MetricStrategy().evaluate(
+        _task("compute_experiment"), _compute_result(outcome=None)
+    )
+    assert v.passed is False
+
+
+def test_metric_compute_experiment_missing_cost_fails():
+    """No measured final/accrued cost → gate fails closed."""
+    payload = json.dumps({"job_id": "j", "outcome": "SUCCESS"})
+    v = MetricStrategy().evaluate(_task("compute_experiment"), payload)
+    assert v.passed is False
+
+
+def test_metric_compute_experiment_non_numeric_cost_fails():
+    v = MetricStrategy().evaluate(
+        _task("compute_experiment"),
+        _compute_result(final_cost_usd="n/a", accrued_cost_usd=None),
+    )
+    assert v.passed is False
+
+
+def test_metric_compute_experiment_empty_and_unparseable_fail():
+    for bad in ("", "   ", "not json at all", "[1, 2, 3]"):
+        v = MetricStrategy().evaluate(_task("compute_experiment"), bad)
+        assert v.passed is False, bad
+
+
+def test_metric_compute_experiment_does_not_use_perf_array_path():
+    """A compute_experiment must NOT be accepted by the perf severity-array path —
+    a severity array carries no terminal outcome and must fail the compute gate."""
+    findings = json.dumps([{"severity": "high", "title": "x"}])
+    v = MetricStrategy().evaluate(_task("compute_experiment"), findings)
+    assert v.passed is False
 
 
 # ── record_failed_gate ──────────────────────────────────────────────────────

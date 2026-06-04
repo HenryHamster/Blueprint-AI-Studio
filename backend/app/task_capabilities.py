@@ -461,6 +461,22 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
             "VM. Reports the job outcome and final cost; budget/deadline kills "
             "are intentional terminal outcomes, not crashes."
         ),
+        # This reference type runs the long-running experiment_loop shape: the
+        # agent launches a budgeted job and polls it to terminal state. It needs
+        # the compute substrate, not a code checkout, and its durable product is
+        # a verdict (the terminal job outcome + final cost), graded by a metric
+        # forward gate that fails an experiment which produced no terminal,
+        # costed result. Dispatch is by the bespoke agent handler, so the
+        # experiment_loop run_shape is declarative only and does not change how
+        # the task is claimed/executed.
+        output_kind="verdict",
+        requires_code=False,
+        requires_compute=True,
+        evaluation_strategy="metric",
+        cost_ceiling_usd=5.0,
+        completion_handler="compute_experiment",
+        evaluation="metric",
+        run_shape="experiment_loop",
     ),
     TaskCapability(
         TaskType.web_research,

@@ -11,6 +11,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.problem_model import (
+    ARCHIVED_GAPS_DURABLE_MAX,
     GAP_HISTORY_DURABLE_MAX,
     GAP_PAST_MOVES_DURABLE_MAX,
     MODEL_SIZE_HEALTHY_CAPABILITIES,
@@ -33,6 +34,7 @@ from app.problem_model import (
     apply_user_intent_patch,
     archive_closed_gaps,
     compute_model_size_signal,
+    gc_problem_model,
     is_empty,
     parse_problem_model,
 )
@@ -409,6 +411,155 @@ def test_apply_agent_update_preserves_prior_archive_and_log():
     assert len(new_raw["revision_log"]) == 2
     assert new_raw["revision_log"][0]["summary"] == "prior"
     assert new_raw["revision_log"][1]["revision"] == 3
+
+
+def test_gc_problem_model_keeps_most_recent_archived():
+    """Direct unit test of eviction ordering: oldest archived gaps (by
+    closed/opened timestamp) roll off, the most-recent ARCHIVED_GAPS_DURABLE_MAX
+    are kept."""
+    # Build cap+5 archived gaps with strictly increasing closed timestamps so
+    # ordering is unambiguous.
+    total = ARCHIVED_GAPS_DURABLE_MAX + 5
+    archived = [
+        Gap(
+            id=f"g-{i:04d}",
+            name=f"archived {i}",
+            status="closed",
+            closed=f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}",
+        )
+        for i in range(total)
+    ]
+    model = ProblemModel(archived_gaps=archived)
+
+    summary = gc_problem_model(model)
+
+    assert len(model.archived_gaps) == ARCHIVED_GAPS_DURABLE_MAX
+    # The 5 oldest (lowest timestamps == lowest indices) were evicted.
+    assert summary["archived_gaps_evicted"] == [f"g-{i:04d}" for i in range(5)]
+    kept_ids = {g.id for g in model.archived_gaps}
+    assert kept_ids == {f"g-{i:04d}" for i in range(5, total)}
+
+
+def test_gc_problem_model_noop_under_cap():
+    """Below the cap, gc_problem_model evicts nothing and returns an empty
+    summary so callers can keep output byte-identical on the no-op path."""
+    archived = [
+        Gap(id=f"g-{i}", name=f"x{i}", status="closed", closed=f"2026-01-0{i}")
+        for i in range(1, 4)
+    ]
+    model = ProblemModel(archived_gaps=archived)
+    before = model.model_dump()
+
+    summary = gc_problem_model(model)
+
+    assert summary == {}
+    assert model.model_dump() == before
+
+
+def test_apply_agent_update_caps_archived_gaps():
+    """A model accumulating archived gaps past the cap is structurally bounded
+    on write-back, regardless of whether the agent pruned — the oldest roll
+    off and active state is untouched."""
+    current = {
+        "revision": 1,
+        "archived_gaps": [
+            {
+                "id": f"g-{i:04d}",
+                "name": f"old {i}",
+                "status": "closed",
+                "closed": f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}",
+            }
+            for i in range(ARCHIVED_GAPS_DURABLE_MAX + 10)
+        ],
+        "gaps": [{"id": "g-live", "name": "active gap", "status": "active"}],
+    }
+    proposed = {"gaps": [{"id": "g-live", "name": "active gap", "status": "active"}]}
+
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+
+    assert len(new_raw["archived_gaps"]) == ARCHIVED_GAPS_DURABLE_MAX
+    # Oldest 10 evicted; the active gap is never touched by GC.
+    assert diff["archived_gaps_evicted"] == [f"g-{i:04d}" for i in range(10)]
+    assert {g["id"] for g in new_raw["gaps"]} == {"g-live"}
+    kept = {g["id"] for g in new_raw["archived_gaps"]}
+    assert "g-0000" not in kept
+    assert f"g-{ARCHIVED_GAPS_DURABLE_MAX + 9:04d}" in kept
+
+
+def test_apply_agent_update_archived_gc_recorded_in_revision_log():
+    """The GC eviction is observable: evicted ids land in the diff AND the
+    revision-log entry recorded for the revision that performed the eviction."""
+    current = {
+        "revision": 5,
+        "archived_gaps": [
+            {
+                "id": f"g-{i:04d}",
+                "name": f"old {i}",
+                "status": "closed",
+                "closed": f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}",
+            }
+            for i in range(ARCHIVED_GAPS_DURABLE_MAX + 3)
+        ],
+    }
+    new_raw, diff = apply_agent_update(current, {"gaps": []}, "2026-04-21T12:00:00")
+
+    assert diff["archived_gaps_evicted"] == [f"g-{i:04d}" for i in range(3)]
+    last_entry = new_raw["revision_log"][-1]
+    assert last_entry["changes"]["archived_gaps_evicted"] == [
+        f"g-{i:04d}" for i in range(3)
+    ]
+    assert "GC evicted 3 archived gap(s)" in last_entry["summary"]
+
+
+def test_apply_agent_update_under_cap_no_gc_mutation():
+    """Below the cap, no archived gaps are evicted and the diff carries no GC
+    key — the GC backstop is invisible when the model is small."""
+    current = {
+        "revision": 1,
+        "archived_gaps": [
+            {"id": "g-a", "name": "a", "status": "closed", "closed": "2026-01-01"},
+            {"id": "g-b", "name": "b", "status": "closed", "closed": "2026-01-02"},
+        ],
+    }
+    new_raw, diff = apply_agent_update(current, {"gaps": []}, "2026-04-21T12:00:00")
+
+    assert {g["id"] for g in new_raw["archived_gaps"]} == {"g-a", "g-b"}
+    assert "archived_gaps_evicted" not in diff
+
+
+def test_apply_agent_update_gc_never_drops_active_state():
+    """GC bounds history/archive only — active gaps, capabilities, and pending
+    confirmations survive even when the archive is over the cap and evicting."""
+    current = {
+        "revision": 1,
+        "archived_gaps": [
+            {
+                "id": f"g-arch-{i:04d}",
+                "name": f"old {i}",
+                "status": "closed",
+                "closed": f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}",
+            }
+            for i in range(ARCHIVED_GAPS_DURABLE_MAX + 25)
+        ],
+        "gaps": [{"id": "g-live", "name": "live", "status": "active"}],
+        "capabilities": [{"name": "cap-x", "status": "working"}],
+        "pending_user_confirmation": [
+            {"id": "p-1", "type": "access_needed", "proposal": "grant access"}
+        ],
+    }
+    proposed = {
+        "gaps": [{"id": "g-live", "name": "live", "status": "active"}],
+        "capabilities": [{"name": "cap-x", "status": "working"}],
+        "pending_user_confirmation": [
+            {"id": "p-1", "type": "access_needed", "proposal": "grant access"}
+        ],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+
+    assert len(new_raw["archived_gaps"]) == ARCHIVED_GAPS_DURABLE_MAX
+    assert {g["id"] for g in new_raw["gaps"]} == {"g-live"}
+    assert {c["name"] for c in new_raw["capabilities"]} == {"cap-x"}
+    assert {p["id"] for p in new_raw["pending_user_confirmation"]} == {"p-1"}
 
 
 def test_apply_agent_update_detects_new_gaps():

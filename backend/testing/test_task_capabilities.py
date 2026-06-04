@@ -95,8 +95,9 @@ def test_recovery_paths_source_write_allowlist_from_registry():
 
 def test_completion_handler_declarations_match_legacy_dispatch():
     """The registry's completion-handler declarations must reproduce exactly the
-    type→handler routing the old if/elif cascade encoded, so the registry-driven
-    dispatch in task_lifecycle is behaviour-preserving."""
+    type→handler routing the old if/elif cascade encoded (plus the
+    compute_experiment terminal metric gate), so the registry-driven dispatch in
+    task_lifecycle is behaviour-preserving."""
     assert COMPLETION_HANDLER_BY_TASK_TYPE == {
         "plan": "plan",
         "design_doc_update": "design_doc",
@@ -104,6 +105,7 @@ def test_completion_handler_declarations_match_legacy_dispatch():
         "research": "research",
         "security_audit": "security_audit",
         "perf": "perf",
+        "compute_experiment": "compute_experiment",
         "self_audit": "self_audit",
         "memo": "memo",
         "web_research": "web_research",
@@ -226,18 +228,19 @@ def test_run_shape_for_accessor_and_honest_per_type_shapes():
 
 
 def test_experiment_loop_is_a_valid_declarable_run_shape():
-    """No task type runs the experiment loop yet, but the value MUST be part of
-    the closed vocabulary so the future experiment proof can register a type
-    against it with no edit to this module. Assert it is declarable by
-    constructing a capability with it (the dataclass / Literal accepts it)."""
+    """`experiment_loop` is part of the closed run-shape vocabulary and is now
+    DECLARED by the reference compute_experiment type (the long-running
+    launch-and-poll experiment). Assert both that the value is declarable on the
+    dataclass and that compute_experiment is the registered type using it."""
     from app.task_capabilities import TaskCapability, TaskType
 
     cap = TaskCapability(
         TaskType.investigate, "X", "read_only", run_shape="experiment_loop"
     )
     assert cap.run_shape == "experiment_loop"
-    # It is intentionally unused by every registered type today.
-    assert "experiment_loop" not in set(RUN_SHAPE_BY_TASK_TYPE.values())
+    # compute_experiment is the registered type that runs the experiment loop.
+    assert RUN_SHAPE_BY_TASK_TYPE["compute_experiment"] == "experiment_loop"
+    assert run_shape_for("compute_experiment") == "experiment_loop"
 
 
 def test_product_task_types_derived_from_registry():

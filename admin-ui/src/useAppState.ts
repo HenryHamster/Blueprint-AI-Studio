@@ -107,6 +107,7 @@ export function useAppState() {
     setNewTaskType, setNewTaskPrNumber, setNewTaskPrBranch, setNewTaskModel, setNewTaskEffort,
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
+    launchableTaskTypeOptions,
     openNewTaskModal, openDuplicateTaskModal, openPrefilledTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
   } = useTaskModal(defaultTaskType, addToast, fetchTasksRef, defaultTaskBranchRef, selectedProjectRepoRef);
 
@@ -552,6 +553,7 @@ export function useAppState() {
     setNewTaskType, setNewTaskPrNumber, setNewTaskPrBranch, setNewTaskModel, setNewTaskEffort,
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
+    launchableTaskTypeOptions,
     taskBranchDefaultsReady, taskBranchDefaultsLoading, taskBranchDefaultsError,
     openNewTaskModal, openDuplicateTaskModal, openPrefilledTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
     // Defaults

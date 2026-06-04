@@ -1137,6 +1137,7 @@ export default function App() {
           useManualBranch={s.useManualBranch}
           setUseManualBranch={s.setUseManualBranch}
           setBranchOptions={s.setBranchOptions}
+          launchableTaskTypeOptions={s.launchableTaskTypeOptions}
           taskBranchDefaultsReady={s.taskBranchDefaultsReady}
           taskBranchDefaultsLoading={s.taskBranchDefaultsLoading}
           taskBranchDefaultsError={s.taskBranchDefaultsError}

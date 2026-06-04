@@ -867,6 +867,65 @@ def test_base_branch_explicit_value_preserved():
 
 
 # ---------------------------------------------------------------------------
+# Registry-tolerant fallback for unregistered payload models
+# ---------------------------------------------------------------------------
+
+
+def test_registered_type_without_bespoke_model_uses_base_payload():
+    """When a task type is registered in the enum but absent from
+    _MODEL_FOR_TYPE, validation should fall back to BasePayload
+    (extra='allow' + shared constraints) rather than crashing with KeyError.
+
+    This enables new task types to be runnable by registration alone.
+    """
+    from app.payload_schemas import _MODEL_FOR_TYPE
+
+    # Temporarily remove a system-populated type from the dispatch to simulate
+    # a newly-registered type that hasn't been added to the dispatch yet.
+    original = _MODEL_FOR_TYPE.pop(TaskType.debug, None)
+    try:
+        # Should validate against BasePayload, not crash with KeyError
+        result = _valid({"type": "debug"})
+        assert result["type"] == "debug"
+
+        # Extra fields should be preserved (BasePayload has extra='allow')
+        result = _valid({"type": "debug", "custom_field": "custom_value"})
+        assert result["custom_field"] == "custom_value"
+
+        # Base-payload constraints (e.g., effort pattern) still apply
+        msg = _invalid({"type": "debug", "effort": "invalid_effort"})
+        assert "debug" in msg
+    finally:
+        # Restore the original entry
+        if original is not None:
+            _MODEL_FOR_TYPE[TaskType.debug] = original
+
+
+def test_registered_type_without_model_still_enforces_size_budget():
+    """When a type falls back to BasePayload, the size-budget gate
+    must still reject payloads that exceed _MAX_PAYLOAD_BYTES.
+    """
+    from app.payload_schemas import _MODEL_FOR_TYPE
+
+    # Temporarily remove a type to force BasePayload fallback
+    original = _MODEL_FOR_TYPE.pop(TaskType.qa, None)
+    try:
+        # Build an oversized payload
+        big_blob = {"data": ["x" * 100] * 5000}
+        raw = {"type": "qa", "custom_huge_field": big_blob}
+
+        # Should fail on size, not validate silently
+        with pytest.raises(PayloadTooLargeError) as exc_info:
+            validate_task_payload(raw)
+        err = exc_info.value
+        assert err.size > _MAX_PAYLOAD_BYTES
+        assert "custom_huge_field" in [k for k, _ in err.top_keys]
+    finally:
+        if original is not None:
+            _MODEL_FOR_TYPE[TaskType.qa] = original
+
+
+# ---------------------------------------------------------------------------
 # SystemMaturity ORM constraint
 # ---------------------------------------------------------------------------
 

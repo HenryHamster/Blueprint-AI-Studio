@@ -8,6 +8,12 @@ vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
 }));
 
+const LAUNCHABLE_OPTIONS = [
+  { value: 'create', label: 'Create', description: 'Write code, open PR' },
+  { value: 'review', label: 'Review', description: 'Review existing PR' },
+  { value: 'fix', label: 'Fix', description: 'Fix PR feedback' },
+];
+
 describe('NewTaskModal — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
@@ -71,6 +77,7 @@ describe('NewTaskModal — viewport regression', () => {
             useManualBranch={false}
             setUseManualBranch={() => {}}
             setBranchOptions={() => {}}
+            launchableTaskTypeOptions={LAUNCHABLE_OPTIONS}
             taskBranchDefaultsReady={true}
             taskBranchDefaultsLoading={false}
             taskBranchDefaultsError={null}
@@ -126,6 +133,7 @@ describe('NewTaskModal — viewport regression', () => {
           useManualBranch={false}
           setUseManualBranch={() => {}}
           setBranchOptions={() => {}}
+          launchableTaskTypeOptions={LAUNCHABLE_OPTIONS}
           taskBranchDefaultsReady={false}
           taskBranchDefaultsLoading={true}
           taskBranchDefaultsError={null}
@@ -185,6 +193,7 @@ describe('NewTaskModal — viewport regression', () => {
             useManualBranch={false}
             setUseManualBranch={() => {}}
             setBranchOptions={() => {}}
+            launchableTaskTypeOptions={LAUNCHABLE_OPTIONS}
             taskBranchDefaultsReady={true}
             taskBranchDefaultsLoading={false}
             taskBranchDefaultsError={null}
@@ -246,6 +255,7 @@ describe('NewTaskModal — viewport regression', () => {
             useManualBranch={false}
             setUseManualBranch={() => {}}
             setBranchOptions={() => {}}
+            launchableTaskTypeOptions={LAUNCHABLE_OPTIONS}
             taskBranchDefaultsReady={true}
             taskBranchDefaultsLoading={false}
             taskBranchDefaultsError={null}
@@ -305,6 +315,7 @@ describe('NewTaskModal — viewport regression', () => {
             useManualBranch={false}
             setUseManualBranch={() => {}}
             setBranchOptions={() => {}}
+            launchableTaskTypeOptions={LAUNCHABLE_OPTIONS}
             taskBranchDefaultsReady={true}
             taskBranchDefaultsLoading={false}
             taskBranchDefaultsError={null}
@@ -361,6 +372,7 @@ describe('NewTaskModal — viewport regression', () => {
             useManualBranch={false}
             setUseManualBranch={() => {}}
             setBranchOptions={() => {}}
+            launchableTaskTypeOptions={LAUNCHABLE_OPTIONS}
             taskBranchDefaultsReady={true}
             taskBranchDefaultsLoading={false}
             taskBranchDefaultsError={null}
@@ -419,6 +431,7 @@ describe('NewTaskModal — viewport regression', () => {
             useManualBranch={false}
             setUseManualBranch={() => {}}
             setBranchOptions={() => {}}
+            launchableTaskTypeOptions={LAUNCHABLE_OPTIONS}
             taskBranchDefaultsReady={true}
             taskBranchDefaultsLoading={false}
             taskBranchDefaultsError={null}
@@ -432,5 +445,65 @@ describe('NewTaskModal — viewport regression', () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 50));
       });
     });
+  });
+
+  test('renders a backend-registered type with no bespoke icon using the fallback icon', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <NewTaskModal
+          newTaskRepo="example/repo"
+          newTaskBranch="main"
+          newTaskTitle="Test task"
+          newTaskPrompt="Test prompt"
+          newTaskType="create"
+          newTaskPrNumber=""
+          newTaskPrBranch=""
+          setNewTaskRepo={() => {}}
+          setNewTaskBranch={() => {}}
+          setNewTaskTitle={() => {}}
+          setNewTaskPrompt={() => {}}
+          setNewTaskType={() => {}}
+          setNewTaskPrNumber={() => {}}
+          setNewTaskPrBranch={() => {}}
+          newTaskModel=""
+          newTaskEffort=""
+          setNewTaskModel={() => {}}
+          setNewTaskEffort={() => {}}
+          getDefaultModelForType={() => 'claude-opus-4-7'}
+          getDefaultEffortForType={() => 'medium'}
+          repoOptions={[{ full_name: 'example/repo', default_branch: 'main' }]}
+          repoLoading={false}
+          repoError={null}
+          useManualRepo={false}
+          setUseManualRepo={() => {}}
+          branchOptions={['main']}
+          branchLoading={false}
+          branchError={null}
+          useManualBranch={false}
+          setUseManualBranch={() => {}}
+          setBranchOptions={() => {}}
+          launchableTaskTypeOptions={[
+            { value: 'create', label: 'Create', description: 'Write code, open PR' },
+            { value: 'panel_review', label: 'Panel Review', description: 'Multi-agent registered type with no static icon' },
+          ]}
+          taskBranchDefaultsReady={true}
+          taskBranchDefaultsLoading={false}
+          taskBranchDefaultsError={null}
+          onRepoChange={() => {}}
+          onSubmit={async () => {}}
+          onClose={() => {}}
+        />,
+      );
+    });
+    // The unknown task-type id renders its label (fallback icon, no crash).
+    const buttons = Array.from(document.querySelectorAll('button'));
+    const panelButton = buttons.find(b => b.textContent?.includes('Panel Review'));
+    expect(panelButton).toBeTruthy();
+    expect(panelButton?.querySelector('svg')).toBeTruthy();
   });
 });

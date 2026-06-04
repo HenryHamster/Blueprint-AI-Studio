@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
 import type React from 'react';
-import { API_BASE_URL, authHeaders, authGet } from '../api';
-import type { UserLaunchableTaskType } from '../taskCapabilities';
-import { USER_LAUNCHABLE_TASK_TYPE_IDS } from '../taskCapabilities';
+import { API_BASE_URL, authHeaders, authGet, fetchTaskTypeCatalog } from '../api';
+import type { LaunchableTaskTypeOption, UserLaunchableTaskType } from '../taskCapabilities';
+import { USER_LAUNCHABLE_TASK_TYPE_IDS, USER_LAUNCHABLE_TASK_TYPE_OPTIONS } from '../taskCapabilities';
 import type { Task } from '../types/task';
 
 interface RepoOption {
@@ -47,6 +47,29 @@ export function useTaskModal(
   const [branchLoading, setBranchLoading] = useState(false);
   const [branchError, setBranchError] = useState<string | null>(null);
   const [useManualBranch, setUseManualBranch] = useState(false);
+
+  // Launchable task-type options, derived from the backend task-type catalog so
+  // a newly registered launchable type appears in the launcher with no frontend
+  // edit. Seeded with (and falling back to) the static list so the dropdown is
+  // never empty while the catalog loads or if the fetch fails.
+  const [launchableTaskTypeOptions, setLaunchableTaskTypeOptions] =
+    useState<LaunchableTaskTypeOption[]>(() => [...USER_LAUNCHABLE_TASK_TYPE_OPTIONS]);
+
+  const fetchLaunchableTaskTypeOptions = async () => {
+    try {
+      const catalog = await fetchTaskTypeCatalog();
+      const launchable = catalog
+        .filter(entry => entry.user_launchable)
+        .map(entry => ({ value: entry.id, label: entry.label, description: entry.description }));
+      // Only adopt the catalog when it yields options; an empty/garbled
+      // response must not blank the dropdown — keep the static fallback.
+      if (launchable.length > 0) {
+        setLaunchableTaskTypeOptions(launchable);
+      }
+    } catch {
+      // Catalog unreachable — retain the current (static) fallback options.
+    }
+  };
 
   useEffect(() => {
     if (!showNewTaskModal) {
@@ -185,6 +208,7 @@ export function useTaskModal(
     setBranchError(null);
     restoreDraft();
     fetchRepoOptions();
+    fetchLaunchableTaskTypeOptions();
   };
 
   const handleRepoChange = (value: string) => {
@@ -277,6 +301,7 @@ export function useTaskModal(
     setBranchOptions([]);
     setBranchError(null);
     fetchRepoOptions();
+    fetchLaunchableTaskTypeOptions();
     if (repo) fetchBranchOptions(repo);
   };
 
@@ -307,6 +332,7 @@ export function useTaskModal(
     setBranchOptions([]);
     setBranchError(null);
     fetchRepoOptions();
+    fetchLaunchableTaskTypeOptions();
     if (repo) fetchBranchOptions(repo);
   };
 
@@ -318,6 +344,7 @@ export function useTaskModal(
     setNewTaskType, setNewTaskPrNumber, setNewTaskPrBranch, setNewTaskModel, setNewTaskEffort,
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
+    launchableTaskTypeOptions,
     openNewTaskModal, openDuplicateTaskModal, openPrefilledTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
   };
 }

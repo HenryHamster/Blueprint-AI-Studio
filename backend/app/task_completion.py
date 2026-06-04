@@ -38,6 +38,7 @@ from app.models import (
 from app.task_capabilities import WRITE_TASK_TYPES
 from app.task_evaluators import (
     EvaluationVerdict,
+    _extract_compute_measurement,
     evaluate_terminal_output,
     record_failed_gate,
 )
@@ -1700,6 +1701,80 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
     logger.info(
         f"[PERF] Created 1 bundled fix task from perf analysis {task.id} "
         f"(findings={len(actionable)})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Compute-experiment completion — terminal metric gate, no PR, no children
+# ---------------------------------------------------------------------------
+
+
+async def _handle_compute_experiment_completion(
+    task: Task, logs: str, session: AsyncSession
+):
+    """Gate and persist a compute_experiment task's terminal job result.
+
+    The agent's bespoke compute-experiment handler launches a budgeted,
+    auto-torn-down compute job, polls it to terminal state, and emits a
+    COMPUTE_RESULT artifact: a JSON object carrying the terminal job
+    ``outcome`` plus ``final_cost_usd``/``accrued_cost_usd``. This handler is a
+    thin terminal gate (no children, no PR), modelled on ``_handle_perf_completion``:
+
+      * Forward metric gate (registry-resolved 'metric' strategy, made
+        compute-shape-aware): an experiment that produced no terminal job
+        outcome OR no measured cost must NOT complete clean. Mark it FAILED
+        (terminal) — a compute_experiment spawns no children and opens no PR,
+        so EVALUATING would hang forever and pin its parent.
+      * On pass: store the result on ``task.plan_output`` and mark COMPLETED.
+        Budget/deadline kills carry an honest terminal outcome and a cost, so
+        they pass the gate and surface through the task as COMPLETED with the
+        kill outcome recorded — they are intentional terminal outcomes, not
+        crashes.
+    """
+    verdict = evaluate_terminal_output(task, logs)
+    if not verdict.passed:
+        record_failed_gate(task, verdict)
+        session.add(task)
+        await session.commit()
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": TaskStatus.FAILED},
+        )
+        logger.info(
+            "[COMPUTE] Task %s did not clear the metric gate: %s",
+            task.id,
+            verdict.reason,
+        )
+        return
+
+    # The gate passed, so a terminal, costed result is present. Re-extract it
+    # for display/telemetry (outcome + cost). _extract_compute_measurement is
+    # the same parser the gate used, so the two can never disagree.
+    measurement = _extract_compute_measurement(logs)
+    plan_output = task.plan_output if isinstance(task.plan_output, dict) else {}
+    plan_output = dict(plan_output)
+    if measurement is not None:
+        outcome, cost = measurement
+        plan_output["compute_result"] = {"outcome": outcome, "final_cost_usd": cost}
+        task.latest_status_message = (
+            f"Compute experiment terminal: outcome={outcome}, "
+            f"final_cost=${cost}"
+        )[:500]
+    else:  # pragma: no cover - defensive; the gate guarantees a measurement
+        task.latest_status_message = "Compute experiment completed"
+    task.plan_output = plan_output
+    flag_modified(task, "plan_output")
+    task.status = TaskStatus.COMPLETED
+    session.add(task)
+    await session.commit()
+    await broadcast_to_project(
+        str(task.project_id),
+        "task_updated",
+        {"task_id": str(task.id), "status": TaskStatus.COMPLETED},
+    )
+    logger.info(
+        "[COMPUTE] Task %s passed the metric gate and completed", task.id
     )
 
 

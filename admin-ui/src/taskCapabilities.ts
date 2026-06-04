@@ -223,11 +223,25 @@ export const PROVIDER_ROUTABLE_TASK_TYPE_OPTIONS = PROVIDER_ROUTABLE_TASK_TYPE_I
   label: TASK_CAPABILITY_BY_ID[id].label,
 }));
 
-export const USER_LAUNCHABLE_TASK_TYPE_OPTIONS = USER_LAUNCHABLE_TASK_TYPE_IDS.map(id => ({
-  value: id,
-  label: TASK_CAPABILITY_BY_ID[id].label,
-  description: TASK_CAPABILITY_BY_ID[id].description,
-}));
+/**
+ * Shape of a launchable-task-type option rendered by the New Task launcher.
+ * `value` is a plain string (not the compile-time `UserLaunchableTaskType`
+ * union) because the launcher now derives its options from the backend
+ * catalog, which can include types registered after this static list was
+ * authored.
+ */
+export interface LaunchableTaskTypeOption {
+  value: string;
+  label: string;
+  description: string;
+}
+
+export const USER_LAUNCHABLE_TASK_TYPE_OPTIONS: readonly LaunchableTaskTypeOption[] =
+  USER_LAUNCHABLE_TASK_TYPE_IDS.map(id => ({
+    value: id,
+    label: TASK_CAPABILITY_BY_ID[id].label,
+    description: TASK_CAPABILITY_BY_ID[id].description,
+  }));
 
 export function getTaskCapability(taskType: string): TaskCapability | undefined {
   return TASK_CAPABILITY_BY_ID[taskType as TaskType];
