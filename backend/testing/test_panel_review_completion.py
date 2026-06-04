@@ -365,3 +365,41 @@ def test_panel_review_lenses_match_parallel_review_guidance_contract():
     text = lens_path.read_text(encoding="utf-8")
     for lens_name in expected:
         assert f"id: '{lens_name}'" in text
+
+
+def test_panel_review_handler_genuinely_fans_out_per_lens():
+    """Static invariant: the agent handler runs a GENUINE multi-agent workflow —
+    one independent ``runClaudeCode`` pass per declared lens that writes a
+    lens-specific output file — rather than a single combined invocation.
+
+    The agent vitest suite is not run in CI, so this run_shape=workflow guarantee
+    must be enforced by a backend static scan too (precedent: the lens-contract
+    scan above). If this handler ever regresses to a single combined pass, the
+    declared workflow run-shape would silently become declarative-only again.
+    """
+    lens_path = _resolve_panel_review_ts_path()
+    if lens_path is None:
+        pytest.skip("agent/src not available in this test environment")
+    text = lens_path.read_text(encoding="utf-8")
+
+    # The handler iterates the declared lenses and invokes the model inside that
+    # loop — the structural signature of genuine per-lens fan-out.
+    assert "PANEL_REVIEW_LENSES.entries()" in text
+    assert "for (const [index, lens] of PANEL_REVIEW_LENSES.entries())" in text
+    assert "runClaudeCode(" in text
+
+    # Each lens reads its OWN output channel (panel_review_lens_<id>), not one
+    # shared combined verdict file.
+    assert "panel_review_lens_" in text
+    assert "panelReviewLensOutputType" in text
+
+    # A deterministic code-side synthesis aggregates the per-lens passes into the
+    # single structured object the backend gate consumes.
+    assert "synthesizePanelReviewVerdict" in text
+
+    # Fail-closed marker: a crashed or unusable lens must surface honestly.
+    assert "panel_review_lens_failed" in text
+
+    # Guard against regression to the old single combined verdict file written by
+    # the model in one pass.
+    assert "panel_review_verdict_" not in text
