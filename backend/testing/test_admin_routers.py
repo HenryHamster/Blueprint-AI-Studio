@@ -4936,6 +4936,73 @@ class TestNotificationConfigStartupRestore:
                 await conn.run_sync(SQLModel.metadata.drop_all)
             await _engine.dispose()
 
+    @pytest.mark.asyncio
+    async def test_init_deployment_state_degrades_on_commit_lock_timeout(self, mocker):
+        """A contended DeploymentState write during deploy-detection must NOT crash
+        startup. Boot used to die ("Application startup failed. Exiting.") when this
+        commit hit a lock timeout, failing the deploy and pinning prod on the old
+        revision (incident 2026-06-04). It must now degrade and still boot."""
+        from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+        from sqlalchemy.exc import OperationalError
+        from sqlmodel import SQLModel
+        from app.models import DeploymentState, DeploymentStatus
+        from app.main import _init_deployment_state
+        import app.main as _main
+
+        _engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        async with _engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.create_all)
+        _Session = sessionmaker(
+            bind=_engine,
+            class_=AsyncSession,
+            autocommit=False,
+            autoflush=False,
+            expire_on_commit=False,
+        )
+        mocker.patch("app.main.AsyncSessionLocal", _Session)
+
+        # Seed an existing deploy-state on a DIFFERENT revision → the new-deploy
+        # path, which reaches the (previously fatal) detection commit.
+        async with _Session() as session:
+            session.add(
+                DeploymentState(
+                    id=1,
+                    current_revision="old-rev",
+                    current_sha="old-sha",
+                    last_known_good_revision="old-rev",
+                    last_known_good_sha="old-sha",
+                    status=DeploymentStatus.STABLE,
+                )
+            )
+            await session.commit()
+
+        mocker.patch.object(_main, "_current_revision", "new-rev")
+        mocker.patch.object(_main, "_current_sha", "new-sha")
+
+        # Simulate the contended row: the detection commit raises a lock timeout.
+        # (Seeded above before this patch; close()/rollback on context-exit are
+        # unaffected since only commit is patched.)
+        async def _boom(_self):
+            raise OperationalError(
+                "UPDATE deploymentstate", {}, Exception("canceling statement due to lock timeout")
+            )
+
+        mocker.patch.object(AsyncSession, "commit", _boom)
+
+        try:
+            # Must NOT raise — it degrades (logs + rollback) and the app boots.
+            await _init_deployment_state()
+        finally:
+            async with _engine.begin() as conn:
+                await conn.run_sync(SQLModel.metadata.drop_all)
+            await _engine.dispose()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_settings.py — repair-state stuck task persists failure_category
