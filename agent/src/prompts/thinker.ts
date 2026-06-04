@@ -66,7 +66,7 @@ export interface ThinkerPromptParams {
    * so it does not mistake the shortened view for the gap's whole lifetime.
    */
   gapMemoryTrimmedGapIds?: string[];
-  verificationFailuresSection?: string;
+  cycleStartReconciliationSection?: string;
   reflectionSection: string;
   selfImprovementBlock: string;
   runningUpdateSection: string;
@@ -91,8 +91,10 @@ export interface ThinkerPromptParams {
   rejectedProposalsSection: string;
   operatorOverridesSection: string;
   portfolioCompositionText: string;
+  modelHealthSection: string;
   systemMaturitySection: string;
   driftSection: string;
+  linkageAuditSection: string;
   recentWorkSection: string;
   feedbackSection: string;
   threadSection: string;
@@ -146,7 +148,7 @@ ${p.userStateLine}
 ${p.packerMetaSection ? `\n${p.packerMetaSection}\n` : ''}
 ${p.strategicContext ? `\n## Running Context (from prior cycles)\n${p.strategicContext}\n` : ''}
 ${p.problemModelSection}
-${p.verificationFailuresSection ? `\n${p.verificationFailuresSection}\n` : ''}
+${p.cycleStartReconciliationSection ? `\n${p.cycleStartReconciliationSection}\n` : ''}
 
 ${p.reflectionSection}
 
@@ -165,7 +167,7 @@ ${p.dirHealthSummary}
 ${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
 ## Portfolio Composition
 ${p.portfolioCompositionText}
-${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}
+${p.modelHealthSection}${p.systemMaturitySection}${p.driftSection}${p.linkageAuditSection}${p.efficiencySnapshotSection}
 ${p.recentWorkSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 
@@ -202,6 +204,8 @@ Each cycle:
 - \`recommended_mode=ship\` or absent/unknown: normal mode — ship product value.
 - \`recommended_mode=pause\`: the system is blocked externally; do not add new directions to it this cycle.
 On **every** \`create-direction\` and \`update-direction\` call, emit a \`recommended_mode\` field (one of: \`audit\`, \`fundamentals\`, \`ship\`, \`pause\`) that reflects your judgment for that direction's system. Omit only if the direction has no system affiliation.
+
+**Model-size hygiene (soft).** The "Problem-model size (soft signal)" section above (when present) reports how heavy your durable problem_model has grown. Healthy is **<=12 active gaps / <=20 capabilities / <=8 active friction**; a dimension at **>=1.5x** is \`growing\`, **>=2x** is \`large\`, **>=3x** is \`oversized\` (worst dimension wins). When the status is \`large\` or \`oversized\`, the model is getting too big to audit in one pass — **before** opening new gaps or capabilities this cycle, prioritize closing/archiving resolved gaps and consolidating overlapping capabilities to bring it back down. This is a signal to weigh, **never a hard cap**: if a genuinely needed new gap is warranted, still open it. The model grows without bound otherwise, and a model you can't read in one pass is one you can't defend.
 
 ${p.selfImprovementBlock}
 
@@ -283,6 +287,8 @@ rationale: 1 sentence — the observable evidence behind this verdict
 
 Each direction in the "Direction outcomes" section above lists its cumulative confirmed-finding count and recent trend (improving/stable/declining) — use these signals when assessing whether a direction is advancing. A deterministic detector already flags stalled scaffolding on its own, so this verdict is OPTIONAL precision-tuning — only assess directions you have a genuine read on, and skip the section if none qualify. The Executor persists these via \`./strategic set-evidence-progress\`.
 
+**Weight evidence by verification basis.** A direction may carry a \`recent_findings_verification_basis\` distribution (counts of \`code_verified\` / \`path_verified\` / \`pattern_inferred\` / \`deduced\` findings). This records HOW each finding's claim was established, not whether it is implementable. Weight your \`evidence_progress\` read accordingly: a direction whose recent findings are predominantly \`code_verified\`/\`path_verified\` warrants higher confidence that its claimed progress is real than one whose findings are predominantly \`pattern_inferred\`/\`deduced\`. This is purely a WEIGHTING signal, NOT a gate — inferred findings remain valid and are often correct; a heavily-inferred direction is not stalled merely for being inferred.
+
 ## 4. Running update document (for the user)
 Write the full refined running_update as markdown to \`/tmp/running_update_${p.taskId}.md\` (also show it as a code block in your analysis for auditability — the file is the authoritative handoff to the Executor). This is the document the user sees as "project current state" — rewrite, don't append. Under 400 words. Follow the section guidance above.
 
@@ -302,8 +308,10 @@ To intentionally REMOVE an agent-owned entry (not just change its status), add a
 - context: {project_type, users, team, deploy_cadence, notes}
 - constraints: [string]
 - capabilities: [{name, status (working|partial|planned), notes?, source?, backing_paths}]
-- gaps: [{id, name, description, evidence, size, priority, status, tag?, source?, active_moves, past_moves, history}]
+- gaps: [{id, name, description, evidence, size, priority, status, tag?, source?, active_moves, past_moves, history, deferral?}]
 - friction: [{id, name, description, seen_in, status, source?, promoted_to_gap_id?}]
+
+\`deferral\` (optional, on a gap) = {rationale, hold_until?, created_at?} — set it to record that an active gap is **intentionally** unstaffed this cycle ("real, still open, but deliberately not worked now") instead of fabricating a direction just so the gap doesn't look orphaned. Clear it (\`deferral: null\`) when you pick the gap back up. A \`create-direction\`/\`update-direction\` op carries \`gap_id\` to ground the direction to the gap it closes — that linkage is persisted on the direction, so reconciliation can tell which gaps have a working direction, which directions trace to no gap, and which unstaffed gaps are deferred-on-purpose.
 
 For every capability, preserve existing \`backing_paths\` and add repo-relative file paths when the code implementing that capability is known. Emit \`backing_paths: []\` instead of dropping the field when the implementation is still unknown.
 

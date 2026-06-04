@@ -157,6 +157,9 @@ async def query_findings_index(
                     "finding_title": finding.get("title", ""),
                     "finding_description": finding.get("description", ""),
                     "actionability_grade": finding.get("actionability_grade", "MEDIUM"),
+                    "verification_basis": finding.get(
+                        "verification_basis", "pattern_inferred"
+                    ),
                     "claims": finding.get("claims") or [],
                     "sources": finding.get("sources") or [],
                 }

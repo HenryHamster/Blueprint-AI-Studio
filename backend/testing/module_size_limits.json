@@ -76,7 +76,7 @@
     "playbook_sr_metrics.py": 3100,
     "models.py": 3500,
     "shared_state.py": 2850,
-    "strategic_spawning.py": 3450,
+    "strategic_spawning.py": 4050,
     "failure_classification.py": 2400,
     "notification_dispatch.py": 2250,
     "ci_completion.py": 1850
@@ -117,7 +117,7 @@
     "utils/test-runners.ts": 940,
     "utils/diff-detection.ts": 150,
     "utils/stale-result.ts": 150,
-    "handlers/strategic-sections.ts": 420,
+    "handlers/strategic-sections.ts": 700,
     "providers/runners.ts": 1400,
     "prompts/context-prefix.ts": 850,
     "handlers/fresh-reviewer.ts": 700

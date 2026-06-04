@@ -4630,6 +4630,56 @@ async def test_research_history_entry_has_correct_fields(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_research_history_verification_basis_distribution(db_session, mocker):
+    """research_history entry carries a per-direction verification_basis_distribution
+    counting each basis, with missing/invalid coerced to pattern_inferred."""
+    direction_id = "d-vbasis1"
+    direction = {
+        **_active_direction(direction_id, "Verification basis direction"),
+        "research_history": [],
+    }
+    project = Project(
+        name="Verification Basis Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    code_f = {**_make_finding("Code verified finding", direction_id),
+              "verification_basis": "code_verified"}
+    path_f = {**_make_finding("Path verified finding", direction_id),
+              "verification_basis": "path_verified"}
+    missing_f = _make_finding("Missing basis finding", direction_id)
+    invalid_f = {**_make_finding("Invalid basis finding", direction_id),
+                 "verification_basis": "guessed"}
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[code_f, path_f, missing_f, invalid_f],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    updated = next(d for d in project.directions if d["id"] == direction_id)
+    history = updated.get("research_history", [])
+    assert len(history) == 1
+    dist = history[0].get("verification_basis_distribution")
+    assert dist is not None
+    assert dist["code_verified"] == 1
+    assert dist["path_verified"] == 1
+    # Missing + invalid both coerce to pattern_inferred.
+    assert dist["pattern_inferred"] == 2
+    assert dist["deduced"] == 0
+
+
+@pytest.mark.asyncio
 async def test_research_history_capped_at_10_entries(db_session, mocker):
     """research_history is truncated to 10 entries — oldest entry is dropped."""
     direction_id = "d-histcap1"

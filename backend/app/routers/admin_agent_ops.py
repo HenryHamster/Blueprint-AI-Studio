@@ -807,6 +807,11 @@ async def strategic_operation(
             new_dir["system_id"] = _cap_str(
                 data["system_id"], STRATEGIC_SYSTEM_ID_MAX, "system_id", warnings
             )
+        # Persist the direction→gap linkage so reconciliation can map an active
+        # direction back to the problem-model gap it works on. Optional and
+        # string-cast; additive on the JSONB direction dict (no migration).
+        if data.get("gap_id"):
+            new_dir["gap_id"] = str(data["gap_id"])
         if data.get("paths"):
             new_dir["paths"] = data["paths"]
         if data.get("category") and data["category"] in ("product", "structural"):
@@ -922,6 +927,14 @@ async def strategic_operation(
                     mode = _normalize_recommended_mode(changes["recommended_mode"])
                     if mode is not None:
                         d["recommended_mode"] = mode
+                # Allow updating (or clearing) the direction→gap linkage so the
+                # agent can re-ground an existing direction to a different gap.
+                if "gap_id" in changes:
+                    gid = changes["gap_id"]
+                    if gid:
+                        d["gap_id"] = str(gid)
+                    else:
+                        d.pop("gap_id", None)
                 # Handle success_evidence and retirement_condition in context
                 _DIR_FIELD_MAX = 500
                 if "success_evidence" in changes or "retirement_condition" in changes:

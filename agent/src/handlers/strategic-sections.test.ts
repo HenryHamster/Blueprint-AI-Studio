@@ -3,7 +3,9 @@ import {
   fmtScalar,
   buildSystemMaturitySection,
   buildCapabilityVerificationSection,
+  buildCycleStartReconciliationSection,
   buildDriftSection,
+  buildGapDirectionLinkageSection,
   buildOutcomeSection,
   buildClockAndRecentWorkSection,
   buildConversationThreadSection,
@@ -104,6 +106,46 @@ describe('buildDriftSection', () => {
   });
 });
 
+describe('buildGapDirectionLinkageSection', () => {
+  it('returns empty for undefined input', () => {
+    expect(buildGapDirectionLinkageSection(undefined)).toBe('');
+  });
+
+  it('returns empty when both lists are empty', () => {
+    expect(buildGapDirectionLinkageSection({ orphaned_gaps: [], ungrounded_directions: [] })).toBe('');
+  });
+
+  it('renders orphaned gaps', () => {
+    const result = buildGapDirectionLinkageSection({
+      orphaned_gaps: [{ id: 'g-1', name: 'auth hardening' }],
+      ungrounded_directions: [],
+    });
+    expect(result).toContain('## Gap-Direction Alignment');
+    expect(result).toContain('Orphaned gaps');
+    expect(result).toContain('g-1: auth hardening');
+  });
+
+  it('renders ungrounded directions', () => {
+    const result = buildGapDirectionLinkageSection({
+      orphaned_gaps: [],
+      ungrounded_directions: [{ id: 'd-9', text: 'refactor the packer' }],
+    });
+    expect(result).toContain('## Gap-Direction Alignment');
+    expect(result).toContain('Ungrounded directions');
+    expect(result).toContain('d-9: refactor the packer');
+  });
+
+  it('renders both lists when present', () => {
+    const result = buildGapDirectionLinkageSection({
+      orphaned_gaps: [{ id: 'g-2', name: 'memo dedup' }],
+      ungrounded_directions: [{ id: 'd-3', text: 'add telemetry' }],
+    });
+    expect(result).toContain('g-2: memo dedup');
+    expect(result).toContain('d-3: add telemetry');
+    expect(result).toContain('STEERING');
+  });
+});
+
 describe('buildCapabilityVerificationSection', () => {
   it('returns empty when problem model is missing or has no capabilities', () => {
     expect(buildCapabilityVerificationSection(undefined)).toBe('');
@@ -158,6 +200,116 @@ describe('buildCapabilityVerificationSection', () => {
     });
     expect(result).toContain('**notifications** (claimed status: partial): PARTIAL');
     expect(result).toContain('missing: backend/app/notify_worker.py; present: backend/app/notify.py');
+  });
+});
+
+describe('buildCycleStartReconciliationSection', () => {
+  it('returns empty when the reconciliation block is absent', () => {
+    expect(buildCycleStartReconciliationSection(undefined)).toBe('');
+  });
+
+  it('renders the header for an empty (all-consistent) block', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      direction_pipeline: [],
+      counts: {},
+    });
+    expect(result).toContain('## Cycle-start reconciliation (your starting state)');
+    // No conflict subsections when every surface is consistent.
+    expect(result).not.toContain('Capability status contradicted');
+    expect(result).not.toContain('Orphaned active gaps');
+    expect(result).not.toContain('Ungrounded active directions');
+  });
+
+  it('renders capability contradictions with stored-vs-grounded framing', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [{
+        name: 'payments',
+        stored_status: 'working',
+        effective_status: 'absent',
+        missing: ['backend/app/payments.py', 'backend/app/ledger.py'],
+      }],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      direction_pipeline: [],
+      counts: { capability_contradictions: 1 },
+    });
+    expect(result).toContain('Capability status contradicted by code (1)');
+    expect(result).toContain('**payments**: stored=working but code shows ABSENT');
+    expect(result).toContain('missing: backend/app/payments.py, backend/app/ledger.py');
+  });
+
+  it('renders orphaned gaps and ungrounded directions with their reasons', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [{ gap_id: 'g-7', name: 'cross-cycle memory', priority: 'high' }],
+      ungrounded_directions: [
+        { direction_id: 'd-1', text: 'refactor auth', reason: 'no_gap' },
+        { direction_id: 'd-2', text: 'old idea', reason: 'gap_missing' },
+      ],
+      direction_pipeline: [],
+      counts: { orphaned_gaps: 1, ungrounded_directions: 2 },
+    });
+    expect(result).toContain('Orphaned active gaps — open, unstaffed, not deferred (1)');
+    expect(result).toContain('**cross-cycle memory** [high] (gap g-7)');
+    expect(result).toContain('Ungrounded active directions — advance no tracked gap (2)');
+    expect(result).toContain('refactor auth (id: d-1) — no gap_id linkage');
+    expect(result).toContain('old idea (id: d-2) — its gap_id no longer resolves to an active gap');
+  });
+
+  it('splits the research pipeline into waiting / in-progress / idle', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      direction_pipeline: [
+        { direction_id: 'd-w', text: 'waiting dir', state: 'research_waiting_on_action', in_flight: 0, findings: 3 },
+        { direction_id: 'd-p', text: 'busy dir', state: 'tasks_in_progress', in_flight: 2, findings: 0 },
+        { direction_id: 'd-i', text: 'quiet dir', state: 'idle', in_flight: 0, findings: 0 },
+      ],
+      counts: { deferred_gaps: 1, active_directions: 3 },
+    });
+    expect(result).toContain('Research pipeline by direction (1 with tasks in progress, 1 waiting on action, 1 idle; 1 gaps deferred)');
+    expect(result).toContain('waiting dir (id: d-w) — 3 recent finding(s), 0 tasks in flight');
+    expect(result).toContain('busy dir (id: d-p) — 2 task(s) in flight');
+    expect(result).toContain('Idle (no findings, no tasks in flight): quiet dir');
+  });
+
+  it('shows a "+N more" tail when a list was capped below its true total', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [{ gap_id: 'g-1', name: 'shown gap', priority: 'medium' }],
+      ungrounded_directions: [],
+      direction_pipeline: [],
+      counts: { orphaned_gaps: 5 },
+    });
+    expect(result).toContain('Orphaned active gaps — open, unstaffed, not deferred (5)');
+  });
+
+  it('uses true pipeline totals when the per-direction list was capped', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      direction_pipeline: [
+        { direction_id: 'd-w', text: 'shown waiting', state: 'research_waiting_on_action', in_flight: 0, findings: 2 },
+        { direction_id: 'd-p', text: 'shown progress', state: 'tasks_in_progress', in_flight: 1, findings: 0 },
+      ],
+      counts: {
+        deferred_gaps: 0,
+        pipeline_waiting_on_action: 4,
+        pipeline_tasks_in_progress: 3,
+        pipeline_idle: 5,
+        direction_pipeline_overflow: 10,
+      },
+    });
+    expect(result).toContain('Research pipeline by direction (3 with tasks in progress, 4 waiting on action, 5 idle; 0 gaps deferred)');
+    expect(result).toContain('Only the first 2 active directions are listed below (+10 more not shown).');
+    expect(result).toContain('+3 more waiting direction(s) not shown');
+    expect(result).toContain('+2 more in-progress direction(s) not shown');
+    expect(result).toContain('Idle (no findings, no tasks in flight): +5 direction(s) not shown');
   });
 });
 

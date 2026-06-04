@@ -13,11 +13,15 @@ from pydantic import ValidationError
 from app.problem_model import (
     GAP_HISTORY_DURABLE_MAX,
     GAP_PAST_MOVES_DURABLE_MAX,
+    MODEL_SIZE_HEALTHY_CAPABILITIES,
+    MODEL_SIZE_HEALTHY_FRICTION,
+    MODEL_SIZE_HEALTHY_GAPS,
     REVISION_LOG_MAX,
     SELF_REFLECTION_LOG_MAX,
     Capability,
     Friction,
     Gap,
+    GapDeferral,
     Intent,
     ProblemModel,
     ProjectContext,
@@ -28,6 +32,7 @@ from app.problem_model import (
     apply_agent_update,
     apply_user_intent_patch,
     archive_closed_gaps,
+    compute_model_size_signal,
     is_empty,
     parse_problem_model,
 )
@@ -1841,3 +1846,191 @@ def test_source_is_reusable_across_model_elements():
     assert cap.source.pr_number == 42
     assert friction.source.direction_id == "d-7"
     assert gap.source.type == "self_reflection"
+
+
+# Gap.deferral — acknowledged intentional non-staffing
+# ---------------------------------------------------------------------------
+
+
+def test_gap_deferral_defaults_none_and_absent_in_dump():
+    """A gap without a deferral parses fine and serializes with deferral=None —
+    every stored JSONB model and older agent payload validates unchanged."""
+    gap = Gap(id="g-1", name="invoicing")
+    assert gap.deferral is None
+    assert gap.model_dump()["deferral"] is None
+
+
+def test_gap_deferral_validates_and_round_trips():
+    """An explicit deferral validates and survives a model_dump round-trip."""
+    gap = Gap(
+        id="g-1",
+        name="invoicing",
+        deferral=GapDeferral(
+            rationale="Not staffed this cycle — waiting on v6 to open.",
+            hold_until="v6",
+            created_at="2026-06-04T00:00:00",
+        ),
+    )
+    dumped = gap.model_dump()
+    assert dumped["deferral"]["rationale"].startswith("Not staffed")
+    assert dumped["deferral"]["hold_until"] == "v6"
+    reparsed = Gap.model_validate(dumped)
+    assert reparsed.deferral is not None
+    assert reparsed.deferral.hold_until == "v6"
+
+
+def test_gap_deferral_defaults_within_model():
+    """GapDeferral fields are all optional/defaulted so a minimal deferral
+    (rationale only) is valid."""
+    deferral = GapDeferral(rationale="deferred")
+    assert deferral.hold_until is None
+    assert deferral.created_at == ""
+
+
+def test_gap_deferral_survives_apply_agent_update_merge():
+    """A deferral set by the agent threads through apply_agent_update's
+    non-destructive merge (proposed-wins for non-log gap fields)."""
+    current = {
+        "revision": 3,
+        "gaps": [{"id": "g-1", "name": "invoicing", "status": "active"}],
+    }
+    proposed = {
+        "gaps": [
+            {
+                "id": "g-1",
+                "name": "invoicing",
+                "status": "active",
+                "deferral": {
+                    "rationale": "intentionally parked this cycle",
+                    "hold_until": "next-version",
+                },
+            }
+        ]
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-06-04T12:00:00")
+    g = next(g for g in new_raw["gaps"] if g["id"] == "g-1")
+    assert g["deferral"]["rationale"] == "intentionally parked this cycle"
+    assert g["deferral"]["hold_until"] == "next-version"
+
+
+def test_gap_deferral_cleared_by_agent_via_merge():
+    """Clearing the deferral (proposed deferral=None) wins over a prior
+    deferral — the agent picks the gap back up by writing deferral: null."""
+    current = {
+        "revision": 4,
+        "gaps": [
+            {
+                "id": "g-1",
+                "name": "invoicing",
+                "status": "active",
+                "deferral": {"rationale": "parked", "hold_until": "later"},
+            }
+        ],
+    }
+    proposed = {
+        "gaps": [
+            {"id": "g-1", "name": "invoicing", "status": "active", "deferral": None}
+        ]
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-06-04T12:00:00")
+    g = next(g for g in new_raw["gaps"] if g["id"] == "g-1")
+    assert g["deferral"] is None
+
+
+# ---------------------------------------------------------------------------
+# Model size / health signal
+# ---------------------------------------------------------------------------
+
+
+def _gaps(n: int) -> list[Gap]:
+    return [Gap(id=f"g-{i}", name=f"gap {i}") for i in range(n)]
+
+
+def _caps(n: int) -> list[Capability]:
+    return [Capability(name=f"cap-{i}", status="working") for i in range(n)]
+
+
+def _friction(n_active: int, n_other: int = 0) -> list[Friction]:
+    out = [Friction(id=f"f-a{i}", name=f"fa{i}", status="active") for i in range(n_active)]
+    out += [Friction(id=f"f-r{i}", name=f"fr{i}", status="resolved") for i in range(n_other)]
+    return out
+
+
+def test_model_size_signal_empty_is_healthy():
+    sig = compute_model_size_signal(ProblemModel())
+    assert sig["active_gap_count"] == 0
+    assert sig["capability_count"] == 0
+    assert sig["active_friction_count"] == 0
+    assert sig["estimated_token_footprint"] == 0
+    assert sig["model_size_status"] == "healthy"
+
+
+def test_model_size_signal_excludes_archived_gaps():
+    model = ProblemModel(
+        gaps=_gaps(3),
+        archived_gaps=_gaps(50),
+    )
+    sig = compute_model_size_signal(model)
+    # archived_gaps must NOT inflate the active gap count or push the status up.
+    assert sig["active_gap_count"] == 3
+    assert sig["model_size_status"] == "healthy"
+
+
+def test_model_size_signal_counts_only_active_friction():
+    model = ProblemModel(friction=_friction(n_active=2, n_other=40))
+    sig = compute_model_size_signal(model)
+    assert sig["active_friction_count"] == 2
+    assert sig["model_size_status"] == "healthy"
+
+
+def test_model_size_signal_gap_dimension_transitions():
+    h = MODEL_SIZE_HEALTHY_GAPS  # 12
+    # at threshold -> still healthy
+    assert compute_model_size_signal(ProblemModel(gaps=_gaps(h)))["model_size_status"] == "healthy"
+    # 1.5x -> growing
+    assert (
+        compute_model_size_signal(ProblemModel(gaps=_gaps(int(h * 1.5))))["model_size_status"]
+        == "growing"
+    )
+    # 2x -> large
+    assert (
+        compute_model_size_signal(ProblemModel(gaps=_gaps(h * 2)))["model_size_status"] == "large"
+    )
+    # 3x -> oversized
+    assert (
+        compute_model_size_signal(ProblemModel(gaps=_gaps(h * 3)))["model_size_status"]
+        == "oversized"
+    )
+
+
+def test_model_size_signal_capability_dimension_transitions():
+    h = MODEL_SIZE_HEALTHY_CAPABILITIES  # 20
+    assert compute_model_size_signal(ProblemModel(capabilities=_caps(h)))["model_size_status"] == "healthy"
+    assert compute_model_size_signal(ProblemModel(capabilities=_caps(int(h * 1.5))))["model_size_status"] == "growing"
+    assert compute_model_size_signal(ProblemModel(capabilities=_caps(h * 2)))["model_size_status"] == "large"
+    assert compute_model_size_signal(ProblemModel(capabilities=_caps(h * 3)))["model_size_status"] == "oversized"
+
+
+def test_model_size_signal_friction_dimension_transitions():
+    h = MODEL_SIZE_HEALTHY_FRICTION  # 8
+    assert compute_model_size_signal(ProblemModel(friction=_friction(h)))["model_size_status"] == "healthy"
+    assert compute_model_size_signal(ProblemModel(friction=_friction(int(h * 1.5))))["model_size_status"] == "growing"
+    assert compute_model_size_signal(ProblemModel(friction=_friction(h * 2)))["model_size_status"] == "large"
+    assert compute_model_size_signal(ProblemModel(friction=_friction(h * 3)))["model_size_status"] == "oversized"
+
+
+def test_model_size_signal_worst_dimension_wins():
+    # gaps healthy, capabilities healthy, friction oversized -> overall oversized
+    model = ProblemModel(
+        gaps=_gaps(2),
+        capabilities=_caps(2),
+        friction=_friction(MODEL_SIZE_HEALTHY_FRICTION * 3),
+    )
+    assert compute_model_size_signal(model)["model_size_status"] == "oversized"
+
+
+def test_model_size_signal_footprint_positive_and_monotonic():
+    small = compute_model_size_signal(ProblemModel(gaps=_gaps(2)))["estimated_token_footprint"]
+    big = compute_model_size_signal(ProblemModel(gaps=_gaps(10)))["estimated_token_footprint"]
+    assert small > 0
+    assert big > small

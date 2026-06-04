@@ -286,6 +286,13 @@ async def apply_post_spawn_state(
             # for filtered_findings bucketing.
             findings_produced_by_dir: dict = {}
             grade_dist_by_dir: dict = {}
+            basis_dist_by_dir: dict = {}
+            _valid_bases = (
+                "code_verified",
+                "path_verified",
+                "pattern_inferred",
+                "deduced",
+            )
             for _f in findings:
                 _did = _f.get("direction_id") or current_direction_id
                 if _did:
@@ -299,6 +306,19 @@ async def apply_post_spawn_state(
                         _did, {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
                     )
                     _gd[_g] = _gd.get(_g, 0) + 1
+                    _vb = _f.get("verification_basis", "pattern_inferred")
+                    if _vb not in _valid_bases:
+                        _vb = "pattern_inferred"
+                    _bd = basis_dist_by_dir.setdefault(
+                        _did,
+                        {
+                            "code_verified": 0,
+                            "path_verified": 0,
+                            "pattern_inferred": 0,
+                            "deduced": 0,
+                        },
+                    )
+                    _bd[_vb] = _bd.get(_vb, 0) + 1
             for d in directions:
                 did = d.get("id")
                 if did in direction_ids_with_findings:
@@ -313,6 +333,7 @@ async def apply_post_spawn_state(
                     titles = finding_titles_by_dir.get(did, [])[:3]
                     descriptions = finding_descriptions_by_dir.get(did, [])[:3]
                     _dir_grade_dist = grade_dist_by_dir.get(did)
+                    _dir_basis_dist = basis_dist_by_dir.get(did)
                     entry = {
                         "timestamp": now_iso,
                         "task_id": str(task.id),
@@ -327,6 +348,11 @@ async def apply_post_spawn_state(
                         **(
                             {"grade_distribution": _dir_grade_dist}
                             if _dir_grade_dist
+                            else {}
+                        ),
+                        **(
+                            {"verification_basis_distribution": _dir_basis_dist}
+                            if _dir_basis_dist
                             else {}
                         ),
                         "filter_breakdown": {

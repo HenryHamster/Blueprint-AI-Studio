@@ -1824,6 +1824,7 @@ implementation findings. Add metadata alongside them when relevant.
   "risk": "low|medium|high",
   "priority": "high|medium|low",
   "actionability_grade": "HIGH|MEDIUM|LOW",
+  "verification_basis": "code_verified|path_verified|pattern_inferred|deduced",
   "related_files": ["path/to/file.py"],
   "depends_on_indices": [],
   "direction_id": "d-xxx or null",
@@ -1841,6 +1842,12 @@ implementation findings. Add metadata alongside them when relevant.
 - HIGH: problem statement is clear, desired outcome is clear, related files identified, no major unknowns blocking implementation.
 - MEDIUM: problem clear but solution path uncertain, OR small unknowns the implementer can resolve with brief exploration.
 - LOW: vague or exploratory, or requires sub-research before code can land. Consider emitting a research sub-finding instead.
+
+**verification_basis rubric** (OPTIONAL — defaults to pattern_inferred when omitted): how you established the underlying claim, i.e. the STRENGTH OF EVIDENCE behind it. This is ORTHOGONAL to actionability_grade — actionability_grade is about how implementable the finding is, verification_basis is about how well-evidenced the claim is. A finding can be HIGH actionability but only pattern_inferred, or LOW actionability but code_verified. Do not conflate them.
+- code_verified: you read the actual source and confirmed the claim directly.
+- path_verified: you confirmed the relevant file paths are present/absent via the file tree, but did not read their contents.
+- pattern_inferred: structural inference from naming/architecture patterns, with no direct inspection. This is the default — use it (or omit the field) when uncertain.
+- deduced: derived from adjacent evidence (e.g. another finding, a log line) without directly inspecting the subject.
 
 Scope: small (<50 lines, 1 file), medium (2-5 files, 50-200 lines), large (cross-component, 200+ lines).
 Risk: low (cosmetic), medium (logic/endpoints), high (core logic, auth, data models).

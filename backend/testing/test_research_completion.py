@@ -322,6 +322,73 @@ class TestActionabilityGradeNormalization:
         assert structural_grade == "LOW"
 
 
+class TestVerificationBasisNormalization:
+    """Normalization step: missing or invalid verification_basis defaults to
+    pattern_inferred (the lowest-evidence tier); a non-missing invalid value
+    is logged just like the actionability_grade path."""
+
+    _VALID = {"code_verified", "path_verified", "pattern_inferred", "deduced"}
+
+    def _normalize(self, findings: list) -> list:
+        """Simulate the verification_basis normalization loop in
+        research_completion.py (logging warning only for non-missing invalids)."""
+        logger = logging.getLogger("app.research_completion")
+        result = [dict(f) for f in findings]
+        for _f in result:
+            _vb = _f.get("verification_basis")
+            if _vb not in self._VALID:
+                if _vb is not None:
+                    logger.warning(
+                        "[RESEARCH] Finding '%s' has invalid verification_basis=%r; "
+                        "defaulting to pattern_inferred",
+                        _f.get("title", "<untitled>"),
+                        _vb,
+                    )
+                _f["verification_basis"] = "pattern_inferred"
+        return result
+
+    def test_missing_basis_defaults_to_pattern_inferred(self, caplog):
+        findings = [{"title": "no-basis"}]
+        with caplog.at_level(logging.WARNING, logger="app.research_completion"):
+            normalized = self._normalize(findings)
+        assert normalized[0]["verification_basis"] == "pattern_inferred"
+        # Missing (not invalid) values are NOT warned about.
+        assert "invalid verification_basis" not in caplog.text
+
+    def test_invalid_basis_defaults_to_pattern_inferred_with_warning(self, caplog):
+        findings = [{"title": "bad-basis", "verification_basis": "guessed"}]
+        with caplog.at_level(logging.WARNING, logger="app.research_completion"):
+            normalized = self._normalize(findings)
+        assert normalized[0]["verification_basis"] == "pattern_inferred"
+        assert "invalid verification_basis" in caplog.text
+
+    def test_none_basis_defaults_to_pattern_inferred(self):
+        findings = [{"title": "none-basis", "verification_basis": None}]
+        normalized = self._normalize(findings)
+        assert normalized[0]["verification_basis"] == "pattern_inferred"
+
+    def test_each_valid_basis_passes_through(self):
+        for basis in self._VALID:
+            findings = [{"title": basis, "verification_basis": basis}]
+            normalized = self._normalize(findings)
+            assert normalized[0]["verification_basis"] == basis
+
+    def test_mixed_batch_normalization(self):
+        findings = [
+            {"title": "code", "verification_basis": "code_verified"},
+            {"title": "missing"},
+            {"title": "path", "verification_basis": "path_verified"},
+            {"title": "invalid", "verification_basis": "BOGUS"},
+            {"title": "deduced", "verification_basis": "deduced"},
+        ]
+        normalized = self._normalize(findings)
+        assert normalized[0]["verification_basis"] == "code_verified"
+        assert normalized[1]["verification_basis"] == "pattern_inferred"
+        assert normalized[2]["verification_basis"] == "path_verified"
+        assert normalized[3]["verification_basis"] == "pattern_inferred"
+        assert normalized[4]["verification_basis"] == "deduced"
+
+
 class TestSourceRefParsing:
     """Parsing of file source refs into (path, start_line, end_line)."""
 

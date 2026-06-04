@@ -158,6 +158,31 @@ class GapHistoryEvent(BaseModel):
     note: str | None = None
 
 
+class GapDeferral(BaseModel):
+    """An acknowledged, intentional decision to NOT staff a gap this cycle.
+
+    Lets the strategist record "this gap is real and still open, but we are
+    deliberately not working on it right now" without fabricating a direction
+    just to keep the gap from looking orphaned in the reconciliation view. An
+    active gap carrying a ``deferral`` is *intentionally* without an active
+    direction — distinct from a gap that drifted unstaffed by neglect.
+
+    Default-empty and optional so every stored JSONB model and older agent
+    payload validates unchanged. The agent clears it (sets ``deferral`` back to
+    ``None`` via a model write) when it picks the gap back up.
+    """
+
+    rationale: str = ""
+    """Why the gap is intentionally unstaffed this cycle."""
+
+    hold_until: str | None = None
+    """Optional ISO-8601 (or free-form milestone) marking when to revisit —
+    e.g. a date, a version tag, or a condition the agent will re-evaluate."""
+
+    created_at: str = ""
+    """ISO-8601 when the deferral was recorded."""
+
+
 class Gap(BaseModel):
     """A specific delta between intent and capabilities.
 
@@ -198,6 +223,15 @@ class Gap(BaseModel):
     """direction_ids that previously worked on this gap (merged or failed)."""
 
     history: list[GapHistoryEvent] = Field(default_factory=list)
+
+    deferral: GapDeferral | None = None
+    """Set when the gap is intentionally left unstaffed this cycle (see
+    :class:`GapDeferral`). ``None`` means the gap is either being actively
+    worked (has ``active_moves``) or is a genuine orphan — the reconciliation
+    view distinguishes a deferred gap from a drifted one by this field. As a
+    plain proposed-wins field it threads through :func:`_merge_gap` and
+    ``apply_agent_update`` with no extra merge logic: the agent sets it to
+    record a deferral and clears it (``None``) when it resumes the gap."""
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +490,110 @@ def append_self_reflection(
     if len(log) > SELF_REFLECTION_LOG_MAX:
         log = log[-SELF_REFLECTION_LOG_MAX:]
     return log
+
+
+# ---------------------------------------------------------------------------
+# Model size / health signal
+# ---------------------------------------------------------------------------
+
+MODEL_SIZE_HEALTHY_GAPS = 12
+"""At or below this many ACTIVE gaps (archived excluded) the gap dimension is
+``healthy``. Chosen so the thinker can audit every active gap in one pass."""
+
+MODEL_SIZE_HEALTHY_CAPABILITIES = 20
+"""At or below this many capabilities the capability dimension is ``healthy``."""
+
+MODEL_SIZE_HEALTHY_FRICTION = 8
+"""At or below this many ACTIVE friction items (status=='active') the friction
+dimension is ``healthy``."""
+
+MODEL_SIZE_GROWING_MULTIPLIER = 1.5
+"""A dimension at >= 1.5x its healthy threshold is at least ``growing``."""
+
+MODEL_SIZE_LARGE_MULTIPLIER = 2.0
+"""A dimension at >= 2x its healthy threshold is at least ``large``."""
+
+MODEL_SIZE_OVERSIZED_MULTIPLIER = 3.0
+"""A dimension at >= 3x its healthy threshold is ``oversized``."""
+
+ModelSizeStatus = Literal["healthy", "growing", "large", "oversized"]
+
+# Per-entry token weights for the APPROXIMATE footprint estimate. These are
+# deliberately round order-of-magnitude guesses, NOT measured token counts —
+# the estimate exists only to give the thinker a rough sense of how heavy the
+# model is to read, never as a precise budget. A gap costs a base (name +
+# description + evidence) plus a per-history-event increment; capabilities and
+# friction items each cost a flat approximate amount.
+_TOKENS_PER_GAP_BASE = 60
+_TOKENS_PER_GAP_HISTORY_ENTRY = 20
+_TOKENS_PER_CAPABILITY = 25
+_TOKENS_PER_FRICTION = 30
+
+
+def _dimension_status(count: int, healthy: int) -> ModelSizeStatus:
+    """Classify one dimension against its healthy threshold and the shared
+    growing/large/oversized multipliers. Worst-case ordering is
+    healthy < growing < large < oversized."""
+    if count >= healthy * MODEL_SIZE_OVERSIZED_MULTIPLIER:
+        return "oversized"
+    if count >= healthy * MODEL_SIZE_LARGE_MULTIPLIER:
+        return "large"
+    if count >= healthy * MODEL_SIZE_GROWING_MULTIPLIER:
+        return "growing"
+    return "healthy"
+
+
+def compute_model_size_signal(model: ProblemModel) -> dict[str, Any]:
+    """Compute a SOFT size/health signal for a problem model.
+
+    Pure and side-effect-free — takes a parsed :class:`ProblemModel` (the
+    DURABLE model, not the trimmed agent view, so counts are honest) and
+    returns a small dict the strategic payload injects under ``model_health``:
+
+      - ``active_gap_count`` — number of active gaps (``archived_gaps`` excluded)
+      - ``capability_count`` — number of capabilities
+      - ``active_friction_count`` — friction items with ``status == 'active'``
+      - ``estimated_token_footprint`` — an EXPLICITLY APPROXIMATE estimate of how
+        many tokens the model costs to read (see the ``_TOKENS_PER_*`` weights);
+        do not treat it as precise
+      - ``model_size_status`` — worst-dimension-wins classification, one of
+        ``healthy`` / ``growing`` / ``large`` / ``oversized``
+
+    The status is purely advisory: it tells the thinker the model is getting
+    expensive to audit, never a hard cap that blocks opening new gaps. The
+    healthy thresholds and multipliers are exported as module constants so the
+    agent prompt can cite the same numbers.
+    """
+    active_gaps = model.gaps  # gaps already excludes archived_gaps
+    active_gap_count = len(active_gaps)
+    capability_count = len(model.capabilities)
+    active_friction_count = sum(1 for f in model.friction if f.status == "active")
+
+    # Approximate token footprint — monotonic in gap count via the per-gap base.
+    estimated_token_footprint = (
+        sum(
+            _TOKENS_PER_GAP_BASE + len(g.history) * _TOKENS_PER_GAP_HISTORY_ENTRY
+            for g in active_gaps
+        )
+        + capability_count * _TOKENS_PER_CAPABILITY
+        + active_friction_count * _TOKENS_PER_FRICTION
+    )
+
+    statuses = (
+        _dimension_status(active_gap_count, MODEL_SIZE_HEALTHY_GAPS),
+        _dimension_status(capability_count, MODEL_SIZE_HEALTHY_CAPABILITIES),
+        _dimension_status(active_friction_count, MODEL_SIZE_HEALTHY_FRICTION),
+    )
+    order: list[ModelSizeStatus] = ["healthy", "growing", "large", "oversized"]
+    model_size_status = max(statuses, key=order.index)
+
+    return {
+        "active_gap_count": active_gap_count,
+        "capability_count": capability_count,
+        "active_friction_count": active_friction_count,
+        "estimated_token_footprint": estimated_token_footprint,
+        "model_size_status": model_size_status,
+    }
 
 
 def is_empty(model: ProblemModel) -> bool:

@@ -149,6 +149,7 @@ def _trim_finding_for_memo(finding: Dict[str, Any]) -> Dict[str, Any]:
         "risk",
         "priority",
         "actionability_grade",
+        "verification_basis",
         "direction_id",
     ):
         val = finding.get(key)
@@ -826,6 +827,29 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 _g,
             )
             _f["actionability_grade"] = "MEDIUM"
+
+    # Normalize verification_basis: how the finding's claim was established
+    # (evidence strength), orthogonal to actionability_grade (implementability).
+    # Any missing or invalid value defaults to the lowest-evidence tier
+    # (pattern_inferred) so legacy findings are never mis-promoted. A non-missing
+    # invalid value is logged just like the grade path.
+    _valid_bases = {
+        "code_verified",
+        "path_verified",
+        "pattern_inferred",
+        "deduced",
+    }
+    for _f in findings:
+        _vb = _f.get("verification_basis")
+        if _vb not in _valid_bases:
+            if _vb is not None:
+                logger.warning(
+                    "[RESEARCH] Finding '%s' has invalid verification_basis=%r; "
+                    "defaulting to pattern_inferred",
+                    _f.get("title", "<untitled>"),
+                    _vb,
+                )
+            _f["verification_basis"] = "pattern_inferred"
 
     # Resolve the project's real integration-branch verification context once so
     # file-type source refs validate against the GitHub tree rather than a local

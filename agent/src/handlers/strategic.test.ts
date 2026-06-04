@@ -88,8 +88,13 @@ vi.mock('./research-plan.js', () => ({
 
 vi.mock('./strategic-sections.js', () => ({
   buildSystemMaturitySection: () => '',
-  buildCapabilityVerificationSection: () => '',
+  // Echo presence so wiring tests can assert the handler passes
+  // payload.cycle_start_reconciliation through to this builder.
+  buildCycleStartReconciliationSection: (recon: Record<string, unknown> | undefined) =>
+    recon ? `RECON(${Object.keys(recon).length})` : '',
+  buildModelHealthSection: () => '',
   buildDriftSection: () => '',
+  buildGapDirectionLinkageSection: () => '',
   buildOutcomeSection: () => '',
   buildClockAndRecentWorkSection: () => ({ clockHeader: '', recentWorkSection: '' }),
   buildConversationThreadSection: () => '',
@@ -237,6 +242,38 @@ describe('handleStrategic operator_overrides wiring', () => {
 
     const params = capturedThinkerParams;
     expect(params?.operatorOverridesSection).toBe('');
+  });
+});
+
+describe('handleStrategic cycle_start_reconciliation wiring', () => {
+  beforeEach(() => {
+    capturedThinkerParams = undefined;
+  });
+
+  it('threads payload.cycle_start_reconciliation into the thinker params', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      cycle_start_reconciliation: {
+        capability_contradictions: [],
+        orphaned_gaps: [{ gap_id: 'g-1', name: 'x' }],
+        ungrounded_directions: [],
+        direction_pipeline: [],
+        counts: { active_directions: 3 },
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-recon', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const params = capturedThinkerParams;
+    expect(params?.cycleStartReconciliationSection).toBe('RECON(5)');
+  });
+
+  it('passes an empty section when cycle_start_reconciliation is absent', async () => {
+    const payload: Record<string, unknown> = { project_name: 'Blueprint' };
+    const statusRef = { value: '' };
+    await handleStrategic('task-recon-empty', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(capturedThinkerParams?.cycleStartReconciliationSection).toBe('');
   });
 });
 

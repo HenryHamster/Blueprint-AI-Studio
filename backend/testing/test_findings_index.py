@@ -135,3 +135,34 @@ class TestQueryFindingsIndexSmoke:
         assert len(rows) == 1
         assert rows[0]["finding_title"] == "Finding A"
         assert rows[0]["direction_id"] == "d-1"
+        # actionability_grade is exported verbatim; verification_basis is added
+        # for consistency and defaults to pattern_inferred for legacy findings
+        # that carry no such field.
+        assert rows[0]["actionability_grade"] == "HIGH"
+        assert rows[0]["verification_basis"] == "pattern_inferred"
+
+    @pytest.mark.asyncio
+    async def test_verification_basis_exported_when_present(self):
+        from app.findings_index import query_findings_index
+        from app.models import TaskStatus
+
+        task = MagicMock()
+        task.id = "t-2"
+        task.status = TaskStatus.COMPLETED
+        task.context = {"direction_id": "d-2"}
+        task.created_at = None
+        task.first_payload = {"type": "research"}
+        task.plan_output = [
+            {
+                "title": "Finding B",
+                "description": "desc",
+                "actionability_grade": "MEDIUM",
+                "verification_basis": "code_verified",
+            }
+        ]
+
+        session = self._mock_session([task])
+        rows = await query_findings_index(session, "proj-2")
+
+        assert len(rows) == 1
+        assert rows[0]["verification_basis"] == "code_verified"

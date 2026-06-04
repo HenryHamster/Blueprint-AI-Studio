@@ -3096,6 +3096,118 @@ async def test_dedup_reasoning_persisted_on_successful_create_fallback_path(
 
 
 @pytest.mark.asyncio
+async def test_gap_id_persisted_on_create_fallback_path(db_session, mocker):
+    """The fallback (legacy parse) create path persists gap_id, mirroring the
+    HTTP create_direction op."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="GAPLINK-FB-CREATE",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "create",
+                    "text": "Close the metering gap",
+                    "priority": "high",
+                    "gap_id": "g-metering",
+                    "success_evidence": "Metering accurate",
+                    "retirement_condition": "No open metering bugs",
+                }
+            ],
+        }
+    )
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    dirs = [d for d in (project.directions or []) if "metering" in d.get("text", "")]
+    assert len(dirs) == 1, "Direction should have been created"
+    assert dirs[0].get("gap_id") == "g-metering"
+
+
+@pytest.mark.asyncio
+async def test_gap_id_updated_on_update_fallback_path(db_session, mocker):
+    """The fallback update path sets the gap_id linkage on an existing direction."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="GAPLINK-FB-UPDATE",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-fb",
+                "text": "Existing direction",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-fb",
+                    "changes": {"gap_id": "g-linked"},
+                }
+            ],
+        }
+    )
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    d = next(d for d in project.directions if d.get("id") == "d-fb")
+    assert d.get("gap_id") == "g-linked"
+
+
+@pytest.mark.asyncio
 async def test_absent_dedup_reasoning_no_error_on_create(db_session, mocker):
     """Omitting dedup_reasoning entirely causes no error — direction is created normally."""
     import json
@@ -4650,6 +4762,154 @@ async def test_api_path_overlap_retired_direction_creates_advisory(
         (n.get("text") or "").startswith("Advisory: resembles existing direction")
         for n in notes
     ), "Created direction should carry an advisory-resemblance note"
+
+
+@pytest.mark.asyncio
+async def test_api_path_create_direction_persists_gap_id(client, db_session, mocker):
+    """HTTP create_direction persists the gap_id linkage on the new direction so
+    reconciliation can map it back to the problem-model gap it works on."""
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    project = Project(
+        name="GAPLINK-CREATE-HTTP",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-gaplink",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-gaplink", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "create_direction",
+            "data": {
+                "text": "Close the invoicing gap",
+                "priority": "high",
+                "gap_id": "g-invoicing",
+                "rationale": "linked to gap",
+                "success_evidence": "Invoices generate correctly",
+                "retirement_condition": "No open invoicing bugs",
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    new_id = resp.json().get("direction_id")
+    assert new_id
+
+    await db_session.refresh(project)
+    created = next(d for d in project.directions if d.get("id") == new_id)
+    assert created.get("gap_id") == "g-invoicing"
+
+
+@pytest.mark.asyncio
+async def test_api_path_update_direction_sets_and_clears_gap_id(
+    client, db_session, mocker
+):
+    """HTTP update_direction can set the gap_id linkage on an existing direction
+    and clear it again (empty/None removes the key)."""
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    project = Project(
+        name="GAPLINK-UPDATE-HTTP",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-link",
+                "text": "Existing direction",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-gaplink-up",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-gaplink-up", task_type="strategic_review"
+    )
+
+    # Set the gap_id.
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-link",
+                "changes": {"gap_id": "g-new"},
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    await db_session.refresh(project)
+    d = next(d for d in project.directions if d.get("id") == "d-link")
+    assert d.get("gap_id") == "g-new"
+
+    # Clear it.
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-link",
+                "changes": {"gap_id": None},
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    await db_session.refresh(project)
+    d = next(d for d in project.directions if d.get("id") == "d-link")
+    assert "gap_id" not in d
 
 
 @pytest.mark.asyncio

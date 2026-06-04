@@ -2554,6 +2554,11 @@ async def _handle_strategic_completion(
                         new_dir["context"]["dedup_reasoning"] = dr
                 if op_entry.get("source"):
                     new_dir["source"] = str(op_entry["source"])[:64]
+                # Persist the direction→gap linkage (mirrors the API write path
+                # in admin_agent_ops.create_direction) so reconciliation can map
+                # an active direction back to its problem-model gap.
+                if op_entry.get("gap_id"):
+                    new_dir["gap_id"] = str(op_entry["gap_id"])
                 if op_entry.get("paths"):
                     new_dir["paths"] = op_entry["paths"]
                 raw_category = op_entry.get("category")
@@ -2644,6 +2649,14 @@ async def _handle_strategic_completion(
                             d["priority"] = changes["priority"]
                         if "paths" in changes:
                             d["paths"] = changes["paths"]
+                        # Update (or clear) the direction→gap linkage (mirrors the
+                        # API update_direction path in admin_agent_ops).
+                        if "gap_id" in changes:
+                            gid = changes["gap_id"]
+                            if gid:
+                                d["gap_id"] = str(gid)
+                            else:
+                                d.pop("gap_id", None)
                         if "system_id" in changes:
                             if changes["system_id"]:
                                 sid_new = str(changes["system_id"])

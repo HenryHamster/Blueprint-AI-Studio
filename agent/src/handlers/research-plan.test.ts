@@ -2058,6 +2058,19 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     expect(p).toContain('actionability_grade');
   });
 
+  it('handleResearch prompt contains verification_basis schema field, all four enum values, and the orthogonality note', async () => {
+    await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('verification_basis');
+    expect(p).toContain('code_verified');
+    expect(p).toContain('path_verified');
+    expect(p).toContain('pattern_inferred');
+    expect(p).toContain('deduced');
+    // Orthogonal to actionability_grade and optional with a pattern_inferred default.
+    expect(p).toContain('ORTHOGONAL');
+    expect(p).toContain('defaults to pattern_inferred');
+  });
+
   it('handleResearch prompt contains /tmp/research_progress_ second output file', async () => {
     await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
     const p = vi.mocked(runClaudeCode).mock.calls[0][0];

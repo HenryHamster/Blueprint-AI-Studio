@@ -61,8 +61,10 @@ describe('buildThinkerPrompt', () => {
     rejectedProposalsSection: '',
     operatorOverridesSection: '',
     portfolioCompositionText: 'No active directions — portfolio is empty.',
+    modelHealthSection: '',
     systemMaturitySection: '',
     driftSection: '',
+    linkageAuditSection: '',
     recentWorkSection: '',
     feedbackSection: '',
     threadSection: '',
@@ -93,6 +95,17 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('## 6. Problem model');
   });
 
+  it('documents the gap deferral shape and the direction→gap linkage', () => {
+    const prompt = buildThinkerPrompt(base);
+    // Gap quick-reference lists the optional deferral field.
+    expect(prompt).toContain('deferral?');
+    // The deferral gloss explains intentional non-staffing and how to clear it.
+    expect(prompt).toContain('{rationale, hold_until?, created_at?}');
+    expect(prompt).toContain('intentionally');
+    // The gap_id linkage on direction ops is documented for reconciliation.
+    expect(prompt).toContain('gap_id');
+  });
+
   it('section ordering is stable: key sections appear in expected sequence', () => {
     const prompt = buildThinkerPrompt(base);
     const idx = (s: string) => prompt.indexOf(s);
@@ -106,20 +119,22 @@ describe('buildThinkerPrompt', () => {
     expect(idx('## 1. State assessment')).toBeLessThan(idx('## 6. Problem model'));
   });
 
-  it('renders verificationFailuresSection before # Your job when provided', () => {
+  it('renders cycleStartReconciliationSection after the problem_model and before # Your job', () => {
     const prompt = buildThinkerPrompt({
       ...base,
-      verificationFailuresSection: '\n## Capability Verification (advisory)\nflagged capability\n',
+      cycleStartReconciliationSection: '\n## Cycle-start reconciliation (your starting state)\nflagged conflict\n',
     });
-    const verificationIdx = prompt.indexOf('## Capability Verification (advisory)');
+    const reconIdx = prompt.indexOf('## Cycle-start reconciliation (your starting state)');
+    const modelIdx = prompt.indexOf('## Your current understanding (problem_model)');
     const jobIdx = prompt.indexOf('# Your job');
-    expect(verificationIdx).toBeGreaterThan(-1);
-    expect(verificationIdx).toBeLessThan(jobIdx);
+    expect(reconIdx).toBeGreaterThan(-1);
+    expect(reconIdx).toBeGreaterThan(modelIdx);
+    expect(reconIdx).toBeLessThan(jobIdx);
   });
 
-  it('omits verificationFailuresSection when empty', () => {
-    const prompt = buildThinkerPrompt({ ...base, verificationFailuresSection: '' });
-    expect(prompt).not.toContain('## Capability Verification (advisory)');
+  it('omits cycleStartReconciliationSection when empty', () => {
+    const prompt = buildThinkerPrompt({ ...base, cycleStartReconciliationSection: '' });
+    expect(prompt).not.toContain('## Cycle-start reconciliation');
   });
 
   it('problem_model section uses bootstrap text when problemModelSection signals empty', () => {
@@ -199,6 +214,21 @@ describe('buildThinkerPrompt', () => {
     expect(without).not.toContain('## System Maturity');
   });
 
+  it('model health section rendered only when modelHealthSection is non-empty', () => {
+    const with_ = buildThinkerPrompt({ ...base, modelHealthSection: '\n## Problem-model size (soft signal)\nStatus: **large**\n' });
+    expect(with_).toContain('## Problem-model size (soft signal)');
+
+    const without = buildThinkerPrompt({ ...base, modelHealthSection: '' });
+    expect(without).not.toContain('## Problem-model size (soft signal)');
+  });
+
+  it('includes standing model-size hygiene guidance citing thresholds', () => {
+    const prompt = buildThinkerPrompt(base);
+    expect(prompt).toContain('Model-size hygiene (soft)');
+    expect(prompt).toContain('<=12 active gaps');
+    expect(prompt).toContain('never a hard cap');
+  });
+
   it('staged directions section rendered only when stagedDirectionsSection is non-empty', () => {
     const with_ = buildThinkerPrompt({ ...base, stagedDirectionsSection: '## Staged for next version\n- d-x [high] — work (auto-activates when v3 promotes)' });
     expect(with_).toContain('## Staged for next version');
@@ -228,6 +258,14 @@ describe('buildThinkerPrompt', () => {
 
     const without = buildThinkerPrompt({ ...base, driftSection: '' });
     expect(without).not.toContain('## Drift Signals');
+  });
+
+  it('gap-direction linkage section rendered only when linkageAuditSection is non-empty', () => {
+    const with_ = buildThinkerPrompt({ ...base, linkageAuditSection: '\n## Gap-Direction Alignment\norphaned\n' });
+    expect(with_).toContain('## Gap-Direction Alignment');
+
+    const without = buildThinkerPrompt({ ...base, linkageAuditSection: '' });
+    expect(without).not.toContain('## Gap-Direction Alignment');
   });
 
   it('running_update superseded note rendered only when runningUpdateSupersededSection is non-empty', () => {
@@ -530,8 +568,10 @@ describe('buildThinkerPrompt on_automain annotation', () => {
     rejectedProposalsSection: '',
     operatorOverridesSection: '',
     portfolioCompositionText: 'No active directions — portfolio is empty.',
+    modelHealthSection: '',
     systemMaturitySection: '',
     driftSection: '',
+    linkageAuditSection: '',
     recentWorkSection: '',
     feedbackSection: '',
     threadSection: '',
@@ -587,8 +627,10 @@ describe('buildThinkerPrompt + renderStrategicPromptSuffix (strategic handler co
     rejectedProposalsSection: '',
     operatorOverridesSection: '',
     portfolioCompositionText: 'No active directions — portfolio is empty.',
+    modelHealthSection: '',
     systemMaturitySection: '',
     driftSection: '',
+    linkageAuditSection: '',
     recentWorkSection: '',
     feedbackSection: '',
     threadSection: '',

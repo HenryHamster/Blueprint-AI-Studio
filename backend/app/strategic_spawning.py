@@ -29,6 +29,7 @@ from app.models import (
 )
 from app.payload_schemas import pack_under_budget, validate_internal_payload
 from app.problem_model import REJECTED_AGENT_EDITS_KEY as PM_REJECTED_EDITS_KEY
+from app.problem_model import compute_model_size_signal, parse_problem_model
 from app.running_update_merge import RUNNING_UPDATE_REJECTED_KIND
 from app.source_ref_validation import (
     classify_existing_paths,
@@ -127,6 +128,30 @@ def _agent_view_design_doc(doc: dict | None) -> dict:
 _GAP_HISTORY_KEEP = 5
 _GAP_PAST_MOVES_KEEP = 5
 _GAP_EVIDENCE_KEEP = 8
+
+
+def _compute_model_health(pm: dict | None) -> dict | None:
+    """Fail-open wrapper around :func:`compute_model_size_signal`.
+
+    Computes the soft model size/health signal from the DURABLE problem_model
+    (honest pre-trim counts). Returns ``None`` when the durable blob fails strict
+    schema validation (``parse_problem_model`` raises ``ValidationError`` on a
+    malformed model) so a legacy/loose stored model never crashes strategic
+    spawning — the signal is advisory, so omitting it on parse failure is the
+    safe degradation. Callers conditionally include the key only when non-None.
+    """
+    if not pm:
+        # Empty/absent durable model — report an honest 'healthy' zero signal.
+        return compute_model_size_signal(parse_problem_model(None))
+    try:
+        return compute_model_size_signal(parse_problem_model(pm))
+    except Exception:
+        logger.warning(
+            "[STRATEGIC] could not compute model_health (durable problem_model "
+            "failed strict validation); omitting the soft signal this cycle",
+            exc_info=True,
+        )
+        return None
 
 
 def _agent_view_problem_model(pm: dict | None) -> dict:
@@ -695,6 +720,223 @@ def _summarize_outcome_evaluation(oe: dict) -> dict:
     return trimmed
 
 
+# Per-list cap for the cycle-start reconciliation block. The block is meant to
+# be a conflict-focused starting-state digest, NOT a restatement of the full
+# problem model or direction list, so each conflict list is capped and the true
+# total carried in ``counts`` (the renderer shows "+N more"). Twelve is enough
+# to surface the conflicts that matter without ever bloating the payload.
+_RECON_LIST_CAP = 12
+# Char cap for any direction/gap/capability label echoed into the block.
+_RECON_LABEL_MAXLEN = 120
+
+
+def _build_cycle_start_reconciliation(
+    direction_stats: list[dict],
+    problem_model: dict | None,
+    active_by_direction: dict[str, int] | None,
+) -> dict | None:
+    """Compute one authoritative cycle-start reconciliation of the strategic surfaces.
+
+    The strategic cycle reasons over four surfaces that can silently disagree:
+    problem-model capabilities (agent-asserted), grounded design-doc/file-tree
+    verification, active directions (with their durable ``gap_id`` linkage and
+    deferral metadata), and each direction's research pipeline. Rather than make
+    the agent hand-reconcile these every cycle, this computes the *conflicts*
+    between them up front:
+
+      * ``capability_contradictions`` — capabilities whose stored ``status``
+        disagrees with the grounded file-tree check (``verification``): a
+        ``working`` capability whose backing paths are all missing (``absent``)
+        or only partly present (``partial``). The grounding is advisory (see
+        :func:`_verify_capability_backing_paths`); a contradiction means the
+        stored status is not backed by code that currently exists.
+      * ``orphaned_gaps`` — ``active`` gaps with no active direction pointing
+        back via ``gap_id`` AND no intentional
+        :class:`~app.problem_model.GapDeferral`.
+        A gap carrying a ``deferral`` is *deliberately* unstaffed and is NOT an
+        orphan — it is excluded and counted separately so the agent can tell a
+        drifted gap from a parked one.
+      * ``ungrounded_directions`` — ``active`` directions whose ``gap_id`` no
+        longer resolves to an active gap (closed/archived/never-existed), or that
+        carry no gap linkage at all. These advance no tracked gap.
+      * ``direction_pipeline`` — per active direction, whether its research is
+        ``research_waiting_on_action`` (findings surfaced but no task in flight),
+        ``tasks_in_progress`` (work already moving), or ``idle``.
+
+    Returns ``None`` when there is nothing to reconcile (no active directions and
+    no conflicts), so the caller omits the field for cold-start projects. Pure
+    and side-effect free — operates only on the data handed in — so the backend
+    computation is directly unit-testable.
+    """
+    pm = problem_model if isinstance(problem_model, dict) else {}
+    active_by_direction = active_by_direction or {}
+
+    def _label(text: Any) -> str:
+        return str(text or "")[:_RECON_LABEL_MAXLEN]
+
+    # Active directions and the set of gap_ids they reference (forward linkage).
+    active_dirs = [
+        d for d in direction_stats if isinstance(d, dict) and d.get("status") == "active"
+    ]
+    referenced_gap_ids: set[str] = {
+        str(d["gap_id"]) for d in active_dirs if d.get("gap_id")
+    }
+
+    gaps = pm.get("gaps") if isinstance(pm.get("gaps"), list) else []
+    # Active gaps only resolve here — closed/abandoned gaps move to
+    # archived_gaps (stripped from the agent view), so an unresolved gap_id is a
+    # genuine dangling reference.
+    active_gap_ids: set[str] = {
+        str(g.get("id"))
+        for g in gaps
+        if isinstance(g, dict) and g.get("id") and g.get("status") == "active"
+    }
+
+    # 1. Capability ↔ grounded-verification contradictions.
+    capability_contradictions: list[dict] = []
+    for cap in pm.get("capabilities") or []:
+        if not isinstance(cap, dict):
+            continue
+        verification = cap.get("verification")
+        if not isinstance(verification, dict):
+            continue
+        effective = verification.get("effective_status")
+        stored = cap.get("status")
+        # Only a contradiction when the grounded check DISAGREES with the stored
+        # status. ``unverified`` (no backing_paths) and an effective status that
+        # matches the stored one are not conflicts.
+        if effective in ("absent", "partial") and effective != stored:
+            missing = [
+                m for m in (verification.get("missing") or []) if isinstance(m, str)
+            ]
+            capability_contradictions.append(
+                {
+                    "name": _label(cap.get("name")),
+                    "stored_status": stored,
+                    "effective_status": effective,
+                    "missing": missing[:6],
+                }
+            )
+
+    # 2. Orphaned active gaps (excluding intentionally-deferred ones).
+    orphaned_gaps: list[dict] = []
+    deferred_gap_count = 0
+    for g in gaps:
+        if not isinstance(g, dict) or g.get("status") != "active":
+            continue
+        gid = str(g.get("id") or "")
+        staffed = bool(gid and gid in referenced_gap_ids)
+        if staffed:
+            continue
+        if g.get("deferral"):
+            deferred_gap_count += 1
+            continue
+        orphaned_gaps.append(
+            {
+                "gap_id": gid,
+                "name": _label(g.get("name")),
+                "priority": g.get("priority"),
+            }
+        )
+
+    # 3. Ungrounded active directions.
+    ungrounded_directions: list[dict] = []
+    for d in active_dirs:
+        gap_id = d.get("gap_id")
+        if not gap_id:
+            reason = "no_gap"
+        elif str(gap_id) not in active_gap_ids:
+            reason = "gap_missing"
+        else:
+            continue
+        ungrounded_directions.append(
+            {
+                "direction_id": d.get("id"),
+                "text": _label(d.get("text")),
+                "reason": reason,
+            }
+        )
+
+    # 4. Per-direction research pipeline state.
+    direction_pipeline: list[dict] = []
+    pipeline_counts = {
+        "research_waiting_on_action": 0,
+        "tasks_in_progress": 0,
+        "idle": 0,
+    }
+    for d in active_dirs:
+        did = str(d.get("id") or "")
+        in_flight = int(active_by_direction.get(did, 0) or 0)
+        findings = len(d.get("recent_findings") or [])
+        if in_flight > 0:
+            state = "tasks_in_progress"
+        elif findings > 0:
+            state = "research_waiting_on_action"
+        else:
+            state = "idle"
+        pipeline_counts[state] += 1
+        direction_pipeline.append(
+            {
+                "direction_id": did,
+                "text": _label(d.get("text")),
+                "state": state,
+                "in_flight": in_flight,
+                "findings": findings,
+            }
+        )
+    direction_pipeline.sort(
+        key=lambda item: (
+            {"research_waiting_on_action": 0, "tasks_in_progress": 1, "idle": 2}.get(
+                str(item.get("state")), 3
+            ),
+            -int(item.get("findings") or 0),
+            -int(item.get("in_flight") or 0),
+            str(item.get("text") or ""),
+        )
+    )
+
+    # Nothing to reconcile (e.g. a cold-start project): let the caller omit it.
+    if (
+        not active_dirs
+        and not capability_contradictions
+        and not orphaned_gaps
+        and not deferred_gap_count
+    ):
+        return None
+
+    def _cap(items: list) -> tuple[list, int]:
+        if len(items) <= _RECON_LIST_CAP:
+            return items, 0
+        return items[:_RECON_LIST_CAP], len(items) - _RECON_LIST_CAP
+
+    capped_caps, caps_total = _cap(capability_contradictions)
+    capped_orphans, orphans_total = _cap(orphaned_gaps)
+    capped_ungrounded, ungrounded_total = _cap(ungrounded_directions)
+    capped_pipeline, pipeline_dropped = _cap(direction_pipeline)
+
+    return {
+        "capability_contradictions": capped_caps,
+        "orphaned_gaps": capped_orphans,
+        "ungrounded_directions": capped_ungrounded,
+        "direction_pipeline": capped_pipeline,
+        "counts": {
+            # True totals (shown + overflow) so the renderer can say "+N more".
+            "capability_contradictions": len(capped_caps) + caps_total,
+            "orphaned_gaps": len(capped_orphans) + orphans_total,
+            "ungrounded_directions": len(capped_ungrounded) + ungrounded_total,
+            "deferred_gaps": deferred_gap_count,
+            "active_directions": len(active_dirs),
+            "direction_pipeline": len(direction_pipeline),
+            "direction_pipeline_overflow": pipeline_dropped,
+            "pipeline_waiting_on_action": pipeline_counts[
+                "research_waiting_on_action"
+            ],
+            "pipeline_tasks_in_progress": pipeline_counts["tasks_in_progress"],
+            "pipeline_idle": pipeline_counts["idle"],
+        },
+    }
+
+
 _OPERATOR_STEERING_QUOTE_MAX_CHARS = 600
 _OPERATOR_STEERING_QUOTE_COUNT = 2
 
@@ -856,6 +1098,12 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # operator-wins reconciliation loop so the agent reconciles instead of
     # re-proposing overridden values.
     "operator_overrides": {"priority": "medium"},
+    # Computed cycle-start reconciliation of the four strategic surfaces
+    # (capabilities vs grounding, gaps vs directions, per-direction research
+    # pipeline). Conflict-focused and bounded at build time, so it ships whole
+    # or not at all. High priority: it is the authoritative starting state the
+    # agent reasons from, and it is small.
+    "cycle_start_reconciliation": {"priority": "high"},
     # Core working set (the big stuff) — summarize when over budget
     "directions_summary": {"priority": "high", "summarize": _summarize_directions},
     # Directions already queued for the NEXT version (status=staged). Medium
@@ -864,6 +1112,10 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # strategist knows what is already staged and does NOT re-propose it.
     "staged_directions": {"priority": "medium"},
     "problem_model": {"priority": "high", "summarize": _agent_view_problem_model},
+    # Tiny, load-bearing soft size/health signal computed from the DURABLE
+    # problem_model (honest counts, not the trimmed agent view). High priority,
+    # no summarize_fn — it should only drop under genuine budget exhaustion.
+    "model_health": {"priority": "high"},
     "design_doc": {"priority": "medium", "summarize": _agent_view_design_doc},
     "outcome_evaluation": {
         "priority": "medium",
@@ -916,6 +1168,11 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # hold threshold. Low priority — purely observational planning context the
     # strategic agent reads to decide whether to refine/retire a stuck direction.
     "held_directions": {"priority": "low"},
+    # Bidirectional gap↔direction linkage audit (orphaned gaps / ungrounded
+    # directions). Low priority with no summarize_fn: it is already capped +
+    # truncated at build time, so the packer drops it whole first under budget.
+    # Purely informational — the thinker uses it to spot strategic drift.
+    "linkage_audit": {"priority": "low"},
 }
 
 
@@ -929,6 +1186,8 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     "open_messages": {"priority": "high"},
     "design_doc": {"priority": "high", "summarize": _agent_view_design_doc},
     "problem_model": {"priority": "high", "summarize": _agent_view_problem_model},
+    # See _STRATEGIC_REVIEW_SCHEMA: tiny, load-bearing soft size/health signal.
+    "model_health": {"priority": "high"},
     "proposed_changes": {"priority": "high"},
     "shipped_changes_manifest": {"priority": "medium"},
 }
@@ -1124,6 +1383,15 @@ async def _build_recent_interventions(
             project.id,
             lookback_days,
         )
+    active_tasks_result = await session.execute(
+        select(Task)
+        .where(
+            Task.project_id == project.id,
+            Task.status.in_(_IN_FLIGHT_TASK_STATUSES),
+        )
+        .options(load_only(Task.id, Task.status, Task.context, Task.payloads))
+    )
+    active_tasks = list(active_tasks_result.scalars().all())
 
     # Build direction lookup for text enrichment
     directions_by_id: dict[str, str] = {
@@ -1480,21 +1748,22 @@ async def _build_recent_interventions(
     # pulling in-flight out of the rate would hide slow-moving large-scope
     # tasks entirely — the agent would see "no large merges in 24h" with
     # no signal that 3 large tasks are actively running.
-    active_statuses = (
-        TaskStatus.QUEUED,
-        TaskStatus.PROVISIONING,
-        TaskStatus.IN_PROGRESS,
-        TaskStatus.EVALUATING,
-    )
     active_by_scope: dict[str, int] = {
         "small": 0,
         "medium": 0,
         "large": 0,
         "unknown": 0,
     }
-    for t in tasks_in_window:
-        if t.status not in active_statuses:
-            continue
+    # In-flight task count per direction — the "is work already moving on this
+    # direction" signal the cycle-start reconciliation reads to distinguish a
+    # direction whose research is piling up unactioned from one with tasks
+    # already in progress. Counts ANY in-flight task (research/plan/create/fix/
+    # review) attributed to the direction, since each means the lane is active.
+    active_by_direction: dict[str, int] = {}
+    for t in active_tasks:
+        did = (t.context or {}).get("direction_id")
+        if did:
+            active_by_direction[did] = active_by_direction.get(did, 0) + 1
         # Only count ROLLUP_TYPES work — pipeline tasks (review/fix) aren't
         # scope-classified and would inflate the counts.
         t_type = (t.first_payload or {}).get("type", "")
@@ -1539,6 +1808,7 @@ async def _build_recent_interventions(
         "rolling_rates": rolling_rates,
         "per_direction_delta": per_direction_delta,
         "active_by_scope": active_by_scope,
+        "active_by_direction": active_by_direction,
         "lookback_days": lookback_days,
         "undeployed_directions": undeployed_directions,
     }
@@ -1797,6 +2067,87 @@ def _build_playbook_summary(project: Project) -> dict[str, Any] | None:
     return {"entries": candidates[:10]}
 
 
+_LINKAGE_AUDIT_LIST_CAP = 20
+"""Defensive cap on each linkage-audit list — keeps the advisory block bounded."""
+
+_LINKAGE_DIRECTION_TEXT_CAP = 160
+"""Truncate ungrounded-direction text in the linkage audit for prompt budget."""
+
+_IN_FLIGHT_TASK_STATUSES = (
+    TaskStatus.QUEUED,
+    TaskStatus.PROVISIONING,
+    TaskStatus.IN_PROGRESS,
+    TaskStatus.EVALUATING,
+)
+"""Statuses treated as live in-flight work for strategic pipeline summaries."""
+
+
+def _build_gap_direction_linkage_audit(project: Project) -> dict[str, Any] | None:
+    """Cheap single-pass bidirectional gap↔direction linkage audit.
+
+    Surfaces strategic drift the thinker would otherwise have to cross-reference
+    by hand between the problem-model and directions sections:
+
+      - ORPHANED GAPS: active gaps (``status`` ``active`` or ``blocked``) that
+        no currently *active* direction points back to via ``gap_id`` — a known
+        problem the strategy has stopped working on.
+      - UNGROUNDED DIRECTIONS: active directions whose ``gap_id`` is null or
+        references a gap that is absent from / not active in the problem model —
+        strategic effort with no documented problem statement.
+
+    Directions are read from the ``project.directions`` JSONB list (NOT the
+    Direction DB table); a direction is active only when ``status == 'active'``
+    (paused/proposed/retired/etc. do not count for grounding). Parsing is
+    fail-open: a malformed problem model yields no audit rather than raising,
+    since this is purely informational and must never block cycle assembly.
+
+    Returns a compact dict ``{"orphaned_gaps": [...], "ungrounded_directions":
+    [...]}`` or ``None`` when both lists are empty, so the key is omitted from
+    cold-start payloads (keeping them byte-identical).
+    """
+    from app.problem_model import parse_problem_model
+
+    try:
+        model = parse_problem_model(project.problem_model)
+    except Exception:  # pragma: no cover - defensive: never block on bad model
+        return None
+
+    active_gaps = [g for g in model.gaps if g.status in ("active", "blocked")]
+    active_gap_ids = {g.id for g in active_gaps}
+
+    directions = project.directions or []
+    active_directions = [
+        d for d in directions if isinstance(d, dict) and d.get("status") == "active"
+    ]
+    referenced_gap_ids = {
+        str(d["gap_id"]) for d in active_directions if d.get("gap_id")
+    }
+
+    orphaned_gaps: list[dict[str, Any]] = []
+    for gap in active_gaps:
+        if gap.id not in referenced_gap_ids:
+            orphaned_gaps.append({"id": gap.id, "name": gap.name})
+
+    ungrounded_directions: list[dict[str, Any]] = []
+    for d in active_directions:
+        gap_id = d.get("gap_id")
+        if not gap_id or gap_id not in active_gap_ids:
+            ungrounded_directions.append(
+                {
+                    "id": d.get("id"),
+                    "text": (d.get("text") or "")[:_LINKAGE_DIRECTION_TEXT_CAP],
+                }
+            )
+
+    if not orphaned_gaps and not ungrounded_directions:
+        return None
+
+    return {
+        "orphaned_gaps": orphaned_gaps[:_LINKAGE_AUDIT_LIST_CAP],
+        "ungrounded_directions": ungrounded_directions[:_LINKAGE_AUDIT_LIST_CAP],
+    }
+
+
 async def _find_last_strategic_cycle_time(
     project: Project, session: AsyncSession
 ) -> datetime | None:
@@ -1902,6 +2253,14 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
             "problem_model": await _verify_capability_backing_paths(
                 _agent_view_problem_model(project.problem_model),
                 **verification_kwargs,
+            ),
+            # Soft size/health signal from the DURABLE pre-trim model so counts
+            # are honest (the agent view above is trimmed). Fail-open: omitted
+            # when the durable model fails strict validation.
+            **(
+                {"model_health": _dd_model_health}
+                if (_dd_model_health := _compute_model_health(project.problem_model))
+                else {}
             ),
             "open_messages": open_msgs,
             "shipped_changes_manifest": shipped_changes_manifest,
@@ -2057,6 +2416,12 @@ async def _spawn_strategic_review(
         recent_findings = []
         recent_failures = []
         _agg_grade: dict = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+        _agg_basis: dict = {
+            "code_verified": 0,
+            "path_verified": 0,
+            "pattern_inferred": 0,
+            "deduced": 0,
+        }
         for h in recent_history:
             for desc in h.get("key_finding_descriptions") or []:
                 if desc and desc not in recent_findings:
@@ -2067,6 +2432,9 @@ async def _spawn_strategic_review(
             for _gk, _gv in (h.get("grade_distribution") or {}).items():
                 if _gk in _agg_grade:
                     _agg_grade[_gk] = _agg_grade.get(_gk, 0) + int(_gv or 0)
+            for _bk, _bv in (h.get("verification_basis_distribution") or {}).items():
+                if _bk in _agg_basis:
+                    _agg_basis[_bk] = _agg_basis.get(_bk, 0) + int(_bv or 0)
         total_prs = total_merged + total_rejected
         operator_rejection_rate = (
             round(total_rejected / total_prs, 2) if total_prs > 0 else None
@@ -2081,6 +2449,11 @@ async def _spawn_strategic_review(
             "tasks_failed": total_failed,
             "possibly_saturated": d.get("possibly_saturated", False),
         }
+        # Surface the direction→gap linkage so the strategic agent can reconcile
+        # active directions against problem-model gaps (which gaps have a working
+        # direction, which directions trace to no gap) without cross-referencing.
+        if d.get("gap_id"):
+            stat_entry["gap_id"] = str(d["gap_id"])
         if total_failed_infra > 0:
             stat_entry["tasks_failed_infra"] = total_failed_infra
         if taxonomy_totals:
@@ -2140,6 +2513,8 @@ async def _spawn_strategic_review(
             stat_entry["recent_findings"] = recent_findings[:10]
         if any(_agg_grade.values()):
             stat_entry["recent_findings_grade_distribution"] = _agg_grade
+        if any(_agg_basis.values()):
+            stat_entry["recent_findings_verification_basis"] = _agg_basis
         if recent_failures:
             stat_entry["recent_failures"] = recent_failures[:5]
         # Surface cumulative confirmed-finding count and trend from
@@ -2408,8 +2783,6 @@ async def _spawn_strategic_review(
                 # Snapshot the project's current focus as the version's goal.
                 _bootstrap_goal: str | None = None
                 try:
-                    from app.problem_model import parse_problem_model
-
                     _bootstrap_goal = (
                         parse_problem_model(project.problem_model).intent.current_focus
                         or None
@@ -3098,6 +3471,19 @@ async def _spawn_strategic_review(
                 if prompt_suffix
                 else _steering_directive
             )
+    # Compute the grounded problem_model once so it backs BOTH the payload field
+    # and the cycle-start reconciliation (capabilities carry their advisory
+    # ``verification`` block here). Reusing the single computed view keeps the
+    # reconciliation consistent with what the agent sees in problem_model.
+    _verified_problem_model = await _verify_capability_backing_paths(
+        _agent_view_problem_model(project.problem_model),
+        **verification_kwargs,
+    )
+    _cycle_start_reconciliation = _build_cycle_start_reconciliation(
+        direction_stats,
+        _verified_problem_model,
+        (recent_interventions or {}).get("active_by_direction"),
+    )
     payload: dict = pack_under_budget(
         {
             "type": "strategic_review",
@@ -3106,9 +3492,19 @@ async def _spawn_strategic_review(
                 _agent_view_design_doc(project.design_doc), **verification_kwargs
             ),
             "vision": project.vision or {},
-            "problem_model": await _verify_capability_backing_paths(
-                _agent_view_problem_model(project.problem_model),
-                **verification_kwargs,
+            "problem_model": _verified_problem_model,
+            **(
+                {"cycle_start_reconciliation": _cycle_start_reconciliation}
+                if _cycle_start_reconciliation
+                else {}
+            ),
+            # Soft size/health signal from the DURABLE pre-trim model so counts
+            # are honest (the agent view above is trimmed). Fail-open: omitted
+            # when the durable model fails strict validation.
+            **(
+                {"model_health": _sr_model_health}
+                if (_sr_model_health := _compute_model_health(project.problem_model))
+                else {}
             ),
             "running_update": project.running_update or "",
             "running_update_acknowledged_at": (
@@ -3198,6 +3594,11 @@ async def _spawn_strategic_review(
             **(
                 {"held_directions": _held_directions_block}
                 if _held_directions_block
+                else {}
+            ),
+            **(
+                {"linkage_audit": _linkage_audit}
+                if (_linkage_audit := _build_gap_direction_linkage_audit(project))
                 else {}
             ),
             "base_branch": get_project_integration_branch(project),

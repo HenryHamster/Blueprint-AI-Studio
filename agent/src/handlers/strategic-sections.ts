@@ -24,6 +24,39 @@ export function buildSystemMaturitySection(systemMaturity: Array<Record<string, 
   return lines.join('\n');
 }
 
+/**
+ * Render the backend `model_health` signal — a SOFT indicator of how large the
+ * durable problem_model has grown (honest pre-trim counts). Thresholds are
+ * cited so the thinker understands the basis, not just the label. The status is
+ * advisory: a 'large'/'oversized' model is a nudge to prune resolved gaps and
+ * consolidate overlapping capabilities BEFORE growing the model — never a hard
+ * cap that blocks opening a genuinely needed new gap. Returns '' when absent.
+ */
+export function buildModelHealthSection(modelHealth: Record<string, unknown> | null): string {
+  if (!modelHealth) return '';
+  const status = strVal(modelHealth.model_size_status as string, 'unknown');
+  const gaps = fmtScalar(modelHealth.active_gap_count);
+  const caps = fmtScalar(modelHealth.capability_count);
+  const friction = fmtScalar(modelHealth.active_friction_count);
+  const footprint = fmtScalar(modelHealth.estimated_token_footprint);
+  const lines: string[] = ['\n## Problem-model size (soft signal)'];
+  lines.push(
+    `Status: **${status}** — active gaps=${gaps}, capabilities=${caps}, active friction=${friction}, ~${footprint} est. tokens (approximate, not precise).`
+  );
+  lines.push(
+    'Healthy is <=12 active gaps / <=20 capabilities / <=8 active friction. ' +
+    'A dimension at >=1.5x its threshold is `growing`, >=2x is `large`, >=3x is `oversized`; worst dimension wins.'
+  );
+  if (status === 'large' || status === 'oversized') {
+    lines.push(
+      `The model is **${status}** — it is getting expensive to audit in one pass. ` +
+      'BEFORE proposing new gaps/capabilities this cycle, prioritize closing or archiving resolved gaps and consolidating overlapping capabilities. ' +
+      'This is a soft signal to weigh, NOT a hard cap: if a genuinely new gap is warranted, still open it.'
+    );
+  }
+  return lines.join('\n');
+}
+
 export function buildDriftSection(driftSignals: Record<string, unknown> | null): string {
   if (!driftSignals) return '';
   const byDir = driftSignals.by_direction as Record<string, Record<string, unknown>> | undefined;
@@ -42,6 +75,41 @@ export function buildDriftSection(driftSignals: Record<string, unknown> | null):
     const flags = [sig.over_claim_flag ? 'over_claim' : '', sig.stalled_despite_churn_flag ? 'stalled_despite_churn' : ''].filter(Boolean).join(', ');
     lines.push(`- System ${sid}: claimed=${fmtScalar(sig.claimed_changes_count)}, merged=${fmtScalar(sig.actually_merged_prs)}, consistency=${typeof sig.claim_shipped_consistency === 'number' ? sig.claim_shipped_consistency.toFixed(2) : '?'} [${flags}]`);
   }
+  return lines.join('\n');
+}
+
+export function buildGapDirectionLinkageSection(linkageAudit: Record<string, unknown> | undefined): string {
+  if (!linkageAudit || typeof linkageAudit !== 'object') return '';
+  const orphanedGaps = Array.isArray(linkageAudit.orphaned_gaps)
+    ? linkageAudit.orphaned_gaps as Array<Record<string, unknown>>
+    : [];
+  const ungroundedDirections = Array.isArray(linkageAudit.ungrounded_directions)
+    ? linkageAudit.ungrounded_directions as Array<Record<string, unknown>>
+    : [];
+  if (orphanedGaps.length === 0 && ungroundedDirections.length === 0) return '';
+
+  const lines: string[] = ['\n## Gap-Direction Alignment'];
+  lines.push('A single-pass audit of the linkage between problem-model gaps and active directions. **Orphaned gaps** are known problems with no active direction working on them — the strategy has stopped pushing on them. **Ungrounded directions** are active effort with no documented gap behind them — work without a stated problem. This is advisory, not a defect list.');
+  lines.push('STEERING: For each orphaned gap, either create a direction targeting it or explicitly acknowledge (in your reasoning / the gap history) that it is intentionally on hold. For each ungrounded direction, either link it to an existing gap (set its gap_id) or propose a new gap that captures the problem it addresses.');
+
+  if (orphanedGaps.length > 0) {
+    lines.push('\n### Orphaned gaps (no active direction)');
+    for (const g of orphanedGaps) {
+      const gid = strVal(g.id as string, '?');
+      const name = strVal(g.name as string, '(unnamed)');
+      lines.push(`- ${gid}: ${name}`);
+    }
+  }
+
+  if (ungroundedDirections.length > 0) {
+    lines.push('\n### Ungrounded directions (no documented gap)');
+    for (const d of ungroundedDirections) {
+      const did = strVal(d.id as string, '?');
+      const text = strVal(d.text as string, '(no text)');
+      lines.push(`- ${did}: ${text}`);
+    }
+  }
+
   return lines.join('\n');
 }
 
@@ -77,6 +145,123 @@ export function buildCapabilityVerificationSection(problemModel: Record<string, 
   const lines: string[] = ['\n## Capability Verification (advisory)'];
   lines.push('The backend checked declared capability backing paths against the integration-branch file tree. Use flagged entries to avoid hallucinating current behavior, but do not treat missing code as a ban on proposing future work.');
   lines.push(...flagged);
+  return lines.join('\n');
+}
+
+/**
+ * Render the backend-computed cycle-start reconciliation block (payload field
+ * `cycle_start_reconciliation`, built by `_build_cycle_start_reconciliation` in
+ * backend/app/strategic_spawning.py) as the authoritative starting state for the
+ * cycle. It replaces the older scattered capability-verification advisory: rather
+ * than make the agent hand-reconcile capabilities, gaps, directions, and research
+ * pipeline from separate sections, the backend surfaces only the conflicts between
+ * those four surfaces and this renders them as one block.
+ */
+export function buildCycleStartReconciliationSection(recon: Record<string, unknown> | undefined): string {
+  if (!recon || typeof recon !== 'object') return '';
+
+  const capContradictions = Array.isArray(recon.capability_contradictions)
+    ? recon.capability_contradictions as Array<Record<string, unknown>> : [];
+  const orphanedGaps = Array.isArray(recon.orphaned_gaps)
+    ? recon.orphaned_gaps as Array<Record<string, unknown>> : [];
+  const ungroundedDirs = Array.isArray(recon.ungrounded_directions)
+    ? recon.ungrounded_directions as Array<Record<string, unknown>> : [];
+  const pipeline = Array.isArray(recon.direction_pipeline)
+    ? recon.direction_pipeline as Array<Record<string, unknown>> : [];
+  const counts = (recon.counts && typeof recon.counts === 'object')
+    ? recon.counts as Record<string, unknown> : {};
+  const countOr = (value: unknown, fallback: number): number => {
+    if (typeof value === 'number') return value;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+
+  const lines: string[] = ['\n## Cycle-start reconciliation (your starting state)'];
+  lines.push('The backend reconciled your four surfaces — problem-model capabilities, grounded file-tree verification, active directions (gap_id linkage + deferrals), and each direction\'s research pipeline — and surfaces only the CONFLICTS below. This is where you start: resolve these before reasoning further. An empty list means that surface is consistent.');
+
+  // Capabilities whose stored status disagrees with the grounded file-tree check.
+  if (capContradictions.length > 0) {
+    lines.push(`\n### Capability status contradicted by code (${fmtScalar(counts.capability_contradictions, String(capContradictions.length))})`);
+    lines.push('Stored status disagrees with what the integration-branch file tree actually shows. Not a ban on future work — but do not reason as if the capability already works.');
+    for (const c of capContradictions) {
+      const name = strVal(c.name as string, 'Unnamed capability');
+      const stored = strVal(c.stored_status as string, '?');
+      const effective = strVal(c.effective_status as string, '?');
+      const missing = Array.isArray(c.missing) ? c.missing as string[] : [];
+      const missTail = missing.length > 0 ? ` — missing: ${missing.join(', ')}` : '';
+      lines.push(`- **${name}**: stored=${stored} but code shows ${effective.toUpperCase()}${missTail}`);
+    }
+  }
+
+  // Active gaps with no direction working them and no intentional deferral.
+  if (orphanedGaps.length > 0) {
+    lines.push(`\n### Orphaned active gaps — open, unstaffed, not deferred (${fmtScalar(counts.orphaned_gaps, String(orphanedGaps.length))})`);
+    lines.push('No active direction advances these and no deferral is recorded. Open a direction, defer the gap explicitly, or close it.');
+    for (const g of orphanedGaps) {
+      const name = strVal(g.name as string, 'Unnamed gap');
+      const gid = strVal(g.gap_id as string, '?');
+      const priority = strVal(g.priority as string, 'medium');
+      lines.push(`- **${name}** [${priority}] (gap ${gid})`);
+    }
+  }
+
+  // Active directions whose gap_id no longer resolves to an active gap.
+  if (ungroundedDirs.length > 0) {
+    lines.push(`\n### Ungrounded active directions — advance no tracked gap (${fmtScalar(counts.ungrounded_directions, String(ungroundedDirs.length))})`);
+    lines.push('These directions trace to no active gap. Link each to a gap (set gap_id), or retire it if it no longer serves the intent.');
+    for (const d of ungroundedDirs) {
+      const text = strVal(d.text as string, '?');
+      const did = strVal(d.direction_id as string, '?');
+      const reason = strVal(d.reason as string) === 'gap_missing'
+        ? 'its gap_id no longer resolves to an active gap'
+        : 'no gap_id linkage';
+      lines.push(`- ${text} (id: ${did}) — ${reason}`);
+    }
+  }
+
+  // Per-direction research pipeline: where is each active direction stuck/moving.
+  const waiting = pipeline.filter(p => strVal(p.state as string) === 'research_waiting_on_action');
+  const inProgress = pipeline.filter(p => strVal(p.state as string) === 'tasks_in_progress');
+  const idle = pipeline.filter(p => strVal(p.state as string) === 'idle');
+  const waitingTotal = countOr(counts.pipeline_waiting_on_action, waiting.length);
+  const inProgressTotal = countOr(counts.pipeline_tasks_in_progress, inProgress.length);
+  const idleTotal = countOr(counts.pipeline_idle, idle.length);
+  const pipelineOverflow = countOr(counts.direction_pipeline_overflow, 0);
+  if (pipeline.length > 0 || waitingTotal > 0 || inProgressTotal > 0 || idleTotal > 0) {
+    const deferredGaps = fmtScalar(counts.deferred_gaps, '0');
+    lines.push(`\n### Research pipeline by direction (${inProgressTotal} with tasks in progress, ${waitingTotal} waiting on action, ${idleTotal} idle; ${deferredGaps} gaps deferred)`);
+    if (pipelineOverflow > 0) {
+      lines.push(`Only the first ${pipeline.length} active directions are listed below (+${pipelineOverflow} more not shown).`);
+    }
+    if (waitingTotal > 0) {
+      lines.push('Research surfaced findings but NOTHING is acting on them — these are the directions most likely to need a plan/create task spawned:');
+      for (const p of waiting) {
+        lines.push(`- ${strVal(p.text as string, '?')} (id: ${strVal(p.direction_id as string, '?')}) — ${fmtScalar(p.findings, '0')} recent finding(s), 0 tasks in flight`);
+      }
+      if (waitingTotal > waiting.length) {
+        lines.push(`- +${waitingTotal - waiting.length} more waiting direction(s) not shown`);
+      }
+    }
+    if (inProgressTotal > 0) {
+      lines.push('Already moving (tasks in flight — do not double-spawn):');
+      for (const p of inProgress) {
+        lines.push(`- ${strVal(p.text as string, '?')} (id: ${strVal(p.direction_id as string, '?')}) — ${fmtScalar(p.in_flight, '0')} task(s) in flight`);
+      }
+      if (inProgressTotal > inProgress.length) {
+        lines.push(`- +${inProgressTotal - inProgress.length} more in-progress direction(s) not shown`);
+      }
+    }
+    if (idleTotal > 0) {
+      const idleNames = idle.map(p => strVal(p.text as string, '?')).join('; ');
+      if (idle.length > 0) {
+        const idleTail = idleTotal > idle.length ? `; +${idleTotal - idle.length} more not shown` : '';
+        lines.push(`Idle (no findings, no tasks in flight): ${idleNames}${idleTail}`);
+      } else {
+        lines.push(`Idle (no findings, no tasks in flight): +${idleTotal} direction(s) not shown`);
+      }
+    }
+  }
+
   return lines.join('\n');
 }
 

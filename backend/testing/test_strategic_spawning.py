@@ -36,6 +36,7 @@ from app.strategic_spawning import (
     _build_operator_steering_directive,
     _build_shipped_changes_manifest,
     _build_recent_interventions,
+    _build_gap_direction_linkage_audit,
 )
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
@@ -454,6 +455,44 @@ async def test_spawn_review_includes_operator_overrides_when_present(db_session)
 
 
 @pytest.mark.asyncio
+async def test_spawn_review_includes_model_health_signal(db_session):
+    """The strategic_review payload carries the soft model size/health signal
+    computed from the DURABLE problem_model (honest pre-trim counts)."""
+    # 24 active gaps = 2x the healthy threshold (12) -> 'large'.
+    problem_model = {
+        "gaps": [
+            {"id": f"g-{i}", "name": f"gap {i}", "status": "active"}
+            for i in range(24)
+        ],
+    }
+    project = _make_project(
+        vision={"purpose": "test purpose"},
+        problem_model=problem_model,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    assert "model_health" in payload
+    mh = payload["model_health"]
+    assert mh["active_gap_count"] == 24
+    assert mh["model_size_status"] == "large"
+    assert set(mh.keys()) == {
+        "active_gap_count",
+        "capability_count",
+        "active_friction_count",
+        "estimated_token_footprint",
+        "model_size_status",
+    }
+
+
+@pytest.mark.asyncio
 async def test_spawn_review_omits_operator_overrides_when_empty(db_session):
     """The payload omits operator_overrides entirely when no ledger entries exist."""
     project = _make_project(vision={"purpose": "test purpose"})
@@ -622,6 +661,70 @@ async def test_success_evidence_absent_when_not_in_context(db_session):
 
     assert "success_evidence" not in d_stat
     assert "retirement_condition" not in d_stat
+
+
+@pytest.mark.asyncio
+async def test_gap_id_present_in_direction_stats(db_session):
+    """A direction's gap_id linkage is surfaced in the direction stat entry so
+    the strategic agent can reconcile directions against problem-model gaps."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-gl01",
+                "status": "active",
+                "text": "Direction grounded to a gap",
+                "priority": "medium",
+                "gap_id": "g-target",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-gl01")
+
+    assert d_stat["gap_id"] == "g-target"
+
+
+@pytest.mark.asyncio
+async def test_gap_id_absent_when_not_set(db_session):
+    """A direction with no gap_id linkage omits the key from its stat entry."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-gl02",
+                "status": "active",
+                "text": "Direction with no gap link",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-gl02")
+
+    assert "gap_id" not in d_stat
 
 
 @pytest.mark.asyncio
@@ -5943,6 +6046,39 @@ async def test_rolling_rates_exclude_rollup_children(db_session):
     )
 
 
+@pytest.mark.asyncio
+async def test_active_counts_include_old_inflight_tasks_outside_lookback(db_session):
+    """Current in-flight work is counted even when the task predates the lookback window."""
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[{"id": "d-old", "status": "active", "text": "long-lived lane"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    old_started = datetime.utcnow().replace(tzinfo=None) - timedelta(days=35)
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="Long running task",
+            description="still in flight",
+            payloads=[{"type": "create"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            created_at=old_started,
+            updated_at=old_started,
+            context={"direction_id": "d-old", "scope": "large"},
+        )
+    )
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session, lookback_days=21)
+    assert result["active_by_direction"] == {"d-old": 1}
+    assert result["active_by_scope"]["large"] == 1
+
+
 # ── git-ancestry landing verification in _build_recent_interventions ──────────
 
 
@@ -6554,6 +6690,188 @@ class TestVerifyCapabilityBackingPaths:
             "branch": "automain",
             "project_id": "proj-123",
         }
+
+
+# ── _build_cycle_start_reconciliation: conflict-focused starting state ─────────
+
+
+class TestBuildCycleStartReconciliation:
+    """The cycle-start reconciliation surfaces only the CONFLICTS between the
+    four strategic surfaces (capabilities vs grounding, gaps vs directions,
+    per-direction research pipeline). Pure function — directly unit-testable."""
+
+    def test_returns_none_when_nothing_to_reconcile(self):
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        # No active directions, no gaps, no capabilities → nothing to surface.
+        assert _build_cycle_start_reconciliation([], {}, {}) is None
+        assert _build_cycle_start_reconciliation([], None, None) is None
+
+    def test_capability_contradiction_flags_stored_vs_grounded(self):
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        pm = {
+            "capabilities": [
+                # Contradiction: stored working, code shows absent.
+                {
+                    "name": "payments",
+                    "status": "working",
+                    "verification": {
+                        "effective_status": "absent",
+                        "present": [],
+                        "missing": ["backend/app/payments.py"],
+                    },
+                },
+                # Not a contradiction: stored matches grounded.
+                {
+                    "name": "search",
+                    "status": "partial",
+                    "verification": {
+                        "effective_status": "partial",
+                        "present": ["s.py"],
+                        "missing": ["t.py"],
+                    },
+                },
+                # Not a contradiction: unverified (no backing paths).
+                {
+                    "name": "memos",
+                    "status": "working",
+                    "verification": {
+                        "effective_status": "unverified",
+                        "present": [],
+                        "missing": [],
+                    },
+                },
+            ]
+        }
+        out = _build_cycle_start_reconciliation([], pm, {})
+        # An active-direction-less project with a contradiction still returns a
+        # block (the contradiction is content worth surfacing).
+        assert out is not None
+        contradictions = out["capability_contradictions"]
+        assert len(contradictions) == 1
+        assert contradictions[0]["name"] == "payments"
+        assert contradictions[0]["stored_status"] == "working"
+        assert contradictions[0]["effective_status"] == "absent"
+        assert contradictions[0]["missing"] == ["backend/app/payments.py"]
+        assert out["counts"]["capability_contradictions"] == 1
+
+    def test_orphaned_gap_excludes_staffed_and_deferred(self):
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        pm = {
+            "gaps": [
+                # Orphan: active, no deferral, no live direction.
+                {"id": "g-orphan", "name": "drifted", "status": "active",
+                 "priority": "high"},
+                # Stale active_moves alone do NOT prove staffing.
+                {"id": "g-moved", "name": "worked", "status": "active",
+                 "active_moves": ["d-9"]},
+                # Staffed via a direction pointing back (gap_id) → not an orphan.
+                {"id": "g-linked", "name": "linked", "status": "active"},
+                # Intentionally deferred → counted separately, not an orphan.
+                {"id": "g-deferred", "name": "parked", "status": "active",
+                 "deferral": {"rationale": "next version", "created_at": "x"}},
+                # Closed gaps never count.
+                {"id": "g-closed", "name": "done", "status": "closed"},
+            ]
+        }
+        direction_stats = [
+            {"id": "d-1", "status": "active", "gap_id": "g-linked"},
+        ]
+        out = _build_cycle_start_reconciliation(direction_stats, pm, {})
+        orphan_ids = [g["gap_id"] for g in out["orphaned_gaps"]]
+        assert orphan_ids == ["g-orphan", "g-moved"]
+        assert out["orphaned_gaps"][0]["priority"] == "high"
+        assert out["counts"]["deferred_gaps"] == 1
+
+    def test_ungrounded_directions_by_reason(self):
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        pm = {"gaps": [{"id": "g-live", "name": "x", "status": "active"}]}
+        direction_stats = [
+            {"id": "d-nogap", "status": "active", "text": "no link"},
+            {"id": "d-dangling", "status": "active", "text": "stale",
+             "gap_id": "g-gone"},
+            {"id": "d-ok", "status": "active", "text": "fine", "gap_id": "g-live"},
+            # Paused direction is ignored (only active directions reconcile).
+            {"id": "d-paused", "status": "paused", "text": "n/a"},
+        ]
+        out = _build_cycle_start_reconciliation(direction_stats, pm, {})
+        by_id = {d["direction_id"]: d["reason"] for d in out["ungrounded_directions"]}
+        assert by_id == {"d-nogap": "no_gap", "d-dangling": "gap_missing"}
+
+    def test_research_pipeline_states(self):
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            # In flight → tasks_in_progress (regardless of findings).
+            {"id": "d-busy", "status": "active", "text": "busy",
+             "recent_findings": ["f1"]},
+            # No tasks but has findings → research_waiting_on_action.
+            {"id": "d-wait", "status": "active", "text": "wait",
+             "recent_findings": ["f1", "f2"]},
+            # No tasks, no findings → idle.
+            {"id": "d-idle", "status": "active", "text": "idle"},
+        ]
+        active_by_direction = {"d-busy": 2}
+        out = _build_cycle_start_reconciliation(
+            direction_stats, {}, active_by_direction
+        )
+        states = {p["direction_id"]: p["state"] for p in out["direction_pipeline"]}
+        assert states == {
+            "d-busy": "tasks_in_progress",
+            "d-wait": "research_waiting_on_action",
+            "d-idle": "idle",
+        }
+        busy = next(p for p in out["direction_pipeline"] if p["direction_id"] == "d-busy")
+        assert busy["in_flight"] == 2
+        wait = next(p for p in out["direction_pipeline"] if p["direction_id"] == "d-wait")
+        assert wait["findings"] == 2
+        assert out["counts"]["active_directions"] == 3
+
+    def test_lists_are_capped_but_counts_carry_true_total(self):
+        from app.strategic_spawning import _build_cycle_start_reconciliation, _RECON_LIST_CAP
+
+        gaps = [
+            {"id": f"g-{i}", "name": f"orphan {i}", "status": "active"}
+            for i in range(_RECON_LIST_CAP + 5)
+        ]
+        out = _build_cycle_start_reconciliation([], {"gaps": gaps}, {})
+        assert len(out["orphaned_gaps"]) == _RECON_LIST_CAP
+        # The count carries the true (uncapped) total so the renderer shows "+N more".
+        assert out["counts"]["orphaned_gaps"] == _RECON_LIST_CAP + 5
+
+    def test_pipeline_counts_survive_list_cap(self):
+        from app.strategic_spawning import _build_cycle_start_reconciliation, _RECON_LIST_CAP
+
+        direction_stats = []
+        for i in range(_RECON_LIST_CAP + 3):
+            direction_stats.append(
+                {
+                    "id": f"d-w-{i}",
+                    "status": "active",
+                    "text": f"wait {i}",
+                    "recent_findings": ["f1"],
+                }
+            )
+        for i in range(2):
+            direction_stats.append(
+                {
+                    "id": f"d-p-{i}",
+                    "status": "active",
+                    "text": f"progress {i}",
+                    "recent_findings": [],
+                }
+            )
+        active_by_direction = {"d-p-0": 1, "d-p-1": 2}
+        out = _build_cycle_start_reconciliation(direction_stats, {}, active_by_direction)
+        assert len(out["direction_pipeline"]) == _RECON_LIST_CAP
+        assert out["counts"]["direction_pipeline"] == _RECON_LIST_CAP + 5
+        assert out["counts"]["direction_pipeline_overflow"] == 5
+        assert out["counts"]["pipeline_waiting_on_action"] == _RECON_LIST_CAP + 3
+        assert out["counts"]["pipeline_tasks_in_progress"] == 2
+        assert out["counts"]["pipeline_idle"] == 0
 
 
 # ── Onboarding goal reaches the first strategic cycle's payload ─────────────────
@@ -7791,3 +8109,140 @@ async def test_arm_operator_refresh_persists_excerpt_and_replaces_on_coalesce(
     assert marker2.get("excerpt") == "newer steering content wins"
     # Coalesced into the same single slot (not stacked into a second marker).
     assert marker2.get("count") == 2
+
+
+# ── _build_gap_direction_linkage_audit ────────────────────────────────────────
+
+
+def test_linkage_audit_detects_orphaned_gap():
+    """An active gap with no live active direction pointing back via gap_id is orphaned."""
+    project = _make_project(
+        problem_model={
+            "gaps": [
+                {"id": "g-1", "name": "orphan gap", "status": "active", "active_moves": []},
+                {
+                    "id": "g-2",
+                    "name": "grounded gap",
+                    "status": "active",
+                    "active_moves": ["d-1"],
+                },
+            ],
+        },
+        directions=[
+            {"id": "d-1", "text": "work on g-2", "status": "active", "gap_id": "g-2"},
+        ],
+    )
+    audit = _build_gap_direction_linkage_audit(project)
+    assert audit is not None
+    orphan_ids = {g["id"] for g in audit["orphaned_gaps"]}
+    assert orphan_ids == {"g-1"}
+    # g-2 is grounded by an active direction pointing back via gap_id.
+    assert audit["ungrounded_directions"] == []
+
+
+def test_linkage_audit_detects_ungrounded_direction():
+    """Active directions with null or dangling gap_id are ungrounded."""
+    project = _make_project(
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-1",
+                    "name": "real gap",
+                    "status": "active",
+                    "active_moves": ["d-1"],
+                },
+            ],
+        },
+        directions=[
+            {"id": "d-1", "text": "grounded", "status": "active", "gap_id": "g-1"},
+            {"id": "d-2", "text": "no gap", "status": "active", "gap_id": None},
+            {"id": "d-3", "text": "dangling", "status": "active", "gap_id": "g-missing"},
+        ],
+    )
+    audit = _build_gap_direction_linkage_audit(project)
+    assert audit is not None
+    ungrounded_ids = {d["id"] for d in audit["ungrounded_directions"]}
+    assert ungrounded_ids == {"d-2", "d-3"}
+
+
+def test_linkage_audit_all_linked_returns_none():
+    """When every active gap has an active direction and every active direction
+    references an active gap, the audit is None (key omitted)."""
+    project = _make_project(
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-1",
+                    "name": "linked",
+                    "status": "active",
+                    "active_moves": ["d-1"],
+                },
+            ],
+        },
+        directions=[
+            {"id": "d-1", "text": "links to g-1", "status": "active", "gap_id": "g-1"},
+        ],
+    )
+    assert _build_gap_direction_linkage_audit(project) is None
+
+
+def test_linkage_audit_blocked_gap_counts_active():
+    """A blocked gap is still active for linkage purposes — orphaned if no
+    active direction targets it."""
+    project = _make_project(
+        problem_model={
+            "gaps": [
+                {"id": "g-1", "name": "blocked orphan", "status": "blocked", "active_moves": []},
+            ],
+        },
+        directions=[],
+    )
+    audit = _build_gap_direction_linkage_audit(project)
+    assert audit is not None
+    assert {g["id"] for g in audit["orphaned_gaps"]} == {"g-1"}
+
+
+def test_linkage_audit_paused_direction_excluded():
+    """Paused/proposed directions are not active, so a gap whose only move is a
+    paused direction is orphaned, and the paused direction is not reported as
+    ungrounded."""
+    project = _make_project(
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-1",
+                    "name": "only paused move",
+                    "status": "active",
+                    "active_moves": ["d-1"],
+                },
+            ],
+        },
+        directions=[
+            {"id": "d-1", "text": "paused", "status": "paused", "gap_id": "g-1"},
+        ],
+    )
+    audit = _build_gap_direction_linkage_audit(project)
+    assert audit is not None
+    # d-1 is paused, so no active direction points back to g-1 → orphaned.
+    assert {g["id"] for g in audit["orphaned_gaps"]} == {"g-1"}
+    # d-1 is paused → not an active direction → not reported as ungrounded.
+    assert audit["ungrounded_directions"] == []
+
+
+def test_linkage_audit_closed_gap_excluded():
+    """Closed/abandoned gaps are not active and are never reported as orphaned."""
+    project = _make_project(
+        problem_model={
+            "gaps": [
+                {"id": "g-1", "name": "closed", "status": "closed", "active_moves": []},
+            ],
+        },
+        directions=[],
+    )
+    assert _build_gap_direction_linkage_audit(project) is None
+
+
+def test_linkage_audit_empty_model_returns_none():
+    """A cold-start project with no problem model and no directions yields None."""
+    project = _make_project(problem_model={}, directions=[])
+    assert _build_gap_direction_linkage_audit(project) is None
