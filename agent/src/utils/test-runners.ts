@@ -673,6 +673,7 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
     /^AssertionError:/i.test(line) ||
     /^Traceback \(most recent call last\):/i.test(line) ||
     /\b[1-9]\d*\s+failed\b/i.test(line) ||
+    /\b[1-9]\d*\s+errors?\b/i.test(line) ||
     /\btest result:\s+ok\.\s+[1-9]\d*\s+passed;\s+[1-9]\d*\s+failed\b/i.test(line) ||
     // Go: verbose per-test failure marker and the tab-separated package-fail
     // summary line ("FAIL\texample.com/pkg\t0.03s"). The bare-2-space FAIL rule

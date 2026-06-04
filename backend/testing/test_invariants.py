@@ -7871,6 +7871,7 @@ class TestAgentTestRunnerSourceParity:
         # least one must be present). The substrings are the line-anchored,
         # non-zero-guarded signatures the guard uses for that family.
         required_signatures = [
+            ("pytest collection/import/conftest `1 error` summary", [r"[1-9]\d*\s+errors?"]),
             ("Go verbose per-test failure (--- FAIL:)", [r"^--- FAIL:"]),
             ("Go tab-separated package FAIL summary", [r"^FAIL\t"]),
             (".NET `Failed: N` (non-zero)", [r"Failed:\s+[1-9]"]),

@@ -1345,6 +1345,12 @@ describe('classifyTestExecution — placeholder/empty suite detection', () => {
     )).toBe('no_tests');
   });
 
+  it('pytest collection/import/conftest error-only output → ran', () => {
+    expect(classifyTestExecution(
+      'collected 0 items / 1 error\n\nERROR tests/test_import.py - ImportError: cannot import name foo\n1 error in 0.01s',
+    )).toBe('ran');
+  });
+
   it('pytest empty-suite text mixed with a real failure marker → ran', () => {
     expect(classifyTestExecution(
       'FAILED src/foo.test.ts > test_command_parser\nAssertionError: collected 0 items but 1 test failed',

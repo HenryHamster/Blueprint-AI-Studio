@@ -70,6 +70,13 @@
     "output": "collected 0 items\n\nno tests ran in 0.01s"
   },
   {
+    "name": "pytest_collected_zero_items_with_error",
+    "category": "zero-test",
+    "genuine_suite": true,
+    "expected": "ran",
+    "output": "collected 0 items / 1 error\n\nERROR tests/test_import.py - ImportError: cannot import name foo\n1 error in 0.01s"
+  },
+  {
     "name": "rust_zero_test_summary",
     "category": "zero-test",
     "genuine_suite": false,
