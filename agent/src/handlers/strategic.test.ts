@@ -105,6 +105,8 @@ vi.mock('./strategic-sections.js', () => ({
 }));
 
 import { renderStrategicPromptSuffix, buildStagedDirectionsSection, handleStrategic } from './strategic.js';
+import { runClaudeCode } from '../index.js';
+import { runThinkerWithGate } from '../prompts/thinker.js';
 
 describe('buildStagedDirectionsSection', () => {
   it('returns empty string when nothing is staged', () => {
@@ -212,6 +214,42 @@ describe('handleStrategic problem_model recovery framing', () => {
     expect(section).toContain('```json');
     expect(section).not.toContain('this is the first cycle');
     expect(section).not.toContain('EXISTS but was not shipped in full');
+  });
+});
+
+describe('handleStrategic executor prompt: atomic staged create-direction', () => {
+  it('documents create-direction with "staged": true as a single atomic op (no create-then-stage)', async () => {
+    vi.mocked(runClaudeCode).mockClear();
+    // Let the thinker gate pass so the executor prompt is actually built and
+    // handed to runClaudeCode (its first arg is the executor prompt).
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+    } as unknown as { ok: boolean; analysisText: string });
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '',
+    });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-staged-exec',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    expect(executorPrompt).toBeDefined();
+    expect(executorPrompt).toContain('"staged": true');
+    expect(executorPrompt).toContain('one atomic op');
+    // Steers AWAY from the old create-then-stage sequence for new ideas.
+    expect(executorPrompt).toContain('Do NOT create-then-stage');
   });
 });
 

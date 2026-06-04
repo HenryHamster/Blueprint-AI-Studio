@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { apiFetch } from '../api';
+import { apiFetch, fetchVersionLifecycle } from '../api';
 import { useDirectionForm } from './useDirectionForm';
 import { useAutonomousConfig } from './useAutonomousConfig';
 import type { Direction } from '../components/DirectionsPanel';
@@ -33,6 +33,10 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
   const [runningUpdateAckAt, setRunningUpdateAckAt] = useState<string | null>(null);
   const [runningUpdateReconciliation, setRunningUpdateReconciliation] =
     useState<RunningUpdateReconciliation | null>(null);
+  // The currently-open release version number, used to gate the "stage for next
+  // version" affordance: staging requires an open version (the backend stamps
+  // staged_for_version from it and 404s when none is open).
+  const [openVersionNumber, setOpenVersionNumber] = useState<number | null>(null);
 
   // Error feedback
   const [error, setError] = useState<string | null>(null);
@@ -102,6 +106,17 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     } catch (err) {
       console.error('Failed to fetch directions:', err);
       addToast('Failed to load directions', 'error');
+    }
+    // Fetch the open version separately so a version-lifecycle failure never
+    // blocks the directions list. A null result simply disables staging in the UI.
+    if (selectedProjectId) {
+      try {
+        const lifecycle = await fetchVersionLifecycle(selectedProjectId);
+        setOpenVersionNumber(lifecycle.current_version?.version_number ?? null);
+      } catch (err) {
+        console.error('Failed to fetch version lifecycle:', err);
+        setOpenVersionNumber(null);
+      }
     }
     setLoading(false);
   }
@@ -414,6 +429,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     runningUpdateAckAt,
     setRunningUpdateAckAt,
     runningUpdateReconciliation,
+    openVersionNumber,
     error,
     setError,
     researchingIds,

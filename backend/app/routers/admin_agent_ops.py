@@ -734,28 +734,64 @@ async def strategic_operation(
                 status_code=400,
                 detail="success_evidence and retirement_condition are required for direction creation",
             )
-        active_count = sum(1 for d in directions if d.get("status") == "active")
-        max_active = _runtime_config.get("max_active_directions", 5)
-        if active_count >= max_active:
-            ctx = task.context or {}
-            task.context = {**ctx, "_strategic_api_called": True}
-            flag_modified(task, "context")
-            session.add(task)
-            await session.commit()
-            return JSONResponse(
-                content=_resp(
-                    {
-                        "status": "skipped",
-                        "reason": f"Direction cap reached: {active_count}/{max_active} active",
-                    }
-                ),
-                status_code=409,
-            )
+        # Atomic create-staged: when ``staged`` is set, the direction is born in
+        # the "staged" state stamped to the CURRENT open version — identical
+        # resolution semantics to ``stage_direction`` — so a next-version idea
+        # never passes through a research-eligible active state (closing the old
+        # create-then-stage race). Resolve the version FIRST so a missing open
+        # version skips cleanly (409) without creating anything.
+        staged_create = bool(data.get("staged"))
+        staged_for_version: int | None = None
+        if staged_create:
+            from app.release_version import current_open_version  # noqa: PLC0415
+
+            open_version = await current_open_version(session, project.id)
+            if open_version is None:
+                # No open version to gate against — staging would have no target
+                # to auto-activate at, so skip (409) rather than silently
+                # creating an active direction the strategist meant for next
+                # version (mirrors stage_direction).
+                ctx = task.context or {}
+                task.context = {**ctx, "_strategic_api_called": True}
+                flag_modified(task, "context")
+                session.add(task)
+                await session.commit()
+                return JSONResponse(
+                    content=_resp(
+                        {
+                            "status": "skipped",
+                            "reason": "No open version to stage against",
+                        }
+                    ),
+                    status_code=409,
+                )
+            staged_for_version = open_version.version_number
+        # The active-direction cap counts active directions only; a staged
+        # create is inert until its target version promotes, so it does not
+        # consume a slot (mirrors the user PATCH / add_direction staged paths).
+        if not staged_create:
+            active_count = sum(1 for d in directions if d.get("status") == "active")
+            max_active = _runtime_config.get("max_active_directions", 5)
+            if active_count >= max_active:
+                ctx = task.context or {}
+                task.context = {**ctx, "_strategic_api_called": True}
+                flag_modified(task, "context")
+                session.add(task)
+                await session.commit()
+                return JSONResponse(
+                    content=_resp(
+                        {
+                            "status": "skipped",
+                            "reason": f"Direction cap reached: {active_count}/{max_active} active",
+                        }
+                    ),
+                    status_code=409,
+                )
         _DIR_FIELD_MAX = 500
         new_dir: dict = {
             "id": f"d-{uuid.uuid4().hex[:8]}",
             "text": text,
-            "status": "active",
+            "status": "staged" if staged_create else "active",
             "priority": priority,
             "notes": (
                 [
@@ -765,6 +801,18 @@ async def strategic_operation(
                     }
                 ]
                 if rationale
+                else []
+            )
+            + (
+                [
+                    {
+                        "text": (
+                            f"Staged to begin after v{staged_for_version} promotes"
+                        ),
+                        "added_at": _utcnow().isoformat(),
+                    }
+                ]
+                if staged_create
                 else []
             )
             + (
@@ -788,6 +836,9 @@ async def strategic_operation(
                 "retirement_condition": retirement_condition[:_DIR_FIELD_MAX],
             },
         }
+        if staged_create:
+            new_dir["staged_for_version"] = staged_for_version
+            new_dir["staged_at"] = _utcnow().isoformat()
         impl_constraints = str(data.get("implementation_constraints", "")).strip()
         if impl_constraints:
             new_dir["context"]["implementation_constraints"] = impl_constraints[
@@ -826,21 +877,37 @@ async def strategic_operation(
         ctx = task.context or {}
         created_ids = list(ctx.get("_strategic_created_ids", []))
         created_ids.append(new_dir["id"])
-        task.context = {
+        new_ctx = {
             **ctx,
             "_strategic_dirs_created": ctx.get("_strategic_dirs_created", 0) + 1,
             "_strategic_created_ids": created_ids,
         }
+        # An atomic staged create is also a staging decision — record it under
+        # the staged counters too (parity with stage_direction) so the cycle's
+        # staging activity is auditable.
+        if staged_create:
+            staged_ids = list(ctx.get("_strategic_staged_ids", []))
+            staged_ids.append(new_dir["id"])
+            new_ctx["_strategic_dirs_staged"] = ctx.get("_strategic_dirs_staged", 0) + 1
+            new_ctx["_strategic_staged_ids"] = staged_ids
+        task.context = new_ctx
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
         await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
         logger.info(
-            f"[STRATEGIC API] Created direction '{text[:60]}' for project {project.id}"
+            f"[STRATEGIC API] Created direction '{text[:60]}' "
+            f"({'staged for v' + str(staged_for_version) if staged_create else 'active'}) "
+            f"for project {project.id}"
         )
-        return _resp(
-            {"status": "ok", "op": "create_direction", "direction_id": new_dir["id"]}
-        )
+        resp_body: dict = {
+            "status": "ok",
+            "op": "create_direction",
+            "direction_id": new_dir["id"],
+        }
+        if staged_create:
+            resp_body["staged_for_version"] = staged_for_version
+        return _resp(resp_body)
 
     elif payload.op == "update_direction":
         dir_id = data.get("direction_id")

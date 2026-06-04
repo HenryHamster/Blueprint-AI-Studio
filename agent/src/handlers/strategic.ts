@@ -568,13 +568,18 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # conflicts_with: list direction IDs that touch overlapping code/systems — they won't run in parallel.
 # recommended_mode: audit|fundamentals|ship|pause — your judgment for this direction's system health.
 ./strategic create-direction '{"text": "outcome statement", "priority": "high|medium|low", "category": "product|structural", "gap_id": "g-xxx", "rationale": "...", "conflicts_with": ["d-xxx"], "recommended_mode": "ship", "success_evidence": "observable outcome that proves this direction is done (required)", "retirement_condition": "measurable condition that triggers retirement (required)", "implementation_constraints": "optional constraints for implementors", "dedup_reasoning": {"closest_directions": ["d-xxx"], "distinction": "one-line justification why this is distinct in scope or mechanism"}}'
+# To create a NEW idea that belongs to the NEXT version, pass "staged": true on
+# the SAME create-direction call — it is born staged (inert, gated to the open
+# version) in one atomic op, so it never passes through a research-eligible
+# active state. Requires an open version (skips 409 if none). Do NOT create-then-stage.
 ./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "...", "text": "...", "conflicts_with": [...], "recommended_mode": "audit"}, "rationale": "..."}'
 ./strategic retire-direction '{"direction_id": "d-xxx", "rationale": "..."}'
 # Stage a direction for the NEXT version: it goes inert (no work spawned) and
 # auto-activates when the current version promotes and the next one opens. Use
 # ONLY for work the Thinker DECIDED belongs to the next version (Section 3
-# "Staging") — never to defer a within-cycle call. To stage a NEW next-version
-# idea, create-direction first, then stage it by the returned id.
+# "Staging") — never to defer a within-cycle call. For an EXISTING active
+# direction, stage it by id below. For a NEW next-version idea, do NOT
+# create-then-stage — pass "staged": true on create-direction (one atomic op).
 ./strategic stage-direction '{"direction_id": "d-xxx", "rationale": "why this belongs to the next version"}'
 
 # REQUIRED: Submit the retired-direction critique from Section 3.5.
@@ -633,7 +638,7 @@ ${analysisText.slice(0, 50_000)}
 
    - Does an existing direction already cover this? → UPDATE it; don't duplicate.
    - Does this depend on another direction being done first? → Keep it paused or don't create yet.
-   - Did the Thinker's Section 3 "Staging" decide this work belongs to the NEXT version? → For an existing direction, \`./strategic stage-direction\`. For a new idea, \`./strategic create-direction\` first, then \`./strategic stage-direction\` with the returned id. Stage ONLY what the analysis explicitly staged — never to defer a call the analysis left open.
+   - Did the Thinker's Section 3 "Staging" decide this work belongs to the NEXT version? → For an existing direction, \`./strategic stage-direction\`. For a NEW idea, \`./strategic create-direction\` with \`"staged": true\` — born staged in ONE atomic op (never create-then-stage, which would briefly expose it as research-eligible). Stage ONLY what the analysis explicitly staged — never to defer a call the analysis left open.
    - Direction text describes OUTCOME ("users can X", "the system handles Y"), not implementation. Implementation details go in rationale.
 
    Priority is scarce:

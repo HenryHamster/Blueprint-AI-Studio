@@ -25,7 +25,7 @@ from app.directions_repo import (
     activate_eligible_staged_directions,
     sync_directions,
 )
-from app.models import Direction, Project, Task, TaskStatus
+from app.models import Direction, Project, ProjectMember, Task, TaskStatus
 from app.reaper_sweeps import sweep_activate_staged_directions
 from app.strategic_spawning import _build_staged_directions_summary
 
@@ -428,3 +428,389 @@ def test_build_staged_directions_summary_empty_when_none_staged():
         directions=[_active_direction("d-a"), _active_direction("d-b")],
     )
     assert _build_staged_directions_summary(project) == []
+
+
+# ---------------------------------------------------------------------------
+# 6. Auto-activation notifies the operator + annotates the direction
+# ---------------------------------------------------------------------------
+
+
+async def _activation_messages(db_session, project_id):
+    from app.models import ProjectMessage
+
+    rows = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project_id
+            )
+        )
+    ).scalars().all()
+    return [
+        m
+        for m in rows
+        if (m.context or {}).get("event_type") == "direction_staged_activated"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_activation_annotates_direction_with_note(db_session):
+    """Each activated direction gets a note naming the promoting version,
+    symmetric with the note written when it was staged."""
+    project = Project(
+        name="Staged-Notes",
+        user_id="staged-user",
+        autonomous_enabled=True,
+        directions=[_staged_direction("d-note", staged_for_version=2)],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    activated = await activate_eligible_staged_directions(
+        db_session, project.id, promoted_version_number=3
+    )
+    assert activated == ["d-note"]
+
+    await db_session.refresh(project)
+    notes = project.directions[0].get("notes") or []
+    assert notes, "activation must append a note to the direction"
+    assert "v3" in notes[-1]["text"]
+    assert "resumed" in notes[-1]["text"].lower()
+    assert notes[-1]["added_at"]
+
+
+@pytest.mark.asyncio
+async def test_activation_posts_operator_message(db_session):
+    """Activation posts a single high-signal ProjectMessage naming the version
+    and the activated count."""
+    project = Project(
+        name="Staged-Notify",
+        user_id="staged-user",
+        autonomous_enabled=True,
+        directions=[
+            _staged_direction("d-n1", staged_for_version=2),
+            _staged_direction("d-n2", staged_for_version=2),
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await activate_eligible_staged_directions(
+        db_session, project.id, promoted_version_number=2
+    )
+
+    msgs = await _activation_messages(db_session, project.id)
+    assert len(msgs) == 1
+    msg = msgs[0]
+    assert "v2" in msg.content
+    assert (msg.context or {}).get("count") == 2
+    assert (msg.context or {}).get("promoted_version_number") == 2
+    assert set((msg.context or {}).get("direction_ids") or []) == {"d-n1", "d-n2"}
+
+
+@pytest.mark.asyncio
+async def test_activation_no_message_when_nothing_activates(db_session):
+    """A sweep that activates nothing posts no note and no message — and a
+    repeat run is idempotent (no duplicate signal)."""
+    project = Project(
+        name="Staged-Idempotent",
+        user_id="staged-user",
+        autonomous_enabled=True,
+        directions=[_staged_direction("d-idem", staged_for_version=5)],  # 5 > 2
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Nothing eligible — no message at all.
+    assert await activate_eligible_staged_directions(
+        db_session, project.id, promoted_version_number=2
+    ) == []
+    assert await _activation_messages(db_session, project.id) == []
+
+    # Now activate, then re-run: the second run is a no-op and posts no
+    # duplicate message.
+    await activate_eligible_staged_directions(
+        db_session, project.id, promoted_version_number=5
+    )
+    assert len(await _activation_messages(db_session, project.id)) == 1
+    await activate_eligible_staged_directions(
+        db_session, project.id, promoted_version_number=5
+    )
+    assert len(await _activation_messages(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_activation_survives_notification_failure(db_session, monkeypatch):
+    """A notification failure is swallowed — the activation (status flip + note)
+    must still commit, proving the best-effort isolation contract."""
+    import app.notification_dispatch as nd
+
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("notification backend down")
+
+    monkeypatch.setattr(nd, "post_staged_directions_activated_message", _boom)
+
+    project = Project(
+        name="Staged-NotifyFail",
+        user_id="staged-user",
+        autonomous_enabled=True,
+        directions=[_staged_direction("d-fail", staged_for_version=1)],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    activated = await activate_eligible_staged_directions(
+        db_session, project.id, promoted_version_number=1
+    )
+    # Activation is unaffected by the notification failure.
+    assert activated == ["d-fail"]
+    await db_session.refresh(project)
+    assert project.directions[0]["status"] == "active"
+    assert project.directions[0].get("notes"), "note still written despite notify failure"
+
+
+# ---------------------------------------------------------------------------
+# 7. Atomic create-staged: a next-version direction is born staged in one op
+#    (closes the create→stage race where a brand-new active direction is
+#    immediately research-eligible).
+# ---------------------------------------------------------------------------
+
+
+async def _strategic_task(db_session, project_id, vm: str) -> Task:
+    task = Task(
+        project_id=project_id,
+        payloads=[{"type": "strategic_review"}],
+        vm_instance_id=vm,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+_CREATE_STAGED_DATA = {
+    "text": "build-phase idea that belongs to the next version",
+    "priority": "high",
+    "success_evidence": "observable outcome that proves it is done",
+    "retirement_condition": "measurable condition that triggers retirement",
+}
+
+
+@pytest.mark.asyncio
+async def test_create_direction_op_staged_round_trips(client: AsyncClient, db_session):
+    """create_direction with staged=true is born 'staged', stamps the open
+    version, never passes through 'active', and the staged status round-trips
+    through the normalized Direction mirror table."""
+    project = Project(
+        name="CreateStaged-Op",
+        user_id="stage-user",
+        autonomous_enabled=True,
+        directions=[],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await rv.open_version(db_session, project.id, version_number=7)
+    await db_session.commit()
+
+    task = await _strategic_task(db_session, project.id, "agent-vm-create-staged")
+    token = create_agent_token(
+        str(task.id), "agent-vm-create-staged", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "create_direction",
+            "data": {**_CREATE_STAGED_DATA, "staged": True},
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["op"] == "create_direction"
+    assert body["staged_for_version"] == 7
+    new_id = body["direction_id"]
+
+    await db_session.refresh(project)
+    created = project.directions[0]
+    assert created["id"] == new_id
+    assert created["status"] == "staged"
+    assert created["staged_for_version"] == 7
+    assert "staged_at" in created
+
+    # Round-trip: the normalized Direction mirror row reflects the staged status.
+    row = (
+        await db_session.execute(
+            select(Direction).where(
+                Direction.project_id == project.id,
+                Direction.direction_key == new_id,
+            )
+        )
+    ).scalar_one()
+    assert row.status == "staged"
+    assert row.data["staged_for_version"] == 7
+
+
+@pytest.mark.asyncio
+async def test_create_direction_op_staged_no_open_version_skips(
+    client: AsyncClient, db_session
+):
+    """staged=true with no open version → 409 skipped and NOTHING is created
+    (never silently falls back to an active direction)."""
+    project = Project(
+        name="CreateStaged-NoVersion",
+        user_id="stage-user",
+        autonomous_enabled=True,
+        directions=[],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _strategic_task(db_session, project.id, "agent-vm-create-nover")
+    token = create_agent_token(
+        str(task.id), "agent-vm-create-nover", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "create_direction",
+            "data": {**_CREATE_STAGED_DATA, "staged": True},
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["status"] == "skipped"
+
+    # Nothing created — the blob is still empty.
+    await db_session.refresh(project)
+    assert project.directions == []
+
+
+@pytest.mark.asyncio
+async def test_create_direction_op_staged_ignores_active_cap(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """A staged create is inert, so it does NOT count against the active cap:
+    creation succeeds even when active directions are already at the cap."""
+    from app import shared_state
+
+    monkeypatch.setitem(shared_state.runtime_config, "max_active_directions", 2)
+
+    project = Project(
+        name="CreateStaged-Cap",
+        user_id="stage-user",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-a1"), _active_direction("d-a2")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await rv.open_version(db_session, project.id, version_number=3)
+    await db_session.commit()
+
+    task = await _strategic_task(db_session, project.id, "agent-vm-create-cap")
+    token = create_agent_token(
+        str(task.id), "agent-vm-create-cap", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "create_direction",
+            "data": {**_CREATE_STAGED_DATA, "staged": True},
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["staged_for_version"] == 3
+
+    await db_session.refresh(project)
+    statuses = sorted(d["status"] for d in project.directions)
+    assert statuses == ["active", "active", "staged"]
+
+
+# ---------------------------------------------------------------------------
+# 8. Operator-facing creation path: add_direction with staged=true
+# ---------------------------------------------------------------------------
+
+
+async def _member_project(db_session, name: str, **extra) -> Project:
+    """Create a project owned by the test client's current user."""
+    project = Project(
+        name=name,
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],
+        vision={"purpose": "test"},
+        **extra,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
+    await db_session.commit()
+    return project
+
+
+@pytest.mark.asyncio
+async def test_add_direction_staged_stamps_version(client: AsyncClient, db_session):
+    """Operator add_direction with staged=true creates the direction directly in
+    the staged state stamped to the open version."""
+    project = await _member_project(db_session, "AddStaged")
+    await rv.open_version(db_session, project.id, version_number=9)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/directions",
+        json={
+            "text": "operator next-version idea",
+            "priority": "medium",
+            "staged": True,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    created = resp.json()["direction"]
+    assert created["status"] == "staged"
+    assert created["staged_for_version"] == 9
+    assert "staged_at" in created
+
+    await db_session.refresh(project)
+    assert project.directions[0]["status"] == "staged"
+    assert project.directions[0]["staged_for_version"] == 9
+
+
+@pytest.mark.asyncio
+async def test_add_direction_staged_no_open_version_404(
+    client: AsyncClient, db_session
+):
+    """Operator add_direction with staged=true and no open version → 404 and no
+    direction is created (never silently active)."""
+    project = await _member_project(db_session, "AddStaged-NoVersion")
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/directions",
+        json={"text": "idea", "priority": "low", "staged": True},
+    )
+    assert resp.status_code == 404, resp.text
+
+    await db_session.refresh(project)
+    assert project.directions == []

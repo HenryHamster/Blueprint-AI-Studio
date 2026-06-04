@@ -362,6 +362,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
             researchSuccessIds={data.researchSuccessIds}
             forceConfirmId={data.forceConfirmId}
             setForceConfirmId={data.setForceConfirmId}
+            stageTargetVersion={data.openVersionNumber}
             onViewFindings={onViewFindings}
             onNavigateToTask={onNavigateToTask}
           />

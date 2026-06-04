@@ -96,6 +96,14 @@ class DirectionPayload(BaseModel):
         ge=0,
         description="Optional cost budget ceiling in USD for this direction",
     )
+    staged: bool = Field(
+        default=False,
+        description=(
+            "Create the direction directly in the 'staged' state, gated to the "
+            "current open release version, so it never passes through a "
+            "research-eligible active state. Requires an open version (404 if none)."
+        ),
+    )
 
 
 @router.get("/projects/{project_id}/directions")
@@ -213,14 +221,34 @@ async def add_direction(
 
     max_active = _runtime_config.get("max_active_directions", 5)
 
+    # Atomic staged create: resolve and stamp the open version exactly the way
+    # the staged PATCH branch (update_direction) does, so a next-version idea is
+    # born staged in a single commit and never passes through a research-eligible
+    # active state. No open version → no target to auto-activate against, so 404
+    # rather than silently creating active.
+    staged_for_version: int | None = None
+    if payload.staged:
+        from app.release_version import current_open_version  # noqa: PLC0415
+
+        open_version = await current_open_version(session, project.id)
+        if open_version is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No open release version found for this project.",
+            )
+        staged_for_version = open_version.version_number
+
     direction = {
         "id": f"d-{uuid.uuid4().hex[:8]}",
         "text": payload.text,
         "priority": payload.priority,
         "paths": payload.paths or [],
         "added_at": _utcnow().isoformat(),
-        "status": "active",
+        "status": "staged" if payload.staged else "active",
     }
+    if payload.staged:
+        direction["staged_for_version"] = staged_for_version
+        direction["staged_at"] = _utcnow().isoformat()
     if payload.category:
         direction["category"] = payload.category
     if payload.completion_criteria:
@@ -233,12 +261,16 @@ async def add_direction(
         direction["cost_budget_usd"] = float(payload.cost_budget_usd)
 
     def _mutate_add(directions: list) -> None:
-        active_count = sum(1 for d in directions if d.get("status") == "active")
-        if active_count >= max_active:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Direction cap reached: max {max_active} active directions allowed",
-            )
+        # The active-direction cap counts active directions only; a staged
+        # create is inert until its version promotes, so it does not consume a
+        # slot (mirrors update_direction, where the cap fires only on → active).
+        if not payload.staged:
+            active_count = sum(1 for d in directions if d.get("status") == "active")
+            if active_count >= max_active:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Direction cap reached: max {max_active} active directions allowed",
+                )
         if payload.conflicts_with:
             existing_ids = {d.get("id") for d in directions}
             invalid = [cid for cid in payload.conflicts_with if cid not in existing_ids]

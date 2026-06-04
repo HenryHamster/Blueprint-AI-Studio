@@ -233,7 +233,12 @@ async def activate_eligible_staged_directions(
         emit_strategic_updated,
     )
 
+    # Bound notes the same way every other direction note writer does, so a
+    # repeatedly-staged/activated direction can't grow its notes array forever.
+    from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX
+
     activated: List[str] = []
+    activated_meta: List[Dict[str, Any]] = []
     now_iso = _utcnow().isoformat()
 
     def _mutate(directions: List[Dict[str, Any]]) -> None:
@@ -254,13 +259,49 @@ async def activate_eligible_staged_directions(
             d["status"] = "active"
             d.pop("staged_for_version", None)
             d["staged_activated_at"] = now_iso
+            # Symmetric with the staging-IN note: record why the direction
+            # resumed and which version's promotion triggered it.
+            notes = d.get("notes", [])
+            notes.append(
+                {
+                    "text": (
+                        f"Auto-activated: v{promoted_version_number} promoted "
+                        "— staged work resumed"
+                    ),
+                    "added_at": now_iso,
+                }
+            )
+            d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
             did = d.get("id")
             if did:
                 activated.append(str(did))
+            activated_meta.append(
+                {"id": str(did) if did else None, "text": d.get("text")}
+            )
 
     applied = await with_directions_locked(session, project_id, _mutate)
     if not applied or not activated:
         return []
+    # Best-effort operator notification — posted into the SAME session so it
+    # rides the commit below atomically with the activation notes. Wrapped in
+    # its own try/except (log-and-swallow) so a notification failure can never
+    # abort the already-decided activation. Lazy import preserves this module's
+    # documented cycle avoidance.
+    try:
+        from app.notification_dispatch import (
+            post_staged_directions_activated_message,
+        )
+
+        await post_staged_directions_activated_message(
+            session, project_id, activated_meta, promoted_version_number
+        )
+    except Exception as exc:  # noqa: BLE001 — notification is strictly best-effort
+        logger.warning(
+            "[directions_repo] staged-activation notification failed for project "
+            "%s (activation will still commit): %s",
+            project_id,
+            exc,
+        )
     await session.commit()
     try:
         await emit_strategic_updated(project_id, STRATEGIC_KIND_DIRECTIONS)

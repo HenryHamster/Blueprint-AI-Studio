@@ -252,7 +252,7 @@ Directions to retire (one-sentence reason each) and to create (name the gap_id e
 
 Staging is NOT deferral, and it is not an escape from the "you're not allowed to defer" rule. Staging is itself a DECISION — a hard call that the work genuinely belongs to the NEXT version's scope, not this one. The natural case: the project is in its stabilize/hardening phase (see the version-phase section, when present) and a strong *build-phase* idea appears that would pollute the current version's scope if started now — stage it so it activates cleanly when the next build phase opens. Use it for genuinely next-version-scoped work. Do NOT use it to dodge a within-cycle call: if work belongs to THIS version, create it active now; if it's not worth doing, retire/don't-create it. "I'm not sure, I'll stage it" is deferral wearing staging's clothes — make the call instead.
 
-To stage a genuinely new next-version idea, create the direction first, then stage it (the Executor will create-then-stage). To stage an existing active direction whose work you've decided belongs to the next version, stage it by id.
+To stage a genuinely new next-version idea, create it with the staged flag (a single atomic op — the Executor passes \`"staged": true\` on create-direction, so the direction is born staged and never passes through a research-eligible active state). To stage an existing active direction whose work you've decided belongs to the next version, stage it by id.
 
 ## 3.5. Retired-direction critique (REQUIRED)
 

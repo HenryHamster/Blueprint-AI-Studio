@@ -70,6 +70,7 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset[str] = frozenset(
         "rollback_recommended",  # post_rollback_recommendation_message
         "fix_loop_divergence_regressed",  # post_fix_loop_divergence_regression_message
         "direction_outcome_stalled",  # post_direction_outcome_stalled_message
+        "direction_staged_activated",  # post_staged_directions_activated_message
         "promotion_readiness_reached",  # post_version_promotion_readiness_message
         "release_calcifying",  # post_version_calcification_message
         "release_build_stalled",  # post_version_build_stalled_message
@@ -631,6 +632,66 @@ async def post_direction_milestone_message(
             project_id,
             "DIRECTION_MILESTONE",
             payload,
+        )
+    )
+    return msg
+
+
+async def post_staged_directions_activated_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    activated: list[dict[str, Any]],
+    promoted_version_number: int,
+    task_id: Optional[uuid.UUID] = None,
+) -> Optional[ProjectMessage]:
+    """Post a HIGH-SIGNAL message when staged directions auto-activate on version open.
+
+    Symmetric counterpart to the staging-IN note/notice: when the version a
+    direction was staged behind promotes, the shared activation helper flips it
+    back to ``active`` (making it researchable and able to consume VM capacity
+    again). This is the one direction lifecycle transition that was previously
+    silent — every other transition (auto-pause, auto-retire, churn/burn pause,
+    outcome-stalled) posts an operator milestone. ``activated`` is a list of
+    ``{"id", "text"}`` dicts for the directions that flipped; classified
+    ``high_signal`` so it survives paging and fires an info toast.
+
+    Returns ``None`` (posts nothing) when ``activated`` is empty so callers need
+    no guard. Best-effort: the external webhook is fire-and-forget and the
+    in-session message rides the caller's commit.
+    """
+    if not activated:
+        return None
+    texts = [str(d.get("text") or d.get("id") or "?")[:80] for d in activated]
+    count = len(activated)
+    joined = "; ".join(texts)
+    summary = (
+        f"{count} staged direction(s) auto-activated after v"
+        f"{promoted_version_number} promoted — staged work resumed: {joined}"
+    )
+    context: dict[str, Any] = {
+        "promoted_version_number": promoted_version_number,
+        "count": count,
+        "direction_ids": [str(d.get("id")) for d in activated if d.get("id")],
+        "direction_texts": texts,
+    }
+    msg = await post_event_message(
+        session,
+        project_id,
+        event_type="direction_staged_activated",
+        summary=summary,
+        context=context,
+        task_id=task_id,
+    )
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "DIRECTION_STAGED_ACTIVATED",
+            {
+                "promoted_version_number": promoted_version_number,
+                "count": count,
+                "direction_ids": context["direction_ids"],
+                "direction_texts": texts,
+            },
         )
     )
     return msg

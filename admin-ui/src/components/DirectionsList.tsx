@@ -48,6 +48,9 @@ export interface DirectionsListProps {
   researchSuccessIds: Record<string, boolean>;
   forceConfirmId: string | null;
   setForceConfirmId: React.Dispatch<React.SetStateAction<string | null>>;
+  // Open release version number staging targets, or null when no version is open
+  // (staging is then disabled — the backend rejects staging with no open version).
+  stageTargetVersion: number | null;
   onViewFindings?: (directionId: string) => void;
   onNavigateToTask?: (taskId: string) => void;
 }
@@ -76,6 +79,7 @@ export function DirectionsList(props: DirectionsListProps) {
     researchSuccessIds,
     forceConfirmId,
     setForceConfirmId,
+    stageTargetVersion,
     onViewFindings,
     onNavigateToTask,
   } = props;
@@ -176,6 +180,7 @@ export function DirectionsList(props: DirectionsListProps) {
                         researchSuccessIds={researchSuccessIds}
                         forceConfirmId={forceConfirmId}
                         setForceConfirmId={setForceConfirmId}
+                        stageTargetVersion={stageTargetVersion}
                         onViewFindings={onViewFindings}
                         onNavigateToTask={onNavigateToTask}
                       />

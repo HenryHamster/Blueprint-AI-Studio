@@ -244,6 +244,16 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('Staging is NOT deferral');
   });
 
+  it('staging guidance directs new next-version ideas to the atomic staged flag (not create-then-stage)', () => {
+    const prompt = buildThinkerPrompt(base);
+    // A genuinely new idea is created with the staged flag in a single atomic
+    // op — never created active then staged (which would briefly expose it as
+    // research-eligible).
+    expect(prompt).toContain('"staged": true');
+    expect(prompt).toContain('single atomic op');
+    expect(prompt).not.toContain('create-then-stage');
+  });
+
   it('operator overrides section rendered only when operatorOverridesSection is non-empty', () => {
     const with_ = buildThinkerPrompt({ ...base, operatorOverridesSection: '\n## Operator Overrides Since Last Cycle\nentry\n' });
     expect(with_).toContain('## Operator Overrides Since Last Cycle');

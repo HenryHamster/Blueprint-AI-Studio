@@ -111,6 +111,10 @@ export interface DirectionCardProps {
   // Force confirm popover
   forceConfirmId: string | null;
   setForceConfirmId: React.Dispatch<React.SetStateAction<string | null>>;
+  // Open release version to stage against, or null when none is open. When null,
+  // the edit-form "Staged" status option is disabled (the backend rejects staging
+  // with no open version).
+  stageTargetVersion?: number | null;
   // Navigation callbacks
   onViewFindings?: (directionId: string) => void;
   onNavigateToTask?: (taskId: string) => void;
@@ -128,6 +132,7 @@ function DirectionCardImpl({
   applyDirectionUpdate, dismissDirectionUpdate, triggerResearch, reorderDirections,
   taskCounts, activeTasks, cooldownMinutes, researchingIds, researchSuccessIds,
   forceConfirmId, setForceConfirmId,
+  stageTargetVersion,
   onViewFindings, onNavigateToTask,
 }: DirectionCardProps) {
   const forceConfirmRef = useRef<HTMLDivElement | null>(null);
@@ -444,7 +449,7 @@ function DirectionCardImpl({
               className="flex-1 min-w-[120px] bg-transparent text-neutral-100 text-xs focus:outline-none placeholder-neutral-600"
             />
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <select
               value={editPriority}
               onChange={e => setEditPriority(e.target.value as 'high' | 'medium' | 'low')}
@@ -456,12 +461,24 @@ function DirectionCardImpl({
             </select>
             <select
               value={editStatus}
-              onChange={e => setEditStatus(e.target.value as 'active' | 'completed' | 'paused')}
+              onChange={e => setEditStatus(e.target.value as 'active' | 'completed' | 'paused' | 'staged')}
               className="bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
             >
               <option value="active">Active</option>
               <option value="completed">Completed</option>
               <option value="paused">Paused</option>
+              {/* Stage for the next version — disabled when no version is open to
+                  stage against, since the backend rejects that case. The selected
+                  target version is surfaced in the hint below the row. */}
+              <option
+                value="staged"
+                disabled={stageTargetVersion == null}
+                title={stageTargetVersion == null
+                  ? 'No open release version to stage against'
+                  : `Stage to begin when v${stageTargetVersion} promotes and the next version opens`}
+              >
+                Staged
+              </option>
             </select>
             <select
               value={editCategory ?? ''}
@@ -495,6 +512,15 @@ function DirectionCardImpl({
               <X className="w-3.5 h-3.5" />
             </button>
           </div>
+          {stageTargetVersion == null ? (
+            <p className="text-[10px] text-neutral-500 leading-relaxed">
+              No open release version to stage against.
+            </p>
+          ) : editStatus === 'staged' && (
+            <p className="text-[10px] text-sky-400/80 leading-relaxed">
+              Will stage to begin after v{stageTargetVersion} promotes and the next version opens.
+            </p>
+          )}
         </div>
       ) : (
         /* View mode */

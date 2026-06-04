@@ -272,4 +272,92 @@ describe('DirectionCard — viewport regression', () => {
     expect(host.textContent).toContain('Activate now');
     expect(host.textContent).toContain('Cancel');
   });
+
+  test('edit mode offers an enabled Staged option when a version is open', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <DirectionCard
+          {...noopProps}
+          direction={richDirection}
+          editingId={richDirection.id}
+          editStatus="staged"
+          stageTargetVersion={7}
+        />,
+      );
+    });
+    const stagedOption = host.querySelector('option[value="staged"]') as HTMLOptionElement | null;
+    if (!stagedOption) throw new Error('expected a Staged option in edit mode');
+    expect(stagedOption.disabled).toBe(false);
+    expect(stagedOption.textContent).toContain('Staged');
+    // With staged selected, the target version is surfaced in the hint below the row.
+    expect(host.textContent).toContain('after v7 promotes');
+    expect(host.textContent).not.toContain('No open release version to stage against');
+  });
+
+  test('edit mode disables the Staged option and explains why when no version is open', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <DirectionCard
+          {...noopProps}
+          direction={richDirection}
+          editingId={richDirection.id}
+          stageTargetVersion={null}
+        />,
+      );
+    });
+    const stagedOption = host.querySelector('option[value="staged"]') as HTMLOptionElement | null;
+    if (!stagedOption) throw new Error('expected a Staged option in edit mode');
+    expect(stagedOption.disabled).toBe(true);
+    expect(host.textContent).toContain('No open release version to stage against');
+  });
+
+  test('edit row renders without horizontal overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <DirectionCard
+            {...noopProps}
+            direction={richDirection}
+            editingId={richDirection.id}
+            stageTargetVersion={7}
+          />,
+        );
+      });
+    });
+  });
+
+  test('edit row has no undocumented small touch targets at 768px', async () => {
+    await expectMinTouchTargetAt(768, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <DirectionCard
+            {...noopProps}
+            direction={richDirection}
+            editingId={richDirection.id}
+            stageTargetVersion={7}
+          />,
+        );
+      });
+    });
+  });
 });
