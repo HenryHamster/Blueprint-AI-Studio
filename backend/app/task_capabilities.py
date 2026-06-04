@@ -91,6 +91,20 @@ EvaluationStrategy = Literal[
 # for every non-strategic type. See STRATEGIC_TASK_TYPES below for membership.
 StrategicPhase = Literal["phase1", "phase2"]
 
+# HOW a task type runs — its execution shape. This is the declarative answer to
+# "what kind of run produces this type's output?" and is the axis the operator
+# catalog surfaces alongside produces/needs/evaluated/cost. The closed
+# vocabulary names the three shapes the GENERALITY direction calls for:
+#   single_agent   — one terminal agent run produces the output (read-only
+#       analyses: research, plan, review, audits, memo, etc.).
+#   workflow       — a fixed multi-step agent workflow (the existing
+#       create→review→fix pipeline that PR-producing code types pass through).
+#   experiment_loop— a long-running, iterated experiment loop. DECLARABLE but
+#       currently UNUSED: no task type runs this shape yet, but the experiment
+#       proof direction will register one against this value. Keeping it in the
+#       vocabulary now lets that future type declare its shape with no edit here.
+RunShape = Literal["single_agent", "workflow", "experiment_loop"]
+
 
 @dataclass(frozen=True)
 class TaskCapability:
@@ -147,6 +161,12 @@ class TaskCapability:
     # dimension — intentionally distinct from agent_mode and WRITE_TASK_TYPES.
     # See PRODUCT_TASK_TYPES below for the derived single source of truth.
     delivers_product: bool = False
+    # HOW this task type runs (its execution shape). Defaults to "single_agent"
+    # so a newly-registered terminal type needs no edit; the PR-producing code
+    # types declare "workflow" (the create→review→fix pipeline) explicitly.
+    # "experiment_loop" is a valid declarable value with no current user yet.
+    # Surfaced in the operator catalog and resolved via ``run_shape_for``.
+    run_shape: RunShape = "single_agent"
 
 
 TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
@@ -162,6 +182,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         evaluation_strategy="ci_and_review",
         cost_ceiling_usd=8.0,
         evaluation="code-ci-review",
+        run_shape="workflow",
     ),
     TaskCapability(
         TaskType.review,
@@ -187,6 +208,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         evaluation_strategy="ci_and_review",
         cost_ceiling_usd=8.0,
         evaluation="code-ci-review",
+        run_shape="workflow",
     ),
     TaskCapability(
         TaskType.plan,
@@ -265,6 +287,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         evaluation_strategy="ci_and_review",
         cost_ceiling_usd=6.0,
         evaluation="code-ci-review",
+        run_shape="workflow",
     ),
     TaskCapability(
         TaskType.deps,
@@ -276,6 +299,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         evaluation_strategy="ci_and_review",
         cost_ceiling_usd=5.0,
         evaluation="code-ci-review",
+        run_shape="workflow",
     ),
     TaskCapability(
         TaskType.docs,
@@ -287,6 +311,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         evaluation_strategy="review_only",
         cost_ceiling_usd=4.0,
         evaluation="code-ci-review",
+        run_shape="workflow",
     ),
     TaskCapability(
         TaskType.migrate,
@@ -300,6 +325,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         evaluation_strategy="ci_and_review",
         cost_ceiling_usd=6.0,
         evaluation="code-ci-review",
+        run_shape="workflow",
     ),
     TaskCapability(
         TaskType.smoketest,
@@ -324,6 +350,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         evaluation_strategy="ci_and_review",
         cost_ceiling_usd=8.0,
         evaluation="code-ci-review",
+        run_shape="workflow",
     ),
     TaskCapability(
         TaskType.debug,
@@ -500,6 +527,14 @@ COMPLETION_HANDLER_BY_TASK_TYPE: dict[str, str] = {
 EVALUATION_STRATEGY_BY_TASK_TYPE: dict[str, str] = {
     capability.id.value: capability.evaluation for capability in TASK_CAPABILITIES
 }
+# Map of task-type value -> declared run-shape, derived from the registry. This
+# is the SINGLE source of truth for "how does this type run?" that future
+# dispatchers (the multi-agent-workflow engine, the experiment-loop engine) read
+# instead of re-deriving the shape. Every task type is present (the field is
+# non-optional with a "single_agent" default). Resolved via ``run_shape_for``.
+RUN_SHAPE_BY_TASK_TYPE: dict[str, str] = {
+    capability.id.value: capability.run_shape for capability in TASK_CAPABILITIES
+}
 # Canonical registry-derived set of "strategic-style" task types — those whose
 # completion runs the strategic-cycle chain under the canonical Project→Task
 # lock (``completion_needs_locked_project=True``, currently design_doc_update
@@ -537,6 +572,17 @@ def strategic_phase_for(task_type: str | TaskType) -> str | None:
     return capability.strategic_phase if capability is not None else None
 
 
+def run_shape_for(task_type: str | TaskType) -> str | None:
+    """Return the declared run-shape ("single_agent"/"workflow"/"experiment_loop")
+    for a task type, or ``None`` if the type is unknown/unregistered.
+
+    This is the single registry accessor future dispatchers consult to learn how
+    a type runs, mirroring ``strategic_phase_for``.
+    """
+    capability = get_task_capability(task_type)
+    return capability.run_shape if capability is not None else None
+
+
 def get_task_capability(task_type: str | TaskType) -> TaskCapability | None:
     """Return metadata for a known task type, or None for future/unknown types."""
     value = task_type.value if isinstance(task_type, TaskType) else task_type
@@ -565,6 +611,7 @@ def _capability_to_catalog_entry(capability: TaskCapability) -> dict:
         "requires_compute": capability.requires_compute,
         "evaluation_strategy": capability.evaluation_strategy,
         "cost_ceiling_usd": capability.cost_ceiling_usd,
+        "run_shape": capability.run_shape,
     }
 
 

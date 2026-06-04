@@ -29,6 +29,12 @@ const OUTPUT_KIND_LABELS: Record<TaskTypeCatalogEntry['output_kind'], string> = 
   none: '—',
 };
 
+const RUN_SHAPE_LABELS: Record<TaskTypeCatalogEntry['run_shape'], string> = {
+  single_agent: 'Single agent',
+  workflow: 'Multi-agent workflow',
+  experiment_loop: 'Experiment loop',
+};
+
 const EVALUATION_LABELS: Record<TaskTypeCatalogEntry['evaluation_strategy'], string> = {
   ci_and_review: 'CI + review',
   review_only: 'Review',
@@ -100,6 +106,8 @@ function CatalogCard({
       </p>
 
       <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]">
+        <dt className="text-neutral-500">Runs as</dt>
+        <dd className="text-neutral-300 truncate text-right">{RUN_SHAPE_LABELS[entry.run_shape]}</dd>
         <dt className="text-neutral-500">Output</dt>
         <dd className="text-neutral-300 truncate text-right">{OUTPUT_KIND_LABELS[entry.output_kind]}</dd>
         <dt className="text-neutral-500">Evaluated by</dt>

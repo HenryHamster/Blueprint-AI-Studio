@@ -21,6 +21,7 @@ const ENTRIES: TaskTypeCatalogEntry[] = [
     requires_compute: false,
     evaluation_strategy: 'ci_and_review',
     cost_ceiling_usd: 8.0,
+    run_shape: 'workflow',
   },
   {
     id: 'research',
@@ -37,6 +38,7 @@ const ENTRIES: TaskTypeCatalogEntry[] = [
     requires_compute: false,
     evaluation_strategy: 'forward_quality',
     cost_ceiling_usd: 4.0,
+    run_shape: 'single_agent',
   },
   {
     id: 'memo',
@@ -53,6 +55,7 @@ const ENTRIES: TaskTypeCatalogEntry[] = [
     requires_compute: false,
     evaluation_strategy: 'none',
     cost_ceiling_usd: null,
+    run_shape: 'single_agent',
   },
 ];
 
@@ -106,6 +109,8 @@ describe('TaskTypeCatalogPanel — viewport regression', () => {
     const createCard = host!.querySelector('[data-task-type="create"]');
     expect(createCard?.textContent).toContain('$8.00');
     expect(createCard?.textContent).toContain('CI + review');
+    // The run-shape axis surfaces "how it runs" alongside the other axes.
+    expect(createCard?.textContent).toContain('Multi-agent workflow');
   });
 
   test('renders actual avg/p95 cost and an over-ceiling badge when a type chronically overruns', async () => {

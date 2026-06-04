@@ -1,5 +1,8 @@
 """Tests for the task capability registry."""
 
+import os
+import re
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -12,6 +15,7 @@ from app.task_capabilities import (
     PRODUCT_TASK_TYPES,
     PROVIDER_CONFIGURABLE_TASK_TYPES,
     READ_ONLY_TASK_TYPES,
+    RUN_SHAPE_BY_TASK_TYPE,
     STRATEGIC_PHASE_BY_TASK_TYPE,
     STRATEGIC_TASK_TYPES,
     TASK_CAPABILITIES,
@@ -19,6 +23,7 @@ from app.task_capabilities import (
     USER_LAUNCHABLE_TASK_TYPES,
     WRITE_TASK_TYPES,
     get_task_capability,
+    run_shape_for,
     strategic_phase_for,
     task_type_catalog,
 )
@@ -189,6 +194,49 @@ def test_code_pr_types_keep_code_ci_review_gate():
     assert EVALUATION_STRATEGY_BY_TASK_TYPE["plan"] == "none"
 
 
+def test_every_capability_declares_a_valid_run_shape():
+    """The additive `run_shape` field is present on every capability with a value
+    from the closed run-shape vocabulary, and the derived map covers every type.
+    This is the registry invariant locking the new declarative axis, mirroring
+    the evaluation-strategy invariant above."""
+    valid = {"single_agent", "workflow", "experiment_loop"}
+    for cap in TASK_CAPABILITIES:
+        assert cap.run_shape in valid, (cap.id, cap.run_shape)
+    assert set(RUN_SHAPE_BY_TASK_TYPE) == ALL_TASK_TYPES
+    assert RUN_SHAPE_BY_TASK_TYPE == {
+        cap.id.value: cap.run_shape for cap in TASK_CAPABILITIES
+    }
+
+
+def test_run_shape_for_accessor_and_honest_per_type_shapes():
+    """`run_shape_for` is the single accessor future dispatchers read. PR-producing
+    code types run the create→review→fix WORKFLOW; terminal read-only analyses run
+    as a SINGLE agent. Unknown types resolve to None."""
+    # The PR-producing code workflow types declare "workflow".
+    for t in ("create", "fix", "refactor", "qa", "migrate", "deps", "docs"):
+        assert run_shape_for(t) == "workflow", t
+    # Terminal single-agent analyses declare "single_agent".
+    for t in ("research", "plan", "review", "memo", "security_audit", "investigate"):
+        assert run_shape_for(t) == "single_agent", t
+    # Unknown / unregistered types have no declared shape.
+    assert run_shape_for("totally_unknown_type") is None
+
+
+def test_experiment_loop_is_a_valid_declarable_run_shape():
+    """No task type runs the experiment loop yet, but the value MUST be part of
+    the closed vocabulary so the future experiment proof can register a type
+    against it with no edit to this module. Assert it is declarable by
+    constructing a capability with it (the dataclass / Literal accepts it)."""
+    from app.task_capabilities import TaskCapability, TaskType
+
+    cap = TaskCapability(
+        TaskType.investigate, "X", "read_only", run_shape="experiment_loop"
+    )
+    assert cap.run_shape == "experiment_loop"
+    # It is intentionally unused by every registered type today.
+    assert "experiment_loop" not in set(RUN_SHAPE_BY_TASK_TYPE.values())
+
+
 def test_product_task_types_derived_from_registry():
     """PRODUCT_TASK_TYPES is the single source of truth for the product/structural
     split. It must be derived from the registry's delivers_product flag, contain
@@ -246,8 +294,10 @@ _CATALOG_FIELDS = {
     "requires_compute",
     "evaluation_strategy",
     "cost_ceiling_usd",
+    "run_shape",
 }
 _VALID_OUTPUT_KINDS = {"pr", "artifact", "knowledge", "verdict", "none"}
+_VALID_RUN_SHAPES = {"single_agent", "workflow", "experiment_loop"}
 _VALID_EVAL_STRATEGIES = {
     "ci_and_review",
     "review_only",
@@ -265,6 +315,7 @@ def test_task_type_catalog_covers_every_capability_with_all_fields():
         assert set(entry.keys()) == _CATALOG_FIELDS, entry["id"]
         assert entry["agent_mode"] in {"write", "read_only"}
         assert entry["output_kind"] in _VALID_OUTPUT_KINDS, entry["id"]
+        assert entry["run_shape"] in _VALID_RUN_SHAPES, entry["id"]
         assert entry["evaluation_strategy"] in _VALID_EVAL_STRATEGIES, entry["id"]
         assert isinstance(entry["requires_code"], bool)
         assert isinstance(entry["requires_web"], bool)
@@ -327,3 +378,116 @@ async def test_task_types_endpoint_requires_auth():
         assert resp.status_code == 401
     finally:
         app.dependency_overrides.pop(get_current_user, None)
+
+
+# ── Agent ↔ backend dispatch-coverage CI guard ──────────────────────────────────
+#
+# Adding a new kind of task is meant to be a matter of registering it. But the
+# backend task-type registry (TaskType / TASK_CAPABILITIES) and the agent's
+# task→handler dispatch map (agent/src/handlers/index.ts) are two separate
+# hand-maintained tables. If a type is registered on the backend but no handler
+# is wired on the agent, the task passes backend validation, gets queued,
+# provisions an agent VM, and only THEN fails with a runtime "unknown task type"
+# error — wasting the VM spin-up. The agent has its own vitest test for this, but
+# CI only runs `tsc` on the agent, so that invariant is enforced nowhere
+# automatically. These tests close the loop: drift between the two tables breaks
+# the backend build (which DOES run in CI) loudly and early, naming the offending
+# type. They complement — and do not duplicate — the agent consuming the backend
+# capability contract for its read-only/write modes: handler FUNCTIONS are code
+# and cannot come from a JSON contract, so a code-coverage cross-check is still
+# needed (and matters more once the agent trusts the contract for the type list).
+
+
+def _resolve_agent_src_file(relative_path: str) -> "str | None":
+    """Locate a file under ``agent/src`` across local + Docker test environments.
+
+    Search order mirrors ``_resolve_prompt_ts_path`` in test_invariants.py:
+      1. ``/agent/src/<relative_path>`` (Docker volume-mount target used by
+         ``scripts/test-backend.sh``).
+      2. Host filesystem at ``../../agent/src/<relative_path>`` from this test
+         file (``backend/testing/`` → repo root).
+
+    Returns the first existing path or ``None`` if none resolve (e.g. CI's
+    backend-only Docker build context, where the caller skips gracefully).
+    """
+    candidates = [
+        os.path.join("/agent/src", relative_path),
+        os.path.normpath(
+            os.path.join(
+                os.path.dirname(__file__), "..", "..", "agent", "src", relative_path
+            )
+        ),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _extract_agent_handler_task_types(source: str) -> "set[str]":
+    """Parse the dispatchable task-type keys from the ``handlers`` object literal
+    in ``agent/src/handlers/index.ts``.
+
+    Balances braces from the literal's opening ``{`` so nested generic types in
+    the declaration line don't confuse key extraction, then reads each top-level
+    ``<key>:`` entry. Raises if the literal can't be located/parsed — a silent
+    empty set would defeat the guard."""
+    marker = "export const handlers"
+    start = source.find(marker)
+    if start == -1:
+        raise ValueError(
+            "could not find `export const handlers` in agent/src/handlers/index.ts"
+        )
+    brace = source.find("{", start)
+    if brace == -1:
+        raise ValueError("malformed handlers literal: no opening brace")
+    depth = 0
+    end = -1
+    for i in range(brace, len(source)):
+        if source[i] == "{":
+            depth += 1
+        elif source[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    if end == -1:
+        raise ValueError("malformed handlers literal: unbalanced braces")
+    body = source[brace + 1 : end]
+    return set(re.findall(r"^\s*([A-Za-z_]\w*)\s*:", body, re.MULTILINE))
+
+
+def test_agent_handler_dispatch_matches_backend_registry():
+    """Every backend-registered task type MUST have an agent handler, and every
+    agent handler MUST correspond to a registered type. Drift in either direction
+    breaks the build early instead of failing on a freshly-provisioned VM."""
+    agent_index = _resolve_agent_src_file(os.path.join("handlers", "index.ts"))
+    if agent_index is None:
+        pytest.skip("agent/src not available in this test environment")
+    with open(agent_index) as f:
+        source = f.read()
+
+    handler_types = _extract_agent_handler_task_types(source)
+    assert handler_types, (
+        "parsed zero handler keys from agent/src/handlers/index.ts — the "
+        "`handlers` object-literal format likely changed; fix the parser"
+    )
+
+    registered = {t.value for t in TaskType}
+
+    missing_handler = registered - handler_types
+    assert not missing_handler, (
+        f"Task types registered on the backend but with NO agent handler in "
+        f"agent/src/handlers/index.ts: {sorted(missing_handler)}. Such a type "
+        f"would queue, provision a VM, then fail at runtime with 'unknown task "
+        f"type'. Add a handler entry to the `handlers` map (or unregister the "
+        f"type from the TaskType enum)."
+    )
+
+    orphan_handler = handler_types - registered
+    assert not orphan_handler, (
+        f"Agent handlers wired for task types NOT registered on the backend: "
+        f"{sorted(orphan_handler)}. Either register the type in the TaskType enum "
+        f"/ TASK_CAPABILITIES, or remove the stale handler entry from "
+        f"agent/src/handlers/index.ts."
+    )
