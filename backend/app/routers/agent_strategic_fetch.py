@@ -27,6 +27,10 @@ from app.message_convergence import get_message_link, resolve_message_ref
 from app.models import Project, Task
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
+from app.source_ref_validation import (
+    ground_design_doc_value,
+    resolve_branch_verification_context,
+)
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
@@ -113,6 +117,35 @@ async def agent_fetch_playbook_entry(
         if pending_source and pending_source != my_task_id:
             raise HTTPException(status_code=404, detail="Playbook entry not found")
     return {"status": "success", "data": {"key": full_key, "entry": entry}}
+
+
+@router.get("/projects/{project_id}/design-doc/{key:path}")
+@limiter.limit("60/minute")
+async def agent_fetch_design_doc_section(
+    request: Request,
+    project_id: uuid.UUID,
+    key: str,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return a single design_doc section by key with its FULL content. Used
+    when the strategic payload ships design_doc as a compact index (one entry
+    per section: key + summary + reconciled status) and the agent needs the
+    full prose/specs of a specific section before acting on it.
+
+    The returned section is presence-grounded against the project's real
+    integration branch via the SAME ``ground_design_doc_value`` path as the
+    write-capable design-doc ``get`` op (admin_agent_ops.py), so the fetched
+    status matches what the index already showed and the agent never sees an
+    un-reconciled status. Cross-project access and missing keys both 404."""
+    project = await _resolve_agent_project(project_id, token, session)
+    doc = project.design_doc or {}
+    value = doc.get(key)
+    if value is None:
+        raise HTTPException(status_code=404, detail="Design doc section not found")
+    verification_kwargs = await resolve_branch_verification_context(session, project)
+    value = await ground_design_doc_value(value, key, **verification_kwargs)
+    return {"status": "success", "data": {"key": key, "value": value}}
 
 
 @router.get("/projects/{project_id}/problem_model")

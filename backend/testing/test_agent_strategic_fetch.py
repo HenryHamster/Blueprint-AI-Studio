@@ -282,6 +282,107 @@ async def test_agent_fetch_playbook_entry_pending_source_visibility(
 
 
 @pytest.mark.asyncio
+async def test_agent_fetch_design_doc_section_returns_full_and_grounds(
+    client: AsyncClient, db_session, mocker
+):
+    """Agent can pull a single design_doc section by key (slash keys work via
+    the {key:path} route), and the returned section is presence-grounded
+    against the integration branch exactly like the design-doc get op — a
+    present-status systems entry whose backing files are absent downgrades to
+    ``missing`` before it reaches the agent."""
+    # Drive grounding through the GitHub-backed branch path (the local-HEAD
+    # fallback degrades to a no-op without a real checkout) and report every
+    # backing file absent so the present-status entry deterministically
+    # downgrades — proving the endpoint shares the design-doc get grounding.
+    async def _ctx(session, project):
+        return {
+            "token": "ghs_tok",
+            "owner": "acme",
+            "repo": "widget",
+            "branch": "automain",
+            "project_id": str(project.id),
+        }
+
+    mocker.patch(
+        "app.routers.agent_strategic_fetch.resolve_branch_verification_context",
+        side_effect=_ctx,
+    )
+    mocker.patch(
+        "app.source_ref_validation._file_exists_in_repo_branch",
+        side_effect=lambda path, **kw: False,
+    )
+    project = Project(
+        name="Section Test",
+        user_id="test-user-sec",
+        design_doc={
+            "systems/auth": {
+                "status": "mature",
+                "modules": ["backend/app/gone.py"],
+                "description": "Auth subsystem.",
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-sec")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-sec")
+    headers = {"x-agent-token": token}
+
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/design-doc/systems/auth",
+        headers=headers,
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert data["key"] == "systems/auth"
+    # Grounding ran: present status was reconciled to missing with a warning.
+    assert data["value"]["status"] == "missing"
+    assert "presence_warning" in data["value"]
+
+    # 404 on a missing key.
+    r_missing = await client.get(
+        f"/api/agent/projects/{project.id}/design-doc/systems/does-not-exist",
+        headers=headers,
+    )
+    assert r_missing.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_design_doc_section_rejects_cross_project(
+    client: AsyncClient, db_session
+):
+    """Token for project A can't fetch a section in project B (404, not 403)."""
+    project_a = Project(name="A", user_id="test-user-sa")
+    project_b = Project(
+        name="B",
+        user_id="test-user-sb",
+        design_doc={"systems/core": {"status": "mature", "description": "B core"}},
+    )
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(project_id=project_a.id, payloads=[{}], vm_instance_id="agent-vm-sa")
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token = create_agent_token(str(task_a.id), "agent-vm-sa")
+    res = await client.get(
+        f"/api/agent/projects/{project_b.id}/design-doc/systems/core",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_agent_fetch_problem_model_returns_full_untrimmed(
     client: AsyncClient, db_session
 ):

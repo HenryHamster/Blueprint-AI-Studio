@@ -732,3 +732,153 @@ def test_gap_memory_trimmed_surfaced_for_capped_model():
     assert a_gap["fields"]["history"]["shown"] == _GAP_HISTORY_KEEP
     assert a_gap["fields"]["history"]["total"] == GAP_APPEND_ONLY_GC_FLOOR
     assert a_gap["fields"]["past_moves"]["total"] == GAP_APPEND_ONLY_GC_FLOOR
+
+
+def test_design_doc_index_and_whole_problem_model_coexist_in_realistic_payload():
+    """Regression: a realistic strategic-review payload ships both the design_doc
+    as a compact index AND the whole agent-view problem_model (not floored) at the
+    real default budget, proving the compact design_doc index successfully reserves
+    headroom for the complete problem_model to fit intact.
+
+    The design_doc was switched from full-content to a bounded navigation index
+    (key + one-line summary + reconciled status/modules) specifically to keep the
+    problem_model from being crowded out of the budget. This test proves that
+    tradeoff works in a realistic end-to-end payload: both the design_doc index
+    and the whole problem_model ship in full, neither is floored or dropped.
+    """
+    from app.problem_model import gc_problem_model
+    from app.strategic_spawning import (
+        _STRATEGIC_REVIEW_SCHEMA,
+        _agent_view_problem_model,
+        _design_doc_index,
+    )
+
+    model = _worst_case_durable_problem_model()
+    gc_problem_model(model)
+
+    # Build a realistic design_doc with multiple sections (systems, capabilities,
+    # notes). Each section carries content so the full doc (before indexing) is
+    # realistic in size.
+    design_doc = {
+        "systems/auth": {
+            "title": "Authentication System",
+            "description": (
+                "OAuth2 integration with external provider, multi-factor "
+                "authentication support, session management, and token refresh logic."
+            ),
+            "status": "working",
+            "modules": ["backend/app/auth.py", "backend/app/auth_handlers.py"],
+        },
+        "systems/api": {
+            "title": "API Layer",
+            "description": "REST API endpoints, OpenAPI schema generation, and request routing.",
+            "status": "working",
+            "modules": ["backend/app/routers/", "backend/app/schemas.py"],
+        },
+        "capabilities/database": {
+            "title": "Database Access Layer",
+            "notes": "SQLAlchemy ORM with async support and connection pooling.",
+            "status": "working",
+        },
+        "notes": "Core platform systems are stable; focus areas for next version.",
+    }
+
+    # Assemble a realistic strategic-review payload with multiple high-tier
+    # sections alongside the problem_model: directions_summary, open_messages,
+    # cycle_start_reconciliation, and model_health. This represents a typical
+    # cycle payload with meaningful context, not a minimal test case.
+    payload = {
+        "type": "strategic_review",
+        "research_mode": False,
+        "project_name": "Blueprint",
+        "base_branch": "main",
+        "model": "opus",
+        "effort": "standard",
+        "enable_self_improvement": False,
+        "vision": {"purpose": "Stabilize platform and add observability hooks"},
+        "problem_model": _agent_view_problem_model(model.model_dump()),
+        # The compact design_doc index — the whole doc is replaced with a bounded
+        # index (one entry per section: key + summary + reconciled status/modules).
+        "design_doc": _design_doc_index(design_doc),
+        # Representative open messages (operator feedback / issues).
+        "open_messages": [
+            {"id": "m1", "type": "NOTE", "title": "Observability gap", "body": "x" * 500},
+            {
+                "id": "m2",
+                "type": "BUG_REPORT",
+                "title": "Session token leak",
+                "body": "y" * 800,
+            },
+        ],
+        # Cycle-start reconciliation summarizing live state.
+        "cycle_start_reconciliation": {
+            "conflicts": ["Direction d-1 conflicts with staged d-2"],
+            "summary": "State aligned; model up-to-date.",
+        },
+        # Soft health signal (advisory).
+        "model_health": {"gaps_count": 5, "capabilities_count": 3},
+    }
+
+    # Pack under the real default budget with the production schema.
+    out = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA)
+
+    # Prove the design_doc index is present.
+    assert "design_doc" in out, "design_doc index was dropped or absent"
+    design_doc_out = out["design_doc"]
+    assert isinstance(design_doc_out, dict), "design_doc should be a dict with sections"
+    assert "sections" in design_doc_out
+    sections = design_doc_out["sections"]
+    assert isinstance(sections, list)
+    assert len(sections) > 0, "design_doc index should have section entries"
+    # Verify the index is compact (bounded summaries, not full prose).
+    for entry in sections:
+        if "summary" in entry:
+            assert len(entry["summary"]) <= 200 + 1, (
+                "design_doc index summaries should be bounded to ~200 chars"
+            )
+
+    # Prove the problem_model ships in full (whole, not floored or dropped).
+    assert "problem_model" in out, (
+        "problem_model was dropped under real multi-section budget pressure"
+    )
+    dropped_keys = {d["key"] for d in out["_packer_meta"]["dropped"]}
+    assert "problem_model" not in dropped_keys, (
+        f"problem_model was dropped by the packer: {out['_packer_meta']['dropped']}"
+    )
+
+    # The delivered model must be whole (not floored). The floor marker is only
+    # present when the packer's summarize callback shrinks the model to fit.
+    pm = out["problem_model"]
+    assert "_agent_view_floor_applied" not in pm, (
+        "problem_model should not be floored when design_doc index reserves "
+        "enough headroom — the floor marker indicates degradation."
+    )
+
+    # Verify the model retains its full structure: gaps, capabilities, friction
+    # are all present (not summarized away or dropped).
+    assert pm.get("gaps"), (
+        "whole problem_model should retain its active gaps list"
+    )
+    assert isinstance(pm["gaps"], list) and len(pm["gaps"]) > 0
+    # Capabilities and friction are present and substantial (not skeletonized).
+    # A skeletonized section would have only name + status; a full one has notes,
+    # descriptions, evidence, backing_paths, etc. Check a sample entry.
+    if pm.get("capabilities"):
+        cap = pm["capabilities"][0]
+        assert isinstance(cap, dict)
+        assert "name" in cap
+        # The whole model has notes/descriptions; floored/skeletonized would not.
+        # If the model is truly whole, at least one capability should have detail
+        # beyond just name+status.
+        has_detail = any(
+            pm["capabilities"][i].get(k)
+            for i in range(len(pm["capabilities"]))
+            for k in ("notes", "source", "backing_paths")
+        )
+        assert has_detail, (
+            "capabilities should retain full detail (notes, source, paths) "
+            "when not floored"
+        )
+
+    # The payload stayed under budget.
+    assert out["_packer_meta"]["budget_used"] <= 120 * 1024

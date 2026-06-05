@@ -83,7 +83,7 @@ function generateFetchScript(projectIdRaw: string): string {
   return `#!/bin/bash
 # Strategic-context fetch tool — pull detail for items the packer trimmed.
 # Reads ORCHESTRATOR_URL, AGENT_API_TOKEN from env. project_id is baked in.
-KIND="\${1:?Usage: fetch problem-model|direction|playbook|gap|message [id]}"
+KIND="\${1:?Usage: fetch problem-model|direction|playbook|gap|message|section [id]}"
 ID="\${2:-}"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
@@ -100,7 +100,8 @@ case "$KIND" in
   playbook)   PATH_SUFFIX="playbook/$ID" ;;
   gap)        PATH_SUFFIX="gaps/$ID" ;;
   message)    PATH_SUFFIX="messages/$ID" ;;
-  *) echo "Unknown kind: $KIND (use problem-model|direction|playbook|gap|message)" >&2; exit 1 ;;
+  section)    PATH_SUFFIX="design-doc/$ID" ;;
+  *) echo "Unknown kind: $KIND (use problem-model|direction|playbook|gap|message|section)" >&2; exit 1 ;;
 esac
 
 if [ "$KIND" != "problem-model" ] && [ -z "$ID" ]; then

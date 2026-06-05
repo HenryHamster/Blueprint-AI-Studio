@@ -428,6 +428,7 @@ export async function handleStrategic(
         '  - `./fetch playbook <key>` — single playbook entry (e.g. `./fetch playbook frontend-build`)',
         '  - `./fetch gap <id>` — single gap with full history/past_moves/evidence',
         '  - `./fetch message <ref>` — inspect a message by short ref (8+ hex chars) or UUID, including one aged out of the live thread; then `./messages resolve <ref>` accepts the same ref',
+        '  - `./fetch section <key>` — single design_doc section, full prose/specs, presence-grounded (e.g. `./fetch section systems/auth`); the design_doc ships as a compact index so pull a section before relying on its detail',
         '  - `./fetch problem-model` — the FULL untrimmed problem_model (all gaps, friction, archived) if it was trimmed/dropped above',
       );
       return lines.join('\n');
