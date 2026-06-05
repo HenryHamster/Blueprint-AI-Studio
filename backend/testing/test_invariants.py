@@ -7481,6 +7481,14 @@ class TestAgentEnvFailureSignatureParity:
             # TS source uses regex literals: \bnode:\s+command not found
             ("node runtime missing", r"\bnode:"),
             ("python3 runtime missing", "python3"),
+            # dash/sh "<tool>: not found" missing-executable phrasing
+            ("dash not-found", "not found"),
+            # Docker daemon unavailable on the gate VM
+            ("docker daemon unavailable", "cannot connect to the docker daemon"),
+            # OOM kills (exit 137 / SIGKILL / signal 9)
+            ("OOM sigkill", "sigkill"),
+            ("OOM signal killed", r"signal:\s*killed"),
+            ("OOM exit 137", "137"),
         ]
         missing = [
             label

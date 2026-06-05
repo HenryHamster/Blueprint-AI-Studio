@@ -1929,6 +1929,66 @@ describe('matchesEnvironmentFailureSignature — env/setup failure detection', (
       'missing required system library: libgomp.so',
     )).toBe(true);
   });
+
+  // ── dash/sh "<tool>: not found" missing-executable phrasing ─────────────────
+
+  it("Debian dash '/bin/sh: 1: pytest: not found' → true", () => {
+    expect(matchesEnvironmentFailureSignature(
+      '/bin/sh: 1: pytest: not found',
+    )).toBe(true);
+  });
+
+  it("sh '<tool>: not found' without line number → true", () => {
+    expect(matchesEnvironmentFailureSignature(
+      'sh: rspec: not found',
+    )).toBe(true);
+  });
+
+  it("repo dependency 'No module named' (not shell-prefixed) stays red", () => {
+    expect(matchesEnvironmentFailureSignature(
+      "ImportError: No module named 'requests' — not found in site-packages",
+    )).toBe(false);
+  });
+
+  // ── Docker daemon unavailable on the gate VM ────────────────────────────────
+
+  it('cannot connect to the Docker daemon → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?',
+    )).toBe(true);
+  });
+
+  // ── Out-of-memory kills (exit 137 / SIGKILL / signal 9) ─────────────────────
+
+  it("bare 'Killed' line → true (OOM killer)", () => {
+    expect(matchesEnvironmentFailureSignature(
+      'npm test\nKilled',
+    )).toBe(true);
+  });
+
+  it("Go 'signal: killed' → true", () => {
+    expect(matchesEnvironmentFailureSignature(
+      'go test ./...\nsignal: killed',
+    )).toBe(true);
+  });
+
+  it('exit code 137 → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'Command failed with exit code 137',
+    )).toBe(true);
+  });
+
+  it('JavaScript heap out of memory → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory',
+    )).toBe(true);
+  });
+
+  it('OOM phrase + real FAILED line → false (real test failure quotes env phrase)', () => {
+    expect(matchesEnvironmentFailureSignature(
+      "FAILED test_oom.py::test_msg - AssertionError: expected 'out of memory: kill'\n1 failed in 0.02s",
+    )).toBe(false);
+  });
 });
 
 // ── detectAcceptanceProbes ───────────────────────────────────────────────────

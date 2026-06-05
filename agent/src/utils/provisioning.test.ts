@@ -83,4 +83,43 @@ describe('detectProvisioningSteps', () => {
     expect(detectProvisioningSteps(undefined)).toEqual([]);
     expect(detectProvisioningSteps({ directories: [{ path: '', type: 'node' }] })).toEqual([]);
   });
+
+  // Extra-ecosystem auto-provision: the suite detector launches these runners
+  // (bundle exec / gradle / mvn / mix / composer) but none of those commands
+  // installs its own deps, so the gate must provision them first.
+  it.each([
+    ['Gemfile', 'bundle', ['install']],
+    ['build.gradle', './gradlew', ['dependencies', '--no-daemon']],
+    ['build.gradle.kts', './gradlew', ['dependencies', '--no-daemon']],
+    ['pom.xml', 'mvn', ['-B', 'dependency:go-offline']],
+    ['mix.exs', 'mix', ['deps.get']],
+    ['composer.json', 'composer', ['install']],
+  ])('auto-provisions an extra-ecosystem manifest %s with %s', (manifest, cmd, args) => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/${manifest}`);
+    const steps = detectProvisioningSteps(undefined);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].cmd).toBe(cmd);
+    expect(steps[0].args).toEqual(args);
+    expect(steps[0].cwd).toBe(WORKSPACE);
+    expect(steps[0].declared).toBeUndefined();
+  });
+
+  it('declared install_cmd suppresses the extra-ecosystem fallback for the same dir', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/Gemfile`);
+    const buildConfig: BuildConfig = {
+      directories: [{ path: '', type: 'other', install_cmd: 'bundle install --frozen' }],
+    };
+    const steps = detectProvisioningSteps(buildConfig);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].declared).toBe(true);
+    expect(steps[0].args).toEqual(['install', '--frozen']);
+  });
+
+  it('detects an extra-ecosystem manifest under a build_config directory', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/api/composer.json`);
+    const steps = detectProvisioningSteps({ directories: [{ path: 'api', type: 'other' }] });
+    expect(steps).toHaveLength(1);
+    expect(steps[0].cmd).toBe('composer');
+    expect(steps[0].cwd).toBe(`${WORKSPACE}/api`);
+  });
 });

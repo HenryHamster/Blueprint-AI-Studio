@@ -63,6 +63,26 @@ class TestAgentVM:
         result = classify_layers("CODE_ERROR", msg)
         assert LAYER_AGENT_VM in result
 
+    def test_dash_tool_not_found(self):
+        msg = "/bin/sh: 1: pytest: not found"
+        result = classify_layers("CODE_ERROR", msg)
+        assert LAYER_AGENT_VM in result
+
+    def test_docker_daemon_unavailable(self):
+        msg = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock"
+        result = classify_layers("CODE_ERROR", msg)
+        assert LAYER_AGENT_VM in result
+
+    def test_oom_exit_137(self):
+        msg = "Command failed with exit code 137"
+        result = classify_layers("CODE_ERROR", msg)
+        assert LAYER_AGENT_VM in result
+
+    def test_oom_signal_killed(self):
+        msg = "go test ./...\nsignal: killed"
+        result = classify_layers("CODE_ERROR", msg)
+        assert LAYER_AGENT_VM in result
+
 
 class TestCIWorkflow:
     def test_no_jobs_ran(self):

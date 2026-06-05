@@ -605,6 +605,12 @@ export interface ProvisioningStep {
  *     ``pip install .`` so the declared package + its dependencies are present
  *     before pytest collects. A directory that already declares its own
  *     ``install_cmd`` is NOT given this fallback (the operator's command wins).
+ *  3) Extra-ecosystem manifests whose suite command does NOT self-install deps —
+ *     Ruby (Gemfile → ``bundle install``), Gradle (build.gradle[.kts] →
+ *     ``./gradlew dependencies``), Maven (pom.xml → ``mvn dependency:go-offline``),
+ *     Elixir (mix.exs → ``mix deps.get``), PHP (composer.json → ``composer
+ *     install``). Detected from the SAME signals the suite detector uses, skipped
+ *     when the operator declared an install_cmd for that directory.
  *
  * Deduped by ``cwd``; inspects ONLY the local filesystem (zero GitHub-API cost).
  */
@@ -652,6 +658,57 @@ export function detectProvisioningSteps(buildConfig?: BuildConfig): Provisioning
   }
   // Repo root covers the auto-detected (no build_config) case.
   addPyprojectAuto(WORKSPACE, 'root');
+
+  // 3) Extra-ecosystem auto-provision (Ruby/Gradle/Maven/Elixir/PHP). The suite
+  //    detector LAUNCHES these runners (detectExtraFamilyRunner) but their test
+  //    commands (`bundle exec rake test`, `./gradlew test`, `mvn test`,
+  //    `mix test`, `composer test`) do NOT install their own dependencies. Without
+  //    a pre-install step the suite runs against an UNPROVISIONED workspace and
+  //    fails on dependency resolution — which the env-failure classifier
+  //    deliberately treats as a REAL red test (blocking the merge AND spawning a
+  //    code-fix agent against code that isn't broken). Auto-provision from the
+  //    SAME local manifest signals the suite detector keys off, skipping any dir
+  //    that already declared its own install_cmd (the operator's command wins) and
+  //    any cwd already provisioned above (deduped by `add`). First match wins per
+  //    dir; mirrors detectExtraFamilyRunner's detection order. A provisioning
+  //    FAILURE flows through the existing setup-failure path exactly like a failed
+  //    declared install or pip/poetry install — never a blocking test failure.
+  const addExtraFamilyAuto = (absDir: string, label: string): void => {
+    if (declaredCwds.has(absDir)) return;
+    // Ruby: Gemfile → `bundle install`.
+    if (exists(`${absDir}/Gemfile`)) {
+      add({ cmd: 'bundle', args: ['install'], cwd: absDir, label: `bundle install (${label})` });
+      return;
+    }
+    // Gradle: build.gradle / build.gradle.kts → prefetch dependencies so the
+    // suite's first run does not fail on initial dependency download.
+    if (exists(`${absDir}/build.gradle`) || exists(`${absDir}/build.gradle.kts`)) {
+      add({ cmd: './gradlew', args: ['dependencies', '--no-daemon'], cwd: absDir, label: `./gradlew dependencies (${label})` });
+      return;
+    }
+    // Maven: pom.xml → resolve all dependencies for an offline-ready clean run.
+    if (exists(`${absDir}/pom.xml`)) {
+      add({ cmd: 'mvn', args: ['-B', 'dependency:go-offline'], cwd: absDir, label: `mvn dependency:go-offline (${label})` });
+      return;
+    }
+    // Elixir: mix.exs → `mix deps.get`.
+    if (exists(`${absDir}/mix.exs`)) {
+      add({ cmd: 'mix', args: ['deps.get'], cwd: absDir, label: `mix deps.get (${label})` });
+      return;
+    }
+    // PHP: composer.json → `composer install`.
+    if (exists(`${absDir}/composer.json`)) {
+      add({ cmd: 'composer', args: ['install'], cwd: absDir, label: `composer install (${label})` });
+      return;
+    }
+  };
+  if (buildConfig?.directories) {
+    for (const dir of buildConfig.directories) {
+      addExtraFamilyAuto(dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE, dir.path || 'root');
+    }
+  }
+  // Repo root covers the auto-detected (no build_config) case.
+  addExtraFamilyAuto(WORKSPACE, 'root');
 
   return steps;
 }
@@ -989,8 +1046,11 @@ function runnerKindFromCmd(cmd: string): string {
  * Detect environment/infrastructure failure signatures in test runner output.
  *
  * Returns true when the output shows a setup or infrastructure failure —
- * missing shared library, missing system runtime, spawn ENOENT — rather than a
- * genuine test failure. Repo dependency / packaging regressions are
+ * missing shared library, missing system runtime, spawn ENOENT, the dash/sh
+ * "<tool>: not found" missing-executable phrasing, the Docker daemon being
+ * unavailable on the gate VM, or an out-of-memory kill (exit 137 / SIGKILL /
+ * signal 9) — rather than a genuine test failure. Repo dependency / packaging
+ * regressions are
  * intentionally EXCLUDED here: a bare `ModuleNotFoundError`, `Cannot find
  * module`, or missing Go package/module line from the suite itself must stay on
  * the red-suite lane so the no-CI gate blocks broken repo changes instead of
@@ -1037,7 +1097,30 @@ export function matchesEnvironmentFailureSignature(output: string): boolean {
     /\bspawn\b.+\bENOENT\b/i.test(line) ||
     // System runtimes not on PATH (VM-level, not test-runner-level)
     /\bnode:\s+command not found/i.test(line) ||
-    /\bpython3?:\s+command not found/i.test(line)
+    /\bpython3?:\s+command not found/i.test(line) ||
+    // dash/sh phrase the missing-executable diagnostic as "<tool>: not found"
+    // (Debian's /bin/sh is dash). Anchored to the shell prefix so it can only
+    // be a shell missing-binary error, never a repo dependency error
+    // ("No module named …") or a test assertion that merely contains the words.
+    /^(?:\/(?:usr\/)?bin\/)?(?:sh|bash|dash|ash):\s*(?:\d+:\s*)?\S+:\s+not found\s*$/i.test(line) ||
+    // Docker daemon unavailable on the gate VM — repos whose test command shells
+    // out to Docker cannot run, but that is the VM's missing daemon, not the code.
+    /cannot connect to the docker daemon/i.test(line) ||
+    /is the docker daemon running/i.test(line) ||
+    /docker daemon is not running/i.test(line) ||
+    // Out-of-memory kills: the OOM killer reaps the runner (exit 137 / signal 9 /
+    // SIGKILL) with no test-failure summary. Surface forms vary per ecosystem;
+    // all are VM resource exhaustion, never a repo assertion failure.
+    /^killed\s*$/i.test(line) ||
+    /\bsignal:\s*killed\b/i.test(line) ||
+    /\bsigkill\b/i.test(line) ||
+    /\bsignal 9\b/i.test(line) ||
+    /\b(?:exit(?:ed with)?|exit code|exit status|code|status)\s+137\b/i.test(line) ||
+    /\boomkilled\b/i.test(line) ||
+    /out of memory:\s*kill/i.test(line) ||
+    /javascript heap out of memory/i.test(line) ||
+    /java\.lang\.outofmemoryerror/i.test(line) ||
+    /cannot allocate memory/i.test(line)
   ));
 }
 
