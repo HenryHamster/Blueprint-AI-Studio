@@ -1991,6 +1991,76 @@ describe('matchesEnvironmentFailureSignature — env/setup failure detection', (
       "FAILED test_oom.py::test_msg - AssertionError: expected 'out of memory: kill'\n1 failed in 0.02s",
     )).toBe(false);
   });
+
+  // ── Disk/quota/space failures (host resource exhaustion on the gate VM) ──────
+
+  it('no space left on device → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'write error: No space left on device',
+    )).toBe(true);
+  });
+
+  it('disk quota exceeded → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'Error: EDQUOT: disk quota exceeded, write',
+    )).toBe(true);
+  });
+
+  it('filesystem is full → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'Filesystem is full, cannot write to /tmp',
+    )).toBe(true);
+  });
+
+  it('ENOSPC error code → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'ENOSPC: no space left on device, write',
+    )).toBe(true);
+  });
+
+  // ── Permission denied / access failures (insufficient perms, read-only fs) ────
+
+  it('permission denied → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'Error: EACCES: permission denied, open /tmp/test.log',
+    )).toBe(true);
+  });
+
+  it('permission denied without error code → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'fatal: Permission denied (publickey)',
+    )).toBe(true);
+  });
+
+  it('EACCES error code → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'EACCES: permission denied when reading file',
+    )).toBe(true);
+  });
+
+  it('read-only file system → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'Error: EROFS: read-only file system, write',
+    )).toBe(true);
+  });
+
+  it('read-only file system phrase → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'mount: read-only file system',
+    )).toBe(true);
+  });
+
+  it('disk full + real FAILED line → false (real test failure quotes env phrase)', () => {
+    expect(matchesEnvironmentFailureSignature(
+      "FAILED test_disk.py::test_write - AssertionError: 'no space left on device'\n1 failed in 0.01s",
+    )).toBe(false);
+  });
+
+  it('permission denied + real error count → false (real test failure)', () => {
+    expect(matchesEnvironmentFailureSignature(
+      "test_access.py::test_file - OSError: permission denied\n1 failed in 0.02s",
+    )).toBe(false);
+  });
 });
 
 // ── buildWroteNewOutput (no-op declared-build detection) ─────────────────────

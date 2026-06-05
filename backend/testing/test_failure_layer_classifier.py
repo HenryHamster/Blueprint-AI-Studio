@@ -83,6 +83,46 @@ class TestAgentVM:
         result = classify_layers("CODE_ERROR", msg)
         assert LAYER_AGENT_VM in result
 
+    def test_no_space_left_on_device(self):
+        msg = "write error: No space left on device"
+        result = classify_layers("CODE_ERROR", msg)
+        assert LAYER_AGENT_VM in result
+
+    def test_disk_quota_exceeded(self):
+        msg = "Error: EDQUOT: disk quota exceeded, write"
+        result = classify_layers("CODE_ERROR", msg)
+        assert LAYER_AGENT_VM in result
+
+    def test_filesystem_is_full(self):
+        msg = "Filesystem is full, cannot write to /tmp"
+        result = classify_layers("CODE_ERROR", msg)
+        assert LAYER_AGENT_VM in result
+
+    def test_enospc_error_code(self):
+        msg = "ENOSPC: no space left on device, write"
+        result = classify_layers("CODE_ERROR", msg)
+        assert LAYER_AGENT_VM in result
+
+    def test_permission_denied(self):
+        msg = "Error: EACCES: permission denied, open /tmp/test.log"
+        result = classify_layers("CODE_ERROR", msg)
+        assert LAYER_AGENT_VM in result
+
+    def test_eacces_error_code(self):
+        msg = "EACCES: permission denied when reading file"
+        result = classify_layers("CODE_ERROR", msg)
+        assert LAYER_AGENT_VM in result
+
+    def test_read_only_file_system(self):
+        msg = "Error: EROFS: read-only file system, write"
+        result = classify_layers("CODE_ERROR", msg)
+        assert LAYER_AGENT_VM in result
+
+    def test_read_only_file_system_phrase(self):
+        msg = "mount: read-only file system"
+        result = classify_layers("CODE_ERROR", msg)
+        assert LAYER_AGENT_VM in result
+
 
 class TestCIWorkflow:
     def test_no_jobs_ran(self):

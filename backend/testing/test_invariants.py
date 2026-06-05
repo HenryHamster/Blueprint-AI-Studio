@@ -7489,6 +7489,16 @@ class TestAgentEnvFailureSignatureParity:
             ("OOM sigkill", "sigkill"),
             ("OOM signal killed", r"signal:\s*killed"),
             ("OOM exit 137", "137"),
+            # Disk/quota/space failures (host resource exhaustion)
+            ("disk no space", "no space left on device"),
+            ("disk quota exceeded", "disk quota exceeded"),
+            ("filesystem full", "filesystem (is )?full"),
+            ("disk ENOSPC", "enospc"),
+            # Permission denied / access failures (read-only fs, insufficient perms)
+            ("permission denied", "permission denied"),
+            ("permission EACCES", "eacces"),
+            ("read-only filesystem", "read-only file system"),
+            ("read-only EROFS", "erofs"),
         ]
         missing = [
             label

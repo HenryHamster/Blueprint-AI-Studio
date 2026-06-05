@@ -1203,7 +1203,17 @@ export function matchesEnvironmentFailureSignature(output: string): boolean {
     /out of memory:\s*kill/i.test(line) ||
     /javascript heap out of memory/i.test(line) ||
     /java\.lang\.outofmemoryerror/i.test(line) ||
-    /cannot allocate memory/i.test(line)
+    /cannot allocate memory/i.test(line) ||
+    // Disk/quota/space failures (host resource exhaustion on the gate VM)
+    /no space left on device/i.test(line) ||
+    /disk quota exceeded/i.test(line) ||
+    /filesystem (is )?full/i.test(line) ||
+    /enospc/i.test(line) ||
+    // Permission denied / access failures (read-only fs, insufficient perms)
+    /permission denied/i.test(line) ||
+    /eacces/i.test(line) ||
+    /read-only file system/i.test(line) ||
+    /erofs/i.test(line)
   ));
 }
 

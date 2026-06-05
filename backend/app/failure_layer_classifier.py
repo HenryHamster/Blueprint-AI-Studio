@@ -86,6 +86,16 @@ _AGENT_VM_PATTERNS: list[re.Pattern] = [
     re.compile(r"javascript heap out of memory", re.IGNORECASE),
     re.compile(r"java\.lang\.outofmemoryerror", re.IGNORECASE),
     re.compile(r"cannot allocate memory", re.IGNORECASE),
+    # Disk/quota/space failures (host resource exhaustion on the gate VM)
+    re.compile(r"no space left on device", re.IGNORECASE),
+    re.compile(r"disk quota exceeded", re.IGNORECASE),
+    re.compile(r"filesystem (is )?full", re.IGNORECASE),
+    re.compile(r"enospc", re.IGNORECASE),
+    # Permission denied / access failures (read-only fs, insufficient perms)
+    re.compile(r"permission denied", re.IGNORECASE),
+    re.compile(r"eacces", re.IGNORECASE),
+    re.compile(r"read-only file system", re.IGNORECASE),
+    re.compile(r"erofs", re.IGNORECASE),
 ]
 
 _AGENT_VM_FAILURE_CLASSES: frozenset[str] = frozenset(
