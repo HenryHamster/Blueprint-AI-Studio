@@ -7838,6 +7838,229 @@ async def test_unblock_sweep_cancels_when_needed_foundation_terminally_dead(
 
 
 @pytest.mark.asyncio
+async def test_unblock_sweep_resolves_finding_hash_task_need_into_dep_edge(
+    reaper_db, mocker
+):
+    """A {kind:'task'} need referencing a foundation's context['finding_hash']
+    (not its UUID) resolves into a real depends_on edge — the resume matcher now
+    honors the same finding-hash signal the research spawn path uses."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    foundation = Task(
+        project_id=project.id, title="foundation", description="x",
+        status=TaskStatus.IN_PROGRESS, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}],
+        context={"finding_hash": "abc123def4560000"}, status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: needs the foundation finding first",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "foundation finding",
+                "reason": "BLOCKER: needs the foundation finding first",
+                "need": {"kind": "task", "ref": "abc123def4560000"},
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    assert str(foundation.id) in (t.depends_on or [])
+    assert "blocker" not in (t.context or {})
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_resolves_capability_marker_need_into_dep_edge(
+    reaper_db, mocker
+):
+    """A {kind:'capability'} need resolves onto the in-flight task that advertises
+    the matching explicit provides_capability marker — and wires a dep edge."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    foundation = Task(
+        project_id=project.id, title="schema work", description="x",
+        status=TaskStatus.IN_PROGRESS, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}],
+        context={"provides_capability": "schema-models"}, status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: needs the schema models",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "schema-models",
+                "reason": "BLOCKER: needs the schema models",
+                "need": {"kind": "capability", "ref": "schema-models"},
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    assert str(foundation.id) in (t.depends_on or [])
+    assert "blocker" not in (t.context or {})
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_resolves_legacy_capability_description_need_into_dep_edge(
+    reaper_db, mocker
+):
+    """A legacy free-text blocked capability need still resolves when it exactly
+    matches the foundation title advertised by ``./blocked --needs-capability``."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    foundation = Task(
+        project_id=project.id,
+        title="shared auth layer",
+        description="x",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="u",
+        requires_approval=False,
+        payloads=[{"type": "create"}],
+        context={},
+        status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: waiting on shared auth layer",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "shared auth layer",
+                "reason": "BLOCKER: waiting on shared auth layer",
+                "need": {"kind": "capability", "ref": "shared auth layer"},
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    assert str(foundation.id) in (t.depends_on or [])
+    assert "blocker" not in (t.context or {})
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_resumes_when_finding_hash_need_satisfied_by_completed(
+    reaper_db, mocker
+):
+    """A finding-hash {kind:'task'} need satisfied by already-COMPLETED work
+    resumes edge-free on the routine sweep."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    foundation = Task(
+        project_id=project.id, title="foundation", description="x",
+        status=TaskStatus.COMPLETED, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}],
+        context={"finding_hash": "0011223344556677"}, status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: waiting on foundation finding",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "foundation finding",
+                "reason": "BLOCKER: waiting on foundation finding",
+                "need": {"kind": "task", "ref": "0011223344556677"},
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    assert not (t.depends_on or [])
+    assert "blocker" not in (t.context or {})
+    assert "completed work" in (t.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_cancels_when_capability_foundation_terminally_dead(
+    reaper_db, mocker
+):
+    """A {kind:'capability'} need matched ONLY to a terminally FAILED foundation
+    (by explicit marker) is cancelled rather than parked to re-arm forever."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    dead = Task(
+        project_id=project.id, title="dead-foundation", description="x",
+        status=TaskStatus.FAILED, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}],
+        context={"capability": "schema-models"}, status_log=[],
+    )
+    reaper_db.add(dead)
+    await reaper_db.commit()
+    await reaper_db.refresh(dead)
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: waiting on schema models",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "schema-models",
+                "reason": "BLOCKER: waiting on schema models",
+                "need": {"kind": "capability", "ref": "schema-models"},
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.CANCELLED
+    assert "terminally failed" in (t.latest_status_message or "").lower()
+    assert "blocker" not in (t.context or {})
+
+
+@pytest.mark.asyncio
 async def test_unblock_sweep_cancels_never_provided_capability_after_reeval_cap(
     reaper_db, mocker
 ):

@@ -23,6 +23,7 @@ from app.finding_deduplication import (
     finding_hash,
     is_duplicate,
     normalize_prerequisite,
+    prerequisite_matches_task,
     resolve_prerequisite_task,
 )
 from app.models import Task, TaskStatus
@@ -1212,3 +1213,40 @@ def test_resolve_prerequisite_task_prefers_first_match_in_order():
     )
     prereq = {"kind": "task", "ref": "shared-hash-0001"}
     assert resolve_prerequisite_task(prereq, [first, second]) is first
+
+
+# ---------------------------------------------------------------------------
+# prerequisite_matches_task (shared predicate — single source of truth)
+# ---------------------------------------------------------------------------
+
+
+def test_prerequisite_matches_task_matches_by_id():
+    task = _make_task()
+    assert prerequisite_matches_task({"kind": "task", "ref": str(task.id)}, task) is True
+
+
+def test_prerequisite_matches_task_matches_by_finding_hash():
+    task = _make_task(context={"finding_hash": "abc123def4560000"})
+    assert prerequisite_matches_task({"kind": "task", "ref": "abc123def4560000"}, task) is True
+
+
+def test_prerequisite_matches_task_matches_capability_marker_case_insensitive():
+    task = _make_task(context={"provides_capability": "Auth-Service"})
+    assert prerequisite_matches_task({"kind": "capability", "ref": "auth-service"}, task) is True
+
+
+def test_prerequisite_matches_task_matches_capability_list_marker():
+    task = _make_task(context={"capability": ["logging", "auth-service"]})
+    assert prerequisite_matches_task({"kind": "capability", "ref": "auth-service"}, task) is True
+
+
+def test_prerequisite_matches_task_negatives():
+    task = _make_task(context={"finding_hash": "1111222233334444"})
+    # Wrong hash, missing marker, malformed need, None task, and the resume-only
+    # 'pr' kind all return False (pr is intentionally not a predicate signal).
+    assert prerequisite_matches_task({"kind": "task", "ref": "ffffffffffffffff"}, task) is False
+    assert prerequisite_matches_task({"kind": "capability", "ref": "auth"}, task) is False
+    assert prerequisite_matches_task({"kind": "bogus", "ref": "x"}, task) is False
+    assert prerequisite_matches_task(None, task) is False
+    assert prerequisite_matches_task({"kind": "task", "ref": "x"}, None) is False
+    assert prerequisite_matches_task({"kind": "pr", "ref": "42"}, task) is False

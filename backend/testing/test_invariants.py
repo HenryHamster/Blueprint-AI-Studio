@@ -8480,3 +8480,137 @@ def test_unverified_reason_severity_degraded_are_error():
             "_UNVERIFIED_REASON_SEVERITY (app/alert_dispatch.py), but got {severity}. "
             "Degraded environment/setup failures must escalate loudly to ERROR, not WARNING."
         )
+
+
+class TestSpawnResumeNeedSignalParity:
+    """The spawn-time prerequisite resolver and the resume-time blocked-need
+    matcher MUST agree on the shared EXPLICIT ``{kind, ref}`` signals.
+
+    They diverged once (resume matched task needs by UUID only and capability
+    needs by payload-type/title/related-file heuristics, while spawn matched by
+    id-or-finding_hash and explicit capability markers), silently failing to
+    resume dependents whose foundation declared a finding-hash or marker signal.
+    Both now route shared explicit signals through
+    ``finding_deduplication.prerequisite_matches_task``; this fixture-table
+    parity test fails if either side stops honoring one of those shared signals.
+    """
+
+    @staticmethod
+    def _task(*, tid=None, context=None, title="cand", payloads=None):
+        import uuid as _uuid
+
+        from app.models import Task, TaskStatus
+
+        return Task(
+            id=tid or _uuid.uuid4(),
+            project_id=_uuid.uuid4(),
+            title=title,
+            description="x",
+            status=TaskStatus.IN_PROGRESS,
+            created_by="u",
+            requires_approval=False,
+            payloads=payloads if payloads is not None else [{"type": "create"}],
+            context=context or {},
+            depends_on=[],
+            status_log=[],
+        )
+
+    def test_shared_signals_agree_on_match_and_no_match(self):
+        import uuid as _uuid
+
+        from app.blocked_need_resolution import resolve_blocked_need
+        from app.finding_deduplication import resolve_prerequisite_task
+
+        task_id = _uuid.uuid4()
+        # (label, need, candidate-factory, expect_match)
+        cases = [
+            (
+                "task-by-id",
+                {"kind": "task", "ref": str(task_id)},
+                lambda: self._task(tid=task_id),
+                True,
+            ),
+            (
+                "task-by-finding-hash",
+                {"kind": "task", "ref": "feedfacefeedface"},
+                lambda: self._task(context={"finding_hash": "feedfacefeedface"}),
+                True,
+            ),
+            (
+                "capability-marker",
+                {"kind": "capability", "ref": "auth-foundation"},
+                lambda: self._task(context={"provides_capability": "auth-foundation"}),
+                True,
+            ),
+            (
+                "capability-list-marker",
+                {"kind": "capability", "ref": "schema-models"},
+                lambda: self._task(context={"capability": ["x", "schema-models"]}),
+                True,
+            ),
+            (
+                "task-wrong-hash",
+                {"kind": "task", "ref": "0000000000000000"},
+                lambda: self._task(context={"finding_hash": "1111111111111111"}),
+                False,
+            ),
+            (
+                "capability-no-marker",
+                {"kind": "capability", "ref": "auth"},
+                lambda: self._task(title="Build the auth foundation",
+                                   context={"related_files": ["backend/app/auth.py"]}),
+                False,
+            ),
+        ]
+
+        for label, need, factory, expect_match in cases:
+            spawn_task = factory()
+            resume_task = factory()
+            # A BLOCKED dependent distinct from the foundation candidate.
+            blocked = self._task()
+            spawn_hit = resolve_prerequisite_task(need, [spawn_task]) is not None
+            resume_hit = (
+                resolve_blocked_need(blocked, need, [resume_task]) is not None
+            )
+            assert spawn_hit == resume_hit, (
+                f"spawn/resume need-signal parity broken for case '{label}': "
+                f"spawn matched={spawn_hit}, resume matched={resume_hit}. Both "
+                "must agree on shared explicit signals."
+            )
+            assert spawn_hit == expect_match, (
+                f"case '{label}' expected match={expect_match} but spawn "
+                f"matched={spawn_hit}"
+            )
+
+    def test_resume_preserves_legacy_blocked_capability_description_fallback(self):
+        from app.blocked_need_resolution import resolve_blocked_need
+        from app.finding_deduplication import resolve_prerequisite_task
+
+        blocked = self._task()
+        cases = [
+            (
+                "payload-type",
+                {"kind": "capability", "ref": "design"},
+                self._task(payloads=[{"type": "design"}]),
+            ),
+            (
+                "exact-title",
+                {"kind": "capability", "ref": "shared auth layer"},
+                self._task(title="shared auth layer"),
+            ),
+            (
+                "related-file",
+                {"kind": "capability", "ref": "backend/app/auth.py"},
+                self._task(context={"related_files": ["backend/app/auth.py"]}),
+            ),
+        ]
+
+        for label, need, candidate in cases:
+            assert resolve_prerequisite_task(need, [candidate]) is None, (
+                f"spawn path should stay explicit-only for legacy capability case "
+                f"'{label}'"
+            )
+            assert resolve_blocked_need(blocked, need, [candidate]) is candidate, (
+                f"resume path lost legacy blocked capability fallback for case "
+                f"'{label}'"
+            )
