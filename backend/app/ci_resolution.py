@@ -183,6 +183,13 @@ def compute_merge_verification_verdict(project) -> dict[str, Any]:
     return {"state": "unverified", "test_commands": []}
 
 
+# Bound on the rolling ``recent_outcomes`` history kept inside
+# ``project.merge_gate_runtime``. Small by design — operators want an
+# at-a-glance recent trend, not a full audit log — and it caps the JSONB
+# column growth (oldest entries are dropped first).
+_RECENT_OUTCOMES_CAP = 20
+
+
 def record_no_ci_gate_runtime(
     db_session,
     project,
@@ -208,6 +215,17 @@ def record_no_ci_gate_runtime(
     ``last_unverified_*`` fields — they preserve the most recent fall-open,
     which remains historically true.
 
+    Additionally maintains, additively, a bounded rolling history and a
+    per-reason tally so an operator can see a TREND rather than only the single
+    latest value:
+      - ``recent_outcomes``: list (capped at :data:`_RECENT_OUTCOMES_CAP`,
+        oldest dropped) of ``{"at": iso, "verified": bool, "reason": key|None}``
+        — one entry per terminal call (verified AND fell-open);
+      - ``unverified_reason_counts``: ``{reason_key: count}`` incremented only
+        on fall-opens.
+    Legacy four-key-only records upgrade transparently (the list starts empty,
+    the tally starts absent).
+
     Best-effort by contract: it mutates the in-memory ``project`` and stages it
     on ``db_session`` (the caller's commit persists it) but NEVER raises — a
     failure here must not block or break the merge hot path.
@@ -224,6 +242,35 @@ def record_no_ci_gate_runtime(
         if unverified_reason:
             runtime["last_unverified_at"] = when_iso
             runtime["last_unverified_reason"] = str(unverified_reason)
+
+        # Rolling history of recent terminal outcomes (additive; legacy
+        # four-key records simply start an empty list). Append one entry per
+        # terminal call and cap at the most recent ``_RECENT_OUTCOMES_CAP`` so
+        # the JSONB column cannot grow unbounded.
+        prior_outcomes = runtime.get("recent_outcomes")
+        outcomes: list[dict[str, Any]] = (
+            list(prior_outcomes) if isinstance(prior_outcomes, list) else []
+        )
+        outcomes.append(
+            {
+                "at": when_iso,
+                "verified": bool(executed_real_tests),
+                "reason": str(unverified_reason) if unverified_reason else None,
+            }
+        )
+        runtime["recent_outcomes"] = outcomes[-_RECENT_OUTCOMES_CAP:]
+
+        # Per-reason fall-open tally — incremented ONLY on fall-opens (a
+        # verified run has no reason key to count).
+        if unverified_reason:
+            prior_counts = runtime.get("unverified_reason_counts")
+            counts: dict[str, int] = (
+                dict(prior_counts) if isinstance(prior_counts, dict) else {}
+            )
+            key = str(unverified_reason)
+            counts[key] = int(counts.get(key, 0) or 0) + 1
+            runtime["unverified_reason_counts"] = counts
+
         project.merge_gate_runtime = runtime
         try:
             from sqlalchemy.orm.attributes import flag_modified
@@ -253,6 +300,17 @@ def merge_gate_runtime_block(project) -> dict[str, Any] | None:
     has never fallen open to an UNVERIFIED merge.  Defensive against a missing /
     malformed column so it can be attached to every project API response without
     raising.
+
+    When the runtime record carries the additive history fields it also surfaces:
+      - ``recent_outcomes``: the bounded rolling list (most recent last);
+      - ``unverified_reason_counts``: the per-reason fall-open tally;
+      - ``summary``: a derived at-a-glance aggregate —
+        ``window`` (entries retained), ``verified_runs`` / ``fell_open_runs``
+        (counts WITHIN that window), ``total_fall_opens`` (the all-time tally
+        sum, which can exceed the window once older entries are evicted), and
+        ``most_common_reason`` (the most-tallied fall-open reason key, or None).
+    A legacy four-key-only record or a never-ran project omits all four — the
+    response shape stays additive and backward-compatible.
     """
     raw = getattr(project, "merge_gate_runtime", None)
     if not isinstance(raw, dict) or not raw:
@@ -265,6 +323,45 @@ def merge_gate_runtime_block(project) -> dict[str, Any] | None:
         block["last_unverified_at"] = raw.get("last_unverified_at")
     if raw.get("last_unverified_reason") is not None:
         block["last_unverified_reason"] = raw.get("last_unverified_reason")
+
+    # Additive history fields. A legacy four-key-only record (no list, no tally)
+    # simply omits these — older consumers keep working unchanged.
+    raw_outcomes = raw.get("recent_outcomes")
+    outcomes = [o for o in raw_outcomes if isinstance(o, dict)] if isinstance(
+        raw_outcomes, list
+    ) else []
+    if outcomes:
+        block["recent_outcomes"] = outcomes
+
+    raw_counts = raw.get("unverified_reason_counts")
+    counts: dict[str, int] = {}
+    if isinstance(raw_counts, dict):
+        for reason_key, count in raw_counts.items():
+            try:
+                counts[str(reason_key)] = int(count)
+            except (TypeError, ValueError):
+                continue
+    if counts:
+        block["unverified_reason_counts"] = counts
+
+    # Derived at-a-glance summary over the retained window. Only emitted when
+    # there is real history to summarize (never for a legacy/never-ran record).
+    if outcomes:
+        verified_runs = sum(1 for o in outcomes if o.get("verified"))
+        fell_open_runs = len(outcomes) - verified_runs
+        most_common_reason = None
+        if counts:
+            # Deterministic tie-break: highest count, then reason key.
+            most_common_reason = sorted(
+                counts.items(), key=lambda kv: (-kv[1], kv[0])
+            )[0][0]
+        block["summary"] = {
+            "window": len(outcomes),
+            "verified_runs": verified_runs,
+            "fell_open_runs": fell_open_runs,
+            "total_fall_opens": sum(counts.values()) if counts else fell_open_runs,
+            "most_common_reason": most_common_reason,
+        }
     return block
 
 
@@ -299,6 +396,45 @@ def should_run_no_ci_test_gate(project, branch: str | None, *, gate_enabled: boo
 MergeTestOutcome = Literal["pass", "fail", "undetected"]
 
 
+# Conservative threshold for flagging a PASSED suite as "heavily skipped": the
+# run reported a best-effort ``coverage`` summary in which almost every test was
+# skipped/deselected/ignored/filtered (e.g. ``5 passed, 1500 skipped``). This is
+# purely an operator-visible signal — it NEVER changes the pass/fail decision —
+# so the bar is deliberately high to avoid noise on ordinary runs that skip a
+# handful of tests. ``_HEAVY_SKIP_MIN_TOTAL`` keeps tiny suites (where a couple
+# of skips is meaningless) out of the signal; ``_HEAVY_SKIP_RATIO`` requires the
+# skip fraction to be at/above 90% of the total.
+_HEAVY_SKIP_MIN_TOTAL = 10
+_HEAVY_SKIP_RATIO = 0.9
+
+
+def _heavy_skip_coverage_summary(coverage: Any) -> str:
+    """Return a concise ``"passed N, skipped M of T"`` summary when a PASSED
+    suite's best-effort ``coverage`` block shows a heavy skip ratio, else ``""``.
+
+    ``coverage`` is the optional ``{passed, skipped, total}`` block the agent
+    attaches to a detected+passed verdict. Defensive about a missing / non-dict /
+    malformed / older-agent block (returns ``""``), and about a tiny suite or a
+    low skip ratio (returns ``""`` — behaves exactly as today). When the skip
+    fraction is at/above :data:`_HEAVY_SKIP_RATIO` and the total is at/above
+    :data:`_HEAVY_SKIP_MIN_TOTAL`, returns the human summary so the caller can
+    surface it as ``detail`` WITHOUT changing the (non-blocking) ``"pass"``.
+    """
+    if not isinstance(coverage, dict):
+        return ""
+    try:
+        total = int(coverage.get("total"))
+        skipped = int(coverage.get("skipped"))
+        passed = int(coverage.get("passed"))
+    except (TypeError, ValueError):
+        return ""
+    if total < _HEAVY_SKIP_MIN_TOTAL or skipped < 0 or total <= 0:
+        return ""
+    if skipped / total < _HEAVY_SKIP_RATIO:
+        return ""
+    return f"passed {passed}, skipped {skipped} of {total}"
+
+
 def classify_merge_test_verdict(
     verdict: dict[str, Any] | None,
 ) -> tuple[MergeTestOutcome, str]:
@@ -318,16 +454,285 @@ def classify_merge_test_verdict(
                            absent-tests repo must still progress, merging
                            UNVERIFIED.
 
-    ``detail`` is the failing-test output for ``"fail"`` and ``""`` otherwise.
+    ``detail`` is the failing-test output for ``"fail"`` and ``""`` otherwise —
+    EXCEPT a detected+passed suite whose best-effort ``coverage`` summary
+    (``{passed, skipped, total}``) shows a heavy skip ratio: there the outcome
+    stays a non-blocking ``"pass"`` but ``detail`` carries a concise
+    ``"passed N, skipped M of T"`` summary so an operator can distinguish a
+    near-empty run (e.g. ``5 passed, 1500 skipped``) from a fully-exercised pass.
+    Absent / below-threshold / malformed coverage keeps the empty detail exactly
+    (older agents that emit no ``coverage`` are unaffected).
+
+    Acceptance probe (``detected=false`` only): when no unit suite ran, the agent
+    may still attach a cheap goal-level ``probe`` ("does the changed code still
+    compile/build/boot"). A CLEAR probe failure — it ran, did not pass, and was
+    NOT a could-not-run degrade — maps to ``"fail"`` so the existing block-and-fix
+    path fires carrying the probe output. Every other probe state (pass /
+    could-not-run / absent / old-shape verdict) keeps today's ``"undetected"``
+    fall-open, so missing-deps / unprovisioned setup never hard-blocks a merge.
+
+    Documented-command probe (HIGH precedence, runs regardless of suite
+    detection): the agent may attach a ``documentedCommands`` block describing the
+    outcome of running a command the PR INTRODUCES or DOCUMENTS (a newly added
+    package.json script, Makefile/justfile/Taskfile target, declared
+    console-script entrypoint, or a command shown in a touched README/docs block).
+    A CLEAR documented-command failure — it ran, did not pass, and was NOT a
+    could-not-run degrade — maps to ``"fail"`` EVEN WHEN a unit suite was detected
+    and passed, because the documented command is a DISTINCT claim the PR
+    introduced that must be exercised. Every other state (pass / could-not-run /
+    absent / old-shape verdict) does NOT block — an older agent that emits no
+    ``documentedCommands`` behaves exactly as before.
+
+    Newly-disabled tests (VISIBILITY-ONLY, never blocks): the agent may attach a
+    ``disabledTests`` block when the PR's own diff NEWLY introduces test-skip /
+    disable markers. It is parsed defensively via :func:`disabled_tests_block` and
+    NEVER changes the merge decision — on a non-blocking ``"pass"`` it only
+    enriches the operator-facing ``detail`` with a concise "PR newly disables N
+    test(s)" note. Absent / malformed / older-agent verdicts keep today's detail
+    byte-for-byte (the note is appended ONLY when a well-formed block is present).
     """
     if not isinstance(verdict, dict):
         return ("undetected", "")
+    # HIGH precedence: a documented / PR-introduced command that CLEARLY failed
+    # blocks the merge regardless of whether a unit suite was detected & passed.
+    documented = verdict.get("documentedCommands")
+    if _documented_command_is_clear_failure(documented):
+        output = str(documented.get("output") or "").strip()
+        label = str(documented.get("label") or "").strip()
+        prefix = (
+            f"PR-documented command `{label}` failed: "
+            if label
+            else "PR-documented command failed: "
+        )
+        return (
+            "fail",
+            (prefix + output)
+            if output
+            else (prefix + "the documented command did not succeed."),
+        )
+    # Partial-setup failure: SOME-but-not-all test runners failed environment
+    # setup, so at least one suite never executed (a polyglot repo where e.g. the
+    # Python suite ran but the TS runner's ``npm ci`` failed). The runners that
+    # ran may have passed, but a clean ``detected=false`` fall-open here would
+    # silently merge with an entire suite unverified. Treat it as a BLOCK (fail)
+    # — never a clean pass or an undetected fall-open — mirroring the
+    # all-runners-failed escalation while staying distinguishable via the flag.
+    # Checked BEFORE the detected/passed branches so it cannot be masked by a
+    # sibling runner's pass. Defensive about an older agent that never emits the
+    # flag (falsy → falls through to existing behavior).
+    if verdict.get("partialSetupFailed"):
+        output = str(verdict.get("output") or "").strip()
+        return (
+            "fail",
+            output
+            or "Partial setup failure: one or more test runners could not run "
+            "their suite (environment/setup error); the suite is only partially "
+            "verified.",
+        )
+    # PR-CAUSED SELF-SUPPRESSION (blocks): the PR's OWN diff newly introduced
+    # skip/disable markers (a well-formed ``disabledTests`` block) AND the
+    # resulting suite is non-verifying — either it all-skipped (every test
+    # skipped) or it "passed" with a heavy/mostly-skipped coverage summary. An
+    # agent must not be able to make a red suite green by disabling its own
+    # tests. Checked AFTER documented-command / partial-setup but BEFORE the
+    # ``detected is False`` fall-open (the all-skipped case) and BEFORE the
+    # ``passed`` branch (the mostly-skipped case), so both shapes are
+    # intercepted first. Conservative by construction: it fires ONLY on
+    # PR-introduced self-suppression of the whole/near-whole suite — an
+    # environmental all-skip (no ``disabledTests``) or a small flaky quarantine
+    # (suite still genuinely runs) does NOT meet the conjunction and keeps its
+    # existing non-blocking behavior.
+    if pr_self_suppressed_suite(verdict):
+        disabled = disabled_tests_block(verdict)
+        count = disabled["count"] if disabled else 0
+        marker_list = ", ".join(
+            f"{m['marker']} in {m['file']}".strip()
+            for m in (disabled["markers"] if disabled else [])
+            if m.get("marker") or m.get("file")
+        )
+        suffix = f" (markers: {marker_list})" if marker_list else ""
+        return (
+            "fail",
+            f"PR newly disabled {count} test(s) and thereby self-suppressed the "
+            f"suite — the test run no longer verifies anything (all/near-all "
+            f"tests skipped), so the suite was made green by skipping rather "
+            f"than by passing{suffix}.",
+        )
     if verdict.get("detected") is False:
+        if probe_is_clear_failure(verdict.get("probe")):
+            probe = verdict["probe"]
+            output = str(probe.get("output") or "").strip()
+            if probe.get("declared"):
+                # The operator's OWN declared build command failed — surface that
+                # explicitly so the spawned fix task knows the authoritative build
+                # (not a generic compile probe) is what broke.
+                label = str(probe.get("label") or "").strip()
+                prefix = (
+                    f"Declared build command `{label}` failed: "
+                    if label
+                    else "Declared build command failed: "
+                )
+                return (
+                    "fail",
+                    (prefix + output)
+                    if output
+                    else (prefix + "the declared build did not succeed."),
+                )
+            return (
+                "fail",
+                output
+                or "Acceptance probe failed: the changed code does not compile/build.",
+            )
         return ("undetected", "")
     if verdict.get("passed"):
-        return ("pass", "")
+        # A detected suite ran and passed → non-blocking ``"pass"``. If the agent
+        # attached a best-effort ``coverage`` summary showing almost every test
+        # was skipped/deselected (a near-empty run like ``5 passed, 1500
+        # skipped``), enrich the operator-visible ``detail`` with a concise
+        # coverage summary so the gate is distinguishable from a fully-exercised
+        # pass. The OUTCOME stays ``"pass"`` — this is the conservative,
+        # stabilize-phase gate and a heavily-skipped pass never blocks a merge.
+        # Absent / below-threshold / malformed coverage keeps today's empty
+        # detail exactly (older-agent compatible).
+        detail = _heavy_skip_coverage_summary(verdict.get("coverage"))
+        # VISIBILITY-ONLY: if the PR newly disabled tests, annotate the (still
+        # non-blocking) pass so an operator can see a green suite may have been
+        # made green by skipping. Never flips the outcome; appended ONLY when a
+        # well-formed block is present, so an absent field keeps detail unchanged.
+        disabled = disabled_tests_block(verdict)
+        if disabled:
+            note = f"PR newly disables {disabled['count']} test(s)"
+            detail = f"{detail}; {note}" if detail else note
+        return ("pass", detail)
     output = str(verdict.get("output") or "").strip()
     return ("fail", output or "Detected test suite failed (no output captured).")
+
+
+def probe_is_clear_failure(probe: Any) -> bool:
+    """Whether an acceptance ``probe`` block represents a CLEAR, blocking failure.
+
+    True only when the probe ran, was not a could-not-run degrade, and did not
+    pass — i.e. the changed code genuinely failed to compile/build. Defensive
+    about a missing / non-dict / old-shape probe (returns False), so a verdict
+    from an older agent that emits no probe keeps the undetected fall-open.
+
+    Public so the orchestrator can redirect a setup-failure (FAILED) verify task
+    that nonetheless ran the probe and caught a clear build break into a merge
+    BLOCK, rather than the crash-retry-then-fall-open path.
+    """
+    if not isinstance(probe, dict):
+        return False
+    if not probe.get("ran"):
+        return False
+    if probe.get("could_not_run"):
+        return False
+    return probe.get("passed") is False
+
+
+def _documented_command_is_clear_failure(documented: Any) -> bool:
+    """Whether a ``documentedCommands`` block represents a CLEAR, blocking failure.
+
+    Mirrors :func:`_probe_is_clear_failure` for the diff-aware documented /
+    PR-introduced command probe (same ``ran``/``could_not_run``/``passed`` shape).
+    True only when the command ran, was not a could-not-run degrade, and did not
+    pass. Defensive about a missing / non-dict / old-shape field (returns False),
+    so a verdict from an older agent that emits no ``documentedCommands`` keeps
+    today's gate behavior exactly.
+    """
+    if not isinstance(documented, dict):
+        return False
+    if not documented.get("ran"):
+        return False
+    if documented.get("could_not_run"):
+        return False
+    return documented.get("passed") is False
+
+
+# Hard cap on disabled-test markers surfaced from a verdict, mirroring the
+# agent-side ``MAX_DISABLED_TEST_MARKERS`` so a PR that mass-disables a suite
+# cannot bloat the API response even if a malformed/oversized artifact slips in.
+_MAX_DISABLED_TEST_MARKERS = 20
+
+
+def disabled_tests_block(verdict: Any) -> dict[str, Any] | None:
+    """Defensively normalize the optional ``disabledTests`` VISIBILITY block an
+    agent may attach when a PR's own diff NEWLY introduces test-skip/disable
+    markers (``it.skip``, ``@pytest.mark.skip``, ``t.Skip(``, ``#[ignore]`` …).
+
+    Returns ``{"count": int, "markers": [{"file", "marker", "line"}, …]}`` when a
+    well-formed block with a positive count is present, else ``None``. This is a
+    pure read-side accessor — it NEVER affects the merge decision (see
+    :func:`classify_merge_test_verdict`). Defensive about a missing / non-dict /
+    malformed / older-agent block (returns ``None``) exactly like the other
+    optional-block parsers, so an agent that omits it degrades silently and the
+    gate is unchanged. Markers are bounded to :data:`_MAX_DISABLED_TEST_MARKERS`.
+    """
+    if not isinstance(verdict, dict):
+        return None
+    raw = verdict.get("disabledTests")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        count = int(raw.get("count"))
+    except (TypeError, ValueError):
+        return None
+    if count <= 0:
+        return None
+    markers: list[dict[str, str]] = []
+    raw_markers = raw.get("markers")
+    if isinstance(raw_markers, list):
+        for m in raw_markers[:_MAX_DISABLED_TEST_MARKERS]:
+            if not isinstance(m, dict):
+                continue
+            markers.append(
+                {
+                    "file": str(m.get("file") or ""),
+                    "marker": str(m.get("marker") or ""),
+                    "line": str(m.get("line") or ""),
+                }
+            )
+    return {"count": count, "markers": markers}
+
+
+def _suite_is_non_verifying(verdict: dict[str, Any]) -> bool:
+    """Whether a verdict's suite did not really verify anything — EITHER it ran
+    but every test was skipped (``noTestsReason`` in
+    :data:`_ALL_SKIPPED_NO_TESTS_REASONS`) OR it ``passed`` with a heavy/mostly
+    -skipped coverage summary (per :func:`_heavy_skip_coverage_summary`, the
+    same 90%-skip threshold used for the operator-visible heavy-skip note).
+
+    Read-only; does not change the merge decision on its own.
+    """
+    no_tests_reason = str(verdict.get("noTestsReason") or "").strip().lower()
+    if no_tests_reason in _ALL_SKIPPED_NO_TESTS_REASONS:
+        return True
+    if verdict.get("passed") and _heavy_skip_coverage_summary(verdict.get("coverage")):
+        return True
+    return False
+
+
+def pr_self_suppressed_suite(verdict: Any) -> bool:
+    """Whether the PR's OWN diff made the suite stop verifying by disabling tests.
+
+    True ONLY when BOTH hold:
+      (a) the PR newly introduced skip/disable markers — :func:`disabled_tests_block`
+          returns a non-``None`` block; AND
+      (b) the resulting suite is non-verifying — :func:`_suite_is_non_verifying`
+          (all-skipped, or a heavily/mostly-skipped pass).
+
+    The conjunction is deliberately narrow so it stays safe for the stabilize
+    phase: an environmental all-skip / heavy-skip where the PR did NOT introduce
+    the skips (no ``disabledTests`` block) returns False and keeps falling open /
+    passing; a small flaky quarantine where a few tests are disabled but the
+    suite still genuinely runs (not all/near-all skipped) also returns False and
+    keeps its visibility-only pass. Defensive about a missing / old-shape verdict
+    (returns False) like the other optional-block accessors.
+    """
+    if not isinstance(verdict, dict):
+        return False
+    if disabled_tests_block(verdict) is None:
+        return False
+    return _suite_is_non_verifying(verdict)
 
 
 def build_no_ci_gate_ci_result(
@@ -367,6 +772,147 @@ def build_no_ci_gate_ci_result(
         "details": [],
         "failed_logs": "",
     }
+
+
+# Values an agent's verify-tests handler may emit in the verdict's
+# ``noTestsReason`` field to mark a suite that was PRESENT and ran but skipped
+# (or deselected) every test — distinct from a genuine no-suite/placeholder
+# repo. Matched case-insensitively; tolerant of the field name not yet existing
+# on an older agent (then the generic reason is kept).
+_ALL_SKIPPED_NO_TESTS_REASONS = frozenset(
+    {"all_skipped", "all_tests_skipped", "every_test_skipped", "skipped"}
+)
+
+
+def classify_unverified_fall_open_reason(
+    verdict: dict[str, Any] | None,
+) -> tuple[str, str]:
+    """Map a detected=false MERGE_TEST_RESULT verdict to the operator-visible
+    ``(phrase, stable_key)`` for a no-CI gate fall-open to an UNVERIFIED merge.
+
+    A genuine no-suite/placeholder repo keeps today's generic
+    ``("no test command detectable", "undetected_runtime")``.  When the agent's
+    verify-tests handler marks — via the verdict's ``noTestsReason`` field — a
+    suite that was PRESENT but skipped EVERY test (e.g. an integration suite
+    that all-skips on the cold verify VM because no services are provisioned),
+    return a DISTINCT ``("suite present but every test skipped",
+    "suite_all_skipped")`` so an operator can tell the two apart on
+    ``merge_gate_runtime.last_unverified_reason``.
+
+    Acceptance probe: when the gate falls open with a probe attached (and the
+    probe was NOT a clear failure — that case blocks instead, via
+    :func:`classify_merge_test_verdict`), surface the probe's honest signal:
+    ``("acceptance probe passed (...)", "probe_passed")`` when the cheap
+    compile/build check passed, or ``("acceptance probe could not run (...)",
+    "probe_could_not_run")`` when missing deps / unprovisioned setup degraded it.
+    The probe signal takes precedence over the all-skipped phrasing because it is
+    the stronger execution evidence we have for this fall-open.
+
+    Declared-build no-op refinement: when the PASSED probe ran the project's OWN
+    declared ``build_cmd`` and the agent confidently observed (via the additive
+    ``wrote_no_artifact`` flag) that it exited 0 yet wrote no output to the fresh
+    PR-head clone, return ``("declared build ran but emitted no artifact (...)",
+    "probe_no_artifact")`` instead of the confident ``probe_passed`` phrasing — a
+    no-op build does not honestly "build the deliverable". An absent / false flag
+    (older agent, or an ambiguous/unobservable tree) keeps ``probe_passed`` exactly.
+
+    Documented-command probe: when the merge falls open and a
+    ``documentedCommands`` block is present (a command the PR INTRODUCES or
+    DOCUMENTS), surface DISTINCT operator-visible reason keys —
+    ``documented_command_could_not_run`` when missing deps / unprovisioned setup
+    degraded it (the claim went unverified), or ``documented_command_passed``
+    when the documented command was the positive execution evidence (no unit
+    suite ran but the documented command executed and passed). This signal takes
+    precedence over the acceptance-probe / all-skipped phrasing because a command
+    the PR itself introduced is the most specific claim we can speak to. A CLEAR
+    documented-command failure never reaches here — it blocks via
+    :func:`classify_merge_test_verdict`.
+
+    Purely a refinement of the operator-visible reason: it never changes the
+    pass/fail/undetected merge decision.  Defensive about a missing / old-shape
+    verdict (an older agent that does not emit ``noTestsReason`` /
+    ``documentedCommands`` keeps the generic reason).
+    """
+    if isinstance(verdict, dict):
+        documented = verdict.get("documentedCommands")
+        if isinstance(documented, dict) and documented.get("ran"):
+            label = str(documented.get("label") or "").strip()
+            if documented.get("could_not_run"):
+                phrase = (
+                    f"a PR-introduced/documented command could not be run ({label})"
+                    if label
+                    else "a PR-introduced/documented command could not be run "
+                    "(missing deps/unprovisioned setup)"
+                )
+                return (phrase, "documented_command_could_not_run")
+            if documented.get("passed") is True:
+                phrase = (
+                    f"a PR-introduced/documented command was executed and passed ({label})"
+                    if label
+                    else "a PR-introduced/documented command was executed and passed"
+                )
+                return (phrase, "documented_command_passed")
+        probe = verdict.get("probe")
+        if isinstance(probe, dict) and probe.get("ran"):
+            # A declared probe ran the project's OWN ``build_cmd`` — surface
+            # declared-build wording (with the command label) instead of the
+            # generic compile-probe phrasing. The stable KEY is unchanged
+            # (``probe_passed`` / ``probe_could_not_run``) so the operator
+            # label maps and the no-CI fall-open invariant stay intact; only the
+            # human phrase distinguishes declared from generic. An older agent
+            # that emits no ``declared`` marker keeps the generic phrase.
+            declared = bool(probe.get("declared"))
+            label = str(probe.get("label") or "").strip()
+            if probe.get("could_not_run"):
+                if declared:
+                    phrase = (
+                        f"declared build command could not run ({label})"
+                        if label
+                        else "declared build command could not run (missing deps/unprovisioned setup)"
+                    )
+                    return (phrase, "probe_could_not_run")
+                return (
+                    "acceptance probe could not run (missing deps/unprovisioned setup)",
+                    "probe_could_not_run",
+                )
+            if probe.get("passed") is True:
+                if declared:
+                    # Honest refinement of the declared-build fall-open: a
+                    # declared build that exited 0 but — per the agent's
+                    # ``wrote_no_artifact`` observation — wrote NOTHING to the
+                    # fresh PR-head clone is a likely no-op build (an empty
+                    # Makefile recipe, a script that silently does nothing, a
+                    # generator that writes nowhere). The build's result IS the
+                    # deliverable, so "exited 0 yet emitted no artifact" makes the
+                    # confident "deliverable builds" phrasing dishonest. Distinct
+                    # phrase + stable key. The agent sets the flag ONLY when it
+                    # confidently observed the tree; an absent / false flag (an
+                    # older agent, or an ambiguous/unobservable tree) keeps
+                    # today's ``probe_passed`` behaviour byte-for-byte — the new
+                    # reason is never emitted on uncertainty.
+                    if probe.get("wrote_no_artifact") is True:
+                        phrase = (
+                            f"declared build ran but emitted no artifact ({label}) "
+                            "— possible no-op build"
+                            if label
+                            else "declared build ran but emitted no artifact "
+                            "(possible no-op build)"
+                        )
+                        return (phrase, "probe_no_artifact")
+                    phrase = (
+                        f"declared build command passed ({label})"
+                        if label
+                        else "declared build command passed (deliverable builds)"
+                    )
+                    return (phrase, "probe_passed")
+                return (
+                    "acceptance probe passed (changed code compiles/builds)",
+                    "probe_passed",
+                )
+        no_tests_reason = str(verdict.get("noTestsReason") or "").strip().lower()
+        if no_tests_reason in _ALL_SKIPPED_NO_TESTS_REASONS:
+            return ("suite present but every test skipped", "suite_all_skipped")
+    return ("no test command detectable", "undetected_runtime")
 
 
 ResolutionSource = Literal["branch_head", "merge_sha", "unresolved"]

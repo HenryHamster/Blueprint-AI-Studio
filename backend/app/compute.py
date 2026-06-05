@@ -73,6 +73,11 @@ INFRA_PROVISION_PATTERNS = [
 # Track which zone each VM was created in (for delete/cleanup)
 _vm_zones: dict[str, str] = {}
 
+# Name prefixes for all Blueprint-managed GCE instances. The orphan-cleanup
+# sweep inventories every prefix here; a new managed-VM family (e.g. the
+# compute-job substrate) MUST be added so its VMs are reclaimable.
+_MANAGED_VM_PREFIXES = ("agent-vm-", "compute-job-vm-")
+
 # Track per-VM image identity reported via heartbeats: vm_id -> (image_name, build_ts)
 _vm_images: dict[str, tuple[str | None, int | None]] = {}
 
@@ -434,6 +439,7 @@ async def provision_agent_vm(
     provider_metadata: dict | None = None,
     provider_settings: dict | None = None,
     provisioning_model: str | None = None,
+    machine_type: str | None = None,
 ):
     """
     Provisions an agent. In LOCAL_MODE, spawns a subprocess.
@@ -482,6 +488,7 @@ async def provision_agent_vm(
         provider_metadata=provider_metadata,
         provider_settings=provider_settings,
         provisioning_model=provisioning_model,
+        machine_type=machine_type,
     )
 
 
@@ -534,6 +541,7 @@ async def provision_pool_vm(
     provider_metadata: dict | None = None,
     provider_settings: dict | None = None,
     provisioning_model: str | None = None,
+    machine_type: str | None = None,
 ) -> str | None:
     """Boot a TASKLESS, credentialed warm-pool VM and register it in PoolVm.
 
@@ -625,6 +633,7 @@ async def provision_pool_vm(
         provider_metadata=provider_metadata,
         provider_settings=provider_settings,
         provisioning_model=provisioning_model,
+        machine_type=machine_type,
         startup_script_override=startup_script,
     )
     if not success:
@@ -673,6 +682,32 @@ def get_provision_error(vm_instance_id: str) -> str:
 def get_vm_zone(vm_instance_id: str) -> str:
     """Get the zone a VM was provisioned in."""
     return _vm_zones.get(vm_instance_id, "unknown")
+
+
+def find_vm_zone(vm_name: str) -> str | None:
+    """Restart-safe zone discovery: locate a VM by name across fallback zones.
+
+    The in-memory ``_vm_zones`` map is empty after a leader restart, so a service
+    that must inspect a VM provisioned by a previous process (the compute-job
+    monitor) cannot rely on ``get_vm_zone`` alone. This probes each fallback zone
+    for the instance, repopulates ``_vm_zones`` on a hit, and returns ``None`` if
+    the VM exists nowhere. Synchronous GCP RPCs — wrap in ``asyncio.to_thread``
+    when called from async code.
+    """
+    if not vm_name:
+        return None
+    cached = _vm_zones.get(vm_name)
+    if cached and cached != "unknown":
+        return cached
+    for zone, _ in FALLBACK_ZONES:
+        status = get_vm_status(vm_name, zone)
+        # get_vm_status returns a synthetic "DELETED" for a 404 (not in this
+        # zone); any other non-None status means the VM lives in this zone.
+        if status and status != "DELETED":
+            with _zone_lock:
+                _vm_zones[vm_name] = zone
+            return zone
+    return None
 
 
 def record_vm_image(
@@ -1211,6 +1246,7 @@ async def _provision_gcp(
     provider_settings: dict | None = None,
     provisioning_model: str | None = None,
     startup_script_override: str | None = None,
+    machine_type: str | None = None,
 ):
     """Provision a GCP VM. When ``startup_script_override`` is provided it is used
     verbatim as the instance startup-script (the taskless warm-pool path passes
@@ -1222,6 +1258,7 @@ async def _provision_gcp(
         f"Starting provisioning for VM: {vm_instance_id} "
         f"(Task: {task_id if task_id is not None else 'pool'})"
     )
+    effective_machine_type = machine_type or MACHINE_TYPE
 
     if secret_version_name is None and task_id is not None:
         # Secret was not pre-computed by the caller — build and store it now.
@@ -1381,7 +1418,7 @@ async def _provision_gcp(
             try:
                 # Update zone-dependent config for this attempt
                 instance_config.machine_type = (
-                    f"zones/{zone}/machineTypes/{MACHINE_TYPE}"
+                    f"zones/{zone}/machineTypes/{effective_machine_type}"
                 )
                 zone_region = "-".join(zone.split("-")[:-1])
                 network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{zone_region}/subnetworks/{subnet_name}"
@@ -1587,7 +1624,7 @@ async def _provision_gcp(
                 # Retry the soonest zone
                 try:
                     instance_config.machine_type = (
-                        f"zones/{wait_zone}/machineTypes/{MACHINE_TYPE}"
+                        f"zones/{wait_zone}/machineTypes/{effective_machine_type}"
                     )
                     zone_region = "-".join(wait_zone.split("-")[:-1])
                     network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{zone_region}/subnetworks/{wait_subnet}"
@@ -1695,6 +1732,44 @@ async def _provision_gcp(
         await _release_provision_slot(vm_instance_id)
 
 
+async def provision_ephemeral_vm(
+    vm_instance_id: str,
+    *,
+    startup_script: str,
+    machine_type: str | None = None,
+    provisioning_model: str | None = None,
+) -> bool:
+    """Provision a non-agent VM that runs a caller-supplied startup script.
+
+    This reuses the shared GCP fallback-zone, secret-free boot, and teardown
+    plumbing already used by agent VMs while keeping cloud imports hidden from
+    the higher-level compute-job service layer.
+    """
+    _ensure_image_family_valid()
+    if LOCAL_MODE:
+        raise RuntimeError(
+            "provision_ephemeral_vm is unavailable in LOCAL_MODE; use the local backend"
+        )
+    return await _provision_gcp(
+        vm_instance_id=vm_instance_id,
+        task_id=None,
+        provisioning_model=provisioning_model,
+        startup_script_override=startup_script,
+        machine_type=machine_type,
+    )
+def get_vm_serial_output(vm_instance_id: str, zone: str | None = None) -> str | None:
+    """Best-effort serial-port tail for a VM.
+
+    ``zone`` is optional for backward compatibility. Callers that persisted the
+    zone durably (for example compute jobs) should pass it explicitly so serial
+    recovery stays correct across leader restarts when ``_vm_zones`` is empty.
+    """
+    zone = zone or get_vm_zone(vm_instance_id)
+    if not zone or zone == "unknown":
+        return None
+    return _capture_serial_for_vm(vm_instance_id, zone)
+
+
 # ─── Shared VM Helpers (used by both delete and cleanup paths) ────────────
 
 
@@ -1764,6 +1839,42 @@ def get_vm_status(vm_name: str, zone: str) -> str | None:
         return None
 
 
+def get_vm_created_at(vm_name: str, zone: str) -> datetime | None:
+    """Return a VM's GCE creation timestamp as a naive UTC datetime."""
+    from google.cloud import compute_v1
+
+    if not zone or zone == "unknown":
+        return None
+    try:
+        client = compute_v1.InstancesClient()
+        instance = client.get(project=GCP_PROJECT_ID, zone=zone, instance=vm_name)
+    except Exception:
+        logger.warning(
+            "[COMPUTE] get_vm_created_at failed for vm=%s zone=%s",
+            vm_name,
+            zone,
+            exc_info=True,
+        )
+        return None
+
+    created_at = getattr(instance, "creation_timestamp", None)
+    if not created_at:
+        return None
+    try:
+        parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
+    except ValueError:
+        logger.warning(
+            "[COMPUTE] could not parse creation_timestamp for vm=%s zone=%s: %r",
+            vm_name,
+            zone,
+            created_at,
+        )
+        return None
+
+
 def _delete_single_vm(vm_name: str, zone: str) -> bool:
     """Delete a single VM. No serial capture. Returns True on success."""
     from google.cloud import compute_v1
@@ -1781,7 +1892,13 @@ def _delete_single_vm(vm_name: str, zone: str) -> bool:
 
 
 def _list_vms_in_zone(zone: str) -> list[tuple[str, str, str]]:
-    """List all agent-vm-* instances in a single zone. Returns [(name, zone, status)]."""
+    """List all Blueprint-managed instances in a single zone.
+
+    Returns [(name, zone, status)] for both ``agent-vm-*`` (task agent VMs) and
+    ``compute-job-vm-*`` (budgeted compute-job VMs). Without the latter prefix a
+    compute-job VM that survived its immediate delete retries would leak forever,
+    since the orphan sweep would never inventory it.
+    """
     from google.cloud import compute_v1
 
     results = []
@@ -1797,7 +1914,7 @@ def _list_vms_in_zone(zone: str) -> list[tuple[str, str, str]]:
         results = [
             (instance.name, zone, instance.status)
             for instance in client.list(request=request, timeout=30)
-            if instance.name.startswith("agent-vm-")
+            if instance.name.startswith(_MANAGED_VM_PREFIXES)
         ]
     except Exception:
         logger.exception(f"[GCP CLEANUP] Failed to list VMs in zone {zone}")

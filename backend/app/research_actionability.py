@@ -8,17 +8,26 @@ from app.landed_signal import is_merged_completion
 _MAX_ACTIONABILITY_CYCLES = 50
 
 
-def _aggregate_actionability_bucket(
+def _aggregate_actionability_extended(
     research_tasks_in_bucket: list,
     followon_tasks: list,
     research_task_ids: set,
-) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
-    """Aggregate (grade_distribution, grade_tasked, grade_merged) for a bucket
-    of research tasks. Reuses the same merge-attribution rules as the global
-    aggregation: research tasks are excluded from follow-ons (self-attribution
-    guard), and a follow-on must be created strictly after the bucket's
-    earliest research task that produced the finding's direction.
+) -> tuple[dict[str, int], dict[str, int], dict[str, int], dict[str, int]]:
+    """Aggregate (grade_distribution, grade_tasked, grade_merged, grade_succeeded).
+
+    Tracks both the merge-based code sub-metric (``grade_merged``) and the
+    generalized forward-quality outcome: a finding's grade is counted in
+    ``grade_succeeded`` when its direction's follow-on task achieved ANY terminal
+    evaluation success — not just a PR merge, but also research quality,
+    audit findings, memo artifacts, or verification verdicts (resolved via
+    :func:`~app.task_outcomes.is_successful_outcome`).
+
+    Reuses the same merge-attribution rules as the global aggregation: research
+    tasks are excluded from follow-ons (self-attribution guard), and a follow-on
+    must be created strictly after the bucket's earliest research task.
     """
+    from app.task_outcomes import is_successful_outcome  # noqa: PLC0415
+
     finding_direction_ids: set[str] = set()
     findings_by_dir: dict[str, list[dict]] = {}
     grade_counts: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
@@ -64,13 +73,18 @@ def _aggregate_actionability_bucket(
             and t.created_at <= research_at
         ):
             continue
-        entry = dir_outcome.setdefault(key, {"tasked": False, "merged": False})
+        entry = dir_outcome.setdefault(
+            key, {"tasked": False, "merged": False, "succeeded": False}
+        )
         entry["tasked"] = True
         if is_merged_completion(t):
             entry["merged"] = True
+        if is_successful_outcome(t):
+            entry["succeeded"] = True
 
     grade_tasked: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
     grade_merged: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    grade_succeeded: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
     for dir_id, findings in findings_by_dir.items():
         outcome = dir_outcome.get(dir_id, {})
         for f in findings:
@@ -79,8 +93,10 @@ def _aggregate_actionability_bucket(
                 grade_tasked[g] = grade_tasked.get(g, 0) + 1
             if outcome.get("merged"):
                 grade_merged[g] = grade_merged.get(g, 0) + 1
+            if outcome.get("succeeded"):
+                grade_succeeded[g] = grade_succeeded.get(g, 0) + 1
 
-    return grade_counts, grade_tasked, grade_merged
+    return grade_counts, grade_tasked, grade_merged, grade_succeeded
 
 
 def _compute_actionability_rates(
@@ -110,3 +126,44 @@ def _compute_actionability_rates(
         else None
     )
     return grade_merge_rate, grade_merge_rate_of_tasked, calibration_score
+
+
+def _compute_actionability_rates_extended(
+    grade_counts: dict[str, int],
+    grade_tasked: dict[str, int],
+    grade_merged: dict[str, int],
+    grade_succeeded: dict[str, int],
+) -> dict[str, object]:
+    """Derive both merge-rate (code sub-metric) and generalized success-rate.
+
+    Returns a dict with:
+    - ``grade_merge_rate``: per-grade rate of findings that led to a merged PR.
+    - ``grade_merge_rate_of_tasked``: merge rate among tasked findings only.
+    - ``calibration_score``: HIGH-rate minus LOW-rate (merge-based).
+    - ``grade_success_rate``: per-grade rate of findings with ANY successful
+      follow-on (PR merge OR successful non-code evaluation outcome).
+    - ``generalized_calibration_score``: HIGH-success-rate minus LOW-success-rate.
+
+    This is the extended form consumed by new analytics paths; existing callers
+    use :func:`_compute_actionability_rates` for the 3-tuple form.
+    """
+    merge_rate, merge_rate_tasked, calibration = _compute_actionability_rates(
+        grade_counts, grade_tasked, grade_merged
+    )
+    grade_success_rate: dict[str, Optional[float]] = {}
+    for g in ("HIGH", "MEDIUM", "LOW"):
+        gd = grade_counts.get(g, 0)
+        gs = grade_succeeded.get(g, 0)
+        grade_success_rate[g] = (gs / gd) if gd > 0 else None
+    high_sr = grade_success_rate["HIGH"]
+    low_sr = grade_success_rate["LOW"]
+    generalized_calibration = (
+        high_sr - low_sr if (high_sr is not None and low_sr is not None) else None
+    )
+    return {
+        "grade_merge_rate": merge_rate,
+        "grade_merge_rate_of_tasked": merge_rate_tasked,
+        "calibration_score": calibration,
+        "grade_success_rate": grade_success_rate,
+        "generalized_calibration_score": generalized_calibration,
+    }

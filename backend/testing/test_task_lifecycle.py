@@ -6561,3 +6561,142 @@ class TestMarkDependentsWarmClaimable:
 
         # Must not raise.
         assert await _mark_dependents_warm_claimable(landed) is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Forward-quality grader resume is registry-driven for security_audit.
+#
+# A security_audit source parks EVALUATING behind an independent grader; when the
+# grader's verdict returns, _resolve_quality_grader_completion must re-dispatch
+# the source to its REGISTRY completion handler (not a hardwired research-only
+# map). The source stores plan_output as {"findings": [...]}, so the resume
+# reconstruction must round-trip that dict shape back to the findings JSON array
+# the handler's parser expects.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+async def _make_audit_source_and_grader(session, *, verdict_passed: bool):
+    """A parked security_audit source + its independent grader, mid-grade."""
+    from app.task_evaluators import QUALITY_GRADER_SOURCE_KEY
+
+    project = await _make_project(session)
+    findings = [
+        {
+            "severity": "high",
+            "title": "Missing auth check",
+            "description": "Endpoint lacks @require_role.",
+            "fix_prompt": "Add @require_role('admin').",
+            "file_path": "app/routers/admin.py",
+            "line_number": 7,
+        },
+    ]
+    source = Task(
+        project_id=project.id,
+        payloads=[{"type": "security_audit", "base_branch": "main"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        plan_output={"findings": findings},  # dict shape the audit handler writes
+        context={"awaiting_quality_grader": True},
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    session.add(source)
+    await session.commit()
+    await session.refresh(source)
+
+    grader = Task(
+        project_id=project.id,
+        payloads=[{"type": "investigate", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={QUALITY_GRADER_SOURCE_KEY: str(source.id)},
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    session.add(grader)
+    await session.commit()
+    await session.refresh(grader)
+    return project, source, grader
+
+
+def _quiet_audit_completion_io(mocker):
+    """Silence the GitHub / broadcast / safeguard IO the audit handler performs."""
+    mocker.patch(
+        "app.task_completion.broadcast_to_project", new=AsyncMock(return_value=None)
+    )
+    mocker.patch(
+        "app.task_completion._maybe_release_safeguard_gate",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.task_completion.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.task_completion.get_open_pull_requests", new=AsyncMock(return_value=[])
+    )
+    mocker.patch(
+        "app.task_completion.create_pr_comment", new=AsyncMock(return_value=None)
+    )
+
+
+@pytest.mark.asyncio
+async def test_grader_resume_security_audit_pass_spawns_from_dict_plan_output(
+    tl_db, mocker
+):
+    """A PASS grade re-dispatches the security_audit source through the registry
+    and spawns fix children, reconstructed from the dict-shaped plan_output."""
+    from app.task_lifecycle import _resolve_quality_grader_completion
+
+    session, _ = tl_db
+    _quiet_audit_completion_io(mocker)
+    _project, source, grader = await _make_audit_source_and_grader(
+        session, verdict_passed=True
+    )
+
+    payload = AgentStatusPayload(
+        task_id=grader.id,
+        status=TaskStatus.COMPLETED,
+        logs='{"verdict": "pass", "reasoning": "audit is well-grounded"}',
+    )
+    await _resolve_quality_grader_completion(grader, payload, session)
+
+    children = (
+        (await session.execute(select(Task).where(Task.parent_task_id == source.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, "PASS grade must spawn the fix child from stored findings"
+    await session.refresh(source)
+    assert source.status == TaskStatus.EVALUATING
+    assert (source.context or {}).get("quality_grader", {}).get("passed") is True
+
+
+@pytest.mark.asyncio
+async def test_grader_resume_security_audit_fail_spawns_nothing_and_fails(
+    tl_db, mocker
+):
+    """A FAIL grade re-dispatches the source, which marks itself FAILED and
+    spawns no fix children (fail closed for an ungrounded audit)."""
+    from app.task_lifecycle import _resolve_quality_grader_completion
+
+    session, _ = tl_db
+    _quiet_audit_completion_io(mocker)
+    _project, source, grader = await _make_audit_source_and_grader(
+        session, verdict_passed=False
+    )
+
+    payload = AgentStatusPayload(
+        task_id=grader.id,
+        status=TaskStatus.COMPLETED,
+        logs='{"verdict": "fail", "reasoning": "cited vulnerability absent at HEAD"}',
+    )
+    await _resolve_quality_grader_completion(grader, payload, session)
+
+    children = (
+        (await session.execute(select(Task).where(Task.parent_task_id == source.id)))
+        .scalars()
+        .all()
+    )
+    assert children == [], "FAIL grade must spawn no fix tasks"
+    await session.refresh(source)
+    assert source.status == TaskStatus.FAILED
+    assert (source.context or {}).get("evaluation_gate", {}).get("passed") is False

@@ -1,0 +1,189 @@
+import { afterEach, describe, expect, test, vi } from 'vitest';
+import { createRoot, type Root } from 'react-dom/client';
+import { act } from 'react';
+import { fireEvent } from '@testing-library/react';
+import { KnowledgeBrowser } from './KnowledgeBrowser';
+import { fetchKnowledgeDocuments } from '../api';
+import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
+
+const sampleDocs = [
+  {
+    id: 'doc-0000-1111-2222-3333',
+    title: 'Resilient connection pooling strategies for high-concurrency Postgres workloads',
+    summary: 'A survey of pool sizing, overflow handling, and proxy-side retry behaviour under sustained concurrent load with citations.',
+    topic: 'database-resilience',
+    direction_id: 'd-1a2b3c4d',
+    tags: ['postgres', 'pooling', 'reliability', 'cloud-sql'],
+    source_citations: [
+      'https://www.postgresql.org/docs/current/runtime-config-connection.html',
+      { title: 'SQLAlchemy pool docs', url: 'https://docs.sqlalchemy.org/en/20/core/pooling.html', excerpt: 'max_overflow defaults to 10' },
+    ],
+    source_task_id: 'task-web-research-1',
+    authoring_branch: 'feature/knowledge-provenance',
+    head_sha: 'abc1234',
+    source_kind: 'web_research',
+    created_at: '2026-06-01T00:00:00Z',
+    updated_at: '2026-06-01T00:00:00Z',
+    forward_quality_verdict: { passed: true, reason: 'Well-cited, actionable, verified against current docs.', strategy: 'forward_quality' },
+  },
+  {
+    id: 'doc-4444-5555-6666-7777',
+    title: 'Exponential backoff vs fixed-delay retry under thundering-herd reconnect',
+    summary: 'Comparison of reconnect strategies and their effect on recovery latency.',
+    topic: 'database-resilience',
+    direction_id: null,
+    tags: ['retry', 'backoff'],
+    source_citations: [],
+    source_task_id: null,
+    authoring_branch: null,
+    head_sha: null,
+    source_kind: 'design',
+    created_at: '2026-05-30T00:00:00Z',
+    updated_at: '2026-05-30T00:00:00Z',
+    forward_quality_verdict: { passed: false, reason: 'Insufficient citations.', strategy: 'forward_quality' },
+  },
+];
+
+vi.mock('../api', () => ({
+  // Transitively-imported modules (TaskCard) read these from '../api'.
+  API_BASE_URL: '',
+  authGet: vi.fn(() => Promise.resolve({ ok: false, status: 503, json: () => Promise.resolve({}) })),
+  authHeaders: vi.fn(() => Promise.resolve({})),
+  fetchKnowledgeDocuments: vi.fn((projectId: string, params?: Record<string, unknown>) => {
+    const q = typeof params?.q === 'string' ? params.q : '';
+    if (q.includes('no-match')) {
+      return Promise.resolve({ documents: [], total: 0, limit: 50, offset: 0 });
+    }
+    return Promise.resolve({ documents: sampleDocs, total: sampleDocs.length, limit: 50, offset: 0 });
+  }),
+  fetchKnowledgeDocument: vi.fn(() =>
+    Promise.resolve({ ...sampleDocs[0], body: '# Heading\n\nA paragraph of markdown body text with a [link](https://example.com) and a list:\n\n- one\n- two\n' }),
+  ),
+}));
+
+describe('KnowledgeBrowser — viewport regression', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) { host.remove(); host = null; }
+  });
+
+  async function renderList(onLaunchWebResearchTask = vi.fn()) {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <KnowledgeBrowser
+          selectedProjectId="project-test"
+          onClose={() => {}}
+          onNavigateToTask={() => {}}
+          onLaunchWebResearchTask={onLaunchWebResearchTask}
+        />,
+      );
+    });
+    // let the debounced fetch (250ms) resolve and the list render
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+  }
+
+  test('list view renders without horizontal overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => { await renderList(); });
+  });
+
+  test('document titles and summaries do not silently clip text at 375px', async () => {
+    await expectNoTextTruncationAt(375, async () => { await renderList(); }, { waitMs: 50 });
+  });
+
+  test('detail view renders without horizontal overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      await renderList();
+      const buttons = (host as HTMLDivElement).querySelectorAll('button');
+      const docButton = Array.from(buttons).find(b => b.textContent?.includes('Resilient connection pooling'));
+      if (docButton) {
+        await act(async () => { docButton.click(); });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+      }
+    });
+  });
+
+  test('interactive controls meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => { await renderList(); }, { selector: 'button, a[href]' });
+  });
+
+  test('empty-state CTA launches web research for the search term at 375px', async () => {
+    const onLaunchWebResearchTask = vi.fn();
+    await expectNoOverflowAt(375, async () => {
+      await renderList(onLaunchWebResearchTask);
+      const searchInput = (host as HTMLDivElement).querySelector('input[placeholder*="Search title"]') as HTMLInputElement | null;
+      if (searchInput) {
+        await act(async () => { fireEvent.change(searchInput, { target: { value: 'no-match topic' } }); });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+      }
+      const launchButton = Array.from((host as HTMLDivElement).querySelectorAll('button')).find(b => b.textContent?.includes('Launch web research for'));
+      if (launchButton) {
+        await act(async () => { fireEvent.click(launchButton); });
+      }
+    });
+    expect(onLaunchWebResearchTask).toHaveBeenCalledWith('no-match topic');
+  });
+
+  test('detail refresh launches web research on the selected topic at 375px', async () => {
+    const onLaunchWebResearchTask = vi.fn();
+    await expectNoOverflowAt(375, async () => {
+      await renderList(onLaunchWebResearchTask);
+      const buttons = (host as HTMLDivElement).querySelectorAll('button');
+      const docButton = Array.from(buttons).find(b => b.textContent?.includes('Resilient connection pooling'));
+      if (docButton) {
+        await act(async () => { fireEvent.click(docButton); });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+      }
+      const refreshButton = Array.from((host as HTMLDivElement).querySelectorAll('button')).find(b => b.textContent?.includes('refresh research'));
+      if (refreshButton) {
+        await act(async () => { fireEvent.click(refreshButton); });
+      }
+    });
+    expect(onLaunchWebResearchTask).toHaveBeenCalledWith('database-resilience');
+  });
+
+  test('renders an origin badge for each document source kind', async () => {
+    await renderList();
+    const text = (host as HTMLDivElement).textContent ?? '';
+    // Badge labels mirror SOURCE_KIND_STYLES; both sample kinds should be visible.
+    expect(text).toContain('Web Research');
+    expect(text).toContain('Design');
+  });
+
+  test('selecting an origin filter forwards source_kind to fetchKnowledgeDocuments', async () => {
+    const mock = vi.mocked(fetchKnowledgeDocuments);
+    await renderList();
+    mock.mockClear();
+    const buttons = (host as HTMLDivElement).querySelectorAll('button');
+    const designFilter = Array.from(buttons).find(
+      b => b.textContent?.trim() === 'Design' && b.hasAttribute('data-viewport-allow-small-target'),
+    );
+    expect(designFilter).toBeTruthy();
+    await act(async () => { designFilter!.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    expect(mock).toHaveBeenCalledWith(
+      'project-test',
+      expect.objectContaining({ source_kind: 'design' }),
+    );
+  });
+
+  test('detail view renders provenance branch and sha when present', async () => {
+    await renderList();
+    const buttons = (host as HTMLDivElement).querySelectorAll('button');
+    const docButton = Array.from(buttons).find(b => b.textContent?.includes('Resilient connection pooling'));
+    expect(docButton).toBeTruthy();
+    await act(async () => { docButton!.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    expect((host as HTMLDivElement).textContent).toContain('feature/knowledge-provenance@abc1234');
+  });
+});

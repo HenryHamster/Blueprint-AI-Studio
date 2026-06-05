@@ -70,6 +70,7 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset[str] = frozenset(
         "rollback_recommended",  # post_rollback_recommendation_message
         "fix_loop_divergence_regressed",  # post_fix_loop_divergence_regression_message
         "direction_outcome_stalled",  # post_direction_outcome_stalled_message
+        "direction_staged_activated",  # post_staged_directions_activated_message
         "promotion_readiness_reached",  # post_version_promotion_readiness_message
         "release_calcifying",  # post_version_calcification_message
         "release_build_stalled",  # post_version_build_stalled_message
@@ -636,6 +637,66 @@ async def post_direction_milestone_message(
     return msg
 
 
+async def post_staged_directions_activated_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    activated: list[dict[str, Any]],
+    promoted_version_number: int,
+    task_id: Optional[uuid.UUID] = None,
+) -> Optional[ProjectMessage]:
+    """Post a HIGH-SIGNAL message when staged directions auto-activate on version open.
+
+    Symmetric counterpart to the staging-IN note/notice: when the version a
+    direction was staged behind promotes, the shared activation helper flips it
+    back to ``active`` (making it researchable and able to consume VM capacity
+    again). This is the one direction lifecycle transition that was previously
+    silent — every other transition (auto-pause, auto-retire, churn/burn pause,
+    outcome-stalled) posts an operator milestone. ``activated`` is a list of
+    ``{"id", "text"}`` dicts for the directions that flipped; classified
+    ``high_signal`` so it survives paging and fires an info toast.
+
+    Returns ``None`` (posts nothing) when ``activated`` is empty so callers need
+    no guard. Best-effort: the external webhook is fire-and-forget and the
+    in-session message rides the caller's commit.
+    """
+    if not activated:
+        return None
+    texts = [str(d.get("text") or d.get("id") or "?")[:80] for d in activated]
+    count = len(activated)
+    joined = "; ".join(texts)
+    summary = (
+        f"{count} staged direction(s) auto-activated after v"
+        f"{promoted_version_number} promoted — staged work resumed: {joined}"
+    )
+    context: dict[str, Any] = {
+        "promoted_version_number": promoted_version_number,
+        "count": count,
+        "direction_ids": [str(d.get("id")) for d in activated if d.get("id")],
+        "direction_texts": texts,
+    }
+    msg = await post_event_message(
+        session,
+        project_id,
+        event_type="direction_staged_activated",
+        summary=summary,
+        context=context,
+        task_id=task_id,
+    )
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "DIRECTION_STAGED_ACTIVATED",
+            {
+                "promoted_version_number": promoted_version_number,
+                "count": count,
+                "direction_ids": context["direction_ids"],
+                "direction_texts": texts,
+            },
+        )
+    )
+    return msg
+
+
 async def post_cycle_summary_message(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -946,6 +1007,64 @@ async def post_auto_fix_result_message(
     return msg
 
 
+# Authoring channels treated as "system-generated" for de-dup purposes. User
+# messages, FEEDBACK, and QUESTION are NEVER de-duped on create.
+_DEDUPED_SYSTEM_FROM_TYPES: frozenset[str] = frozenset({"system", "agent"})
+
+
+async def open_system_bug_or_blocker_exists(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    dedupe_key: str,
+) -> Optional[ProjectMessage]:
+    """Return an already-open system/agent BUG_REPORT/BLOCKER carrying the same
+    ``context["dedupe_key"]``, or ``None`` when no duplicate is open.
+
+    Shared, query-only de-dup primitive for the recurring-condition creators
+    that auto-raise a bug/blocker (auto-fix branch escalation, residual-fix
+    fingerprint escalation, direction burn/churn pause, …). Each creator stamps
+    a stable ``dedupe_key`` into the message ``context`` and consults this helper
+    before posting, so one underlying problem maps to at most one OPEN system
+    message instead of an ever-growing pile.
+
+    The bug-class eligibility predicate is shared with the convergence layer via
+    ``message_convergence.BUG_CLASS_TYPES`` (defined once there). Conservative by
+    construction: only ``status == "open"`` messages of a bug-class type authored
+    by ``from_type in ("system", "agent")`` are considered. An empty/falsy
+    ``dedupe_key`` never matches, so an un-keyed creator stays a byte-identical
+    no-op rather than collapsing unrelated messages. Query-only and fail-open:
+    does NOT commit (callers own their transaction) and any lookup error returns
+    ``None`` so a legitimately new message is never blocked.
+    """
+    if not dedupe_key:
+        return None
+
+    from sqlmodel import select
+
+    from app.message_convergence import BUG_CLASS_TYPES
+
+    try:
+        eligible_types = tuple(MessageType(v) for v in BUG_CLASS_TYPES)
+        result = await session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.status == "open",
+                ProjectMessage.message_type.in_(eligible_types),
+                ProjectMessage.from_type.in_(tuple(_DEDUPED_SYSTEM_FROM_TYPES)),
+            )
+        )
+        for msg in result.scalars().all():
+            if (msg.context or {}).get("dedupe_key") == dedupe_key:
+                return msg
+    except Exception as exc:  # fail-open: never block a legitimately new message
+        logger.warning(
+            "[DEDUPE] open_system_bug_or_blocker_exists lookup failed for %s: %s",
+            dedupe_key,
+            exc,
+        )
+    return None
+
+
 async def post_auto_fix_escalation_message(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -963,10 +1082,22 @@ async def post_auto_fix_escalation_message(
         f"Auto-remediation suspended for {branch} after {failure_count} consecutive failures. "
         f"Manual intervention required. Re-enable via the auto-remediation settings."
     )
+    dedupe_key = f"auto_fix_escalated:{branch}"
+    existing = await open_system_bug_or_blocker_exists(session, project_id, dedupe_key)
+    if existing is not None:
+        # Refresh the latest detail on the still-open escalation rather than
+        # opening a duplicate BLOCKER for the same branch.
+        _ctx = dict(existing.context or {})
+        _ctx["consecutive_failures"] = failure_count
+        existing.context = _ctx
+        existing.content = summary
+        session.add(existing)
+        return existing
     ctx: dict[str, Any] = {
         "event_type": "auto_fix_escalated",
         "branch": branch,
         "consecutive_failures": failure_count,
+        "dedupe_key": dedupe_key,
     }
     msg = ProjectMessage(
         project_id=project_id,
@@ -1251,10 +1382,22 @@ async def post_residual_fix_escalation_message(
         f"required. Re-enable via the Unsuspend button in the dashboard "
         f"or POST /api/admin/residual-cases/{fingerprint}/unsuspend."
     )
+    dedupe_key = f"residual_fix_escalated:{fingerprint}"
+    existing = await open_system_bug_or_blocker_exists(session, project_id, dedupe_key)
+    if existing is not None:
+        # Refresh the still-open escalation instead of opening a duplicate
+        # BLOCKER for the same fingerprint.
+        _ctx = dict(existing.context or {})
+        _ctx["consecutive_failures"] = failure_count
+        existing.context = _ctx
+        existing.content = summary
+        session.add(existing)
+        return existing
     ctx: dict[str, Any] = {
         "event_type": "residual_fix_escalated",
         "fingerprint": fingerprint,
         "consecutive_failures": failure_count,
+        "dedupe_key": dedupe_key,
     }
     msg = ProjectMessage(
         project_id=project_id,
@@ -1502,6 +1645,12 @@ async def post_direction_burn_pause_message(
         f"Direction auto-paused — manual intervention required: "
         f"'{direction_text[:80]}'{ev_str} — {reason}"
     )
+    # Stable key only when we have a direction_id; an un-keyed pause stays a
+    # byte-identical no-op (creates as before).
+    dedupe_key = f"direction_burn_pause:{direction_id}" if direction_id else ""
+    existing = await open_system_bug_or_blocker_exists(session, project_id, dedupe_key)
+    if existing is not None:
+        return existing
     ctx: dict[str, Any] = {
         "event_type": "direction_burn_pause",
         "direction_text": direction_text[:120],
@@ -1509,6 +1658,8 @@ async def post_direction_burn_pause_message(
         "direction_id": direction_id,
         "manual_intervention_required": True,
     }
+    if dedupe_key:
+        ctx["dedupe_key"] = dedupe_key
     if evidence:
         ctx["evidence"] = evidence
     msg = ProjectMessage(
@@ -1573,12 +1724,18 @@ async def post_direction_churn_pause_message(
         f"Direction auto-paused by churn guardrail — will auto-recover after cooldown: "
         f"'{direction_text[:80]}'{ev_str} — {reason}"
     )
+    dedupe_key = f"direction_churn_pause:{direction_id}" if direction_id else ""
+    existing = await open_system_bug_or_blocker_exists(session, project_id, dedupe_key)
+    if existing is not None:
+        return existing
     ctx: dict[str, Any] = {
         "event_type": "direction_churn_pause",
         "direction_text": direction_text[:120],
         "reason": reason,
         "direction_id": direction_id,
     }
+    if dedupe_key:
+        ctx["dedupe_key"] = dedupe_key
     if evidence:
         ctx["evidence"] = evidence
     msg = ProjectMessage(

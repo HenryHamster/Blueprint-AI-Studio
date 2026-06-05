@@ -30,6 +30,7 @@ from app.failure_classification import (
 from app.landed_signal import is_merged_completion
 from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
 from app.review_pipeline import _is_test_file
+from app.task_capabilities import PRODUCT_TASK_TYPES
 from app.task_locking import with_design_doc_locked, with_directions_locked
 
 
@@ -461,6 +462,43 @@ async def _update_direction_research_outcomes(
     entry["conversion_rate"] = (
         round(entry["prs_merged"] / _tasks_created, 3) if _tasks_created > 0 else None
     )
+    # Generalized outcome aggregates — ADDITIVE alongside existing PR metrics.
+    # Uses evaluate_task_outcome to count successes across ALL task types (code
+    # merges + research quality + audit findings + memo artifacts + verification
+    # verdicts), not just PR-merging tasks. This lets directions whose work is
+    # primarily read-only (research, audit, memo) appear as positive-health
+    # rather than zero-output in analytics and the strategic cycle.
+    # Lazy import avoids the direction_outcomes → task_outcomes → direction_outcomes
+    # circular dependency at module load time.
+    from app.task_outcomes import evaluate_task_outcome  # noqa: PLC0415
+
+    _outcome_kind_counts: dict[str, dict[str, int]] = {}
+    _generalized_success_count = 0
+    for _ct in child_tasks_rows:
+        if _ct.status not in (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        ):
+            continue
+        _task_outcome = evaluate_task_outcome(_ct)
+        _kind = _task_outcome.kind
+        if _kind not in _outcome_kind_counts:
+            _outcome_kind_counts[_kind] = {"success": 0, "neutral": 0, "failure": 0}
+        _outcome_kind_counts[_kind][_task_outcome.status] += 1
+        if _task_outcome.status == "success":
+            _generalized_success_count += 1
+    entry["generalized_successes"] = _generalized_success_count
+    _all_terminal_ct = sum(
+        _v for _d in _outcome_kind_counts.values() for _v in _d.values()
+    )
+    entry["generalized_health_rate"] = (
+        round(_generalized_success_count / _all_terminal_ct, 3)
+        if _all_terminal_ct > 0
+        else None
+    )
+    if _outcome_kind_counts:
+        entry["outcome_kind_breakdown"] = _outcome_kind_counts
     # Review quality signals: track how users respond to Blueprint's reviews
     entry["reviews_dismissed"] = sum(
         1
@@ -634,8 +672,11 @@ async def _update_direction_research_outcomes(
         "tasks_merged_staging_only": sd_staging_only,
     }
 
-    # Classify child tasks as product vs structural
-    PRODUCT_TYPES = {"create", "feature", "improvement"}
+    # Classify child tasks as product vs structural. Membership is derived from
+    # the task-type registry (task_capabilities.PRODUCT_TASK_TYPES) — the single
+    # source of truth — so value-shipping types (create, fix, migrate, ...) count
+    # as product and overhead/read-only types as structural. Unknown/future types
+    # not in the registry fall through to structural by the conservative default.
     type_counts: dict = {}
     type_breakdown: dict = {}
     product_count = 0
@@ -650,7 +691,7 @@ async def _update_direction_research_outcomes(
             type_breakdown[task_type]["merged"] += 1
         if _counts_as_failure(ct):
             type_breakdown[task_type]["failed"] += 1
-        if task_type in PRODUCT_TYPES:
+        if task_type in PRODUCT_TASK_TYPES:
             product_count += 1
         else:
             structural_count += 1

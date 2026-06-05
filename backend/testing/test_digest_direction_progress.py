@@ -210,6 +210,67 @@ async def test_digest_direction_progress_prs_merged(client: AsyncClient, db_sess
 
 
 @pytest.mark.asyncio
+async def test_digest_direction_progress_generalized_success_metrics(
+    client: AsyncClient, db_session
+):
+    """Windowed direction progress includes generalized successes and kind breakdowns."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+    recent_ts2 = (_utcnow() - timedelta(hours=2)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-gen",
+                "text": "Direction with generalized outcomes",
+                "status": "active",
+                "research_history": [
+                    {"timestamp": recent_ts, "prs_merged": 2},
+                    {
+                        "timestamp": recent_ts2,
+                        "generalized_successes": 3,
+                        "tasks_completed": 3,
+                        "tasks_failed": 1,
+                        "outcome_kind_breakdown": {
+                            "research_quality": {
+                                "success": 3,
+                                "neutral": 0,
+                                "failure": 1,
+                            }
+                        },
+                    },
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-gen"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    dp = response.json()["direction_progress"][0]
+
+    assert dp["generalized_successes"] == 5
+    assert dp["generalized_terminal_outcomes"] == 6
+    assert dp["generalized_health_rate"] == 0.833
+    assert dp["outcome_kind_breakdown"] == {
+        "code_merge": {"success": 2, "neutral": 0, "failure": 0},
+        "research_quality": {"success": 3, "neutral": 0, "failure": 1},
+    }
+
+
+@pytest.mark.asyncio
 async def test_digest_direction_progress_prompt_quality_hint(
     client: AsyncClient, db_session
 ):
@@ -440,6 +501,121 @@ async def test_digest_direction_progress_lifetime_metrics(
     assert dp["lifetime_conversion_rate"] == round(
         11 / 28, 3
     )  # 11 merged / (5 + 3 + 20) created
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_lifetime_generalized_metrics(
+    client: AsyncClient, db_session
+):
+    """Lifetime generalized metrics combine live history with history_aggregate."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-life-gen",
+                "text": "Lifetime generalized direction",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts,
+                        "generalized_successes": 1,
+                        "tasks_completed": 1,
+                        "outcome_kind_breakdown": {
+                            "memo_artifact": {
+                                "success": 1,
+                                "neutral": 0,
+                                "failure": 0,
+                            }
+                        },
+                    }
+                ],
+                "history_aggregate": {
+                    "total_generalized_successes": 4,
+                    "total_generalized_terminal_outcomes": 6,
+                },
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-life-gen"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    dp = response.json()["direction_progress"][0]
+
+    assert dp["lifetime_generalized_successes"] == 5
+    assert dp["lifetime_generalized_health_rate"] == round(5 / 7, 3)
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_lifetime_generalized_metrics_upgrade_legacy_aggregate(
+    client: AsyncClient, db_session
+):
+    """Lifetime generalized digest metrics upgrade legacy aggregates before combining live history."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-life-legacy-gen",
+                "text": "Lifetime legacy generalized direction",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts,
+                        "generalized_successes": 3,
+                        "tasks_completed": 3,
+                        "outcome_kind_breakdown": {
+                            "memo_artifact": {
+                                "success": 3,
+                                "neutral": 0,
+                                "failure": 0,
+                            }
+                        },
+                    }
+                ],
+                "history_aggregate": {
+                    "total_prs_merged": 2,
+                    "total_tasks_completed": 2,
+                    "total_tasks_failed": 1,
+                },
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-life-legacy-gen"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    dp = response.json()["direction_progress"][0]
+
+    assert dp["lifetime_generalized_successes"] == 5
+    assert dp["lifetime_generalized_health_rate"] == round(5 / 6, 3)
 
 
 @pytest.mark.asyncio

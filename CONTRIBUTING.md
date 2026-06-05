@@ -6,7 +6,7 @@ Thanks for your interest in contributing to Blueprint! This guide will help you 
 
 ### Prerequisites
 
-- Node.js (v18+)
+- Node.js (v18+ for development; v20+ recommended for production deployment)
 - Python 3.11+
 - Docker and Docker Compose
 - A GCP project (for infrastructure work)

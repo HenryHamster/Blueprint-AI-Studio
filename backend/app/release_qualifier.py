@@ -151,6 +151,7 @@ from app.release_scoring import (
     _extract_excluded_audit_findings,
     _extract_smoketest_detail,  # noqa: F401 — re-exported for callers/tests
     _extract_test_erosion_detail,  # noqa: F401 — re-exported for callers/tests
+    _finding_subject_is_authorized_divergence,  # noqa: F401 — re-exported for tests
     _fmt_sub_scores,
     _score_audit,
     _score_smoketest,
@@ -185,6 +186,9 @@ from app.release_qualifier_sweep import (
     _parse_started_at,
     sweep_stuck_qualifications,  # noqa: F401 — re-exported for reaper + tests
 )
+from app.rollup_migration_validation import (
+    check_qualification_migration_identity,
+)
 from app.release_readiness import (
     # Re-exports — release_qualifier is the canonical import surface for the
     # readiness layer (tests access via ``rq.*``; strategic_spawning and
@@ -203,11 +207,22 @@ from app.release_readiness import (
 )
 from app.shared_state import (
     get_project_integration_branch,
+    resolve_project_promotion_enabled,
     runtime_config as _runtime_config,
 )
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
+
+# Conclusive qualification verdicts — when a candidate commit receives one of
+# these verdicts, the outcome is settled and idempotent (relying on lucky
+# re-rolls of a coin-flip margin is not sound). A re-run is only permitted
+# when the integration branch advances to a new commit. Infra/error outcomes
+# (infra_failure, error, etc.) are non-conclusive and always re-run, since they
+# produced no real quality verdict.
+_CONCLUSIVE_VERDICT_STATUSES: frozenset[str] = frozenset(
+    {"promoted", "not_promoted", "dry_run"}
+)
 
 # ---------------------------------------------------------------------------
 # Policy — the trusted core.  weights + threshold come from a human-owned file.
@@ -901,14 +916,14 @@ async def run_qualification(
         terminated is *not* in flight — it is awaiting finalize — so a fresh
         run is still allowed; ``_finalize_qualification``/the reaper handle
         that stale record.)
-      * the prior qualification finalized as a ``dry_run`` and ``automain``
-        has not advanced since ⇒ ``{"status": "already_dry_run"}``.  In the
-        shipped-dark default (``promotion_enabled=False``) a passing candidate
-        records ``status="dry_run"`` and the version stays open + stabilize.
-        Without this guard the strategic agent re-emits ``qualify_request``
-        every cycle and re-spawns two agent VMs for an identical, already-
-        scored commit.  Once ``automain`` moves, the candidate is new and a
-        fresh qualification is allowed.
+      * a conclusive qualification verdict (promoted/not_promoted/dry_run) was
+        reached for this candidate commit and ``automain`` has not advanced
+        since ⇒ ``{"status": "cached_verdict", ...}``.  A conclusive verdict is
+        settled and idempotent — relying on lucky re-rolls of an LLM audit at
+        the margin is not sound. Once ``automain`` advances to a new commit,
+        that unscored candidate triggers a fresh qualification.  Non-conclusive
+        outcomes (infra_failure, error) always re-run when re-requested since
+        they produced no real quality verdict.
 
     Concurrency (audit C3): two callers can race here — the strategic
     ``qualify_request`` path and the admin ``POST /qualify`` endpoint.  Neither
@@ -932,7 +947,7 @@ async def run_qualification(
          side).  ``ci_green`` is recorded but not acted on here — the composite
          in ``_finalize_qualification`` applies it as a hard blocker.
       4. Lock the ``ReleaseVersion`` row, then re-check the in-flight /
-         already-dry-run guards under the lock.
+         cached-verdict guards under the lock.
       5. Spawn a ``release_audit`` task (clones ``main``, audits the
          ``main...<candidate_sha>`` diff against main's standards) and — only
          when ``smoketest_enabled`` is True — a qualify-time ``smoketest`` task.
@@ -946,7 +961,7 @@ async def run_qualification(
          bump ``version.qualification_attempts``.
 
     Returns a status dict.  ``status`` is ``"spawned"`` on success;
-    ``"wrong_phase"`` / ``"already_pending"`` / ``"already_dry_run"`` when a
+    ``"wrong_phase"`` / ``"already_pending"`` / ``"cached_verdict"`` when a
     guard fired (no side effects); or an error code (``"project_not_found"``,
     ``"no_credentials"``, ``"sha_error"``, ``"spawn_failed"``).  The caller
     commits the session.
@@ -1124,26 +1139,33 @@ async def run_qualification(
         )
         return {"status": "already_pending"}
 
-    # Guard 3 (under the lock — audit H1): the prior qualification finalized as
-    # a dry_run and automain has not advanced.  In the shipped-dark default
-    # (promotion_enabled=False) a passing candidate records status="dry_run"
-    # and the version stays open + stabilize; the strategic agent then re-emits
-    # qualify_request every cycle.  Re-qualifying the same already-scored
-    # commit just burns two more agent VMs, so short-circuit until automain
-    # actually moves.
+    # Guard 3 (under the lock): a conclusive qualification verdict
+    # (promoted/not_promoted/dry_run) for this candidate commit has been reached
+    # and automain has not advanced. A conclusive verdict is settled and
+    # idempotent — re-scoring identical code can yield a different (potentially
+    # lucky) result, so that verdict is not re-rolled on the same commit.
+    # Infra/error outcomes are non-conclusive; they must re-run when the
+    # qualification is re-requested.  Once automain moves to a new commit, that
+    # new candidate is unscored and a fresh qualification is always permitted.
     prior_qual = version.last_qualification or {}
+    prior_status = prior_qual.get("status")
     if (
-        prior_qual.get("status") == "dry_run"
+        prior_status in _CONCLUSIVE_VERDICT_STATUSES
         and prior_qual.get("candidate_sha") == candidate_sha
     ):
         logger.info(
             "[RELEASE_QUALIFIER] run_qualification: version v%d already has a "
-            "dry_run for candidate %s (automain unchanged) — skipping "
-            "(already_dry_run)",
+            "conclusive %s verdict for candidate %s (automain unchanged) — "
+            "skipping (cached verdict)",
             version.version_number,
+            prior_status,
             candidate_sha[:8],
         )
-        return {"status": "already_dry_run"}
+        return {
+            "status": "cached_verdict",
+            "cached_verdict_status": prior_status,
+            "candidate_sha": candidate_sha,
+        }
 
     # Carry forward the infra-failure streak so _finalize_qualification can
     # detect a persistently broken qualifier pipeline.  The streak is the count
@@ -1284,7 +1306,88 @@ _BLOCKER_LABELS: dict[str, str] = {
     "smoketest_startup_failed": "the smoketest startup suite failed",
     "audit_missing": "the release audit produced no usable report",
     "test_file_deleted": "the diff deleted a test file",
+    "migration_identity_collision": (
+        "an Alembic revision-identity collision between the candidate and the "
+        "deployed promotion target"
+    ),
 }
+
+async def _resolve_migration_identity_at_finalize(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    candidate_sha: str | None,
+) -> tuple[str, str | None]:
+    """Run the deterministic Alembic revision-identity gate at finalize time.
+
+    Resolves the project's GitHub credentials and branch names, then delegates
+    to :func:`check_qualification_migration_identity`, which lists the
+    candidate's migration filenames (at ``candidate_sha``) and the deployed
+    promotion target's current migration filenames (at the promotion-target
+    branch from ``_lts_branch_names``) and runs the existing
+    ``find_content_divergent_revisions`` detector over the two.
+
+    Returns the ``("ok"|"block"|"defer", detail)`` verdict:
+      * ``"ok"``    — no collision; qualification proceeds normally.
+      * ``"block"`` — a confirmed collision; the caller turns this into the
+        ``migration_identity_collision`` hard blocker (confidence forced to 0).
+      * ``"defer"`` — the candidate's / target's migration LIST could not be
+        fetched; the caller HOLDS the release for this attempt rather than waving
+        it through (a fetch error is not "no collision").
+
+    The gate is deliberately scoped to migration-LIST fetch failures. A MISSING
+    ``candidate_sha``, a vanished project, or unresolved GitHub credentials
+    return ``("ok", None)`` so the gate stays inert for those edges — they are
+    ALREADY handled upstream (the promote path's missing-SHA guard; the
+    finalize-time CI re-resolution, which degrades to the ``ci_unresolved`` hard
+    blocker on a missing project / credentials). Letting the gate hold on those
+    too would only double-handle a case CI already blocks, never wave it through.
+    """
+    if not candidate_sha:
+        # The check cannot run without a candidate ref; the promote path's
+        # existing missing-SHA guard handles this case (it returns an error and
+        # stays in stabilize), so do not perturb it here.
+        return ("ok", None)
+    try:
+        project = await session.get(Project, version.project_id)
+        if project is None:
+            # A vanished project is already a ci_unresolved hard blocker via the
+            # finalize CI re-resolution — keep the gate inert rather than convert
+            # that into an infra failure.
+            return ("ok", None)
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved is None:
+            # No credentials → CI re-resolution already degrades to not-green
+            # (ci_unresolved blocker); the gate stays inert (CI blocks anyway).
+            return ("ok", None)
+        token, owner, repo = resolved
+        _integration_branch, promotion_target = _lts_branch_names(project)
+        verdict, detail = await check_qualification_migration_identity(
+            token,
+            owner,
+            repo,
+            candidate_sha,
+            promotion_target,
+            project_id=str(version.project_id),
+        )
+        logger.info(
+            "[RELEASE_QUALIFIER] finalize migration-identity gate for v%d "
+            "candidate %s vs %s: %s (%s)",
+            version.version_number,
+            candidate_sha[:8],
+            promotion_target,
+            verdict,
+            detail or "no divergence",
+        )
+        return verdict, detail
+    except Exception as exc:  # noqa: BLE001 — any failure HOLDS (never waves through)
+        logger.warning(
+            "[RELEASE_QUALIFIER] finalize migration-identity gate failed for "
+            "v%d (holding this attempt): %s",
+            version.version_number,
+            exc,
+        )
+        return ("defer", f"migration-identity gate error: {exc}")
+
 
 async def _finalize_qualification(
     session: AsyncSession,
@@ -1564,6 +1667,28 @@ async def _finalize_qualification(
     # so the agent can target it when smoketest is the binding constraint.
     smoketest_detail = _extract_smoketest_detail(smoketest_result)
 
+    # --- Deterministic Alembic revision-identity safety gate ----------------
+    # A revision-identity collision between the candidate and the deployed
+    # promotion target (the back-merge renumber class, prod incident
+    # 2026-06-04) must be a HARD, clearly-attributed qualification blocker — not
+    # an opaque, score-eroding audit deduction the spawned auditor might miss.
+    # Reuse the existing deterministic detector + GitHub fetch helpers; a fetch
+    # failure DEFERS (holds) the release rather than waving it through. Routed
+    # through _handle_infra_failure so a persistent inability to verify migration
+    # identity surfaces the same way as any other finalize-time infra failure
+    # (no verdict recorded, returned to stabilize, retried by the next cycle).
+    migration_verdict, migration_detail = await _resolve_migration_identity_at_finalize(
+        session, version, candidate_sha
+    )
+    if migration_verdict == "defer":
+        return await _handle_infra_failure(
+            session,
+            version,
+            qual,
+            "migration_identity_check_unavailable",
+        )
+    migration_collision = migration_verdict == "block"
+
     # --- Compute the composite ---------------------------------------------
     composite = compute_composite(
         ci_green=ci_green,
@@ -1573,6 +1698,7 @@ async def _finalize_qualification(
         policy=policy,
         smoketest_enabled=smoketest_enabled,
         ci_state=ci_resolution.get("state", _CI_RED),
+        migration_collision=migration_collision,
     )
 
     finalized_at = _utcnow().isoformat()
@@ -1595,9 +1721,14 @@ async def _finalize_qualification(
         "smoketest_detail": smoketest_detail,
         "audit_missing_reason": audit_missing_reason,
         "audit_reconciliation": audit_reconciliation,
+        "migration_safety": migration_verdict,
+        "migration_safety_detail": migration_detail,
     }
 
-    promotion_enabled = bool(_runtime_config.get("promotion_enabled"))
+    # Per-project override (falls back to the fleet-wide promotion_enabled when
+    # this project has no explicit override) — additive, behavior unchanged for
+    # projects without one.
+    promotion_enabled = resolve_project_promotion_enabled(version.project_id)
 
     logger.info(
         "[RELEASE_QUALIFIER] v%d composite=%.4f promote=%s blocker=%s "
@@ -1645,6 +1776,14 @@ async def _finalize_qualification(
             blocker_label = _BLOCKER_LABELS.get(
                 composite["blocker"], composite["blocker"]
             )
+            # The migration-identity blocker carries the specific diverging
+            # revision so the operator sees WHICH revision collides, not just the
+            # generic blocker label.
+            if (
+                composite["blocker"] == "migration_identity_collision"
+                and migration_detail
+            ):
+                blocker_label = f"{blocker_label} — {migration_detail}"
             notify_event = "release_blocked"
             notify_summary = (
                 f"v{version.version_number} blocked from promotion — "

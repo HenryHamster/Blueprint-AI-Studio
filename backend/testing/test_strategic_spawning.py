@@ -11,6 +11,7 @@ Covers:
     in directions_summary for the strategic agent
 """
 
+import json
 import uuid
 from datetime import datetime, timezone, timedelta
 
@@ -36,7 +37,15 @@ from app.strategic_spawning import (
     _build_operator_steering_directive,
     _build_shipped_changes_manifest,
     _build_recent_interventions,
+    _agent_view_problem_model_packed,
+    _AGENT_VIEW_FLOOR_BYTES,
+    _FLOOR_MIN_GAPS,
+    _STRATEGIC_REVIEW_SCHEMA,
+    _design_doc_index,
+    _summarize_design_doc_index,
+    _DESIGN_DOC_INDEX_SUMMARY_CHARS,
 )
+from app.payload_schemas import pack_under_budget
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 
@@ -454,6 +463,45 @@ async def test_spawn_review_includes_operator_overrides_when_present(db_session)
 
 
 @pytest.mark.asyncio
+async def test_spawn_review_includes_model_health_signal(db_session):
+    """The strategic_review payload carries the soft model size/health signal
+    computed from the DURABLE problem_model (honest pre-trim counts)."""
+    # 24 active gaps = 2x the healthy threshold (12) -> 'large'.
+    problem_model = {
+        "gaps": [
+            {"id": f"g-{i}", "name": f"gap {i}", "status": "active"}
+            for i in range(24)
+        ],
+    }
+    project = _make_project(
+        vision={"purpose": "test purpose"},
+        problem_model=problem_model,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    assert "model_health" in payload
+    mh = payload["model_health"]
+    assert mh["active_gap_count"] == 24
+    assert mh["model_size_status"] == "large"
+    assert set(mh.keys()) == {
+        "active_gap_count",
+        "capability_count",
+        "active_friction_count",
+        "estimated_token_footprint",
+        "serialized_bytes",
+        "model_size_status",
+    }
+
+
+@pytest.mark.asyncio
 async def test_spawn_review_omits_operator_overrides_when_empty(db_session):
     """The payload omits operator_overrides entirely when no ledger entries exist."""
     project = _make_project(vision={"purpose": "test purpose"})
@@ -622,6 +670,70 @@ async def test_success_evidence_absent_when_not_in_context(db_session):
 
     assert "success_evidence" not in d_stat
     assert "retirement_condition" not in d_stat
+
+
+@pytest.mark.asyncio
+async def test_gap_id_present_in_direction_stats(db_session):
+    """A direction's gap_id linkage is surfaced in the direction stat entry so
+    the strategic agent can reconcile directions against problem-model gaps."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-gl01",
+                "status": "active",
+                "text": "Direction grounded to a gap",
+                "priority": "medium",
+                "gap_id": "g-target",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-gl01")
+
+    assert d_stat["gap_id"] == "g-target"
+
+
+@pytest.mark.asyncio
+async def test_gap_id_absent_when_not_set(db_session):
+    """A direction with no gap_id linkage omits the key from its stat entry."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-gl02",
+                "status": "active",
+                "text": "Direction with no gap link",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-gl02")
+
+    assert "gap_id" not in d_stat
 
 
 @pytest.mark.asyncio
@@ -2576,6 +2688,106 @@ async def test_playbook_summary_caps_at_ten_entries(db_session, mocker):
     assert entries[0]["key"] == "auto-pattern-14"
 
 
+# ── playbook_keys_index in _spawn_strategic_review payload ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_playbook_keys_index_includes_all_entries(db_session, mocker):
+    """Compact index lists ALL playbook entries (not just strategy-relevant ones)."""
+    _patch_spawning_deps(mocker)
+    design_doc = {
+        "playbook/auto-importerror": {
+            "content": "Pattern for importerror.",
+            "source": "auto-generated",
+            "updated_at": "2026-04-15T00:00:00",
+        },
+        "playbook/review-test": {
+            "content": "Review pattern.",
+            "source": "review-extracted",
+            "updated_at": "2026-04-18T00:00:00",
+        },
+        "playbook/success-create": {
+            "content": "Success pattern.",
+            "source": "success-pattern",
+            "updated_at": "2026-04-19T00:00:00",
+        },
+    }
+    project = _make_project(vision={"purpose": "test"}, design_doc=design_doc)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    assert "playbook_keys_index" in payload
+    entries = payload["playbook_keys_index"]["entries"]
+    # All 3 entries should be listed, even the success-pattern (not strategy-relevant)
+    assert len(entries) == 3
+    keys = {e["key"] for e in entries}
+    assert keys == {"auto-importerror", "review-test", "success-create"}
+    # Each entry should have key, source, and updated_at
+    for entry in entries:
+        assert "key" in entry
+        assert "source" in entry
+        assert "updated_at" in entry
+        assert "content" not in entry  # compact index should NOT include content
+    # Sorted newest-first
+    assert entries[0]["key"] == "success-create"
+
+
+@pytest.mark.asyncio
+async def test_playbook_keys_index_absent_when_no_entries(db_session, mocker):
+    """When no playbook entries exist, keys_index is omitted."""
+    _patch_spawning_deps(mocker)
+    project = _make_project(vision={"purpose": "test"}, design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    await _spawn_strategic_review(project, db_session)
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+    assert "playbook_keys_index" not in payload
+
+
+@pytest.mark.asyncio
+async def test_playbook_keys_index_skips_pending_entries(db_session, mocker):
+    """Pending entries (mid-flight writes) are excluded from the index."""
+    _patch_spawning_deps(mocker)
+    design_doc = {
+        "playbook/completed": {
+            "content": "Completed entry.",
+            "source": "manual",
+            "updated_at": "2026-04-15T00:00:00",
+        },
+        "playbook/pending": {
+            "content": "Pending entry (in flight).",
+            "source": "manual",
+            "updated_at": "2026-04-16T00:00:00",
+            "pending_source": "task-123",  # marks it as pending
+        },
+    }
+    project = _make_project(vision={"purpose": "test"}, design_doc=design_doc)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    await _spawn_strategic_review(project, db_session)
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    assert "playbook_keys_index" in payload
+    entries = payload["playbook_keys_index"]["entries"]
+    assert len(entries) == 1
+    assert entries[0]["key"] == "completed"
+
+
 # ---------------------------------------------------------------------------
 # _agent_view_design_doc — strips agent-unused + internal keys
 # ---------------------------------------------------------------------------
@@ -2825,9 +3037,13 @@ async def test_design_doc_update_payload_omits_playbook_archive(db_session):
     tasks = result.scalars().all()
     assert len(tasks) == 1
     payload = tasks[0].payloads[0]
+    # design_doc now ships as a compact navigation index (one entry per
+    # non-internal section). playbook_archive is operator-only and excluded;
+    # the top-level "summary" section is represented by its key.
     dd = payload["design_doc"]
-    assert "playbook_archive" not in dd
-    assert dd["summary"] == "ok"
+    by_key = {e["key"]: e for e in dd["sections"]}
+    assert "playbook_archive" not in by_key
+    assert by_key["summary"]["summary"] == "ok"
 
 
 @pytest.mark.asyncio
@@ -2896,7 +3112,13 @@ async def test_spawn_design_doc_update_payload_uses_reconciled_design_doc(
     tasks = result.scalars().all()
     assert len(tasks) == 1
     payload = tasks[0].payloads[0]
-    assert payload["design_doc"] == reconciled_design_doc
+    # The reconciled status flows into the compact index, not a full inline doc.
+    by_key = {e["key"]: e for e in payload["design_doc"]["sections"]}
+    assert by_key["systems/api"]["status"] == "missing"
+    assert (
+        by_key["systems/api"]["presence_warning"]
+        == "reconciled against integration branch"
+    )
     reconcile_mock.assert_awaited_once_with(
         _agent_view_design_doc(project.design_doc), **verification_context
     )
@@ -2975,10 +3197,13 @@ async def test_spawn_design_doc_update_payload_downgrades_symbol_absent_entry(
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
     assert len(tasks) == 1
-    entry = tasks[0].payloads[0]["design_doc"]["systems/api"]
+    by_key = {e["key"]: e for e in tasks[0].payloads[0]["design_doc"]["sections"]}
+    entry = by_key["systems/api"]
     assert entry["status"] == "missing"
     assert "backend/app/api.py:deleted_func" in entry["presence_warning"]
-    assert "[reconciled:" in entry["description"]
+    # The "[reconciled: ...]" note appended to the section's description is
+    # surfaced through the bounded index summary.
+    assert "[reconciled:" in entry["summary"]
 
 
 @pytest.mark.asyncio
@@ -3044,7 +3269,8 @@ async def test_spawn_design_doc_update_symbol_indeterminate_leaves_entry(
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
     assert len(tasks) == 1
-    entry = tasks[0].payloads[0]["design_doc"]["systems/api"]
+    by_key = {e["key"]: e for e in tasks[0].payloads[0]["design_doc"]["sections"]}
+    entry = by_key["systems/api"]
     assert entry["status"] == "functional"
     assert "presence_warning" not in entry
 
@@ -3142,7 +3368,13 @@ async def test_spawn_strategic_review_payload_uses_reconciled_design_doc(
     ]
     assert len(tasks) == 1
     payload = tasks[0].payloads[0]
-    assert payload["design_doc"] == reconciled_design_doc
+    # The reconciled status flows into the compact index, not a full inline doc.
+    by_key = {e["key"]: e for e in payload["design_doc"]["sections"]}
+    assert by_key["capabilities/search"]["status"] == "missing"
+    assert (
+        by_key["capabilities/search"]["presence_warning"]
+        == "reconciled against integration branch"
+    )
     reconcile_mock.assert_awaited_once_with(
         _agent_view_design_doc(project.design_doc), **verification_context
     )
@@ -4649,6 +4881,141 @@ async def test_stabilize_hint_names_lower_dimension_when_audit_not_binding(
     assert "the audit sub-score is the binding constraint on promotion" not in suffix
 
 
+def _patch_candidate_currency(mocker, *, resolved, head_sha):
+    """Mock the GitHub resolution path used by _resolve_candidate_currency.
+
+    ``resolved`` is the (token, owner, repo) tuple or None returned by
+    ``_resolve_github_with_session``; ``head_sha`` is the integration-branch
+    HEAD ``get_branch_sha`` reports.
+    """
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=resolved),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=head_sha),
+    )
+
+
+def _make_stabilize_version_with_candidate(candidate_sha):
+    from app.models import ReleaseVersion
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    return ReleaseVersion(
+        version_number=4,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={
+            "status": "not_promoted",
+            "confidence": 0.85,
+            "blocker": None,
+            "sub_scores": {"audit": 0.74, "test_erosion": 1.0},
+            "candidate_sha": candidate_sha,
+            "audit_findings": [
+                {"severity": "high", "summary": "Token baked into VM image."},
+                {"severity": "low", "summary": "Private cross-module import."},
+            ],
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_stabilize_carried_findings_marked_stale_when_candidate_behind_head(
+    db_session, mocker, _lts_split_active
+):
+    """When the qualification's candidate commit is BEHIND the live integration
+    HEAD, the carried findings are framed POSSIBLY-STALE, the agent is steered
+    toward a fresh qualify_request, and they are NOT asserted as a current
+    binding blocker nor escalated into a new audit direction."""
+    await _ensure_releaseversion_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "a" * 40
+    version = _make_stabilize_version_with_candidate(candidate)
+    version.project_id = project.id
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    _patch_candidate_currency(
+        mocker, resolved=("tok", "owner", "repo"), head_sha="b" * 40
+    )
+    suffix = await _spawn_and_get_stabilize_suffix(project, db_session)
+
+    assert "POSSIBLY-STALE" in suffix
+    assert "qualify_request" in suffix
+    assert candidate[:8] in suffix
+    # Must NOT assert the stale findings are a current binding blocker, and must
+    # NOT churn a fresh remediation direction at a superseded snapshot.
+    assert "the audit sub-score is the binding constraint on promotion" not in suffix
+    assert "MUST create a new direction" not in suffix
+
+
+@pytest.mark.asyncio
+async def test_stabilize_carried_findings_live_when_candidate_equals_head(
+    db_session, mocker, _lts_split_active
+):
+    """When the candidate commit equals the live HEAD, the findings are presented
+    live exactly as before — binding-constraint framing + create-a-direction
+    escalation — with no POSSIBLY-STALE wording."""
+    await _ensure_releaseversion_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "c" * 40
+    version = _make_stabilize_version_with_candidate(candidate)
+    version.project_id = project.id
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    _patch_candidate_currency(
+        mocker, resolved=("tok", "owner", "repo"), head_sha=candidate
+    )
+    suffix = await _spawn_and_get_stabilize_suffix(project, db_session)
+
+    assert "POSSIBLY-STALE" not in suffix
+    assert "the audit sub-score is the binding constraint on promotion" in suffix
+    assert "MUST create a new direction" in suffix
+    assert "Could not confirm" not in suffix
+
+
+@pytest.mark.asyncio
+async def test_stabilize_carried_findings_degrades_when_sha_unresolvable(
+    db_session, mocker, _lts_split_active
+):
+    """When the integration HEAD can't be resolved (GitHub unavailable), the loop
+    degrades to today's behavior but softens the currency assertion with a
+    provisional caveat — and never crashes."""
+    await _ensure_releaseversion_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "d" * 40
+    version = _make_stabilize_version_with_candidate(candidate)
+    version.project_id = project.id
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    _patch_candidate_currency(mocker, resolved=None, head_sha="e" * 40)
+    suffix = await _spawn_and_get_stabilize_suffix(project, db_session)
+
+    assert "POSSIBLY-STALE" not in suffix
+    assert "the audit sub-score is the binding constraint on promotion" in suffix
+    assert "Could not confirm" in suffix
+
+
 @pytest.mark.asyncio
 async def test_stabilize_hint_names_hard_blocker_as_binding_constraint(
     db_session, mocker, _lts_split_active
@@ -5010,6 +5377,79 @@ async def test_post_promote_handoff_hint_fires_on_fresh_version(
     )
     assert "intent.current_focus" in suffix
     assert "v2" in suffix and "v1" in suffix
+    # The hint must ASSERT the prior version promoted and FORBID re-promoting it,
+    # not merely flag the carried goal as stale — otherwise the agent re-qualifies
+    # an already-shipped version (incident 2026-06-03).
+    assert "PROMOTED" in suffix
+    assert "do NOT" in suffix
+    assert "STALE CARRY-OVER" in suffix
+
+
+@pytest.mark.asyncio
+async def test_post_promote_handoff_hint_grounds_in_prior_promoted_record(
+    db_session, mocker, _lts_split_active
+):
+    """When the prior version's promoted record is readable, the handoff hint
+    states the concrete promotion — its date and final confidence — so the agent
+    gets a positive 'it shipped' signal rather than only a 'stale text' warning,
+    and is explicitly forbidden from re-qualifying the already-shipped version."""
+    from datetime import datetime, timedelta
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    promoted_at = now - timedelta(hours=3)
+    prior = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="promoted",
+        opened_at=now - timedelta(days=5),
+        promoted_at=promoted_at,
+        last_qualification={"status": "promoted", "confidence": 0.93},
+    )
+    db_session.add(prior)
+    fresh = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="build",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification=None,
+        qualification_attempts=0,
+        goal="Promote v1: re-requesting qualification now that findings are fixed",
+    )
+    db_session.add(fresh)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    suffix = tasks[0].payloads[0].get("prompt_suffix", "")
+
+    assert "Version handoff" in suffix
+    # Grounded in the real promoted record: concrete date + final verdict.
+    assert promoted_at.date().isoformat() in suffix, (
+        f"Expected the prior version's promotion date in the hint; got: {suffix}"
+    )
+    assert "confidence 0.93" in suffix
+    # And the binding instruction: do not re-qualify the already-shipped version.
+    assert "re-qualify v1" in suffix
 
 
 @pytest.mark.asyncio
@@ -5870,6 +6310,39 @@ async def test_rolling_rates_exclude_rollup_children(db_session):
     )
 
 
+@pytest.mark.asyncio
+async def test_active_counts_include_old_inflight_tasks_outside_lookback(db_session):
+    """Current in-flight work is counted even when the task predates the lookback window."""
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[{"id": "d-old", "status": "active", "text": "long-lived lane"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    old_started = datetime.utcnow().replace(tzinfo=None) - timedelta(days=35)
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="Long running task",
+            description="still in flight",
+            payloads=[{"type": "create"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            created_at=old_started,
+            updated_at=old_started,
+            context={"direction_id": "d-old", "scope": "large"},
+        )
+    )
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session, lookback_days=21)
+    assert result["active_by_direction"] == {"d-old": 1}
+    assert result["active_by_scope"]["large"] == 1
+
+
 # ── git-ancestry landing verification in _build_recent_interventions ──────────
 
 
@@ -6245,6 +6718,170 @@ async def test_on_automain_false_for_root_task_ancestry_api_exception(
     assert merges[0]["on_automain"] is False
 
 
+@pytest.mark.asyncio
+async def test_recent_merged_titles_carry_tristate_merge_verdict(db_session, mocker):
+    """Each recent_merged_titles entry carries a tri-state merge_verdict.
+
+    on_automain is fail-closed (collapses verified-not-landed and unverifiable
+    into False); merge_verdict keeps them apart so cycle-start merge-accounting
+    can flag only the genuine not-landed conflict. Two merged tasks on the same
+    active direction: one ancestry-verified landed, one ancestry-verified NOT
+    landed — both have pr_number, so both are verifiable.
+    """
+    direction_id = "dir-merge-acct"
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[
+            {"id": direction_id, "text": "merge accounting dir", "status": "active"}
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    landed = Task(
+        project_id=project.id,
+        title="Landed on automain",
+        description="ancestor of integration branch",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "pr_number": 301, "direction_id": direction_id},
+    )
+    stranded = Task(
+        project_id=project.id,
+        title="Badge says merged but stranded",
+        description="merge commit NOT an ancestor",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "pr_number": 302, "direction_id": direction_id},
+    )
+    db_session.add_all([landed, stranded])
+    await db_session.commit()
+
+    def _pr_side_effect(token, owner, repo, pr_num, project_id=None):
+        return {
+            301: {"merge_commit_sha": "landed-sha", "head": {"sha": "h1"}},
+            302: {"merge_commit_sha": "stranded-sha", "head": {"sha": "h2"}},
+        }[pr_num]
+
+    def _anc_side_effect(token, owner, repo, sha, ref, project_id=None):
+        return sha == "landed-sha"
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(side_effect=_pr_side_effect),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(side_effect=_anc_side_effect),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+    delta = next(
+        d for d in result["per_direction_delta"] if d["direction_id"] == direction_id
+    )
+    verdicts = {
+        t["title"]: t["merge_verdict"] for t in delta["recent_merged_titles"]
+    }
+    assert verdicts["Landed on automain"] == "verified_landed"
+    assert verdicts["Badge says merged but stranded"] == "verified_not_landed"
+
+
+@pytest.mark.asyncio
+async def test_recent_merged_titles_cap_preserves_full_merge_accounting_counts(
+    db_session, mocker
+):
+    """The visible merge sample stays capped, but reconciliation metadata keeps
+    exact verdict counts and a conflict-title sample from the full window."""
+
+    from app.strategic_spawning import _RECON_LIST_CAP, _RECENT_MERGED_TITLES_CAP
+
+    direction_id = "dir-merge-cap"
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[
+            {"id": direction_id, "text": "merge accounting dir", "status": "active"}
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    base_time = datetime.utcnow()
+    tasks = []
+    for i in range(_RECENT_MERGED_TITLES_CAP + 3):
+        tasks.append(
+            Task(
+                project_id=project.id,
+                title=f"{'landed' if i < _RECENT_MERGED_TITLES_CAP else 'stranded'} {i}",
+                description="merge accounting sample",
+                payloads=[{"type": "create"}],
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                context={
+                    "pr_merged": True,
+                    "pr_number": 400 + i,
+                    "direction_id": direction_id,
+                },
+                created_at=base_time - timedelta(minutes=i + 1),
+                updated_at=base_time - timedelta(minutes=i + 1),
+            )
+        )
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    def _pr_side_effect(token, owner, repo, pr_num, project_id=None):
+        return {
+            "merge_commit_sha": (
+                f"landed-sha-{pr_num}"
+                if pr_num < 400 + _RECENT_MERGED_TITLES_CAP
+                else f"stranded-sha-{pr_num}"
+            ),
+            "head": {"sha": f"h-{pr_num}"},
+        }
+
+    def _anc_side_effect(token, owner, repo, sha, ref, project_id=None):
+        return sha.startswith("landed-sha-")
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(side_effect=_pr_side_effect),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(side_effect=_anc_side_effect),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+    delta = next(
+        d for d in result["per_direction_delta"] if d["direction_id"] == direction_id
+    )
+    assert len(delta["recent_merged_titles"]) == _RECENT_MERGED_TITLES_CAP
+    assert {
+        t["merge_verdict"] for t in delta["recent_merged_titles"]
+    } == {"verified_landed"}
+    assert delta["recent_merge_verdict_counts"] == {
+        "verified_landed": _RECENT_MERGED_TITLES_CAP,
+        "verified_not_landed": 3,
+        "unverifiable": 0,
+    }
+    assert delta["recent_not_landed_titles"] == ["stranded 10", "stranded 11", "stranded 12"]
+    assert len(delta["recent_not_landed_titles"]) <= _RECON_LIST_CAP
+
+
 # ── Per-project integration_branch resolution (column-based) ─────────────────
 
 
@@ -6483,6 +7120,520 @@ class TestVerifyCapabilityBackingPaths:
         }
 
 
+# ── _build_cycle_start_reconciliation: conflict-focused starting state ─────────
+
+
+class TestBuildCycleStartReconciliation:
+    """The cycle-start reconciliation surfaces only the CONFLICTS between the
+    four strategic surfaces (capabilities vs grounding, gaps vs directions,
+    per-direction research pipeline). Pure function — directly unit-testable."""
+
+    def test_returns_none_when_nothing_to_reconcile(self):
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        # No active directions, no gaps, no capabilities → nothing to surface.
+        assert _build_cycle_start_reconciliation([], {}, {}) is None
+        assert _build_cycle_start_reconciliation([], None, None) is None
+
+    def test_capability_contradiction_flags_stored_vs_grounded(self):
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        pm = {
+            "capabilities": [
+                # Contradiction: stored working, code shows absent.
+                {
+                    "name": "payments",
+                    "status": "working",
+                    "verification": {
+                        "effective_status": "absent",
+                        "present": [],
+                        "missing": ["backend/app/payments.py"],
+                    },
+                },
+                # Not a contradiction: stored matches grounded.
+                {
+                    "name": "search",
+                    "status": "partial",
+                    "verification": {
+                        "effective_status": "partial",
+                        "present": ["s.py"],
+                        "missing": ["t.py"],
+                    },
+                },
+                # Not a contradiction: unverified (no backing paths).
+                {
+                    "name": "memos",
+                    "status": "working",
+                    "verification": {
+                        "effective_status": "unverified",
+                        "present": [],
+                        "missing": [],
+                    },
+                },
+            ]
+        }
+        out = _build_cycle_start_reconciliation([], pm, {})
+        # An active-direction-less project with a contradiction still returns a
+        # block (the contradiction is content worth surfacing).
+        assert out is not None
+        contradictions = out["capability_contradictions"]
+        assert len(contradictions) == 1
+        assert contradictions[0]["name"] == "payments"
+        assert contradictions[0]["stored_status"] == "working"
+        assert contradictions[0]["effective_status"] == "absent"
+        assert contradictions[0]["missing"] == ["backend/app/payments.py"]
+        assert out["counts"]["capability_contradictions"] == 1
+
+    def test_orphaned_gap_excludes_staffed_and_deferred(self):
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        pm = {
+            "gaps": [
+                # Orphan: active, no deferral, no live direction.
+                {"id": "g-orphan", "name": "drifted", "status": "active",
+                 "priority": "high"},
+                # Stale active_moves alone do NOT prove staffing.
+                {"id": "g-moved", "name": "worked", "status": "active",
+                 "active_moves": ["d-9"]},
+                # Staffed via a direction pointing back (gap_id) → not an orphan.
+                {"id": "g-linked", "name": "linked", "status": "active"},
+                # Intentionally deferred → counted separately, not an orphan.
+                {"id": "g-deferred", "name": "parked", "status": "active",
+                 "deferral": {"rationale": "next version", "created_at": "x"}},
+                # Closed gaps never count.
+                {"id": "g-closed", "name": "done", "status": "closed"},
+            ]
+        }
+        direction_stats = [
+            {"id": "d-1", "status": "active", "gap_id": "g-linked"},
+        ]
+        out = _build_cycle_start_reconciliation(direction_stats, pm, {})
+        orphan_ids = [g["gap_id"] for g in out["orphaned_gaps"]]
+        assert orphan_ids == ["g-orphan", "g-moved"]
+        assert out["orphaned_gaps"][0]["priority"] == "high"
+        assert out["orphaned_gaps"][0]["status"] == "active"
+        assert out["counts"]["deferred_gaps"] == 1
+
+    def test_orphaned_gap_includes_blocked_open_gaps(self):
+        # A blocked gap is still an open problem; if no active direction works
+        # it (and it is not deferred) it is orphan-eligible, flagged by status.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        pm = {
+            "gaps": [
+                # Blocked + unstaffed → orphan, carries status="blocked".
+                {"id": "g-blocked", "name": "blocked orphan", "status": "blocked",
+                 "priority": "medium"},
+                # Blocked but staffed by a live direction → not an orphan.
+                {"id": "g-blocked-linked", "name": "worked", "status": "blocked"},
+                # Blocked + deferred → counted as deferred, not orphaned.
+                {"id": "g-blocked-deferred", "name": "parked", "status": "blocked",
+                 "deferral": {"rationale": "later", "created_at": "x"}},
+            ]
+        }
+        direction_stats = [
+            {"id": "d-1", "status": "active", "gap_id": "g-blocked-linked"},
+        ]
+        out = _build_cycle_start_reconciliation(direction_stats, pm, {})
+        orphans = {g["gap_id"]: g["status"] for g in out["orphaned_gaps"]}
+        assert orphans == {"g-blocked": "blocked"}
+        assert out["counts"]["deferred_gaps"] == 1
+
+    def test_ungrounded_directions_by_reason(self):
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        pm = {"gaps": [{"id": "g-live", "name": "x", "status": "active"}]}
+        direction_stats = [
+            {"id": "d-nogap", "status": "active", "text": "no link"},
+            {"id": "d-dangling", "status": "active", "text": "stale",
+             "gap_id": "g-gone"},
+            {"id": "d-ok", "status": "active", "text": "fine", "gap_id": "g-live"},
+            # Paused direction is ignored (only active directions reconcile).
+            {"id": "d-paused", "status": "paused", "text": "n/a"},
+        ]
+        out = _build_cycle_start_reconciliation(direction_stats, pm, {})
+        by_id = {d["direction_id"]: d["reason"] for d in out["ungrounded_directions"]}
+        assert by_id == {"d-nogap": "no_gap", "d-dangling": "gap_missing"}
+
+    def test_research_pipeline_states(self):
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            # In flight → tasks_in_progress (regardless of findings).
+            {"id": "d-busy", "status": "active", "text": "busy",
+             "recent_findings": ["f1"]},
+            # No tasks but has findings → research_waiting_on_action.
+            {"id": "d-wait", "status": "active", "text": "wait",
+             "recent_findings": ["f1", "f2"]},
+            # No tasks, no findings → idle.
+            {"id": "d-idle", "status": "active", "text": "idle"},
+        ]
+        active_by_direction = {"d-busy": 2}
+        out = _build_cycle_start_reconciliation(
+            direction_stats, {}, active_by_direction
+        )
+        states = {p["direction_id"]: p["state"] for p in out["direction_pipeline"]}
+        assert states == {
+            "d-busy": "tasks_in_progress",
+            "d-wait": "research_waiting_on_action",
+            "d-idle": "idle",
+        }
+        busy = next(p for p in out["direction_pipeline"] if p["direction_id"] == "d-busy")
+        assert busy["in_flight"] == 2
+        wait = next(p for p in out["direction_pipeline"] if p["direction_id"] == "d-wait")
+        assert wait["findings"] == 2
+        assert out["counts"]["active_directions"] == 3
+
+    def test_lists_are_capped_but_counts_carry_true_total(self):
+        from app.strategic_spawning import _build_cycle_start_reconciliation, _RECON_LIST_CAP
+
+        gaps = [
+            {"id": f"g-{i}", "name": f"orphan {i}", "status": "active"}
+            for i in range(_RECON_LIST_CAP + 5)
+        ]
+        out = _build_cycle_start_reconciliation([], {"gaps": gaps}, {})
+        assert len(out["orphaned_gaps"]) == _RECON_LIST_CAP
+        # The count carries the true (uncapped) total so the renderer shows "+N more".
+        assert out["counts"]["orphaned_gaps"] == _RECON_LIST_CAP + 5
+
+    def test_pipeline_counts_survive_list_cap(self):
+        from app.strategic_spawning import _build_cycle_start_reconciliation, _RECON_LIST_CAP
+
+        direction_stats = []
+        for i in range(_RECON_LIST_CAP + 3):
+            direction_stats.append(
+                {
+                    "id": f"d-w-{i}",
+                    "status": "active",
+                    "text": f"wait {i}",
+                    "recent_findings": ["f1"],
+                }
+            )
+        for i in range(2):
+            direction_stats.append(
+                {
+                    "id": f"d-p-{i}",
+                    "status": "active",
+                    "text": f"progress {i}",
+                    "recent_findings": [],
+                }
+            )
+        active_by_direction = {"d-p-0": 1, "d-p-1": 2}
+        out = _build_cycle_start_reconciliation(direction_stats, {}, active_by_direction)
+        assert len(out["direction_pipeline"]) == _RECON_LIST_CAP
+        assert out["counts"]["direction_pipeline"] == _RECON_LIST_CAP + 5
+        assert out["counts"]["direction_pipeline_overflow"] == 5
+        assert out["counts"]["pipeline_waiting_on_action"] == _RECON_LIST_CAP + 3
+        assert out["counts"]["pipeline_tasks_in_progress"] == 2
+        assert out["counts"]["pipeline_idle"] == 0
+
+    def test_merge_accounting_flags_only_verified_not_landed(self):
+        # Three merged titles within the recent window for one active direction:
+        # one ancestry-verified landed, one badge-asserted-but-NOT-landed, one
+        # unverifiable. Only the verified-not-landed one is a real conflict; the
+        # unverifiable one must NOT manufacture a contradiction.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        # Clean gap linkage so the four pre-existing classes stay empty and the
+        # only signal is merge-accounting drift.
+        pm = {"gaps": [{"id": "g-1", "name": "x", "status": "active"}]}
+        direction_stats = [
+            {"id": "d-1", "status": "active", "text": "shipping dir", "gap_id": "g-1"},
+        ]
+        per_direction_delta = [
+            {
+                "direction_id": "d-1",
+                "direction_text": "shipping dir",
+                "recent_merged_titles": [
+                    {"title": "landed feat", "merge_verdict": "verified_landed"},
+                    {"title": "ghost feat", "merge_verdict": "verified_not_landed"},
+                    {"title": "maybe feat", "merge_verdict": "unverifiable"},
+                ],
+            },
+        ]
+        out = _build_cycle_start_reconciliation(
+            direction_stats, pm, {}, per_direction_delta
+        )
+        assert out is not None
+        acct = out["merge_accounting"]
+        assert len(acct) == 1
+        entry = acct[0]
+        assert entry["direction_id"] == "d-1"
+        assert entry["not_landed"] == 1
+        assert entry["landed"] == 1
+        assert entry["unverifiable"] == 1
+        assert entry["not_landed_titles"] == ["ghost feat"]
+        # The four pre-existing classes are unchanged by the extension.
+        assert out["capability_contradictions"] == []
+        assert out["orphaned_gaps"] == []
+        assert out["ungrounded_directions"] == []
+        # Aggregate tallies carry every bucket so nothing is silently truncated.
+        assert out["counts"]["merge_accounting"] == 1
+        assert out["counts"]["merge_not_landed"] == 1
+        assert out["counts"]["merge_landed"] == 1
+        assert out["counts"]["merge_unverifiable"] == 1
+
+    def test_merge_accounting_landed_and_unverifiable_only_no_conflict(self):
+        # A direction whose recent merges are all verified-landed or unverifiable
+        # has NO accounting conflict — it must not appear in merge_accounting,
+        # though its tallies still ride in counts.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-1", "status": "active", "text": "clean dir"},
+        ]
+        per_direction_delta = [
+            {
+                "direction_id": "d-1",
+                "direction_text": "clean dir",
+                "recent_merged_titles": [
+                    {"title": "a", "merge_verdict": "verified_landed"},
+                    {"title": "b", "merge_verdict": "unverifiable"},
+                    {"title": "c", "merge_verdict": "unverifiable"},
+                ],
+            },
+        ]
+        out = _build_cycle_start_reconciliation(
+            direction_stats, {}, {}, per_direction_delta
+        )
+        assert out is not None
+        assert out["merge_accounting"] == []
+        assert out["counts"]["merge_accounting"] == 0
+        assert out["counts"]["merge_not_landed"] == 0
+        assert out["counts"]["merge_landed"] == 1
+        assert out["counts"]["merge_unverifiable"] == 2
+
+    def test_merge_accounting_absent_when_no_delta(self):
+        # Back-compatible: omitting per_direction_delta yields an empty
+        # merge_accounting list and zero tallies (no second pass invented).
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [{"id": "d-1", "status": "active", "text": "x"}]
+        out = _build_cycle_start_reconciliation(direction_stats, {}, {})
+        assert out is not None
+        assert out["merge_accounting"] == []
+        assert out["counts"]["merge_accounting"] == 0
+        assert out["counts"]["merge_not_landed"] == 0
+
+    def test_merge_accounting_caps_titles_with_true_overflow(self):
+        # A direction with more not-landed titles than the list cap keeps the
+        # true count and reports the overflow on the entry.
+        from app.strategic_spawning import (
+            _build_cycle_start_reconciliation,
+            _RECON_LIST_CAP,
+        )
+
+        titles = [
+            {"title": f"ghost {i}", "merge_verdict": "verified_not_landed"}
+            for i in range(_RECON_LIST_CAP + 4)
+        ]
+        per_direction_delta = [
+            {
+                "direction_id": "d-1",
+                "direction_text": "noisy dir",
+                "recent_merged_titles": titles,
+            },
+        ]
+        out = _build_cycle_start_reconciliation([], {}, {}, per_direction_delta)
+        assert out is not None
+        entry = out["merge_accounting"][0]
+        assert entry["not_landed"] == _RECON_LIST_CAP + 4
+        assert len(entry["not_landed_titles"]) == _RECON_LIST_CAP
+        assert entry["not_landed_titles_overflow"] == 4
+        assert out["counts"]["merge_not_landed"] == _RECON_LIST_CAP + 4
+
+    def test_merge_accounting_uses_exact_counts_beyond_visible_merge_sample(self):
+        from app.strategic_spawning import (
+            _build_cycle_start_reconciliation,
+            _RECENT_MERGED_TITLES_CAP,
+        )
+
+        per_direction_delta = [
+            {
+                "direction_id": "d-1",
+                "direction_text": "noisy dir",
+                "recent_merged_titles": [
+                    {"title": f"landed {i}", "merge_verdict": "verified_landed"}
+                    for i in range(_RECENT_MERGED_TITLES_CAP)
+                ],
+                "recent_merge_verdict_counts": {
+                    "verified_landed": _RECENT_MERGED_TITLES_CAP,
+                    "verified_not_landed": 3,
+                    "unverifiable": 0,
+                },
+                "recent_not_landed_titles": ["ghost 10", "ghost 11", "ghost 12"],
+            },
+        ]
+        out = _build_cycle_start_reconciliation([], {}, {}, per_direction_delta)
+        assert out is not None
+        entry = out["merge_accounting"][0]
+        assert entry["landed"] == _RECENT_MERGED_TITLES_CAP
+        assert entry["not_landed"] == 3
+        assert entry["unverifiable"] == 0
+        assert entry["not_landed_titles"] == ["ghost 10", "ghost 11", "ghost 12"]
+        assert entry["not_landed_titles_overflow"] == 0
+        assert out["counts"]["merge_landed"] == _RECENT_MERGED_TITLES_CAP
+        assert out["counts"]["merge_not_landed"] == 3
+
+
+# ── _build_prune_candidates: concrete cleanup list when the model is heavy ─────
+
+
+class TestBuildPruneCandidates:
+    """Concrete prune candidates are surfaced ONLY when the model is large or
+    oversized, drawn from signals the backend already has. Pure function."""
+
+    _LARGE = {"model_size_status": "large"}
+
+    def test_returns_none_when_model_not_heavy(self):
+        from app.strategic_spawning import _build_prune_candidates
+
+        pm = {
+            "gaps": [
+                {"id": "g1", "name": "x", "status": "active",
+                 "active_moves": ["d-retired"]},
+            ],
+        }
+        directions = [{"id": "d-retired", "status": "retired"}]
+        for status in (None, {}, {"model_size_status": "healthy"},
+                       {"model_size_status": "growing"}):
+            assert _build_prune_candidates(pm, directions, status, "2026-06-04T00:00:00+00:00") is None
+
+    def test_returns_none_when_no_candidates_even_if_heavy(self):
+        from app.strategic_spawning import _build_prune_candidates
+
+        pm = {
+            "gaps": [
+                # Active gap worked by a still-active, never-merged direction.
+                {"id": "g1", "name": "x", "status": "active",
+                 "active_moves": ["d-live"]},
+            ],
+            "capabilities": [
+                {"name": "ok", "status": "working",
+                 "verification": {"effective_status": "working"}},
+            ],
+        }
+        directions = [{"id": "d-live", "status": "active", "research_history": []}]
+        assert _build_prune_candidates(
+            pm, directions, self._LARGE, "2026-06-04T00:00:00+00:00"
+        ) is None
+
+    def test_surfaces_gap_linked_to_retired_direction(self):
+        from app.strategic_spawning import _build_prune_candidates
+
+        pm = {
+            "gaps": [
+                {"id": "g-ret", "name": "retired work", "status": "active",
+                 "active_moves": ["d-ret"]},
+            ],
+        }
+        directions = [{"id": "d-ret", "status": "retired"}]
+        out = _build_prune_candidates(
+            pm, directions, {"model_size_status": "oversized"},
+            "2026-06-04T00:00:00+00:00",
+        )
+        assert out is not None
+        assert out["model_size_status"] == "oversized"
+        assert len(out["resolved_gaps"]) == 1
+        rg = out["resolved_gaps"][0]
+        assert rg["gap_id"] == "g-ret"
+        assert rg["reason"] == "direction_retired"
+        assert rg["directions"] == ["d-ret"]
+        assert out["counts"]["resolved_gaps"] == 1
+
+    def test_surfaces_gap_linked_to_shipped_direction(self):
+        from app.strategic_spawning import _build_prune_candidates
+
+        pm = {
+            "gaps": [
+                {"id": "g-ship", "name": "shipped work", "status": "active",
+                 "active_moves": ["d-ship"]},
+            ],
+        }
+        # Still active, but has merged PRs in its history → shipped.
+        directions = [
+            {"id": "d-ship", "status": "active",
+             "research_history": [{"prs_merged": 2}]},
+        ]
+        out = _build_prune_candidates(pm, directions, self._LARGE, "2026-06-04T00:00:00+00:00")
+        assert len(out["resolved_gaps"]) == 1
+        assert out["resolved_gaps"][0]["reason"] == "direction_shipped"
+
+    def test_surfaces_claimed_but_absent_capabilities(self):
+        from app.strategic_spawning import _build_prune_candidates
+
+        pm = {
+            "capabilities": [
+                {"name": "ghost", "status": "working",
+                 "verification": {"effective_status": "absent"}},
+                # partial is NOT absent → not a prune candidate here.
+                {"name": "partial-cap", "status": "working",
+                 "verification": {"effective_status": "partial"}},
+                {"name": "unverified-cap", "status": "working",
+                 "verification": {"effective_status": "unverified"}},
+            ],
+        }
+        out = _build_prune_candidates(pm, [], self._LARGE, "2026-06-04T00:00:00+00:00")
+        assert [c["name"] for c in out["absent_capabilities"]] == ["ghost"]
+        assert out["absent_capabilities"][0]["stored_status"] == "working"
+        assert out["counts"]["absent_capabilities"] == 1
+
+    def test_surfaces_expired_hold_deferrals(self):
+        from app.strategic_spawning import _build_prune_candidates
+
+        pm = {
+            "gaps": [
+                # Hold elapsed.
+                {"id": "g-exp", "name": "expired hold", "status": "active",
+                 "deferral": {"rationale": "later", "created_at": "x",
+                              "hold_until": "2026-01-01T00:00:00+00:00"}},
+                # Hold still in the future → NOT a candidate.
+                {"id": "g-fut", "name": "future hold", "status": "active",
+                 "deferral": {"rationale": "later", "created_at": "x",
+                              "hold_until": "2027-01-01T00:00:00+00:00"}},
+                # Deferral with no hold_until → NOT a candidate.
+                {"id": "g-noh", "name": "no hold", "status": "active",
+                 "deferral": {"rationale": "later", "created_at": "x"}},
+            ],
+        }
+        out = _build_prune_candidates(pm, [], self._LARGE, "2026-06-04T00:00:00+00:00")
+        assert [g["gap_id"] for g in out["expired_holds"]] == ["g-exp"]
+        assert out["expired_holds"][0]["hold_until"] == "2026-01-01T00:00:00+00:00"
+
+    def test_tolerates_malformed_hold_until(self):
+        from app.strategic_spawning import _build_prune_candidates
+
+        pm = {
+            "gaps": [
+                {"id": "g-bad", "name": "bad ts", "status": "active",
+                 "deferral": {"rationale": "x", "created_at": "x",
+                              "hold_until": "not-a-timestamp"}},
+                {"id": "g-num", "name": "num ts", "status": "active",
+                 "deferral": {"rationale": "x", "created_at": "x",
+                              "hold_until": 12345}},
+            ],
+        }
+        # Malformed hold_until is ignored — no candidates, so None.
+        assert _build_prune_candidates(
+            pm, [], self._LARGE, "2026-06-04T00:00:00+00:00"
+        ) is None
+
+    def test_respects_cap_and_carries_true_totals(self):
+        from app.strategic_spawning import _build_prune_candidates, _RECON_LIST_CAP
+
+        gaps = [
+            {"id": f"g-{i}", "name": f"resolved {i}", "status": "active",
+             "active_moves": ["d-ret"]}
+            for i in range(_RECON_LIST_CAP + 4)
+        ]
+        directions = [{"id": "d-ret", "status": "retired"}]
+        out = _build_prune_candidates(
+            {"gaps": gaps}, directions, self._LARGE, "2026-06-04T00:00:00+00:00",
+        )
+        assert len(out["resolved_gaps"]) == _RECON_LIST_CAP
+        assert out["counts"]["resolved_gaps"] == _RECON_LIST_CAP + 4
+
+
 # ── Onboarding goal reaches the first strategic cycle's payload ─────────────────
 #
 # The New Project onboarding flow seeds the user's goal into BOTH channels the
@@ -6595,6 +7746,135 @@ async def test_empty_goal_leaves_strategic_payload_blank(db_session):
     assert not (payload.get("problem_model") or {}).get("intent", {}).get("purpose")
     assert payload["conversation_thread"] == []
     assert payload["open_messages"] == []
+
+
+@pytest.mark.asyncio
+async def test_open_bug_report_survives_thread_cap_in_strategic_review(db_session):
+    """An OPEN BUG_REPORT created before 15+ newer messages must still appear in
+    the strategic_review open_messages inbox — not only in the architecture cycle.
+
+    Regression guard for the thread-slice behavior: previously open_messages was
+    derived by filtering the conversation_thread (capped at the 15 newest rows),
+    so an old open BUG_REPORT aged out of the strategist's view entirely and
+    could never be resolved.
+    """
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Oldest row: an OPEN BUG_REPORT the strategist must keep seeing.
+    bug_text = "Bug: strategist never sees this aged-out open report"
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            from_type="agent",
+            message_type=MessageType.BUG_REPORT,
+            content=bug_text,
+            status="open",
+            created_at=datetime(2026, 5, 1, 0, 0, 0),
+        )
+    )
+    # 30 newer messages — well beyond the 15-row conversation_thread cap.
+    for i in range(30):
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                from_type="user",
+                message_type=MessageType.NOTE,
+                content=f"newer chatter #{i}",
+                status="open",
+                created_at=datetime(2026, 6, 1, 0, 0, i),
+            )
+        )
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    # The aged-out bug report is gone from the recency-capped thread...
+    thread_contents = [m["content"] for m in payload["conversation_thread"]]
+    assert bug_text not in thread_contents
+    assert len(payload["conversation_thread"]) == 15
+    # ...but the authoritative open-message inbox still surfaces it.
+    open_contents = [m["content"] for m in payload["open_messages"]]
+    assert bug_text in open_contents
+
+
+@pytest.mark.asyncio
+async def test_open_messages_not_derived_from_capped_thread(db_session):
+    """The open-message inbox can exceed the 15-row conversation_thread cap.
+
+    Proves open_messages is its own query, not a byproduct of the capped thread.
+    """
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for i in range(25):
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                from_type="user",
+                message_type=MessageType.NOTE,
+                content=f"open message #{i}",
+                status="open",
+                created_at=datetime(2026, 6, 1, 0, 0, i),
+            )
+        )
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    # All 25 open messages surface, far more than the thread cap of 15.
+    assert len(payload["open_messages"]) == 25
+    assert len(payload["conversation_thread"]) == 15
+
+
+def test_summarize_open_messages_preserves_critical_and_oldest():
+    """The budget-pressure fallback keeps BUG_REPORT/BLOCKER + oldest-open items
+    and trims the rest, instead of dropping the whole inbox."""
+    from app.strategic_spawning import (
+        _summarize_open_messages,
+        _OPEN_MESSAGES_KEEP_WHEN_TRIMMED,
+        _OPEN_MESSAGE_EXCERPT_MAX_CHARS,
+    )
+
+    messages = []
+    # One old critical BUG_REPORT (oldest) and one BLOCKER.
+    messages.append(
+        {"id": "bug", "type": "BUG_REPORT", "content": "x" * 5000,
+         "created_at": "2026-05-01T00:00:00"}
+    )
+    messages.append(
+        {"id": "blk", "type": "BLOCKER", "content": "blocked",
+         "created_at": "2026-05-02T00:00:00"}
+    )
+    # Many newer NOTEs that should be trimmed away first.
+    for i in range(50):
+        messages.append(
+            {"id": f"note{i}", "type": "NOTE", "content": f"note {i}",
+             "created_at": f"2026-06-01T00:00:{i:02d}"}
+        )
+
+    trimmed = _summarize_open_messages(messages)
+
+    assert len(trimmed) == _OPEN_MESSAGES_KEEP_WHEN_TRIMMED
+    ids = {m["id"] for m in trimmed}
+    # Critical items survive trimming.
+    assert "bug" in ids
+    assert "blk" in ids
+    # Per-message excerpt is capped.
+    bug = next(m for m in trimmed if m["id"] == "bug")
+    assert len(bug["content"]) == _OPEN_MESSAGE_EXCERPT_MAX_CHARS
 
 
 class TestParallelismHint:
@@ -7718,3 +8998,676 @@ async def test_arm_operator_refresh_persists_excerpt_and_replaces_on_coalesce(
     assert marker2.get("excerpt") == "newer steering content wins"
     # Coalesced into the same single slot (not stacked into a second marker).
     assert marker2.get("count") == 2
+
+
+@pytest.mark.asyncio
+async def test_open_bug_report_older_than_thread_cap_appears_in_open_messages(
+    db_session,
+):
+    """Open BUG_REPORT created before 15+ newer messages still appears in payload.
+
+    Regression test for: strategist's open-message feed survives the 15-msg
+    thread cap. The conversation_thread is capped at 15 recent messages of ANY
+    status, but open_messages must come from a dedicated query so open
+    BUG_REPORT/BLOCKER items older than the thread cap are NOT aged out of view.
+    """
+    project = _make_project(
+        vision={"purpose": "test project"},
+        problem_model={},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create an old open BUG_REPORT (will be older than the 15-message cap).
+    old_bug_content = "Ancient bug that needs fixing"
+    old_bug = ProjectMessage(
+        project_id=project.id,
+        from_type="system",
+        message_type=MessageType.BUG_REPORT,
+        content=old_bug_content,
+        status="open",
+    )
+    db_session.add(old_bug)
+    await db_session.commit()
+
+    # Create 20+ newer messages to push the old bug out of the 15-message
+    # conversation_thread window.
+    for i in range(20):
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                from_type="system" if i % 2 == 0 else "user",
+                message_type=MessageType.NOTE if i % 3 == 0 else MessageType.FEEDBACK,
+                content=f"Recent message {i}",
+                status="resolved" if i % 5 == 0 else "open",
+            )
+        )
+    await db_session.commit()
+
+    # Spawn the strategic review; the old bug should still appear in open_messages.
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    assert len(tasks) == 1
+    payload = tasks[0].payloads[0]
+
+    # The old bug should be in open_messages despite being aged out of
+    # conversation_thread (which is capped at 15 most recent rows).
+    open_msg_contents = [m["content"] for m in payload["open_messages"]]
+    assert old_bug_content in open_msg_contents, (
+        "Old open BUG_REPORT aged out of conversation_thread must still appear "
+        "in open_messages via dedicated status-filtered query"
+    )
+
+    # Verify the old bug is NOT in conversation_thread (proves it aged out).
+    thread_contents = [m["content"] for m in payload["conversation_thread"]]
+    assert old_bug_content not in thread_contents, (
+        "Old bug aged out of 15-message thread cap as expected"
+    )
+
+
+def _pathological_problem_model(n_gaps: int = 400) -> dict:
+    """A problem_model whose ACTIVE gap list (no count cap by design) has grown
+    so large that the count-based agent-view trim alone cannot fit it under the
+    payload byte budget."""
+    big = "x" * 2000  # bulky free-text body per gap
+    gaps = []
+    for i in range(n_gaps):
+        gaps.append(
+            {
+                "id": f"g-{i}",
+                "name": f"gap {i}",
+                "description": big,
+                "evidence": big,
+                "priority": "high" if i % 3 == 0 else "low",
+                "status": "active",
+                "opened": f"2026-01-{(i % 28) + 1:02d}T00:00:00Z",
+                "history": [{"ts": "2026-01-01T00:00:00Z", "event": big}],
+                "past_moves": [f"d-{i}-{j}" for j in range(20)],
+            }
+        )
+    return {"gaps": gaps, "capabilities": [], "constraints": []}
+
+
+def test_agent_view_problem_model_packed_shrinks_under_floor():
+    """A pathologically large model is shrunk under the guaranteed-small floor
+    and carries a marker of what was shortened — never returned oversized."""
+    pm = _pathological_problem_model()
+    packed = _agent_view_problem_model_packed(pm)
+
+    serialized = len(json.dumps(packed, default=str).encode())
+    assert serialized <= _AGENT_VIEW_FLOOR_BYTES, (
+        f"floor shrink must bring the model under {_AGENT_VIEW_FLOOR_BYTES} "
+        f"bytes, got {serialized}"
+    )
+    marker = packed.get("_agent_view_floor_applied")
+    assert marker is not None, "shrink must leave a loud, visible marker"
+    assert marker["floor_bytes"] == _AGENT_VIEW_FLOOR_BYTES
+    # At least the highest-value gaps survive so the strategist can still reason.
+    assert len(packed["gaps"]) >= _FLOOR_MIN_GAPS
+
+
+def _caps_friction_heavy_problem_model(
+    n_caps: int = 120, n_friction: int = 120
+) -> dict:
+    """A problem_model whose bulk lives in capabilities and friction (verbose
+    free-text bodies), with few/no gaps — so gap-shrinking alone cannot reach
+    the floor."""
+    big = "y" * 800
+    caps = []
+    for i in range(n_caps):
+        caps.append(
+            {
+                "name": f"cap {i}",
+                "status": "working" if i % 2 == 0 else "planned",
+                "notes": big,
+                "source": {"kind": "pr", "ref": big},
+                "backing_paths": [f"backend/app/mod_{i}_{j}.py" for j in range(8)],
+            }
+        )
+    friction = []
+    for i in range(n_friction):
+        friction.append(
+            {
+                "id": f"f-{i}",
+                "name": f"friction {i}",
+                "status": "active" if i % 2 == 0 else "resolved",
+                "description": big,
+                "seen_in": [f"d-{i}-{j}" for j in range(8)],
+                "mitigations_tried": [big],
+                "source": {"kind": "agent_observation", "ref": big},
+            }
+        )
+    return {"gaps": [], "capabilities": caps, "friction": friction}
+
+
+def test_floor_shrinks_caps_and_friction_when_gaps_are_not_the_bulk():
+    """A capability/friction-heavy model (few/no gaps) is shrunk under the floor
+    by reducing capabilities and friction to a name+status skeleton, and is
+    delivered with an honest summarized-section marker — never dropped."""
+    pm = _caps_friction_heavy_problem_model()
+    packed = _agent_view_problem_model_packed(pm)
+
+    serialized = len(json.dumps(packed, default=str).encode())
+    assert serialized <= _AGENT_VIEW_FLOOR_BYTES, (
+        f"caps/friction-heavy model must be shrunk under {_AGENT_VIEW_FLOOR_BYTES} "
+        f"bytes, got {serialized}"
+    )
+    marker = packed.get("_agent_view_floor_applied")
+    assert marker is not None, "shrink must leave a loud, visible marker"
+    assert marker["summarized_capabilities"] > 0, "capabilities must be reduced"
+    assert marker["summarized_friction"] > 0, "friction must be reduced"
+    # Reduced entries are name+status skeletons — detail fields are gone.
+    cap = packed["capabilities"][0]
+    assert "notes" not in cap and "backing_paths" not in cap and "source" not in cap
+    assert {"name", "status"} <= set(cap.keys())
+    fric = packed["friction"][0]
+    assert "description" not in fric and "seen_in" not in fric
+    assert "mitigations_tried" not in fric and "source" not in fric
+    assert {"id", "name", "status"} <= set(fric.keys())
+
+
+def test_floor_leaves_caps_friction_untouched_when_gaps_are_the_bulk():
+    """Regression: when gap-shrinking alone reaches the floor, capabilities and
+    friction are NOT touched and no summarized-section marker is recorded — the
+    gap-only shrink path is unchanged."""
+    # Gaps whose bulk is the (strippable) append-only history; stripping the
+    # first floor level brings the model under the floor without dropping gaps.
+    big = "z" * 1200
+    gaps = [
+        {
+            "id": f"g-{i}",
+            "name": f"gap {i}",
+            "status": "active",
+            "priority": "high",
+            "opened": "2026-01-01T00:00:00Z",
+            "history": [{"ts": "2026-01-01T00:00:00Z", "event": big}],
+            "past_moves": [big],
+        }
+        for i in range(30)
+    ]
+    pm = {
+        "gaps": gaps,
+        "capabilities": [
+            {"name": "keep me", "status": "working", "notes": "n", "backing_paths": ["a.py"]}
+        ],
+        "friction": [
+            {"id": "f-keep", "name": "keep", "status": "active", "description": "d"}
+        ],
+    }
+    packed = _agent_view_problem_model_packed(pm)
+
+    marker = packed["_agent_view_floor_applied"]
+    assert marker["dropped_gaps"] == 0, "field-stripping should reach the floor"
+
+    marker = packed["_agent_view_floor_applied"]
+    assert "summarized_capabilities" not in marker
+    assert "summarized_friction" not in marker
+    # Detail-bearing capability/friction entries survive intact.
+    assert packed["capabilities"][0]["notes"] == "n"
+    assert packed["friction"][0]["description"] == "d"
+
+
+def test_floor_no_pressure_path_is_byte_identical():
+    """A model that already fits the floor is returned byte-identical — no
+    marker, no reordering, no shrink."""
+    pm = {
+        "gaps": [{"id": "g1", "name": "g", "status": "active", "priority": "high"}],
+        "capabilities": [{"name": "c", "status": "working", "notes": "n"}],
+        "friction": [{"id": "f1", "name": "f", "status": "active", "description": "d"}],
+    }
+    packed = _agent_view_problem_model_packed(pm)
+    assert "_agent_view_floor_applied" not in packed
+    assert packed["capabilities"][0]["notes"] == "n"
+    assert packed["friction"][0]["description"] == "d"
+
+
+def test_pathological_problem_model_degrades_loudly_when_it_cannot_fit():
+    """The GENUINELY EXCEPTIONAL case: a problem_model so large it cannot fit the
+    packer budget even on its own. The floor reservation now equals the WHOLE
+    agent-view model, so an oversized model's reservation exceeds the budget and
+    the packer drops the floor guarantee — at which point the ``summarize``
+    callback (_agent_view_problem_model_packed -> _shrink_pm_to_floor) degrades
+    the model LOUDLY rather than silently: it ships a bounded floored skeleton
+    carrying the ``_agent_view_floor_applied`` marker, recorded in
+    ``_packer_meta['trimmed']`` so the agent's problemModelRecovery resolves to
+    'fetch'. This is the visibly-exceptional fallback, never the normal mode.
+
+    Siblings are kept modest here so the degradation is clearly attributable to
+    the model's own size — the normal/contended whole-model guarantee (where the
+    model fits and siblings yield first) is exercised separately in
+    ``test_strategic_review_ships_whole_problem_model_under_contention``."""
+    pm = _pathological_problem_model()  # ~MBs of active-gap bulk, >> 120KB budget
+    payload = {
+        "type": "strategic_review",
+        "project_name": "p",
+        "base_branch": "main",
+        "model": "claude-opus-4-8",
+        "effort": "medium",
+        "vision": {"purpose": "small"},
+        "problem_model": pm,
+        "model_health": {"model_size_status": "oversized", "gap_count": 400},
+    }
+    packed = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA)
+
+    meta = packed["_packer_meta"]
+    dropped_keys = {d["key"] for d in meta["dropped"]}
+
+    # The model is DELIVERED (degraded), never silently dropped.
+    assert "problem_model" in packed, (
+        "problem_model must be delivered degraded, never silently dropped"
+    )
+    assert "problem_model" not in dropped_keys, (
+        f"problem_model was dropped: {meta['dropped']}"
+    )
+    # Degraded loudly: the floored skeleton carries the marker so the agent
+    # knows it must ./fetch the full model.
+    assert "_agent_view_floor_applied" in packed["problem_model"], (
+        "an oversized model must ship floored with a loud marker"
+    )
+    serialized = len(json.dumps(packed["problem_model"], default=str).encode())
+    assert serialized <= _AGENT_VIEW_FLOOR_BYTES, (
+        f"floored model must fit the {_AGENT_VIEW_FLOOR_BYTES}-byte floor, got {serialized}"
+    )
+    # Recorded in _packer_meta['trimmed'] (kind=summarized) so problemModelRecovery
+    # becomes 'fetch'. This is the agent's single fetch-decision channel.
+    trimmed_pm = [t for t in meta["trimmed"] if t["key"] == "problem_model"]
+    assert trimmed_pm, (
+        f"the degraded model must be recorded in _packer_meta['trimmed']: {meta['trimmed']}"
+    )
+    assert trimmed_pm[0]["kind"] == "summarized"
+    # The tiny size/health signal still ships alongside it.
+    assert "model_health" in packed
+    assert "model_health" not in dropped_keys
+
+
+def _mature_agent_view_problem_model() -> dict:
+    """A realistic, mature-but-healthy agent-view problem_model that fits well
+    under the 120KB packer budget while carrying full per-entry detail.
+
+    Sized at the healthy thresholds (12 gaps / 20 capabilities / 8 friction) with
+    substantial — but not pathological — free-text bodies, so the WHOLE model is
+    expected to ship inline under normal cycle sizes (the floor never fires)."""
+    gap_body = "g" * 1600
+    gaps = [
+        {
+            "id": f"g-{i}",
+            "name": f"gap {i}: concrete delta between intent and capability {i}",
+            "description": gap_body,
+            "evidence": gap_body,
+            "priority": "high" if i % 2 == 0 else "medium",
+            "status": "active",
+            "opened": f"2026-02-{(i % 27) + 1:02d}T00:00:00Z",
+            "history": [{"ts": "2026-02-01T00:00:00Z", "event": "opened"}],
+            "past_moves": [f"d-{i}-{j}" for j in range(3)],
+        }
+        for i in range(12)
+    ]
+    cap_notes = "c" * 1400
+    capabilities = [
+        {
+            "name": f"cap {i}: registry-derived subsystem {i}",
+            "status": "working" if i % 2 == 0 else "partial",
+            "notes": cap_notes,
+            "source": {"type": "shipped_change", "pr_number": 7000 + i},
+            "backing_paths": [f"backend/app/mod_{i}.py", f"backend/testing/test_mod_{i}.py"],
+        }
+        for i in range(20)
+    ]
+    fric_body = "f" * 1400
+    friction = [
+        {
+            "id": f"f-{i}",
+            "name": f"friction {i}: recurring blocker observed across moves",
+            "status": "active",
+            "description": fric_body,
+            "seen_in": [f"d-{i}", f"d-{i + 1}"],
+            "mitigations_tried": [f"tried approach {k}" for k in range(3)],
+        }
+        for i in range(8)
+    ]
+    return {"gaps": gaps, "capabilities": capabilities, "friction": friction}
+
+
+def test_strategic_review_ships_whole_problem_model_under_contention():
+    """The NORMAL operating mode: a realistic mature problem_model ships WHOLE
+    inline even when recoverable siblings genuinely contend for the budget.
+
+    Because the floor reservation now equals the whole agent-view model, its
+    bytes are reserved off the top of the budget, so the recoverable siblings
+    (directions_summary, conversation_thread, self_reflection_log, …) degrade or
+    drop FIRST while the model keeps its full capabilities and friction detail.
+    The skeletonizing path (_skeletonize_caps_friction / _shrink_pm_to_floor)
+    must NOT fire: no ``_agent_view_floor_applied`` marker, full per-entry detail
+    preserved, and the model is neither in the dropped nor the trimmed list."""
+    pm = _mature_agent_view_problem_model()
+    model_bytes = len(json.dumps(pm, default=str).encode())
+    # Sanity: the realistic model is comfortably under the 120KB budget so the
+    # whole-model guarantee is the expected outcome (not the floored fallback).
+    assert model_bytes < 120 * 1024
+
+    payload = {
+        "type": "strategic_review",
+        "research_mode": "strategic",
+        "project_name": "p",
+        "base_branch": "main",
+        "model": "claude-opus-4-8",
+        "effort": "medium",
+        "vision": {"purpose": "x" * 8000},
+        "problem_model": pm,
+        "model_health": {"model_size_status": "healthy", "gap_count": 12},
+        # Recoverable, summarizable siblings sized to genuinely contend so the
+        # reservation is what protects the model — not slack budget.
+        "directions_summary": [
+            {"id": f"d-{i}", "text": "z" * 1100, "priority": "high"} for i in range(50)
+        ],
+        "conversation_thread": [
+            {"id": f"m-{i}", "role": "user", "content": "w" * 1100} for i in range(40)
+        ],
+        "self_reflection_log": [{"what_was_hard": "s" * 1100} for _ in range(20)],
+    }
+    packed = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA)
+
+    meta = packed["_packer_meta"]
+    dropped_keys = {d["key"] for d in meta["dropped"]}
+    trimmed_keys = {t["key"] for t in meta["trimmed"]}
+
+    # Genuine contention: at least one recoverable sibling degraded or dropped.
+    assert (dropped_keys | trimmed_keys) - {"problem_model"}, (
+        f"expected recoverable siblings to yield first; meta={meta}"
+    )
+
+    # The WHOLE model shipped inline — present, not dropped, not trimmed.
+    assert "problem_model" in packed
+    assert "problem_model" not in dropped_keys, f"model dropped: {meta['dropped']}"
+    assert "problem_model" not in trimmed_keys, f"model trimmed: {meta['trimmed']}"
+
+    shipped = packed["problem_model"]
+    # The skeletonizing floor path did NOT fire.
+    assert "_agent_view_floor_applied" not in shipped, (
+        "the whole model must ship without the floored/skeletonized marker"
+    )
+    # Full per-entry detail survived — capabilities/friction were NOT collapsed
+    # to name+status skeletons.
+    assert len(shipped["capabilities"]) == 20
+    assert len(shipped["friction"]) == 8
+    assert len(shipped["gaps"]) == 12
+    assert shipped["capabilities"][0].get("notes"), "capability detail was collapsed"
+    assert shipped["capabilities"][0].get("backing_paths"), "capability detail collapsed"
+    assert shipped["friction"][0].get("description"), "friction detail was collapsed"
+
+
+def test_strategic_review_degrades_loudly_in_near_budget_band():
+    """The NEAR-BUDGET band: a problem_model that fits the budget on its OWN, but
+    whose bytes plus the always-critical identity/vision keys exceed it. The
+    full-model floor reservation is ``<= budget`` (so the old drop condition kept
+    the guarantee), yet the critical ``vision`` key sorts first and would be
+    starved into a hard PayloadTooLargeError. The reworked packer accounts for
+    non-floored critical keys' bytes and drops the floor guarantee, so the model
+    degrades LOUDLY via summarize (marker + _packer_meta record) and the cycle
+    still runs — it must NOT raise or silently drop the model."""
+    pm = _mature_agent_view_problem_model()
+    model_bytes = len(json.dumps(pm, default=str).encode())
+    # A large but load-bearing critical vision. model alone fits the budget;
+    # model + vision does not.
+    vision = {"purpose": "p" * 12000}
+    vision_bytes = len(json.dumps(vision, default=str).encode())
+    # Budget fits the model alone (reservation <= budget) but NOT model + vision.
+    budget = model_bytes + vision_bytes - 2000
+    assert model_bytes <= budget < model_bytes + vision_bytes
+
+    payload = {
+        "type": "strategic_review",
+        "research_mode": "strategic",
+        "project_name": "p",
+        "base_branch": "main",
+        "model": "claude-opus-4-8",
+        "effort": "medium",
+        "vision": vision,
+        "problem_model": pm,
+        "model_health": {"model_size_status": "healthy", "gap_count": 12},
+    }
+    # Must NOT raise PayloadTooLargeError — the cycle still runs.
+    packed = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA, budget=budget)
+
+    # The critical vision shipped intact.
+    assert packed["vision"] == vision
+    meta = packed["_packer_meta"]
+    dropped_keys = {d["key"] for d in meta["dropped"]}
+
+    # The model is delivered DEGRADED (floored), never silently dropped.
+    assert "problem_model" in packed
+    assert "problem_model" not in dropped_keys, f"model dropped: {meta['dropped']}"
+    assert "_agent_view_floor_applied" in packed["problem_model"], (
+        "the degraded model must carry the loud floor-applied marker"
+    )
+    # Recorded in _packer_meta['trimmed'] so problemModelRecovery resolves to 'fetch'.
+    trimmed_pm = [t for t in meta["trimmed"] if t["key"] == "problem_model"]
+    assert trimmed_pm and trimmed_pm[0]["kind"] == "summarized", (
+        f"the degraded model must be recorded as summarized: {meta['trimmed']}"
+    )
+
+
+# ── design_doc compact index in the strategic payload ─────────────────────────
+# The strategic cycle ships the design doc as a COMPACT, BOUNDED navigation
+# index (key + bounded summary + reconciled presence status/modules/warning for
+# systems/capabilities) instead of full inline prose; full per-section content
+# is fetched on demand via POST /api/agent/design-doc (op:get).
+
+
+_BIG_DESIGN_PROSE = "LOREM_" + ("x" * 4000)
+
+
+def _design_doc_with_sections(prose: str) -> dict:
+    """A design doc whose section bodies carry *prose* (made large to prove the
+    index does not scale with content)."""
+    return {
+        "systems/auth": {
+            "status": "mature",
+            "description": prose,
+            "modules": ["backend/app/auth.py", "backend/app/routers/agent.py"],
+        },
+        "capabilities/login": {
+            "status": "working",
+            "notes": prose,
+            "modules": ["backend/app/auth.py"],
+        },
+        "notes/roadmap": {"title": "Roadmap", "body": prose},
+        # Operator-only / internal keys — must be excluded from the index.
+        "_meta": {"last_updated": "2026-01-01"},
+        "playbook_archive": [{"key": "x", "value": prose}],
+    }
+
+
+def test_design_doc_index_is_complete():
+    """Every non-internal section is represented by its key; operator-only and
+    underscore-prefixed keys are excluded."""
+    index = _design_doc_index(_design_doc_with_sections("short prose"))
+    keys = {e["key"] for e in index["sections"]}
+    assert keys == {"systems/auth", "capabilities/login", "notes/roadmap"}
+    assert "_meta" not in keys
+    assert "playbook_archive" not in keys
+
+
+def test_design_doc_index_excludes_proposed_changes_bookkeeping_key():
+    """proposed_changes is the reconciliation queue, shipped as its OWN top-level
+    payload field — it is not an architecture section and must not pollute the
+    index with a summary-less 'Other sections' entry."""
+    doc = _design_doc_with_sections("short prose")
+    doc["proposed_changes"] = [{"key": "systems/auth", "op": "set"}]
+    keys = {e["key"] for e in _design_doc_index(doc)["sections"]}
+    assert "proposed_changes" not in keys
+    assert keys == {"systems/auth", "capabilities/login", "notes/roadmap"}
+
+
+def test_design_doc_index_carries_reconciled_presence():
+    """systems/* and capabilities/* entries carry the reconciled presence
+    status, the declared backing modules, and any presence_warning."""
+    doc = {
+        "systems/auth": {
+            "status": "missing",
+            "description": "x",
+            "modules": ["backend/app/auth.py"],
+            "presence_warning": (
+                "claimed mature but all referenced module file(s) are absent"
+            ),
+        },
+        "capabilities/login": {
+            "status": "partial",
+            "notes": "y",
+            "modules": ["backend/app/auth.py"],
+        },
+    }
+    by_key = {e["key"]: e for e in _design_doc_index(doc)["sections"]}
+    assert by_key["systems/auth"]["status"] == "missing"
+    assert by_key["systems/auth"]["modules"] == ["backend/app/auth.py"]
+    assert by_key["systems/auth"]["presence_warning"].startswith("claimed mature")
+    assert by_key["capabilities/login"]["status"] == "partial"
+    assert by_key["capabilities/login"]["modules"] == ["backend/app/auth.py"]
+    # notes/* are not presence-reconciled — no status field.
+    assert "status" not in _design_doc_index({"notes/x": {"body": "z"}})["sections"][0]
+
+
+def test_design_doc_index_is_bounded_does_not_scale_with_prose():
+    """The index serialized size stays roughly stable when section prose grows
+    massively — per-entry summaries are bounded, so the 4000x blow-up does not
+    propagate."""
+    small = _design_doc_index(_design_doc_with_sections("short"))
+    large = _design_doc_index(_design_doc_with_sections(_BIG_DESIGN_PROSE))
+    small_bytes = len(json.dumps(small).encode())
+    large_bytes = len(json.dumps(large).encode())
+    # The big-prose variant adds at most a few bounded summaries' worth of bytes.
+    assert large_bytes - small_bytes < 3 * (_DESIGN_DOC_INDEX_SUMMARY_CHARS + 64)
+    for entry in large["sections"]:
+        if "summary" in entry:
+            assert len(entry["summary"]) <= _DESIGN_DOC_INDEX_SUMMARY_CHARS
+
+
+def test_design_doc_index_summary_truncated_with_ellipsis():
+    doc = {"notes/x": {"summary": "A" * (_DESIGN_DOC_INDEX_SUMMARY_CHARS + 500)}}
+    summary = _design_doc_index(doc)["sections"][0]["summary"]
+    assert len(summary) <= _DESIGN_DOC_INDEX_SUMMARY_CHARS
+    assert summary.endswith("…")
+
+
+def test_design_doc_index_empty_doc():
+    assert _design_doc_index(None) == {"sections": []}
+    assert _design_doc_index({}) == {"sections": []}
+
+
+def test_summarize_design_doc_index_drops_summaries_keeps_skeleton():
+    """The budget-pressure fallback drops per-entry summaries but keeps the
+    navigation skeleton (key + status + modules + presence_warning)."""
+    index = _design_doc_index(
+        {
+            "systems/auth": {
+                "status": "mature",
+                "description": "prose here",
+                "modules": ["backend/app/auth.py"],
+            }
+        }
+    )
+    assert "summary" in index["sections"][0]
+    skeleton = _summarize_design_doc_index(index)
+    entry = skeleton["sections"][0]
+    assert "summary" not in entry
+    assert entry["key"] == "systems/auth"
+    assert entry["status"] == "mature"
+    assert entry["modules"] == ["backend/app/auth.py"]
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_ships_design_doc_index_not_full_prose(
+    db_session, mocker
+):
+    """The strategic_review packed payload carries the compact design_doc index
+    (not full inline prose) for every non-internal section, with reconciled
+    presence statuses on systems/capabilities."""
+    unique = "UNIQUE_PROSE_MARKER_SR_" + ("z" * 4000)
+    design_doc = {
+        "systems/auth": {
+            "status": "mature",
+            "description": unique,
+            "modules": ["backend/app/auth.py"],
+        },
+        "capabilities/login": {
+            "status": "working",
+            "notes": unique,
+            "modules": ["backend/app/auth.py"],
+        },
+        "notes/roadmap": {"title": "Roadmap", "body": unique},
+    }
+    # Passthrough grounding so the index is built from exactly this doc and the
+    # presence statuses are deterministic (no git/GitHub dependency in tests).
+    mocker.patch(
+        "app.strategic_spawning.ground_design_doc",
+        new=AsyncMock(side_effect=lambda doc, **kw: doc),
+    )
+    project = _make_project(vision={"purpose": "p"}, design_doc=design_doc)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )
+    payload = result.scalars().all()[0].payloads[0]
+
+    dd = payload["design_doc"]
+    assert set(dd.keys()) == {"sections"}
+    by_key = {e["key"]: e for e in dd["sections"]}
+    assert set(by_key) == {"systems/auth", "capabilities/login", "notes/roadmap"}
+    assert by_key["systems/auth"]["status"] == "mature"
+    assert by_key["systems/auth"]["modules"] == ["backend/app/auth.py"]
+    # Full prose is NOT inline anywhere in the packed design_doc field.
+    assert unique not in json.dumps(dd)
+
+
+@pytest.mark.asyncio
+async def test_design_doc_update_ships_design_doc_index_not_full_prose(
+    db_session, mocker
+):
+    """The design_doc_update packed payload also carries the compact index and
+    not the full inline prose."""
+    unique = "UNIQUE_PROSE_MARKER_DDU_" + ("z" * 4000)
+    design_doc = {
+        "systems/auth": {
+            "status": "mature",
+            "description": unique,
+            "modules": ["backend/app/auth.py"],
+        },
+        "capabilities/login": {
+            "status": "working",
+            "notes": unique,
+            "modules": ["backend/app/auth.py"],
+        },
+    }
+    mocker.patch(
+        "app.strategic_spawning.ground_design_doc",
+        new=AsyncMock(side_effect=lambda doc, **kw: doc),
+    )
+    project = _make_project(vision={"purpose": "p"}, design_doc=design_doc)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )
+    payload = result.scalars().all()[0].payloads[0]
+    assert payload["type"] == "design_doc_update"
+
+    dd = payload["design_doc"]
+    assert set(dd.keys()) == {"sections"}
+    by_key = {e["key"]: e for e in dd["sections"]}
+    assert set(by_key) == {"systems/auth", "capabilities/login"}
+    assert by_key["capabilities/login"]["status"] == "working"
+    assert unique not in json.dumps(dd)

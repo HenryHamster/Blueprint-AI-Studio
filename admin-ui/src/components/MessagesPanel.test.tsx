@@ -6,7 +6,7 @@ import { MessagesPanel } from './MessagesPanel';
 import { classifySignalLevel, effectiveSignal, loadEventPrefs, saveEventPrefs, EVENT_PREFS_KEY, eventPrefsKey, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity, isCriticalSeverity, loadTemporaryMutes, saveTemporaryMutes, isEventTypeTemporarilyMuted } from './MessagesPanel.utils';
 import type { ProjectMessage } from './MessageBubble';
 import type { SavedView } from './MessagesPanel.utils';
-import { armingToastCopy, armingHintCopy, type ArmingOutcome } from './messageArming';
+import { armingToastCopy, armingHintCopy, parseArmingOutcome, type ArmingOutcome } from './messageArming';
 
 // Full replacement (NOT a partial mock): the real `../firebase` calls
 // initializeApp()/getAuth() at module load, which we must not run in jsdom.
@@ -368,6 +368,55 @@ describe('isFailingGroup', () => {
 
   test('returns false for empty array', () => {
     expect(isFailingGroup([])).toBe(false);
+  });
+});
+
+// ── armingToastCopy / parseArmingOutcome unit tests ──────────────────────────
+
+describe('arming outcomes', () => {
+  describe('parseArmingOutcome', () => {
+    test('recognizes steering', () => {
+      expect(parseArmingOutcome('steering')).toBe('steering');
+    });
+
+    test('recognizes passive_note', () => {
+      expect(parseArmingOutcome('passive_note')).toBe('passive_note');
+    });
+
+    test('recognizes routine_event', () => {
+      expect(parseArmingOutcome('routine_event')).toBe('routine_event');
+    });
+
+    test('recognizes not_armed', () => {
+      expect(parseArmingOutcome('not_armed')).toBe('not_armed');
+    });
+
+    test('recognizes duplicate', () => {
+      expect(parseArmingOutcome('duplicate')).toBe('duplicate');
+    });
+
+    test('returns null for unknown outcomes', () => {
+      expect(parseArmingOutcome('unknown')).toBeNull();
+      expect(parseArmingOutcome(123)).toBeNull();
+      expect(parseArmingOutcome(null)).toBeNull();
+      expect(parseArmingOutcome(undefined)).toBeNull();
+    });
+  });
+
+  describe('armingToastCopy', () => {
+    test('returns truthful toast for duplicate resend', () => {
+      expect(armingToastCopy('duplicate')).toBe('Message already sent — steer already armed');
+    });
+
+    test('returns generic copy for null outcome', () => {
+      expect(armingToastCopy(null)).toBe('Message sent');
+    });
+  });
+
+  describe('armingHintCopy', () => {
+    test('returns truthful hint for duplicate resend', () => {
+      expect(armingHintCopy('duplicate')).toBe('Message already sent — steer already armed.');
+    });
   });
 });
 
@@ -3520,5 +3569,241 @@ describe('MessagesPanel send arming receipt', () => {
     // Hint falls back to the type-based prediction (FEEDBACK → steering).
     expect(hintText(el)).toBe(armingHintCopy('steering'));
   });
+
+  test('a failed send and its retry reuse one idempotency key, so a double-submit is one logical message', async () => {
+    const postKeys: unknown[] = [];
+    let postCount = 0;
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'POST') {
+        const body = JSON.parse(String((init as RequestInit).body));
+        postKeys.push(body.idempotency_key);
+        postCount += 1;
+        // First attempt fails server-side → the draft's key must be retained so
+        // the retry carries the SAME key and the backend dedups it.
+        if (postCount === 1) return new Response('boom', { status: 500 });
+        return new Response(
+          JSON.stringify({ id: 'm1', status: 'created', arming: 'steering' }),
+          { status: 200 },
+        );
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+      }
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      return new Response('', { status: 404 });
+    });
+    const addToast = vi.fn();
+    const el = await renderPanel(addToast);
+
+    // First send fails — content is retained (only cleared on success).
+    await typeAndSend(el, 'please prioritize the migration work');
+    await waitFor(() => expect(addToast).toHaveBeenCalled());
+
+    // Retry the SAME draft: the key must match so it collapses to one message.
+    const sendBtn = el.querySelector('button[class*="bg-blue-600"]') as HTMLButtonElement;
+    expect(sendBtn.disabled).toBe(false);
+    await act(async () => { sendBtn.click(); });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+
+    expect(postKeys.length).toBe(2);
+    expect(postKeys[0]).toBeTruthy();
+    expect(postKeys[0]).toBe(postKeys[1]);
+
+    // A subsequent distinct message mints a FRESH key (no false dedup).
+    await typeAndSend(el, 'a different steering message');
+    expect(postKeys.length).toBe(3);
+    expect(postKeys[2]).toBeTruthy();
+    expect(postKeys[2]).not.toBe(postKeys[0]);
+  });
 });
 
+
+describe('MessagesPanel strategic-refresh pending badge', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  beforeEach(() => { localStorage.clear(); });
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  // Installs a mock where GET /api/admin/projects/{id} returns the supplied vision,
+  // and the messages list is empty. Mirrors _setupApiFetchMock's URL routing.
+  function _mockWithVision(vision: Record<string, unknown> | null): void {
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: Date.now() + 1e9 }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+      }
+      // Project detail GET carries the vision marker; tolerate trailing query.
+      if (/\/api\/admin\/projects\/[^/]+($|\?)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ vision: vision ?? {} }), { status: 200 });
+      }
+      if (method === 'GET' && (
+        urlStr.includes('/noise-prefs') || urlStr.includes('/saved-views') ||
+        urlStr.includes('/temp-mutes') || urlStr.includes('/mute-window')
+      )) {
+        return new Response('', { status: 404 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+  }
+
+  async function renderPanel(vision: Record<string, unknown> | null, strategistActive = false) {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _mockWithVision(vision);
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+          strategistActive={strategistActive}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    return host as HTMLDivElement;
+  }
+
+  test('shows pending badge with origin + age when marker is present', async () => {
+    const el = await renderPanel({
+      _strategic_refresh: { requested_at: new Date(Date.now() - 60_000).toISOString(), origin: 'steering', reason: 'op', count: 1 },
+    });
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).toContain('steering');
+  });
+
+  test('hides pending badge when no marker is present', async () => {
+    const el = await renderPanel({});
+    expect(el.textContent).not.toContain('Strategic cycle pending');
+  });
+
+  test('hides pending badge once the cycle is running (strategistActive)', async () => {
+    const el = await renderPanel(
+      { _strategic_refresh: { requested_at: new Date().toISOString(), origin: 'steering' } },
+      true,
+    );
+    expect(el.textContent).not.toContain('Strategic cycle pending');
+    expect(el.textContent).toContain('Strategist working');
+  });
+
+  test('Cancel button posts to cancel-strategic-refresh and clears the badge', async () => {
+    const el = await renderPanel({
+      _strategic_refresh: { requested_at: new Date(Date.now() - 60_000).toISOString(), origin: 'steering' },
+    });
+    const cancelBtn = Array.from(el.querySelectorAll('button')).find(b => b.textContent === 'Cancel');
+    expect(cancelBtn).toBeTruthy();
+
+    // After cancel, the project GET returns no marker so the badge clears.
+    _mockWithVision({});
+    await act(async () => { cancelBtn!.click(); });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+
+    const mock = apiFetch as ReturnType<typeof vi.fn>;
+    const calledCancel = mock.mock.calls.some(([url, init]) =>
+      String(url).includes('/cancel-strategic-refresh') && (init as RequestInit | undefined)?.method === 'POST');
+    expect(calledCancel).toBe(true);
+    expect(el.textContent).not.toContain('Strategic cycle pending');
+  });
+
+  test('no Cancel button on the receipt (non-pending) state', async () => {
+    const el = await renderPanel({
+      _strategic_refresh_last_fired_at: new Date(Date.now() - 60_000).toISOString(),
+      _strategic_refresh_last_fired_origin: 'operator',
+    });
+    expect(el.textContent).toContain('Steer picked up');
+    const cancelBtn = Array.from(el.querySelectorAll('button')).find(b => b.textContent === 'Cancel');
+    expect(cancelBtn).toBeFalsy();
+  });
+
+  test('displays the directive excerpt when present', async () => {
+    const el = await renderPanel({
+      _strategic_refresh: {
+        requested_at: new Date(Date.now() - 60_000).toISOString(),
+        excerpt: 'Fix the flaky test in the auth module by adding proper setup/teardown',
+        origin: 'operator',
+        count: 1,
+      },
+    });
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).toContain('Fix the flaky test in the auth module by adding proper setup/teardown');
+  });
+
+  test('truncates long directives with ellipsis', async () => {
+    const longExcerpt = 'This is a very long directive text that should be truncated with ellipsis because it exceeds the maximum display length and we want to keep the UI compact and readable for the operator'.repeat(2);
+    const el = await renderPanel({
+      _strategic_refresh: {
+        requested_at: new Date(Date.now() - 60_000).toISOString(),
+        excerpt: longExcerpt,
+        origin: 'operator',
+        count: 1,
+      },
+    });
+    expect(el.textContent).toContain('Strategic cycle pending');
+    // Should contain first 120 chars of the excerpt
+    expect(el.textContent).toContain(longExcerpt.slice(0, 120));
+    expect(el.textContent).toContain('…');
+  });
+
+  test('displays coalesce count when count > 1', async () => {
+    const el = await renderPanel({
+      _strategic_refresh: {
+        requested_at: new Date(Date.now() - 60_000).toISOString(),
+        excerpt: 'Update the problem model for the new version',
+        origin: 'qualification',
+        count: 3,
+      },
+    });
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).toContain('+2 steers coalesced');
+  });
+
+  test('does not display coalesce info when count = 1', async () => {
+    const el = await renderPanel({
+      _strategic_refresh: {
+        requested_at: new Date(Date.now() - 60_000).toISOString(),
+        excerpt: 'Update the problem model for the new version',
+        origin: 'operator',
+        count: 1,
+      },
+    });
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).not.toContain('coalesced');
+  });
+
+  test('displays multiple pending details together', async () => {
+    const el = await renderPanel({
+      _strategic_refresh: {
+        requested_at: new Date(Date.now() - 120_000).toISOString(),
+        excerpt: 'Investigate the performance regression in the query handler',
+        origin: 'operator',
+        count: 5,
+      },
+    });
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).toContain('Investigate the performance regression in the query handler');
+    expect(el.textContent).toContain('+4 steers coalesced');
+    expect(el.textContent).toContain('armed 2m ago');
+  });
+});

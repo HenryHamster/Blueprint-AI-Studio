@@ -25,6 +25,7 @@ from fastapi import HTTPException
 from app.task_completion import (
     _parse_plan_output,
     _extract_json_array,
+    _inject_build_on_deps,
     _inject_file_overlap_deps,
     _log_file_overlaps,
     _compute_first_attempt_succeeded,
@@ -388,6 +389,118 @@ class TestInjectFileOverlapDeps:
                 st.pop("depends_on_indices", None)
         # After revert, plan should be valid again
         assert _validate_plan_dependencies(subtasks) is True
+
+
+# ── _inject_build_on_deps ────────────────────────────────────────────────────
+
+
+class TestInjectBuildOnDeps:
+    def test_consumer_referencing_new_module_is_ordered(self):
+        """B builds a feature in a different file that imports A's new module."""
+        subtasks = [
+            {
+                "title": "feat: add auth client module",
+                "prompt": "Create the auth client.",
+                "related_files": ["src/auth/client.py"],
+            },
+            {
+                "title": "feat: wire login flow",
+                "prompt": "Add a login flow that imports src/auth/client.py.",
+                "related_files": ["src/routes/login.py"],
+            },
+        ]
+        added = _inject_build_on_deps(subtasks)
+        assert 0 in subtasks[1].get("depends_on_indices", [])
+        assert (0, 1, "src/auth/client.py") in added
+
+    def test_no_reference_stays_parallel(self):
+        """Independent subtasks in different files get no build-on edge."""
+        subtasks = [
+            {
+                "title": "A",
+                "prompt": "Create src/a.py.",
+                "related_files": ["src/a.py"],
+            },
+            {
+                "title": "B",
+                "prompt": "Create src/b.py, an unrelated helper.",
+                "related_files": ["src/b.py"],
+            },
+        ]
+        added = _inject_build_on_deps(subtasks)
+        assert added == []
+        assert "depends_on_indices" not in subtasks[1]
+
+    def test_same_file_left_to_overlap_pass(self):
+        """When the consumer also edits the file, no build-on edge is added.
+
+        The same-file case is already serialized by _inject_file_overlap_deps;
+        build-on injection must not double-handle it.
+        """
+        subtasks = [
+            {
+                "title": "A",
+                "prompt": "Create src/shared.py.",
+                "related_files": ["src/shared.py"],
+            },
+            {
+                "title": "B",
+                "prompt": "Extend src/shared.py with a helper.",
+                "related_files": ["src/shared.py"],
+            },
+        ]
+        added = _inject_build_on_deps(subtasks)
+        assert added == []
+
+    def test_no_backward_edge(self):
+        """A reference from an EARLIER subtask to a later one adds no edge."""
+        subtasks = [
+            {
+                "title": "consumer first",
+                "prompt": "Use src/late.py once it exists.",
+                "related_files": ["src/early.py"],
+            },
+            {
+                "title": "producer second",
+                "prompt": "Create the module.",
+                "related_files": ["src/late.py"],
+            },
+        ]
+        added = _inject_build_on_deps(subtasks)
+        assert added == []
+        assert "depends_on_indices" not in subtasks[0]
+
+    def test_bounded_match_avoids_substring_false_positive(self):
+        """Short path a.py must not match inside data.py in the prompt."""
+        subtasks = [
+            {
+                "title": "A",
+                "prompt": "Create a.py.",
+                "related_files": ["a.py"],
+            },
+            {
+                "title": "B",
+                "prompt": "Create data.py, a fresh dataset loader.",
+                "related_files": ["data.py"],
+            },
+        ]
+        added = _inject_build_on_deps(subtasks)
+        assert added == []
+
+    def test_merges_with_existing_explicit_deps(self):
+        subtasks = [
+            {"title": "A", "prompt": "Create src/m.py.", "related_files": ["src/m.py"]},
+            {
+                "title": "B",
+                "prompt": "Build on src/m.py.",
+                "related_files": ["src/b.py"],
+                "depends_on_indices": [99],
+            },
+        ]
+        _inject_build_on_deps(subtasks)
+        deps = subtasks[1].get("depends_on_indices", [])
+        assert 0 in deps
+        assert 99 in deps
 
 
 # ── _log_file_overlaps ───────────────────────────────────────────────────────

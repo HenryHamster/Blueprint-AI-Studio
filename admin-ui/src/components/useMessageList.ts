@@ -69,10 +69,12 @@ export function useMessageList({
     return false;
   };
 
-  const { openMessages, resolvedMessages, openFeedbackMessages } = useMemo(() => {
+  const { openMessages, linkedMessages, resolvedMessages, openFeedbackMessages } = useMemo(() => {
     const open = messages.filter(m => m.status === 'open' && (!criticalOnly || isCriticalSeverity(m)));
+    const linked = messages.filter(m => m.status === 'linked' && (!criticalOnly || isCriticalSeverity(m)));
     return {
       openMessages: open,
+      linkedMessages: linked,
       resolvedMessages: messages.filter(m => m.status === 'resolved'),
       openFeedbackMessages: open.filter(m => m.message_type === 'FEEDBACK' && matchesSearch(m)),
     };
@@ -216,6 +218,7 @@ export function useMessageList({
 
   return {
     openMessages,
+    linkedMessages,
     resolvedMessages,
     openFeedbackMessages,
     newHighSignalCount,

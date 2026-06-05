@@ -16,6 +16,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from app.migration_reconciliation import AUTHORIZED_DIVERGENCES
+
 logger = logging.getLogger(__name__)
 
 # Hardcoded fallback used when promotion_policy.yaml is missing, unreadable, or
@@ -49,6 +51,7 @@ def compute_composite(
     *,
     smoketest_enabled: bool = True,
     ci_state: str = "red",  # _CI_RED — defined later in module; use literal here
+    migration_collision: bool = False,
 ) -> dict[str, Any]:
     """Compute the composite promotion confidence for a release candidate.
 
@@ -58,6 +61,13 @@ def compute_composite(
         (``"ci_not_green"``).
       * ``not ci_green`` + ``ci_state != _CI_RED``  — CI could not be evaluated
         (pending, no check-runs, or I/O degraded) (``"ci_unresolved"``).
+      * ``migration_collision`` is True — a deterministic Alembic
+        revision-identity collision between the candidate and the deployed
+        promotion target (the back-merge renumber class, prod incident
+        2026-06-04) (``"migration_identity_collision"``).  The caller
+        (``release_qualifier._finalize_qualification``) precomputes this with
+        ``find_content_divergent_revisions`` and the existing GitHub fetch
+        helpers — this function stays pure and only consumes the boolean.
       * ``smoketest_score`` is None — the smoketest never produced a usable
         score, treated as a startup-suite failure
         (``"smoketest_startup_failed"``).  ONLY checked when
@@ -131,6 +141,12 @@ def compute_composite(
         # no check-runs, or GitHub I/O degraded).  Only a real red build is a
         # quality blocker; unresolved CI is a resolution/infrastructure concern.
         blocker = "ci_not_green" if ci_state == _CI_RED else "ci_unresolved"
+    elif migration_collision:
+        # A deterministic Alembic revision-identity collision between the
+        # candidate and the deployed promotion target — checked ahead of the
+        # audit-derived blockers so it is a clear, attributed gate rather than a
+        # soft, score-eroding audit finding the spawned auditor might miss.
+        blocker = "migration_identity_collision"
     elif smoketest_enabled and smoketest_score is None:
         # Only a hard blocker when the smoketest subsystem was actually
         # enabled — a disabled subsystem legitimately produces no score.
@@ -239,6 +255,75 @@ def _finding_is_verified(f: dict, sev: str) -> bool:
     return sum(1 for c in note if not c.isspace()) >= 20
 
 
+# Phrases that mark an audit finding as being about the Alembic
+# revision-identity / back-merge-renumber concern — the exact dimension the
+# deterministic migration-identity gate (compute_composite migration_collision
+# + check_qualification_migration_identity) already owns.  A finding is
+# delegated to that gate (and excluded from the audit deduction) ONLY when it
+# names a registry-listed divergence's revision id AND uses one of these
+# identity/renumber phrases.  Genuine migration-BODY defects (bad DDL, missing
+# downgrade, data-loss risk) use none of these phrases, so they keep deducting.
+_REVISION_IDENTITY_PHRASES: tuple[str, ...] = (
+    "revision id",
+    "revision-id",
+    "revision identity",
+    "revision-identity",
+    "renumber",
+    "re-number",
+    "back-merge",
+    "backmerge",
+    "back merge",
+    "collision",
+    "reused",
+    "re-used",
+    "duplicate revision",
+    "same revision",
+)
+
+
+def _finding_subject_is_authorized_divergence(f: dict) -> bool:
+    """Return True when a finding's subject is an authorized, registry-listed
+    Alembic revision-identity divergence already owned by the deterministic
+    migration-identity gate.
+
+    The release audit is a general LLM scan over ``git diff main...<candidate>``;
+    that diff necessarily contains the authorized ``0143`` back-merge renumber
+    until the candidate actually promotes, so a competent auditor flags it as a
+    correctness/architecture finding.  Counting that deduction double-penalizes
+    the same divergence the gate (compute_composite ``migration_collision``)
+    already evaluates and deploy-time reconciliation handles.  This delegates
+    such findings to the gate by excluding them from the audit sub-score.
+
+    The match is deliberately narrow: the finding text must name a
+    registry-listed divergence's revision id AND use a revision-identity /
+    renumber phrase (or name both the deployed and integration migration
+    identities of that revision).  Findings about a migration's BODY (broken
+    DDL, missing downgrade, destructive re-apply) match neither and continue to
+    deduct normally.
+    """
+    if not isinstance(f, dict):
+        return False
+    text = " ".join(
+        str(f.get(k, ""))
+        for k in ("summary", "description", "title", "text", "file", "verification_note")
+    ).lower()
+    if not text:
+        return False
+    for div in AUTHORIZED_DIVERGENCES:
+        if div.revision.lower() not in text:
+            continue
+        if any(p in text for p in _REVISION_IDENTITY_PHRASES):
+            return True
+        # The back-merge identity swap named explicitly (both migration
+        # identities of the reused revision) is itself the divergence concern.
+        if (
+            div.deployed_identity.lower() in text
+            and div.integration_identity.lower() in text
+        ):
+            return True
+    return False
+
+
 def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | None]:
     """Derive ``(audit_score, test_erosion_score)`` from a RELEASE_AUDIT_REPORT.
 
@@ -270,8 +355,13 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
         for f in findings:
             if isinstance(f, dict):
                 sev = str(f.get("severity") or f.get("level") or "").lower()
-                if sev and _finding_is_verified(f, sev):
-                    derived -= _AUDIT_DEDUCTIONS.get(sev, _AUDIT_DEDUCTION_UNKNOWN)
+                if not sev or not _finding_is_verified(f, sev):
+                    continue
+                if _finding_subject_is_authorized_divergence(f):
+                    # Owned by the deterministic migration-identity gate — do
+                    # not double-count it as an audit deduction.
+                    continue
+                derived -= _AUDIT_DEDUCTIONS.get(sev, _AUDIT_DEDUCTION_UNKNOWN)
     derived = _clamp01(derived)
     missing_reason = _audit_missing_reason(report)
     audit_score: float | None = derived
@@ -397,6 +487,10 @@ def _compute_audit_reconciliation(report: dict[str, Any] | None) -> dict[str, An
                 sev = str(f.get("severity") or f.get("level") or "").lower()
                 if sev:
                     if _finding_is_verified(f, sev):
+                        if _finding_subject_is_authorized_divergence(f):
+                            # Delegated to the migration-identity gate — mirror
+                            # _score_audit and apply no deduction here.
+                            continue
                         derived -= _AUDIT_DEDUCTIONS.get(sev, _AUDIT_DEDUCTION_UNKNOWN)
                     elif sev in _SEVERITIES_REQUIRING_VERIFICATION:
                         excluded_count += 1

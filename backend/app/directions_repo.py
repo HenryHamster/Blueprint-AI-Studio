@@ -189,6 +189,167 @@ async def sync_directions(
         )
 
 
+async def activate_eligible_staged_directions(
+    session: AsyncSession,
+    project_id,
+    promoted_version_number: int,
+) -> List[str]:
+    """Activate staged directions whose target version has promoted/opened.
+
+    A *staged* direction (``status == "staged"``) is inert work marked to begin
+    only after the version that was OPEN when it was staged has promoted. The
+    per-direction ``staged_for_version`` marker records that version number.
+
+    This flips to ``active`` every staged direction whose
+    ``staged_for_version <= promoted_version_number``, clears the
+    ``staged_for_version`` marker, and stamps ``staged_activated_at``. It is the
+    single shared activation entry point used by BOTH the version-open promotion
+    hook and the reaper durability backstop, so the two paths can never diverge.
+
+    Idempotency / gating guarantees:
+      - Activating an already-``active`` direction is a no-op (only ``staged``
+        rows are touched), so repeated sweeps converge.
+      - A direction staged DURING the version that just opened
+        (``staged_for_version > promoted_version_number``) stays staged — its
+        target version has not promoted yet.
+      - A staged direction with a missing/unparseable ``staged_for_version`` is
+        activated (fail-open) so a malformed marker can never strand work forever.
+
+    Runs the mutation under the project-row lock via ``with_directions_locked``
+    (which dual-writes the normalised ``direction`` table), commits, then
+    broadcasts ``emit_strategic_updated(project_id, STRATEGIC_KIND_DIRECTIONS)``
+    when at least one direction was activated. Returns the list of activated
+    direction ids (empty when nothing was eligible).
+
+    Best-effort contract: callers wrap this in try/except so an activation
+    failure can never abort the promotion / reaper sweep that invoked it.
+    """
+    # Lazy imports: task_locking imports directions_repo (sync_directions), so a
+    # module-level import here would create a cycle. strategic_events is only
+    # needed for the post-commit broadcast.
+    from app.task_locking import with_directions_locked
+    from app.strategic_events import (
+        STRATEGIC_KIND_DIRECTIONS,
+        emit_strategic_updated,
+    )
+
+    # Bound notes the same way every other direction note writer does, so a
+    # repeatedly-staged/activated direction can't grow its notes array forever.
+    from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX
+
+    activated: List[str] = []
+    activated_meta: List[Dict[str, Any]] = []
+    now_iso = _utcnow().isoformat()
+
+    def _mutate(directions: List[Dict[str, Any]]) -> None:
+        for d in directions:
+            if d.get("status") != "staged":
+                continue
+            target = d.get("staged_for_version")
+            try:
+                target_n: int | None = int(target)
+            except (TypeError, ValueError):
+                # Unparseable marker — fail open so malformed staging can't
+                # strand the direction forever.
+                target_n = None
+            if target_n is not None and target_n > promoted_version_number:
+                # Staged during the version that just opened — its target
+                # version has not promoted yet; leave it staged.
+                continue
+            d["status"] = "active"
+            d.pop("staged_for_version", None)
+            d["staged_activated_at"] = now_iso
+            # Symmetric with the staging-IN note: record why the direction
+            # resumed and which version's promotion triggered it.
+            notes = d.get("notes", [])
+            notes.append(
+                {
+                    "text": (
+                        f"Auto-activated: v{promoted_version_number} promoted "
+                        "— staged work resumed"
+                    ),
+                    "added_at": now_iso,
+                }
+            )
+            d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+            did = d.get("id")
+            if did:
+                activated.append(str(did))
+            activated_meta.append(
+                {"id": str(did) if did else None, "text": d.get("text")}
+            )
+
+    applied = await with_directions_locked(session, project_id, _mutate)
+    if not applied or not activated:
+        return []
+    # Best-effort operator notification — posted into the SAME session so it
+    # rides the commit below atomically with the activation notes. Wrapped in
+    # its own try/except (log-and-swallow) so a notification failure can never
+    # abort the already-decided activation. Lazy import preserves this module's
+    # documented cycle avoidance.
+    try:
+        from app.notification_dispatch import (
+            post_staged_directions_activated_message,
+        )
+
+        await post_staged_directions_activated_message(
+            session, project_id, activated_meta, promoted_version_number
+        )
+    except Exception as exc:  # noqa: BLE001 — notification is strictly best-effort
+        logger.warning(
+            "[directions_repo] staged-activation notification failed for project "
+            "%s (activation will still commit): %s",
+            project_id,
+            exc,
+        )
+    await session.commit()
+    try:
+        await emit_strategic_updated(project_id, STRATEGIC_KIND_DIRECTIONS)
+    except Exception as exc:  # noqa: BLE001 — broadcast is a best-effort UI signal
+        logger.warning(
+            "[directions_repo] staged-activation broadcast failed for project "
+            "%s (activation committed): %s",
+            project_id,
+            exc,
+        )
+    # Best-effort: resolve any open "stale staged direction" alert for the
+    # directions we just activated. This is exactly the moment a long-stalled
+    # staged direction finally activates, so a lingering WARNING alert is most
+    # likely there — clear it so the operator UI doesn't show a phantom stall.
+    # Placed AFTER the commit above and wrapped in try/except (log-and-swallow)
+    # so a resolution failure can never affect the already-committed activation.
+    # Lazy import preserves this module's documented cycle avoidance.
+    try:
+        from app.alert_dispatch import _resolve_stale_staged_direction_alerts
+
+        dismissed = await _resolve_stale_staged_direction_alerts(
+            session, project_id, activated
+        )
+        if dismissed:
+            logger.info(
+                "[directions_repo] resolved %d stale-staged-direction alert(s) "
+                "for project %s on activation",
+                dismissed,
+                project_id,
+            )
+    except Exception as exc:  # noqa: BLE001 — alert resolution is strictly best-effort
+        logger.warning(
+            "[directions_repo] staged-activation alert resolution failed for "
+            "project %s (activation committed): %s",
+            project_id,
+            exc,
+        )
+    logger.info(
+        "[directions_repo] activated %d staged direction(s) for project %s "
+        "(promoted_version=%d): %s",
+        len(activated),
+        project_id,
+        promoted_version_number,
+        ", ".join(activated),
+    )
+    return activated
+
+
 async def expire_proposals(
     session: AsyncSession, project_id, cutoff_iso: str
 ) -> int:

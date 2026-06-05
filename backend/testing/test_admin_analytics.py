@@ -495,6 +495,86 @@ class TestTaskCostBreakdown:
             round(3600 * admin_analytics.ON_DEMAND_RATE, 2)
         )
 
+    @pytest.mark.asyncio
+    async def test_max_tasks_caps_materialized_set(
+        self, client: AsyncClient, db_session
+    ):
+        """The query is bounded by max_tasks so a large backlog can't OOM the worker.
+
+        With max_tasks=2 and three in-window tasks, only the two most recently
+        created rows are materialized, and the response flags truncation.
+        """
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        now = _utcnow()
+        for minutes_ago in (10, 20, 30):
+            completed_at = now - timedelta(minutes=minutes_ago)
+            started_at = completed_at - timedelta(seconds=600)
+            db_session.add(
+                make_task(
+                    project_id=project.id,
+                    title=f"Task {minutes_ago}",
+                    status=TaskStatus.COMPLETED,
+                    created_by="ORCHESTRATOR",
+                    payloads=[{"type": "create", "prompt": "x"}],
+                    started_at=started_at,
+                    created_at=started_at,
+                    status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+                    vm_provisioned_at=started_at,
+                    vm_stopped_at=completed_at,
+                    vm_spot=False,
+                )
+            )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/task-cost-breakdown?project_id={project.id}&window=1h&max_tasks=2"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["max_tasks"] == 2
+        assert body["truncated"] is True
+        # Only the two most-recently-created tasks survive the LIMIT.
+        assert body["task_count"] == 2
+        assert {t["task_title"] for t in body["top_tasks"]} == {"Task 10", "Task 20"}
+
+    @pytest.mark.asyncio
+    async def test_truncated_false_when_under_cap(
+        self, client: AsyncClient, db_session
+    ):
+        """truncated is False when the result set fits under max_tasks."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        now = _utcnow()
+        completed_at = now - timedelta(minutes=10)
+        started_at = completed_at - timedelta(seconds=600)
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="Only task",
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[{"type": "create", "prompt": "x"}],
+                started_at=started_at,
+                created_at=started_at,
+                status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+                vm_provisioned_at=started_at,
+                vm_stopped_at=completed_at,
+                vm_spot=False,
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/task-cost-breakdown?project_id={project.id}&window=1h"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["max_tasks"] == 5000
+        assert body["truncated"] is False
+
 
 class TestOpenPrs:
     @pytest.fixture(autouse=True)

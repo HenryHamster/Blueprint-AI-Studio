@@ -8,7 +8,7 @@ import type { useDirectionForm } from '../hooks/useDirectionForm';
 export type DirectionCategoryFilter = 'all' | 'product' | 'structural' | 'mixed';
 
 export interface DirectionGroup {
-  key: 'proposed' | 'active' | 'paused' | 'completed' | 'expired';
+  key: 'proposed' | 'active' | 'staged' | 'paused' | 'completed' | 'expired';
   label: string;
   items: Direction[];
 }
@@ -30,6 +30,9 @@ export interface DirectionsListProps {
   rejectProposal: (id: string) => Promise<void>;
   reviveProposal: (id: string) => Promise<void>;
   reactivateDirection: (id: string) => Promise<void>;
+  activateStagedDirection: (id: string) => Promise<void>;
+  retargetStagedDirection: (id: string, version: number) => Promise<void>;
+  cancelStagedDirection: (id: string) => Promise<void>;
   unholdDirection: (id: string) => Promise<void>;
   markDirectionComplete: (id: string) => Promise<void>;
   quickToggleStatus: (id: string, currentStatus: 'active' | 'paused') => Promise<void>;
@@ -46,6 +49,9 @@ export interface DirectionsListProps {
   researchSuccessIds: Record<string, boolean>;
   forceConfirmId: string | null;
   setForceConfirmId: React.Dispatch<React.SetStateAction<string | null>>;
+  // Open release version number staging targets, or null when no version is open
+  // (staging is then disabled — the backend rejects staging with no open version).
+  stageTargetVersion: number | null;
   onViewFindings?: (directionId: string) => void;
   onNavigateToTask?: (taskId: string) => void;
 }
@@ -74,6 +80,7 @@ export function DirectionsList(props: DirectionsListProps) {
     researchSuccessIds,
     forceConfirmId,
     setForceConfirmId,
+    stageTargetVersion,
     onViewFindings,
     onNavigateToTask,
   } = props;
@@ -126,6 +133,11 @@ export function DirectionsList(props: DirectionsListProps) {
                   <span className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider group-hover:text-neutral-300 transition-colors">
                     {label} ({items.length})
                   </span>
+                  {key === 'staged' && stageTargetVersion != null && (
+                    <span className="text-[10px] text-sky-400/70 normal-case">
+                      current open: v{stageTargetVersion}
+                    </span>
+                  )}
                 </button>
                 {!isCollapsed && (
                   <div className="space-y-2">
@@ -157,6 +169,9 @@ export function DirectionsList(props: DirectionsListProps) {
                         rejectProposal={props.rejectProposal}
                         reviveProposal={props.reviveProposal}
                         reactivateDirection={props.reactivateDirection}
+                        activateStagedDirection={props.activateStagedDirection}
+                        retargetStagedDirection={props.retargetStagedDirection}
+                        cancelStagedDirection={props.cancelStagedDirection}
                         unholdDirection={props.unholdDirection}
                         markDirectionComplete={props.markDirectionComplete}
                         quickToggleStatus={props.quickToggleStatus}
@@ -172,6 +187,7 @@ export function DirectionsList(props: DirectionsListProps) {
                         researchSuccessIds={researchSuccessIds}
                         forceConfirmId={forceConfirmId}
                         setForceConfirmId={setForceConfirmId}
+                        stageTargetVersion={stageTargetVersion}
                         onViewFindings={onViewFindings}
                         onNavigateToTask={onNavigateToTask}
                       />

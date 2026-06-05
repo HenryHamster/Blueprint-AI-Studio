@@ -329,11 +329,63 @@ _UNVERIFIED_REASON_LABELS = {
         "the PR targets an internal staging branch (CI is path-filtered there)"
     ),
     "undetected_runtime": "the detected test suite produced no usable verdict",
+    "suite_all_skipped": (
+        "a test suite was present but every test was skipped "
+        "(no real verification ran)"
+    ),
     "verify_setup_failed": (
         "the detected test suite exists but could not be run "
         "(setup/runner infrastructure failed after retries)"
     ),
+    "probe_passed": (
+        "no unit suite ran; only a cheap acceptance probe (compile/build) "
+        "passed — not real test verification"
+    ),
+    "probe_could_not_run": (
+        "no unit suite ran and the acceptance probe could not run "
+        "(missing deps/unprovisioned setup)"
+    ),
+    "probe_no_artifact": (
+        "no unit suite ran; the declared build command exited cleanly but "
+        "produced no artifact (possible no-op build) — not real verification"
+    ),
+    "documented_command_could_not_run": (
+        "a command the PR introduced/documented could not be run "
+        "(missing deps/unprovisioned setup) -- claim unverified"
+    ),
+    "documented_command_passed": (
+        "no unit suite ran; a command the PR introduced/documented was "
+        "executed and passed"
+    ),
 }
+
+# Severity escalation for no-CI UNVERIFIED-merge reasons: degraded environment/setup
+# failures escalate to ERROR, benign fall-open reasons stay WARNING.
+_UNVERIFIED_REASON_SEVERITY = {
+    # ERROR (degraded): environment/setup failure prevented verification that was expected
+    "verify_setup_failed": AlertSeverity.ERROR,
+    "undetected_runtime": AlertSeverity.ERROR,
+    "suite_all_skipped": AlertSeverity.ERROR,
+    "probe_could_not_run": AlertSeverity.ERROR,
+    "probe_no_artifact": AlertSeverity.ERROR,
+    "documented_command_could_not_run": AlertSeverity.ERROR,
+    # WARNING (benign): no verification expected or only positive signals obtained
+    "no_detectable_test_command": AlertSeverity.WARNING,
+    "kill_switch_off": AlertSeverity.WARNING,
+    "internal_staging_base": AlertSeverity.WARNING,
+    "probe_passed": AlertSeverity.WARNING,
+    "documented_command_passed": AlertSeverity.WARNING,
+}
+
+
+def _severity_for_unverified_reason(reason: str) -> AlertSeverity:
+    """Map an unverified-merge reason to its alert severity.
+
+    Degraded reasons (environment/setup failure blocked verification) escalate
+    to ERROR; benign reasons (no verification expected) stay WARNING. Defaults
+    to WARNING for unknown reasons to preserve backward compatibility.
+    """
+    return _UNVERIFIED_REASON_SEVERITY.get(reason, AlertSeverity.WARNING)
 
 
 async def _maybe_create_unverified_merge_alert(
@@ -674,6 +726,215 @@ async def _maybe_create_precondition_blocker_alert(
     return True
 
 
+# Stable title prefix for stale-staged-direction alerts. The title encodes the
+# direction id so dedup is per-direction: a single stalled staged direction
+# raises exactly ONE alert across many reaper sweeps, while distinct stalled
+# directions each get their own. Keep the prefix stable.
+_STALE_STAGED_DIRECTION_TITLE_PREFIX = "Stale staged direction"
+
+
+async def _maybe_create_stale_staged_direction_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    *,
+    direction_id: str,
+    direction_text: "str | None",
+    waited_days: int,
+    staged_for_version: "int | None",
+    open_version: "int | None",
+    severity: AlertSeverity = AlertSeverity.WARNING,
+) -> bool:
+    """Create a deduplicated operator Alert for a staged direction that has
+    waited past the staleness threshold while its target version has NOT yet
+    promoted.
+
+    A *staged* direction (``status == "staged"``, ``staged_for_version=N``) is
+    inert work that only begins once version ``N`` promotes/opens. The single
+    thing that un-stages it is that promotion — but a version can stay open far
+    longer than the ~14-day stall gate (deferred by repeated qualification
+    failures or operator inaction), stranding the staged direction indefinitely
+    and invisibly. This surfaces that stall so an operator can retarget,
+    force-activate, or cancel the work. Alerting only — it never mutates the
+    direction or its staging state.
+
+    Deduplicated by ``(project_id, title, dismissed_at IS NULL)`` where the title
+    encodes ``direction_id`` — so a staged direction that stays stale across many
+    reaper sweeps raises exactly ONE alert, and a genuinely *different* stalled
+    direction gets its own. ``project_id``-scoped with ``task_id=None`` (mirrors
+    the warm-pool payoff / strategic alerts). The waited age lives in the message
+    so a creeping age never defeats dedup. Returns ``True`` when it inserted a new
+    alert, ``False`` when dedup short-circuited.
+
+    Commits ONLY its own ``Alert`` row and broadcasts ``alert_created``; callers
+    (the reaper staleness sweep) wrap it best-effort so an alert failure can never
+    abort the sweep.
+    """
+    title = (
+        f"{_STALE_STAGED_DIRECTION_TITLE_PREFIX}: {str(direction_id)[:64]}"
+    )[:200]
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return False
+    label = (direction_text or "(no description)").strip()
+    if len(label) > 200:
+        label = label[:197] + "…"
+    target = (
+        f"v{staged_for_version}"
+        if staged_for_version is not None
+        else "an unknown version"
+    )
+    open_desc = (
+        f"the current open version is v{open_version}"
+        if open_version is not None
+        else "no open version is recorded"
+    )
+    message = (
+        f"Staged direction {direction_id} (\"{label}\") has waited "
+        f"{waited_days} day(s) for its target version ({target}) to promote, "
+        f"but {open_desc} — the version has not promoted, so the staged work "
+        f"is stalled. Retarget, force-activate, or cancel it."
+    )[:1000]
+    alert = Alert(
+        project_id=project_id,
+        severity=severity,
+        title=title,
+        message=message,
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": severity.value,
+            "title": alert.title,
+        },
+    )
+    return True
+
+
+async def _resolve_stale_staged_direction_alerts(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    direction_ids,
+) -> int:
+    """Dismiss any open stale-staged-direction alert for the given directions.
+
+    The companion to :func:`_maybe_create_stale_staged_direction_alert`. When a
+    staged direction's stall finally clears — most importantly when its target
+    version promotes and the direction auto-activates — the WARNING alert that
+    flagged the stall no longer describes a real condition and must be resolved,
+    mirroring how the deployment-HALTED recovery path stamps ``dismissed_at`` on
+    its alert once recovery happens.
+
+    The stale-staged alert title deterministically encodes the direction id, so
+    the matching open alert is looked up directly per direction. We rebuild the
+    lookup title with the SAME construction the create path uses (same prefix,
+    same truncation), so the comparison is byte-identical. Only open
+    (``dismissed_at IS NULL``), project-scoped (``task_id IS NULL``) alerts are
+    touched, so this is a safe no-op when no such alert exists and idempotent
+    across repeated calls (a second call finds nothing open to dismiss).
+
+    Stamps ``dismissed_at`` on each match, commits its own rows, and broadcasts
+    one ``alert_dismissed`` event per dismissed alert so the operator UI drops it
+    without waiting for the next poll. Returns the number of alerts dismissed.
+
+    Best-effort contract: callers wrap this in try/except so a resolution failure
+    can never abort the activation that triggered it.
+    """
+    titles = {
+        (f"{_STALE_STAGED_DIRECTION_TITLE_PREFIX}: {str(did)[:64]}")[:200]
+        for did in (direction_ids or [])
+        if did
+    }
+    if not titles:
+        return 0
+    result = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title.in_(titles),
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(open_alerts)
+
+
+# Shared title prefix for the "permanently blocked" ERROR escalation alert. The
+# create path appends the blocker_kind; the reconcile path matches on the prefix
+# so a resumed task's stale alert is dismissed regardless of which kind it named.
+_BLOCKED_ESCALATION_TITLE_PREFIX = "Task permanently blocked"
+
+
+async def _resolve_blocked_escalation_alert(
+    task: "Task",
+    session: AsyncSession,
+) -> int:
+    """Dismiss any open 'permanently blocked' ERROR alert for a resumed task.
+
+    The companion to :func:`_maybe_create_blocked_escalation_alert`. When a parked
+    (escalated) blocker's need finally becomes satisfiable and the recovery sweep
+    resumes the task, the ERROR alert that declared it permanently blocked no
+    longer describes a real condition and must be reconciled — mirroring how
+    :func:`_resolve_stale_staged_direction_alerts` dismisses its alert once the
+    underlying stall clears.
+
+    Matches on the deterministic title prefix (the create path appends the
+    blocker_kind, which may already have been cleared by the time we resume), so
+    any open ``Task permanently blocked: …`` alert for this task is dismissed.
+    Only open (``dismissed_at IS NULL``), task-scoped alerts are touched, so this
+    is a safe no-op when none exists and idempotent across repeated calls.
+
+    Best-effort contract: the caller wraps this in try/except so a reconcile
+    failure can never abort the resume that triggered it. Returns the number of
+    alerts dismissed.
+    """
+    result = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task.id,
+            Alert.dismissed_at.is_(None),
+            Alert.title.like(f"{_BLOCKED_ESCALATION_TITLE_PREFIX}%"),
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(task.project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(open_alerts)
+
+
 async def _maybe_create_blocked_escalation_alert(
     task: "Task",
     session: AsyncSession,
@@ -697,7 +958,7 @@ async def _maybe_create_blocked_escalation_alert(
     fires exactly once per blocked task and does not re-fire while the operator
     still has the alert open.
     """
-    title = f"Task permanently blocked: {blocker_kind}"[:200]
+    title = f"{_BLOCKED_ESCALATION_TITLE_PREFIX}: {blocker_kind}"[:200]
     existing = await session.execute(
         select(Alert).where(
             Alert.task_id == task.id,

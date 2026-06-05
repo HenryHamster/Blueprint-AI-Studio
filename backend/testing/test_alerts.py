@@ -16,6 +16,7 @@ from app.alert_dispatch import (
     _maybe_create_circuit_breaker_alert,
     _maybe_create_escalation_alert,
     _maybe_create_precondition_blocker_alert,
+    _maybe_create_stale_staged_direction_alert,
 )
 from app.deploy_health import (
     _create_auto_pause_alerts,
@@ -1862,3 +1863,109 @@ class TestSRCatchRateRegressionAlertRow:
             r for r in rows if r.title.startswith(_SR_REGRESSION_ALERT_TITLE_PREFIX)
         ]
         assert reg_rows == []
+
+
+class TestStaleStagedDirectionAlert:
+    """Tests for _maybe_create_stale_staged_direction_alert.
+
+    A project-scoped WARNING alert (task_id=None) deduplicated by
+    (project_id, direction-id-in-title); distinct directions get distinct
+    alerts; the message names the direction and how long it has waited.
+    """
+
+    async def _make_project(self, db_session):
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        return project
+
+    @pytest.mark.asyncio
+    async def test_creates_warning_alert_scoped_to_project(self, db_session, mocker):
+        mocker.patch(
+            "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+        )
+        project = await self._make_project(db_session)
+
+        created = await _maybe_create_stale_staged_direction_alert(
+            db_session,
+            project.id,
+            direction_id="dir-abc",
+            direction_text="Refactor the widget pipeline",
+            waited_days=30,
+            staged_for_version=4,
+            open_version=4,
+        )
+        assert created is True
+
+        alerts = await _all_alerts(db_session, project_id=project.id)
+        assert len(alerts) == 1
+        alert = alerts[0]
+        assert alert.severity == AlertSeverity.WARNING
+        assert alert.project_id == project.id
+        assert alert.task_id is None
+        assert "dir-abc" in alert.title
+        assert "30 day" in alert.message
+        assert "Refactor the widget pipeline" in alert.message
+
+    @pytest.mark.asyncio
+    async def test_deduplicates_same_direction(self, db_session, mocker):
+        mocker.patch(
+            "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+        )
+        project = await self._make_project(db_session)
+
+        first = await _maybe_create_stale_staged_direction_alert(
+            db_session, project.id, direction_id="dir-x",
+            direction_text="t", waited_days=25,
+            staged_for_version=3, open_version=3,
+        )
+        assert first is True
+        # A later sweep with a creeping age must NOT create a second alert.
+        second = await _maybe_create_stale_staged_direction_alert(
+            db_session, project.id, direction_id="dir-x",
+            direction_text="t", waited_days=40,
+            staged_for_version=3, open_version=3,
+        )
+        assert second is False
+        assert len(await _all_alerts(db_session, project_id=project.id)) == 1
+
+    @pytest.mark.asyncio
+    async def test_distinct_directions_get_distinct_alerts(self, db_session, mocker):
+        mocker.patch(
+            "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+        )
+        project = await self._make_project(db_session)
+
+        await _maybe_create_stale_staged_direction_alert(
+            db_session, project.id, direction_id="dir-1",
+            direction_text="one", waited_days=25,
+            staged_for_version=3, open_version=3,
+        )
+        await _maybe_create_stale_staged_direction_alert(
+            db_session, project.id, direction_id="dir-2",
+            direction_text="two", waited_days=25,
+            staged_for_version=3, open_version=3,
+        )
+        alerts = await _all_alerts(db_session, project_id=project.id)
+        assert len(alerts) == 2
+        titles = {a.title for a in alerts}
+        assert any("dir-1" in t for t in titles)
+        assert any("dir-2" in t for t in titles)
+
+    @pytest.mark.asyncio
+    async def test_broadcasts_alert_created_event(self, db_session, mocker):
+        mock_bc = mocker.patch(
+            "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+        )
+        project = await self._make_project(db_session)
+
+        await _maybe_create_stale_staged_direction_alert(
+            db_session, project.id, direction_id="dir-bc",
+            direction_text="t", waited_days=22,
+            staged_for_version=2, open_version=2,
+        )
+        mock_bc.assert_called_once()
+        call_args = mock_bc.call_args
+        assert call_args[0][0] == str(project.id)
+        assert call_args[0][1] == "alert_created"

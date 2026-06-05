@@ -5,6 +5,13 @@ import { StrategicAuditPanel } from './StrategicAuditPanel';
 import { isSafeUrl } from './TaskCard';
 import { apiFetch, fetchEvictedFindings, type EvictedFinding } from '../api';
 import { timeAgo } from '../utils/time';
+import {
+  hasNonCodeMergeOutcomes,
+  healthRateColorClass,
+  mergeOutcomeKindBreakdowns,
+  summarizeOutcomeKinds,
+  type OutcomeKindBreakdown,
+} from '../utils/outcomeKinds';
 
 export interface DirectionProgress {
   direction_id: string;
@@ -45,6 +52,14 @@ export interface DirectionProgress {
   history_aggregate?: { total_autonomous_prs_merged?: number | null; total_operator_actions?: number | null; evicted_findings?: number | null; [key: string]: unknown } | null;
   research_history?: Array<{ autonomous_prs_merged?: number | null; operator_action_count?: number | null; [key: string]: unknown }> | null;
   evicted_findings_count?: number | null;
+  // Generalized cross-task-type success (code merges + research/audit/memo/
+  // verification successes). Surfaced alongside — never instead of — PR metrics.
+  generalized_successes?: number | null;
+  generalized_terminal_outcomes?: number | null;
+  generalized_health_rate?: number | null;
+  outcome_kind_breakdown?: OutcomeKindBreakdown | null;
+  lifetime_generalized_successes?: number | null;
+  lifetime_generalized_health_rate?: number | null;
 }
 
 interface DirectionPortfolioSectionProps {
@@ -281,6 +296,19 @@ export function DirectionPortfolioSection({
   const evictedLoadedAtRef = useRef<number>(0);
   const evictedDrawerDirectionId = evictedDrawer?.directionId ?? null;
 
+  // Aggregate generalized (cross-type) success across directions, for the
+  // header summary line. Only surfaced when at least one non-code-merge lane
+  // has terminal outcomes — otherwise the count equals PR merges and the
+  // existing "PRs merged" stat already covers it (honest legacy degrade).
+  const generalizedSummary = useMemo(() => {
+    const merged = mergeOutcomeKindBreakdowns(directions.map(d => d.outcome_kind_breakdown ?? null));
+    if (!hasNonCodeMergeOutcomes(merged)) return null;
+    const successes = directions.reduce((sum, d) => sum + (d.generalized_successes ?? 0), 0);
+    const terminal = directions.reduce((sum, d) => sum + (d.generalized_terminal_outcomes ?? 0), 0);
+    const rate = terminal > 0 ? successes / terminal : null;
+    return { successes, terminal, rate };
+  }, [directions]);
+
   const taxonomyVisibleKeysByDir = useMemo(() => {
     const result = new Map<string, Array<typeof TAXONOMY_ORDER[number]>>();
     for (const d of directions) {
@@ -440,6 +468,20 @@ export function DirectionPortfolioSection({
             )}
             <span className="text-neutral-600">&middot;</span>
             <span>{totalDirPRs} PR{totalDirPRs !== 1 ? 's' : ''} merged</span>
+            {generalizedSummary && (
+              <>
+                <span className="text-neutral-600">&middot;</span>
+                <span
+                  className="flex items-center gap-1"
+                  title="Generalized success across all task types: evaluator-positive outcomes (code merges + research/audit/memo/verification) divided by terminal outcomes"
+                >
+                  <span className={healthRateColorClass(generalizedSummary.rate)}>
+                    {generalizedSummary.successes} eval-success
+                    {generalizedSummary.rate != null ? ` · ${Math.round(generalizedSummary.rate * 100)}%` : ''}
+                  </span>
+                </span>
+              </>
+            )}
             {hasAttribution && (totalAutonomousPRs != null || totalAssistedPRs != null) && (
               <>
                 <span className="text-neutral-600">&middot;</span>
@@ -475,6 +517,8 @@ export function DirectionPortfolioSection({
                 0,
                 Math.trunc(d.evicted_findings_count ?? d.history_aggregate?.evicted_findings ?? 0),
               );
+              const outcomeRows = summarizeOutcomeKinds(d.outcome_kind_breakdown);
+              const showGeneralized = outcomeRows.some(r => r.kind !== 'code_merge');
               return (
                 <div
                   key={d.direction_id}
@@ -495,6 +539,14 @@ export function DirectionPortfolioSection({
                     <span>{d.prs_merged} PR{d.prs_merged !== 1 ? 's' : ''}{d.prs_rejected != null && d.prs_rejected > 0 && <span className="text-red-400" title={`${d.prs_rejected} PR${d.prs_rejected !== 1 ? 's' : ''} rejected`}> · {d.prs_rejected} rej</span>}</span>
                     {d.product_ratio != null && (
                       <span className={d.product_ratio >= 0.6 ? 'text-emerald-400' : d.product_ratio >= 0.3 ? 'text-amber-400' : 'text-red-400'}>{Math.round(d.product_ratio * 100)}% prod</span>
+                    )}
+                    {showGeneralized && (
+                      <span
+                        className={healthRateColorClass(d.generalized_health_rate)}
+                        title="Generalized success across task types (code merges + research/audit/memo/verification), distinct from the PR-merge count"
+                      >
+                        {d.generalized_successes ?? 0} eval{d.generalized_health_rate != null ? ` · ${Math.round(d.generalized_health_rate * 100)}%` : ''}
+                      </span>
                     )}
                     {evictedCount > 0 && (
                       // eslint-disable-next-line viewport/min-touch-target -- dense inline badge inside compact direction card
@@ -545,6 +597,23 @@ export function DirectionPortfolioSection({
                   })()}
                   {taxonomyVisibleKeysByDir.has(d.direction_id) && <div className="flex gap-1 mt-1 flex-wrap">{(taxonomyVisibleKeysByDir.get(d.direction_id) ?? []).map(k => { const v = d.taxonomy_summary?.[k] ?? 0; return <span key={k} title={`${TAXONOMY_LABELS[k]}: ${v}`} className={`text-[9px] leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[k]}`}>{TAXONOMY_LABELS[k]} {v}</span>; })}</div>}
                   {d.scope_breakdown && Object.keys(d.scope_breakdown).length > 0 && <div className="flex gap-1 mt-1 flex-wrap">{(['small', 'medium', 'large'] as const).map(sz => { const s = d.scope_breakdown?.[sz]; if (!s || (!s.merged && !s.failed)) return null; const total = s.merged + s.failed; const rate = total > 0 ? s.merged / total : 0; const color = rate >= 0.7 ? 'border-emerald-700 bg-emerald-900/40 text-emerald-300' : rate >= 0.4 ? 'border-amber-700 bg-amber-900/40 text-amber-300' : 'border-red-700 bg-red-900/40 text-red-300'; const subtypes = [[s.failed_code_error, 'code'], [s.failed_infra, 'infra'], [s.failed_scope_overflow, 'scope']].filter(([v]) => typeof v === 'number' && (v as number) > 0).map(([v, l]) => `${v} ${l}`).join(', '); const subtypeStr = subtypes ? ` (${subtypes})` : ''; return <span key={sz} title={`${sz}: ${s.merged} merged / ${s.failed} failed${subtypeStr} (${Math.round(rate * 100)}%)`} className={`text-[9px] leading-none px-1 py-0.5 rounded border ${color}`}>{sz[0].toUpperCase()} {s.merged}/{s.failed}</span>; })}</div>}
+                  {showGeneralized && (
+                    <div className="flex gap-1 mt-1 flex-wrap">
+                      {outcomeRows.map(row => {
+                        const rate = row.terminal > 0 ? row.success / row.terminal : 0;
+                        const color = rate >= 0.7 ? 'border-emerald-700 bg-emerald-900/40 text-emerald-300' : rate >= 0.4 ? 'border-amber-700 bg-amber-900/40 text-amber-300' : 'border-slate-600 bg-slate-800/60 text-slate-300';
+                        return (
+                          <span
+                            key={row.kind}
+                            title={`${row.label}: ${row.success} success / ${row.neutral} neutral / ${row.failure} failure (${Math.round(rate * 100)}%)`}
+                            className={`text-[9px] leading-none px-1 py-0.5 rounded border ${color}`}
+                          >
+                            {row.label} {row.success}/{row.terminal}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  )}
                   {d.review_quality && (d.review_quality.reviews_dismissed || d.review_quality.reviews_overridden || d.review_quality.user_issues_caught) ? (
                     <div className="flex gap-1 mt-1 flex-wrap">
                       {d.review_quality.reviews_dismissed ? <span title="Automated reviews dismissed by the system" className="text-[9px] leading-none px-1 py-0.5 rounded border border-amber-700 bg-amber-900/40 text-amber-300">{d.review_quality.reviews_dismissed} dismissed</span> : null}

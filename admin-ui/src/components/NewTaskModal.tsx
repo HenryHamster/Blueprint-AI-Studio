@@ -1,31 +1,35 @@
 import { useState, useRef } from 'react';
-import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, AlertCircle, Loader2, ChevronDown, ArrowUpDown, Wrench } from 'lucide-react';
-import { USER_LAUNCHABLE_TASK_TYPE_OPTIONS } from '../taskCapabilities';
-import type { UserLaunchableTaskType } from '../taskCapabilities';
+import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, CheckSquare, AlertCircle, Loader2, ChevronDown, ArrowUpDown, Wrench, Boxes } from 'lucide-react';
+import type { LaunchableTaskTypeOption } from '../taskCapabilities';
 
-const TASK_TYPE_OPTION_ICONS: Record<UserLaunchableTaskType, typeof Plus> = {
+const TASK_TYPE_OPTION_ICONS: Record<string, typeof Plus> = {
   create: Plus,
   refactor: Wrench,
   plan: GitFork,
   research: Microscope,
   review: CheckCircle,
+  panel_review: CheckSquare,
   fix: AlertCircle,
   migrate: ArrowUpDown,
 };
+
+// Fallback icon for backend-registered launchable types that have no bespoke
+// frontend icon — keeps a dynamically-registered type renderable with no edit.
+const DEFAULT_TASK_TYPE_ICON = Boxes;
 
 interface NewTaskModalProps {
   newTaskRepo: string;
   newTaskBranch: string;
   newTaskTitle: string;
   newTaskPrompt: string;
-  newTaskType: UserLaunchableTaskType;
+  newTaskType: string;
   newTaskPrNumber: string;
   newTaskPrBranch: string;
   setNewTaskRepo: (value: string) => void;
   setNewTaskBranch: (value: string) => void;
   setNewTaskTitle: (value: string) => void;
   setNewTaskPrompt: (value: string) => void;
-  setNewTaskType: (value: UserLaunchableTaskType) => void;
+  setNewTaskType: (value: string) => void;
   setNewTaskPrNumber: (value: string) => void;
   setNewTaskPrBranch: (value: string) => void;
   newTaskModel: string;
@@ -45,6 +49,7 @@ interface NewTaskModalProps {
   useManualBranch: boolean;
   setUseManualBranch: React.Dispatch<React.SetStateAction<boolean>>;
   setBranchOptions: React.Dispatch<React.SetStateAction<string[]>>;
+  launchableTaskTypeOptions: LaunchableTaskTypeOption[];
   taskBranchDefaultsReady: boolean;
   taskBranchDefaultsLoading: boolean;
   taskBranchDefaultsError: string | null;
@@ -86,6 +91,7 @@ export function NewTaskModal({
   useManualBranch,
   setUseManualBranch,
   setBranchOptions,
+  launchableTaskTypeOptions,
   taskBranchDefaultsReady,
   taskBranchDefaultsLoading,
   taskBranchDefaultsError,
@@ -100,7 +106,7 @@ export function NewTaskModal({
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const prNumberRef = useRef<HTMLInputElement>(null);
 
-  const handleTaskTypeChange = (value: UserLaunchableTaskType) => {
+  const handleTaskTypeChange = (value: string) => {
     setNewTaskType(value);
     setNewTaskModel(getDefaultModelForType(value));
     setNewTaskEffort(getDefaultEffortForType(value));
@@ -113,7 +119,7 @@ export function NewTaskModal({
     setSubmitAttempted(true);
     if (repoError || branchError) return;
     if (!taskBranchDefaultsReady) return;
-    if ((newTaskType === 'review' || newTaskType === 'fix') && !isPrNumberValid(newTaskPrNumber)) {
+    if ((newTaskType === 'review' || newTaskType === 'panel_review' || newTaskType === 'fix') && !isPrNumberValid(newTaskPrNumber)) {
       setPrNumberError(true);
       prNumberRef.current?.focus();
       return;
@@ -227,8 +233,8 @@ export function NewTaskModal({
           <div className="mb-4">
             <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Task Type</label>
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
-              {USER_LAUNCHABLE_TASK_TYPE_OPTIONS.map(opt => {
-                const Icon = TASK_TYPE_OPTION_ICONS[opt.value];
+              {launchableTaskTypeOptions.map(opt => {
+                const Icon = TASK_TYPE_OPTION_ICONS[opt.value] ?? DEFAULT_TASK_TYPE_ICON;
                 return (
                   <button
                     key={opt.value}
@@ -250,7 +256,7 @@ export function NewTaskModal({
               })}
             </div>
           </div>
-          <div className={`transition-all duration-150 ${(newTaskType === 'review' || newTaskType === 'fix') ? 'opacity-100 h-auto mb-4' : 'opacity-0 h-0 overflow-hidden'}`}>
+          <div className={`transition-all duration-150 ${(newTaskType === 'review' || newTaskType === 'panel_review' || newTaskType === 'fix') ? 'opacity-100 h-auto mb-4' : 'opacity-0 h-0 overflow-hidden'}`}>
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">PR Number</label>
@@ -279,10 +285,12 @@ export function NewTaskModal({
             </div>
           </div>
           <div className="mb-4">
-            <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Task Title</label>
+            <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
+              Task Title{newTaskType === 'panel_review' && <span className="ml-1 text-neutral-600 normal-case font-normal tracking-normal">(optional)</span>}
+            </label>
             <input
               type="text"
-              required
+              required={newTaskType !== 'panel_review'}
               autoFocus
               value={newTaskTitle}
               onChange={e => setNewTaskTitle(e.target.value)}
@@ -291,10 +299,12 @@ export function NewTaskModal({
             />
           </div>
           <div className="mb-6">
-            <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Prompt / Instructions</label>
+            <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
+              Prompt / Instructions{newTaskType === 'panel_review' && <span className="ml-1 text-neutral-600 normal-case font-normal tracking-normal">(optional — fixed workflow)</span>}
+            </label>
             <div className="relative">
               <textarea
-                required
+                required={newTaskType !== 'panel_review'}
                 value={newTaskPrompt}
                 onChange={e => setNewTaskPrompt(e.target.value)}
                 className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[160px] max-h-[400px] transition-all placeholder:text-neutral-600"

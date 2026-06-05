@@ -284,6 +284,7 @@ async def lifespan(app):
         stale_branch_cleanup_service,
     )
     from app.max_plan_pool import load_max_plan_pool
+    from app.compute_jobs import compute_job_monitor_service
     from app.orchestrator import orchestrator_worker
     from app.shared_state import runtime_config_sync_service
     from app.github import close_github_client
@@ -615,6 +616,9 @@ async def lifespan(app):
 
     pool_maintainer_task = asyncio.create_task(pool_maintainer_service())
 
+    # Start the compute-job monitor (budgeted external compute substrate).
+    compute_job_monitor_task = asyncio.create_task(compute_job_monitor_service())
+
     # Start the Efficiency Snapshot service (daily per-project axis snapshots).
     async def _efficiency_snapshot_service():
         """Hourly leader-only tick that writes a daily efficiency snapshot per project.
@@ -868,6 +872,7 @@ async def lifespan(app):
     _bg_tasks["pipeline_alert_scan"] = pipeline_alert_scan_task
     _bg_tasks["digest_precompute"] = digest_precompute_task
     _bg_tasks["pool_maintainer"] = pool_maintainer_task
+    _bg_tasks["compute_job_monitor"] = compute_job_monitor_task
     _bg_tasks["efficiency_snapshot"] = efficiency_snapshot_task
     _bg_tasks["branch_reconciliation"] = branch_reconciliation_task
     _bg_tasks["evaluating_timeout"] = evaluating_timeout_task
@@ -901,6 +906,7 @@ async def lifespan(app):
             "pipeline_alert_scan": pipeline_alert_scan_service,
             "digest_precompute": digest_precompute_service,
             "pool_maintainer": pool_maintainer_service,
+            "compute_job_monitor": compute_job_monitor_service,
             "efficiency_snapshot": _efficiency_snapshot_service,
             "branch_reconciliation": _branch_reconciliation_service,
             "evaluating_timeout": _evaluating_timeout_service,
@@ -1177,6 +1183,7 @@ async def lifespan(app):
         pipeline_alert_scan_task,
         digest_precompute_task,
         pool_maintainer_task,
+        compute_job_monitor_task,
         branch_reconciliation_task,
         orchestrator_task,
         config_sync_task,

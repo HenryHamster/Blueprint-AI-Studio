@@ -706,9 +706,13 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWav
           {onClearWaveDeps && tasks.some(t => t.status === 'QUEUED' && t.depends_on && t.depends_on.length > 0) && (
             <button
               className="px-2.5 py-1 text-xs rounded-full border border-red-500/30 bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-colors font-medium"
-              onClick={onClearWaveDeps}
+              onClick={() => {
+                if (window.confirm('Clear stale/legacy wave serialization edges from queued tasks? True prerequisites (research prerequisites, blocked-need gates, sibling foundations) are preserved.')) {
+                  onClearWaveDeps();
+                }
+              }}
             >
-              Clear All Deps
+              Clear Stale Wave Deps
             </button>
           )}
         </div>

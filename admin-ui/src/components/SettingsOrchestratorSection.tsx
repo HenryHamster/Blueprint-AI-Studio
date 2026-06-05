@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Loader2, RotateCcw } from 'lucide-react';
+import { useTaskCapabilities } from '../taskCapabilities';
 
 interface SettingsOrchestratorSectionProps {
   maxConcurrentVMs: number;
@@ -40,8 +41,6 @@ interface SettingsOrchestratorSectionProps {
   onPauseAllAutonomous: () => Promise<void>;
   onRestartOrchestrator: () => Promise<void>;
 }
-
-const RESERVED_SLOT_TYPES = ['create', 'research', 'plan'] as const;
 
 function Toggle({ enabled, onChange }: { enabled: boolean; onChange: (v: boolean) => void }) {
   return (
@@ -94,13 +93,16 @@ export function SettingsOrchestratorSection({
   onPauseAllAutonomous,
   onRestartOrchestrator,
 }: SettingsOrchestratorSectionProps) {
+  // Reservable task types derive from the published capability contract so a
+  // newly registered reservable type gets a control here automatically.
+  const { reservableIds } = useTaskCapabilities();
   const [vmInputVal, setVmInputVal] = useState(String(maxConcurrentVMs));
   const [retriesInputVal, setRetriesInputVal] = useState(String(maxRetries));
   const [autonomousRateInputVal, setAutonomousRateInputVal] = useState(String(maxAutonomousTasksPerHour));
   const [globalRateInputVal, setGlobalRateInputVal] = useState(String(maxGlobalAutonomousTasksPerHour));
   const [pipelineSlotsInputVal, setPipelineSlotsInputVal] = useState(String(maxPipelineSlots));
   const [reservedInputVals, setReservedInputVals] = useState<Record<string, string>>(() =>
-    Object.fromEntries(RESERVED_SLOT_TYPES.map(t => [t, String(reservedSlotsForTypes[t] ?? 0)])),
+    Object.fromEntries(reservableIds.map(t => [t, String(reservedSlotsForTypes[t] ?? 0)])),
   );
   const [evalTimeoutInputVal, setEvalTimeoutInputVal] = useState(String(evaluatingPipelineTimeoutMinutes));
   const [evalFailHoursInputVal, setEvalFailHoursInputVal] = useState(String(evaluatingFailHours));
@@ -114,8 +116,8 @@ export function SettingsOrchestratorSection({
   useEffect(() => { setGlobalRateInputVal(String(maxGlobalAutonomousTasksPerHour)); }, [maxGlobalAutonomousTasksPerHour]);
   useEffect(() => { setPipelineSlotsInputVal(String(maxPipelineSlots)); }, [maxPipelineSlots]);
   useEffect(() => {
-    setReservedInputVals(Object.fromEntries(RESERVED_SLOT_TYPES.map(t => [t, String(reservedSlotsForTypes[t] ?? 0)])));
-  }, [reservedSlotsForTypes]);
+    setReservedInputVals(Object.fromEntries(reservableIds.map(t => [t, String(reservedSlotsForTypes[t] ?? 0)])));
+  }, [reservedSlotsForTypes, reservableIds]);
   useEffect(() => { setEvalTimeoutInputVal(String(evaluatingPipelineTimeoutMinutes)); }, [evaluatingPipelineTimeoutMinutes]);
   useEffect(() => { setEvalFailHoursInputVal(String(evaluatingFailHours)); }, [evaluatingFailHours]);
   useEffect(() => { setCiBackstopInputVal(String(ciBackstopTimeoutMinutes)); }, [ciBackstopTimeoutMinutes]);
@@ -223,7 +225,7 @@ export function SettingsOrchestratorSection({
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
           </div>
-          {RESERVED_SLOT_TYPES.map(t => (
+          {reservableIds.map(t => (
             <div key={t}>
               <label htmlFor={`orch-reserved-${t}`} className="block text-xs font-medium text-neutral-400 mb-1.5">Reserved: {t} (0-10)</label>
               <input

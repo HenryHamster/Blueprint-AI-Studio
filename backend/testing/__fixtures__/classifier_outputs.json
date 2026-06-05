@@ -4,7 +4,8 @@
     "category": "command-not-found",
     "genuine_suite": false,
     "expected": "no_tests",
-    "output": "bash: pytest: command not found"
+    "output": "bash: pytest: command not found",
+    "setup_expected": false
   },
   {
     "name": "zsh_missing_runner",
@@ -116,7 +117,8 @@
     "category": "command-not-found",
     "genuine_suite": true,
     "expected": "ran",
-    "output": "--- FAIL: TestHelperInvocation (0.01s)\n    runner_test.go:42: child process output did not match\nbash: testhelper: command not found\nFAIL\texample.com/runner\t0.03s\nFAIL"
+    "output": "--- FAIL: TestHelperInvocation (0.01s)\n    runner_test.go:42: child process output did not match\nbash: testhelper: command not found\nFAIL\texample.com/runner\t0.03s\nFAIL",
+    "setup_expected": false
   },
   {
     "name": "dotnet_fail_quoting_no_test_specified",
@@ -180,5 +182,37 @@
     "genuine_suite": true,
     "expected": "ran",
     "output": "> Task :test FAILED\n\nRunnerTest > invokesPytest() FAILED\n    java.lang.IllegalStateException: child suite produced no pass summary\nno tests ran in 0.01s\n\nTests run: 5, Failures: 0, Errors: 1, Skipped: 0"
+  },
+  {
+    "name": "python_runtime_missing_python3",
+    "category": "setup-missing-runtime",
+    "genuine_suite": true,
+    "expected": "ran",
+    "setup_expected": true,
+    "output": "bash: python3: command not found"
+  },
+  {
+    "name": "python_dependency_module_not_found",
+    "category": "setup-missing-dependency",
+    "genuine_suite": true,
+    "expected": "ran",
+    "setup_expected": false,
+    "output": "Traceback (most recent call last):\n  File \"/tmp/workspace/run_tests.py\", line 1, in <module>\n    import sqlalchemy\nModuleNotFoundError: No module named 'sqlalchemy'"
+  },
+  {
+    "name": "go_dependency_missing_go_sum",
+    "category": "setup-missing-dependency",
+    "genuine_suite": true,
+    "expected": "ran",
+    "setup_expected": false,
+    "output": "missing go.sum entry for module providing package github.com/acme/lib"
+  },
+  {
+    "name": "node_dependency_cannot_find_module",
+    "category": "setup-missing-dependency",
+    "genuine_suite": true,
+    "expected": "ran",
+    "setup_expected": false,
+    "output": "Error: Cannot find module 'typescript'"
   }
 ]

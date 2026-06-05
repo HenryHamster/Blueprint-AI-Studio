@@ -163,6 +163,12 @@
       "source_fn": "post_direction_outcome_stalled_message"
     },
     {
+      "name": "direction_staged_activated",
+      "classification": "high_signal",
+      "message_type": "NOTE",
+      "source_fn": "post_staged_directions_activated_message"
+    },
+    {
       "name": "direction_outcome_scaffolding_escalation",
       "classification": "escalation",
       "message_type": "BLOCKER",

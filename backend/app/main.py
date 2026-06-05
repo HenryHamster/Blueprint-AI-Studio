@@ -52,6 +52,8 @@ from app.routers.agent_github import router as agent_github_router
 from app.routers.agent_strategic_fetch import router as agent_strategic_fetch_router
 from app.routers.agent_warm_continuity import router as agent_warm_continuity_router
 from app.routers.agent_credentials import router as agent_credentials_router
+from app.routers.agent_compute_jobs import router as agent_compute_jobs_router
+from app.routers.admin_compute_jobs import router as admin_compute_jobs_router
 from app.routers.github import router as github_router
 from app.routers.projects import router as projects_router
 from app.routers.directions import router as directions_router
@@ -82,7 +84,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0143"
+EXPECTED_SCHEMA_REVISION = "0150"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -775,6 +777,8 @@ app.include_router(admin_orchestrator_errors_router)
 app.include_router(admin_scope_measurement_router)
 app.include_router(agent_status_router)
 app.include_router(agent_credentials_router)
+app.include_router(agent_compute_jobs_router)
+app.include_router(admin_compute_jobs_router)
 app.include_router(admin_onboard_router)
 app.include_router(admin_agent_ops_router)
 

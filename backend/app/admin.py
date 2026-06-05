@@ -54,6 +54,9 @@ from app.payload_schemas import (
     TaskType,
     validate_task_payload,
 )
+from app.task_capabilities import USER_LAUNCHABLE_TASK_TYPES
+from app.schemas import TaskEvaluationSummary, TaskEvaluationSummaryItem
+from app.task_outcomes import build_task_evaluation_summary
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
 from app.admin_helpers import (  # noqa: F401
     _ROLE_LEVEL,
@@ -108,6 +111,31 @@ def _fix_loop_summary(
                 }
             )
     return flagged if flagged else None
+
+
+def _build_task_evaluation_summary(
+    task: Task,
+    *,
+    merge_test_result: Dict[str, Any] | None = None,
+) -> Dict[str, Any] | None:
+    """Wrap the registry-backed evaluation summary into the wire schema.
+
+    The per-task-type summary logic lives in
+    :func:`app.task_outcomes.build_task_evaluation_summary` — a registry of
+    builders keyed by task-type — so registering a new evaluator-backed type is
+    one map entry there rather than a new branch here. This shim validates the
+    normalized ``{status, verdict, evidence, highlights}`` dict through the
+    ``TaskEvaluationSummary`` pydantic model so the wire contract is unchanged.
+    """
+    summary = build_task_evaluation_summary(task, merge_test_result=merge_test_result)
+    if summary is None:
+        return None
+    return TaskEvaluationSummary(
+        status=summary["status"],
+        verdict=summary["verdict"],
+        evidence=[TaskEvaluationSummaryItem(**item) for item in summary["evidence"]],
+        highlights=[TaskEvaluationSummaryItem(**item) for item in summary["highlights"]],
+    ).model_dump()
 
 
 logger = logging.getLogger(__name__)
@@ -206,6 +234,7 @@ async def get_all_tasks(
     pr_map: Dict[str, str] = {}
     logs_map: Dict[str, str] = {}
     research_map: Dict[str, str] = {}
+    merge_test_map: Dict[str, Dict[str, Any]] = {}
     commit_map: Dict[str, Dict[str, Any]] = {}
     if task_ids:
         artifact_stmt = (
@@ -253,9 +282,14 @@ async def get_all_tasks(
             .where(
                 Artifact.task_id.in_(task_ids),
                 Artifact.artifact_type.in_(
-                    [ArtifactType.ERROR_LOG, ArtifactType.RESEARCH_FINDINGS]
+                    [
+                        ArtifactType.ERROR_LOG,
+                        ArtifactType.RESEARCH_FINDINGS,
+                        ArtifactType.MERGE_TEST_RESULT,
+                    ]
                 ),
             )
+            .order_by(Artifact.created_at.asc())
         )
         logs_artifacts = (await session.execute(logs_stmt)).scalars().all()
         for a in logs_artifacts:
@@ -271,6 +305,13 @@ async def get_all_tasks(
                         logs = parsed.get("logs", [])
                         if isinstance(logs, list):
                             research_map[tid] = logs
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+            if a.artifact_type == ArtifactType.MERGE_TEST_RESULT and a.logs:
+                try:
+                    parsed = await asyncio.to_thread(json.loads, a.logs[:100000])
+                    if isinstance(parsed, dict):
+                        merge_test_map[tid] = parsed
                 except (json.JSONDecodeError, AttributeError):
                     pass
 
@@ -373,6 +414,9 @@ async def get_all_tasks(
             "pr_url": pr_map.get(str(t.id)),
             "error_logs": logs_map.get(str(t.id)),
             "research_findings": research_map.get(str(t.id)),
+            "evaluation_summary": _build_task_evaluation_summary(
+                t, merge_test_result=merge_test_map.get(str(t.id))
+            ),
             "commit_hash": commit_map.get(str(t.id), {}).get("commit_hash"),
             "repo_url": commit_map.get(str(t.id), {}).get("repo_url"),
             "history": history_map.get(str(t.id), []),
@@ -912,6 +956,7 @@ async def get_task(
     pr_url = None
     error_logs = None
     research_findings = None
+    merge_test_result = None
     commit_hash = None
     repo_url = None
     for a in artifacts:
@@ -931,6 +976,13 @@ async def get_task(
             error_logs = a.logs
         if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
             research_findings = a.logs[:100000]
+        if a.artifact_type == ArtifactType.MERGE_TEST_RESULT and a.logs:
+            try:
+                parsed = json.loads(a.logs[:100000])
+                if isinstance(parsed, dict):
+                    merge_test_result = parsed
+            except (json.JSONDecodeError, AttributeError):
+                pass
         if a.artifact_type == ArtifactType.GIT_COMMIT and a.commit_hash:
             commit_hash = a.commit_hash
             repo_url = a.repo_url
@@ -1015,6 +1067,9 @@ async def get_task(
         "commit_hash": commit_hash,
         "repo_url": repo_url,
         "research_findings": research_findings,
+        "evaluation_summary": _build_task_evaluation_summary(
+            task, merge_test_result=merge_test_result
+        ),
         "history": history,
         "child_task_ids": child_task_ids,
         "estimated_cost_usd": get_task_total_vm_cost_usd_or_none(task),
@@ -1176,6 +1231,12 @@ class CreateTaskPayload(BaseModel):
     )
     model: str | None = Field(default=None, min_length=1)
     effort: str | None = Field(default=None, pattern=r"^(low|medium|high|max)$")
+    # Optional client-supplied idempotency key for deduping retried requests.
+    # When provided, the endpoint returns the existing task if one with the same
+    # key already exists in an active state, instead of creating a duplicate.
+    idempotency_key: str | None = Field(
+        default=None, max_length=255, pattern=r"^[a-zA-Z0-9_.-]+$"
+    )
     # Hotfix path (Phase 5 / automain-LTS): set hotfix=True together with
     # base_branch="main" to mark a plan task as an expedited fix off main.
     # The agent handler branches hotfix/* off main and the orchestrator
@@ -1197,10 +1258,22 @@ class CreateTaskPayload(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def validate_pr_required_for_review_fix(self) -> "CreateTaskPayload":
-        if self.task_type in (TaskType.review, TaskType.fix) and self.pr_number is None:
+    def validate_pr_metadata_required_for_pr_tasks(self) -> "CreateTaskPayload":
+        if self.task_type in (
+            TaskType.review,
+            TaskType.panel_review,
+            TaskType.fix,
+        ) and self.pr_number is None:
             raise ValueError(
                 f"pr_number is required for task_type '{self.task_type.value}'"
+            )
+        if self.task_type in (
+            TaskType.review,
+            TaskType.panel_review,
+            TaskType.fix,
+        ) and not self.branch:
+            raise ValueError(
+                f"branch is required for task_type '{self.task_type.value}'"
             )
         return self
 
@@ -1234,6 +1307,28 @@ async def create_task_manually(
                 "hotfix=true is only supported for task_type='plan' "
                 f"(got '{payload.task_type.value}'); a non-plan hotfix would "
                 "merge to main without the automain back-merge."
+            ),
+        )
+
+    # Guard: the manual operator creation path may only emit task types the
+    # capability registry declares ``user_launchable``. A non-launchable type
+    # (e.g. ``compute_experiment``) needs a launch contract — for
+    # compute_experiment, a non-empty ``command`` plus positive
+    # ``spend_cap_usd`` and ``deadline_seconds`` — that this endpoint's
+    # ``CreateTaskPayload`` does not carry, so accepting it would enqueue a
+    # task that only fails later on the agent (``compute_launch_failed``) and at
+    # the backend launch endpoint. Reject cleanly at the boundary. Gating off
+    # ``USER_LAUNCHABLE_TASK_TYPES`` (the registry-derived single source of
+    # truth) means a newly registered launchable/non-launchable type is honored
+    # here automatically with no edit to this call site.
+    if payload.task_type.value not in USER_LAUNCHABLE_TASK_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"task_type '{payload.task_type.value}' is not operator-launchable "
+                "and cannot be created through this endpoint. It requires a launch "
+                "contract the manual creation path does not supply; launch it "
+                "through its dedicated path instead."
             ),
         )
 
@@ -1288,11 +1383,15 @@ async def create_task_manually(
         task_payload["effort"] = payload.effort
     if payload.hotfix:
         task_payload["hotfix"] = True
-    # Review/fix tasks need pr_number and branch
-    if payload.task_type in ("review", "fix") and payload.pr_number:
+    # PR-based read-only/write review tasks need pr_number and branch
+    if payload.task_type in (
+        TaskType.review,
+        TaskType.panel_review,
+        TaskType.fix,
+    ) and payload.pr_number is not None and payload.branch is not None:
         task_payload["pr_number"] = payload.pr_number
-        task_payload["branch"] = payload.branch or ""
-        if payload.task_type == "review":
+        task_payload["branch"] = payload.branch
+        if payload.task_type in (TaskType.review, TaskType.panel_review):
             task_payload["original_prompt"] = payload.prompt
     # Research tasks auto-include project directions. For ad-hoc manual
     # spawns we ship lightweight direction summaries (id/text/priority/
@@ -1350,6 +1449,45 @@ async def create_task_manually(
             detail=f"Project has {active_count} active tasks (limit: 200)",
         )
 
+    # Idempotency check: if client supplied an idempotency_key, check for
+    # existing active task with that key and return it instead of creating a duplicate.
+    # The stored key is namespaced with the project id so a client key that collides
+    # with an active task in ANOTHER project cannot match here (the
+    # ux_task_active_idempotency_key unique index is global) — that would otherwise
+    # leak the foreign task's fields and silently skip creating the caller's task.
+    # Mirrors review_pipeline._pipeline_task_idempotency_key's project-scoping convention.
+    scoped_idempotency_key = (
+        f"admin_launcher:{project.id}:{payload.idempotency_key}"
+        if payload.idempotency_key
+        else None
+    )
+    if scoped_idempotency_key:
+        existing = (
+            await session.execute(
+                select(Task).where(
+                    Task.idempotency_key == scoped_idempotency_key,
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                            TaskStatus.EVALUATING,
+                            TaskStatus.BLOCKED,
+                        ]
+                    ),
+                )
+            )
+        ).scalars().first()
+        if existing:
+            return {
+                "id": str(existing.id),
+                "project_id": str(existing.project_id),
+                "title": existing.title,
+                "status": existing.status,
+                "vm_instance_id": existing.vm_instance_id,
+                "is_duplicate": True,
+            }
+
     new_task = Task(
         project_id=project.id,
         title=payload.title,
@@ -1360,9 +1498,42 @@ async def create_task_manually(
         created_by="USER",
         launched_by_user_id=current_user["user_id"],
         requires_approval=False,
+        idempotency_key=scoped_idempotency_key,
     )
     session.add(new_task)
-    await session.commit()
+    try:
+        await session.commit()
+    except Exception as e:
+        # Handle unique constraint race: concurrent insert with same idempotency_key.
+        # Roll back and fetch the existing task that won the race.
+        await session.rollback()
+        if scoped_idempotency_key and "ux_task_active_idempotency_key" in str(e):
+            existing = (
+                await session.execute(
+                    select(Task).where(
+                        Task.idempotency_key == scoped_idempotency_key,
+                        Task.status.in_(
+                            [
+                                TaskStatus.QUEUED,
+                                TaskStatus.PROVISIONING,
+                                TaskStatus.IN_PROGRESS,
+                                TaskStatus.EVALUATING,
+                                TaskStatus.BLOCKED,
+                            ]
+                        ),
+                    )
+                )
+            ).scalars().first()
+            if existing:
+                return {
+                    "id": str(existing.id),
+                    "project_id": str(existing.project_id),
+                    "title": existing.title,
+                    "status": existing.status,
+                    "vm_instance_id": existing.vm_instance_id,
+                    "is_duplicate": True,
+                }
+        raise
     await session.refresh(new_task)
 
     # Log history

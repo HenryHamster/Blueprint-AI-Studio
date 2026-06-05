@@ -29,6 +29,7 @@ from app.models import (
     TaskStatus,
 )
 from app.shared_state import runtime_config as _runtime_config
+from app.task_capabilities import strategic_phase_for
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -143,7 +144,7 @@ async def _record_strategic_task_failure(
     cycle_id = task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id")
     if cycle_id:
         task_type = task.first_payload.get("type", "")
-        failed_phase = "phase1" if task_type == "design_doc_update" else "phase2"
+        failed_phase = strategic_phase_for(task_type) or "phase2"
         failure_category = task.first_payload.get("failure_category", "")
         outcome_override = (
             strategic_cycle.OUTCOME_THINKER_ARTIFACTS_MISSING
@@ -226,6 +227,44 @@ _VALID_EVIDENCE_PROGRESS = frozenset({"advancing", "stalled", "met"})
 _EVIDENCE_PROGRESS_SUPPRESSING = frozenset({"advancing", "met"})
 _EVIDENCE_PROGRESS_RATIONALE_MAX = 300
 EVIDENCE_PROGRESS_CONTEXT_KEY = "_strategic_evidence_progress"
+
+
+async def _link_clustered_bug_messages(
+    session: AsyncSession,
+    project: Project,
+    anchor_msg: ProjectMessage,
+    *,
+    kind: str,
+    identifier: str,
+    resolution_text: str,
+) -> int:
+    """Link other open bug-class messages that share the anchor's structured signature."""
+    from app.message_convergence import (
+        bug_message_cluster_signature as _bug_message_cluster_signature,
+        bug_messages_share_cluster as _bug_messages_share_cluster,
+        link_message_to_outcome as _link_message_to_outcome,
+    )
+
+    if _bug_message_cluster_signature(anchor_msg) is None:
+        return 0
+
+    result = await session.execute(
+        select(ProjectMessage).where(
+            ProjectMessage.project_id == project.id,
+            ProjectMessage.status == "open",
+        )
+    )
+    linked = 0
+    for candidate in result.scalars().all():
+        if candidate.id == anchor_msg.id:
+            continue
+        if not _bug_messages_share_cluster(anchor_msg, candidate):
+            continue
+        _link_message_to_outcome(candidate, kind, identifier)
+        candidate.resolution = resolution_text
+        session.add(candidate)
+        linked += 1
+    return linked
 
 
 def _normalize_version_phase(value: object) -> str | None:
@@ -739,15 +778,24 @@ def format_findings_for_prompt(
 ) -> str:
     """Format query_findings_index rows as a compact prompt block.
 
-    Returns a newline-separated string with one finding per line: grade, title,
-    truncated description, top claims, and source refs.  Empty string when rows
-    is empty.  Suitable for embedding in a strategic synthesis prompt.
+    Returns a newline-separated string with one finding per line: grade,
+    verification basis, title, truncated description, top claims, and source
+    refs.  Empty string when rows is empty.  Suitable for embedding in a
+    strategic synthesis prompt.
+
+    The verification_basis (e.g. code_verified vs pattern_inferred) is rendered
+    alongside the actionability grade so the strategist can weight a finding
+    verified against HEAD differently from one merely asserted.  It is a
+    weighting signal only — rows are never filtered out by basis.
     """
     if not rows:
         return ""
     lines: list[str] = []
     for r in rows[:max_rows]:
         grade = r.get("actionability_grade") or "MEDIUM"
+        basis = r.get("verification_basis") or "pattern_inferred"
+        downgraded_from = r.get("verification_basis_downgraded_from")
+        downgrade_reason = r.get("verification_basis_downgrade_reason")
         title = r.get("finding_title") or ""
         desc = (r.get("finding_description") or "")[:_FINDINGS_DESCRIPTION_MAX]
         claims = [str(c) for c in (r.get("claims") or [])[:_FINDINGS_CLAIM_MAX]]
@@ -757,7 +805,12 @@ def format_findings_for_prompt(
             for s in sources[:_FINDINGS_SOURCE_MAX]
             if isinstance(s, dict) and s.get("ref")
         ]
-        line = f"[{grade}] {title}: {desc}"
+        prefix = f"[{grade}/{basis}]"
+        if downgraded_from:
+            prefix = f"[{grade}/{basis} downgraded-from={downgraded_from}]"
+        line = f"{prefix} {title}: {desc}"
+        if downgrade_reason:
+            line += f" | downgrade: {downgrade_reason}"
         if claims:
             line += f" | claims: {'; '.join(claims)}"
         if refs:
@@ -2554,6 +2607,11 @@ async def _handle_strategic_completion(
                         new_dir["context"]["dedup_reasoning"] = dr
                 if op_entry.get("source"):
                     new_dir["source"] = str(op_entry["source"])[:64]
+                # Persist the direction→gap linkage (mirrors the API write path
+                # in admin_agent_ops.create_direction) so reconciliation can map
+                # an active direction back to its problem-model gap.
+                if op_entry.get("gap_id"):
+                    new_dir["gap_id"] = str(op_entry["gap_id"])
                 if op_entry.get("paths"):
                     new_dir["paths"] = op_entry["paths"]
                 raw_category = op_entry.get("category")
@@ -2644,6 +2702,14 @@ async def _handle_strategic_completion(
                             d["priority"] = changes["priority"]
                         if "paths" in changes:
                             d["paths"] = changes["paths"]
+                        # Update (or clear) the direction→gap linkage (mirrors the
+                        # API update_direction path in admin_agent_ops).
+                        if "gap_id" in changes:
+                            gid = changes["gap_id"]
+                            if gid:
+                                d["gap_id"] = str(gid)
+                            else:
+                                d.pop("gap_id", None)
                         if "system_id" in changes:
                             if changes["system_id"]:
                                 sid_new = str(changes["system_id"])
@@ -2962,6 +3028,12 @@ async def _handle_strategic_completion(
         resolved_entries = [
             {"id": mid} for mid in (parsed.get("resolved_message_ids") or [])
         ]
+    from app.message_convergence import (
+        LINKED_STATUS as _LINKED_STATUS,
+        is_bug_class as _is_bug_class,
+        link_message_to_outcome as _link_message_to_outcome,
+    )
+
     for entry in resolved_entries[:10]:
         try:
             msg_id = entry.get("id") if isinstance(entry, dict) else str(entry)
@@ -2970,38 +3042,79 @@ async def _handle_strategic_completion(
                 if isinstance(entry, dict)
                 else "Addressed by strategic review"
             )
+            # Ownership fields signal that the fix is in-flight rather than already landed.
+            owned_by_direction = (
+                entry.get("owned_by_direction") if isinstance(entry, dict) else None
+            )
+            owned_by_task = (
+                entry.get("owned_by_task") if isinstance(entry, dict) else None
+            )
             msg = await session.get(ProjectMessage, uuid.UUID(str(msg_id)))
-            if msg and msg.project_id == project.id and msg.status == "open":
-                msg.status = "resolved"
-                if resolution_text:
-                    rt = str(resolution_text)
+            # Accept both 'open' and 'linked' so an explicit terminal resolve can
+            # always move a linked message to 'resolved' (the operator's escape hatch).
+            if msg and msg.project_id == project.id and msg.status in {
+                "open",
+                _LINKED_STATUS,
+            }:
+                if _is_bug_class(msg) and (owned_by_direction or owned_by_task):
+                    # Bug-class message with ownership info: record the forward
+                    # link and move to 'linked' state. The actual convergence to
+                    # 'resolved' happens when the owning outcome lands (reaper sweep).
+                    kind = "direction" if owned_by_direction else "task"
+                    identifier = owned_by_direction or owned_by_task
+                    rt = str(resolution_text or f"Fix owned by {kind}: {identifier}")
                     if len(rt) > STRATEGIC_RESOLUTION_MAX:
-                        logger.warning(
-                            f"[STRATEGIC] Task {task.id}: truncating resolution {len(rt)}→{STRATEGIC_RESOLUTION_MAX} chars"
-                        )
-                    msg.resolution = rt[:STRATEGIC_RESOLUTION_MAX]
+                        rt = rt[:STRATEGIC_RESOLUTION_MAX]
+                    _link_message_to_outcome(msg, kind, str(identifier))
+                    msg.resolution = rt
+                    session.add(msg)
+                    clustered = await _link_clustered_bug_messages(
+                        session,
+                        project,
+                        msg,
+                        kind=kind,
+                        identifier=str(identifier),
+                        resolution_text=rt,
+                    )
+                    msgs_resolved += 1 + clustered
+                    logger.info(
+                        f"[STRATEGIC] Task {task.id}: linked {msg.message_type} "
+                        f"message {msg.id} to {kind}={identifier} "
+                        f"(clustered={clustered})"
+                    )
                 else:
-                    msg.resolution = "Addressed by strategic review"
-                msg.resolved_at = _utcnow()
-                session.add(msg)
-                msgs_resolved += 1
-                if msg.message_type == MessageType.FEEDBACK:
-                    try:
-                        from app.notification_dispatch import (
-                            post_feedback_acknowledgment,
-                        )
+                    # Explicit terminal resolve: operator/strategist dismisses
+                    # the message (no ownership info, or not a bug-class type).
+                    msg.status = "resolved"
+                    if resolution_text:
+                        rt = str(resolution_text)
+                        if len(rt) > STRATEGIC_RESOLUTION_MAX:
+                            logger.warning(
+                                f"[STRATEGIC] Task {task.id}: truncating resolution {len(rt)}→{STRATEGIC_RESOLUTION_MAX} chars"
+                            )
+                        msg.resolution = rt[:STRATEGIC_RESOLUTION_MAX]
+                    else:
+                        msg.resolution = "Addressed by strategic review"
+                    msg.resolved_at = _utcnow()
+                    session.add(msg)
+                    msgs_resolved += 1
+                    if msg.message_type == MessageType.FEEDBACK:
+                        try:
+                            from app.notification_dispatch import (
+                                post_feedback_acknowledgment,
+                            )
 
-                        await post_feedback_acknowledgment(
-                            session,
-                            project.id,
-                            msg.id,
-                            msg.resolution or "Addressed by strategic review",
-                            task.id,
-                        )
-                    except Exception as _e:  # noqa: BLE001
-                        logger.warning(
-                            f"[NOTIFY] Failed to post feedback acknowledgment: {_e}"
-                        )
+                            await post_feedback_acknowledgment(
+                                session,
+                                project.id,
+                                msg.id,
+                                msg.resolution or "Addressed by strategic review",
+                                task.id,
+                            )
+                        except Exception as _e:  # noqa: BLE001
+                            logger.warning(
+                                f"[NOTIFY] Failed to post feedback acknowledgment: {_e}"
+                            )
         except (ValueError, TypeError):  # noqa: PERF203
             pass
 

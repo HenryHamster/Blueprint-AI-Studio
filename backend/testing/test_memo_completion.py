@@ -179,11 +179,14 @@ async def test_memo_completion_persists_artifact_and_no_children(
 
 
 @pytest.mark.asyncio
-async def test_memo_completion_unparseable_does_not_create_artifact(
+async def test_memo_completion_unparseable_fails_forward_quality_gate(
     db_session, _quiet_broadcast
 ):
-    """If the agent's output can't be parsed as a memo object, we record a
-    status message but do NOT create an artifact and do NOT spawn children."""
+    """Forward-quality gate: if the agent's output can't be parsed as a memo
+    object, the task must NOT complete clean. It creates no artifact, spawns no
+    children, and is marked FAILED (not COMPLETED) with the gate verdict
+    recorded — a memo opens no PR and spawns no children, so EVALUATING would
+    hang forever; FAILED is the honest terminal outcome for bad output."""
     project = make_project(name="MemoBad")
     db_session.add(project)
     await db_session.commit()
@@ -217,10 +220,45 @@ async def test_memo_completion_unparseable_does_not_create_artifact(
     assert children == []
 
     await db_session.refresh(task)
+    # Did NOT complete clean — the gate failed it.
+    assert task.status == TaskStatus.FAILED
     assert task.latest_status_message is not None
-    assert "no parseable" in task.latest_status_message.lower()
-    # Terminal even when uncitable — do not leave it lingering in EVALUATING.
-    assert task.status == TaskStatus.COMPLETED
+    assert "gate" in task.latest_status_message.lower()
+    # Gate verdict is recorded on the task for observability.
+    assert task.context["evaluation_gate"]["passed"] is False
+    assert task.context["evaluation_gate"]["strategy"] == "forward-quality"
+
+
+@pytest.mark.asyncio
+async def test_memo_completion_empty_output_fails_gate(db_session, _quiet_broadcast):
+    """An empty terminal artifact fails the forward-quality gate and does not
+    complete clean."""
+    project = make_project(name="MemoEmpty")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="Memo: empty",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "memo", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _handle_memo_completion(task, "   ", db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    artifacts = (
+        (await db_session.execute(select(Artifact).where(Artifact.task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert artifacts == []
 
 
 @pytest.mark.asyncio

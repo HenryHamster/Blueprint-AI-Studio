@@ -12,15 +12,18 @@ from app.models import (
 from app.digest_metrics import (
     _FAILURE_CLASS_LABELS,
     _compute_first_review_approval_breakdowns,
+    _compute_non_code_outcomes,
     compute_churn_direction,
     compute_digest_cost_economics,
     compute_digest_trend_history,
     compute_failure_grouping,
     compute_narrative_summary,
+    compute_dependency_health_signals,
     compute_recurring_error_clusters,
     compute_release_qualifier_infra_metrics,
     compute_retry_analytics,
     compute_scope_mismatch_summary,
+    compute_task_type_cost_adherence,
 )
 from app.failure_classification import ALL_FAILURE_CLASSES
 from app.sr_review_quality_metrics import (
@@ -330,6 +333,182 @@ def test_compute_narrative_summary_consumes_explicit_churn_direction():
 def _make_failed_task(**kwargs):
     """Minimal failed Task object for compute_failure_grouping unit tests."""
     return make_task(status=TaskStatus.FAILED, **kwargs)
+
+
+def _make_cost_task(task_type, cost, *, status=TaskStatus.COMPLETED, created_at=None):
+    """Terminal task whose total VM cost equals ``cost`` (via banked spend).
+
+    Banking the cost on ``vm_runtime_cost_banked_db`` and leaving
+    ``vm_provisioned_at`` None gives a deterministic total cost equal to ``cost``
+    (current-attempt term is 0), which is all the adherence math needs.
+    """
+    now = _utcnow()
+    return make_task(
+        status=status,
+        payloads=[{"type": task_type}],
+        created_at=created_at if created_at is not None else now - timedelta(hours=1),
+        vm_runtime_cost_banked_db=cost,
+    )
+
+
+def test_cost_adherence_avg_p95_and_sample_count():
+    """Per-type avg/p95/sample_count reflect the banked total VM cost."""
+    now = _utcnow()
+    tasks = [
+        _make_cost_task("create", 2.0),
+        _make_cost_task("create", 4.0),
+        _make_cost_task("create", 6.0),
+    ]
+    rows = compute_task_type_cost_adherence(
+        tasks,
+        window_start=now - timedelta(days=14),
+        ceilings={"create": 8.0},
+    )
+    row = next(r for r in rows if r["id"] == "create")
+    assert row["sample_count"] == 3
+    assert row["avg_cost_usd"] == pytest.approx(4.0)
+    assert row["p95_cost_usd"] == pytest.approx(6.0)
+    assert row["declared_ceiling_usd"] == 8.0
+    assert row["over_ceiling"] is False
+
+
+def test_cost_adherence_over_ceiling_requires_min_samples():
+    """A type only flags over_ceiling once it has >= MIN_SAMPLES costly runs."""
+    now = _utcnow()
+    window_start = now - timedelta(days=14)
+    # Two runs, both well over the $1 ceiling, but below the 3-sample minimum.
+    thin = compute_task_type_cost_adherence(
+        [_make_cost_task("fix", 5.0), _make_cost_task("fix", 5.0)],
+        window_start=window_start,
+        ceilings={"fix": 1.0},
+    )
+    assert next(r for r in thin if r["id"] == "fix")["over_ceiling"] is False
+
+    # Three over-ceiling runs now trip the flag.
+    enough = compute_task_type_cost_adherence(
+        [_make_cost_task("fix", 5.0) for _ in range(3)],
+        window_start=window_start,
+        ceilings={"fix": 1.0},
+    )
+    assert next(r for r in enough if r["id"] == "fix")["over_ceiling"] is True
+
+
+def test_cost_adherence_none_ceiling_never_flags():
+    """A type with no declared ceiling never flags over_ceiling."""
+    now = _utcnow()
+    rows = compute_task_type_cost_adherence(
+        [_make_cost_task("research", 99.0) for _ in range(5)],
+        window_start=now - timedelta(days=14),
+        ceilings={"research": None},
+    )
+    row = next(r for r in rows if r["id"] == "research")
+    assert row["sample_count"] == 5
+    assert row["over_ceiling"] is False
+
+
+def test_cost_adherence_excludes_out_of_window_and_zero_cost():
+    """Out-of-window tasks and tasks with no VM cost contribute no sample."""
+    now = _utcnow()
+    window_start = now - timedelta(days=14)
+    tasks = [
+        _make_cost_task("create", 3.0),  # in-window, counts
+        _make_cost_task("create", 3.0, created_at=now - timedelta(days=30)),  # too old
+        make_task(  # terminal but never ran a VM -> cost None
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            created_at=now - timedelta(hours=1),
+        ),
+    ]
+    rows = compute_task_type_cost_adherence(
+        tasks, window_start=window_start, ceilings={"create": 8.0}
+    )
+    assert next(r for r in rows if r["id"] == "create")["sample_count"] == 1
+
+
+def test_cost_adherence_renders_row_per_registered_type():
+    """Every registered type gets a row even with zero in-window samples."""
+    now = _utcnow()
+    rows = compute_task_type_cost_adherence(
+        [],
+        window_start=now - timedelta(days=14),
+        ceilings={"create": 8.0, "fix": 3.0},
+    )
+    by_id = {r["id"]: r for r in rows}
+    assert set(by_id) == {"create", "fix"}
+    assert by_id["create"]["sample_count"] == 0
+    assert by_id["create"]["avg_cost_usd"] is None
+    assert by_id["create"]["p95_cost_usd"] is None
+    assert by_id["create"]["over_ceiling"] is False
+
+
+def test_cost_adherence_compute_substrate_sources_from_compute_jobs():
+    """A compute-substrate type (compute_experiment) is measured from the
+    compute-job ledger, not from Task VM fields."""
+    now = _utcnow()
+    window_start = now - timedelta(days=14)
+    # Three compute_experiment tasks. Their banked VM cost is intentionally
+    # different (and would mislead) — the honest cost comes from the compute-job
+    # ledger keyed by task id.
+    tasks = [_make_cost_task("compute_experiment", 0.01) for _ in range(3)]
+    compute_job_cost_by_task = {
+        str(tasks[0].id): 6.0,
+        str(tasks[1].id): 8.0,
+        str(tasks[2].id): 10.0,
+    }
+    rows = compute_task_type_cost_adherence(
+        tasks,
+        window_start=window_start,
+        ceilings={"compute_experiment": 5.0},
+        compute_job_cost_by_task=compute_job_cost_by_task,
+    )
+    row = next(r for r in rows if r["id"] == "compute_experiment")
+    assert row["sample_count"] == 3
+    assert row["avg_cost_usd"] == pytest.approx(8.0)
+    assert row["p95_cost_usd"] == pytest.approx(10.0)
+    # Average ($8) exceeds the $5 ceiling with >= MIN_SAMPLES runs.
+    assert row["over_ceiling"] is True
+
+
+def test_cost_adherence_compute_substrate_no_ledger_entry_no_sample():
+    """A compute-substrate task with VM cost but no compute-job spend contributes
+    no sample — it must NOT fall back to the monitoring VM's cost."""
+    now = _utcnow()
+    window_start = now - timedelta(days=14)
+    # Banked VM cost present, but no entry (and a non-positive entry) in the
+    # compute-job ledger -> no samples.
+    tasks = [
+        _make_cost_task("compute_experiment", 3.0),
+        _make_cost_task("compute_experiment", 3.0),
+    ]
+    rows = compute_task_type_cost_adherence(
+        tasks,
+        window_start=window_start,
+        ceilings={"compute_experiment": 5.0},
+        compute_job_cost_by_task={str(tasks[1].id): 0.0},  # non-positive -> skip
+    )
+    row = next(r for r in rows if r["id"] == "compute_experiment")
+    assert row["sample_count"] == 0
+    assert row["avg_cost_usd"] is None
+    assert row["over_ceiling"] is False
+
+
+def test_cost_adherence_non_compute_type_still_uses_vm_cost():
+    """Regression: non-compute types keep sourcing cost from VM fields and ignore
+    the compute-job ledger."""
+    now = _utcnow()
+    window_start = now - timedelta(days=14)
+    tasks = [_make_cost_task("create", 4.0) for _ in range(3)]
+    rows = compute_task_type_cost_adherence(
+        tasks,
+        window_start=window_start,
+        ceilings={"create": 8.0},
+        # A stray compute-job entry for a create task must be ignored.
+        compute_job_cost_by_task={str(tasks[0].id): 999.0},
+    )
+    row = next(r for r in rows if r["id"] == "create")
+    assert row["sample_count"] == 3
+    assert row["avg_cost_usd"] == pytest.approx(4.0)
+    assert row["over_ceiling"] is False
 
 
 def test_compute_failure_grouping_empty():
@@ -738,6 +917,9 @@ def test_compute_digest_cost_economics_empty():
     assert result["pipeline_autonomous_prs_merged"] == 0
     assert result["pipeline_assisted_prs_merged"] == 0
     assert result["pipeline_operator_action_count"] == 0
+    assert result["pipeline_generalized_successes"] == 0
+    assert result["pipeline_generalized_health_rate"] is None
+    assert result["pipeline_outcome_kind_breakdown"] == {}
     assert result["overall_type_distribution"] == {}
     assert result["pipeline_filter_funnel"] == {}
 
@@ -930,6 +1112,12 @@ def test_compute_digest_cost_economics_pipeline_aggregates():
             "autonomous_prs_merged": 2,
             "assisted_prs_merged": 1,
             "operator_action_count": 4,
+            "generalized_successes": 5,
+            "generalized_terminal_outcomes": 6,
+            "outcome_kind_breakdown": {
+                "code_merge": {"success": 3, "neutral": 0, "failure": 1},
+                "research_quality": {"success": 2, "neutral": 0, "failure": 0},
+            },
             "type_distribution": {"create": 5},
             "filter_funnel": {"a": 2},
         },
@@ -941,6 +1129,11 @@ def test_compute_digest_cost_economics_pipeline_aggregates():
             "autonomous_prs_merged": 1,
             "assisted_prs_merged": 0,
             "operator_action_count": 1,
+            "generalized_successes": 1,
+            "generalized_terminal_outcomes": 2,
+            "outcome_kind_breakdown": {
+                "code_merge": {"success": 1, "neutral": 0, "failure": 1}
+            },
             "type_distribution": {"create": 2, "fix": 1},
             "filter_funnel": {"a": 1, "b": 3},
         },
@@ -958,6 +1151,12 @@ def test_compute_digest_cost_economics_pipeline_aggregates():
     assert result["pipeline_autonomous_prs_merged"] == 3
     assert result["pipeline_assisted_prs_merged"] == 1
     assert result["pipeline_operator_action_count"] == 5
+    assert result["pipeline_generalized_successes"] == 6
+    assert result["pipeline_generalized_health_rate"] == 0.75
+    assert result["pipeline_outcome_kind_breakdown"] == {
+        "code_merge": {"success": 4, "neutral": 0, "failure": 2},
+        "research_quality": {"success": 2, "neutral": 0, "failure": 0},
+    }
     assert result["overall_type_distribution"] == {"create": 7, "fix": 1}
     assert result["pipeline_filter_funnel"] == {"a": 3, "b": 3}
 
@@ -1281,6 +1480,93 @@ def test_parallel_review_effectiveness_none_when_insufficient_sample():
     ]
     result = compute_review_quality_metrics(tasks)
     assert result["parallel_review_effectiveness"] is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _compute_non_code_outcomes — generalized outcomes for tasks outside PR chains
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_compute_non_code_outcomes_mixed_portfolio():
+    """Research/audit/memo successes (no PR chain) are surfaced by kind."""
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+    in_window = now - timedelta(hours=1)
+
+    research = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        plan_output=[{"title": "Investigate", "actionability_grade": "HIGH"}],
+        created_at=in_window,
+    )
+    audit = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "security_audit"}],
+        plan_output={"findings": [{"severity": "high"}]},
+        created_at=in_window,
+    )
+    memo = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "memo"}],
+        plan_output={"memo": "Reasoning"},
+        created_at=in_window,
+    )
+
+    result = _compute_non_code_outcomes([research, audit, memo], window_start)
+    assert result["total"] == 3
+    assert result["successes"] == 3
+    assert result["neutrals"] == 0
+    assert result["failures"] == 0
+    assert result["by_kind"]["research_quality"]["success"] == 1
+    assert result["by_kind"]["audit_findings"]["success"] == 1
+    assert result["by_kind"]["memo_artifact"]["success"] == 1
+
+
+def test_compute_non_code_outcomes_excludes_review_chain_and_inflight():
+    """Review-chain tasks and in-flight (non-terminal) tasks are excluded so
+    neutrals/total are not inflated."""
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+    in_window = now - timedelta(hours=1)
+
+    # Part of a PR review chain → excluded by review_loop context.
+    review_chain = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"review_loop": {"iteration": 1}},
+        created_at=in_window,
+    )
+    # In-flight non-review task → must NOT be counted as a neutral.
+    inflight = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "research"}],
+        created_at=in_window,
+    )
+    # One genuine terminal success keeps the dict non-empty.
+    audit = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "security_audit"}],
+        plan_output={"findings": [{"severity": "low"}]},
+        created_at=in_window,
+    )
+
+    result = _compute_non_code_outcomes([review_chain, inflight, audit], window_start)
+    # Only the audit is counted: review_chain excluded, inflight excluded.
+    assert result["total"] == 1
+    assert result["successes"] == 1
+    assert result["neutrals"] == 0
+
+
+def test_compute_non_code_outcomes_empty_when_no_qualifying_tasks():
+    """Returns an empty dict when only review-chain/in-flight tasks exist."""
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+    inflight = make_task(
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "memo"}],
+        created_at=now - timedelta(hours=1),
+    )
+    assert _compute_non_code_outcomes([inflight], window_start) == {}
 
 
 class TestComputeRetryAnalytics:
@@ -1683,3 +1969,613 @@ class TestDigestMetricsModuleSeams:
                         "load time — this risks a circular import. Use a "
                         "function-local import instead."
                     )
+
+
+# ── Dependency-health observability signals ────────────────────────────────
+
+
+def test_parked_blocker_summary_counts_only_escalated_blocked():
+    """Only BLOCKED tasks carrying ``_blocked_escalated`` are counted as parked;
+    a still-rechecking blocker (no escalation flag) is excluded."""
+    from app.digest_metrics import compute_parked_blocker_summary
+
+    now = _utcnow()
+    parked = make_task(
+        status=TaskStatus.BLOCKED,
+        title="parked-foundation",
+        blocker_kind="upstream_dependency",
+        blocked_reason="Waiting: foundation never landed",
+        blocked_at=now - timedelta(hours=8),
+        recheck_after=now + timedelta(days=3650),
+        context={"_blocked_escalated": True, "direction_id": "d-1"},
+    )
+    still_rechecking = make_task(
+        status=TaskStatus.BLOCKED,
+        title="still-waiting",
+        context={"_blocked_recheck_attempts": 2},
+    )
+
+    result = compute_parked_blocker_summary([parked, still_rechecking])
+
+    assert result["total"] == 1
+    assert len(result["tasks"]) == 1
+    row = result["tasks"][0]
+    assert row["task_id"] == str(parked.id)
+    assert row["blocker_kind"] == "upstream_dependency"
+    assert row["direction_id"] == "d-1"
+    assert row["blocked_at"] is not None
+
+
+def test_parked_blocker_summary_includes_recut_escalated_tasks():
+    """Tasks with ``_recut_escalated`` marker (persistent re-cut conflicts) are
+    included in the parked summary alongside BLOCKED-escalated tasks. Only
+    escalated re-cuts are included; a still-retrying re-cut (no escalation) is
+    excluded even if it has re-cut context."""
+    from app.digest_metrics import compute_parked_blocker_summary
+
+    now = _utcnow()
+    recut_conflict_escalated = make_task(
+        status=TaskStatus.QUEUED,
+        title="dependent-held-by-conflict",
+        created_at=now - timedelta(hours=6),
+        recheck_after=now + timedelta(days=1),
+        context={
+            "_recut_escalated": True,
+            "_recut_recheck_attempts": 5,
+            "_recut_last_outcome": "conflict",
+            "_recut_conflict_attempts": 3,
+        },
+    )
+    recut_still_retrying = make_task(
+        status=TaskStatus.QUEUED,
+        title="dependent-held-by-error",
+        created_at=now - timedelta(hours=2),
+        context={
+            "_recut_recheck_attempts": 2,
+            "_recut_last_outcome": "error",
+            "_recut_conflict_attempts": 0,
+            # No _recut_escalated marker
+        },
+    )
+    not_held = make_task(
+        status=TaskStatus.QUEUED,
+        title="normal-queued",
+        context={"_blocked_recheck_attempts": 1},  # Different context, no re-cut
+    )
+
+    result = compute_parked_blocker_summary([recut_conflict_escalated, recut_still_retrying, not_held])
+
+    assert result["total"] == 1  # Only the escalated re-cut
+    assert len(result["tasks"]) == 1
+    # Verify conflict is present
+    conflict_row = result["tasks"][0]
+    assert conflict_row["title"] == "dependent-held-by-conflict"
+    assert conflict_row["blocker_kind"] == "Base re-cut conflict"
+    # Verify still-retrying is excluded
+    retrying_row = next((t for t in result["tasks"] if t["title"] == "dependent-held-by-error"), None)
+    assert retrying_row is None
+
+
+@pytest.mark.asyncio
+async def test_dependency_health_signals_query_surfaces_recut_escalated(db_session):
+    """Regression: the DB-backed query in ``compute_dependency_health_signals``
+    must feed BOTH parked classes to the pure summarizer — not just
+    BLOCKED+``_blocked_escalated`` tasks but also ``_recut_escalated`` tasks,
+    which the producer stamps on QUEUED (or BLOCKED-without-``_blocked_escalated``)
+    dependents. A previous version filtered to ``status == BLOCKED AND
+    _blocked_escalated`` only, making the summarizer's re-cut branch unreachable
+    in production even though the unit test passed by calling the pure function
+    directly."""
+    project = make_project(name="Dep health query test", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # QUEUED dependent held by a persistent re-cut conflict (no _blocked_escalated).
+    recut_held = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        title="recut-held-dependent",
+        context={
+            "_recut_escalated": True,
+            "_recut_recheck_attempts": 5,
+            "_recut_last_outcome": "conflict",
+            "_recut_conflict_attempts": 3,
+        },
+    )
+    # BLOCKED + operator-escalated block.
+    blocked_escalated = make_task(
+        project_id=project.id,
+        status=TaskStatus.BLOCKED,
+        title="blocked-escalated-dependent",
+        context={"_blocked_escalated": True},
+    )
+    # Neither marker → must be excluded.
+    plain_queued = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        title="plain-queued",
+        context={"_blocked_recheck_attempts": 1},
+    )
+    db_session.add_all([recut_held, blocked_escalated, plain_queued])
+    await db_session.commit()
+
+    result = await compute_dependency_health_signals(db_session, project_id=project.id)
+
+    parked = result["parked_blockers"]
+    titles = {t["title"] for t in parked["tasks"]}
+    assert parked["total"] == 2
+    assert titles == {"recut-held-dependent", "blocked-escalated-dependent"}
+    assert "plain-queued" not in titles
+
+
+def test_duplicate_foundation_signal_flags_cross_parent_overlap():
+    """Two active write-tasks under DIFFERENT parents whose related-file sets
+    strongly overlap are surfaced; a disjoint task is not."""
+    from app.digest_metrics import compute_duplicate_foundation_signal
+
+    p_a, p_b = uuid4(), uuid4()
+    files = ["app/foundation.py", "app/db.py"]
+    # Cross-parent, identical files → flagged.
+    t1 = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=p_a,
+        payloads=[{"type": "create", "related_files": files}],
+    )
+    t2 = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=p_b,
+        payloads=[{"type": "create", "related_files": files}],
+    )
+    # Disjoint files → NOT flagged.
+    t3 = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create", "related_files": ["app/unrelated.py"]}],
+    )
+
+    result = compute_duplicate_foundation_signal([t1, t2, t3])
+
+    assert result["total"] == 1
+    cand = result["candidates"][0]
+    assert set(cand["task_ids"]) == {str(t1.id), str(t2.id)}
+    assert cand["overlap_ratio"] == 1.0
+    assert cand["shared_files"] == ["app/db.py", "app/foundation.py"]
+
+
+def test_duplicate_foundation_signal_skips_same_parent_siblings():
+    """Same-parent siblings are intra-decomposition work gated by depends_on
+    edges, not the silent cross-parent duplication this signal surfaces — so an
+    overlapping same-parent pair is NOT flagged."""
+    from app.digest_metrics import compute_duplicate_foundation_signal
+
+    parent = uuid4()
+    files = ["app/foundation.py", "app/db.py"]
+    t1 = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=parent,
+        payloads=[{"type": "create", "related_files": files}],
+    )
+    t2 = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=parent,
+        payloads=[{"type": "fix", "related_files": files}],
+    )
+
+    result = compute_duplicate_foundation_signal([t1, t2])
+
+    assert result["total"] == 0
+    assert result["candidates"] == []
+
+
+def test_duplicate_foundation_signal_ignores_non_write_tasks():
+    """Research/plan (non code-change) active tasks never contribute to the
+    duplicate-foundation signal even with overlapping declared files."""
+    from app.digest_metrics import compute_duplicate_foundation_signal
+
+    t1 = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "research", "related_files": ["app/x.py"]}],
+    )
+    t2 = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "plan", "related_files": ["app/x.py"]}],
+    )
+
+    result = compute_duplicate_foundation_signal([t1, t2])
+
+    assert result["total"] == 0
+    assert result["candidates"] == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Section: Foundation Convergence Predicate Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_genuine_duplicate_reason_shared_finding_origin():
+    """Genuine duplicate: two write-tasks with identical finding_hash."""
+    from app.digest_metrics import _genuine_duplicate_reason
+
+    t1 = make_task(
+        payloads=[{"type": "fix"}],
+        context={"finding_hash": "abc123"},
+    )
+    t2 = make_task(
+        payloads=[{"type": "fix"}],
+        context={"finding_hash": "abc123"},
+    )
+    reason = _genuine_duplicate_reason(t1, set(), t2, set())
+    assert reason is not None
+    assert "shared finding origin" in reason
+    assert "abc123" in reason
+
+
+def test_genuine_duplicate_reason_shared_capability():
+    """Genuine duplicate: two write-tasks with a shared capability marker."""
+    from app.digest_metrics import _genuine_duplicate_reason
+
+    t1 = make_task(
+        payloads=[{"type": "create"}],
+        context={"provides_capability": "linting"},
+    )
+    t2 = make_task(
+        payloads=[{"type": "create"}],
+        context={"provides_capability": "linting"},
+    )
+    reason = _genuine_duplicate_reason(t1, set(), t2, set())
+    assert reason is not None
+    assert "shared capability" in reason
+    assert "linting" in reason
+
+
+def test_genuine_duplicate_reason_near_identical_files_at_threshold():
+    """Genuine duplicate: file overlap exactly at the 0.85 convergence threshold."""
+    from app.digest_metrics import _genuine_duplicate_reason
+
+    # Create exact threshold case: 85 shared, 15 unique to i, 0 unique to j = 85/100 = 0.85 >= 0.85
+    shared_files = {f"file_{i}.py" for i in range(85)}
+    fi = shared_files | {f"unique_i_{i}.py" for i in range(15)}
+    fj = shared_files
+
+    t1 = make_task(payloads=[{"type": "refactor"}])
+    t2 = make_task(payloads=[{"type": "refactor"}])
+    reason = _genuine_duplicate_reason(t1, fi, t2, fj)
+    assert reason is not None
+    assert "near-identical file sets" in reason
+    overlap = 85 / 100
+    assert f"{round(overlap, 3)}" in reason
+
+
+def test_genuine_duplicate_reason_below_convergence_threshold_returns_none():
+    """Below convergence threshold (0.85): strong-but-partial overlap is NOT genuine.
+
+    This is the incidental-shared-infra case where tasks can safely run in parallel
+    and reconcile at merge. They should NOT be serialized.
+    """
+    from app.digest_metrics import _genuine_duplicate_reason, _FOUNDATION_CONVERGE_THRESHOLD
+
+    # Create a case just below the threshold: 5 shared, 5 unique each = 5/10 = 0.50
+    fi = {"a.py", "b.py", "c.py", "d.py", "e.py", "f1.py", "g1.py", "h1.py", "i1.py", "j1.py"}
+    fj = {"a.py", "b.py", "c.py", "d.py", "e.py", "f2.py", "g2.py", "h2.py", "i2.py", "j2.py"}
+
+    t1 = make_task(payloads=[{"type": "create"}])
+    t2 = make_task(payloads=[{"type": "create"}])
+    reason = _genuine_duplicate_reason(t1, fi, t2, fj)
+    assert reason is None, (
+        f"Overlap {len(fi & fj)}/{len(fi | fj)} should be below {_FOUNDATION_CONVERGE_THRESHOLD}"
+    )
+
+
+def test_genuine_duplicate_reason_prefers_earliest_signal():
+    """Among multiple signals, any one is sufficient (shared finding > shared cap > file overlap)."""
+    from app.digest_metrics import _genuine_duplicate_reason
+
+    # Both have finding hash AND shared capability
+    t1 = make_task(
+        payloads=[{"type": "fix"}],
+        context={"finding_hash": "xyz789", "provides_capability": "auth"},
+    )
+    t2 = make_task(
+        payloads=[{"type": "fix"}],
+        context={"finding_hash": "xyz789", "provides_capability": "auth"},
+    )
+    reason = _genuine_duplicate_reason(t1, set(), t2, set())
+    # Should return the first match (finding hash)
+    assert "shared finding origin" in reason
+
+
+def test_compute_foundation_convergence_actions_shared_finding_origin():
+    """Acting convergence predicate: genuine duplicate with shared finding origin."""
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    now = _utcnow()
+    t1 = make_task(
+        created_at=now - timedelta(hours=1),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "fix"}],
+        context={"finding_hash": "finding001"},
+    )
+    t2 = make_task(
+        created_at=now,
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),  # Different parent
+        payloads=[{"type": "fix"}],
+        context={"finding_hash": "finding001"},
+    )
+
+    actions = compute_foundation_convergence_actions([t1, t2])
+
+    assert len(actions) == 1
+    assert actions[0]["foundation_id"] == str(t1.id)
+    assert actions[0]["dependent_id"] == str(t2.id)
+    assert "finding001" in actions[0]["reason"]
+
+
+def test_compute_foundation_convergence_actions_shared_capability():
+    """Acting convergence predicate: genuine duplicate with shared capability."""
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    now = _utcnow()
+    t1 = make_task(
+        created_at=now - timedelta(hours=2),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create"}],
+        context={"provides_capability": "performance-tuning"},
+    )
+    t2 = make_task(
+        created_at=now - timedelta(hours=1),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create"}],
+        context={"provides_capability": "performance-tuning"},
+    )
+
+    actions = compute_foundation_convergence_actions([t1, t2])
+
+    assert len(actions) == 1
+    assert actions[0]["foundation_id"] == str(t1.id)
+    assert actions[0]["dependent_id"] == str(t2.id)
+    assert "shared capability" in actions[0]["reason"]
+
+
+def test_compute_foundation_convergence_actions_file_overlap_at_threshold():
+    """Acting convergence predicate: high file overlap at/above convergence threshold."""
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    now = _utcnow()
+    # File overlap at threshold: 6 shared, 0 unique in files_i, 0 unique in files_j
+    # This gives intersection=6, union=6, ratio=1.0 >= 0.85
+    # Actually, let's be more realistic: 6 shared, 1 unique to each = 6/(6+1+1)=6/8=0.75 < 0.85
+    # So we need: shared=6, unique_i=0, unique_j=0 for ratio=1.0
+    # Or: shared=17, unique_i=3, unique_j=3 for ratio=17/23=0.739 < 0.85
+    # Let's use: shared=85, unique_i=15, unique_j=0 for ratio=85/100=0.85
+    shared_files = {f"file_{i}.py" for i in range(85)}
+    files_i = shared_files | {f"unique_i_{i}.py" for i in range(15)}
+    files_j = shared_files
+
+    t1 = make_task(
+        created_at=now - timedelta(minutes=30),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "refactor"}],
+        context={"related_files": list(files_i)},
+    )
+    t2 = make_task(
+        created_at=now,
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "refactor"}],
+        context={"related_files": list(files_j)},
+    )
+
+    actions = compute_foundation_convergence_actions([t1, t2])
+
+    assert len(actions) == 1
+    assert actions[0]["foundation_id"] == str(t1.id)
+    assert actions[0]["dependent_id"] == str(t2.id)
+    assert "near-identical file sets" in actions[0]["reason"]
+    # 85/100 = 0.85, exactly at threshold
+    assert "0.85" in actions[0]["reason"]
+
+
+def test_compute_foundation_convergence_actions_below_threshold_no_convergence():
+    """Below convergence threshold: overlapping files do NOT trigger convergence."""
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    now = _utcnow()
+    # Overlap: 50 shared, 50 unique to each = 50/100 = 0.5 << 0.85
+    # This is the shared-infrastructure case where tasks should run in parallel
+    shared_files = {f"shared/file_{i}.py" for i in range(50)}
+    files_i = shared_files | {f"only_i_{i}.py" for i in range(50)}
+    files_j = shared_files | {f"only_j_{i}.py" for i in range(50)}
+
+    t1 = make_task(
+        created_at=now - timedelta(hours=1),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create"}],
+        context={"related_files": list(files_i)},
+    )
+    t2 = make_task(
+        created_at=now,
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create"}],
+        context={"related_files": list(files_j)},
+    )
+
+    actions = compute_foundation_convergence_actions([t1, t2])
+
+    assert len(actions) == 0, "Below-threshold overlap should not trigger convergence"
+
+
+def test_compute_foundation_convergence_actions_same_parent_excluded():
+    """Same-parent siblings are excluded (handled by intra-decomposition depends_on)."""
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    now = _utcnow()
+    parent_id = uuid4()
+    # Both tasks have the same parent, so they should NOT be serialized by this path
+    t1 = make_task(
+        created_at=now - timedelta(hours=1),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=parent_id,
+        payloads=[{"type": "fix"}],
+        context={"finding_hash": "same_finding"},
+    )
+    t2 = make_task(
+        created_at=now,
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=parent_id,  # Same parent
+        payloads=[{"type": "fix"}],
+        context={"finding_hash": "same_finding"},
+    )
+
+    actions = compute_foundation_convergence_actions([t1, t2])
+
+    assert len(actions) == 0, "Same-parent siblings should be excluded"
+
+
+def test_compute_foundation_convergence_actions_earlier_task_is_canonical():
+    """Earlier-created task becomes canonical foundation; later depends on earlier."""
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    now = _utcnow()
+    # t2 created first, but t1 will be created later so t2 is canonical
+    t2 = make_task(
+        created_at=now - timedelta(hours=2),
+        id=uuid4(),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create"}],
+        context={"finding_hash": "finding_x"},
+    )
+    t1 = make_task(
+        created_at=now - timedelta(hours=1),
+        id=uuid4(),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create"}],
+        context={"finding_hash": "finding_x"},
+    )
+
+    actions = compute_foundation_convergence_actions([t2, t1])
+
+    assert len(actions) == 1
+    # t2 is earlier (created_at), so it's canonical
+    assert actions[0]["foundation_id"] == str(t2.id)
+    assert actions[0]["dependent_id"] == str(t1.id)
+
+
+def test_compute_foundation_convergence_actions_id_tiebreaker_when_same_time():
+    """When created_at is identical, use ID as tiebreaker (deterministic ordering)."""
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    now = _utcnow()
+    t1 = make_task(
+        created_at=now,
+        id=uuid4(),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "fix"}],
+        context={"provides_capability": "test"},
+    )
+    t2 = make_task(
+        created_at=now,
+        id=uuid4(),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "fix"}],
+        context={"provides_capability": "test"},
+    )
+
+    actions = compute_foundation_convergence_actions([t1, t2])
+
+    assert len(actions) == 1
+    # One should be canonical, the other dependent, but which depends on ID ordering
+    assert actions[0]["foundation_id"] in (str(t1.id), str(t2.id))
+    assert actions[0]["dependent_id"] in (str(t1.id), str(t2.id))
+    assert actions[0]["foundation_id"] != actions[0]["dependent_id"]
+
+
+def test_compute_foundation_convergence_actions_shared_files_populated():
+    """Action payload includes shared files for visibility."""
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    now = _utcnow()
+    # Create files with 85 shared, 15 unique to t1, 0 unique to t2 = 85/100 = 0.85 >= 0.85
+    shared = [f"lib/core_{i}.py" for i in range(85)]
+    unique_t1 = [f"lib/only_t1_{i}.py" for i in range(15)]
+
+    t1 = make_task(
+        created_at=now - timedelta(hours=1),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "refactor"}],
+        context={"related_files": shared + unique_t1},
+    )
+    t2 = make_task(
+        created_at=now,
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "refactor"}],
+        context={"related_files": shared},
+    )
+
+    actions = compute_foundation_convergence_actions([t1, t2])
+
+    assert len(actions) == 1
+    shared_set = set(actions[0]["shared_files"])
+    assert shared_set == set(shared)
+    for f in unique_t1:
+        assert f not in shared_set
+
+
+def test_compute_foundation_convergence_actions_multiple_pairs():
+    """Multiple independent cross-parent pairs all trigger convergence."""
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    now = _utcnow()
+    # Pair 1: two creates with shared finding
+    t1a = make_task(
+        created_at=now,
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create"}],
+        context={"finding_hash": "hash_A"},
+    )
+    t1b = make_task(
+        created_at=now + timedelta(minutes=1),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create"}],
+        context={"finding_hash": "hash_A"},
+    )
+    # Pair 2: two fixes with shared capability
+    t2a = make_task(
+        created_at=now + timedelta(minutes=2),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "fix"}],
+        context={"provides_capability": "auth"},
+    )
+    t2b = make_task(
+        created_at=now + timedelta(minutes=3),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "fix"}],
+        context={"provides_capability": "auth"},
+    )
+
+    actions = compute_foundation_convergence_actions([t1a, t1b, t2a, t2b])
+
+    assert len(actions) == 2
+    # Verify both pairs are represented
+    pair_ids = {(a["foundation_id"], a["dependent_id"]) for a in actions}
+    assert (str(t1a.id), str(t1b.id)) in pair_ids
+    assert (str(t2a.id), str(t2b.id)) in pair_ids

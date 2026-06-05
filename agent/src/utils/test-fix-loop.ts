@@ -39,7 +39,8 @@ import {
   type BuildConfig, type TestRunner,
   detectTestRunners, isDockerRunner,
   parseFailingTests, buildTargetedPytestRunners,
-  classifyTestExecution,
+  classifySetupFailure, classifyTestExecution, matchesEnvironmentFailureSignature,
+  extractTestCoverage, runnerFromCommand,
 } from './test-runners.js';
 
 // Build + buffer a FixLoopEvent from one wrapper-loop iteration. Centralized
@@ -85,6 +86,38 @@ function captureFixIterationDiffStat(): string {
 
 function buildFixLoopGuidanceSuffix(): string {
   return `\n\n${READ_THE_FAILURE_MESSAGE}\n${SIZE_GUARDRAIL_GUIDANCE}\n${PRIOR_ATTEMPT_DIVERGENCE}`;
+}
+
+export function matchesTransientSetupFailure(message: string): boolean {
+  const lower = message.toLowerCase();
+  const transportSignals = [
+    'connection refused',
+    'spurious network error',
+    'temporary failure in name resolution',
+    'network is unreachable',
+    'could not resolve host',
+    'registry timeout',
+    'unreachable',
+    'timed out',
+    'timeout',
+    'eai_again',
+    'econnreset',
+    'connection reset',
+  ];
+  if (transportSignals.some(signature => lower.includes(signature))) return true;
+  return false;
+}
+
+function isInfrastructureSetupFailure(
+  err: unknown,
+  message: string,
+  { includeTransientSetupFailures = false }: { includeTransientSetupFailures?: boolean } = {},
+): boolean {
+  const code = err instanceof Error ? (err as NodeJS.ErrnoException).code : undefined;
+  if (code === 'ENOENT') return true;
+  if (classifySetupFailure(message) || matchesEnvironmentFailureSignature(message)) return true;
+  if (includeTransientSetupFailures && matchesTransientSetupFailure(message)) return true;
+  return false;
 }
 
 /**
@@ -379,6 +412,21 @@ export function condensedAnalysisSections(analysisContext: string): string {
   return wanted.map(s => s.trim()).join('\n\n');
 }
 
+/**
+ * Render the per-runner setup/environment failures recorded during one attempt
+ * into a single operator-facing block (capped to keep the verdict artifact under
+ * the backend payload budget). Used to surface partial-setup failures — a runner
+ * whose environment broke (npm ci / pip / go mod / cargo fetch / runner timeout /
+ * missing-runtime signature) never executed its suite, so a sibling runner's
+ * clean pass must NOT be reported as an unqualified pass.
+ */
+function formatSetupErrors(setupErrors: Array<{ label: string; message: string }>): string {
+  return setupErrors
+    .map(e => `[${e.label}] ${e.message}`)
+    .join('\n\n')
+    .slice(0, 2000);
+}
+
 export interface TestFixLoopOptions {
   targetPytestSelectors?: string[];
   runImpactAfterTargeted?: boolean;
@@ -388,6 +436,42 @@ export interface TestFixLoopOptions {
   runnersOverride?: TestRunner[];
 }
 
+function describeRunnerSetupCommand(runner: TestRunner): { cmd: string; args: string[]; label: string } | null {
+  if (runner.installCmd) {
+    return {
+      ...runnerFromCommand(runner.installCmd, runner.cwd),
+      label: runner.installCmd,
+    };
+  }
+  if (runner.cmd === 'npm' && !fs.existsSync(`${runner.cwd}/node_modules`)) {
+    // Detect which Node package manager to use based on lockfile presence
+    const hasYarnLock = fs.existsSync(`${runner.cwd}/yarn.lock`);
+    const hasPnpmLock = fs.existsSync(`${runner.cwd}/pnpm-lock.yaml`);
+
+    if (hasYarnLock) {
+      return {
+        cmd: 'yarn',
+        args: ['install', '--frozen-lockfile'],
+        label: 'yarn install --frozen-lockfile',
+      };
+    }
+    if (hasPnpmLock) {
+      return {
+        cmd: 'pnpm',
+        args: ['install', '--frozen-lockfile'],
+        label: 'pnpm install --frozen-lockfile',
+      };
+    }
+    // Default to npm ci (for package-lock.json or as final fallback)
+    return {
+      cmd: 'npm',
+      args: ['ci'],
+      label: 'npm ci',
+    };
+  }
+  return null;
+}
+
 export async function testFixLoop(
   ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string, buildConfig?: BuildConfig,
@@ -395,7 +479,7 @@ export async function testFixLoop(
   relatedFiles?: string[],
   analysisContext?: string,
   options: TestFixLoopOptions = {},
-): Promise<{ passed: boolean; testFailuresDetected: boolean; setupFailed?: boolean; failureSummary?: string; noTestsExecuted?: boolean }> {
+): Promise<{ passed: boolean; testFailuresDetected: boolean; setupFailed?: boolean; partialSetupFailed?: boolean; failureSummary?: string; noTestsExecuted?: boolean; noTestsReason?: 'all_skipped' | 'no_real_tests'; coverage?: { passed: number; skipped: number; total: number } }> {
   let runners = options.runnersOverride ?? detectTestRunners(buildConfig);
   const targetPytestSelectors = Array.from(new Set(options.targetPytestSelectors ?? []));
 
@@ -483,33 +567,148 @@ export async function testFixLoop(
     // so the caller doesn't push unverified code.
     const setupErrors: Array<{ label: string; message: string }> = [];
     let ranAnyRunner = false;
+    // Accumulate each runner's raw combined output (pass output + real-failure
+    // output) so a best-effort pass/skip/total coverage summary can be parsed
+    // BEFORE the per-runner output is discarded. Reset per attempt so coverage
+    // reflects the run actually being reported. Setup/timeout/env errors route
+    // to setupErrors and are intentionally excluded (no real suite output).
+    const runnerOutputs: string[] = [];
     // Track whether ANY runner's output indicates a real test actually
     // executed (vs. a placeholder command or a zero-test collection). Used to
     // distinguish "a suite ran and produced a verdict" from "no real tests
     // executed" so the no-CI merge gate can route the latter to the documented
     // proceed-without-checks fallback instead of a hard fail / vacuous pass.
     let anyRealTestExecuted = false;
+    // Track whether any runner's output was classified as an ALL-SKIPPED run
+    // (collected tests but executed none — all skipped/deselected/ignored)
+    // vs. a plain no-real-tests case (placeholder / zero-collection), so the
+    // no-execution verdict can distinguish "suite present but every test
+    // skipped" from "no real tests".
+    let sawAllSkipped = false;
     const taskId = process.env.TASK_ID || '';
     for (const runner of runners) {
-      // Setup step: ensure node_modules exist for npm runners. A failure
-      // HERE is NOT a test failure — it's dep-install breakage (registry
-      // flake, lockfile drift, disk, postinstall crash). The Claude fix
-      // loop can't meaningfully repair these; skip this runner but record
-      // the error so we can report "tests couldn't run" when every runner
-      // fails setup.
-      if (runner.cmd === 'npm' && !fs.existsSync(`${runner.cwd}/node_modules`)) {
-        sendLog(ws, `Installing dependencies for ${runner.label}...\n`);
+      // Setup step: run any declared bootstrap/install command before the
+      // suite, otherwise preserve the historical npm ci bootstrap for clean
+      // Node worktrees. A failure HERE is not a fixable test failure.
+      const setupCommand = describeRunnerSetupCommand(runner);
+      if (setupCommand) {
+        const setupDescription = runner.installCmd
+          ? `Running install/bootstrap for ${runner.label}: ${runner.installCmd}`
+          : `Installing dependencies for ${runner.label}...`;
+        sendLog(ws, `${setupDescription}\n`);
         try {
-          await execFileAsync('npm', ['ci'], { cwd: runner.cwd, timeoutMs: TEST_RUNNER_TIMEOUT });
+          await execFileAsync(setupCommand.cmd, setupCommand.args, {
+            cwd: runner.cwd,
+            timeoutMs: TEST_RUNNER_TIMEOUT,
+          });
         } catch (installErr) {
           const msg = installErr instanceof Error ? installErr.message : String(installErr);
+          if (isInfrastructureSetupFailure(installErr, msg, { includeTransientSetupFailures: true })) {
+            sendLog(
+              ws,
+              `WARNING: Runner setup failed for [${runner.label}] — ` +
+              `infrastructure/setup error, not a fixable test failure. Skipping runner.\n` +
+              `${msg.slice(0, 500)}\n`,
+            );
+            setupErrors.push({ label: runner.label, message: `${setupCommand.label} failed: ${msg}` });
+            continue;
+          }
           sendLog(
             ws,
-            `WARNING: Dependency install failed for [${runner.label}] — ` +
-            `setup error, not a fixable test failure. Skipping runner.\n` +
+            `Runner setup failed for [${runner.label}] — treating this as a repository/bootstrap failure ` +
+            `so the verify flow stays red instead of falling open.\n${msg.slice(0, 500)}\n`,
+          );
+          failures.push({ label: runner.label, message: `${setupCommand.label} failed:\n${msg}` });
+          ranAnyRunner = true;
+          continue;
+        }
+      }
+      // Python pre-install: install declared deps before running the suite.
+      // poetry.lock → poetry install --no-root; requirements.txt → pip install.
+      // Treat install failure as a setup error so it routes to setupFailed
+      // rather than the code-fix loop.
+      if (
+        (runner.cmd === 'python3' || runner.cmd === 'python' || runner.cmd === 'pytest' || runner.cmd === 'tox' || runner.cmd === 'nox') &&
+        (fs.existsSync(`${runner.cwd}/poetry.lock`) || fs.existsSync(`${runner.cwd}/requirements.txt`))
+      ) {
+        const usePoetry = fs.existsSync(`${runner.cwd}/poetry.lock`);
+        const installCmd = usePoetry ? 'poetry' : 'pip';
+        const installArgs = usePoetry
+          ? ['install', '--no-root']
+          : ['install', '-r', 'requirements.txt'];
+        sendLog(ws, `Installing Python dependencies for ${runner.label}...\n`);
+        try {
+          await execFileAsync(installCmd, installArgs, { cwd: runner.cwd, timeoutMs: TEST_RUNNER_TIMEOUT });
+        } catch (installErr) {
+          const msg = installErr instanceof Error ? installErr.message : String(installErr);
+          if (isInfrastructureSetupFailure(installErr, msg, { includeTransientSetupFailures: true })) {
+            sendLog(
+              ws,
+              `WARNING: Python dependency install failed for [${runner.label}] — ` +
+              `infrastructure/setup error. Skipping runner.\n${msg.slice(0, 500)}\n`,
+            );
+            setupErrors.push({ label: runner.label, message: `${installCmd} install failed: ${msg}` });
+            continue;
+          }
+          sendLog(
+            ws,
+            `Python dependency install failed for [${runner.label}] — treating this as a repository ` +
+            `dependency failure instead of a setup fallback.\n${msg.slice(0, 500)}\n`,
+          );
+          failures.push({ label: runner.label, message: `${installCmd} install failed:\n${msg}` });
+          ranAnyRunner = true;
+          continue;
+        }
+      }
+      // Go pre-install: download module graph before running tests.
+      if (runner.cmd === 'go' && fs.existsSync(`${runner.cwd}/go.mod`)) {
+        sendLog(ws, `Downloading Go modules for ${runner.label}...\n`);
+        try {
+          await execFileAsync('go', ['mod', 'download'], { cwd: runner.cwd, timeoutMs: TEST_RUNNER_TIMEOUT });
+        } catch (installErr) {
+          const msg = installErr instanceof Error ? installErr.message : String(installErr);
+          if (isInfrastructureSetupFailure(installErr, msg, { includeTransientSetupFailures: true })) {
+            sendLog(
+              ws,
+              `WARNING: Go module download failed for [${runner.label}] — ` +
+              `infrastructure/setup error. Skipping runner.\n${msg.slice(0, 500)}\n`,
+            );
+            setupErrors.push({ label: runner.label, message: `go mod download failed: ${msg}` });
+            continue;
+          }
+          sendLog(
+            ws,
+            `Go module download failed for [${runner.label}] — treating this as a repository/module failure.\n` +
             `${msg.slice(0, 500)}\n`,
           );
-          setupErrors.push({ label: runner.label, message: `npm ci failed: ${msg}` });
+          failures.push({ label: runner.label, message: `go mod download failed:\n${msg}` });
+          ranAnyRunner = true;
+          continue;
+        }
+      }
+      // Rust pre-install: fetch dependencies before running tests.
+      if (runner.cmd === 'cargo' && fs.existsSync(`${runner.cwd}/Cargo.toml`)) {
+        sendLog(ws, `Fetching Rust dependencies for ${runner.label}...\n`);
+        try {
+          await execFileAsync('cargo', ['fetch', '--manifest-path', `${runner.cwd}/Cargo.toml`], { cwd: runner.cwd, timeoutMs: TEST_RUNNER_TIMEOUT });
+        } catch (installErr) {
+          const msg = installErr instanceof Error ? installErr.message : String(installErr);
+          if (isInfrastructureSetupFailure(installErr, msg, { includeTransientSetupFailures: true })) {
+            sendLog(
+              ws,
+              `WARNING: Rust dependency fetch failed for [${runner.label}] — ` +
+              `infrastructure/setup error. Skipping runner.\n${msg.slice(0, 500)}\n`,
+            );
+            setupErrors.push({ label: runner.label, message: `cargo fetch failed: ${msg}` });
+            continue;
+          }
+          sendLog(
+            ws,
+            `Rust dependency fetch failed for [${runner.label}] — treating this as a repository dependency failure.\n` +
+            `${msg.slice(0, 500)}\n`,
+          );
+          failures.push({ label: runner.label, message: `cargo fetch failed:\n${msg}` });
+          ranAnyRunner = true;
           continue;
         }
       }
@@ -529,20 +728,25 @@ export async function testFixLoop(
         const runnerTimeout = isDockerRunner(runner) ? TEST_RUNNER_DOCKER_TIMEOUT : TEST_RUNNER_TIMEOUT;
         const passOutput = await execFileAsync(runner.cmd, runArgs, { cwd: runner.cwd, timeoutMs: runnerTimeout });
         ranAnyRunner = true;
+        runnerOutputs.push(passOutput);
         // A clean exit only counts as a real verdict if real tests ran. An
         // empty/zero-test suite that exits 0 must not be recorded as a
         // verified pass.
-        if (classifyTestExecution(passOutput) === 'ran') anyRealTestExecuted = true;
+        const passClass = classifyTestExecution(passOutput);
+        if (passClass === 'ran') anyRealTestExecuted = true;
+        else if (passClass === 'all_skipped') sawAllSkipped = true;
         sendLog(ws, `Tests passed [${runner.label}].\n`);
       } catch (testErr: unknown) {
+        const errno = testErr instanceof Error
+          ? (testErr as NodeJS.ErrnoException).code
+          : undefined;
         // If the runner timed out (killed by the process-group SIGTERM/SIGKILL
-        // chain in execFileAsync) or the OS could not spawn the process
-        // (ETIMEDOUT), treat as a setup error — a Docker build timeout or
-        // spawn failure is not a fixable code failure, but we also can't
-        // claim tests passed.
+        // chain in execFileAsync) treat as a setup error — a Docker build
+        // timeout is not a fixable code failure, but we also can't claim tests
+        // passed.
         const isRunnerTimeout = testErr instanceof Error && (
           (testErr as Error & { killed?: boolean }).killed === true ||
-          (testErr as NodeJS.ErrnoException).code === 'ETIMEDOUT'
+          errno === 'ETIMEDOUT'
         );
         if (isRunnerTimeout) {
           const msg = testErr instanceof Error ? testErr.message : String(testErr);
@@ -550,15 +754,32 @@ export async function testFixLoop(
           setupErrors.push({ label: runner.label, message: `runner timeout: ${msg}` });
           continue;
         }
-        // Non-timeout non-zero exit = the runner actually ran the suite
-        // and at least one test failed. Record the failure.
-        ranAnyRunner = true;
         const msg = testErr instanceof Error ? testErr.message : String(testErr);
+        // Route only true VM/runtime failures to setupErrors. Repo dependency
+        // regressions (missing package/module/import after the suite starts)
+        // stay on the failure lane so verify blocks instead of downgrading to
+        // setupFailed/UNVERIFIED.
+        if (isInfrastructureSetupFailure(testErr, msg)) {
+          sendLog(
+            ws,
+            `WARNING: Test runner [${runner.label}] hit an environment failure ` +
+            `(missing runtime / shared library / spawn ENOENT) — not a fixable code failure. ` +
+            `Skipping runner.\n${msg.slice(0, 500)}\n`,
+          );
+          setupErrors.push({ label: runner.label, message: `environment failure: ${msg}` });
+          continue;
+        }
+        // Non-timeout, non-env-failure, non-zero exit = the runner ran the
+        // suite and at least one test failed. Record the failure.
+        ranAnyRunner = true;
+        runnerOutputs.push(msg);
         // A non-zero exit from a placeholder command (e.g. the default `npm`
         // "no test specified" script) is NOT a real test failure. Only count
         // this as a real test executing when the output isn't a no-tests
         // signature.
-        if (classifyTestExecution(msg) === 'ran') anyRealTestExecuted = true;
+        const failClass = classifyTestExecution(msg);
+        if (failClass === 'ran') anyRealTestExecuted = true;
+        else if (failClass === 'all_skipped') sawAllSkipped = true;
         let structuredIds: Set<string> | undefined;
         if (jsonOutputPath && fs.existsSync(jsonOutputPath)) {
           try {
@@ -577,9 +798,31 @@ export async function testFixLoop(
       }
     }
 
-    const reportableFailures = anyRealTestExecuted
-      ? failures.filter(failure => classifyTestExecution(failure.message) === 'ran')
-      : failures;
+    // Best-effort coverage summary (pass/skip/total) parsed from the combined
+    // runner output of THIS attempt. Conservative: extractTestCoverage returns
+    // null (→ undefined here) for ambiguous/unparseable output, in which case
+    // the field is simply omitted from the verdict. Visibility only — never
+    // changes pass/fail or detected.
+    const coverage = extractTestCoverage(runnerOutputs.join('\n')) ?? undefined;
+
+    // Partial-setup detection: at least one runner ran AND at least one OTHER
+    // runner failed setup/environment. The failed runner's suite never
+    // executed, so any "pass" here is only over the runners that ran — we must
+    // not report an unqualified clean pass. setupSummary carries the broken
+    // runners' errors; setupNote appends them to the test-failure summary on the
+    // real-failure exits so they are surfaced alongside genuine failures.
+    const partialSetupFailed = ranAnyRunner && setupErrors.length > 0;
+    const setupSummary = setupErrors.length > 0 ? formatSetupErrors(setupErrors) : '';
+    const setupNote = setupSummary
+      ? `\n\nPartial setup failure — the following runner(s) never executed (environment/setup error); their suites are UNVERIFIED:\n${setupSummary}`
+      : '';
+
+    const reportableFailures = failures.filter(
+      failure => classifyTestExecution(failure.message) === 'ran',
+    );
+    const placeholderFailures = failures.filter(
+      failure => classifyTestExecution(failure.message) !== 'ran',
+    );
 
     if (reportableFailures.length === 0) {
       // "No failures" is only a pass if we actually ran at least one
@@ -589,12 +832,26 @@ export async function testFixLoop(
       // setupFailed state so the caller fails the task with an infra
       // category instead of merging unverified code.
       if (!ranAnyRunner && setupErrors.length > 0) {
-        const summary = setupErrors
-          .map(e => `[${e.label}] ${e.message}`)
+        sendLog(ws, `Tests could not run — setup failed for all runners. Not invoking fix loop.\n${setupSummary}\n`);
+        return { passed: false, testFailuresDetected: false, setupFailed: true, failureSummary: setupSummary };
+      }
+      // Partial setup failure: some runner(s) ran clean, but at least one
+      // sibling runner failed setup and never executed its suite. Reporting a
+      // clean pass here would silently merge with an entire suite unverified.
+      // Surface a distinct partialSetupFailed signal (passed:false) so the
+      // caller drives the same bounded setup-retry the all-failed case uses and,
+      // once exhausted, fails the gate closed rather than falling open.
+      if (partialSetupFailed) {
+        sendLog(ws, `Tests passed on the runners that ran, but ${setupErrors.length} runner(s) failed setup — not reporting a clean pass.\n${setupSummary}\n`);
+        return { passed: false, testFailuresDetected: false, partialSetupFailed: true, failureSummary: setupSummary };
+      }
+      if (!anyRealTestExecuted && placeholderFailures.length > 0) {
+        const failureSummary = placeholderFailures
+          .map(failure => `[${failure.label}]:\n${failure.message}`)
           .join('\n\n')
-          .slice(0, 2000);
-        sendLog(ws, `Tests could not run — setup failed for all runners. Not invoking fix loop.\n${summary}\n`);
-        return { passed: false, testFailuresDetected: false, setupFailed: true, failureSummary: summary };
+          .slice(-8000);
+        sendLog(ws, 'No real tests executed — only placeholder/empty-suite failures were observed.\n');
+        return { passed: false, testFailuresDetected: true, failureSummary, noTestsExecuted: true };
       }
       emitWrapperFixLoopEvent({
         loop: 'test', iteration: attempt + 1, errorMessage: '',
@@ -602,8 +859,14 @@ export async function testFixLoop(
       });
       sendLog(ws, 'All tests passed.\n');
       // noTestsExecuted: we ran at least one runner but none of them showed a
-      // real test executing — the "pass" is vacuous (empty/zero-test suite).
-      return { passed: true, testFailuresDetected: false, noTestsExecuted: ranAnyRunner && !anyRealTestExecuted };
+      // real test executing — the "pass" is vacuous (empty/zero-test suite or
+      // an all-skipped suite). noTestsReason distinguishes the two.
+      const noTestsExecuted = ranAnyRunner && !anyRealTestExecuted;
+      return {
+        passed: true, testFailuresDetected: false, noTestsExecuted,
+        noTestsReason: noTestsExecuted ? (sawAllSkipped ? 'all_skipped' : 'no_real_tests') : undefined,
+        coverage,
+      };
     }
 
     // Serialize each failure for operator-facing output. This same format
@@ -637,6 +900,12 @@ export async function testFixLoop(
       if (newFailures.length === 0) {
         // Every detected failure existed before our changes — task is not responsible
         sendLog(ws, `All ${preExistingFailures.length} test failure(s) are pre-existing and were not caused by this task.\n`);
+        // ...but if a sibling runner failed setup, a suite never ran — surface
+        // the partial-setup signal instead of an unqualified clean pass.
+        if (partialSetupFailed) {
+          sendLog(ws, `However, ${setupErrors.length} runner(s) failed setup and never executed — reporting partial setup failure.\n${setupSummary}\n`);
+          return { passed: false, testFailuresDetected: false, partialSetupFailed: true, failureSummary: setupSummary };
+        }
         return { passed: true, testFailuresDetected: false };
       }
 
@@ -655,8 +924,8 @@ export async function testFixLoop(
         exitReason: 'early_unchanged', startedAt: iterStartedAt,
       });
       sendLog(ws, `Test failures unchanged from previous attempt — exiting early (persistent, unfixable by Claude).\n`);
-      const failureSummary = combinedFailures.slice(-8000);
-      return { passed: false, testFailuresDetected: true, failureSummary };
+      const failureSummary = combinedFailures.slice(-8000) + setupNote;
+      return { passed: false, testFailuresDetected: true, failureSummary, partialSetupFailed: partialSetupFailed || undefined, coverage };
     }
     fingerprintHistory.push(fingerprint);
     errorTextHistory.push(combinedFailures);
@@ -668,8 +937,8 @@ export async function testFixLoop(
         exitReason: divergence, startedAt: iterStartedAt,
       });
       sendLog(ws, `Test fix loop divergence detected (${divergence}) — abandoning to avoid wasted iterations.\n`);
-      const failureSummary = combinedFailures.slice(-8000);
-      return { passed: false, testFailuresDetected: true, failureSummary };
+      const failureSummary = combinedFailures.slice(-8000) + setupNote;
+      return { passed: false, testFailuresDetected: true, failureSummary, partialSetupFailed: partialSetupFailed || undefined, coverage };
     }
     // On retry (attempt >= 1), record what the previous Claude call
     // actually changed + the test failures that persisted, so the next
@@ -761,12 +1030,18 @@ export async function testFixLoop(
         ? `${phasePrefix}Tests failed during focused verification.\n`
         : `WARNING: ${phasePrefix}Tests still failing after ${maxFixAttempts} fix attempts. Proceeding with commit.\n`;
       sendLog(ws, exhaustedMessage);
-      const failureSummary = combinedFailures.slice(-8000);
+      const failureSummary = combinedFailures.slice(-8000) + setupNote;
       // noTestsExecuted: the only "failures" came from placeholder commands
       // (e.g. `npm` "no test specified") — no real test executed, so the
       // focused-verification fail should route to the proceed-without-checks
       // fallback rather than blocking the merge.
-      return { passed: false, testFailuresDetected: true, failureSummary, noTestsExecuted: ranAnyRunner && !anyRealTestExecuted };
+      const noTestsExecuted = ranAnyRunner && !anyRealTestExecuted;
+      return {
+        passed: false, testFailuresDetected: true, failureSummary, noTestsExecuted,
+        noTestsReason: noTestsExecuted ? (sawAllSkipped ? 'all_skipped' : 'no_real_tests') : undefined,
+        partialSetupFailed: partialSetupFailed || undefined,
+        coverage,
+      };
     }
   }
   return { passed: false, testFailuresDetected: true };

@@ -4,7 +4,9 @@ import app.github as github
 from app.migration_chain import (
     _filename_revision_prefix,
     build_migration_chain,
+    find_content_divergence_records,
     find_content_divergent_revisions,
+    find_filename_revision_mismatches,
     find_heads,
     plan_integration_side_renumber,
     plan_migration_reconciliation,
@@ -12,6 +14,10 @@ from app.migration_chain import (
     validate_combined_migration_chain,
 )
 from app.migration_path import is_migration_file
+from app.migration_reconciliation import (
+    AUTHORIZED_DIVERGENCES,
+    AuthorizedDivergence,
+)
 
 # Alembic versions directory, used to resolve a bare migration basename (as
 # returned by ``github.list_versions_at_ref``) back to its full repo path for a
@@ -82,6 +88,7 @@ async def _validate_rollup_migration_chain(
     repo: str,
     pr_number: int,
     target_branch: str | None = None,
+    promotion_target: str | None = None,
 ) -> tuple[str, str | None]:
     """Fail-safe Alembic-chain guard for rollup auto-merge.
 
@@ -100,6 +107,18 @@ async def _validate_rollup_migration_chain(
     target branch's migrations is fail-safe (``"defer"``), mirroring the
     diff-fetch handling. With no *target_branch* the guard degrades to the
     in-isolation check.
+
+    When *promotion_target* is given (and distinct from *target_branch*), the
+    added migrations are ALSO compared against the DEPLOYED promotion target's
+    current chain — catching the cross-branch revision-identity collision that
+    birthed the revision-0143 incident (prod 2026-06-04): a migration added on
+    the integration branch reusing a revision id the deployed target already
+    stamped to a DIFFERENT migration. That is a clean addition against the
+    integration branch (so the target-branch checks above pass) yet a deploy-
+    time collision that only surfaces at promotion — too late to renumber
+    cheaply. Caught here it flows to the same ``block`` -> auto-reconcile
+    renumber path. A failure to list the promotion target's migrations is
+    fail-safe (``"defer"``), mirroring the target-branch handling.
     """
     try:
         files = await github.get_pr_files(gh_token, owner, repo, pr_number)
@@ -166,6 +185,43 @@ async def _validate_rollup_migration_chain(
             f"mishandle a migration the live DB already applied): "
             + "; ".join(divergences),
         )
+
+    # Cross-BRANCH revision-identity guard against the DEPLOYED promotion target.
+    # The checks above validate the rollup only against the INTEGRATION branch it
+    # merges into; they are blind to a migration added on integration that reuses
+    # a revision id the DEPLOYED promotion target already stamped to a DIFFERENT
+    # migration — the revision-0143 collision class (prod incident 2026-06-04).
+    # Comparing the added migrations against the promotion target's CURRENT chain
+    # catches it BEFORE it lands (the block flows to the auto-reconcile renumber
+    # path) instead of discovering it at qualification/deploy. Normal integration
+    # ahead-ness is NOT flagged: find_content_divergent_revisions only reports a
+    # SHARED revision id whose migration identity differs (or a shared migration
+    # under a different id), never a revision present on only one side. A failed
+    # fetch is fail-safe (``"defer"``), mirroring the target-branch handling.
+    if promotion_target and promotion_target != target_branch:
+        try:
+            promotion_filenames = await github.list_versions_at_ref(
+                gh_token, owner, repo, promotion_target
+            )
+        except Exception as e:
+            return (
+                "defer",
+                f"could not list promotion target '{promotion_target}' migrations "
+                f"to validate cross-branch Alembic revision identity: "
+                f"{type(e).__name__}: {e}",
+            )
+        promotion_divergences = find_content_divergent_revisions(
+            promotion_filenames, list(added_sources.keys())
+        )
+        if promotion_divergences:
+            return (
+                "block",
+                f"Alembic revision-identity collision between the candidate and "
+                f"the deployed promotion target '{promotion_target}' (a rollup "
+                f"migration reuses a revision id the deployed DB already stamped "
+                f"to a different migration; it would be silently skipped at "
+                f"deploy): " + "; ".join(promotion_divergences),
+            )
     return ("ok", None)
 
 
@@ -175,6 +231,7 @@ async def enforce_premerge_migration_guard(
     repo: str,
     pr_number: int,
     target_branch: str | None,
+    promotion_target: str | None = None,
 ) -> tuple[bool, str | None]:
     """Fail-safe pre-merge Alembic dual-head guard for non-autoreconcile paths.
 
@@ -193,11 +250,149 @@ async def enforce_premerge_migration_guard(
     second migration-safety rule set.
     """
     verdict, reason = await _validate_rollup_migration_chain(
-        gh_token, owner, repo, pr_number, target_branch=target_branch
+        gh_token,
+        owner,
+        repo,
+        pr_number,
+        target_branch=target_branch,
+        promotion_target=promotion_target,
     )
     if verdict == "ok":
         return (True, None)
     return (False, reason)
+
+
+def _divergence_record_is_authorized(
+    record: dict,
+    authorized: tuple[AuthorizedDivergence, ...] = AUTHORIZED_DIVERGENCES,
+) -> bool:
+    """Is *record* an EXACT match for an authorized, already-handled divergence?
+
+    The deploy-time reconciliation (:mod:`app.migration_reconciliation`) makes a
+    SPECIFIC back-merge renumber safe; that registry is the single source of
+    truth for which divergences are handled. A detected divergence matches an
+    authorized entry only when BOTH the revision id AND the pair of migration
+    identities match exactly — a different revision id, or a different identity
+    pair, is NOT authorized and must still hard-block.
+
+    The reused/renumbered classes are two complementary views of the same
+    authorized renumber: ``reused`` matches the colliding revision + its identity
+    pair; ``renumbered`` matches the deployed identity moving from the colliding
+    revision to its renumbered slot.
+    """
+    for auth in authorized:
+        if record["kind"] == "reused" and record["revision"] == auth.revision and {
+            record["base_identity"],
+            record["head_identity"],
+        } == {auth.deployed_identity, auth.integration_identity}:
+            return True
+        if record["kind"] == "renumbered" and record[
+            "identity"
+        ] == auth.deployed_identity and {
+            record["base_revision"],
+            record["head_revision"],
+        } == {auth.revision, auth.integration_revision}:
+            return True
+    return False
+
+
+async def check_qualification_migration_identity(
+    gh_token: str,
+    owner: str,
+    repo: str,
+    candidate_ref: str,
+    promotion_target: str,
+    *,
+    project_id: str | None = None,
+) -> tuple[str, str | None]:
+    """Deterministic Alembic revision-identity verdict for release qualification.
+
+    The release qualifier scores an ``automain`` candidate against the deployed
+    ``main`` promotion target, but its quality dimensions (audit / test-erosion /
+    smoketest) have NO deterministic migration-safety check — whether a
+    revision-identity collision blocks the release depends on the spawned audit
+    agent noticing it by reasoning. That is exactly how the revision-0143
+    collision (prod incident 2026-06-04) became a soft, score-eroding audit
+    finding instead of a clear gate, and a future collision could slip through.
+
+    This makes migration-identity safety DETERMINISTIC at qualification time by
+    reusing the SAME detector + fetch helpers the merge-time guards use — it does
+    NOT introduce a second migration-safety rule set. It lists the candidate's
+    Alembic migration filenames (at *candidate_ref* — the candidate SHA the
+    qualifier snapshotted) and the deployed promotion target's CURRENT migration
+    filenames (at *promotion_target*), then runs
+    :func:`find_content_divergent_revisions` over the two sets.
+
+    Returns one of:
+      ``("ok", None)``      — the two refs agree on every shared revision id and
+                              migration identity (no collision).
+      ``("block", reason)`` — a revision-identity collision was found; *reason*
+                              names the specific diverging revision. A HARD
+                              qualification blocker.
+      ``("defer", reason)`` — either side's migration list could not be fetched.
+                              Migration safety is UNKNOWN, so the release must be
+                              HELD (never waved through); the next qualification
+                              cycle retries.
+
+    Fail-safe by construction: an inability to fetch either side's list is
+    ``"defer"``, never ``"ok"`` — a fetch error is not "no collision".
+    """
+    try:
+        candidate_filenames = await github.list_versions_at_ref(
+            gh_token, owner, repo, candidate_ref, project_id=project_id
+        )
+    except Exception as e:
+        return (
+            "defer",
+            f"could not list candidate '{candidate_ref}' Alembic migrations to "
+            f"check revision-identity safety: {type(e).__name__}: {e}",
+        )
+    try:
+        target_filenames = await github.list_versions_at_ref(
+            gh_token, owner, repo, promotion_target, project_id=project_id
+        )
+    except Exception as e:
+        return (
+            "defer",
+            f"could not list promotion target '{promotion_target}' Alembic "
+            f"migrations to check revision-identity safety: "
+            f"{type(e).__name__}: {e}",
+        )
+
+    # Compare the deployed promotion target against the candidate. A divergence
+    # means a revision id the deployed DB already applied maps to a DIFFERENT
+    # migration on the candidate (so it would be silently skipped), or a
+    # migration moved revision ids (so it would re-run / mishandle).
+    records = find_content_divergence_records(target_filenames, candidate_filenames)
+    unauthorized = [r for r in records if not _divergence_record_is_authorized(r)]
+    authorized = [r for r in records if _divergence_record_is_authorized(r)]
+
+    # Any divergence NOT on the authorized-reconciliation registry still hard-
+    # blocks — the registry is purely additive and never weakens an unknown
+    # collision.
+    if unauthorized:
+        return (
+            "block",
+            f"Alembic revision-identity collision between the candidate and the "
+            f"deployed promotion target '{promotion_target}' (a renumber/reuse "
+            f"that would skip or mishandle a migration the deployed DB already "
+            f"applied): " + "; ".join(r["message"] for r in unauthorized),
+        )
+
+    # Only authorized, already-reconciled divergences remain. The deploy-time
+    # reconciliation makes this exact renumber safe, so it is non-blocking — but
+    # record an informational note so the qualification record shows WHY this
+    # known divergence was waved through (it self-clears once the version
+    # promotes and the branches agree).
+    if authorized:
+        return (
+            "ok",
+            f"authorized reconciled Alembic revision-identity divergence(s) vs "
+            f"deployed promotion target '{promotion_target}' (handled by deploy-"
+            f"time reconciliation, non-blocking): "
+            + "; ".join(r["message"] for r in authorized),
+        )
+    return ("ok", None)
 
 
 async def _validate_migration_chain_post_merge(
@@ -222,17 +417,34 @@ async def _validate_migration_chain_post_merge(
     target-branch migration's source, builds the in-file revision/down_revision
     chain over the WHOLE set as one (NOT an added-vs-existing comparison, which
     would falsely flag the candidate's own just-merged revisions — see #7731),
-    and blocks on a genuine third-party dual head (more than one Alembic head
-    built from distinct revision ids) or a broken chain (a ``down_revision``
-    pointing at a revision absent from the branch).  A clean target (every
-    revision id appears exactly once and the chain has a single head with no
-    dangling anchor) returns ``("ok", None)``.
+    and blocks on the SAME migration-corruption taxonomy the pre-merge guard
+    enforces (reusing the shared chain helpers rather than a second rule set):
+
+      * a duplicate IN-FILE revision id — two distinct migration files declaring
+        the same ``revision = '...'`` (a copy-paste where the filename ``NNNN``
+        was bumped but the in-file id was not).  Chain-building collapses the two
+        into one node, so the filename-prefix pass cannot see it;
+      * an UNPARSEABLE migration source — a numeric-prefixed file with no
+        parseable in-file ``revision``, silently dropped from the analyzed chain;
+      * a filename/revision DESYNC — the ``NNNN`` filename prefix disagrees with
+        the in-file ``revision`` id;
+      * a genuine third-party dual head (more than one Alembic head built from
+        distinct revision ids), or a broken chain (a ``down_revision`` pointing at
+        a revision absent from the branch).
+
+    The first two classes are weighted ahead of the dual-head / broken-chain
+    checks: a collapsed (duplicate-id) or dropped (unparseable) node can MASK a
+    genuine dual head or broken chain that would otherwise be detected, so the
+    reconciler would record a spurious promotion of a target that actually fails
+    the schema-revision startup gate — the exact failure the guard prevents.  A
+    clean target (every revision id unique and parseable, filenames matching, the
+    chain a single head with no dangling anchor) returns ``("ok", None)``.
 
     Returns ``("defer", reason)`` on GitHub I/O failure — including any per-file
     source fetch failure or empty body — consistent with the pre-merge guard's
-    fail-safe semantics, and ``("block", reason)`` when a genuine duplicate
-    revision id, dual head, or broken chain is found.  When the PR does not touch
-    Alembic migrations, returns ``("ok", None)`` immediately.
+    fail-safe semantics, and ``("block", reason)`` when any corruption class above
+    is found.  When the PR does not touch Alembic migrations, returns
+    ``("ok", None)`` immediately.
     """
     try:
         files = await github.get_pr_files(gh_token, owner, repo, pr_number)
@@ -314,7 +526,40 @@ async def _validate_migration_chain_post_merge(
         sources[fn] = text
 
     if sources:
-        chain, _duplicates, _unparseable = build_migration_chain(sources)
+        chain, duplicates, unparseable = build_migration_chain(sources)
+
+        # Weight the unambiguously chain-breaking classes first: a collapsed
+        # (duplicate in-file id) or dropped (unparseable) node can MASK a genuine
+        # dual head / broken chain below, so surface them before the head/dangling
+        # checks. This mirrors the pre-merge guard's corruption taxonomy
+        # (validate_added_migrations) exactly, reusing the same chain helpers.
+        if unparseable:
+            return (
+                "block",
+                f"migration file(s) on '{target_branch}' have no parseable in-file "
+                f"revision and were dropped from the chain: "
+                f"{', '.join(sorted(unparseable))} — an unparseable migration makes "
+                f"the target unbootable and can mask a dual head; chain needs "
+                f"manual resolution.",
+            )
+        if duplicates:
+            dup = sorted(set(duplicates))[0]
+            return (
+                "block",
+                f"in-file Alembic revision id '{dup}' is declared by more than one "
+                f"migration file on '{target_branch}' — distinct files collapsing to "
+                f"one chain node can mask a dual head and the schema-revision startup "
+                f"gate would fail; chain needs manual resolution.",
+            )
+        mismatches = find_filename_revision_mismatches(sources)
+        if mismatches:
+            return (
+                "block",
+                f"migration filename prefix disagrees with its in-file revision on "
+                f"'{target_branch}': {'; '.join(sorted(mismatches))} — chain needs "
+                f"manual resolution.",
+            )
+
         heads = find_heads(chain)
         if len(heads) > 1:
             return (

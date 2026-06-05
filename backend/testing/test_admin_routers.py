@@ -17,10 +17,12 @@ from httpx import AsyncClient, ASGITransport
 from sqlmodel import select
 
 from app.main import app
+from app import release_version as rv
 from app.models import (
     AllowedUser,
     Artifact,
     ArtifactType,
+    ComputeJob,
     Project,
     ProjectMember,
     ProjectStatus,
@@ -2408,6 +2410,109 @@ class TestAutonomousMode:
         assert body["counts_by_type"][direction_id]["research"] == 1
 
 
+class TestTaskTypeCostAdherence:
+    @pytest.mark.asyncio
+    async def test_requires_auth(self, override_get_session):
+        """Unauthenticated callers are rejected (router-level get_current_user)."""
+        from fastapi import HTTPException
+
+        async def reject():
+            raise HTTPException(status_code=401, detail="Not authenticated")
+
+        app.dependency_overrides[get_current_user] = reject
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as anon:
+                resp = await anon.get("/api/admin/task-types/cost-adherence")
+            assert resp.status_code in (401, 403)
+        finally:
+            app.dependency_overrides.pop(get_current_user, None)
+
+    @pytest.mark.asyncio
+    async def test_returns_actual_cost_vs_declared_ceiling(
+        self, client: AsyncClient, db_session
+    ):
+        """Per-type rows carry declared ceilings and actual costs from recent runs."""
+        from datetime import timedelta
+        from app.time_utils import _utcnow
+        from app.task_capabilities import TASK_CAPABILITY_BY_VALUE
+
+        project = await _make_project(db_session, name="Cost Project")
+        now = _utcnow()
+        for cost in (2.0, 4.0, 6.0):
+            db_session.add(
+                Task(
+                    project_id=project.id,
+                    payloads=[{"type": "create"}],
+                    status=TaskStatus.COMPLETED,
+                    created_at=now - timedelta(hours=1),
+                    vm_runtime_cost_banked_db=cost,
+                )
+            )
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/task-types/cost-adherence")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["window_days"] == 14
+        by_id = {r["id"]: r for r in body["task_types"]}
+        # Every registered type is represented.
+        assert set(by_id) >= set(TASK_CAPABILITY_BY_VALUE)
+        create = by_id["create"]
+        assert create["sample_count"] == 3
+        assert create["avg_cost_usd"] == pytest.approx(4.0)
+        assert create["declared_ceiling_usd"] == (
+            TASK_CAPABILITY_BY_VALUE["create"].cost_ceiling_usd
+        )
+
+    @pytest.mark.asyncio
+    async def test_compute_experiment_cost_from_compute_jobs(
+        self, client: AsyncClient, db_session
+    ):
+        """compute_experiment cost is sourced from the linked compute jobs'
+        durable final_cost_usd, not the lightweight monitoring VM."""
+        from datetime import timedelta
+        from app.time_utils import _utcnow
+        from app.models import ComputeJobStatus
+
+        project = await _make_project(db_session, name="Compute Cost Project")
+        now = _utcnow()
+        # Three terminal compute_experiment tasks whose monitoring VM cost is
+        # near-zero; the honest spend lives on the linked compute jobs.
+        for spend in (6.0, 8.0, 10.0):
+            task = Task(
+                project_id=project.id,
+                payloads=[{"type": "compute_experiment"}],
+                status=TaskStatus.COMPLETED,
+                created_at=now - timedelta(hours=1),
+                vm_runtime_cost_banked_db=0.01,
+            )
+            db_session.add(task)
+            await db_session.flush()
+            db_session.add(
+                ComputeJob(
+                    project_id=project.id,
+                    task_id=task.id,
+                    backend="test",
+                    status=ComputeJobStatus.SUCCEEDED,
+                    final_cost_usd=spend,
+                )
+            )
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/task-types/cost-adherence")
+        assert resp.status_code == 200
+        by_id = {r["id"]: r for r in resp.json()["task_types"]}
+        row = by_id["compute_experiment"]
+        assert row["sample_count"] == 3
+        # avg of compute-job spend ($8), NOT the ~$0.01 monitoring VM cost.
+        assert row["avg_cost_usd"] == pytest.approx(8.0)
+        assert row["declared_ceiling_usd"] == 5.0
+        # avg $8 exceeds the $5 ceiling with >= MIN_SAMPLES runs.
+        assert row["over_ceiling"] is True
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_notifications.py — Alerts, Messages, Playbook
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2606,6 +2711,50 @@ class TestMessages:
         data = resp.json()
         assert data["status"] == "created"
         assert "id" in data
+
+    @pytest.mark.asyncio
+    async def test_create_message_idempotency_key_dedupes(
+        self, client: AsyncClient, db_session
+    ):
+        """Two sends sharing one idempotency key collapse to a single row."""
+        from sqlalchemy import func as sa_func
+        from app.models import ProjectMessage
+
+        project = await _make_project(db_session)
+        body = {
+            "project_id": str(project.id),
+            "message_type": "FEEDBACK",
+            "content": "Steer toward X.",
+            "idempotency_key": "key-double-submit-1",
+        }
+
+        first = await client.post("/api/admin/messages", json=body)
+        assert first.status_code == 200
+        assert first.json()["status"] == "created"
+        first_id = first.json()["id"]
+
+        # Identical retry with the same key — idempotent success, same row.
+        second = await client.post("/api/admin/messages", json=body)
+        assert second.status_code == 200
+        assert second.json()["status"] == "duplicate"
+        assert second.json()["id"] == first_id
+
+        # Exactly one row landed for this project.
+        count = await db_session.scalar(
+            select(sa_func.count())
+            .select_from(ProjectMessage)
+            .where(ProjectMessage.project_id == project.id)
+        )
+        assert count == 1
+
+        # A different key on the same content does create a second message.
+        third = await client.post(
+            "/api/admin/messages",
+            json={**body, "idempotency_key": "key-double-submit-2"},
+        )
+        assert third.status_code == 200
+        assert third.json()["status"] == "created"
+        assert third.json()["id"] != first_id
 
     @pytest.mark.asyncio
     async def test_create_message_no_access_returns_404(
@@ -2893,6 +3042,48 @@ class TestMessages:
         assert strategic_refresh_pending(vision) is False
 
     @pytest.mark.asyncio
+    async def test_canonical_message_arm_rollback_does_not_500(
+        self, client: AsyncClient, db_session
+    ):
+        """Under real row contention the arm path rolls the session back to
+        clear the aborted bounded-lock acquire, which EXPIRES the
+        already-committed message. The endpoint must still return 200 with the
+        persisted id — not 500 on a sync lazy-load (MissingGreenlet) of an
+        expired ``msg.id``. Regression for the operator-message 500 where the
+        message committed but the request still errored (prompting a double-post
+        on retry). Distinct from ``..._reports_not_armed``, whose mock returns
+        False WITHOUT rolling back, so it never expired the instance.
+        """
+        project = await _make_project(db_session)
+
+        async def _rollback_then_fail(session, *args, **kwargs):
+            # Mirror request_strategic_refresh's OperationalError handler: roll
+            # the session back to keep the txn usable, which expires the
+            # committed msg in the caller's session.
+            await session.rollback()
+            return False
+
+        with patch(
+            "app.strategic_trigger.request_strategic_refresh",
+            new=AsyncMock(side_effect=_rollback_then_fail),
+        ):
+            resp = await client.post(
+                "/api/admin/messages",
+                json={
+                    "project_id": str(project.id),
+                    "message_type": "FEEDBACK",
+                    "content": "steer me while a cycle is running",
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "created"
+        assert body["arming"] == "not_armed"
+        # The id is the scalar snapshotted before the expire, not a lazy-load.
+        assert isinstance(body["id"], str) and len(body["id"]) == 36
+
+    @pytest.mark.asyncio
     async def test_canonical_message_burst_coalesces(
         self, client: AsyncClient, db_session
     ):
@@ -3056,6 +3247,291 @@ class TestMessages:
         assert "first digest line" in project.running_update
         assert "second digest line" in project.running_update
 
+    # ── Idempotent steering-message creation ─────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_idempotent_double_submit_creates_one_row(
+        self, client: AsyncClient, db_session
+    ):
+        """Posting the same intent twice with one idempotency_key dedupes to a
+        single row, and both responses point at that same row."""
+        project = await _make_project(db_session)
+        key = str(uuid.uuid4())
+        body = {
+            "project_id": str(project.id),
+            "message_type": "NOTE",
+            "content": "duplicate steering intent",
+            "idempotency_key": key,
+        }
+
+        first = await client.post("/api/admin/messages", json=body)
+        second = await client.post("/api/admin/messages", json=body)
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+
+        # Same logical message: the first send creates, the retry is recognized
+        # as a duplicate and returns the existing row's id.
+        assert first.json()["status"] == "created"
+        assert second.json()["status"] == "duplicate"
+        assert first.json()["id"] == second.json()["id"]
+
+        rows = (
+            (
+                await db_session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+        assert str(rows[0].id) == first.json()["id"]
+        assert rows[0].idempotency_key == key
+
+    @pytest.mark.asyncio
+    async def test_idempotent_duplicate_arming_coalesces(
+        self, client: AsyncClient, db_session
+    ):
+        """A steering message POSTed twice with the same key arms a SINGLE
+        refresh slot — the first send arms the wake, and the duplicate is
+        recognized as such (``arming == "duplicate"``) rather than opening a
+        second independent wake."""
+        from app.strategic_trigger import strategic_refresh_pending
+
+        project = await _make_project(db_session)
+        key = str(uuid.uuid4())
+        body = {
+            "project_id": str(project.id),
+            "message_type": "FEEDBACK",
+            "content": "Please refocus on the auth bug",
+            "idempotency_key": key,
+        }
+
+        first = await client.post("/api/admin/messages", json=body)
+        second = await client.post("/api/admin/messages", json=body)
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        # The first send arms the strategist; the duplicate short-circuits before
+        # the wake gate and reports the truthful "duplicate" outcome.
+        assert first.json()["arming"] == "steering"
+        assert second.json()["arming"] == "duplicate"
+        assert first.json()["id"] == second.json()["id"]
+
+        vision = await self._reload_vision(db_session, project.id)
+        assert strategic_refresh_pending(vision) is True
+        marker = vision["_strategic_refresh"]
+        assert marker["origin"] == "operator"
+        # Only the first send armed a wake; the duplicate did not re-arm, so the
+        # strategist has a SINGLE pending wake to consume.
+        assert marker["count"] == 1
+
+        # And the dedup still held: exactly one row backs both responses.
+        rows = (
+            (
+                await db_session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_idempotent_different_key_creates_new_message(
+        self, client: AsyncClient, db_session
+    ):
+        """Identical content under two distinct keys is two distinct intents."""
+        project = await _make_project(db_session)
+        base = {
+            "project_id": str(project.id),
+            "message_type": "NOTE",
+            "content": "same words, different intent",
+        }
+
+        first = await client.post(
+            "/api/admin/messages",
+            json={**base, "idempotency_key": str(uuid.uuid4())},
+        )
+        second = await client.post(
+            "/api/admin/messages",
+            json={**base, "idempotency_key": str(uuid.uuid4())},
+        )
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert first.json()["id"] != second.json()["id"]
+
+        rows = (
+            (
+                await db_session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 2
+
+    @pytest.mark.asyncio
+    async def test_no_idempotency_key_creates_new_row_each_time(
+        self, client: AsyncClient, db_session
+    ):
+        """Legacy path: omitting idempotency_key never dedupes (back-compat)."""
+        project = await _make_project(db_session)
+        body = {
+            "project_id": str(project.id),
+            "message_type": "NOTE",
+            "content": "legacy unconditional insert",
+        }
+
+        first = await client.post("/api/admin/messages", json=body)
+        second = await client.post("/api/admin/messages", json=body)
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert first.json()["id"] != second.json()["id"]
+
+        rows = (
+            (
+                await db_session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 2
+        # Both rows persisted with a NULL key (exempt from the partial index).
+        assert all(r.idempotency_key is None for r in rows)
+
+    @pytest.mark.asyncio
+    async def test_idempotent_duplicate_skips_routine_digest(
+        self, client: AsyncClient, db_session
+    ):
+        """A routine-event message POSTed twice with one key appends its digest
+        line exactly once — the duplicate skips the running_update append."""
+        project = await _make_project(db_session)
+        key = str(uuid.uuid4())
+        body = {
+            "project_id": str(project.id),
+            "message_type": "NOTE",
+            "content": "PR #864 merged into main",
+            "context": {"event_type": "pr_merged"},
+            "idempotency_key": key,
+        }
+
+        first = await client.post("/api/admin/messages", json=body)
+        second = await client.post("/api/admin/messages", json=body)
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert first.json()["id"] == second.json()["id"]
+
+        await db_session.refresh(project)
+        assert project.running_update is not None
+        # Appended exactly once despite two POSTs.
+        assert project.running_update.count("PR #864 merged into main") == 1
+
+        rows = (
+            (
+                await db_session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_idempotent_concurrent_insert_recovers_to_200(
+        self, client: AsyncClient, db_session
+    ):
+        """TOCTOU: a competitor commits the same-key row AFTER this request's
+        idempotency pre-check passed but BEFORE its own commit, so the INSERT
+        trips ux_projectmessage_project_idempotency_key. The handler must
+        recover — roll back, re-select the winner, and return the idempotent 200 pointing at
+        the already-committed row — instead of surfacing the IntegrityError as
+        a 500.
+
+        The ``lock_project_or_429`` call (reached only for a routine-event
+        message) is the seam between the pre-check and the commit; we patch it
+        to commit a conflicting row via an INDEPENDENT session, exactly
+        modelling the concurrent in-flight duplicate.
+        """
+        from conftest import TestingSessionLocal
+        import app.routers.admin_notifications as notif
+
+        project = await _make_project(db_session)
+        key = str(uuid.uuid4())
+        real_lock = notif.lock_project_or_429
+        injected = {"done": False}
+
+        async def _commit_conflict_then_lock(session, pid):
+            # Stand in for a concurrent request that won the race: persist the
+            # same-key row in a separate transaction so this request's pending
+            # INSERT violates the unique index on commit.
+            if not injected["done"]:
+                injected["done"] = True
+                async with TestingSessionLocal() as other:
+                    other.add(
+                        ProjectMessage(
+                            project_id=pid,
+                            message_type=MessageType.NOTE,
+                            from_type="user",
+                            content="winner of the race",
+                            context={"event_type": "pr_merged"},
+                            idempotency_key=key,
+                        )
+                    )
+                    await other.commit()
+            return await real_lock(session, pid)
+
+        with patch.object(
+            notif,
+            "lock_project_or_429",
+            AsyncMock(side_effect=_commit_conflict_then_lock),
+        ):
+            resp = await client.post(
+                "/api/admin/messages",
+                json={
+                    "project_id": str(project.id),
+                    "message_type": "NOTE",
+                    "content": "loser of the race",
+                    "context": {"event_type": "pr_merged"},
+                    "idempotency_key": key,
+                },
+            )
+
+        # Recovered to an idempotent 200, not a 500.
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "duplicate"
+
+        # Exactly one row survived, and the response points at the winner.
+        rows = (
+            (
+                await db_session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id,
+                        ProjectMessage.idempotency_key == key,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+        assert rows[0].content == "winner of the race"
+        assert resp.json()["id"] == str(rows[0].id)
+
     @pytest.mark.asyncio
     async def test_resolve_message(self, client: AsyncClient, db_session):
         """An open message can be resolved."""
@@ -3130,6 +3606,86 @@ class TestMessages:
         assert resp.json()["status"] == "already_resolved"
 
     @pytest.mark.asyncio
+    async def test_resolve_message_concurrent_requests_are_safe(
+        self, client: AsyncClient, db_session
+    ):
+        """Concurrent resolves are safe: one succeeds, the other sees already_resolved."""
+        import asyncio
+
+        project = await _make_project(db_session)
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            content="Help me",
+            status="open",
+        )
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+
+        # Simulate two concurrent resolve requests with different resolutions
+        async def resolve_with(resolution_text):
+            return await client.patch(
+                f"/api/admin/messages/{msg.id}",
+                json={"resolution": resolution_text},
+            )
+
+        resp1, resp2 = await asyncio.gather(
+            resolve_with("First resolution"),
+            resolve_with("Second resolution"),
+        )
+        # Both should succeed (200)
+        assert resp1.status_code == 200
+        assert resp2.status_code == 200
+        # One should be "resolved", the other "already_resolved"
+        statuses = {resp1.json()["status"], resp2.json()["status"]}
+        assert statuses == {"resolved", "already_resolved"}
+
+        # Verify the message is resolved with the first resolution that won
+        await db_session.refresh(msg)
+        assert msg.status == "resolved"
+        assert msg.resolution is not None
+
+    @pytest.mark.asyncio
+    async def test_resolve_message_retried_request_is_safe(
+        self, client: AsyncClient, db_session
+    ):
+        """Retrying a resolve request is safe (idempotent)."""
+        project = await _make_project(db_session)
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            content="Help me",
+            status="open",
+        )
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+
+        # First resolve
+        resp1 = await client.patch(
+            f"/api/admin/messages/{msg.id}",
+            json={"resolution": "Fixed!"},
+        )
+        assert resp1.status_code == 200
+        assert resp1.json()["status"] == "resolved"
+
+        # Retry the same request
+        resp2 = await client.patch(
+            f"/api/admin/messages/{msg.id}",
+            json={"resolution": "Fixed!"},
+        )
+        assert resp2.status_code == 200
+        assert resp2.json()["status"] == "already_resolved"
+
+        # Message should still be resolved
+        await db_session.refresh(msg)
+        assert msg.status == "resolved"
+        assert msg.resolution == "Fixed!"
+
+    @pytest.mark.asyncio
     async def test_delete_message(self, client: AsyncClient, db_session):
         """Can delete an existing message."""
         project = await _make_project(db_session)
@@ -3149,10 +3705,38 @@ class TestMessages:
         assert resp.json()["deleted"] is True
 
     @pytest.mark.asyncio
-    async def test_delete_message_not_found_returns_404(self, client: AsyncClient):
-        """Deleting a non-existent message returns 404."""
+    async def test_delete_message_not_found_is_idempotent(self, client: AsyncClient):
+        """Deleting a non-existent message returns idempotent success."""
         resp = await client.delete(f"/api/admin/messages/{uuid.uuid4()}")
-        assert resp.status_code == 404
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] is True
+
+    @pytest.mark.asyncio
+    async def test_delete_message_twice_is_idempotent(
+        self, client: AsyncClient, db_session
+    ):
+        """Deleting a message twice (retry) is idempotent."""
+        project = await _make_project(db_session)
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            from_type="user",
+            content="Bug found",
+            status="open",
+        )
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+
+        # First delete
+        resp1 = await client.delete(f"/api/admin/messages/{msg.id}")
+        assert resp1.status_code == 200
+        assert resp1.json()["deleted"] is True
+
+        # Retry delete
+        resp2 = await client.delete(f"/api/admin/messages/{msg.id}")
+        assert resp2.status_code == 200
+        assert resp2.json()["deleted"] is True
 
     @pytest.mark.asyncio
     async def test_list_messages_status_filter(self, client: AsyncClient, db_session):
@@ -6214,6 +6798,278 @@ class TestSetVersionPhase:
         assert "dry-run calibration" in reasoning
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin_release_version.py — Set Version Goal
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestSetVersionGoal:
+    @pytest.mark.asyncio
+    async def test_set_goal_happy_path_stamps_editor_and_timestamp(
+        self, client: AsyncClient, db_session
+    ):
+        """Member can set the goal; editor info and updated_at are populated."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-goal",
+            json={"goal": "Ship the lifecycle surface"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["goal"] == "Ship the lifecycle surface"
+        assert data["goal_updated_at"] is not None
+        assert data["goal_editor_info"] == f"[operator:{TEST_USER_EMAIL}]"
+
+        # Persisted, not just echoed back.
+        await db_session.refresh(version)
+        assert version.goal == "Ship the lifecycle surface"
+        assert version.goal_updated_at is not None
+        assert version.goal_editor_info == f"[operator:{TEST_USER_EMAIL}]"
+
+    @pytest.mark.asyncio
+    async def test_set_goal_no_open_version_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns 404 when no open release version exists for the project."""
+        project = await _make_project(db_session)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-goal",
+            json={"goal": "anything"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_set_goal_non_member_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """User without project membership cannot set the version goal."""
+        other = Project(name="Other", user_id="other-owner")
+        db_session.add(other)
+        await db_session.commit()
+        await db_session.refresh(other)
+        db_session.add(
+            ProjectMember(project_id=other.id, user_id="other-owner", role="owner")
+        )
+        await _make_open_version(db_session, other.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{other.id}/version-goal",
+            json={"goal": "intrusion"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_set_goal_idempotent_same_goal_no_restamp(
+        self, client: AsyncClient, db_session
+    ):
+        """Re-posting the identical goal is a no-op that does not re-stamp."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        first = await client.post(
+            f"/api/admin/projects/{project.id}/version-goal",
+            json={"goal": "stable goal"},
+        )
+        assert first.status_code == 200
+        await db_session.refresh(version)
+        first_stamp = version.goal_updated_at
+        assert first_stamp is not None
+
+        second = await client.post(
+            f"/api/admin/projects/{project.id}/version-goal",
+            json={"goal": "stable goal"},
+        )
+        assert second.status_code == 200
+        await db_session.refresh(version)
+        # Idempotent no-op: timestamp is unchanged because the goal matched.
+        assert version.goal_updated_at == first_stamp
+
+    @pytest.mark.asyncio
+    async def test_set_goal_too_long_returns_422(
+        self, client: AsyncClient, db_session
+    ):
+        """Goal exceeding the 500-char body limit is rejected by Pydantic."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-goal",
+            json={"goal": "x" * 501},
+        )
+        assert resp.status_code == 422
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin_release_version.py — Cut/Abandon Version
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestCutVersion:
+    @pytest.mark.asyncio
+    async def test_version_cut_member_can_cut(
+        self, client: AsyncClient, db_session
+    ):
+        """Member can cut the open version; both versions are returned and the
+        old row flips to abandoned while a fresh build version opens."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="stabilize")
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json={"reason": "candidate can never pass"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["abandoned_version"]["version_number"] == 1
+        assert data["abandoned_version"]["status"] == "abandoned"
+        assert data["abandoned_version"]["abandoned_at"]
+        assert data["new_version"]["version_number"] == 2
+        assert data["new_version"]["phase"] == "build"
+        assert data["new_version"]["opened_at"]
+
+        # Persisted: the old row carries operator provenance.
+        old = (
+            (
+                await db_session.execute(
+                    select(ReleaseVersion).where(
+                        ReleaseVersion.project_id == project.id,
+                        ReleaseVersion.version_number == 1,
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        await db_session.refresh(old)
+        assert old.status == "abandoned"
+        assert old.last_qualification["operator"] == TEST_USER_EMAIL
+        assert old.last_qualification["reason"] == "candidate can never pass"
+        history = (await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")).json()["recent_versions"]
+        abandoned = next(row for row in history if row["version_number"] == 1)
+        assert abandoned["abandoned_by"] == TEST_USER_EMAIL
+        assert abandoned["abandon_reason"] == "candidate can never pass"
+        assert abandoned["abandoned_at"]
+
+    @pytest.mark.asyncio
+    async def test_version_cut_no_open_version_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns 404 when there is no open release version to cut."""
+        project = await _make_project(db_session)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json={"reason": "nothing here"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_version_cut_requires_member_role(
+        self, client: AsyncClient, db_session
+    ):
+        """A viewer (below member) cannot cut the version."""
+        other = Project(name="Viewer-Only", user_id="other-owner")
+        db_session.add(other)
+        await db_session.commit()
+        await db_session.refresh(other)
+        db_session.add(
+            ProjectMember(project_id=other.id, user_id="other-owner", role="owner")
+        )
+        db_session.add(
+            ProjectMember(project_id=other.id, user_id=TEST_USER_ID, role="viewer")
+        )
+        await db_session.commit()
+        await _make_open_version(db_session, other.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{other.id}/version-cut",
+            json={"reason": "not allowed"},
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_version_cut_rejects_cross_project(
+        self, client: AsyncClient, db_session
+    ):
+        """A non-member cannot cut another project's version (404)."""
+        other = Project(name="Other", user_id="other-owner")
+        db_session.add(other)
+        await db_session.commit()
+        await db_session.refresh(other)
+        db_session.add(
+            ProjectMember(project_id=other.id, user_id="other-owner", role="owner")
+        )
+        await _make_open_version(db_session, other.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{other.id}/version-cut",
+            json={"reason": "intrusion"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_version_cut_reason_optional(
+        self, client: AsyncClient, db_session
+    ):
+        """A cut with no reason still succeeds and records a null reason."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json={},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["new_version"]["version_number"] == 2
+
+    @pytest.mark.asyncio
+    async def test_version_cut_reason_too_long_returns_422(
+        self, client: AsyncClient, db_session
+    ):
+        """A reason exceeding the 500-char body limit is rejected by Pydantic."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json={"reason": "x" * 501},
+        )
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_version_cut_rejects_promotion_in_flight(
+        self, client: AsyncClient, db_session
+    ):
+        """A version with an open promotion PR is rejected before any state
+        mutation and returns a clear 409 explanation."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        version.last_qualification = {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 7357,
+                "pr_url": "https://example/pr/7357",
+                "auto_merge_enabled": True,
+            },
+        }
+        db_session.add(version)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json={"reason": "too early"},
+        )
+        assert resp.status_code == 409
+        assert "promotion PR is open and auto-merging" in resp.text
+
+        await db_session.refresh(version)
+        assert version.status == "open"
+        assert await rv.current_open_version(db_session, project.id) is not None
+
+
 class TestVersionLifecycleInfraFailureFields:
     """GET /api/admin/projects/{id}/version-lifecycle exposes infra-failure fields."""
 
@@ -6314,6 +7170,206 @@ class TestVersionLifecycleInfraFailureFields:
         assert lq["error"] is None
         assert lq["consecutive_infra_errors"] is None
         assert lq["audit_missing_reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_promotion_pending_state_exposed_in_current_version(
+        self, client: AsyncClient, db_session
+    ):
+        """The lifecycle payload surfaces promotion-in-flight as a distinct
+        qualification_state, not a generic pending status."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=3,
+            phase="stabilize",
+            status="open",
+            last_qualification={
+                "status": "pending",
+                "promotion_pending": {
+                    "pr_number": 7357,
+                    "pr_url": "https://example/pr/7357",
+                    "auto_merge_enabled": True,
+                },
+            },
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.get_latest_release_audit_report",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["qualification_state"]["state"] == "promotion_in_flight"
+        assert current["qualification_state"]["promotion_pr_number"] == 7357
+        assert "auto-merge is armed" in current["qualification_state"]["summary"].lower()
+
+
+class TestVersionLifecycleStagedDirections:
+    """GET /version-lifecycle surfaces staged directions for the next version."""
+
+    @pytest.mark.asyncio
+    async def test_staged_directions_surfaced_with_target_and_age(
+        self, client: AsyncClient, db_session
+    ):
+        """A staged direction appears in staged_directions with its target
+        version; active/proposed directions are excluded."""
+        project = await _make_project(db_session)
+        project.directions = [
+            {
+                "id": "d-staged",
+                "text": "Rework packer budget",
+                "priority": "high",
+                "status": "staged",
+                "staged_for_version": 6,
+                "staged_at": "2026-05-01T00:00:00",
+            },
+            {"id": "d-active", "text": "active work", "status": "active"},
+        ]
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=5,
+            phase="build",
+            status="open",
+        )
+        db_session.add_all([project, version])
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.get_latest_release_audit_report",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        staged = resp.json()["staged_directions"]
+        assert len(staged) == 1
+        assert staged[0]["id"] == "d-staged"
+        assert staged[0]["staged_for_version"] == 6
+        assert staged[0]["staged_age_days"] is not None
+
+    @pytest.mark.asyncio
+    async def test_staged_directions_empty_when_none_staged(
+        self, client: AsyncClient, db_session
+    ):
+        """No staged directions yields an empty staged_directions list."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.get_latest_release_audit_report",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["staged_directions"] == []
+
+
+class TestVersionLifecycleInFlightCount:
+    """GET /version-lifecycle surfaces in_flight_task_count on the open version."""
+
+    @pytest.mark.asyncio
+    async def test_in_flight_task_count_counts_non_terminal_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        """Non-terminal project tasks are counted; terminal ones are excluded."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=3,
+            phase="stabilize",
+            status="open",
+        )
+        db_session.add(version)
+        # Two in-flight + one terminal.
+        db_session.add_all(
+            [
+                Task(
+                    project_id=project.id,
+                    payloads=[{"type": "create"}],
+                    status=TaskStatus.IN_PROGRESS,
+                ),
+                Task(
+                    project_id=project.id,
+                    payloads=[{"type": "create"}],
+                    status=TaskStatus.QUEUED,
+                ),
+                Task(
+                    project_id=project.id,
+                    payloads=[{"type": "create"}],
+                    status=TaskStatus.COMPLETED,
+                ),
+            ]
+        )
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.get_latest_release_audit_report",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["current_version"]["in_flight_task_count"] == 2
 
 
 class TestQualificationVerdictsAuditMissingReason:
@@ -7840,10 +8896,10 @@ class TestModifyTaskApplySeam:
 
 class TestClearWaveDeps:
     @pytest.mark.asyncio
-    async def test_clears_depends_on_for_queued_tasks(
+    async def test_preserves_missing_depends_on_for_queued_tasks(
         self, client: AsyncClient, db_session
     ):
-        """Queued tasks with depends_on are unblocked; returns cleared count."""
+        """A missing dependency row is preserved for cascade-cancel handling."""
         project = await _make_project(db_session)
         dep_id = uuid.uuid4()
         blocked = Task(
@@ -7858,11 +8914,12 @@ class TestClearWaveDeps:
         resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["cleared"] == 1
+        assert data["cleared"] == 0
+        assert data["preserved"] == 1
         assert data["total_queued"] == 1
 
         await db_session.refresh(blocked)
-        assert blocked.depends_on == []
+        assert blocked.depends_on == [str(dep_id)]
 
     @pytest.mark.asyncio
     async def test_returns_zero_when_no_queued_tasks(
@@ -7873,6 +8930,312 @@ class TestClearWaveDeps:
         assert resp.status_code == 200
         assert resp.json()["cleared"] == 0
         assert resp.json()["total_queued"] == 0
+
+    @pytest.mark.asyncio
+    async def test_clears_ordering_only_edge_when_dispatch_gate_says_eligible(
+        self, client: AsyncClient, db_session
+    ):
+        """An ordering-only edge is cleared even if the foundation is still in flight."""
+        project = await _make_project(db_session)
+        foundation = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foundation.py"]},
+            status=TaskStatus.IN_PROGRESS,
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        dependent = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/bbb"}],
+            status=TaskStatus.QUEUED,
+            context={"related_files": ["backend/app/dependent.py"]},
+            depends_on=[str(foundation.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cleared"] == 1
+        assert data["preserved"] == 0
+        assert data["total_queued"] == 1
+
+        await db_session.refresh(dependent)
+        assert dependent.depends_on == []
+
+    @pytest.mark.asyncio
+    async def test_preserves_prerequisite_edge_with_provenance(
+        self, client: AsyncClient, db_session
+    ):
+        """A QUEUED task with foundation-converged provenance keeps its edge."""
+        project = await _make_project(db_session)
+        foundation = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        dependent = Task(
+            project_id=project.id,
+            payloads=[{"type": "smoketest"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(foundation.id)],
+            context={"_foundation_converged": {"foundation_id": str(foundation.id)}},
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cleared"] == 0
+        assert data["preserved"] == 1
+        assert data["total_queued"] == 1
+
+        await db_session.refresh(dependent)
+        assert dependent.depends_on == [str(foundation.id)]
+
+    @pytest.mark.asyncio
+    async def test_preserves_edge_when_foundation_in_flight(
+        self, client: AsyncClient, db_session
+    ):
+        """An in-flight (not-yet-landed) foundation gates its dependent — preserve."""
+        project = await _make_project(db_session)
+        foundation = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.IN_PROGRESS,
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        dependent = Task(
+            project_id=project.id,
+            payloads=[{"type": "smoketest"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(foundation.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cleared"] == 0
+        assert data["preserved"] == 1
+        assert data["total_queued"] == 1
+
+        await db_session.refresh(dependent)
+        assert dependent.depends_on == [str(foundation.id)]
+
+    @pytest.mark.asyncio
+    async def test_preserves_completed_same_base_edge_until_pr_merged(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A COMPLETED same-base code dependency still waits until PR merge/landing."""
+        project = await _make_project(db_session)
+        foundation = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/shared"}],
+            status=TaskStatus.COMPLETED,
+            context={"related_files": ["backend/app/shared.py"]},
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+        mocker.patch(
+            "app.rollup_pr_verification._verify_pr_merged",
+            new_callable=AsyncMock,
+            return_value=False,
+        )
+
+        dependent = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/shared"}],
+            status=TaskStatus.QUEUED,
+            context={"related_files": ["backend/app/shared.py"]},
+            depends_on=[str(foundation.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cleared"] == 0
+        assert data["preserved"] == 1
+        assert data["total_queued"] == 1
+
+        await db_session.refresh(dependent)
+        assert dependent.depends_on == [str(foundation.id)]
+
+    @pytest.mark.asyncio
+    async def test_preserves_failed_prerequisite_edge(
+        self, client: AsyncClient, db_session
+    ):
+        """A genuinely failed prerequisite is preserved for cascade-cancel handling."""
+        project = await _make_project(db_session)
+        foundation = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/shared"}],
+            status=TaskStatus.FAILED,
+            context={"related_files": ["backend/app/shared.py"]},
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        dependent = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/shared"}],
+            status=TaskStatus.QUEUED,
+            context={"related_files": ["backend/app/shared.py"]},
+            depends_on=[str(foundation.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cleared"] == 0
+        assert data["preserved"] == 1
+        assert data["total_queued"] == 1
+
+        await db_session.refresh(dependent)
+        assert dependent.depends_on == [str(foundation.id)]
+
+    @pytest.mark.asyncio
+    async def test_preserves_resolved_need_edge_without_blocker_metadata(
+        self, client: AsyncClient, db_session
+    ):
+        """A real edge resolved from blocked_need survives after blocker metadata clears."""
+        project = await _make_project(db_session)
+        foundation = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            status=TaskStatus.COMPLETED,
+            context={"related_files": ["backend/app/foundation.py"]},
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        dependent = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/bbb"}],
+            status=TaskStatus.QUEUED,
+            context={
+                "related_files": ["backend/app/dependent.py"],
+                "_structural_depends_on_ids": [str(foundation.id)],
+            },
+            depends_on=[str(foundation.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cleared"] == 0
+        assert data["preserved"] == 1
+        assert data["total_queued"] == 1
+
+        await db_session.refresh(dependent)
+        assert dependent.depends_on == [str(foundation.id)]
+
+    @pytest.mark.asyncio
+    async def test_mixed_edges_keeps_only_the_live_prerequisite(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A task mixing ordering-only and real deps clears only the ordering-only edge."""
+        project = await _make_project(db_session)
+        stale_foundation = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            status=TaskStatus.IN_PROGRESS,
+            context={"related_files": ["backend/app/stale.py"]},
+        )
+        live_foundation = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/shared"}],
+            status=TaskStatus.COMPLETED,
+            context={"related_files": ["backend/app/live.py"]},
+        )
+        db_session.add(stale_foundation)
+        db_session.add(live_foundation)
+        await db_session.commit()
+        await db_session.refresh(stale_foundation)
+        await db_session.refresh(live_foundation)
+        mocker.patch(
+            "app.rollup_pr_verification._verify_pr_merged",
+            new_callable=AsyncMock,
+            return_value=False,
+        )
+
+        dependent = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/shared"}],
+            status=TaskStatus.QUEUED,
+            context={"related_files": ["backend/app/live.py"]},
+            depends_on=[str(stale_foundation.id), str(live_foundation.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cleared"] == 1
+        assert data["preserved"] == 1
+        assert data["total_queued"] == 1
+
+        await db_session.refresh(dependent)
+        assert dependent.depends_on == [str(live_foundation.id)]
+
+
+class TestCancelStrategicRefresh:
+    @pytest.mark.asyncio
+    async def test_cancel_clears_armed_marker(
+        self, client: AsyncClient, db_session
+    ):
+        """Cancelling an armed steer clears the pending marker (cleared=True)."""
+        from app import strategic_trigger as st
+
+        project = await _make_project(db_session)
+        await st.request_strategic_refresh(
+            db_session, project.id, "operator_steering", origin=st.ORIGIN_OPERATOR
+        )
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/cancel-strategic-refresh"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["cleared"] is True
+
+        await db_session.refresh(project)
+        assert st.strategic_refresh_pending(project.vision) is False
+
+    @pytest.mark.asyncio
+    async def test_cancel_idempotent_noop_when_nothing_armed(
+        self, client: AsyncClient, db_session
+    ):
+        """Cancelling with nothing armed is a harmless no-op (cleared=False, 200)."""
+        project = await _make_project(db_session)
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/cancel-strategic-refresh"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["cleared"] is False
 
 
 class TestBulkApprove:
@@ -8080,6 +9443,70 @@ class TestBulkRetrySessionFactory:
         assert task.status == TaskStatus.QUEUED
         assert task.attempt_count == 0
         assert task.vm_instance_id != "agent-vm-old"
+
+
+class TestRequeueClearsBlockerMetadata:
+    @pytest.mark.asyncio
+    async def test_manual_requeue_clears_blocked_state(self, db_session):
+        """A BLOCKED task manually requeued to QUEUED must shed all prior-attempt
+        blocker metadata and the budget-exempt BLOCKED_PRECONDITION tags, mirroring
+        the automatic unblock out-transition."""
+        from fastapi import BackgroundTasks
+
+        from app.admin_task_mutations import modify_task_apply
+        from app.task_blocked import (
+            BLOCKED_PRECONDITION,
+            BLOCKER_CONTEXT_KEY,
+            enter_blocked_state,
+        )
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="Blocked then requeued",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.IN_PROGRESS,
+            vm_instance_id="agent-vm-old",
+            attempt_count=2,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        enter_blocked_state(
+            task,
+            waiting_on="upstream rollup PR #123",
+            reason="dependency not yet merged",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        # Precondition: the blocked-state markers are present before requeue.
+        assert task.status == TaskStatus.BLOCKED
+        assert BLOCKER_CONTEXT_KEY in (task.context or {})
+        assert (task.context or {}).get("failure_class") == BLOCKED_PRECONDITION
+        assert task.blocker_kind is not None
+
+        await modify_task_apply(
+            task,
+            {"status": TaskStatus.QUEUED.value},
+            BackgroundTasks(),
+            db_session,
+        )
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        # Structured blocker metadata and the budget-exempt failure tags are gone.
+        assert BLOCKER_CONTEXT_KEY not in (task.context or {})
+        assert (task.context or {}).get("failure_class") != BLOCKED_PRECONDITION
+        assert (task.context or {}).get("failure_category") != BLOCKED_PRECONDITION
+        # Column-shaped blocker markers cleared too.
+        assert task.blocker_kind is None
+        assert task.blocked_reason is None
+        assert task.blocked_at is None
+        assert task.recheck_after is None
+        # Clean attempt: counter reset like any leaf requeue.
+        assert task.attempt_count == 0
 
 
 class TestTriggerRollup:

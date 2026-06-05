@@ -1,16 +1,23 @@
 import { useState, useEffect } from 'react';
 import {
+  cutVersion,
   fetchQualificationVerdicts,
+  patchAdminSettings,
+  setProjectPromotionEnabled,
   setVersionPhase,
+  setVersionGoal,
   triggerQualify,
   type AuditFinding,
   type AuditReconciliation,
   type CiResolution,
+  type CurrentVersion,
   type LatestAudit,
   type QualificationVerdictRecord,
+  type StagedDirection,
   type VersionLifecycleResponse,
   type VersionQualification,
   type PromotionReadiness,
+  type QualificationState,
 } from '../api';
 import { timeAgo } from '../utils/time';
 
@@ -18,7 +25,7 @@ const QUAL_VERDICT_COLOR: Record<string, string> = {
   pending: 'text-blue-400',
   promoted: 'text-emerald-400',
   dry_run: 'text-blue-400',
-  already_dry_run: 'text-blue-400',
+  cached_verdict: 'text-blue-400',
   not_promoted: 'text-amber-400',
   promotion_failed: 'text-red-400',
   error: 'text-red-400',
@@ -67,18 +74,77 @@ const FINDING_SEVERITY_STYLE: Record<string, string> = {
   low: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
 };
 const FINDING_SEVERITY_ORDER = ['critical', 'high', 'medium', 'low'];
+const QUAL_STATE_STYLE: Record<string, string> = {
+  qualifying: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
+  promotion_in_flight: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400',
+  promotion_failed: 'bg-red-500/10 border-red-500/30 text-red-400',
+  dry_run: 'bg-blue-500/10 border-blue-500/30 text-blue-400',
+  promoted: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400',
+  not_promoted: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
+  deferred_unsynced: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
+};
 
-function AuditFindingsList({ audit }: { audit: LatestAudit }) {
+// Provenance + staleness header for the audit findings. Shows which commit the
+// audit ran against and how long ago, and flags when that commit differs from the
+// version's most-recently-evaluated candidate (currentCandidateSha) — i.e. the
+// integration branch advanced and some findings may already be fixed.
+function AuditProvenance({
+  audit,
+  currentCandidateSha,
+}: {
+  audit: LatestAudit;
+  currentCandidateSha?: string | null;
+}) {
+  const sha = audit.candidate_sha;
+  const isStale = !!(sha && currentCandidateSha && sha !== currentCandidateSha);
+  if (!sha && !audit.created_at) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {sha && (
+        <span className="text-[10px] text-neutral-500 font-mono" title={sha}>
+          @{sha.slice(0, 7)}
+        </span>
+      )}
+      {audit.created_at && (
+        <span className="text-[10px] text-neutral-600">ran {timeAgo(audit.created_at)}</span>
+      )}
+      {isStale && (
+        <span
+          className="text-[10px] px-1.5 py-0.5 rounded border bg-amber-950/40 text-amber-400 border-amber-900/50"
+          title={`audit commit ${(sha ?? '').slice(0, 7)} differs from evaluated candidate ${(currentCandidateSha ?? '').slice(0, 7)}`}
+        >
+          findings from an older commit — branch advanced
+        </span>
+      )}
+    </div>
+  );
+}
+
+function AuditFindingsList({
+  audit,
+  currentCandidateSha,
+}: {
+  audit: LatestAudit;
+  currentCandidateSha?: string | null;
+}) {
   if (!audit.report) {
     return (
-      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20">
-        audit crashed — no report
-      </span>
+      <div className="space-y-0.5">
+        <AuditProvenance audit={audit} currentCandidateSha={currentCandidateSha} />
+        <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20">
+          audit crashed — no report
+        </span>
+      </div>
     );
   }
   const findings: AuditFinding[] = audit.report.findings ?? [];
   if (findings.length === 0) {
-    return <span className="text-[10px] text-neutral-500 italic">audit: no findings</span>;
+    return (
+      <div className="space-y-0.5">
+        <AuditProvenance audit={audit} currentCandidateSha={currentCandidateSha} />
+        <span className="text-[10px] text-neutral-500 italic">audit: no findings</span>
+      </div>
+    );
   }
   const sorted = [...findings].sort((a, b) => {
     const ai = FINDING_SEVERITY_ORDER.indexOf(a.severity?.toLowerCase() ?? '');
@@ -88,6 +154,7 @@ function AuditFindingsList({ audit }: { audit: LatestAudit }) {
   return (
     <div className="space-y-0.5">
       <p className="text-[10px] text-neutral-500 uppercase tracking-wide">Audit Findings</p>
+      <AuditProvenance audit={audit} currentCandidateSha={currentCandidateSha} />
       {sorted.map((f, i) => (
         <div key={i} className={`flex items-start gap-1.5 text-[10px] px-1.5 py-0.5 rounded border ${FINDING_SEVERITY_STYLE[f.severity?.toLowerCase() ?? ''] ?? 'bg-neutral-800/50 text-neutral-400 border-neutral-700/50'}`}>
           <span className="font-semibold shrink-0">{f.severity ?? '?'}</span>
@@ -160,19 +227,115 @@ function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadines
   );
 }
 
-export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: { data: VersionLifecycleResponse | null; loading: boolean; projectId: string | null; onRefresh: () => void }) {
+function StagedDirectionsSummary({ staged }: { staged: StagedDirection[] }) {
+  if (!staged.length) return null;
+  return (
+    <div data-testid="staged-directions">
+      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">
+        Staged for next version ({staged.length})
+      </p>
+      <div className="space-y-0.5">
+        {staged.map((s, i) => (
+          <div key={s.id ?? i} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] pl-2 border-l-2 border-neutral-700/40">
+            {s.staged_for_version != null && (
+              <span className="font-mono text-neutral-500 shrink-0">→v{s.staged_for_version}</span>
+            )}
+            {s.priority && <span className="text-neutral-600">{s.priority}</span>}
+            <span className="text-neutral-300 truncate max-w-[220px]" title={s.text ?? undefined}>{s.text ?? '(no description)'}</span>
+            {s.staged_age_days != null && (
+              <span className="text-neutral-600">{s.staged_age_days}d staged</span>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Staged directions that a cut of `versionNumber` will activate NOW: those
+// targeting this version or earlier, plus any with a missing target (the backend
+// fails open and activates those too — see activate_eligible_staged_directions).
+function stagedActivatedByCut(staged: StagedDirection[], versionNumber: number): StagedDirection[] {
+  return staged.filter(
+    (s) => s.staged_for_version == null || s.staged_for_version <= versionNumber,
+  );
+}
+
+// Disclosure of a version cut's concrete effects, shown before the operator
+// confirms: which staged directions begin running now and how much in-flight
+// work keeps running against the freshly-opened version.
+function CutConsequences({ cv, staged }: { cv: CurrentVersion; staged: StagedDirection[] }) {
+  const activating = stagedActivatedByCut(staged, cv.version_number);
+  const inFlight = cv.in_flight_task_count ?? 0;
+  const qualState: QualificationState | null = cv.qualification_state ?? null;
+  return (
+    <div
+      data-testid="cut-consequences"
+      className="text-[10px] text-neutral-300 bg-amber-950/30 border border-amber-900/40 rounded px-2 py-1 space-y-1"
+    >
+      <p className="text-amber-400 font-semibold">Cutting v{cv.version_number} now will:</p>
+      {activating.length > 0 ? (
+        <div className="space-y-0.5">
+          <p>
+            Start {activating.length} staged direction{activating.length !== 1 ? 's' : ''} immediately
+            (rather than waiting for a clean promotion):
+          </p>
+          <ul className="list-disc pl-4 space-y-0.5">
+            {activating.map((s, i) => (
+              <li key={s.id ?? i} className="text-neutral-400 truncate max-w-[260px]" title={s.text ?? undefined}>
+                {s.text ?? '(no description)'}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : (
+        <p className="text-neutral-500">No staged directions will activate.</p>
+      )}
+      <p className={inFlight > 0 ? 'text-neutral-300' : 'text-neutral-500'}>
+        {inFlight > 0
+          ? `${inFlight} in-flight task${inFlight !== 1 ? 's' : ''} will NOT be stopped — they keep running and land against the new version.`
+          : 'No tasks are currently in flight.'}
+      </p>
+      {qualState?.state === 'promotion_in_flight' && (
+        <p className="text-emerald-300">
+          Promotion PR{qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open and auto-merging — this cut will be rejected until it lands or is canceled.
+        </p>
+      )}
+    </div>
+  );
+}
+
+export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, userRole }: { data: VersionLifecycleResponse | null; loading: boolean; projectId: string | null; onRefresh: () => void; userRole?: 'admin' | 'user' | null }) {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   const [verdicts, setVerdicts] = useState<QualificationVerdictRecord[]>([]);
+  const [editingGoal, setEditingGoal] = useState<boolean>(false);
+  const [goalInput, setGoalInput] = useState<string>('');
+  const [optimisticOverrides, setOptimisticOverrides] = useState<Partial<CurrentVersion> | null>(null);
+  const [promotionEnabledOverride, setPromotionEnabledOverride] = useState<boolean | null>(null);
+  const [cuttingVersion, setCuttingVersion] = useState<boolean>(false);
+  const [cutReason, setCutReason] = useState<string>('');
   useEffect(() => {
     if (!projectId) { setVerdicts([]); return; }
     fetchQualificationVerdicts(projectId, 10).then(r => setVerdicts(r.verdicts)).catch(() => {});
   }, [projectId]);
+  useEffect(() => {
+    if (data?.current_version?.goal !== undefined) {
+      setGoalInput(data.current_version.goal || '');
+    }
+  }, [data?.current_version?.goal]);
+  useEffect(() => {
+    setOptimisticOverrides(null);
+  }, [data?.current_version?.phase, data?.current_version?.goal]);
+  useEffect(() => {
+    setPromotionEnabledOverride(null);
+  }, [data?.promotion_enabled]);
 
   if (loading || !data || (!data.current_version && data.recent_versions.length === 0)) return null;
-  const cv = data.current_version;
+  const cv = data.current_version ? (optimisticOverrides ? { ...data.current_version, ...optimisticOverrides } : data.current_version) : null;
   const recent = data.recent_versions;
   const promotionEnabled = data.promotion_enabled ?? false;
+  const optimisticPromotionEnabled = promotionEnabledOverride ?? promotionEnabled;
   const readiness = data.promotion_readiness;
 
   const handleSetPhase = async (phase: 'build' | 'stabilize') => {
@@ -180,11 +343,41 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
     setActionLoading('phase');
     setActionMsg(null);
     try {
-      await setVersionPhase(projectId, phase, 'operator advance');
+      const response = await setVersionPhase(projectId, phase, 'operator advance');
+      setOptimisticOverrides({
+        phase: response.phase,
+        phase_changed_at: response.phase_changed_at,
+        phase_reasoning: response.phase_reasoning,
+      });
       setActionMsg(`Phase → ${phase}`);
       onRefresh();
     } catch {
       setActionMsg('Request failed');
+      setOptimisticOverrides(null);
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleSetGoal = async () => {
+    if (!projectId) return;
+    setActionLoading('goal');
+    setActionMsg(null);
+    try {
+      const response = await setVersionGoal(projectId, goalInput || null);
+      setOptimisticOverrides({
+        goal: response.goal,
+        goal_updated_at: response.goal_updated_at,
+        goal_editor_info: response.goal_editor_info,
+      });
+      setActionMsg('Goal updated');
+      setEditingGoal(false);
+      onRefresh();
+    } catch {
+      setActionMsg('Request failed');
+      setOptimisticOverrides(null);
+      setEditingGoal(false);
+      setGoalInput(cv?.goal || '');
     } finally {
       setActionLoading(null);
     }
@@ -205,15 +398,147 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
     }
   };
 
+  const handleTogglePromotionEnabled = async () => {
+    const nextValue = !optimisticPromotionEnabled;
+    if (nextValue && !window.confirm('Enable live promotion for ALL PROJECTS? Passing qualify runs will push to main fleet-wide.')) return;
+    setActionLoading('promotion');
+    setActionMsg(null);
+    setPromotionEnabledOverride(nextValue);
+    try {
+      await patchAdminSettings({ promotion_enabled: nextValue });
+      setActionMsg(nextValue ? 'Live promotion enabled' : 'Live promotion disabled');
+      onRefresh();
+    } catch {
+      setActionMsg('Request failed');
+      setPromotionEnabledOverride(null);
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleSetProjectPromotion = async (enabled: boolean | null) => {
+    if (!projectId) return;
+    if (enabled === true && !window.confirm('Arm live promotion for THIS project only? Passing qualify runs will push this project to main.')) return;
+    setActionLoading('project-promotion');
+    setActionMsg(null);
+    try {
+      await setProjectPromotionEnabled(projectId, enabled);
+      setActionMsg(enabled === null ? 'Using fleet default' : enabled ? 'Project live promotion armed' : 'Project live promotion held');
+      onRefresh();
+    } catch {
+      setActionMsg('Request failed');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleCutVersion = async () => {
+    if (!projectId || !cv) return;
+    const activating = stagedActivatedByCut(data?.staged_directions ?? [], cv.version_number);
+    const inFlight = cv.in_flight_task_count ?? 0;
+    const qualState: QualificationState | null = cv.qualification_state ?? null;
+    const consequences = [
+      activating.length > 0
+        ? `${activating.length} staged direction${activating.length !== 1 ? 's' : ''} will start now`
+        : null,
+      inFlight > 0
+        ? `${inFlight} in-flight task${inFlight !== 1 ? 's' : ''} will keep running against the new version`
+        : null,
+      qualState?.state === 'promotion_in_flight'
+        ? `promotion PR${qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open and auto-merging`
+        : null,
+    ].filter(Boolean);
+    const msg = consequences.length
+      ? `Abandon v${cv.version_number} and open a fresh version?\n\nThis will: ${consequences.join('; ')}.`
+      : `Abandon v${cv.version_number} and open a fresh version?`;
+    if (!window.confirm(msg)) return;
+    setActionLoading('cut');
+    setActionMsg(null);
+    try {
+      const result = await cutVersion(projectId, cutReason || undefined);
+      setActionMsg(`Cut v${result.abandoned_version.version_number} → opened v${result.new_version.version_number}`);
+      setCuttingVersion(false);
+      setCutReason('');
+      onRefresh();
+    } catch (error) {
+      setActionMsg(error instanceof Error ? error.message : 'Request failed');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
   return (
     <section data-testid="version-lifecycle-panel">
       <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Version Lifecycle</h2>
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 space-y-2 text-xs">
         <div className="flex flex-wrap items-center gap-2">
           {data.promotion_enabled !== undefined && (
-            <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${promotionEnabled ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-neutral-500/10 border-neutral-500/30 text-neutral-400'}`}>
-              {promotionEnabled ? 'LIVE' : 'DRY-RUN'}
-            </span>
+            <>
+              <div className="flex flex-col gap-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${optimisticPromotionEnabled ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-neutral-500/10 border-neutral-500/30 text-neutral-400'}`} title="Fleet-wide setting (all projects)">
+                    {optimisticPromotionEnabled ? 'LIVE' : 'DRY-RUN'}
+                  </span>
+                  {projectId && userRole === 'admin' && (
+                    // eslint-disable-next-line viewport/min-touch-target
+                    <button
+                      onClick={handleTogglePromotionEnabled}
+                      disabled={actionLoading !== null}
+                      className="text-[10px] px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                      title="Changes promotion mode for all projects"
+                    >
+                      {actionLoading === 'promotion' ? '…' : optimisticPromotionEnabled ? 'Disable' : 'Enable'}
+                    </button>
+                  )}
+                </div>
+                <span className="text-[9px] text-neutral-600">Fleet-wide setting</span>
+              </div>
+              {data.promotion_enabled_effective !== undefined && (
+                <div className="flex flex-col gap-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${data.promotion_enabled_effective ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-neutral-500/10 border-neutral-500/30 text-neutral-400'}`} title="Effective promotion mode for THIS project">
+                      {data.promotion_enabled_effective ? 'LIVE' : 'DRY-RUN'}
+                    </span>
+                    {projectId && userRole === 'admin' && (
+                      <>
+                        {/* eslint-disable-next-line viewport/min-touch-target */}
+                        <button
+                          onClick={() => handleSetProjectPromotion(true)}
+                          disabled={actionLoading !== null || (data.promotion_enabled_source === 'project' && data.promotion_enabled_override === true)}
+                          className="text-[10px] px-1.5 py-0.5 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                          title="Arm live promotion for this project only"
+                        >
+                          {actionLoading === 'project-promotion' ? '…' : 'Arm'}
+                        </button>
+                        {/* eslint-disable-next-line viewport/min-touch-target */}
+                        <button
+                          onClick={() => handleSetProjectPromotion(false)}
+                          disabled={actionLoading !== null || (data.promotion_enabled_source === 'project' && data.promotion_enabled_override === false)}
+                          className="text-[10px] px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                          title="Hold live promotion for this project only"
+                        >
+                          Hold
+                        </button>
+                        {data.promotion_enabled_source === 'project' && (
+                          // eslint-disable-next-line viewport/min-touch-target
+                          <button
+                            onClick={() => handleSetProjectPromotion(null)}
+                            disabled={actionLoading !== null}
+                            className="text-[10px] px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                            title="Clear this project's override and follow the fleet default"
+                          >
+                            Use fleet default
+                          </button>
+                        )}
+                      </>
+                    )}
+                  </div>
+                  <span className="text-[9px] text-neutral-600">
+                    This project · {data.promotion_enabled_source === 'project' ? 'project override' : 'fleet default'}
+                  </span>
+                </div>
+              )}
+            </>
           )}
         </div>
         {cv && (
@@ -225,17 +550,115 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
               <span className="text-[10px] text-neutral-500">{cv.merged_task_count} tasks merged</span>
               {cv.qualification_attempts > 0 && <span className="text-[10px] text-neutral-500">{cv.qualification_attempts} qual{cv.qualification_attempts !== 1 ? 's' : ''}</span>}
             </div>
-            {cv.goal && (
-              <p className="text-[11px] text-neutral-300" title={cv.goal}>
-                <span className="text-neutral-500">Goal: </span>{cv.goal}
-              </p>
-            )}
+            {editingGoal && projectId ? (
+              <div className="flex flex-col gap-1.5">
+                <textarea
+                  value={goalInput}
+                  onChange={(e) => setGoalInput(e.target.value)}
+                  placeholder="Enter version goal..."
+                  maxLength={500}
+                  disabled={actionLoading !== null}
+                  className="text-[11px] bg-neutral-800 border border-neutral-700 text-neutral-300 rounded px-2 py-1 focus:outline-none focus:border-neutral-600 disabled:opacity-50 disabled:cursor-not-allowed resize-none"
+                  rows={2}
+                />
+                <div className="flex gap-1">
+                  {/* eslint-disable-next-line viewport/min-touch-target */}
+                  <button
+                    onClick={handleSetGoal}
+                    disabled={actionLoading !== null}
+                    className="text-[10px] px-2 py-0.5 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {actionLoading === 'goal' ? '…' : 'Save'}
+                  </button>
+                  {/* eslint-disable-next-line viewport/min-touch-target */}
+                  <button
+                    onClick={() => {
+                      setEditingGoal(false);
+                      setGoalInput(cv.goal || '');
+                    }}
+                    disabled={actionLoading !== null}
+                    className="text-[10px] px-2 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : cv.goal ? (
+              <div className="flex flex-col gap-1">
+                <p className="text-[11px] text-neutral-300" title={cv.goal}>
+                  <span className="text-neutral-500">Goal: </span>{cv.goal}
+                </p>
+                {cv.goal_updated_at && (
+                  <p className="text-[10px] text-neutral-600">
+                    {cv.goal_editor_info && <span>{cv.goal_editor_info} </span>}
+                    <span>{timeAgo(cv.goal_updated_at)}</span>
+                  </p>
+                )}
+                {cv.live_current_focus && cv.live_current_focus !== cv.goal && (
+                  <div className="flex flex-col gap-1 pt-1 border-t border-amber-500/20">
+                    <p className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                      Goal has drifted from live focus
+                    </p>
+                    <p className="text-[10px] text-neutral-400" title={cv.live_current_focus}>
+                      <span className="text-neutral-600">Live focus: </span>{cv.live_current_focus}
+                    </p>
+                    {projectId && (
+                      // eslint-disable-next-line viewport/min-touch-target
+                      <button
+                        onClick={() => {
+                          setGoalInput(cv.live_current_focus || '');
+                          setEditingGoal(true);
+                        }}
+                        disabled={actionLoading !== null}
+                        className="text-[10px] px-1.5 py-0.5 w-fit rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        Resync to focus
+                      </button>
+                    )}
+                  </div>
+                )}
+                {projectId && (
+                  // eslint-disable-next-line viewport/min-touch-target
+                  <button
+                    onClick={() => setEditingGoal(true)}
+                    disabled={actionLoading !== null}
+                    className="text-[10px] px-1.5 py-0.5 w-fit rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    Edit
+                  </button>
+                )}
+              </div>
+            ) : projectId ? (
+              // eslint-disable-next-line viewport/min-touch-target
+              <button
+                onClick={() => setEditingGoal(true)}
+                disabled={actionLoading !== null}
+                className="text-[10px] px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Set goal
+              </button>
+            ) : null}
             {cv.phase_reasoning && (
               <p className="text-[10px] text-neutral-400 italic truncate" title={cv.phase_reasoning}>{cv.phase_reasoning}</p>
             )}
+            {cv.qualification_state && (
+              <div className="pl-2 border-l border-neutral-700/50 space-y-0.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${QUAL_STATE_STYLE[cv.qualification_state.state] ?? 'bg-neutral-800 text-neutral-400 border-neutral-700'}`}>
+                    {cv.qualification_state.state.replace(/_/g, ' ')}
+                  </span>
+                </div>
+                <p className="text-[10px] text-neutral-400">{cv.qualification_state.summary}</p>
+              </div>
+            )}
             {cv.last_qualification && (
               <div className="pl-2 border-l border-neutral-700/50 space-y-0.5">
-                <QualSummary q={cv.last_qualification} />
+                <div className="flex flex-wrap items-center gap-2">
+                  <QualSummary q={cv.last_qualification} />
+                  {cv.last_qualification.finalized_at && (
+                    <span className="text-[10px] text-neutral-600">as of {timeAgo(cv.last_qualification.finalized_at)}</span>
+                  )}
+                </div>
                 {(cv.last_qualification.sub_scores || cv.last_qualification.ci_resolution) && (
                   <div className="flex flex-wrap gap-x-2 gap-y-0.5 text-[10px] text-neutral-500">
                     {cv.last_qualification.sub_scores && (
@@ -279,7 +702,10 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
             )}
             {cv.latest_audit && (
               <div className="pl-2 border-l border-neutral-700/50">
-                <AuditFindingsList audit={cv.latest_audit} />
+                <AuditFindingsList
+                  audit={cv.latest_audit}
+                  currentCandidateSha={cv.last_qualification?.candidate_sha}
+                />
               </div>
             )}
             {projectId && (
@@ -310,6 +736,52 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
                     {actionLoading === 'qualify' ? '…' : 'Run Qualify'}
                   </button>
                 )}
+                {cuttingVersion ? (
+                  <div className="flex flex-col gap-1 w-full">
+                    <CutConsequences
+                      cv={cv}
+                      staged={data.staged_directions ?? []}
+                    />
+                    <div className="flex flex-wrap items-center gap-1">
+                      <input
+                        type="text"
+                        value={cutReason}
+                        onChange={(e) => setCutReason(e.target.value)}
+                        placeholder="Optional reason for cut..."
+                        disabled={actionLoading !== null}
+                        maxLength={200}
+                        className="text-[10px] flex-1 bg-neutral-800 border border-neutral-700 text-neutral-300 rounded px-2 py-0.5 focus:outline-none focus:border-neutral-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                      />
+                      {/* eslint-disable-next-line viewport/min-touch-target */}
+                      <button
+                        onClick={handleCutVersion}
+                        disabled={actionLoading !== null}
+                        className="text-[10px] px-2 py-0.5 rounded border border-red-500/40 text-red-400 hover:bg-red-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        {actionLoading === 'cut' ? '…' : 'Cut'}
+                      </button>
+                      {/* eslint-disable-next-line viewport/min-touch-target */}
+                      <button
+                        onClick={() => {
+                          setCuttingVersion(false);
+                          setCutReason('');
+                        }}
+                        disabled={actionLoading !== null}
+                        className="text-[10px] px-2 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => setCuttingVersion(true)}
+                    disabled={actionLoading !== null}
+                    className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-red-500/40 text-red-400 hover:bg-red-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    Cut/Abandon
+                  </button>
+                )}
                 {actionMsg && (
                   <span className="text-[10px] text-neutral-400 italic">{actionMsg}</span>
                 )}
@@ -318,6 +790,9 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
           </div>
         )}
         {readiness !== undefined && <PromotionReadinessSummary readiness={readiness} />}
+        {data.staged_directions && data.staged_directions.length > 0 && (
+          <StagedDirectionsSummary staged={data.staged_directions} />
+        )}
         {verdicts.length > 0 && (
           <div data-testid="verdict-history">
             <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Verdict History</p>
@@ -342,10 +817,17 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
             <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">History</p>
             <div className="space-y-0.5">
               {recent.slice(0, 4).map(v => (
-                <div key={v.version_number} className="flex flex-wrap items-center gap-2 text-[10px]">
+                <div key={v.version_number} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px]">
                   <span className="text-neutral-400 font-mono w-8">v{v.version_number}</span>
                   <span className="text-neutral-500">{v.status}</span>
                   <QualSummary q={v.last_qualification} />
+                  {v.status === 'abandoned' && (v.abandoned_by || v.abandon_reason || v.abandoned_at) && (
+                    <span className="text-neutral-400">
+                      cut by {v.abandoned_by ?? 'unknown'}
+                      {v.abandon_reason ? `: ${v.abandon_reason}` : ''}
+                      {v.abandoned_at ? ` · ${timeAgo(v.abandoned_at)}` : ''}
+                    </span>
+                  )}
                 </div>
               ))}
             </div>

@@ -11,13 +11,23 @@ import pytest
 from pydantic import ValidationError
 
 from app.problem_model import (
+    ARCHIVED_GAPS_DURABLE_MAX,
+    CAPABILITIES_DURABLE_MAX,
+    FRICTION_DURABLE_MAX,
+    PROBLEM_MODEL_BYTE_BUDGET,
     GAP_HISTORY_DURABLE_MAX,
     GAP_PAST_MOVES_DURABLE_MAX,
+    GAP_APPEND_ONLY_GC_FLOOR,
+    MODEL_SIZE_HEALTHY_BYTES,
+    MODEL_SIZE_HEALTHY_CAPABILITIES,
+    MODEL_SIZE_HEALTHY_FRICTION,
+    MODEL_SIZE_HEALTHY_GAPS,
     REVISION_LOG_MAX,
     SELF_REFLECTION_LOG_MAX,
     Capability,
     Friction,
     Gap,
+    GapDeferral,
     Intent,
     ProblemModel,
     ProjectContext,
@@ -28,6 +38,8 @@ from app.problem_model import (
     apply_agent_update,
     apply_user_intent_patch,
     archive_closed_gaps,
+    compute_model_size_signal,
+    gc_problem_model,
     is_empty,
     parse_problem_model,
 )
@@ -406,6 +418,533 @@ def test_apply_agent_update_preserves_prior_archive_and_log():
     assert new_raw["revision_log"][1]["revision"] == 3
 
 
+def test_gc_problem_model_keeps_most_recent_archived():
+    """Direct unit test of eviction ordering: oldest archived gaps (by
+    closed/opened timestamp) roll off, the most-recent ARCHIVED_GAPS_DURABLE_MAX
+    are kept."""
+    # Build cap+5 archived gaps with strictly increasing closed timestamps so
+    # ordering is unambiguous.
+    total = ARCHIVED_GAPS_DURABLE_MAX + 5
+    archived = [
+        Gap(
+            id=f"g-{i:04d}",
+            name=f"archived {i}",
+            status="closed",
+            closed=f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}",
+        )
+        for i in range(total)
+    ]
+    model = ProblemModel(archived_gaps=archived)
+
+    summary = gc_problem_model(model)
+
+    assert len(model.archived_gaps) == ARCHIVED_GAPS_DURABLE_MAX
+    # The 5 oldest (lowest timestamps == lowest indices) were evicted.
+    assert summary["archived_gaps_evicted"] == [f"g-{i:04d}" for i in range(5)]
+    kept_ids = {g.id for g in model.archived_gaps}
+    assert kept_ids == {f"g-{i:04d}" for i in range(5, total)}
+
+
+def test_gc_problem_model_noop_under_cap():
+    """Below the cap, gc_problem_model evicts nothing and returns an empty
+    summary so callers can keep output byte-identical on the no-op path."""
+    archived = [
+        Gap(id=f"g-{i}", name=f"x{i}", status="closed", closed=f"2026-01-0{i}")
+        for i in range(1, 4)
+    ]
+    model = ProblemModel(archived_gaps=archived)
+    before = model.model_dump()
+
+    summary = gc_problem_model(model)
+
+    assert summary == {}
+    assert model.model_dump() == before
+
+
+def test_apply_agent_update_caps_archived_gaps():
+    """A model accumulating archived gaps past the cap is structurally bounded
+    on write-back, regardless of whether the agent pruned — the oldest roll
+    off and active state is untouched."""
+    current = {
+        "revision": 1,
+        "archived_gaps": [
+            {
+                "id": f"g-{i:04d}",
+                "name": f"old {i}",
+                "status": "closed",
+                "closed": f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}",
+            }
+            for i in range(ARCHIVED_GAPS_DURABLE_MAX + 10)
+        ],
+        "gaps": [{"id": "g-live", "name": "active gap", "status": "active"}],
+    }
+    proposed = {"gaps": [{"id": "g-live", "name": "active gap", "status": "active"}]}
+
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+
+    assert len(new_raw["archived_gaps"]) == ARCHIVED_GAPS_DURABLE_MAX
+    # Oldest 10 evicted; the active gap is never touched by GC.
+    assert diff["archived_gaps_evicted"] == [f"g-{i:04d}" for i in range(10)]
+    assert {g["id"] for g in new_raw["gaps"]} == {"g-live"}
+    kept = {g["id"] for g in new_raw["archived_gaps"]}
+    assert "g-0000" not in kept
+    assert f"g-{ARCHIVED_GAPS_DURABLE_MAX + 9:04d}" in kept
+
+
+def test_apply_agent_update_archived_gc_recorded_in_revision_log():
+    """The GC eviction is observable: evicted ids land in the diff AND the
+    revision-log entry recorded for the revision that performed the eviction."""
+    current = {
+        "revision": 5,
+        "archived_gaps": [
+            {
+                "id": f"g-{i:04d}",
+                "name": f"old {i}",
+                "status": "closed",
+                "closed": f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}",
+            }
+            for i in range(ARCHIVED_GAPS_DURABLE_MAX + 3)
+        ],
+    }
+    new_raw, diff = apply_agent_update(current, {"gaps": []}, "2026-04-21T12:00:00")
+
+    assert diff["archived_gaps_evicted"] == [f"g-{i:04d}" for i in range(3)]
+    last_entry = new_raw["revision_log"][-1]
+    assert last_entry["changes"]["archived_gaps_evicted"] == [
+        f"g-{i:04d}" for i in range(3)
+    ]
+    assert "GC evicted 3 archived gap(s)" in last_entry["summary"]
+
+
+def test_apply_agent_update_under_cap_no_gc_mutation():
+    """Below the cap, no archived gaps are evicted and the diff carries no GC
+    key — the GC backstop is invisible when the model is small."""
+    current = {
+        "revision": 1,
+        "archived_gaps": [
+            {"id": "g-a", "name": "a", "status": "closed", "closed": "2026-01-01"},
+            {"id": "g-b", "name": "b", "status": "closed", "closed": "2026-01-02"},
+        ],
+    }
+    new_raw, diff = apply_agent_update(current, {"gaps": []}, "2026-04-21T12:00:00")
+
+    assert {g["id"] for g in new_raw["archived_gaps"]} == {"g-a", "g-b"}
+    assert "archived_gaps_evicted" not in diff
+
+
+def test_apply_agent_update_gc_never_drops_active_state():
+    """GC bounds history/archive only — active gaps, capabilities, and pending
+    confirmations survive even when the archive is over the cap and evicting."""
+    current = {
+        "revision": 1,
+        "archived_gaps": [
+            {
+                "id": f"g-arch-{i:04d}",
+                "name": f"old {i}",
+                "status": "closed",
+                "closed": f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}",
+            }
+            for i in range(ARCHIVED_GAPS_DURABLE_MAX + 25)
+        ],
+        "gaps": [{"id": "g-live", "name": "live", "status": "active"}],
+        "capabilities": [{"name": "cap-x", "status": "working"}],
+        "pending_user_confirmation": [
+            {"id": "p-1", "type": "access_needed", "proposal": "grant access"}
+        ],
+    }
+    proposed = {
+        "gaps": [{"id": "g-live", "name": "live", "status": "active"}],
+        "capabilities": [{"name": "cap-x", "status": "working"}],
+        "pending_user_confirmation": [
+            {"id": "p-1", "type": "access_needed", "proposal": "grant access"}
+        ],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+
+    assert len(new_raw["archived_gaps"]) == ARCHIVED_GAPS_DURABLE_MAX
+    assert {g["id"] for g in new_raw["gaps"]} == {"g-live"}
+    assert {c["name"] for c in new_raw["capabilities"]} == {"cap-x"}
+    assert {p["id"] for p in new_raw["pending_user_confirmation"]} == {"p-1"}
+
+
+# ---------------------------------------------------------------------------
+# Byte-aware GC — bound the serialized model under the write cap even when
+# individual entries are large (count caps alone don't catch this).
+# ---------------------------------------------------------------------------
+
+
+def _serialized_bytes(model: ProblemModel) -> int:
+    import json
+
+    return len(json.dumps(model.model_dump(), default=str))
+
+
+def test_gc_problem_model_byte_aware_evicts_large_archived_gaps():
+    """A model UNDER the archived-gap count cap but whose large entries push the
+    serialized size past the byte budget is GC'd down to fit, evicting the
+    oldest archived gaps first."""
+    big = "x" * 5_000
+    # ~20 archived gaps * ~5KB each ≈ 100KB > 90KB budget, but well under the
+    # 200-entry count cap so only the byte pass can catch it.
+    archived = [
+        Gap(
+            id=f"g-{i:04d}",
+            name=f"archived {i}",
+            status="closed",
+            closed=f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}",
+            description=big,
+        )
+        for i in range(20)
+    ]
+    model = ProblemModel(archived_gaps=archived)
+    assert len(model.archived_gaps) < ARCHIVED_GAPS_DURABLE_MAX  # count cap inert
+    assert _serialized_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET
+
+    summary = gc_problem_model(model)
+
+    assert _serialized_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET
+    # Oldest evicted first; the most-recent gaps survive.
+    evicted = summary["archived_gaps_evicted"]
+    assert evicted == [f"g-{i:04d}" for i in range(len(evicted))]
+    kept_ids = {g.id for g in model.archived_gaps}
+    assert f"g-{19:04d}" in kept_ids
+    assert "g-0000" not in kept_ids
+
+
+def test_gc_problem_model_byte_aware_trims_ledger_when_archive_exhausted():
+    """When archived gaps are exhausted (or absent) and the model is still over
+    budget, the byte pass trims the oldest rejected-agent-edits ledger entries —
+    pure reference-only bookkeeping — until it fits."""
+    big = "x" * 6_000
+    ledger = [
+        {
+            "at": f"2026-01-0{i}",
+            "field": "context",
+            "kind": "value_conflict",
+            "operator_value": big,
+            "agent_value": big,
+        }
+        for i in range(10)
+    ]
+    model = ProblemModel(rejected_agent_edits=ledger)
+    assert _serialized_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET
+
+    summary = gc_problem_model(model)
+
+    assert _serialized_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET
+    assert summary["rejected_agent_edits_trimmed"] > 0
+    # Oldest entries dropped; the newest survive (trim is from the front).
+    assert model.rejected_agent_edits[-1]["at"] == "2026-01-09"
+    assert "archived_gaps_evicted" not in summary
+
+
+def test_gc_problem_model_byte_aware_noop_under_budget():
+    """A model already under the byte budget is left byte-identical — the byte
+    pass never re-orders archived gaps or trims the ledger on the no-op path."""
+    model = ProblemModel(
+        archived_gaps=[
+            Gap(id="g-b", name="b", status="closed", closed="2026-01-02"),
+            Gap(id="g-a", name="a", status="closed", closed="2026-01-01"),
+        ],
+        rejected_agent_edits=[{"at": "t", "field": "context"}],
+    )
+    before = model.model_dump()
+    assert _serialized_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET
+
+    summary = gc_problem_model(model)
+
+    assert summary == {}
+    # Archived-gap order is preserved (no spurious recency re-sort).
+    assert model.model_dump() == before
+
+
+def test_apply_agent_update_byte_gc_keeps_model_roundtrippable():
+    """On write-back, a durable model stuffed with large archived gaps AND a
+    large rejected-edits ledger is GC'd under the byte budget — and the eviction
+    is observable in the diff + revision log — while live state is untouched."""
+    big = "y" * 5_000
+    history = [f"e{i}-{('x' * 1000)}" for i in range(60)]
+    past_moves = [f"d-{i}-{('z' * 1000)}" for i in range(60)]
+    current = {
+        "revision": 3,
+        "archived_gaps": [
+            {
+                "id": f"g-arch-{i:04d}",
+                "name": f"old {i}",
+                "status": "closed",
+                "closed": f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}",
+                "description": big,
+            }
+            for i in range(20)
+        ],
+        "rejected_agent_edits": [
+            {
+                "at": f"2026-02-0{i}",
+                "field": "constraints",
+                "kind": "value_conflict",
+                "operator_value": big,
+                "agent_value": big,
+            }
+            for i in range(5)
+        ],
+        "gaps": [_gap_with_memory(history, past_moves)],
+        "capabilities": [{"name": "cap-x", "status": "working"}],
+        "pending_user_confirmation": [
+            {"id": "p-1", "type": "access_needed", "proposal": "grant access"}
+        ],
+    }
+    proposed = {"gaps": [_gap_with_memory(history[-5:], past_moves[-5:])]}
+
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+
+    persisted = ProblemModel.model_validate(new_raw)
+    assert _serialized_bytes(persisted) <= PROBLEM_MODEL_BYTE_BUDGET
+    assert list(diff) == [
+        "archived_gaps_evicted",
+        "rejected_agent_edits_trimmed",
+        "active_gap_tails_trimmed",
+    ]
+    gap = new_raw["gaps"][0]
+    assert gap["id"] == "g-mem"
+    assert len(gap["history"]) == GAP_APPEND_ONLY_GC_FLOOR
+    assert gap["history"][0]["event"] == history[-GAP_APPEND_ONLY_GC_FLOOR]
+    assert len(gap["past_moves"]) == GAP_APPEND_ONLY_GC_FLOOR
+    assert gap["past_moves"][0] == past_moves[-GAP_APPEND_ONLY_GC_FLOOR]
+
+    round_tripped, _ = apply_agent_update(
+        new_raw,
+        {"gaps": [_gap_with_memory(history[-5:], past_moves[-5:])]},
+        "2026-04-21T12:05:00",
+    )
+    assert round_tripped["gaps"][0]["history"] == gap["history"]
+    assert round_tripped["gaps"][0]["past_moves"] == gap["past_moves"]
+
+    last_entry = new_raw["revision_log"][-1]
+    assert "active_gap_tails_trimmed" in last_entry["changes"]
+    assert "GC evicted" in last_entry["summary"]
+    # Live, semantically meaningful state survives untouched.
+    assert {c["name"] for c in new_raw["capabilities"]} == {"cap-x"}
+    assert {p["id"] for p in new_raw["pending_user_confirmation"]} == {"p-1"}
+
+
+def test_apply_agent_update_under_budget_no_byte_gc():
+    """A normally-sized model write-back is not touched by the byte pass — no
+    archived_gaps_evicted / rejected_agent_edits_trimmed keys appear."""
+    current = {
+        "revision": 1,
+        "archived_gaps": [
+            {"id": "g-a", "name": "a", "status": "closed", "closed": "2026-01-01"},
+        ],
+        "gaps": [{"id": "g-live", "name": "live", "status": "active"}],
+    }
+    proposed = {"gaps": [{"id": "g-live", "name": "live", "status": "active"}]}
+
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+
+    assert "archived_gaps_evicted" not in diff
+    assert "rejected_agent_edits_trimmed" not in diff
+    assert {g["id"] for g in new_raw["archived_gaps"]} == {"g-a"}
+
+
+# ---------------------------------------------------------------------------
+# Byte-aware GC — bound capabilities/friction (non-destructively merged, so
+# unbounded on mature projects) without ever dropping live high-value state.
+# ---------------------------------------------------------------------------
+
+
+def test_gc_problem_model_byte_aware_evicts_excess_capabilities():
+    """A capabilities-heavy model over the byte budget is GC'd to fit by evicting
+    terminal (``planned``) capabilities; live working/partial capabilities within
+    budget survive untouched."""
+    big = "x" * 4_000
+    planned = [
+        Capability(name=f"planned-{i}", status="planned", notes=big)
+        for i in range(30)
+    ]
+    live = [
+        Capability(name="cap-working", status="working"),
+        Capability(name="cap-partial", status="partial"),
+    ]
+    model = ProblemModel(capabilities=planned + live)
+    assert _serialized_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET
+
+    summary = gc_problem_model(model)
+
+    assert _serialized_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET
+    assert summary["capabilities_evicted"]  # at least one planned cap evicted
+    surviving = {c.name for c in model.capabilities}
+    # Live high-value capabilities are never evicted.
+    assert {"cap-working", "cap-partial"} <= surviving
+    # Everything evicted was a terminal planned capability.
+    assert all(name.startswith("planned-") for name in summary["capabilities_evicted"])
+
+
+def test_gc_problem_model_byte_aware_evicts_excess_friction_resolved_first():
+    """When friction must be evicted to fit, resolved/mitigated (terminal) entries
+    go first and active friction is preserved."""
+    big = "y" * 4_000
+    resolved = [
+        Friction(id=f"f-res-{i}", name=f"res {i}", status="resolved", description=big)
+        for i in range(15)
+    ]
+    mitigated = [
+        Friction(id=f"f-mit-{i}", name=f"mit {i}", status="mitigated", description=big)
+        for i in range(15)
+    ]
+    active = [Friction(id="f-active", name="live blocker", status="active")]
+    model = ProblemModel(friction=resolved + mitigated + active)
+    assert _serialized_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET
+
+    summary = gc_problem_model(model)
+
+    assert _serialized_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET
+    surviving = {f.id for f in model.friction}
+    # Active friction always survives.
+    assert "f-active" in surviving
+    # Resolved friction is evicted before any mitigated entry: if any mitigated
+    # was evicted, every resolved must already be gone.
+    evicted = set(summary["friction_evicted"])
+    if any(fid.startswith("f-mit-") for fid in evicted):
+        assert all(f"f-res-{i}" in evicted for i in range(15))
+    assert all(fid != "f-active" for fid in evicted)
+
+
+def test_gc_problem_model_byte_aware_runs_when_capfriction_are_bulk():
+    """Regression: an oversized model whose BULK is terminal capabilities/friction
+    is GC'd to fit — the byte pass no longer skips because the live floor (after
+    clearing terminal cap/friction) now fits under budget."""
+    big = "z" * 3_000
+    model = ProblemModel(
+        gaps=[Gap(id="g-live", name="live", status="active")],
+        capabilities=[
+            Capability(name=f"planned-{i}", status="planned", notes=big)
+            for i in range(20)
+        ],
+        friction=[
+            Friction(id=f"f-{i}", name=f"res {i}", status="resolved", description=big)
+            for i in range(20)
+        ],
+    )
+    assert _serialized_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET
+
+    summary = gc_problem_model(model)
+
+    assert _serialized_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET
+    # The byte pass actually fired (rather than being futilely gated off).
+    assert summary.get("capabilities_evicted") or summary.get("friction_evicted")
+    # The live gap is untouched.
+    assert {g.id for g in model.gaps} == {"g-live"}
+
+
+def test_gc_problem_model_caps_capabilities_and_friction_count():
+    """Count caps evict terminal entries down to the durable max even when the
+    model is under the byte budget; live entries are never dropped to satisfy a
+    count, so an all-live collection may remain above the cap."""
+    # Small entries so the byte budget is not the trigger — exercise the count cap.
+    planned = [
+        Capability(name=f"planned-{i}", status="planned")
+        for i in range(CAPABILITIES_DURABLE_MAX + 5)
+    ]
+    working = [Capability(name="cap-working", status="working")]
+    resolved = [
+        Friction(id=f"f-{i}", name=f"res {i}", status="resolved")
+        for i in range(FRICTION_DURABLE_MAX + 7)
+    ]
+    active = [Friction(id="f-active", name="live", status="active")]
+    model = ProblemModel(
+        capabilities=planned + working, friction=resolved + active
+    )
+    assert _serialized_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET  # count, not byte
+
+    summary = gc_problem_model(model)
+
+    # Capability count brought down to the cap; the working cap survives.
+    assert len(model.capabilities) == CAPABILITIES_DURABLE_MAX
+    assert "cap-working" in {c.name for c in model.capabilities}
+    assert len(summary["capabilities_evicted"]) == 6  # 5 overage + working kept
+    # Friction count brought down to the cap; active friction survives.
+    assert len(model.friction) == FRICTION_DURABLE_MAX
+    assert "f-active" in {f.id for f in model.friction}
+    assert len(summary["friction_evicted"]) == 8
+
+
+def test_gc_problem_model_count_cap_never_evicts_all_live():
+    """An all-live collection above the durable max is left intact — the count
+    cap only evicts terminal entries, never live ones, to honor the invariant."""
+    working = [
+        Capability(name=f"cap-{i}", status="working")
+        for i in range(CAPABILITIES_DURABLE_MAX + 10)
+    ]
+    active = [
+        Friction(id=f"f-{i}", name=f"live {i}", status="active")
+        for i in range(FRICTION_DURABLE_MAX + 10)
+    ]
+    model = ProblemModel(capabilities=working, friction=active)
+
+    summary = gc_problem_model(model)
+
+    # No live entry evicted even though both collections exceed their caps.
+    assert summary == {}
+    assert len(model.capabilities) == CAPABILITIES_DURABLE_MAX + 10
+    assert len(model.friction) == FRICTION_DURABLE_MAX + 10
+
+
+def test_apply_agent_update_byte_gc_bounds_capfriction_roundtrippable():
+    """End-to-end: an oversized capability/friction-heavy model write-back lands
+    under the durable byte budget, records the eviction in the diff + revision
+    log, and round-trips; live gaps/pending state is untouched."""
+    big = "w" * 3_500
+    current = {
+        "revision": 4,
+        "capabilities": (
+            [
+                {"name": f"planned-{i}", "status": "planned", "notes": big}
+                for i in range(20)
+            ]
+            + [{"name": "cap-working", "status": "working"}]
+        ),
+        "friction": (
+            [
+                {
+                    "id": f"f-res-{i}",
+                    "name": f"res {i}",
+                    "status": "resolved",
+                    "description": big,
+                }
+                for i in range(20)
+            ]
+            + [{"id": "f-active", "name": "live blocker", "status": "active"}]
+        ),
+        "gaps": [{"id": "g-live", "name": "live", "status": "active"}],
+        "pending_user_confirmation": [
+            {"id": "p-1", "type": "access_needed", "proposal": "grant access"}
+        ],
+    }
+    proposed = {"gaps": [{"id": "g-live", "name": "live", "status": "active"}]}
+
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+
+    persisted = ProblemModel.model_validate(new_raw)
+    assert _serialized_bytes(persisted) <= PROBLEM_MODEL_BYTE_BUDGET
+    assert diff.get("capabilities_evicted") or diff.get("friction_evicted")
+    # Live high-value state survives.
+    assert "cap-working" in {c["name"] for c in new_raw["capabilities"]}
+    assert "f-active" in {f["id"] for f in new_raw["friction"]}
+    assert {g["id"] for g in new_raw["gaps"]} == {"g-live"}
+    assert {p["id"] for p in new_raw["pending_user_confirmation"]} == {"p-1"}
+    # Observable in the revision log.
+    last_entry = new_raw["revision_log"][-1]
+    assert "GC evicted" in last_entry["summary"]
+
+    # Round-trips cleanly back through another write-back.
+    round_tripped, _ = apply_agent_update(
+        new_raw, proposed, "2026-04-21T12:05:00"
+    )
+    assert _serialized_bytes(ProblemModel.model_validate(round_tripped)) <= (
+        PROBLEM_MODEL_BYTE_BUDGET
+    )
+
+
 def test_apply_agent_update_detects_new_gaps():
     current = {
         "revision": 1,
@@ -597,6 +1136,229 @@ def test_apply_agent_update_archived_only_current_not_treated_as_mature():
     new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
     assert new_raw["revision"] == 5
     assert {g["id"] for g in new_raw["archived_gaps"]} == {"g-old"}
+
+
+# ---------------------------------------------------------------------------
+# apply_agent_update — floor-skeleton field preservation
+#
+# Under byte pressure the read-time floor delivers a SKELETON of an entry (gap
+# description/evidence stripped; capabilities/friction reduced to name+status).
+# Editing and resubmitting such an entry must NOT blank the durable fields the
+# agent never received. Preservation keys off the floor's own
+# ``_agent_view_floor_applied`` marker (echoed back) so a genuine clear of a
+# field the agent actually saw still applies.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_agent_update_floored_gap_skeleton_preserves_detail():
+    """Bumping a floored gap's priority and resubmitting it with blank
+    description/evidence preserves the durable detail the agent never saw."""
+    current = {
+        "revision": 3,
+        "gaps": [
+            {
+                "id": "g-1",
+                "name": "invoicing",
+                "status": "active",
+                "priority": "medium",
+                "description": "Durable description the agent never received.",
+                "evidence": "PR #42 establishes the gap.",
+                "active_moves": ["t-staffed-99"],
+            }
+        ],
+    }
+    proposed = {
+        "gaps": [
+            {
+                "id": "g-1",
+                "name": "invoicing",
+                "status": "active",
+                "priority": "high",
+                "description": "",
+                "evidence": "",
+                "active_moves": [],
+            }
+        ],
+        "_agent_view_floor_applied": {
+            "floor_bytes": 32768,
+            "stripped_gap_fields": [
+                "history",
+                "past_moves",
+                "active_moves",
+                "evidence",
+                "description",
+            ],
+            "dropped_gaps": 0,
+        },
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    gap = new_raw["gaps"][0]
+    assert gap["priority"] == "high"  # the real edit still applies
+    assert gap["description"] == "Durable description the agent never received."
+    assert gap["evidence"] == "PR #42 establishes the gap."
+    # Durable staffing state (read by reconciliation) survives the floored
+    # resubmit instead of being silently orphaned.
+    assert gap["active_moves"] == ["t-staffed-99"]
+
+
+def test_apply_agent_update_blank_gap_field_clears_without_floor_marker():
+    """No floor marker means the agent saw the full entry, so a blank field is a
+    deliberate clear and must apply — preservation is not blind."""
+    current = {
+        "revision": 3,
+        "gaps": [
+            {"id": "g-1", "name": "x", "status": "active", "description": "old"}
+        ],
+    }
+    proposed = {
+        "gaps": [{"id": "g-1", "name": "x", "status": "active", "description": ""}]
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["gaps"][0]["description"] == ""
+
+
+def test_apply_agent_update_floor_marker_only_preserves_stripped_gap_fields():
+    """A field NOT in ``stripped_gap_fields`` was seen by the agent, so blanking
+    it is a genuine clear even when the marker is present; only the stripped
+    field is preserved."""
+    current = {
+        "revision": 2,
+        "gaps": [
+            {
+                "id": "g-1",
+                "name": "x",
+                "status": "active",
+                "description": "seen",
+                "evidence": "durable",
+            }
+        ],
+    }
+    proposed = {
+        "gaps": [
+            {
+                "id": "g-1",
+                "name": "x",
+                "status": "active",
+                "description": "",
+                "evidence": "",
+            }
+        ],
+        "_agent_view_floor_applied": {
+            "stripped_gap_fields": ["history", "past_moves", "evidence"],
+            "dropped_gaps": 0,
+        },
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    gap = new_raw["gaps"][0]
+    assert gap["evidence"] == "durable"  # stripped → preserved
+    assert gap["description"] == ""  # seen by agent → genuine clear applies
+
+
+def test_apply_agent_update_floored_capability_skeleton_preserves_detail():
+    """Bumping a skeletonized capability's status preserves its durable notes,
+    backing_paths, and source provenance."""
+    current = {
+        "revision": 5,
+        "capabilities": [
+            {
+                "name": "Billing",
+                "status": "partial",
+                "notes": "durable notes",
+                "backing_paths": ["a.py", "b.py"],
+                "source": {"type": "shipped_change", "pr_number": 42},
+            }
+        ],
+    }
+    proposed = {
+        "capabilities": [{"name": "Billing", "status": "working"}],
+        "_agent_view_floor_applied": {
+            "summarized_capabilities": 1,
+            "summarized_friction": 0,
+        },
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    cap = new_raw["capabilities"][0]
+    assert cap["status"] == "working"  # edit applied
+    assert cap["notes"] == "durable notes"
+    assert cap["backing_paths"] == ["a.py", "b.py"]
+    assert cap["source"]["pr_number"] == 42
+
+
+def test_apply_agent_update_floored_capability_nonblank_value_overwrites():
+    """A skeletonized capability whose notes the agent actually rewrote (non-
+    blank) still takes the new value — preservation only fires on blanks."""
+    current = {
+        "revision": 5,
+        "capabilities": [
+            {"name": "Billing", "status": "partial", "notes": "old notes"}
+        ],
+    }
+    proposed = {
+        "capabilities": [
+            {"name": "Billing", "status": "working", "notes": "rewritten"}
+        ],
+        "_agent_view_floor_applied": {"summarized_capabilities": 1},
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["capabilities"][0]["notes"] == "rewritten"
+
+
+def test_apply_agent_update_floored_friction_skeleton_preserves_detail():
+    """Bumping a skeletonized friction's status preserves its durable
+    description, seen_in, mitigations_tried, source, and the promoted_to_gap_id
+    link (the skeleton keeps only id/name/status, so the link is stripped before
+    the agent sees it and a blank resubmit must NOT sever it)."""
+    current = {
+        "revision": 5,
+        "friction": [
+            {
+                "id": "f-1",
+                "name": "flaky CI",
+                "status": "active",
+                "description": "durable desc",
+                "seen_in": ["d-1"],
+                "mitigations_tried": ["retry"],
+                "source": {"type": "agent_observation"},
+                "promoted_to_gap_id": "g-flaky-ci",
+            }
+        ],
+    }
+    proposed = {
+        "friction": [{"id": "f-1", "name": "flaky CI", "status": "mitigated"}],
+        "_agent_view_floor_applied": {
+            "summarized_friction": 1,
+            "summarized_capabilities": 0,
+        },
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    fr = new_raw["friction"][0]
+    assert fr["status"] == "mitigated"  # edit applied
+    assert fr["description"] == "durable desc"
+    assert fr["seen_in"] == ["d-1"]
+    assert fr["mitigations_tried"] == ["retry"]
+    assert fr["source"]["type"] == "agent_observation"
+    assert fr["promoted_to_gap_id"] == "g-flaky-ci"
+
+
+def test_apply_agent_update_caps_friction_cleared_without_floor_marker():
+    """Without a floor marker (or with the section not skeletonized) a blank
+    capability/friction detail field is a genuine clear and applies."""
+    current = {
+        "revision": 5,
+        "capabilities": [
+            {"name": "Billing", "status": "partial", "notes": "old"}
+        ],
+        "friction": [
+            {"id": "f-1", "name": "flaky", "status": "active", "description": "d"}
+        ],
+    }
+    proposed = {
+        "capabilities": [{"name": "Billing", "status": "working", "notes": ""}],
+        "friction": [{"id": "f-1", "name": "flaky", "status": "mitigated"}],
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["capabilities"][0]["notes"] == ""
+    assert new_raw["friction"][0]["description"] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -1841,3 +2603,320 @@ def test_source_is_reusable_across_model_elements():
     assert cap.source.pr_number == 42
     assert friction.source.direction_id == "d-7"
     assert gap.source.type == "self_reflection"
+
+
+# Gap.deferral — acknowledged intentional non-staffing
+# ---------------------------------------------------------------------------
+
+
+def test_gap_deferral_defaults_none_and_absent_in_dump():
+    """A gap without a deferral parses fine and serializes with deferral=None —
+    every stored JSONB model and older agent payload validates unchanged."""
+    gap = Gap(id="g-1", name="invoicing")
+    assert gap.deferral is None
+    assert gap.model_dump()["deferral"] is None
+
+
+def test_gap_deferral_validates_and_round_trips():
+    """An explicit deferral validates and survives a model_dump round-trip."""
+    gap = Gap(
+        id="g-1",
+        name="invoicing",
+        deferral=GapDeferral(
+            rationale="Not staffed this cycle — waiting on v6 to open.",
+            hold_until="v6",
+            created_at="2026-06-04T00:00:00",
+        ),
+    )
+    dumped = gap.model_dump()
+    assert dumped["deferral"]["rationale"].startswith("Not staffed")
+    assert dumped["deferral"]["hold_until"] == "v6"
+    reparsed = Gap.model_validate(dumped)
+    assert reparsed.deferral is not None
+    assert reparsed.deferral.hold_until == "v6"
+
+
+def test_gap_deferral_defaults_within_model():
+    """GapDeferral fields are all optional/defaulted so a minimal deferral
+    (rationale only) is valid."""
+    deferral = GapDeferral(rationale="deferred")
+    assert deferral.hold_until is None
+    assert deferral.created_at == ""
+
+
+def test_gap_deferral_survives_apply_agent_update_merge():
+    """A deferral set by the agent threads through apply_agent_update's
+    non-destructive merge (proposed-wins for non-log gap fields)."""
+    current = {
+        "revision": 3,
+        "gaps": [{"id": "g-1", "name": "invoicing", "status": "active"}],
+    }
+    proposed = {
+        "gaps": [
+            {
+                "id": "g-1",
+                "name": "invoicing",
+                "status": "active",
+                "deferral": {
+                    "rationale": "intentionally parked this cycle",
+                    "hold_until": "next-version",
+                },
+            }
+        ]
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-06-04T12:00:00")
+    g = next(g for g in new_raw["gaps"] if g["id"] == "g-1")
+    assert g["deferral"]["rationale"] == "intentionally parked this cycle"
+    assert g["deferral"]["hold_until"] == "next-version"
+
+
+def test_gap_deferral_cleared_by_agent_via_merge():
+    """Clearing the deferral (proposed deferral=None) wins over a prior
+    deferral — the agent picks the gap back up by writing deferral: null."""
+    current = {
+        "revision": 4,
+        "gaps": [
+            {
+                "id": "g-1",
+                "name": "invoicing",
+                "status": "active",
+                "deferral": {"rationale": "parked", "hold_until": "later"},
+            }
+        ],
+    }
+    proposed = {
+        "gaps": [
+            {"id": "g-1", "name": "invoicing", "status": "active", "deferral": None}
+        ]
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-06-04T12:00:00")
+    g = next(g for g in new_raw["gaps"] if g["id"] == "g-1")
+    assert g["deferral"] is None
+
+
+# ---------------------------------------------------------------------------
+# Model size / health signal
+# ---------------------------------------------------------------------------
+
+
+def _gaps(n: int) -> list[Gap]:
+    return [Gap(id=f"g-{i}", name=f"gap {i}") for i in range(n)]
+
+
+def _caps(n: int) -> list[Capability]:
+    return [Capability(name=f"cap-{i}", status="working") for i in range(n)]
+
+
+def _friction(n_active: int, n_other: int = 0) -> list[Friction]:
+    out = [Friction(id=f"f-a{i}", name=f"fa{i}", status="active") for i in range(n_active)]
+    out += [Friction(id=f"f-r{i}", name=f"fr{i}", status="resolved") for i in range(n_other)]
+    return out
+
+
+def test_model_size_signal_empty_is_healthy():
+    sig = compute_model_size_signal(ProblemModel())
+    assert sig["active_gap_count"] == 0
+    assert sig["capability_count"] == 0
+    assert sig["active_friction_count"] == 0
+    assert sig["estimated_token_footprint"] == 0
+    assert sig["model_size_status"] == "healthy"
+
+
+def test_model_size_signal_excludes_archived_gaps():
+    model = ProblemModel(
+        gaps=_gaps(3),
+        archived_gaps=_gaps(50),
+    )
+    sig = compute_model_size_signal(model)
+    # archived_gaps must NOT inflate the active gap count or push the status up.
+    assert sig["active_gap_count"] == 3
+    assert sig["model_size_status"] == "healthy"
+
+
+def test_model_size_signal_excludes_blocked_gaps():
+    """Blocked gaps are intentionally parked work, not active load — they must not
+    inflate the active_gap_count or drive the status toward large/oversized."""
+    active = [Gap(id=f"g-active-{i}", name=f"active {i}", status="active") for i in range(3)]
+    blocked = [Gap(id=f"g-blocked-{i}", name=f"blocked {i}", status="blocked") for i in range(10)]
+    model = ProblemModel(gaps=active + blocked)
+    sig = compute_model_size_signal(model)
+    # Only the 3 active gaps count; the 10 blocked are excluded.
+    assert sig["active_gap_count"] == 3
+    # Status should be healthy based on 3 active gaps, not large based on 13 total.
+    assert sig["model_size_status"] == "healthy"
+
+
+def test_model_size_signal_counts_only_active_friction():
+    model = ProblemModel(friction=_friction(n_active=2, n_other=40))
+    sig = compute_model_size_signal(model)
+    assert sig["active_friction_count"] == 2
+    assert sig["model_size_status"] == "healthy"
+
+
+def test_model_size_signal_gap_dimension_transitions():
+    h = MODEL_SIZE_HEALTHY_GAPS  # 12
+    # at threshold -> still healthy
+    assert compute_model_size_signal(ProblemModel(gaps=_gaps(h)))["model_size_status"] == "healthy"
+    # 1.5x -> growing
+    assert (
+        compute_model_size_signal(ProblemModel(gaps=_gaps(int(h * 1.5))))["model_size_status"]
+        == "growing"
+    )
+    # 2x -> large
+    assert (
+        compute_model_size_signal(ProblemModel(gaps=_gaps(h * 2)))["model_size_status"] == "large"
+    )
+    # 3x -> oversized
+    assert (
+        compute_model_size_signal(ProblemModel(gaps=_gaps(h * 3)))["model_size_status"]
+        == "oversized"
+    )
+
+
+def test_model_size_signal_capability_dimension_transitions():
+    h = MODEL_SIZE_HEALTHY_CAPABILITIES  # 20
+    assert compute_model_size_signal(ProblemModel(capabilities=_caps(h)))["model_size_status"] == "healthy"
+    assert compute_model_size_signal(ProblemModel(capabilities=_caps(int(h * 1.5))))["model_size_status"] == "growing"
+    assert compute_model_size_signal(ProblemModel(capabilities=_caps(h * 2)))["model_size_status"] == "large"
+    assert compute_model_size_signal(ProblemModel(capabilities=_caps(h * 3)))["model_size_status"] == "oversized"
+
+
+def test_model_size_signal_friction_dimension_transitions():
+    h = MODEL_SIZE_HEALTHY_FRICTION  # 8
+    assert compute_model_size_signal(ProblemModel(friction=_friction(h)))["model_size_status"] == "healthy"
+    assert compute_model_size_signal(ProblemModel(friction=_friction(int(h * 1.5))))["model_size_status"] == "growing"
+    assert compute_model_size_signal(ProblemModel(friction=_friction(h * 2)))["model_size_status"] == "large"
+    assert compute_model_size_signal(ProblemModel(friction=_friction(h * 3)))["model_size_status"] == "oversized"
+
+
+def test_model_size_signal_worst_dimension_wins():
+    # gaps healthy, capabilities healthy, friction oversized -> overall oversized
+    model = ProblemModel(
+        gaps=_gaps(2),
+        capabilities=_caps(2),
+        friction=_friction(MODEL_SIZE_HEALTHY_FRICTION * 3),
+    )
+    assert compute_model_size_signal(model)["model_size_status"] == "oversized"
+
+
+def test_model_size_signal_footprint_positive_and_monotonic():
+    small = compute_model_size_signal(ProblemModel(gaps=_gaps(2)))["estimated_token_footprint"]
+    big = compute_model_size_signal(ProblemModel(gaps=_gaps(10)))["estimated_token_footprint"]
+    assert small > 0
+    assert big > small
+
+
+def test_model_size_signal_footprint_includes_text_content():
+    terse_gap = Gap(id="g-terse", name="x", description="brief", evidence="")
+    verbose_gap = Gap(
+        id="g-verbose",
+        name="x",
+        description="This is a detailed description with lots of context about the gap. " * 5,
+        evidence="Additional evidence and supporting details that provide substantive information. " * 5,
+    )
+    terse_model = ProblemModel(gaps=[terse_gap])
+    verbose_model = ProblemModel(gaps=[verbose_gap])
+
+    terse_footprint = compute_model_size_signal(terse_model)["estimated_token_footprint"]
+    verbose_footprint = compute_model_size_signal(verbose_model)["estimated_token_footprint"]
+    # Same gap count (1), but verbose has much more text — footprint must reflect it.
+    assert verbose_footprint > terse_footprint
+
+
+def test_model_size_signal_footprint_includes_capability_notes():
+    terse_cap = Capability(name="cap-terse", status="working", notes="brief")
+    verbose_cap = Capability(
+        name="cap-verbose",
+        status="working",
+        notes="Detailed notes about this capability including implementation details "
+        "and architectural considerations. " * 5,
+    )
+    terse_model = ProblemModel(capabilities=[terse_cap])
+    verbose_model = ProblemModel(capabilities=[verbose_cap])
+
+    terse_footprint = compute_model_size_signal(terse_model)["estimated_token_footprint"]
+    verbose_footprint = compute_model_size_signal(verbose_model)["estimated_token_footprint"]
+    assert verbose_footprint > terse_footprint
+
+
+def test_model_size_signal_footprint_includes_friction_description():
+    terse_friction = Friction(id="f-terse", name="x", description="brief")
+    verbose_friction = Friction(
+        id="f-verbose",
+        name="x",
+        description="Detailed friction description explaining the blocker and its impact "
+        "on the project. " * 5,
+    )
+    terse_model = ProblemModel(friction=[terse_friction])
+    verbose_model = ProblemModel(friction=[verbose_friction])
+
+    terse_footprint = compute_model_size_signal(terse_model)["estimated_token_footprint"]
+    verbose_footprint = compute_model_size_signal(verbose_model)["estimated_token_footprint"]
+    assert verbose_footprint > terse_footprint
+
+
+def test_model_size_signal_includes_serialized_bytes():
+    """The signal now includes the actual serialized byte size of the model."""
+    model = ProblemModel(gaps=_gaps(2))
+    sig = compute_model_size_signal(model)
+    assert "serialized_bytes" in sig
+    assert isinstance(sig["serialized_bytes"], int)
+    assert sig["serialized_bytes"] > 0
+
+
+def test_model_size_signal_byte_aware_small_model_healthy():
+    """A small model with few bytes and few entries is healthy."""
+    model = ProblemModel(gaps=_gaps(2))
+    sig = compute_model_size_signal(model)
+    assert sig["serialized_bytes"] < MODEL_SIZE_HEALTHY_BYTES
+    assert sig["model_size_status"] == "healthy"
+
+
+def test_model_size_signal_byte_aware_large_verbose_model_triggers_status():
+    """A model that is byte-heavy but count-light (verbose entries) is classified
+    as large/oversized by the byte dimension, triggering worst-dimension-wins even
+    when entry counts look healthy."""
+    # Create gaps with verbose descriptions that exceed the byte threshold
+    # while keeping the count well under the healthy threshold.
+    # Use larger descriptions to reliably push past the healthy byte threshold.
+    big_description = "x" * 20_000
+    gaps = [
+        Gap(
+            id=f"g-{i}",
+            name=f"gap {i}",
+            description=big_description,
+            evidence=big_description,
+            status="active",
+        )
+        for i in range(3)  # Only 3 gaps (well under healthy count of 12)
+    ]
+    model = ProblemModel(gaps=gaps)
+    sig = compute_model_size_signal(model)
+
+    # Entry counts are healthy, but bytes push it to large/oversized.
+    assert sig["active_gap_count"] == 3  # Under healthy threshold of 12
+    assert sig["serialized_bytes"] > MODEL_SIZE_HEALTHY_BYTES
+    # Worst-dimension-wins: byte dimension is growing/large/oversized,
+    # so overall status reflects the byte pressure
+    assert sig["model_size_status"] in ("growing", "large", "oversized")
+
+
+def test_model_size_signal_byte_dimension_is_part_of_worst_wins():
+    """The byte dimension is included in worst-dimension-wins status calculation."""
+    # Verify a model where all dimensions are healthy would stay healthy
+    small = ProblemModel(gaps=_gaps(2), capabilities=_caps(2), friction=_friction(2))
+    sig_small = compute_model_size_signal(small)
+    assert sig_small["active_gap_count"] <= MODEL_SIZE_HEALTHY_GAPS
+    assert sig_small["capability_count"] <= MODEL_SIZE_HEALTHY_CAPABILITIES
+    assert sig_small["active_friction_count"] <= MODEL_SIZE_HEALTHY_FRICTION
+    assert sig_small["serialized_bytes"] < MODEL_SIZE_HEALTHY_BYTES
+    assert sig_small["model_size_status"] == "healthy"
+
+    # Verify a model with many gaps triggers worst-dimension-wins
+    many_gaps = ProblemModel(gaps=_gaps(MODEL_SIZE_HEALTHY_GAPS * 3))
+    sig_many = compute_model_size_signal(many_gaps)
+    # Gap count dominates: 36 gaps >> 12 healthy threshold
+    assert sig_many["model_size_status"] == "oversized"
+    # Byte information is always present
+    assert "serialized_bytes" in sig_many
+    assert sig_many["serialized_bytes"] > 0

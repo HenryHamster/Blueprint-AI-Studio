@@ -5,7 +5,10 @@ import uuid
 from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock
 
-from app.models import TaskStatus
+import pytest as _pytest
+from sqlmodel import select as _select
+
+from app.models import Project as _Project, Task as _Task, TaskStatus
 from app.spawn_calibration import (
     MEDIUM_ANALYSIS_PLAN_FILE_LIMIT,
     SCOPE_FILE_BUDGETS,
@@ -21,8 +24,20 @@ from app.source_ref_validation import (
     validate_source_refs,
 )
 from app.research_completion import (
+    _DOWNGRADED_VERIFICATION_BASIS,
+    _HIGH_EVIDENCE_BASES,
+    VALID_VERIFICATION_BASES,
     _apply_structural_actionability_downgrade,
+    _handle_research_completion,
+    _reconcile_verification_basis,
+    _research_findings_would_spawn,
     _summarize_ungrounded_claims_grounded,
+)
+from app.task_evaluators import (
+    QUALITY_GRADER_SOURCE_KEY,
+    QUALITY_GRADER_VERDICT_KEY,
+    parse_grader_verdict,
+    spawn_forward_quality_grader,
 )
 from app.time_utils import _utcnow
 
@@ -320,6 +335,134 @@ class TestActionabilityGradeNormalization:
             else "LOW"
         )
         assert structural_grade == "LOW"
+
+
+class TestVerificationBasisNormalization:
+    """Normalization step: missing or invalid verification_basis defaults to
+    pattern_inferred (the lowest-evidence tier); a non-missing invalid value
+    is logged just like the actionability_grade path."""
+
+    _VALID = {"code_verified", "path_verified", "pattern_inferred", "deduced"}
+
+    def _normalize(self, findings: list) -> list:
+        """Simulate the verification_basis normalization loop in
+        research_completion.py (logging warning only for non-missing invalids)."""
+        logger = logging.getLogger("app.research_completion")
+        result = [dict(f) for f in findings]
+        for _f in result:
+            _vb = _f.get("verification_basis")
+            if _vb not in self._VALID:
+                if _vb is not None:
+                    logger.warning(
+                        "[RESEARCH] Finding '%s' has invalid verification_basis=%r; "
+                        "defaulting to pattern_inferred",
+                        _f.get("title", "<untitled>"),
+                        _vb,
+                    )
+                _f["verification_basis"] = "pattern_inferred"
+        return result
+
+    def test_missing_basis_defaults_to_pattern_inferred(self, caplog):
+        findings = [{"title": "no-basis"}]
+        with caplog.at_level(logging.WARNING, logger="app.research_completion"):
+            normalized = self._normalize(findings)
+        assert normalized[0]["verification_basis"] == "pattern_inferred"
+        # Missing (not invalid) values are NOT warned about.
+        assert "invalid verification_basis" not in caplog.text
+
+    def test_invalid_basis_defaults_to_pattern_inferred_with_warning(self, caplog):
+        findings = [{"title": "bad-basis", "verification_basis": "guessed"}]
+        with caplog.at_level(logging.WARNING, logger="app.research_completion"):
+            normalized = self._normalize(findings)
+        assert normalized[0]["verification_basis"] == "pattern_inferred"
+        assert "invalid verification_basis" in caplog.text
+
+    def test_none_basis_defaults_to_pattern_inferred(self):
+        findings = [{"title": "none-basis", "verification_basis": None}]
+        normalized = self._normalize(findings)
+        assert normalized[0]["verification_basis"] == "pattern_inferred"
+
+    def test_each_valid_basis_passes_through(self):
+        for basis in self._VALID:
+            findings = [{"title": basis, "verification_basis": basis}]
+            normalized = self._normalize(findings)
+            assert normalized[0]["verification_basis"] == basis
+
+    def test_mixed_batch_normalization(self):
+        findings = [
+            {"title": "code", "verification_basis": "code_verified"},
+            {"title": "missing"},
+            {"title": "path", "verification_basis": "path_verified"},
+            {"title": "invalid", "verification_basis": "BOGUS"},
+            {"title": "deduced", "verification_basis": "deduced"},
+        ]
+        normalized = self._normalize(findings)
+        assert normalized[0]["verification_basis"] == "code_verified"
+        assert normalized[1]["verification_basis"] == "pattern_inferred"
+        assert normalized[2]["verification_basis"] == "path_verified"
+        assert normalized[3]["verification_basis"] == "pattern_inferred"
+        assert normalized[4]["verification_basis"] == "deduced"
+
+
+class TestVerificationBasisHeadReconciliation:
+    """_reconcile_verification_basis: a self-claimed verified-against-code tier
+    is capped to an honest tier when the finding's own citations fail to resolve
+    at HEAD; clean or absent citations preserve the reported basis."""
+
+    def test_shared_tier_constant_matches_normalization_set(self):
+        assert VALID_VERIFICATION_BASES == {
+            "code_verified",
+            "path_verified",
+            "pattern_inferred",
+            "deduced",
+        }
+        assert _HIGH_EVIDENCE_BASES == {"code_verified", "path_verified"}
+        assert _DOWNGRADED_VERIFICATION_BASIS == "pattern_inferred"
+
+    def test_code_verified_with_broken_citation_downgrades(self):
+        f = {"title": "broken-cite", "verification_basis": "code_verified"}
+        broken = {"broken_source_ref_count": 1, "broken_refs": ["app/gone.py"]}
+        assert _reconcile_verification_basis(f, broken, None) is True
+        assert f["verification_basis"] == "pattern_inferred"
+        assert f["verification_basis_downgraded_from"] == "code_verified"
+        assert f["verification_basis_downgrade_reason"] == (
+            "HEAD validation failed: 1 broken source ref, 0 ungrounded claims"
+        )
+
+    def test_path_verified_with_ungrounded_claim_downgrades(self):
+        f = {"title": "ungrounded", "verification_basis": "path_verified"}
+        ungrounded = {"ungrounded_claim_count": 2, "ungrounded_refs": ["app/x.py:foo"]}
+        assert _reconcile_verification_basis(f, None, ungrounded) is True
+        assert f["verification_basis"] == "pattern_inferred"
+        assert f["verification_basis_downgraded_from"] == "path_verified"
+        assert f["verification_basis_downgrade_reason"] == (
+            "HEAD validation failed: 0 broken source refs, 2 ungrounded claims"
+        )
+
+    def test_clean_citations_preserve_high_basis(self):
+        f = {"title": "clean", "verification_basis": "code_verified"}
+        assert _reconcile_verification_basis(f, None, None) is False
+        assert f["verification_basis"] == "code_verified"
+
+    def test_no_citations_preserve_high_basis(self):
+        f = {"title": "no-cites", "verification_basis": "path_verified"}
+        assert _reconcile_verification_basis(f, None, None) is False
+        assert f["verification_basis"] == "path_verified"
+
+    def test_low_evidence_basis_not_touched_even_with_broken_refs(self):
+        # A finding that already self-reports a low-evidence tier is honest; a
+        # broken citation does not push it further down (no negative tier).
+        f = {"title": "already-low", "verification_basis": "deduced"}
+        broken = {"broken_source_ref_count": 3, "broken_refs": ["a.py", "b.py"]}
+        assert _reconcile_verification_basis(f, broken, None) is False
+        assert f["verification_basis"] == "deduced"
+
+    def test_both_signals_downgrade_once(self):
+        f = {"title": "both", "verification_basis": "code_verified"}
+        broken = {"broken_source_ref_count": 1, "broken_refs": ["a.py"]}
+        ungrounded = {"ungrounded_claim_count": 1, "ungrounded_refs": ["a.py:fn"]}
+        assert _reconcile_verification_basis(f, broken, ungrounded) is True
+        assert f["verification_basis"] == "pattern_inferred"
 
 
 class TestSourceRefParsing:
@@ -2054,3 +2197,623 @@ class TestShelveFindingsForNextCycle:
         assert len(deferred) == 2
         assert deferred[0]["title"] == "prior"
         assert deferred[1]["title"] == "new"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Forward-quality grader: escalation + spawn-on-findings gate
+#
+# Research findings can spawn implementation work. When the research-quality
+# grader is enabled, those findings must clear an INDEPENDENT grader before any
+# child spawns: the research task parks EVALUATING, a fresh grader task scores
+# the artifact, and only a PASS verdict lets the findings spawn children (a FAIL
+# fails the research task and spawns nothing). The gate is proportional —
+# findings that would spawn nothing are never escalated.
+# ─────────────────────────────────────────────────────────────────────────────
+def _enable_grader(mocker):
+    """Flip the dark-shipped research-quality-grader flag ON for one test."""
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"research_quality_grader_enabled": True},
+    )
+
+
+async def _grader_project_and_task(db_session, direction_id="d-grade01"):
+    """A minimal autonomous project + a research task ready to complete."""
+    from test_autonomous_research import _active_direction, _make_research_task
+
+    direction = _active_direction(direction_id, "Grader gate direction")
+    project = _Project(
+        name=f"Grader Gate {direction_id}",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = await _make_research_task(project, direction, db_session)
+    return project, direction, task
+
+
+class TestForwardQualityWouldSpawnPredicate:
+    """_research_findings_would_spawn: blast-radius predicate (pure)."""
+
+    def test_actionable_finding_would_spawn(self):
+        assert _research_findings_would_spawn(
+            [{"type": "improvement", "prompt": "do x", "actionability_grade": "HIGH"}]
+        )
+
+    def test_observation_types_do_not_spawn(self):
+        for t in (
+            "design_doc_observation",
+            "direction_update",
+            "direction_proposal",
+            "direction_note",
+            "note",
+        ):
+            assert not _research_findings_would_spawn(
+                [{"type": t, "prompt": "do x", "actionability_grade": "HIGH"}]
+            ), t
+
+    def test_low_actionability_and_empty_prompt_do_not_spawn(self):
+        assert not _research_findings_would_spawn(
+            [{"type": "improvement", "prompt": "do x", "actionability_grade": "LOW"}]
+        )
+        assert not _research_findings_would_spawn(
+            [{"type": "improvement", "prompt": "   "}]
+        )
+        assert not _research_findings_would_spawn(
+            [{"type": "improvement", "prompt": "do x", "already_spawned": True}]
+        )
+        assert not _research_findings_would_spawn([])
+
+
+class TestParseGraderVerdict:
+    """parse_grader_verdict: structured + anchored parse, fail-closed defaults."""
+
+    def test_structured_pass(self):
+        v = parse_grader_verdict('reasoning...\n{"verdict": "pass", "reasoning": "ok"}')
+        assert v.passed is True
+        assert v.strategy == "forward-quality"
+
+    def test_structured_fail(self):
+        v = parse_grader_verdict('{"verdict": "fail", "reasoning": "thin"}')
+        assert v.passed is False
+
+    def test_anchored_fallback(self):
+        assert parse_grader_verdict('the VERDICT: pass overall').passed is True
+        assert parse_grader_verdict('VERDICT: fail — ungrounded').passed is False
+
+    def test_not_completed_fails_closed(self):
+        assert parse_grader_verdict("looks great", completed=False).passed is False
+
+    def test_unparseable_fails_closed(self):
+        assert parse_grader_verdict("no machine verdict in here").passed is False
+        assert parse_grader_verdict("").passed is False
+
+
+@_pytest.mark.asyncio
+async def test_spawn_forward_quality_grader_is_single_shot(db_session):
+    """spawn_forward_quality_grader parks the source once; a second call no-ops."""
+    _project, _direction, task = await _grader_project_and_task(db_session, "d-single")
+
+    g1 = await spawn_forward_quality_grader(task, "artifact text", db_session)
+    assert g1 is not None
+    assert (g1.first_payload or {}).get("type") == "investigate"
+    assert (g1.context or {}).get(QUALITY_GRADER_SOURCE_KEY) == str(task.id)
+    assert g1.parent_task_id is None
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+    assert task.context.get("awaiting_quality_grader")
+
+    # Second call must NOT spawn another grader (single-shot convergence).
+    g2 = await spawn_forward_quality_grader(task, "artifact text", db_session)
+    assert g2 is None
+    graders = (
+        (
+            await db_session.execute(
+                _select(_Task).where(
+                    _Task.project_id == _project.id, _Task.id != task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(graders) == 1
+
+
+@_pytest.mark.asyncio
+async def test_actionable_findings_escalate_to_grader_and_park(db_session, mocker):
+    """Enabled + spawnable findings → grader spawned, research parked, 0 children."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-esc01")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(direction_id=direction["id"])],
+    )
+    _enable_grader(mocker)
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # No implementation children yet — the source is parked awaiting the grade.
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert children == [], "spawnable findings must NOT spawn before the grade"
+
+    # Exactly one independent grader task, linked back to the research task.
+    others = (
+        (
+            await db_session.execute(
+                _select(_Task).where(
+                    _Task.project_id == _project.id, _Task.id != task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(others) == 1
+    grader = others[0]
+    assert (grader.context or {}).get(QUALITY_GRADER_SOURCE_KEY) == str(task.id)
+    assert (grader.first_payload or {}).get("type") == "investigate"
+    assert task.status == TaskStatus.EVALUATING
+    assert task.context.get("awaiting_quality_grader")
+
+
+@_pytest.mark.asyncio
+async def test_flag_off_spawns_children_without_grader(db_session, mocker):
+    """Non-regression: with the flag OFF, findings spawn children immediately."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-off01")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(direction_id=direction["id"])],
+    )
+    # Flag intentionally NOT enabled.
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, "legacy spawn path must be unchanged when flag is off"
+    # No grader anywhere in the project.
+    all_tasks = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == _project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert all(
+        not (t.context or {}).get(QUALITY_GRADER_SOURCE_KEY) for t in all_tasks
+    ), "no grader may spawn when the gate is disabled"
+
+
+@_pytest.mark.asyncio
+async def test_failed_grade_blocks_spawn_and_fails_research(db_session, mocker):
+    """A FAILED grader verdict spawns NO children and fails the research task."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-fail01")
+    _patch_research_externals(mocker)
+
+    # Simulate the grader having returned a FAIL verdict on the re-entrant pass.
+    task.plan_output = [_make_finding(direction_id=direction["id"])]
+    task.context = {
+        **(task.context or {}),
+        QUALITY_GRADER_VERDICT_KEY: {
+            "passed": False,
+            "reason": "findings are ungrounded; load-bearing claim absent at HEAD",
+        },
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert children == [], "a failing grade must spawn NO implementation tasks"
+    assert task.status == TaskStatus.FAILED
+    assert (task.context or {}).get("evaluation_gate", {}).get("passed") is False
+
+
+@_pytest.mark.asyncio
+async def test_passing_grade_resumes_and_spawns_children(db_session, mocker):
+    """A PASSING grader verdict resumes the research task and spawns children."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-pass01")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(direction_id=direction["id"])],
+    )
+
+    # Simulate the verdict the grader-completion resolver writes before re-dispatch.
+    task.plan_output = [_make_finding(direction_id=direction["id"])]
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        QUALITY_GRADER_VERDICT_KEY: {"passed": True, "reason": "well-grounded"},
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, "a passing grade must let the findings spawn as before"
+    # The verdict pass does NOT re-spawn a grader (single-shot).
+    assert not any(
+        (c.context or {}).get(QUALITY_GRADER_SOURCE_KEY) for c in children
+    )
+    # With children spawned, the research task takes the normal post-spawn
+    # EVALUATING state (awaiting child rollup) — NOT FAILED, and no longer
+    # parked awaiting a grade.
+    assert task.status == TaskStatus.EVALUATING
+
+
+@_pytest.mark.asyncio
+async def test_non_spawning_findings_skip_grader_even_when_enabled(db_session, mocker):
+    """Proportional gate: pure-observation findings never escalate to a grader."""
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-obs01")
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[
+            {
+                "title": "design observation",
+                "description": "An observation about the design doc",
+                "prompt": "noted",
+                "type": "design_doc_observation",
+                "direction_id": direction["id"],
+            }
+        ],
+    )
+    _enable_grader(mocker)
+
+    await _handle_research_completion(task, "", db_session)
+
+    all_tasks = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == _project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert all(
+        not (t.context or {}).get(QUALITY_GRADER_SOURCE_KEY) for t in all_tasks
+    ), "observation-only findings must not escalate to an independent grader"
+    await db_session.refresh(task)
+    assert task.status != TaskStatus.EVALUATING, "must not park when nothing would spawn"
+
+
+@_pytest.mark.asyncio
+async def test_finding_prerequisite_wires_depends_on_to_inflight_foundation(
+    db_session, mocker
+):
+    """A finding declaring an explicit {kind:task} prerequisite that matches an
+    in-flight task gets a depends_on edge to it instead of rebuilding it."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq01")
+
+    # An unrelated in-flight foundation already building shared scaffolding.
+    foundation = _Task(
+        project_id=_project.id,
+        title="Provision shared database schema",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(foundation)
+    await db_session.commit()
+    await db_session.refresh(foundation)
+
+    finding = _make_finding(title="Add login endpoint", direction_id=direction["id"])
+    finding["prerequisite"] = {"kind": "task", "ref": str(foundation.id)}
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    children = [c for c in children if (c.first_payload or {}).get("type") != "memo"]
+    assert len(children) == 1
+    assert str(foundation.id) in (children[0].depends_on or []), (
+        "the dependent finding must structurally depend on the in-flight foundation"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_batch_findings_share_single_foundation_via_capability(
+    db_session, mocker
+):
+    """Two findings declaring the same capability prerequisite both wire onto the
+    single sibling foundation that advertises that capability — exactly one
+    foundation, two dependents."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq02")
+
+    foundation_finding = _make_finding(
+        title="Establish payment gateway core", direction_id=direction["id"]
+    )
+    foundation_finding["provides_capability"] = "payment-core"
+    dep_a = _make_finding(title="Add refund flow", direction_id=direction["id"])
+    dep_a["prerequisite"] = {"kind": "capability", "ref": "payment-core"}
+    dep_b = _make_finding(title="Wire chargeback handler", direction_id=direction["id"])
+    dep_b["prerequisite"] = {"kind": "capability", "ref": "payment-core"}
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[foundation_finding, dep_a, dep_b],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_title = {c.title: c for c in children}
+    assert len(children) == 3, "exactly one foundation + two dependents must spawn"
+    foundation_child = by_title["Establish payment gateway core"]
+    assert (foundation_child.context or {}).get("provides_capability") == "payment-core"
+    for dep_title in ("Add refund flow", "Wire chargeback handler"):
+        assert str(foundation_child.id) in (by_title[dep_title].depends_on or []), (
+            f"{dep_title} must depend on the single shared foundation"
+        )
+
+
+@_pytest.mark.asyncio
+async def test_finding_without_prerequisite_spawns_with_no_extra_deps(
+    db_session, mocker
+):
+    """A finding with no declared prerequisite spawns unchanged (no depends_on)."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq03")
+    finding = _make_finding(title="Tidy logging output", direction_id=direction["id"])
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    assert not (children[0].depends_on or []), (
+        "a finding with no prerequisite must not gain a dependency edge"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_unresolved_prerequisite_blocks_dependent(db_session, mocker):
+    """When a finding declares a prerequisite that does not resolve to any
+    candidate, the dependent is transitioned into the BLOCKED state carrying the
+    unresolved prerequisite as its machine-resolvable need (no depends_on edge),
+    so the blocked-resume sweep gates it instead of letting it duplicate the
+    foundation."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.task_blocked import get_blocker_metadata
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq04")
+    finding = _make_finding(title="Add login endpoint", direction_id=direction["id"])
+    # Declare a prerequisite that does not exist in the project
+    finding["prerequisite"] = {"kind": "task", "ref": "nonexistent-task-id"}
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    child = children[0]
+    assert child.status == TaskStatus.BLOCKED, (
+        "an unresolved prerequisite must transition the dependent into BLOCKED"
+    )
+    assert not (child.depends_on or []), (
+        "unresolved prerequisite must not create a depends_on edge"
+    )
+    # The unresolved prerequisite is persisted as the canonical machine-resolvable
+    # need under context['blocker']['need'] for the blocked-resume sweep.
+    need = get_blocker_metadata(child).get("need")
+    assert need == {"kind": "task", "ref": "nonexistent-task-id"}, (
+        "unresolved prerequisite must be carried as the blocked need"
+    )
+    # Still stamped on context for operator visibility, in addition to BLOCKED.
+    unresolved = (child.context or {}).get("unresolved_prerequisite", [])
+    assert any(
+        u.get("kind") == "task" and u.get("ref") == "nonexistent-task-id"
+        for u in (unresolved if isinstance(unresolved, list) else [unresolved])
+    ), "unresolved prerequisite details must remain in context for visibility"
+
+
+@_pytest.mark.asyncio
+async def test_deferred_sibling_prerequisite_blocks_dependent(db_session, mocker):
+    """If a prerequisite sibling is deferred and not spawned, the dependent
+    must be held instead of spawning runnable with an empty depends_on list."""
+    from app.research_completion import _finding_hash
+    from app.task_blocked import get_blocker_metadata
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq05")
+    prereq = _make_finding(title="Define shared helper", direction_id=direction["id"])
+    prereq["actionability_grade"] = "LOW"
+    dependent = _make_finding(title="Use shared helper", direction_id=direction["id"])
+    dependent["depends_on_indices"] = [0]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[prereq, dependent],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    blocked_children = [
+        c
+        for c in children
+        if c.title == dependent["title"] and c.status == TaskStatus.BLOCKED
+    ]
+    assert len(blocked_children) == 1
+    assert not any(
+        c.title == dependent["title"] and c.status != TaskStatus.BLOCKED
+        for c in children
+    )
+    child = blocked_children[0]
+    assert child.status == TaskStatus.BLOCKED
+    assert not (child.depends_on or [])
+    blocker = get_blocker_metadata(child)
+    expected_hash = _finding_hash(prereq["title"], prereq["description"])
+    assert blocker.get("need") == {
+        "kind": "task",
+        "ref": expected_hash,
+        "label": prereq["title"],
+    }
+    unresolved = (child.context or {}).get("unresolved_prerequisite", [])
+    assert any(
+        u.get("finding_hash") == expected_hash and u.get("title") == prereq["title"]
+        for u in (unresolved if isinstance(unresolved, list) else [unresolved])
+    )
+
+
+@_pytest.mark.asyncio
+async def test_cyclic_prerequisite_refused_at_spawn(db_session, mocker):
+    """Two findings each declaring the other as a capability prerequisite would
+    close a depends_on cycle. The acyclicity check refuses the edge that would
+    close it, so no full cycle is persisted — consistent with the runtime
+    need-resolution path rather than deferring to the dispatch-time breaker."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq05")
+
+    finding_a = _make_finding(title="Build cap A surface", direction_id=direction["id"])
+    finding_a["provides_capability"] = "cap-a"
+    finding_a["prerequisite"] = {"kind": "capability", "ref": "cap-b"}
+    finding_b = _make_finding(title="Build cap B surface", direction_id=direction["id"])
+    finding_b["provides_capability"] = "cap-b"
+    finding_b["prerequisite"] = {"kind": "capability", "ref": "cap-a"}
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding_a, finding_b],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 2
+    by_id = {str(c.id): c for c in children}
+    # At most one of the two mutual edges may be wired — the other is refused so
+    # the depends_on graph never closes a cycle.
+    edge_count = sum(1 for c in children if c.depends_on)
+    assert edge_count <= 1, "the cycle-closing edge must be refused at spawn"
+    # Verify no actual cycle: no child both depends on another AND is depended on.
+    for c in children:
+        for dep in c.depends_on or []:
+            other = by_id.get(str(dep))
+            assert other is None or str(c.id) not in (other.depends_on or []), (
+                "a mutual depends_on cycle must never be persisted"
+            )

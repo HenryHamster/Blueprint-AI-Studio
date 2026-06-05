@@ -3,6 +3,7 @@ import { useState, useEffect, useRef, useReducer, useCallback } from 'react';
 export function useUIState() {
   // Panel visibility
   const [showResearchBrowser, setShowResearchBrowser] = useState(false);
+  const [showKnowledgeBrowser, setShowKnowledgeBrowser] = useState(false);
 
   const [showActivityFeed, setShowActivityFeedState] = useState(false);
   const [activityFeedTimestamps, dispatchActivityFeedTimestamp] = useReducer(
@@ -126,6 +127,7 @@ export function useUIState() {
 
   return {
     showResearchBrowser, setShowResearchBrowser,
+    showKnowledgeBrowser, setShowKnowledgeBrowser,
     showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
     showMessages, setShowMessages,
     showSettings, setShowSettings,

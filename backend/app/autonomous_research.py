@@ -23,6 +23,7 @@ from app.payload_schemas import (
     validate_internal_payload,
     ALL_TASK_TYPES,
     PayloadTooLargeError,
+    _MAX_PAYLOAD_BYTES,
 )
 import app.shared_state as _shared_state
 from app.shared_state import (
@@ -30,6 +31,7 @@ from app.shared_state import (
     runtime_config as _runtime_config,
 )
 from app.max_plan_pool import _max_plan_pools, _account_available_for_model
+from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.task_locking import with_vision_locked
 from app.time_utils import _utcnow
 from app.direction_mode import (
@@ -458,6 +460,16 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                                 TaskStatus.PROVISIONING,
                                 TaskStatus.IN_PROGRESS,
                                 TaskStatus.EVALUATING,
+                                # BLOCKED research parents still structurally
+                                # occupy their direction: a lane parked on an
+                                # unresolved upstream prerequisite is wanted-but-
+                                # not-runnable, not done. Treating it as busy
+                                # keeps the prerequisite-gating model consistent
+                                # — the direction stays held until the lane
+                                # resumes (foundation lands / recheck) or is
+                                # explicitly resolved, instead of drifting back
+                                # into autonomous selection after the cooldown.
+                                TaskStatus.BLOCKED,
                             ]
                         ),
                         and_(
@@ -673,7 +685,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                         Task.project_id == project.id,
                         Task.payloads[0]["type"]
                         .as_string()
-                        .in_(["strategic_review", "design_doc_update"]),
+                        .in_(sorted(STRATEGIC_TASK_TYPES)),
                     )
                 )
             ).scalar()
@@ -979,7 +991,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     Task.project_id == project.id,
                     Task.payloads[0]["type"]
                     .as_string()
-                    .in_(["strategic_review", "design_doc_update"]),
+                    .in_(sorted(STRATEGIC_TASK_TYPES)),
                     Task.status.in_(
                         [
                             TaskStatus.QUEUED,
@@ -1020,7 +1032,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                         Task.project_id == project.id,
                         Task.payloads[0]["type"]
                         .as_string()
-                        .in_(["strategic_review", "design_doc_update"]),
+                        .in_(sorted(STRATEGIC_TASK_TYPES)),
                         Task.created_at >= cooldown_cutoff,
                     )
                 )
@@ -1137,13 +1149,14 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 .first()
             )
             if not existing_alert:
+                max_kb = _MAX_PAYLOAD_BYTES // 1024
                 session.add(
                     Alert(
                         project_id=project.id,
                         severity=AlertSeverity.WARNING,
                         title="Strategic review skipped: payload too large",
                         message=(
-                            f"Strategic spawn payload exceeds the 256 KB limit "
+                            f"Strategic spawn payload exceeds the {max_kb} KB limit "
                             f"({e.size} bytes, top contributors: "
                             f"{', '.join(f'{k}={n}B' for k, n in e.top_keys[:3])}). "
                             "Tactical research continues, but strategic refresh is paused "

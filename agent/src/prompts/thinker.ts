@@ -28,6 +28,7 @@ export function computeResearchPlanPromptFingerprint(mode: 'plan' | 'research'):
       './strategic set-problem-model',
       './strategic set-running-update',
       './strategic create-direction',
+      './strategic stage-direction',
       './strategic set-retirement-critiques',
     );
   }
@@ -65,7 +66,7 @@ export interface ThinkerPromptParams {
    * so it does not mistake the shortened view for the gap's whole lifetime.
    */
   gapMemoryTrimmedGapIds?: string[];
-  verificationFailuresSection?: string;
+  cycleStartReconciliationSection?: string;
   reflectionSection: string;
   selfImprovementBlock: string;
   runningUpdateSection: string;
@@ -78,10 +79,25 @@ export interface ThinkerPromptParams {
   retiredDirectionsSummarySection: string;
   dirSummaryText: string;
   dirHealthSummary: string;
+  /**
+   * Rendered block listing directions already STAGED for the next version
+   * (status=staged, with their staged_for_version). Built from the payload's
+   * `staged_directions` block. Empty string when nothing is staged. Surfaced so
+   * the strategist sees what is already queued for the next version and does NOT
+   * re-propose the same work.
+   */
+  stagedDirectionsSection?: string;
   userPausedSection: string;
   rejectedProposalsSection: string;
   operatorOverridesSection: string;
   portfolioCompositionText: string;
+  modelHealthSection: string;
+  /**
+   * Concrete prune candidates — present only when the model is large/oversized
+   * and something is actually prunable. Optional so existing constructions that
+   * omit it still compile.
+   */
+  pruneCandidatesSection?: string;
   systemMaturitySection: string;
   driftSection: string;
   recentWorkSection: string;
@@ -137,14 +153,15 @@ ${p.userStateLine}
 ${p.packerMetaSection ? `\n${p.packerMetaSection}\n` : ''}
 ${p.strategicContext ? `\n## Running Context (from prior cycles)\n${p.strategicContext}\n` : ''}
 ${p.problemModelSection}
-${p.verificationFailuresSection ? `\n${p.verificationFailuresSection}\n` : ''}
+${p.cycleStartReconciliationSection ? `\n${p.cycleStartReconciliationSection}\n` : ''}
 
 ${p.reflectionSection}
 
 ${p.runningUpdateSection}
 ${p.runningUpdateSupersededSection || ''}
-## Architecture (design document — current state)
+## Architecture (design document — overview index)
 ${p.designDocJson || 'No design document yet.'}
+${p.designDocJson ? '_The above is an OVERVIEW INDEX of the design document — which systems and capabilities exist, their reconciled presence status, and declared backing module paths. It is NOT the full design doc. To read any section\'s FULL prose/specs, run `./design-doc get <key>` (e.g. `./design-doc get systems/auth`); run `./design-doc list` to enumerate every section key. Fetch the full text whenever you need a section\'s detailed prose or specs to reason or decide._' : ''}
 
 ${p.visionJson ? `## Vision (legacy artifact — use problem_model instead; retained for bootstrap reference only)\n${p.visionJson}\n` : ''}
 ${p.outcomeSection}${p.previousDecisionOutcomes}${p.pastRetirementCritiquesSection}${p.retiredDirectionsSummarySection}
@@ -153,10 +170,10 @@ ${p.dirSummaryText}
 
 ## Direction Health
 ${p.dirHealthSummary}
-${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
+${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
 ## Portfolio Composition
 ${p.portfolioCompositionText}
-${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}
+${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}
 ${p.recentWorkSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 
@@ -193,6 +210,8 @@ Each cycle:
 - \`recommended_mode=ship\` or absent/unknown: normal mode — ship product value.
 - \`recommended_mode=pause\`: the system is blocked externally; do not add new directions to it this cycle.
 On **every** \`create-direction\` and \`update-direction\` call, emit a \`recommended_mode\` field (one of: \`audit\`, \`fundamentals\`, \`ship\`, \`pause\`) that reflects your judgment for that direction's system. Omit only if the direction has no system affiliation.
+
+**Model-size hygiene (soft).** The "Problem-model size (soft signal)" section above (when present) reports how heavy your durable problem_model has grown. Healthy is **<=12 active gaps / <=20 capabilities / <=8 active friction**; a dimension at **>=1.5x** is \`growing\`, **>=2x** is \`large\`, **>=3x** is \`oversized\` (worst dimension wins). When the status is \`large\` or \`oversized\`, the model is getting too big to audit in one pass — **before** opening new gaps or capabilities this cycle, prioritize closing/archiving resolved gaps and consolidating overlapping capabilities to bring it back down. This is a signal to weigh, **never a hard cap**: if a genuinely needed new gap is warranted, still open it. The model grows without bound otherwise, and a model you can't read in one pass is one you can't defend.
 
 ${p.selfImprovementBlock}
 
@@ -235,6 +254,12 @@ For each existing gap: open, progressing, or closed? For each new gap you're ope
 ## 3. Moves
 Directions to retire (one-sentence reason each) and to create (name the gap_id each closes, a \`success_evidence\` string describing the observable outcome that proves the direction is done, a \`retirement_condition\` string describing the measurable trigger for retirement, and a \`dedup_reasoning\` object naming the 0–3 closest existing or retired directions you considered and a one-line justification why the new direction is distinct). Parallel moves are fine and encouraged when non-clashing.
 
+**Staging (next-version work).** A fourth move exists alongside create/update/retire: you can **stage** a direction to begin only after the current version promotes and the next one opens. A staged direction is inert — it spawns no work — until that version-open transition auto-activates it. The "Staged for next version" block above lists what is already staged; **do not re-propose work that is already staged there.**
+
+Staging is NOT deferral, and it is not an escape from the "you're not allowed to defer" rule. Staging is itself a DECISION — a hard call that the work genuinely belongs to the NEXT version's scope, not this one. The natural case: the project is in its stabilize/hardening phase (see the version-phase section, when present) and a strong *build-phase* idea appears that would pollute the current version's scope if started now — stage it so it activates cleanly when the next build phase opens. Use it for genuinely next-version-scoped work. Do NOT use it to dodge a within-cycle call: if work belongs to THIS version, create it active now; if it's not worth doing, retire/don't-create it. "I'm not sure, I'll stage it" is deferral wearing staging's clothes — make the call instead.
+
+To stage a genuinely new next-version idea, create it with the staged flag (a single atomic op — the Executor passes \`"staged": true\` on create-direction, so the direction is born staged and never passes through a research-eligible active state). To stage an existing active direction whose work you've decided belongs to the next version, stage it by id.
+
 ## 3.5. Retired-direction critique (REQUIRED)
 
 Look at directions retired in the last 90 days (use "Directions you RETIRED" above and the direction list).
@@ -268,6 +293,8 @@ rationale: 1 sentence — the observable evidence behind this verdict
 
 Each direction in the "Direction outcomes" section above lists its cumulative confirmed-finding count and recent trend (improving/stable/declining) — use these signals when assessing whether a direction is advancing. A deterministic detector already flags stalled scaffolding on its own, so this verdict is OPTIONAL precision-tuning — only assess directions you have a genuine read on, and skip the section if none qualify. The Executor persists these via \`./strategic set-evidence-progress\`.
 
+**Weight evidence by verification basis.** A direction may carry a \`recent_findings_verification_basis\` distribution (counts of \`code_verified\` / \`path_verified\` / \`pattern_inferred\` / \`deduced\` findings). This records HOW each finding's claim was established, not whether it is implementable. Weight your \`evidence_progress\` read accordingly: a direction whose recent findings are predominantly \`code_verified\`/\`path_verified\` warrants higher confidence that its claimed progress is real than one whose findings are predominantly \`pattern_inferred\`/\`deduced\`. This is purely a WEIGHTING signal, NOT a gate — inferred findings remain valid and are often correct; a heavily-inferred direction is not stalled merely for being inferred.
+
 ## 4. Running update document (for the user)
 Write the full refined running_update as markdown to \`/tmp/running_update_${p.taskId}.md\` (also show it as a code block in your analysis for auditability — the file is the authoritative handoff to the Executor). This is the document the user sees as "project current state" — rewrite, don't append. Under 400 words. Follow the section guidance above.
 
@@ -276,6 +303,8 @@ Only if something this cycle was hard in a way worth remembering. Fields: what_w
 
 ## 6. Problem model (update — non-destructive merge)
 Write your problem_model update as JSON to \`/tmp/problem_model_${p.taskId}.json\` (use a code block in your analysis for auditability AND write the file — the file is the authoritative handoff to the Executor). The backend MERGES the agent-owned collections (\`capabilities\`, \`gaps\`, \`friction\`, \`pending_user_confirmation\`) rather than replacing them: entries upsert by stable key (\`capabilities\` by name; the rest by id), **entries you omit are preserved**, and per-gap \`history\`/\`past_moves\` union. So you do NOT need to reconstruct every gap/capability from memory — emit the ones you're changing plus enough to stay coherent. If a section was trimmed or dropped from your payload (see "Context not shipped" above), write just the parts you're changing and trust the rest is retained, or \`./fetch problem-model\` first to read the full current state.
+
+Normally your **whole** problem_model is shipped inline this cycle — full gaps, capabilities, and friction — so you edit it directly. Only in the exceptional case where the full model cannot fit the byte budget does it arrive floored/skeletonized (recoverable siblings yield first, so this is rare). **If** that happened — look for the \`_agent_view_floor_applied\` marker, which means gap \`description\`/\`evidence\` were stripped and capabilities/friction were reduced to \`name\`+\`status\` — **echo that marker back verbatim** in your update file. The backend uses it to know which fields you never actually saw, so editing and resubmitting a skeleton entry (e.g. bumping a gap's \`priority\` or a capability's \`status\`) won't blank the durable \`description\`, \`notes\`, \`source\`, etc. you couldn't see. Without the marker echoed, a blank field is treated as a deliberate clear. When the marker is absent (the normal case), the model you see is complete — edit freely.
 
 To intentionally REMOVE an agent-owned entry (not just change its status), add a top-level \`_deletions\` field: \`{"capabilities": ["name"], "gaps": ["id"], "friction": ["id"]}\`. Removal is ONLY via \`_deletions\` — omitting an entry never deletes it. Closing a gap is a status change, not a deletion (set \`status: closed\` → it auto-archives). Operator-owned fields (\`intent.purpose\`, \`context\`, \`constraints\`) are protected separately — to change those, route through \`pending_user_confirmation\` (\`type: intent_change\`), don't overwrite them. The Executor reads this file verbatim; if it's missing the cycle fails loudly rather than fabricating.
 
@@ -287,8 +316,10 @@ To intentionally REMOVE an agent-owned entry (not just change its status), add a
 - context: {project_type, users, team, deploy_cadence, notes}
 - constraints: [string]
 - capabilities: [{name, status (working|partial|planned), notes?, source?, backing_paths}]
-- gaps: [{id, name, description, evidence, size, priority, status, tag?, source?, active_moves, past_moves, history}]
+- gaps: [{id, name, description, evidence, size, priority, status, tag?, source?, active_moves, past_moves, history, deferral?}]
 - friction: [{id, name, description, seen_in, status, source?, promoted_to_gap_id?}]
+
+\`deferral\` (optional, on a gap) = {rationale, hold_until?, created_at?} — set it to record that an active gap is **intentionally** unstaffed this cycle ("real, still open, but deliberately not worked now") instead of fabricating a direction just so the gap doesn't look orphaned. Clear it (\`deferral: null\`) when you pick the gap back up. A \`create-direction\`/\`update-direction\` op carries \`gap_id\` to ground the direction to the gap it closes — that linkage is persisted on the direction, so reconciliation can tell which gaps have a working direction, which directions trace to no gap, and which unstaffed gaps are deferred-on-purpose.
 
 For every capability, preserve existing \`backing_paths\` and add repo-relative file paths when the code implementing that capability is known. Emit \`backing_paths: []\` instead of dropping the field when the implementation is still unknown.
 

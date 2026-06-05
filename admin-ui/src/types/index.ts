@@ -4,7 +4,7 @@ export type { DeployState, MaxPlanAccount, OrchestratorHealth, ZoneHealthEntry }
 export type { Alert } from './alert';
 export type { StuckTask, ProjectDiagnostics } from './diagnostics';
 export type {
-  ProblemModel, Intent, ProjectContext, Capability, Gap, Friction,
+  ProblemModel, ProblemModelSizeHealth, Intent, ProjectContext, Capability, Gap, Friction,
   PendingConfirmation, Source, SourceType, GapSize, GapPriority, GapStatus,
   FrictionStatus, PendingConfirmationType, CapabilityStatus,
   SelfReflectionEntry, ProblemModelPatch,

@@ -119,6 +119,25 @@ class TaskStatus(str, Enum):
     CANCELLED = "CANCELLED"
 
 
+class ComputeJobStatus(str, Enum):
+    QUEUED = "QUEUED"
+    STARTING = "STARTING"
+    RUNNING = "RUNNING"
+    POLLING = "POLLING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    TIMED_OUT = "TIMED_OUT"
+
+
+class ComputeJobOutcome(str, Enum):
+    SUCCESS = "SUCCESS"
+    FAILURE = "FAILURE"
+    CANCELLED = "CANCELLED"
+    TIMED_OUT = "TIMED_OUT"
+    SPEND_CAP_EXCEEDED = "SPEND_CAP_EXCEEDED"
+
+
 class ArtifactType(str, Enum):
     GIT_COMMIT = "GIT_COMMIT"
     PULL_REQUEST = "PULL_REQUEST"
@@ -137,6 +156,26 @@ class ArtifactType(str, Enum):
     # suite run on a PR head, consulted by the no-CI merge gate. ArtifactType is
     # a plain String column (sa_column=Column(String)) so no migration is needed.
     MERGE_TEST_RESULT = "MERGE_TEST_RESULT"
+    # Result of a compute_experiment task: the terminal outcome (success / spend
+    # cap / deadline / failure) and final cost of a budgeted compute job the
+    # agent launched and monitored. Like MERGE_TEST_RESULT, the column is a plain
+    # String so no migration is needed.
+    COMPUTE_RESULT = "COMPUTE_RESULT"
+
+
+class SourceKind(str, Enum):
+    """Which task type produced a :class:`KnowledgeDocument`.
+
+    A knowledge document is written by either a codebase-internal ``design``
+    task or a web-grounded ``web_research`` task; ``UNKNOWN`` is the durable
+    fallback so pre-existing rows (and any future producer that does not stamp
+    a kind) backfill cleanly. Stored as the enum *value* in a plain String
+    column, mirroring ``ArtifactType`` / ``TaskStatus``.
+    """
+
+    DESIGN = "design"
+    WEB_RESEARCH = "web_research"
+    UNKNOWN = "unknown"
 
 
 class LLMProviderName(str, Enum):
@@ -367,7 +406,15 @@ class Project(SQLModel, table=True):
     # terminal gate outcome. Shape:
     #   {"last_run_at": iso, "executed_real_tests": bool,
     #    "last_unverified_at": iso | absent,
-    #    "last_unverified_reason": str | absent}
+    #    "last_unverified_reason": str | absent,
+    #    # additive rolling history (bounded at 20, oldest dropped):
+    #    "recent_outcomes": [{"at": iso, "verified": bool,
+    #                         "reason": key | None}, ...] | absent,
+    #    # per-reason fall-open tally (incremented only on fall-opens):
+    #    "unverified_reason_counts": {reason_key: count} | absent}
+    # The history keys are purely additive — the column stays schemaless JSONB,
+    # so no migration and no type change is needed; legacy four-key-only rows
+    # upgrade transparently on the next gate run.
     # Nullable/additive: existing rows and create_all test DBs read it as None,
     # and a fresh migration (separate task) adds the column to live DBs.
     merge_gate_runtime: Dict[str, Any] | None = Field(
@@ -587,6 +634,10 @@ class Project(SQLModel, table=True):
         return cls.archived.is_(False)
 
     tasks: List["Task"] = Relationship(
+        back_populates="project",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
+    compute_jobs: List["ComputeJob"] = Relationship(
         back_populates="project",
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},
     )
@@ -1223,6 +1274,15 @@ class Task(SQLModel, table=True):
     history: List["TaskHistory"] = Relationship(
         back_populates="task", sa_relationship_kwargs={"cascade": "all, delete-orphan"}
     )
+    # ComputeJob is durable, first-class persistence decoupled from Task: a
+    # task delete/reset must PRESERVE the compute-job history (task_id is
+    # detached via the DB-level ``ondelete="SET NULL"`` FK), so this link uses
+    # NEITHER delete-orphan NOR an ORM null-out — ``passive_deletes`` leaves the
+    # detach to the database, which also keeps bulk ``delete(Task)`` paths
+    # (e.g. ``admin_projects.reset_project_admin``) from FK-violating.
+    compute_jobs: List["ComputeJob"] = Relationship(
+        back_populates="task", sa_relationship_kwargs={"passive_deletes": True}
+    )
 
     def _get_context_backed_value(self, key: str) -> Any:
         return (self.context or {}).get(key)
@@ -1480,6 +1540,128 @@ def bank_task_current_attempt(
         task.api_call_summary = None
 
     return snapshot
+
+
+class ComputeJob(SQLModel, table=True):
+    """Durable compute-job record for budgeted work decoupled from ``Task``.
+
+    A compute job represents external execution capacity (VM, process, hosted
+    backend job, or similar) with its own budget/deadline/cost/result lifecycle.
+    It is always owned by a project and may be associated with a Task, but the
+    nullable task link lets future budgeted work be tracked independently.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    # Detach-on-delete (SET NULL), NOT cascade: a compute job is durable history
+    # that must outlive its originating task. Mirrors Alert.task_id /
+    # SystemMaturity.source_task_id so bulk task cleanup never FK-violates.
+    task_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("task.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
+
+    backend: str = Field(sa_column=Column(String(64), nullable=False))
+    external_compute_id: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+    machine_type: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+
+    status: ComputeJobStatus = Field(
+        default=ComputeJobStatus.QUEUED,
+        sa_column=Column(
+            String,
+            nullable=False,
+            server_default=ComputeJobStatus.QUEUED.value,
+        ),
+    )
+    terminal_reason: str | None = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    outcome: ComputeJobOutcome | None = Field(
+        default=None, sa_column=Column(String, nullable=True)
+    )
+
+    spend_cap_usd: float | None = Field(
+        default=None, sa_column=Column(Float, nullable=True)
+    )
+    wall_clock_deadline: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+    started_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    completed_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    last_polled_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    next_poll_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    poll_attempt_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+
+    accrued_cost_usd: float | None = Field(
+        default=None, sa_column=Column(Float, nullable=True)
+    )
+    final_cost_usd: float | None = Field(
+        default=None, sa_column=Column(Float, nullable=True)
+    )
+    result_reference: str | None = Field(
+        default=None, sa_column=Column(String(1024), nullable=True)
+    )
+    # Artifacts are task-owned and CASCADE-deleted with their task; this
+    # reference must therefore detach (SET NULL) rather than block task cleanup
+    # or be deleted out from under us.
+    artifact_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("artifact.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
+    polling_metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+
+    __table_args__ = (
+        Index("ix_computejob_project_status", "project_id", "status"),
+        Index("ix_computejob_task_status", "task_id", "status"),
+        Index("ix_computejob_backend_external", "backend", "external_compute_id"),
+        Index("ix_computejob_status_deadline", "status", "wall_clock_deadline"),
+        Index("ix_computejob_next_poll", "next_poll_at"),
+    )
+
+    project: Project = Relationship(back_populates="compute_jobs")
+    task: Task | None = Relationship(back_populates="compute_jobs")
 
 
 class PoolVm(SQLModel, table=True):
@@ -2042,9 +2224,7 @@ class DigestCacheEntry(SQLModel, table=True):
     __tablename__ = "digestcache"
 
     cache_key: str = Field(sa_column=Column(String, primary_key=True))
-    payload: dict = Field(
-        default_factory=dict, sa_column=Column(JSONB, nullable=False)
-    )
+    payload: dict = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False))
     computed_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False),
@@ -2075,7 +2255,7 @@ class VmContact(SQLModel, table=True):
     preempted / OOM — sends no requests) leaves this row stale or absent and is
     reaped on the existing schedule. One row per VM, upserted on every contact.
 
-    ``last_tool_use_at`` (added by alembic 0143) carries the most recent
+    ``last_tool_use_at`` (added by alembic 0144) carries the most recent
     tool-use timestamp the orchestrator heard from this VM, recorded OFF the
     contended Task row for the SAME reason as ``last_contact_at``: a heartbeat
     whose contended ``Task`` write is lock-starved also drops
@@ -2088,7 +2268,7 @@ class VmContact(SQLModel, table=True):
     and is still reaped. Nullable: heartbeats without tool telemetry (or pre-
     backfill rows) leave it None, which falls back to the on-row behaviour.
 
-    Created on Postgres by alembic 0142 (base table) + 0143 (last_tool_use_at)
+    Created on Postgres by alembic 0142 (base table) + 0144 (last_tool_use_at)
     and on the SQLite test fixture by ``SQLModel.metadata.create_all``.
     """
 
@@ -2130,6 +2310,14 @@ class ProjectMessage(SQLModel, table=True):
     )
     status: str = Field(default="open")  # "open" | "resolved"
     resolution: str | None = None
+    # Client-supplied idempotency key. A double-click / network retry of a
+    # send that already succeeded server-side carries the same key, so the
+    # create endpoint returns the existing row instead of inserting a
+    # duplicate. NULL for legacy / keyless sends (backward-compatible); the
+    # partial unique index below only constrains non-NULL keys per project.
+    idempotency_key: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
     resolved_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
@@ -2143,6 +2331,17 @@ class ProjectMessage(SQLModel, table=True):
 
     __table_args__ = (
         Index("ix_projectmessage_project_status", "project_id", "status"),
+        # One logical message per (project, client key). Partial so keyless
+        # legacy sends are unconstrained; the create endpoint queries this
+        # before insert and the index is the concurrency-safe backstop.
+        Index(
+            "ux_projectmessage_project_idempotency_key",
+            "project_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+            sqlite_where=text("idempotency_key IS NOT NULL"),
+        ),
     )
 
 
@@ -2543,6 +2742,129 @@ class Artifact(SQLModel, table=True):
     task: Task = Relationship(back_populates="artifacts")
 
 
+class KnowledgeDocument(SQLModel, table=True):
+    """Durable, queryable home for ``output_kind='knowledge'`` work.
+
+    Blueprint declares ``output_kind='knowledge'`` on several read-only task
+    types, but historically that output lived only as ephemeral
+    ``Task.plan_output`` read back through a narrow recent-findings window. A
+    web-first ``web_research`` task instead persists ONE first-class
+    ``KnowledgeDocument`` row here: a titled, summarized markdown document with
+    web/file citations that the operator can list and full-text search, and
+    that the forward-quality evaluator gated before it was stored.
+
+    This is a PARALLEL lane to ``findings_index`` / the findings→spawn-code-task
+    path — it does not replace or disturb them. ``source_task_id`` records the
+    provenance of the producing task; ``forward_quality_verdict`` captures the
+    gate verdict that admitted the document.
+
+    Search: trigram GIN indexes on ``title`` and ``body`` (same precedent as
+    ``Artifact.pr_url``) back project-scoped ILIKE / similarity search; a plain
+    index on ``topic`` supports topic filtering. No new search dependency is
+    introduced.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    # Project scope — every read path filters on this.
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+
+    # Provenance: the task whose terminal output produced this document.
+    source_task_id: uuid.UUID = Field(foreign_key="task.id", index=True)
+
+    # Which task kind produced this document (``design`` vs ``web_research``).
+    # Stored as the enum value in a plain String column so it is index-friendly
+    # for origin filtering. Non-nullable with a Python default (so unseeded ORM
+    # instances carry a value pre-flush) and a server default (so pre-existing
+    # rows backfill to ``unknown``).
+    source_kind: str = Field(
+        default=SourceKind.UNKNOWN.value,
+        sa_column=Column(
+            String,
+            nullable=False,
+            server_default=text("'unknown'"),
+        ),
+    )
+
+    title: str = Field(sa_column=Column(String, nullable=False))
+    summary: str = Field(sa_column=Column(Text, nullable=False))
+    body: str = Field(sa_column=Column(Text, nullable=False))
+
+    # Optional free-form topic for filtering / grouping.
+    topic: str | None = Field(default=None, sa_column=Column(String, nullable=True))
+
+    # The strategic direction that motivated the producing task, carried on
+    # ``task.context["direction_id"]`` (a string direction key like ``d-1a2b3c4d``,
+    # NOT a FK into a direction table). Nullable: a web_research task may run
+    # without a direction. Indexed for per-direction knowledge browse / counts.
+    direction_id: str | None = Field(
+        default=None, sa_column=Column(String, nullable=True)
+    )
+
+    # Free-form tag list and citation list (web URLs plus any file refs).
+    tags: List[str] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
+    )
+    source_citations: List[Any] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
+    )
+
+    # The forward-quality gate verdict that admitted this document:
+    # {passed, reason, strategy, grader_task_id}. Always set on stored docs
+    # (a failing verdict never reaches persistence), but nullable for safety.
+    forward_quality_verdict: Dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    # Git provenance captured at write time (mirrors playbook entry stamping).
+    # Nullable so legacy rows and older agents that don't supply them remain valid.
+    authoring_branch: str | None = Field(
+        default=None, sa_column=Column(String, nullable=True)
+    )
+    head_sha: str | None = Field(
+        default=None, sa_column=Column(String, nullable=True)
+    )
+
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+
+    # Trigram GIN indexes mirror the Artifact.pr_url precedent so project-scoped
+    # ILIKE / similarity search over title + body is index-backed on Postgres;
+    # the topic b-tree index supports exact/prefix topic filtering. The
+    # ``postgresql_*`` kwargs are dialect-scoped — SQLite create_all emits plain
+    # indexes — so the test suite is unaffected.
+    __table_args__ = (
+        Index(
+            "ix_knowledge_document_title_trgm",
+            "title",
+            postgresql_using="gin",
+            postgresql_ops={"title": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_knowledge_document_body_trgm",
+            "body",
+            postgresql_using="gin",
+            postgresql_ops={"body": "gin_trgm_ops"},
+        ),
+        Index("ix_knowledge_document_topic", "topic"),
+        Index("ix_knowledge_document_direction", "direction_id"),
+    )
+
+
 class SystemMaturity(SQLModel, table=True):
     """Per-system maturity snapshot written by self_audit tasks.
 
@@ -2825,6 +3147,19 @@ class ReleaseVersion(SQLModel, table=True):
     goal: str | None = Field(
         default=None,
         sa_column=Column(Text, nullable=True),
+    )
+
+    # Stamped when the goal is edited by an operator.
+    goal_updated_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    # Editor provenance for the goal: "[operator:email]" format, mirroring phase_reasoning.
+    # Populated only when an operator edits the goal; auto-derived goals carry no editor info.
+    goal_editor_info: str | None = Field(
+        default=None,
+        sa_column=Column(String(255), nullable=True),
     )
 
     opened_at: datetime = Field(

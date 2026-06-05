@@ -1,6 +1,6 @@
 import type { DateRange } from '../hooks/useSearchFilters';
 import { FAILURE_CLASSES } from '../hooks/useSearchFilters';
-import { FILTER_TASK_TYPE_IDS } from '../taskCapabilities';
+import { useTaskCapabilities } from '../taskCapabilities';
 import { FAILURE_CLASS_CONFIG } from './TaskCard';
 
 interface QuickFilterPresetsProps {
@@ -28,7 +28,6 @@ interface QuickFilterPresetsProps {
 // Must stay length-aligned with STATUS_OPTIONS in ../constants — preset
 // active-state detection compares statusFilter.length === ALL_STATUSES.length.
 const ALL_STATUSES = ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'BLOCKED', 'FAILED', 'CANCELLED', 'COMPLETED'];
-const ALL_TYPES = [...FILTER_TASK_TYPE_IDS];
 
 export function QuickFilterPresets({
   statusFilter, dateRange, requiresApproval, blockedFilter, stuckFilter, stuckCount, stuckCount1h, stuckMinSeconds, searchQuery,
@@ -36,6 +35,7 @@ export function QuickFilterPresets({
   failureClassFilter = [],
   setFailureClassFilter,
 }: QuickFilterPresetsProps) {
+  const { filterIds } = useTaskCapabilities();
   const isFailedToday = statusFilter.length === 1 && statusFilter[0] === 'FAILED' && dateRange === '24h' && !requiresApproval && searchQuery === '';
   const isStuckHour = stuckFilter && stuckMinSeconds === 3600 && statusFilter.length === ALL_STATUSES.length && dateRange === 'all' && searchQuery === '';
   const isNeedsReview = requiresApproval && statusFilter.length === ALL_STATUSES.length && dateRange === 'all' && searchQuery === '';
@@ -44,7 +44,7 @@ export function QuickFilterPresets({
 
   const clearAll = () => {
     setStatusFilter(ALL_STATUSES);
-    setTaskTypeFilter(ALL_TYPES);
+    setTaskTypeFilter([...filterIds]);
     setDateRange('all');
     setRequiresApproval(false);
     setBlockedFilter(false);

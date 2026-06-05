@@ -7,6 +7,7 @@ from typing import Optional, Dict, Any, List
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -27,6 +28,7 @@ from app.payload_schemas import validate_internal_payload
 from app.task_locking import lock_project_or_429, with_directions_locked
 from app.direction_lifecycle import _reset_outcome_detection_state
 from app.strategic_events import STRATEGIC_KIND_DIRECTIONS, emit_strategic_updated
+from app.problem_model import compute_model_size_signal, ProblemModel
 
 logger = logging.getLogger(__name__)
 
@@ -40,13 +42,14 @@ COMPLETION_CRITERIA_MAX = 500
 DIRECTION_CONTEXT_FIELD_MAX = 500
 
 
-def _compute_direction_merge_rate(d: dict) -> float:
+def _compute_direction_merge_rate(d: dict) -> Any:
     """Return merged-PRs-per-cycle for a direction. Returns 0.5 (neutral) if never researched."""
-    history = d.get("research_history", [])
-    agg = d.get("history_aggregate", {})
-    total_cycles = len(history) + (agg.get("total_cycles") or 0)
-    total_merged = sum(e.get("prs_merged", 0) for e in history) + (
-        agg.get("total_prs_merged") or 0
+    history: list[dict[str, Any]] = list(d.get("research_history") or [])
+    agg: dict[str, Any] = dict(d.get("history_aggregate") or {})
+    total_cycles = float(len(history) + int(agg.get("total_cycles") or 0))
+    total_merged = float(
+        sum(float(e.get("prs_merged", 0) or 0) for e in history)
+        + float(agg.get("total_prs_merged") or 0)
     )
     if total_cycles == 0:
         return 0.5
@@ -54,6 +57,25 @@ def _compute_direction_merge_rate(d: dict) -> float:
 
 
 VALID_CATEGORIES = {"product", "structural", "mixed"}
+
+
+def _clear_direction_reactivation_state(direction: dict) -> None:
+    """Drop transient status residue so active/staged transitions start clean."""
+    for key in (
+        "paused_reason",
+        "paused_at",
+        "auto_paused",
+        "expired_at",
+        "needs_manual_intervention",
+        "needs_manual_intervention_at",
+        "escalation_notification_pending",
+        "escalation_notification_retries",
+        "last_researched_at",
+        "staged_activated_at",
+        "staged_for_version",
+    ):
+        direction.pop(key, None)
+    direction["remediation_attempts"] = 0
 
 
 class DirectionPayload(BaseModel):
@@ -76,6 +98,23 @@ class DirectionPayload(BaseModel):
         ge=0,
         description="Optional cost budget ceiling in USD for this direction",
     )
+    staged: bool = Field(
+        default=False,
+        description=(
+            "Create the direction directly in the 'staged' state, gated to the "
+            "current open release version, so it never passes through a "
+            "research-eligible active state. Requires an open version (404 if none)."
+        ),
+    )
+    idempotency_key: Optional[str] = Field(
+        default=None,
+        max_length=255,
+        description=(
+            "Client-generated idempotency key. When supplied, a repeat add "
+            "(double-click / network retry) carrying the same key returns the "
+            "existing direction instead of creating a duplicate."
+        ),
+    )
 
 
 @router.get("/projects/{project_id}/directions")
@@ -86,7 +125,10 @@ async def get_directions(
 ):
     from app.shared_state import get_direction_hold_info as _get_direction_hold_info  # noqa: PLC0415
     from app.shared_state import runtime_config as _runtime_config  # noqa: PLC0415
-    from app.direction_metrics import _compute_direction_quality_score  # noqa: PLC0415
+    from app.direction_metrics import (  # noqa: PLC0415
+        _compute_direction_quality_score,
+        _compute_lifetime_generalized_outcome_state,
+    )
     from app.strategic_completion import (
         _compute_churn_metrics,
         _compute_lifetime_burn_metrics,
@@ -97,6 +139,29 @@ async def get_directions(
 
     project = await _get_user_project(project_id, current_user["user_id"], session)
     directions = project.directions or []
+
+    # Per-direction count of durable knowledge documents accumulated by
+    # web_research tasks. One grouped query, scoped to this project; keyed by
+    # the string direction id stamped on KnowledgeDocument.direction_id.
+    from app.models import KnowledgeDocument  # noqa: PLC0415
+    from sqlalchemy import func as _sa_func  # noqa: PLC0415
+
+    knowledge_counts: dict[str, int] = {}
+    count_rows = (
+        await session.execute(
+            select(
+                KnowledgeDocument.direction_id, _sa_func.count()
+            )
+            .where(
+                KnowledgeDocument.project_id == project_id,
+                KnowledgeDocument.direction_id.is_not(None),
+            )
+            .group_by(KnowledgeDocument.direction_id)
+        )
+    ).all()
+    for direction_id, count in count_rows:
+        if direction_id is not None:
+            knowledge_counts[str(direction_id)] = int(count)
     churn_threshold = int(
         _runtime_config.get("direction_churn_non_merge_threshold", 15) or 15
     )
@@ -114,6 +179,7 @@ async def get_directions(
         hold_info = _get_direction_hold_info(d.get("id", ""))
         held_at = hold_info["held_at"]
         held_until = hold_info["held_until"]
+        generalized_state = _compute_lifetime_generalized_outcome_state(d)
         raw_churn = _compute_churn_metrics(d)
         churn_metrics = (
             {
@@ -139,6 +205,13 @@ async def get_directions(
                 **d,
                 "merge_rate": _compute_direction_merge_rate(d),
                 "quality_score": round(_compute_direction_quality_score(d), 3),
+                "generalized_successes": generalized_state["generalized_successes"],
+                "generalized_health_rate": generalized_state[
+                    "generalized_health_rate"
+                ],
+                "outcome_kind_breakdown": generalized_state[
+                    "outcome_kind_breakdown"
+                ],
                 "held": bool(hold_info["held"]),
                 "held_reason": hold_info["reason"] if hold_info["held"] else None,
                 "held_at": held_at.isoformat()
@@ -149,14 +222,24 @@ async def get_directions(
                 else None,
                 "churn_metrics": churn_metrics,
                 "lifetime_burn_metrics": lifetime_burn_metrics,
+                "knowledge_document_count": knowledge_counts.get(d.get("id", ""), 0),
             }
         )
+    problem_model_dict = project.problem_model or {}
+    problem_model_size_health = None
+    if problem_model_dict:
+        try:
+            pm = ProblemModel(**problem_model_dict)
+            problem_model_size_health = compute_model_size_signal(pm)
+        except Exception:
+            pass
     return {
         "directions": enriched,
         "autonomous_enabled": project.autonomous_enabled,
         "vision": project.vision or {},
         "design_doc": project.design_doc or {},
-        "problem_model": project.problem_model or {},
+        "problem_model": problem_model_dict,
+        "problem_model_size_health": problem_model_size_health,
         "running_update": project.running_update or None,
         "running_update_acknowledged_at": (
             project.running_update_acknowledged_at.isoformat()
@@ -193,14 +276,37 @@ async def add_direction(
 
     max_active = _runtime_config.get("max_active_directions", 5)
 
+    # Normalize idempotency key: strip whitespace, treat empty as None
+    idem_key = (payload.idempotency_key or "").strip() or None
+
+    # Atomic staged create: resolve and stamp the open version exactly the way
+    # the staged PATCH branch (update_direction) does, so a next-version idea is
+    # born staged in a single commit and never passes through a research-eligible
+    # active state. No open version → no target to auto-activate against, so 404
+    # rather than silently creating active.
+    staged_for_version: int | None = None
+    if payload.staged:
+        from app.release_version import current_open_version  # noqa: PLC0415
+
+        open_version = await current_open_version(session, project.id)
+        if open_version is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No open release version found for this project.",
+            )
+        staged_for_version = open_version.version_number
+
     direction = {
         "id": f"d-{uuid.uuid4().hex[:8]}",
         "text": payload.text,
         "priority": payload.priority,
         "paths": payload.paths or [],
         "added_at": _utcnow().isoformat(),
-        "status": "active",
+        "status": "staged" if payload.staged else "active",
     }
+    if payload.staged:
+        direction["staged_for_version"] = staged_for_version
+        direction["staged_at"] = _utcnow().isoformat()
     if payload.category:
         direction["category"] = payload.category
     if payload.completion_criteria:
@@ -211,14 +317,30 @@ async def add_direction(
         )
     if payload.cost_budget_usd is not None:
         direction["cost_budget_usd"] = float(payload.cost_budget_usd)
+    if idem_key:
+        direction["idempotency_key"] = idem_key
+
+    existing_direction: list = []  # Will be populated if we find a duplicate
 
     def _mutate_add(directions: list) -> None:
-        active_count = sum(1 for d in directions if d.get("status") == "active")
-        if active_count >= max_active:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Direction cap reached: max {max_active} active directions allowed",
-            )
+        # Idempotency: if this add carries an idempotency key and a direction
+        # with that key already exists, return the existing direction instead of
+        # creating a duplicate.
+        if idem_key:
+            for d in directions:
+                if d.get("idempotency_key") == idem_key:
+                    existing_direction.append(d)
+                    return
+        # The active-direction cap counts active directions only; a staged
+        # create is inert until its version promotes, so it does not consume a
+        # slot (mirrors update_direction, where the cap fires only on → active).
+        if not payload.staged:
+            active_count = sum(1 for d in directions if d.get("status") == "active")
+            if active_count >= max_active:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Direction cap reached: max {max_active} active directions allowed",
+                )
         if payload.conflicts_with:
             existing_ids = {d.get("id") for d in directions}
             invalid = [cid for cid in payload.conflicts_with if cid not in existing_ids]
@@ -242,6 +364,9 @@ async def add_direction(
     await session.commit()
     await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
 
+    # Return existing direction if we found one (idempotent duplicate)
+    if existing_direction:
+        return {"direction": existing_direction[0], "status": "duplicate"}
     return {"direction": direction}
 
 
@@ -344,8 +469,9 @@ async def remove_direction(
         if len(remaining) == len(directions):
             raise HTTPException(status_code=404, detail="Direction not found")
 
-        # If this was a proposed direction, keep a tombstone to prevent re-proposal
-        if removed and removed[0].get("status") == "proposed":
+        # If this was a proposed or staged direction, keep a tombstone to prevent
+        # re-proposal / re-staging.
+        if removed and removed[0].get("status") in {"proposed", "staged"}:
             from datetime import datetime, timezone
 
             rejected_text = (removed[0].get("text") or "")[:200]
@@ -468,13 +594,16 @@ async def update_direction(
     if "status" in payload and payload["status"] not in (
         "active",
         "completed",
+        "staged",
         "paused",
         "proposed",
         "expired",
     ):
         raise HTTPException(
             status_code=400,
-            detail="status must be active, completed, paused, proposed, or expired",
+            detail=(
+                "status must be active, completed, staged, paused, proposed, or expired"
+            ),
         )
     if "text" in payload and (
         not isinstance(payload["text"], str)
@@ -569,6 +698,42 @@ async def update_direction(
                 detail="system_id must be a string of at most 100 characters",
             )
 
+    # Resolve and validate the staging TARGET version. Triggered both when a
+    # direction transitions to ``staged`` AND when an already-staged direction is
+    # retargeted to a different version (an explicit ``staged_for_version`` in the
+    # payload without a status change). The target defaults to the current open
+    # version and must be >= it: a version that has already promoted/closed would
+    # auto-activate the direction on the next sweep, which is nonsensical.
+    staged_for_version: int | None = None
+    _wants_staging = payload.get("status") == "staged" or "staged_for_version" in payload
+    if _wants_staging:
+        from app.release_version import current_open_version  # noqa: PLC0415
+
+        open_version = await current_open_version(session, project.id)
+        if open_version is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No open release version found for this project.",
+            )
+        target = payload.get("staged_for_version")
+        if target is None:
+            staged_for_version = open_version.version_number
+        elif not isinstance(target, int) or isinstance(target, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="staged_for_version must be an integer version number",
+            )
+        elif target < open_version.version_number:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"staged_for_version {target} has already promoted; choose the "
+                    f"current open version ({open_version.version_number}) or later"
+                ),
+            )
+        else:
+            staged_for_version = target
+
     updated_direction: list = []  # [d] populated by mutate_fn
 
     def _mutate_update(directions: list) -> None:
@@ -616,25 +781,26 @@ async def update_direction(
                     d["priority"] = payload["priority"]
                 if "status" in payload:
                     d["status"] = payload["status"]
-                    # When reactivating from paused, clear auto-pause fields
-                    if payload["status"] == "active":
-                        d.pop("paused_reason", None)
-                        d.pop("paused_at", None)
-                        d.pop("auto_paused", None)
-                        d.pop("expired_at", None)
-                        # Operator reactivation acknowledges any escalation — clear
-                        # manual-intervention flag, pending notification state, and
-                        # reset remediation attempts so spawn calibration no longer
-                        # penalizes the direction.
-                        d.pop("needs_manual_intervention", None)
-                        d.pop("needs_manual_intervention_at", None)
-                        d.pop("escalation_notification_pending", None)
-                        d.pop("escalation_notification_retries", None)
-                        d.pop("last_researched_at", None)
-                        d["remediation_attempts"] = 0
+                    if payload["status"] in ("active", "staged"):
+                        _clear_direction_reactivation_state(d)
+                    if payload["status"] == "staged":
+                        d["staged_for_version"] = staged_for_version
+                        d["staged_at"] = _utcnow().isoformat()
                     # When reviving from expired back to proposed, clear expired_at
                     if payload["status"] == "proposed":
                         d.pop("expired_at", None)
+                # Retarget an already-staged direction to a different version
+                # without re-staging it (no status change). Only a currently
+                # staged direction can be retargeted; the resolved/validated
+                # target replaces its marker so the strategist + activation sweep
+                # bind it to the new version.
+                if "staged_for_version" in payload and payload.get("status") != "staged":
+                    if d.get("status") != "staged":
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Only a staged direction can be retargeted to a different version",
+                        )
+                    d["staged_for_version"] = staged_for_version
                 if "text" in payload:
                     d["text"] = payload["text"]
                 if "paths" in payload:
@@ -1010,6 +1176,11 @@ async def trigger_strategic_cycle(
 class CreateMessage(BaseModel):
     content: str
     message_type: str = "NOTE"  # NOTE, FEEDBACK, BUG_REPORT, QUESTION, BLOCKER
+    # Client-generated idempotency key. When supplied, a repeat send (double
+    # submit / network retry of the same steering instruction) converges to the
+    # single already-stored message and a single arming, mirroring the live-chat
+    # endpoint (admin_notifications.create_message).
+    idempotency_key: Optional[str] = None
 
 
 @router.post("/projects/{project_id}/messages")
@@ -1036,15 +1207,66 @@ async def create_message(
             status_code=400, detail=f"Invalid message type: {payload.message_type}"
         )
 
+    # Idempotency: if this send carries a client key and a message with that
+    # key already exists for the project, return the existing row instead of
+    # inserting a duplicate. This collapses an accidental double-submit /
+    # network retry to a single logical message (and a single arming),
+    # identically to the live-chat endpoint (admin_notifications.create_message).
+    idem_key = (payload.idempotency_key or "").strip() or None
+    if idem_key:
+        if len(idem_key) > 255:
+            raise HTTPException(
+                status_code=400, detail="idempotency_key exceeds 255 characters"
+            )
+        existing = (
+            await session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.idempotency_key == idem_key,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return {"id": str(existing.id), "status": "duplicate", "arming": "duplicate"}
+
     msg = ProjectMessage(
         project_id=project.id,
         message_type=msg_type,
         from_type="user",
         content=payload.content.strip(),
+        idempotency_key=idem_key,
     )
     session.add(msg)
-    await session.commit()
+    # Concurrency backstop: two simultaneous sends sharing the same key both
+    # passed the pre-insert query, but the partial unique index lets only one
+    # row land. Roll back and return the winner so the loser is still an
+    # idempotent success rather than a 500.
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        if idem_key:
+            existing = (
+                await session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id,
+                        ProjectMessage.idempotency_key == idem_key,
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                return {
+                    "id": str(existing.id),
+                    "status": "duplicate",
+                    "arming": "duplicate",
+                }
+        raise
     await session.refresh(msg)
+    # Snapshot the id before arming: maybe_arm_operator_refresh's bounded lock
+    # acquire can OperationalError + roll back under project-row contention,
+    # expiring this committed msg; a later ``str(msg.id)`` would then sync
+    # lazy-load (MissingGreenlet) and 500 an already-committed message.
+    message_id = str(msg.id)
 
     # An operator message that warrants strategist attention (steering /
     # feedback / question / blocker — anything but a passive NOTE) arms the
@@ -1070,7 +1292,7 @@ async def create_message(
     if arming == ARMING_STEERING:
         await session.commit()
 
-    return {"id": str(msg.id), "status": "created", "arming": arming}
+    return {"id": message_id, "status": "created", "arming": arming}
 
 
 @router.get("/projects/{project_id}/messages")

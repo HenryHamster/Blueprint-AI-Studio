@@ -2,11 +2,13 @@
 
 import re
 import uuid
+from datetime import datetime
 from typing import List, Dict, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.models import TaskStatus, ArtifactType
+from app.models import ArtifactType, ComputeJobOutcome, ComputeJobStatus, TaskStatus
+from app.task_blocked import NEED_KINDS, NEED_LABEL_MAX_LEN, NEED_REF_MAX_LEN
 
 
 class DeployPayload(BaseModel):
@@ -14,6 +16,41 @@ class DeployPayload(BaseModel):
     payloads: List[Dict[str, Any]]
     github_owner: str | None = Field(None, pattern="^[a-zA-Z0-9_.-]+$")
     github_repo: str | None = Field(None, pattern="^[a-zA-Z0-9_.-]+$")
+
+
+class TaskEvaluationSummaryItem(BaseModel):
+    label: str
+    value: str
+
+
+class TaskEvaluationSummary(BaseModel):
+    status: str
+    verdict: str
+    evidence: List[TaskEvaluationSummaryItem] = Field(default_factory=list)
+    highlights: List[TaskEvaluationSummaryItem] = Field(default_factory=list)
+
+
+class BlockedNeed(BaseModel):
+    """Normalized, machine-resolvable prerequisite a blocked task waits on.
+
+    The canonical NEED primitive: ``kind`` names the reference category (a
+    sibling task, a PR, or a capability/foundation), ``ref`` is the concrete
+    identifier, and ``label`` is an optional human description. Kept in sync
+    with ``app.task_blocked`` (single source of truth for the kinds and bounds)
+    so agent blockers and research findings share one shape.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    kind: str = Field(..., max_length=20)
+    ref: str = Field(..., min_length=1, max_length=NEED_REF_MAX_LEN)
+    label: str | None = Field(None, max_length=NEED_LABEL_MAX_LEN)
+
+    @field_validator("kind")
+    @classmethod
+    def _validate_kind(cls, v: str) -> str:
+        if v not in NEED_KINDS:
+            raise ValueError(f"kind must be one of {NEED_KINDS}")
+        return v
 
 
 class AgentStatusPayload(BaseModel):
@@ -81,6 +118,11 @@ class AgentStatusPayload(BaseModel):
     # operators see WHY there is no PR. A no-diff finish WITHOUT this reason is
     # not a no-op completion; the agent wrapper fails it as `incomplete`.
     no_op_reason: str | None = Field(None, max_length=2000)
+    # Optional normalized machine-resolvable prerequisite for a BLOCKED status.
+    # Set by `./blocked --needs-task|--needs-pr|--needs-capability`. Persisted
+    # into context['blocker']['need'] on the BLOCKED-entry path. Absent payloads
+    # behave identically to today (free-text waiting_on/reason only).
+    blocked_need: BlockedNeed | None = None
 
 
 class UploadUrlRequest(BaseModel):
@@ -149,6 +191,42 @@ class HeartbeatRequest(BaseModel):
     llm_call_count: int | None = Field(None, ge=0)
     total_input_tokens: int | None = Field(None, ge=0)
     total_output_tokens: int | None = Field(None, ge=0)
+
+
+class ComputeJobResponse(BaseModel):
+    """Agent-facing serialization for persisted compute jobs."""
+
+    model_config = ConfigDict(from_attributes=True, use_enum_values=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    task_id: uuid.UUID | None = None
+    backend: str
+    external_compute_id: str | None = None
+    machine_type: str | None = None
+    status: ComputeJobStatus
+    terminal_reason: str | None = None
+    outcome: ComputeJobOutcome | None = None
+    spend_cap_usd: float | None = None
+    wall_clock_deadline: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    last_polled_at: datetime | None = None
+    next_poll_at: datetime | None = None
+    poll_attempt_count: int = 0
+    accrued_cost_usd: float | None = None
+    final_cost_usd: float | None = None
+    result_reference: str | None = None
+    artifact_id: uuid.UUID | None = None
+    polling_metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+def serialize_compute_job_response(job: object) -> Dict[str, Any]:
+    """Return a JSON-ready compute-job response payload."""
+
+    return ComputeJobResponse.model_validate(job).model_dump(mode="json")
 
 
 class SpawnTaskRequest(BaseModel):
@@ -421,6 +499,16 @@ class MergeGateRuntime(BaseModel):
     executed_real_tests: bool = False
     last_unverified_at: str | None = None
     last_unverified_reason: str | None = None
+    # Additive history fields (bounded rolling record + per-reason tally +
+    # derived summary). All optional with safe defaults so never-ran and legacy
+    # four-key-only records remain valid and the response shape stays
+    # backward-compatible. ``recent_outcomes`` entries are
+    # ``{"at": iso, "verified": bool, "reason": key | None}``; ``summary``
+    # carries ``window`` / ``verified_runs`` / ``fell_open_runs`` /
+    # ``total_fall_opens`` / ``most_common_reason``.
+    recent_outcomes: List[Dict[str, Any]] | None = None
+    unverified_reason_counts: Dict[str, int] | None = None
+    summary: Dict[str, Any] | None = None
 
 
 class OnboardPayload(BaseModel):

@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func, update, or_, and_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
@@ -56,6 +57,10 @@ class MessageCreate(BaseModel):
     message_type: str = "NOTE"
     content: str
     context: Optional[Dict[str, Any]] = None
+    # Client-generated idempotency key. When supplied, a repeat send (double
+    # click / network retry) carrying the same key returns the existing
+    # message instead of creating a duplicate. Absent = legacy behavior.
+    idempotency_key: Optional[str] = None
 
 
 class MessageResolve(BaseModel):
@@ -137,6 +142,7 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset = frozenset(
         "rollback_recommended",
         "fix_loop_divergence_regressed",
         "direction_outcome_stalled",
+        "direction_staged_activated",
         "promotion_readiness_reached",
         "release_calcifying",
         "release_build_stalled",
@@ -499,28 +505,89 @@ async def create_message(
     if len(json.dumps(ctx)) > 50_000:
         raise HTTPException(status_code=400, detail="Context too large (max 50KB)")
 
+    # Idempotency: if this send carries a client key and a message with that
+    # key already exists for the project, return the existing row instead of
+    # inserting a duplicate. This collapses an accidental double-submit /
+    # network retry to a single logical message (and a single arming).
+    idem_key = (payload.idempotency_key or "").strip() or None
+    if idem_key:
+        if len(idem_key) > 255:
+            raise HTTPException(
+                status_code=400, detail="idempotency_key exceeds 255 characters"
+            )
+        existing = (
+            await session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.idempotency_key == idem_key,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return {"id": str(existing.id), "status": "duplicate", "arming": "duplicate"}
+
     msg = ProjectMessage(
         project_id=project_id,
         message_type=MessageType(msg_type),
         from_type="user",
         content=content,
         context=ctx,
+        idempotency_key=idem_key,
     )
     session.add(msg)
     event_type = ctx.get("event_type")
-    if event_type and event_type in ROUTINE_EVENT_TYPES:
-        # The routine-digest append is a read-modify-write on running_update,
-        # which races with concurrent message creates and with the agent's
-        # locked set_running_update reconciliation. Acquire the project row
-        # lock (matching the codebase's existing idiom) so the append reads a
-        # fresh, committed running_update and serializes against other writers;
-        # without it, a stale read could silently drop a digest line or clobber
-        # the agent's reconciled document. populate_existing on the locked read
-        # refreshes the identity-mapped project loaded by _get_user_project.
-        locked_project = await lock_project_or_429(session, project_id)
-        append_routine_digest(locked_project, event_type, content)
-    await session.commit()
+    # Wrap the routine-digest append together with the commit so a concurrent
+    # same-key insert is caught wherever the pending ``msg`` actually flushes.
+    # Under READ COMMITTED a competitor can commit the duplicate after this
+    # request's idempotency pre-check passed, and the unique violation then
+    # surfaces either at the explicit ``commit`` below OR earlier, when
+    # ``lock_project_or_429``'s SELECT autoflushes ``msg`` — so catching only
+    # the commit would let the autoflush variant escape as a 500.
+    try:
+        if event_type and event_type in ROUTINE_EVENT_TYPES:
+            # The routine-digest append is a read-modify-write on running_update,
+            # which races with concurrent message creates and with the agent's
+            # locked set_running_update reconciliation. Acquire the project row
+            # lock (matching the codebase's existing idiom) so the append reads a
+            # fresh, committed running_update and serializes against other
+            # writers; without it, a stale read could silently drop a digest line
+            # or clobber the agent's reconciled document. populate_existing on the
+            # locked read refreshes the identity-mapped project loaded by
+            # _get_user_project.
+            locked_project = await lock_project_or_429(session, project_id)
+            append_routine_digest(locked_project, event_type, content)
+        await session.commit()
+    except IntegrityError:
+        # Concurrency backstop: two simultaneous sends sharing the same key
+        # both passed the pre-insert query, but the partial unique index lets
+        # only one row land. Roll back (discarding any routine-digest append so
+        # the duplicate does not double-apply it) and return the winner so the
+        # loser is still an idempotent success rather than a 500.
+        await session.rollback()
+        if idem_key:
+            existing = (
+                await session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project_id,
+                        ProjectMessage.idempotency_key == idem_key,
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                return {
+                    "id": str(existing.id),
+                    "status": "duplicate",
+                    "arming": "duplicate",
+                }
+        raise
     await session.refresh(msg)
+    # Snapshot the id before arming. maybe_arm_operator_refresh's bounded lock
+    # acquire can raise OperationalError under project-row contention (an active
+    # strategic cycle) and roll the session back, which EXPIRES this committed
+    # msg. A later ``str(msg.id)`` would then trigger a sync lazy-load
+    # (MissingGreenlet) and 500 a request whose message already durably
+    # committed. The captured scalar is immune to that expire.
+    message_id = str(msg.id)
 
     # Wake the strategist on genuine operator steering. This is the live-chat
     # surface the admin MessagesPanel composer hits, and it must steer exactly
@@ -547,7 +614,7 @@ async def create_message(
     )
     if arming == ARMING_STEERING:
         await session.commit()
-    return {"id": str(msg.id), "status": "created", "arming": arming}
+    return {"id": message_id, "status": "created", "arming": arming}
 
 
 @router.patch("/messages/{message_id}")
@@ -572,12 +639,25 @@ async def resolve_message(
             status_code=400,
             detail=f"Content exceeds {MESSAGE_CONTENT_MAX} character limit",
         )
-    msg.status = "resolved"
-    msg.resolution = resolution or None
-    msg.resolved_at = _utcnow()
-    session.add(msg)
+    # Use update with status check for idempotency: only update if still open.
+    # If a concurrent request also resolves before this one commits, the update
+    # will find 0 rows and we return already_resolved for both paths.
+    result = await session.execute(
+        update(ProjectMessage).where(
+            ProjectMessage.id == message_id,
+            ProjectMessage.status == "open"
+        ).values(
+            status="resolved",
+            resolution=resolution or None,
+            resolved_at=_utcnow()
+        )
+    )
     await session.commit()
-    return {"id": str(msg.id), "status": "resolved"}
+    if result.rowcount > 0:
+        return {"id": str(msg.id), "status": "resolved"}
+    else:
+        # Message was already resolved by a concurrent request
+        return {"id": str(msg.id), "status": "already_resolved"}
 
 
 @router.delete("/messages/{message_id}")
@@ -586,13 +666,14 @@ async def delete_message(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Delete a message."""
+    """Delete a message (idempotent)."""
     msg = await session.get(ProjectMessage, message_id)
-    if not msg:
-        raise HTTPException(status_code=404, detail="Message not found")
-    await _get_user_project(msg.project_id, current_user["user_id"], session)
-    await session.delete(msg)
-    await session.commit()
+    if msg:
+        # Verify user has access to the project
+        await _get_user_project(msg.project_id, current_user["user_id"], session)
+        await session.delete(msg)
+        await session.commit()
+    # Return success whether or not the message existed (idempotent)
     return {"deleted": True}
 
 

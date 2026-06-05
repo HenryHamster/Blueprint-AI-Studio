@@ -227,9 +227,13 @@ async def test_perf_completion_does_not_broadcast_children_on_commit_failure(
 
 
 @pytest.mark.asyncio
-async def test_perf_completion_no_findings_stays_terminal(db_session, _quiet_perf_io):
-    """Unparseable / empty findings → no children, and the handler leaves the
-    incoming terminal status untouched (does not flip to EVALUATING)."""
+async def test_perf_completion_no_measurement_fails_metric_gate(
+    db_session, _quiet_perf_io
+):
+    """Metric gate: unparseable / empty output means the perf report produced no
+    structured measurement, so it must NOT complete clean. No children spawn and
+    the task is marked FAILED (a perf task opens no PR and spawns no children, so
+    EVALUATING would hang forever)."""
     task = await _make_perf_task(db_session)
 
     await _handle_perf_completion(task, "not a findings array at all", db_session)
@@ -238,8 +242,52 @@ async def test_perf_completion_no_findings_stays_terminal(db_session, _quiet_per
     assert children == []
 
     await db_session.refresh(task)
-    assert task.status == TaskStatus.COMPLETED
-    assert "no parseable findings" in (task.latest_status_message or "").lower()
+    assert task.status == TaskStatus.FAILED
+    assert "gate" in (task.latest_status_message or "").lower()
+    assert task.context["evaluation_gate"]["passed"] is False
+    assert task.context["evaluation_gate"]["strategy"] == "metric"
+
+
+@pytest.mark.asyncio
+async def test_perf_completion_with_non_dict_findings_skips_bad_elements(
+    db_session, _quiet_perf_io
+):
+    """Malformed findings array with non-dict elements → handler completes
+    gracefully, skipping bad elements instead of raising AttributeError."""
+    task = await _make_perf_task(db_session)
+    # Mix valid dicts with non-dict elements that would crash .get() if unfiltered
+    malformed_findings = [
+        {
+            "severity": "high",
+            "area": "db",
+            "title": "N+1 query",
+            "description": "Loads each row in a loop.",
+            "fix_prompt": "Batch the query.",
+        },
+        "stray string",  # non-dict element
+        42,  # non-dict element
+        {
+            "severity": "medium",
+            "area": "ui",
+            "title": "Avoidable re-render",
+            "description": "Memoize the list.",
+            "fix_prompt": "Wrap in useMemo.",
+        },
+        ["nested", "array"],  # non-dict element
+    ]
+
+    await _handle_perf_completion(task, json.dumps(malformed_findings), db_session)
+
+    # One child spawned from the high-severity valid finding
+    children = await _children_of(db_session, task)
+    assert len(children) == 1
+    assert "[PERF] Fix 1 high-severity" in children[0].title
+
+    await db_session.refresh(task)
+    # Handler completes successfully despite malformed elements
+    assert task.status == TaskStatus.EVALUATING
+    # Findings stored should only contain valid dicts (2 valid out of 5 total)
+    assert len(task.plan_output.get("findings", [])) == 2
 
 
 @pytest.mark.asyncio

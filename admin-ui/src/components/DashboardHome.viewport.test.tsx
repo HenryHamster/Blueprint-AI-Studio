@@ -256,7 +256,25 @@ vi.mock('../api', () => ({
     phase_changed_at: '2026-05-20T12:00:00Z',
     phase_reasoning: '[operator:test] operator advance',
   })),
+  setVersionGoal: vi.fn(async () => ({
+    version_number: 42,
+    goal: 'Ship the lifecycle surface',
+    goal_updated_at: '2026-05-20T12:00:00Z',
+    goal_editor_info: '[operator:test]',
+  })),
   triggerQualify: vi.fn(async () => ({ status: 'dry_run' })),
+  cutVersion: vi.fn(async () => ({
+    abandoned_version: { version_number: 42, status: 'abandoned' },
+    new_version: { version_number: 43, phase: 'build', goal: null, opened_at: '2026-05-20T12:00:00Z' },
+  })),
+  patchAdminSettings: vi.fn(async () => ({ promotion_enabled: false })),
+  setProjectPromotionEnabled: vi.fn(async () => ({
+    project_id: 'p1',
+    override: true,
+    effective: true,
+    source: 'project',
+    cleared: false,
+  })),
   fetchQualificationVerdicts: vi.fn(async () => ({
     verdicts: [
       { id: 'v1', release_version_id: 'rv1', candidate_sha: 'abc1234def56', confidence: 0.83, sub_scores: { audit: 0.90, test_erosion: 0.75, smoketest: 0.88 }, blocker: null, would_promote: true, promotion_enabled: false, terminal_status: 'dry_run', threshold: 0.80, started_at: '2026-05-20T10:00:00Z', finalized_at: '2026-05-20T11:00:00Z', created_at: '2026-05-20T11:00:00Z' },

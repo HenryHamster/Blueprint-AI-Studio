@@ -2,8 +2,11 @@
 import React, { useState, useEffect, useRef, memo, forwardRef } from 'react';
 import { CheckCircle, AlertTriangle, Clock, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, ShieldCheck, Package, ArrowUpDown, Wrench, MoreHorizontal, Radio, Layers, Gauge, Compass, FileText, Copy, Check } from 'lucide-react';
 import { formatDurationMs, parseTimestamp } from '../utils/time';
+import { formatVerdict, verdictToneBadgeClass } from '../utils/verdictFormatting';
+import { humanizeUnverifiedReason } from '../utils/unverifiedReasonLabels';
 import { authGet, API_BASE_URL } from '../api';
 import { EXIT_REASON_COLORS } from '../utils/fixLoopColors';
+import { useTaskCapabilities } from '../taskCapabilities';
 import type { FixLoopSummary } from '../types/task';
 
 /** Format seconds as compact "30s", "5m", "1h" for HB age / queue wait labels. */
@@ -314,17 +317,22 @@ export function getHeartbeatStatus(lastHeartbeat?: string) {
 }
 
 export function TaskTypeBadge({ taskType, expanded }: { taskType?: TaskType; expanded?: boolean }) {
+  // Label derives from the published capability contract (so a newly registered
+  // type renders its real label, not the raw id); icon + color stay UI-local
+  // since they are presentation the backend contract does not carry.
+  const { getLabel } = useTaskCapabilities();
   if (!taskType) return null;
   const style = TASK_TYPE_STYLES[taskType] ?? { bg: 'bg-neutral-500/10 border-neutral-500/20', text: 'text-neutral-400', icon: Hash, label: taskType };
   const Icon = style.icon;
+  const label = getLabel(taskType);
   return (
     <span
       className={`group/badge ${style.bg} ${style.text} border text-[10px] uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-0 hover:gap-1 p-1 hover:px-2 hover:py-0.5 transition-all duration-150 ${expanded ? 'gap-1 px-2 py-0.5' : ''}`}
-      title={style.label}
+      title={label}
     >
       <Icon className="w-3 h-3 shrink-0" />
       <span data-viewport-allow-truncation className={`max-w-0 overflow-hidden group-hover/badge:max-w-[80px] transition-all duration-150 ${expanded ? 'max-w-[80px]' : ''}`}>
-        {style.label}
+        {label}
       </span>
     </span>
   );
@@ -727,6 +735,41 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         {(isTerminal || task.status === 'EVALUATING') && (
           <SrDivergenceBadge task={task} onClick={onOpenSelfReview} />
         )}
+        {(isTerminal || task.status === 'EVALUATING') && task.evaluation_summary?.verdict ? (() => {
+          const { label, tone } = formatVerdict(task.evaluation_summary.verdict);
+          if (!label) return null;
+          return (
+            <span
+              className={`inline-flex items-center text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border ${verdictToneBadgeClass(tone)}`}
+              title={`Evaluation verdict: ${label}`}
+            >
+              {label}
+            </span>
+          );
+        })() : null}
+        {task.status === 'COMPLETED' && task.pr_url ? (() => {
+          if (task.unverified_merge_reason) {
+            const label = humanizeUnverifiedReason(task.unverified_merge_reason);
+            return (
+              <span
+                className="inline-flex items-center text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border bg-amber-500/10 border-amber-500/20 text-amber-400"
+                title={`Merge unverified: ${label}`}
+              >
+                <AlertTriangle className="w-3 h-3 mr-1 shrink-0" />
+                Unverified
+              </span>
+            );
+          }
+          return (
+            <span
+              className="inline-flex items-center text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border bg-emerald-500/10 border-emerald-500/20 text-emerald-400"
+              title="Merge verified by tests"
+            >
+              <ShieldCheck className="w-3 h-3 mr-1 shrink-0" />
+              Verified
+            </span>
+          );
+        })() : null}
       </div>
 
       {isActive && heartbeat.text.startsWith('Stale') && (

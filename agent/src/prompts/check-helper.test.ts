@@ -56,6 +56,12 @@ describe('writeCheckHelper — direct invocation', () => {
     expect(script).toContain('touches agent/');
     expect(script).toContain('touches backend/');
     expect(script).toContain('admin-ui playwright chromium');
+    // The agent vitest suite runs on every ./check (not behind `test`) for
+    // agent-touching changes, routed through `run` so a failure lands in
+    // FAILED and ./check fails closed.
+    expect(script).toContain(`run "agent vitest" bash -c 'set -o pipefail; cd agent && npx vitest run 2>&1 | tail -80'`);
+    // It lives inside the agent stack block, so it only runs when agent/ changed.
+    expect(script).toMatch(/if touches agent\/; then[\s\S]*run "agent vitest"/);
     expect(script).toContain('PASS — all checks green');
     // Size guardrail is wired into the self-repo gate: invoked by reference
     // as the committed checker script, scoped from the touched stacks.

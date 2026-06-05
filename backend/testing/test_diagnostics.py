@@ -14,7 +14,9 @@ from unittest.mock import MagicMock
 from app.routers.admin_debug import (
     _classify_stuck_failure,
     _build_stuck_tasks,
+    _build_direction_portfolio_summary,
     _build_direction_remediation_state,
+    _build_problem_model_trim_verdict,
     get_global_diagnostics,
     get_project_diagnostics,
     DIAGNOSTICS_TOP_N,
@@ -1026,3 +1028,165 @@ class TestProjectDiagnosticsActiveTaskCap:
 
         assert result["active_tasks_truncated"] is False
         assert result["active_tasks_cap"] == _MAX_ACTIVE_TASKS_DEFAULT
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _build_direction_portfolio_summary — surfaces non-code direction health
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_portfolio_summary_surfaces_non_code_direction():
+    """A 0-PR direction with non-code generalized successes is surfaced with
+    its non-code contribution computed as generalized - merged."""
+    project = Project(name="p", user_id="u")
+    project.directions = [
+        {
+            "id": "dir-noncode",
+            "text": "Audit the auth subsystem",
+            "status": "active",
+            "research_history": [
+                {
+                    "cycle": 1,
+                    "prs_merged": 0,
+                    "generalized_successes": 3,
+                }
+            ],
+        }
+    ]
+    summary = _build_direction_portfolio_summary(project)
+    assert len(summary) == 1
+    entry = summary[0]
+    assert entry["direction_id"] == "dir-noncode"
+    assert entry["prs_merged_recent"] == 0
+    assert entry["generalized_successes_recent"] == 3
+    assert entry["non_code_successes_recent"] == 3
+
+
+def test_portfolio_summary_skips_code_only_direction():
+    """A direction whose generalized successes equal its merges (pure code) is
+    omitted to keep the diagnostics payload compact."""
+    project = Project(name="p", user_id="u")
+    project.directions = [
+        {
+            "id": "dir-code",
+            "text": "Ship features",
+            "status": "active",
+            "research_history": [
+                {"cycle": 1, "prs_merged": 2, "generalized_successes": 2},
+            ],
+        }
+    ]
+    assert _build_direction_portfolio_summary(project) == []
+
+
+# ── _build_problem_model_trim_verdict ────────────────────────────────────────
+
+
+def test_trim_verdict_none_without_packer_meta():
+    """Payloads without packer metadata (older / unpacked) yield no verdict."""
+    assert _build_problem_model_trim_verdict({"problem_model": {"gaps": []}}) is None
+
+
+def test_trim_verdict_full_counts_gap_memory_trim():
+    """A problem_model that shipped untrimmed reports status 'full' but still
+    surfaces how many gaps had their append-only memory pre-trimmed."""
+    payload = {
+        "problem_model": {
+            "gaps": [{"id": "g1"}],
+            "_gap_memory_trimmed": [{"gap_id": "g1", "fields": {"history": {"shown": 5, "total": 20}}}],
+        },
+        "_packer_meta": {"budget_total": 122880, "budget_used": 40000, "trimmed": [], "dropped": []},
+    }
+    v = _build_problem_model_trim_verdict(payload)
+    assert v["status"] == "full"
+    assert v["gap_memory_trimmed_count"] == 1
+    assert v["budget_total"] == 122880
+    assert "floor" not in v
+
+
+def test_trim_verdict_summarized():
+    """problem_model listed in _packer_meta.trimmed (but not floored) is 'summarized'."""
+    payload = {
+        "problem_model": {"gaps": []},
+        "_packer_meta": {"trimmed": [{"key": "problem_model", "kind": "summarized"}], "dropped": []},
+    }
+    assert _build_problem_model_trim_verdict(payload)["status"] == "summarized"
+
+
+def test_trim_verdict_floor_takes_precedence_over_summarized():
+    """When the summarize path degraded the model to the floor, status is 'floor'
+    and the floor detail (stripped fields / dropped gaps) is surfaced."""
+    payload = {
+        "problem_model": {
+            "gaps": [],
+            "_agent_view_floor_applied": {
+                "floor_bytes": 32768,
+                "stripped_gap_fields": ["history", "evidence"],
+                "dropped_gaps": 3,
+                "still_over_floor": True,
+            },
+        },
+        "_packer_meta": {"trimmed": [{"key": "problem_model"}], "dropped": []},
+    }
+    v = _build_problem_model_trim_verdict(payload)
+    assert v["status"] == "floor"
+    assert v["floor"]["dropped_gaps"] == 3
+    assert v["floor"]["stripped_gap_fields"] == ["history", "evidence"]
+    assert v["floor"]["summarized_capabilities_count"] == 0
+    assert v["floor"]["summarized_friction_count"] == 0
+    assert v["floor"]["still_over_floor"] is True
+
+
+def test_trim_verdict_floor_surfaces_skeletonized_sections():
+    """Floor verdict includes how many capabilities and friction entries were
+    skeletonized so operators can tell the strategist saw a reduced model."""
+    payload = {
+        "problem_model": {
+            "gaps": [],
+            "_agent_view_floor_applied": {
+                "floor_bytes": 32768,
+                "stripped_gap_fields": [],
+                "dropped_gaps": 0,
+                "summarized_capabilities": 1,
+                "summarized_friction": 1,
+            },
+        },
+        "_packer_meta": {"trimmed": [{"key": "problem_model"}], "dropped": []},
+    }
+    floor = payload["problem_model"]["_agent_view_floor_applied"]
+    assert isinstance(floor["summarized_capabilities"], int)
+    assert isinstance(floor["summarized_friction"], int)
+    v = _build_problem_model_trim_verdict(payload)
+    assert v["status"] == "floor"
+    assert v["floor"]["summarized_capabilities_count"] == 1
+    assert v["floor"]["summarized_friction_count"] == 1
+
+
+def test_trim_verdict_dropped_carries_reason():
+    """A problem_model in _packer_meta.dropped is 'dropped' with its reason."""
+    payload = {
+        "_packer_meta": {
+            "trimmed": [],
+            "dropped": [{"key": "problem_model", "reason": "exceeds remaining budget"}],
+        },
+    }
+    v = _build_problem_model_trim_verdict(payload)
+    assert v["status"] == "dropped"
+    assert v["dropped_reason"] == "exceeds remaining budget"
+
+
+def test_portfolio_summary_skips_inactive_and_empty():
+    """Archived directions and directions with no history produce no entries."""
+    project = Project(name="p", user_id="u")
+    project.directions = [
+        {
+            "id": "dir-archived",
+            "text": "Old",
+            "status": "archived",
+            "research_history": [
+                {"cycle": 1, "prs_merged": 0, "generalized_successes": 5}
+            ],
+        },
+        {"id": "dir-empty", "text": "New", "status": "active", "research_history": []},
+    ]
+    assert _build_direction_portfolio_summary(project) == []

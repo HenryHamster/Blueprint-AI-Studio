@@ -147,4 +147,30 @@ describe('MessageBubble', () => {
     render(<MessageBubble {...makeProps()} />);
     expect(screen.getByTestId('message-bubble')).toBeTruthy();
   });
+
+  test('copyable message ref displays first 8 characters of message id', () => {
+    const msgId = 'abcdef0123456789abcdef';
+    render(<MessageBubble {...makeProps({ msg: makeMsg({ id: msgId }) })} />);
+    expect(screen.getByText('abcdef01')).toBeTruthy();
+  });
+
+  test('copy message ref button copies to clipboard on click', async () => {
+    const msgId = 'abcdef0123456789abcdef';
+    const writeTextMock = vi.fn().mockResolvedValue(undefined);
+    vi.spyOn(navigator.clipboard, 'writeText').mockImplementation(writeTextMock);
+    render(<MessageBubble {...makeProps({ msg: makeMsg({ id: msgId }) })} />);
+    const copyBtn = screen.getByTitle('Copy message ref');
+    fireEvent.click(copyBtn);
+    expect(writeTextMock).toHaveBeenCalledWith('abcdef0123456789abcdef');
+  });
+
+  test('copy message ref shows check icon after successful copy', async () => {
+    const msgId = 'abcdef0123456789abcdef';
+    const writeTextMock = vi.fn().mockResolvedValue(undefined);
+    vi.spyOn(navigator.clipboard, 'writeText').mockImplementation(writeTextMock);
+    render(<MessageBubble {...makeProps({ msg: makeMsg({ id: msgId }) })} />);
+    const copyBtn = screen.getByTitle('Copy message ref');
+    fireEvent.click(copyBtn);
+    expect(screen.getByTestId('message-bubble')).toBeTruthy();
+  });
 });

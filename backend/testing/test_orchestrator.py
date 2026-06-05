@@ -2595,6 +2595,156 @@ class TestMarkUnblockedDependents:
         await db_session.refresh(dependent)
         assert dependent.context.get("_deps_satisfied") is True
 
+    @pytest.mark.asyncio
+    async def test_does_not_mark_dependent_when_recut_conflicts(
+        self, db_session, mocker
+    ):
+        """Completion-side warm-claim path: when a re-cut conflicts, the marker
+        is NOT stamped, so the dependent stays unmarked and must wait for
+        dispatch's retry path to resolve the conflict.
+
+        Regression guard: a conflicting re-cut must prevent warm-claim stamping
+        BEFORE it happens (not clear it after). This ensures a dependent never
+        becomes warm-claimable against a base missing the landed dependency code."""
+        from app.orchestrator import _mark_unblocked_dependents
+        from app.landed_signal import mark_landed_on_integration
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            return_value={"merged": False, "conflict": True},
+        )
+        project = make_project(
+            name="UnblockConflict", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Cross-base code dependency that has landed.
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        mark_landed_on_integration(dep)
+        # Dependent on a different base where re-cut will conflict.
+        completed = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "base_branch": "plan/bbb"}],
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add_all([dep, completed])
+        await db_session.commit()
+        await db_session.refresh(dep)
+        await db_session.refresh(completed)
+
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "plan/bbb"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep.id), str(completed.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+        await db_session.refresh(dependent)
+
+        mocker.patch(
+            "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
+
+        # Re-cut conflicts → no dependents marked.
+        marked = await _mark_unblocked_dependents(completed, self._verify_true)
+        assert marked == 0
+
+        # Dependent must NOT have the warm-claim marker.
+        db_session.expire(dependent)
+        await db_session.refresh(dependent)
+        assert not (dependent.context or {}).get("_deps_satisfied")
+
+    @pytest.mark.asyncio
+    async def test_does_not_mark_dependent_when_recut_errors(
+        self, db_session, mocker
+    ):
+        """Completion-side warm-claim path: transient re-cut errors (GitHub API
+        failures, credential issues) hold the dependent for retry next cycle
+        instead of stamping it as warm-claimable against an un-recut base.
+
+        The dependent stays QUEUED and unmarked, so it will be re-evaluated on
+        the next completion cycle (once the transient error resolves or an
+        operator manually retries)."""
+        from app.orchestrator import _mark_unblocked_dependents
+        from app.landed_signal import mark_landed_on_integration
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        # Simulate a transient GitHub API error (e.g. rate limit, timeout).
+        mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            side_effect=Exception("GitHub API timeout"),
+        )
+        project = make_project(
+            name="UnblockTransient", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Cross-base code dependency that has landed.
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        mark_landed_on_integration(dep)
+        # Dependent on a different base where re-cut will error.
+        completed = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "base_branch": "plan/bbb"}],
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add_all([dep, completed])
+        await db_session.commit()
+        await db_session.refresh(dep)
+        await db_session.refresh(completed)
+
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "plan/bbb"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep.id), str(completed.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+        await db_session.refresh(dependent)
+
+        mocker.patch(
+            "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
+
+        # Transient error → no dependents marked.
+        marked = await _mark_unblocked_dependents(completed, self._verify_true)
+        assert marked == 0
+
+        # Dependent must NOT have the warm-claim marker; stays QUEUED for retry.
+        db_session.expire(dependent)
+        await db_session.refresh(dependent)
+        assert not (dependent.context or {}).get("_deps_satisfied")
+        assert dependent.status == TaskStatus.QUEUED
+
 
 class TestOrchestratorClosureSafety:
     """Regression: a `from app.compute import X` inside orchestrator_worker
@@ -2781,6 +2931,81 @@ class TestWarmVMSkipProvision:
         mocker.patch("asyncio.sleep", side_effect=asyncio.CancelledError())
         with contextlib.suppress(asyncio.CancelledError):
             await _orch_module.orchestrator_worker()
+
+    @pytest.mark.asyncio
+    async def test_failed_foundation_dependent_cancelled_on_zero_slot_cycle(
+        self, orch_warm_db, mocker
+    ):
+        """Slot-independent dependency recovery runs even when no dispatch
+        slots are free (auto-paused, max_concurrent_vms=0): a stale QUEUED
+        dependent of a FAILED foundation is cascade-cancelled in the same
+        cycle, instead of piling up until a slot frees. Regression guard for
+        the idle/saturated short-circuit that used to skip ALL dependency
+        recovery."""
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        # Force the zero-slots / paused short-circuit: cap = 0 so
+        # slots_available == 0 and the loop takes the idle branch.
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+        _orch_module._runtime_config["max_concurrent_vms"] = 0
+        # Open the deadlock-scan throttle so the recovery runs this cycle.
+        _orch_module._last_deadlock_check = 0.0
+        prov_mock = mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+
+        stale = self._naive_utcnow() - timedelta(minutes=15)
+        async with orch_warm_db() as session:
+            project = make_project(name="Zero-Slot Recovery", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            foundation = make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                payloads=[{"type": "create", "prompt": "foundation"}],
+                created_at=stale,
+            )
+            session.add(foundation)
+            await session.commit()
+            await session.refresh(foundation)
+
+            dependent = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "create", "prompt": "dependent"}],
+                depends_on=[str(foundation.id)],
+                created_at=stale,
+            )
+            session.add(dependent)
+            await session.commit()
+            await session.refresh(dependent)
+            dep_id = dependent.id
+
+        await self._run_one_cycle(mocker)
+
+        # No slot was free, so nothing was dispatched...
+        prov_mock.assert_not_called()
+        # ...but the failed foundation's dependent was still reclaimed.
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == dep_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            assert row.status == TaskStatus.CANCELLED, (
+                "Dependent of a FAILED foundation must be cascade-cancelled on "
+                f"a zero-slots/paused cycle, got {row.status}"
+            )
 
     @pytest.mark.asyncio
     async def test_warm_pin_with_recent_heartbeat_skips_provision(
@@ -4090,6 +4315,62 @@ class TestClassifyStuckTasksSharedPolicy:
         assert out == [(stuck.id, "dead_deps")]
 
     @pytest.mark.asyncio
+    async def test_requeue_dep_remap_follows_structural_provenance(self, db_session):
+        """Remapping a requeue-cancelled edge moves its structural provenance too.
+
+        Regression: the dispatcher rewrites an existing dependent's ``depends_on``
+        from a cancelled dep ID to its replacement clone, but used to leave
+        ``_structural_depends_on_ids`` pointing at the dead ID. That made the
+        surviving prerequisite edge invisible to ``_has_edge_prerequisite_provenance``
+        so clear-wave-deps would later strip it as legacy sequencing.
+        """
+        from app.orchestrator import _persist_requeue_dep_remap
+        from app.depends_on_provenance import get_structural_depends_on_ids
+        from app.routers.admin_operator_triggers import (
+            _has_edge_prerequisite_provenance,
+        )
+
+        project = make_project(name="RemapProvenance", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        old_dep_id = str(uuid.uuid4())
+        new_dep_id = str(uuid.uuid4())
+
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "dependent"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[old_dep_id],
+            context={"_structural_depends_on_ids": [old_dep_id]},
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+        await db_session.refresh(dependent)
+
+        # Edge is a recognized structural prerequisite before the remap.
+        assert _has_edge_prerequisite_provenance(dependent, old_dep_id)
+
+        remapped = await _persist_requeue_dep_remap(
+            dependent, {old_dep_id: new_dep_id}
+        )
+        assert remapped is True
+
+        # In-memory task updated on BOTH axes.
+        assert dependent.depends_on == [new_dep_id]
+        assert get_structural_depends_on_ids(dependent) == [new_dep_id]
+        # The live edge still resolves as a prerequisite (so clear-wave-deps keeps it),
+        # and the dead edge no longer does.
+        assert _has_edge_prerequisite_provenance(dependent, new_dep_id)
+        assert not _has_edge_prerequisite_provenance(dependent, old_dep_id)
+
+        # Persisted copy carries the same remap.
+        await db_session.refresh(dependent)
+        assert dependent.depends_on == [new_dep_id]
+        assert get_structural_depends_on_ids(dependent) == [new_dep_id]
+
+    @pytest.mark.asyncio
     async def test_requeue_cancelled_dep_with_active_clone_waits(self, db_session):
         from app.orchestrator_health import _classify_stuck_tasks
 
@@ -4175,6 +4456,93 @@ class TestClassifyStuckTasksSharedPolicy:
         # A genuine A<->B cycle: both members cleared-and-dispatched.
         assert sorted(reason for _, reason in out) == ["cycle", "cycle"]
         assert {tid for tid, _ in out} == {a.id, b.id}
+
+    @pytest.mark.asyncio
+    async def test_parked_blocked_foundation_strands_dependent(self, db_session):
+        from app.orchestrator_health import _classify_stuck_tasks
+
+        project = make_project(name="StuckParked", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Foundation is BLOCKED *and* escalated-and-parked (recovery exhausted).
+        foundation = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "foundation"}],
+            status=TaskStatus.BLOCKED,
+            context={"_blocked_escalated": True},
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        stuck = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "stuck"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(foundation.id)],
+        )
+        db_session.add(stuck)
+        await db_session.commit()
+        await db_session.refresh(stuck)
+
+        out = await _classify_stuck_tasks(
+            [stuck],
+            {stuck.id: {foundation.id}},
+            {foundation.id: foundation},
+            {stuck.id},
+            db_session,
+            self._noop_verify,
+        )
+        # Parked foundation strands the dependent → surface for escalation, never
+        # silently waiting and never cleared-and-dispatched.
+        assert out == [(stuck.id, "stranded_parked")]
+
+    @pytest.mark.asyncio
+    async def test_recovering_blocked_foundation_keeps_dependent_waiting(
+        self, db_session
+    ):
+        from app.orchestrator_health import _classify_stuck_tasks
+
+        project = make_project(name="StuckRecovering", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Foundation is BLOCKED but still being actively rechecked/resumed — NOT
+        # escalated-and-parked, so it must NOT strand the dependent.
+        foundation = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "foundation"}],
+            status=TaskStatus.BLOCKED,
+            context={"_blocked_recheck_attempts": 1},
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        stuck = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "stuck"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(foundation.id)],
+        )
+        db_session.add(stuck)
+        await db_session.commit()
+        await db_session.refresh(stuck)
+
+        out = await _classify_stuck_tasks(
+            [stuck],
+            {stuck.id: {foundation.id}},
+            {foundation.id: foundation},
+            {stuck.id},
+            db_session,
+            self._noop_verify,
+        )
+        # Still-recovering BLOCKED foundation is a normal in-flight wait — the
+        # dependent keeps waiting unchanged, not stranded.
+        assert out == []
 
 
 # ── BLOCKED tasks are undispatchable on the normal queue path ────────────────
@@ -4287,6 +4655,42 @@ class TestCrossBaseCodeDependencyPolicy:
         dep = self._dep("create", ["backend/testing/test_foo.py"])
         dependent = self._dependent("create", ["backend/testing/test_foo.py"])
         assert is_genuine_code_dependency(dependent, dep) is False
+
+    def test_transforming_dependent_with_file_overlap_is_genuine(self):
+        from app.orchestrator_health import is_genuine_code_dependency
+
+        # A fix/refactor that overlaps the dependency's files is a genuine code
+        # relationship — transforming dependent + overlap = real code dep.
+        dep = self._dep("create", ["backend/app/foo.py", "backend/app/bar.py"])
+        dependent = self._dependent("fix", ["backend/app/foo.py", "backend/app/baz.py"])
+        assert is_genuine_code_dependency(dependent, dep) is True
+
+    def test_transforming_dependent_refactor_with_disjoint_files_is_ordering_only(self):
+        from app.orchestrator_health import is_genuine_code_dependency
+
+        # Refactor transforming dependent with provably disjoint files from dependency
+        # is ordering-only (no code relationship).
+        dep = self._dep("create", ["backend/app/old_implementation.py"])
+        dependent = self._dependent("refactor", ["backend/app/new_structure.py"])
+        assert is_genuine_code_dependency(dependent, dep) is False
+
+    def test_transforming_dependent_modify_dependent_without_files_is_genuine(self):
+        from app.orchestrator_health import is_genuine_code_dependency
+
+        # A modify dependent with no declared files against a code-producing dep
+        # cannot disprove overlap, so it's treated as genuine (hold rather than risk).
+        dep = self._dep("create", ["backend/app/foo.py"])
+        dependent = self._dependent("modify", [])  # no files declared
+        assert is_genuine_code_dependency(dependent, dep) is True
+
+    def test_transforming_dependent_fix_with_dependency_having_no_files_is_genuine(self):
+        from app.orchestrator_health import is_genuine_code_dependency
+
+        # When the dependency declares no files, we cannot disprove overlap, so the
+        # transforming-dependent edge (fix) is treated as genuine.
+        dep = self._dep("create", [])  # no files
+        dependent = self._dependent("fix", ["backend/app/foo.py"])
+        assert is_genuine_code_dependency(dependent, dep) is True
 
 
 class TestCrossBaseDependencyGate:
@@ -4777,3 +5181,240 @@ class TestCrossBaseBaseRecut:
         _, kwargs = merge_mock.await_args
         assert kwargs.get("base") == "plan/bbb"
         assert kwargs.get("head") == "main"
+
+
+class TestCrossBaseRecutBounding:
+    """A held cross-base re-cut that keeps failing is BOUNDED and ESCALATED rather
+    than retried silently forever: a persistent genuine conflict raises ONE
+    deduplicated operator alert (with an observable status message + context
+    marker), a transient error keeps retrying with backoff and never escalates,
+    and a later successful re-cut clears the accounting and resolves the alert
+    (``orchestrator_health.ensure_dependent_base_recut``)."""
+
+    @staticmethod
+    def _landed_cross_base_pair(project):
+        from app.landed_signal import mark_landed_on_integration
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        mark_landed_on_integration(dep)
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "plan/bbb"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        return dep, dependent
+
+    @staticmethod
+    async def _open_escalation_alerts(db_session, dependent):
+        from sqlmodel import select
+        from app.models import Alert
+
+        return (
+            (
+                await db_session.execute(
+                    select(Alert).where(
+                        Alert.task_id == dependent.id,
+                        Alert.dismissed_at.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    @pytest.mark.asyncio
+    async def test_single_conflict_increments_attempts_and_holds(
+        self, db_session, mocker
+    ):
+        """A single conflict holds the dependent (False), records ONE consecutive
+        conflict, and — being below the bound — does NOT escalate."""
+        from app.orchestrator_health import ensure_dependent_base_recut
+
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            return_value={"merged": False, "conflict": True},
+        )
+        project = make_project(
+            name="RecutBound1", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        dep, dependent = self._landed_cross_base_pair(project)
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        ok = await ensure_dependent_base_recut(dependent, [dep], db_session)
+        assert ok is False
+        assert dependent.context.get("_recut_conflict_attempts") == 1
+        assert dependent.context.get("_recut_last_outcome") == "conflict"
+        assert dependent.context.get("_recut_escalated") is None
+        assert await self._open_escalation_alerts(db_session, dependent) == []
+
+    @pytest.mark.asyncio
+    async def test_persistent_conflict_escalates_exactly_once(
+        self, db_session, mocker
+    ):
+        """After the bound is reached a persistent conflict escalates EXACTLY ONCE
+        (deduplicated); the task carries the status message + context marker, and
+        running the path again does not create a second alert."""
+        from app.orchestrator_health import (
+            ensure_dependent_base_recut,
+            _RECUT_CONFLICT_ESCALATION_THRESHOLD,
+        )
+        from app.models import AlertSeverity
+
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            return_value={"merged": False, "conflict": True},
+        )
+        project = make_project(
+            name="RecutBound2", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        dep, dependent = self._landed_cross_base_pair(project)
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        # Drive consecutive conflicts up to (and past) the escalation bound.
+        for _ in range(_RECUT_CONFLICT_ESCALATION_THRESHOLD):
+            assert await ensure_dependent_base_recut(dependent, [dep], db_session) is False
+
+        assert dependent.context.get("_recut_escalated") is True
+        assert "persistent merge conflict" in (dependent.latest_status_message or "")
+        alerts = await self._open_escalation_alerts(db_session, dependent)
+        assert len(alerts) == 1
+        assert alerts[0].severity == AlertSeverity.ERROR
+
+        # Running again must NOT create a second alert (deduped + post-escalation
+        # backoff short-circuits the merge call).
+        assert await ensure_dependent_base_recut(dependent, [dep], db_session) is False
+        alerts_again = await self._open_escalation_alerts(db_session, dependent)
+        assert len(alerts_again) == 1
+
+    @pytest.mark.asyncio
+    async def test_transient_error_retries_with_backoff_without_escalating(
+        self, db_session, mocker
+    ):
+        """A transient re-cut error retries with backoff WITHOUT escalating: no
+        alert, the consecutive-conflict streak stays at 0, and the backed-off
+        recheck accounting increments no matter how many times it recurs."""
+        from app.orchestrator_health import (
+            ensure_dependent_base_recut,
+            _RECUT_CONFLICT_ESCALATION_THRESHOLD,
+        )
+
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            return_value={"merged": False, "conflict": False},
+        )
+        project = make_project(
+            name="RecutBound3", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        dep, dependent = self._landed_cross_base_pair(project)
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        # Far more attempts than the conflict bound — a transient class must never
+        # escalate.
+        for _ in range(_RECUT_CONFLICT_ESCALATION_THRESHOLD + 2):
+            assert await ensure_dependent_base_recut(dependent, [dep], db_session) is False
+
+        assert dependent.context.get("_recut_conflict_attempts") == 0
+        assert dependent.context.get("_recut_last_outcome") == "error"
+        assert dependent.context.get("_recut_escalated") is None
+        assert dependent.context.get("_recut_recheck_attempts") == (
+            _RECUT_CONFLICT_ESCALATION_THRESHOLD + 2
+        )
+        assert dependent.recheck_after is not None
+        assert await self._open_escalation_alerts(db_session, dependent) == []
+
+    @pytest.mark.asyncio
+    async def test_successful_recut_clears_accounting_and_resolves_alert(
+        self, db_session, mocker
+    ):
+        """A re-cut that later SUCCEEDS clears the ``_recut_*`` accounting, lets the
+        dependent dispatch normally (True), and resolves the open escalation."""
+        from app.orchestrator_health import (
+            ensure_dependent_base_recut,
+            _utcnow,
+            _RECUT_CONFLICT_ESCALATION_THRESHOLD,
+        )
+
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        merge_mock = mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            return_value={"merged": False, "conflict": True},
+        )
+        project = make_project(
+            name="RecutBound4", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        dep, dependent = self._landed_cross_base_pair(project)
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        # Escalate via persistent conflicts.
+        for _ in range(_RECUT_CONFLICT_ESCALATION_THRESHOLD):
+            await ensure_dependent_base_recut(dependent, [dep], db_session)
+        assert dependent.context.get("_recut_escalated") is True
+        assert len(await self._open_escalation_alerts(db_session, dependent)) == 1
+
+        # Rewind the post-escalation backoff window so the next attempt re-issues
+        # the merge, and make that merge succeed.
+        dependent.context = {
+            **dependent.context,
+            "_recut_recheck_after": (_utcnow() - timedelta(hours=1)).isoformat(),
+        }
+        db_session.add(dependent)
+        await db_session.commit()
+        merge_mock.return_value = {"merged": True, "already": False}
+
+        ok = await ensure_dependent_base_recut(dependent, [dep], db_session)
+        assert ok is True
+        # Accounting fully cleared.
+        assert not any(
+            str(k).startswith("_recut_") for k in (dependent.context or {})
+        )
+        # Open escalation reconciled (dismissed).
+        assert await self._open_escalation_alerts(db_session, dependent) == []

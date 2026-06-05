@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import type { Task } from './types/task';
 import { API_BASE_URL, apiFetch, authHeaders, authGet } from './api';
 import { useToasts } from './components/Toasts';
@@ -21,6 +21,7 @@ import { useTasksState } from './hooks/useTasksState';
 import { useProjectsState } from './hooks/useProjectsState';
 import { useAlertsState } from './hooks/useAlertsState';
 import { useProjectConfig } from './hooks/useProjectConfig';
+import { resolveTaskCapabilities } from './taskCapabilities';
 
 export type { DeployState } from './types/settings';
 
@@ -79,10 +80,9 @@ export function useAppState() {
     trackedTaskIds, trackedLogs, trackTask, untrackTask, untrackAll,
   } = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, selectedProjectId });
 
-  const { searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter, stuckMinSeconds, setStuckMinSeconds, failureClassFilter, setFailureClassFilter } = useSearchFilters();
-
   const {
     showResearchBrowser, setShowResearchBrowser,
+    showKnowledgeBrowser, setShowKnowledgeBrowser,
     showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
     showMessages, setShowMessages,
     showSettings, setShowSettings,
@@ -97,17 +97,6 @@ export function useAppState() {
     confirmDialog, setConfirmDialog,
   } = useUIState();
   const [researchFeed, setResearchFeed] = useState<Task[]>([]);
-
-  const {
-    showNewTaskModal, setShowNewTaskModal,
-    newTaskRepo, newTaskBranch, newTaskTitle, newTaskPrompt, newTaskType,
-    newTaskPrNumber, newTaskPrBranch, newTaskModel, newTaskEffort,
-    setNewTaskRepo, setNewTaskBranch, setNewTaskTitle, setNewTaskPrompt,
-    setNewTaskType, setNewTaskPrNumber, setNewTaskPrBranch, setNewTaskModel, setNewTaskEffort,
-    repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
-    branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
-    openNewTaskModal, openDuplicateTaskModal, openPrefilledTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
-  } = useTaskModal(defaultTaskType, addToast, fetchTasksRef, defaultTaskBranchRef, selectedProjectRepoRef);
 
   const {
     maxConcurrentVMs, maxRetries, maxAutonomousTasksPerHour,
@@ -133,6 +122,7 @@ export function useAppState() {
     providerSettingsByEffort,
     providerSelectionMode,
     crossProviderFallbackEnabled, providers,
+    taskCapabilityContract,
     providerSettingsDefaults, taskTypeProviderOverrides,
     buildConfig, setBuildConfig,
     fetchSettings,
@@ -154,6 +144,25 @@ export function useAppState() {
     handleUpdateDirectionCooldownMinutes, handleUpdateStrategicResearchFrequency,
     updateHealthCheckUrls, updateNotificationConfig, updateDailyCostCeiling, updateBuildConfig,
   } = useSettings(addToast);
+  const taskTypeFilterValues = useMemo(
+    () => resolveTaskCapabilities(taskCapabilityContract).filterIds,
+    [taskCapabilityContract],
+  );
+  const { searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter, stuckMinSeconds, setStuckMinSeconds, failureClassFilter, setFailureClassFilter } = useSearchFilters(taskTypeFilterValues);
+
+  // useTaskModal runs after useSettings so it can consume the published
+  // task-capability contract for its launchable-type guard.
+  const {
+    showNewTaskModal, setShowNewTaskModal,
+    newTaskRepo, newTaskBranch, newTaskTitle, newTaskPrompt, newTaskType,
+    newTaskPrNumber, newTaskPrBranch, newTaskModel, newTaskEffort,
+    setNewTaskRepo, setNewTaskBranch, setNewTaskTitle, setNewTaskPrompt,
+    setNewTaskType, setNewTaskPrNumber, setNewTaskPrBranch, setNewTaskModel, setNewTaskEffort,
+    repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
+    branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
+    launchableTaskTypeOptions,
+    openNewTaskModal, openDuplicateTaskModal, openPrefilledTaskModal, openWebResearchTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
+  } = useTaskModal(defaultTaskType, addToast, fetchTasksRef, defaultTaskBranchRef, selectedProjectRepoRef, taskCapabilityContract);
 
   const {
     allowedUsers, addAllowedUser, updateAllowedUserRole, removeAllowedUser,
@@ -537,6 +546,7 @@ export function useAppState() {
     logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason, handleViewLogs, closeLogViewer,
     // Research browser
     showResearchBrowser, setShowResearchBrowser,
+    showKnowledgeBrowser, setShowKnowledgeBrowser,
     researchFeed,
     // Activity feed
     showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
@@ -550,8 +560,9 @@ export function useAppState() {
     setNewTaskType, setNewTaskPrNumber, setNewTaskPrBranch, setNewTaskModel, setNewTaskEffort,
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
+    launchableTaskTypeOptions,
     taskBranchDefaultsReady, taskBranchDefaultsLoading, taskBranchDefaultsError,
-    openNewTaskModal, openDuplicateTaskModal, openPrefilledTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
+    openNewTaskModal, openDuplicateTaskModal, openPrefilledTaskModal, openWebResearchTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
     // Defaults
     defaultTaskType, setDefaultTaskType,
     notifyOnComplete, setNotifyOnComplete,
@@ -596,6 +607,7 @@ export function useAppState() {
     providerSettingsByEffort,
     providerSelectionMode,
     crossProviderFallbackEnabled, providers,
+    taskCapabilityContract,
     providerSettingsDefaults, taskTypeProviderOverrides,
     updateProviderTierModels, updateTaskTypeModelPreferenceConfig,
     updateTaskTypeCategories, updateCategoryRouting, updateTaskTypeRouting,

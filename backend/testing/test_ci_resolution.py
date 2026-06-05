@@ -252,6 +252,77 @@ def test_classify_verdict_pass():
     assert detail == ""
 
 
+def test_classify_verdict_heavily_skipped_pass_surfaces_coverage_detail():
+    # A detected suite RAN and PASSED but its coverage shows almost every test
+    # was skipped (5 passed, 1500 skipped). Outcome stays a non-blocking "pass",
+    # but detail surfaces the coverage summary so the operator can tell it apart
+    # from a fully-exercised pass.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "coverage": {"passed": 5, "skipped": 1500, "total": 1505},
+        }
+    )
+    assert outcome == "pass"
+    assert detail == "passed 5, skipped 1500 of 1505"
+
+
+def test_classify_verdict_pass_low_skip_keeps_empty_detail():
+    # A fully-exercised pass (few skips) is unchanged: empty detail.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "coverage": {"passed": 1500, "skipped": 5, "total": 1505},
+        }
+    )
+    assert outcome == "pass"
+    assert detail == ""
+
+
+def test_classify_verdict_pass_below_total_floor_keeps_empty_detail():
+    # A tiny suite (total under the floor) where a couple of tests skipped is
+    # not flagged — a high ratio on a 5-test suite is meaningless.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "coverage": {"passed": 1, "skipped": 4, "total": 5},
+        }
+    )
+    assert outcome == "pass"
+    assert detail == ""
+
+
+def test_classify_verdict_pass_missing_or_malformed_coverage_is_defensive():
+    # Older agents emit no coverage; malformed coverage must not crash. All keep
+    # today's ("pass", "") behavior.
+    for verdict in (
+        {"detected": True, "passed": True},
+        {"detected": True, "passed": True, "coverage": None},
+        {"detected": True, "passed": True, "coverage": "1500 skipped"},
+        {"detected": True, "passed": True, "coverage": {"total": 0}},
+        {"detected": True, "passed": True, "coverage": {"skipped": "x", "total": 10}},
+    ):
+        assert ci_resolution.classify_merge_test_verdict(verdict) == ("pass", "")
+
+
+def test_classify_verdict_heavily_skipped_pass_still_nonblocking():
+    # The enriched detail must not flip the merge gate: a heavily-skipped pass
+    # still maps to conclusion="success" with no failed_logs.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "coverage": {"passed": 5, "skipped": 1500, "total": 1505},
+        }
+    )
+    ci_result = ci_resolution.build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "success"
+    assert ci_result["failed_logs"] == ""
+
+
 def test_classify_verdict_fail_carries_output():
     outcome, detail = ci_resolution.classify_merge_test_verdict(
         {"detected": True, "passed": False, "tests": [], "output": "2 failed"}
@@ -276,6 +347,39 @@ def test_classify_verdict_detected_false_is_undetected():
     assert detail == ""
 
 
+def test_classify_verdict_partial_setup_failed_blocks_not_falls_open():
+    # SOME-but-not-all runners failed setup: a suite never executed. The verdict
+    # arrives detected=false (the runners that ran may have passed) but it MUST
+    # NOT fall open to undetected — it blocks (fail) so the gate fails closed.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": False,
+            "passed": False,
+            "partialSetupFailed": True,
+            "output": "Partial setup failure — [npm test (ui)] npm ci failed",
+        }
+    )
+    assert outcome == "fail"
+    assert "npm ci failed" in detail
+
+
+def test_classify_verdict_partial_setup_failed_blank_output_gets_fallback():
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {"detected": False, "passed": False, "partialSetupFailed": True}
+    )
+    assert outcome == "fail"
+    assert detail  # non-empty fallback naming the partial setup failure
+
+
+def test_classify_verdict_partial_setup_failed_wins_over_sibling_pass():
+    # Even if a sibling runner's pass is reflected as passed=True, the
+    # partial-setup signal is checked first and still blocks.
+    outcome, _ = ci_resolution.classify_merge_test_verdict(
+        {"detected": True, "passed": True, "partialSetupFailed": True}
+    )
+    assert outcome == "fail"
+
+
 def test_classify_verdict_none_is_undetected():
     # Verify task crashed / produced no artifact → fall back, don't block.
     assert ci_resolution.classify_merge_test_verdict(None) == ("undetected", "")
@@ -283,6 +387,234 @@ def test_classify_verdict_none_is_undetected():
         "undetected",
         "",
     )
+
+
+# disabled_tests_block — defensive parse of the optional VISIBILITY block an
+# agent attaches when a PR newly introduces test-skip/disable markers. Parsing
+# it NEVER changes the merge decision (visibility-only).
+
+
+def test_disabled_tests_block_parses_present_block():
+    block = ci_resolution.disabled_tests_block(
+        {
+            "detected": True,
+            "passed": True,
+            "disabledTests": {
+                "count": 2,
+                "markers": [
+                    {"file": "a.test.ts", "marker": "it.skip", "line": "it.skip('x')"},
+                    {
+                        "file": "test_b.py",
+                        "marker": "@pytest.mark.skip",
+                        "line": "@pytest.mark.skip",
+                    },
+                ],
+            },
+        }
+    )
+    assert block is not None
+    assert block["count"] == 2
+    assert len(block["markers"]) == 2
+    assert block["markers"][0] == {
+        "file": "a.test.ts",
+        "marker": "it.skip",
+        "line": "it.skip('x')",
+    }
+
+
+def test_disabled_tests_block_absent_or_malformed_is_none():
+    # Missing field, non-dict block, zero/negative/non-int count, and a non-dict
+    # verdict all degrade silently to None (older-agent compatible).
+    for verdict in (
+        {"detected": True, "passed": True},
+        {"disabledTests": None},
+        {"disabledTests": "2 disabled"},
+        {"disabledTests": {"count": 0, "markers": []}},
+        {"disabledTests": {"count": -1}},
+        {"disabledTests": {"count": "two"}},
+        None,
+        "not a dict",
+    ):
+        assert ci_resolution.disabled_tests_block(verdict) is None
+
+
+def test_disabled_tests_block_caps_markers():
+    raw_markers = [
+        {"file": f"f{i}.test.ts", "marker": "it.skip", "line": "it.skip()"}
+        for i in range(50)
+    ]
+    block = ci_resolution.disabled_tests_block(
+        {"disabledTests": {"count": 50, "markers": raw_markers}}
+    )
+    assert block is not None
+    # The reported count is preserved, but the markers list is bounded.
+    assert block["count"] == 50
+    assert len(block["markers"]) == 20
+
+
+def test_classify_verdict_disabled_tests_surfaces_on_pass_without_blocking():
+    # A passing suite whose PR newly disabled tests stays a non-blocking "pass",
+    # but detail surfaces the count so the operator can see it.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "disabledTests": {
+                "count": 3,
+                "markers": [
+                    {"file": "a.test.ts", "marker": "it.skip", "line": "it.skip()"}
+                ],
+            },
+        }
+    )
+    assert outcome == "pass"
+    assert "disables 3 test(s)" in detail
+    # Must not flip the merge gate to a block.
+    ci_result = ci_resolution.build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "success"
+    assert ci_result["failed_logs"] == ""
+
+
+def test_classify_verdict_disabled_tests_absence_changes_nothing():
+    # The SAME verdict with vs without the disabledTests field must produce the
+    # identical (outcome, detail) — absence changes nothing.
+    base = {"detected": True, "passed": True, "output": ""}
+    with_field = {
+        **base,
+        "disabledTests": {"count": 0, "markers": []},  # malformed/zero → ignored
+    }
+    assert ci_resolution.classify_merge_test_verdict(
+        base
+    ) == ci_resolution.classify_merge_test_verdict(with_field) == ("pass", "")
+
+
+def test_classify_verdict_disabled_tests_pairs_with_heavy_skip_blocks():
+    # When the PR newly disabled tests AND the resulting "pass" is heavily/mostly
+    # skipped, the PR self-suppressed its own suite — this now BLOCKS (fail)
+    # rather than passing with a visibility note: the suite was made green by
+    # skipping, not by passing.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "coverage": {"passed": 5, "skipped": 1500, "total": 1505},
+            "disabledTests": {
+                "count": 1,
+                "markers": [
+                    {"file": "a.test.ts", "marker": "it.skip", "line": "it.skip()"}
+                ],
+            },
+        }
+    )
+    assert outcome == "fail"
+    assert "self-suppressed" in detail
+    assert "1 test(s)" in detail
+    # The detail names the PR-introduced markers so the spawned fix task knows.
+    assert "it.skip" in detail
+    # And it routes to the block-and-fix path.
+    ci_result = ci_resolution.build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "failure"
+
+
+# ---------------------------------------------------------------------------
+# pr_self_suppressed_suite — the PR's OWN diff disabled tests AND the resulting
+# suite no longer verifies anything (all-skipped or mostly-skipped pass). This
+# is the new BLOCKING conjunction; the preservation cases keep the conservative
+# non-blocking behavior for environmental skips and small flaky quarantines.
+# ---------------------------------------------------------------------------
+def test_pr_self_suppressed_all_skipped_with_markers_blocks():
+    # detected=False + all-skipped + PR newly introduced skip markers => "fail".
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": False,
+            "noTestsReason": "all_skipped",
+            "disabledTests": {
+                "count": 2,
+                "markers": [
+                    {"file": "t_a.py", "marker": "@pytest.mark.skip", "line": "1"},
+                    {"file": "t_b.py", "marker": "@pytest.mark.skip", "line": "2"},
+                ],
+            },
+        }
+    )
+    assert outcome == "fail"
+    assert "self-suppressed" in detail
+    assert "2 test(s)" in detail
+    assert "@pytest.mark.skip" in detail
+    ci_result = ci_resolution.build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "failure"
+
+
+def test_pr_self_suppressed_predicate_conjunction():
+    # The helper fires ONLY when BOTH the disabled-tests block AND a non-verifying
+    # suite are present.
+    disabled = {"count": 1, "markers": []}
+    # Both present (all-skipped) => True.
+    assert ci_resolution.pr_self_suppressed_suite(
+        {"detected": False, "noTestsReason": "all_skipped", "disabledTests": disabled}
+    )
+    # Both present (heavy-skip pass) => True.
+    assert ci_resolution.pr_self_suppressed_suite(
+        {
+            "detected": True,
+            "passed": True,
+            "coverage": {"passed": 5, "skipped": 1500, "total": 1505},
+            "disabledTests": disabled,
+        }
+    )
+    # Non-verifying but NO disabledTests (environmental skip) => False.
+    assert not ci_resolution.pr_self_suppressed_suite(
+        {"detected": False, "noTestsReason": "all_skipped"}
+    )
+    # disabledTests present but suite genuinely runs (fully-exercised pass) => False.
+    assert not ci_resolution.pr_self_suppressed_suite(
+        {"detected": True, "passed": True, "disabledTests": disabled}
+    )
+
+
+def test_preserve_environmental_all_skipped_without_markers_falls_open():
+    # An all-skipped suite where the PR did NOT introduce the skips (no
+    # disabledTests block) MUST keep falling open as "undetected".
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {"detected": False, "noTestsReason": "all_skipped"}
+    )
+    assert outcome == "undetected"
+    assert detail == ""
+
+
+def test_preserve_environmental_heavy_skip_pass_without_markers_passes():
+    # A mostly-skipped pass with NO disabledTests block keeps passing (visibility
+    # detail only).
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "coverage": {"passed": 5, "skipped": 1500, "total": 1505},
+        }
+    )
+    assert outcome == "pass"
+    assert detail == "passed 5, skipped 1500 of 1505"
+
+
+def test_preserve_small_flaky_quarantine_with_markers_passes():
+    # A small flaky quarantine: a disabledTests block IS present but the suite
+    # still genuinely runs (NOT all-skipped, NOT heavy-skip). MUST keep passing
+    # with the existing visibility note.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "coverage": {"passed": 1400, "skipped": 3, "total": 1403},
+            "disabledTests": {
+                "count": 3,
+                "markers": [
+                    {"file": "a.test.ts", "marker": "it.skip", "line": "1"}
+                ],
+            },
+        }
+    )
+    assert outcome == "pass"
+    assert "disables 3 test(s)" in detail
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +649,153 @@ def test_build_ci_result_undetected_proceeds_unverified():
     result = ci_resolution.build_no_ci_gate_ci_result("undetected")
     assert result["conclusion"] == "success"
     assert result["failed_logs"] == ""
+
+
+# ---------------------------------------------------------------------------
+# classify_unverified_fall_open_reason — refine the operator-visible reason a
+# detected=false fall-open records on merge_gate_runtime.last_unverified_reason.
+# Purely cosmetic to operators: the pass/fail/undetected decision is unchanged.
+# ---------------------------------------------------------------------------
+def test_fall_open_reason_all_skipped_gets_distinct_key():
+    phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+        {"detected": False, "noTestsReason": "all_skipped"}
+    )
+    assert key == "suite_all_skipped"
+    assert phrase == "suite present but every test skipped"
+
+
+def test_fall_open_reason_all_skipped_case_insensitive_variants():
+    for value in ("ALL_SKIPPED", "all_tests_skipped", "every_test_skipped", "skipped"):
+        _, key = ci_resolution.classify_unverified_fall_open_reason(
+            {"detected": False, "noTestsReason": value}
+        )
+        assert key == "suite_all_skipped", value
+
+
+def test_fall_open_reason_declared_no_artifact_gets_distinct_key():
+    # A PASSED declared build probe that confidently observed it wrote NOTHING
+    # is a likely no-op build — distinct honest phrase + key, not the confident
+    # "deliverable builds" wording.
+    phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+        {
+            "detected": False,
+            "probe": {
+                "ran": True,
+                "passed": True,
+                "could_not_run": False,
+                "declared": True,
+                "label": "make build",
+                "wrote_no_artifact": True,
+            },
+        }
+    )
+    assert key == "probe_no_artifact"
+    assert "no artifact" in phrase
+    assert "make build" in phrase
+
+
+def test_fall_open_reason_declared_no_artifact_without_label():
+    phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+        {
+            "detected": False,
+            "probe": {
+                "ran": True,
+                "passed": True,
+                "could_not_run": False,
+                "declared": True,
+                "wrote_no_artifact": True,
+            },
+        }
+    )
+    assert key == "probe_no_artifact"
+    assert phrase == "declared build ran but emitted no artifact (possible no-op build)"
+
+
+def test_fall_open_reason_declared_build_passed_without_flag_keeps_probe_passed():
+    # Absent flag, false flag, and observation-unavailable (older agent / ambiguous
+    # tree) ALL keep today's probe_passed behaviour exactly — the new reason is
+    # never emitted on uncertainty.
+    for probe in (
+        {"ran": True, "passed": True, "could_not_run": False, "declared": True, "label": "make build"},
+        {"ran": True, "passed": True, "could_not_run": False, "declared": True, "label": "make build", "wrote_no_artifact": False},
+    ):
+        phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+            {"detected": False, "probe": probe}
+        )
+        assert key == "probe_passed", probe
+        assert phrase == "declared build command passed (make build)", probe
+
+
+def test_fall_open_reason_no_artifact_flag_ignored_for_non_declared_probe():
+    # A GENERIC (non-declared) probe carrying the flag is unaffected — only the
+    # declared-build branch honours wrote_no_artifact.
+    phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+        {
+            "detected": False,
+            "probe": {
+                "ran": True,
+                "passed": True,
+                "could_not_run": False,
+                "declared": False,
+                "wrote_no_artifact": True,
+            },
+        }
+    )
+    assert key == "probe_passed"
+    assert phrase == "acceptance probe passed (changed code compiles/builds)"
+
+
+def test_fall_open_reason_no_artifact_flag_ignored_for_could_not_run_probe():
+    # A could_not_run declared probe carrying the flag still maps to
+    # probe_could_not_run — the no-op refinement only applies to a PASSED probe.
+    _, key = ci_resolution.classify_unverified_fall_open_reason(
+        {
+            "detected": False,
+            "probe": {
+                "ran": True,
+                "passed": False,
+                "could_not_run": True,
+                "declared": True,
+                "label": "make build",
+                "wrote_no_artifact": True,
+            },
+        }
+    )
+    assert key == "probe_could_not_run"
+
+
+def test_fall_open_reason_no_suite_keeps_generic_reason():
+    # A genuine no-suite repo (no noTestsReason field) keeps today's reason.
+    phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+        {"detected": False, "passed": False, "output": "no runner"}
+    )
+    assert key == "undetected_runtime"
+    assert phrase == "no test command detectable"
+
+
+def test_fall_open_reason_unrelated_no_tests_reason_keeps_generic():
+    # An older/other-shape value (e.g. a placeholder marker) is not all-skipped.
+    _, key = ci_resolution.classify_unverified_fall_open_reason(
+        {"detected": False, "noTestsReason": "placeholder"}
+    )
+    assert key == "undetected_runtime"
+
+
+def test_fall_open_reason_missing_or_old_shape_verdict_is_defensive():
+    # An older agent that never emits the field, or a non-dict, keeps the
+    # generic reason — the merge decision is unaffected.
+    assert ci_resolution.classify_unverified_fall_open_reason(None) == (
+        "no test command detectable",
+        "undetected_runtime",
+    )
+    assert ci_resolution.classify_unverified_fall_open_reason("nope") == (
+        "no test command detectable",
+        "undetected_runtime",
+    )
+    assert ci_resolution.classify_unverified_fall_open_reason({}) == (
+        "no test command detectable",
+        "undetected_runtime",
+    )
 
 
 @pytest.mark.asyncio
@@ -830,3 +1309,344 @@ def test_override_merge_preserves_existing_requires_ci_checks_true():
         detected, {"requires_ci_checks": True}
     )
     assert merged["requires_ci_checks"] is True
+
+
+# ── Acceptance probe: classify_merge_test_verdict (detected=false fall-open) ──
+def test_classify_verdict_probe_fail_blocks_with_output():
+    # A clear acceptance-probe failure on a no-suite fall-open flips the
+    # detected=false verdict to a merge-blocking "fail" carrying the probe output.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": False,
+            "noTestsReason": "no_suite",
+            "probe": {
+                "ran": True,
+                "passed": False,
+                "could_not_run": False,
+                "ecosystem": "python",
+                "output": "SyntaxError: invalid syntax",
+            },
+        }
+    )
+    assert outcome == "fail"
+    assert "SyntaxError" in detail
+
+
+def test_classify_verdict_probe_fail_blank_output_gets_fallback():
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": False,
+            "probe": {"ran": True, "passed": False, "could_not_run": False, "output": ""},
+        }
+    )
+    assert outcome == "fail"
+    assert detail  # non-empty fallback message
+
+
+def test_classify_verdict_probe_could_not_run_stays_undetected():
+    # Missing deps / unprovisioned setup must NOT hard-block — fall open.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": False,
+            "probe": {"ran": True, "passed": False, "could_not_run": True, "output": ""},
+        }
+    )
+    assert outcome == "undetected"
+    assert detail == ""
+
+
+def test_classify_verdict_probe_pass_stays_undetected():
+    # A passing probe is a positive signal but still no unit suite — fall open
+    # (UNVERIFIED), never a hard "pass" of the test gate.
+    outcome, _ = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": False,
+            "probe": {"ran": True, "passed": True, "could_not_run": False, "output": ""},
+        }
+    )
+    assert outcome == "undetected"
+
+
+def test_classify_verdict_probe_not_ran_stays_undetected():
+    outcome, _ = ci_resolution.classify_merge_test_verdict(
+        {"detected": False, "probe": {"ran": False, "passed": False, "could_not_run": False}}
+    )
+    assert outcome == "undetected"
+
+
+def test_classify_verdict_no_probe_key_unchanged_undetected():
+    # Older agent emits no probe — behavior byte-for-byte unchanged.
+    assert ci_resolution.classify_merge_test_verdict(
+        {"detected": False, "passed": False, "output": "no runner"}
+    ) == ("undetected", "")
+
+
+def test_classify_verdict_detected_true_ignores_probe():
+    # A real suite verdict is never reinterpreted by a probe field.
+    outcome, _ = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "probe": {"ran": True, "passed": False, "could_not_run": False},
+        }
+    )
+    assert outcome == "pass"
+
+
+# ── Acceptance probe: classify_unverified_fall_open_reason ────────────────────
+def test_fall_open_reason_probe_passed_distinct_key():
+    phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+        {"detected": False, "probe": {"ran": True, "passed": True, "could_not_run": False}}
+    )
+    assert key == "probe_passed"
+    assert "probe" in phrase
+
+
+def test_fall_open_reason_probe_could_not_run_distinct_key():
+    phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+        {"detected": False, "probe": {"ran": True, "passed": False, "could_not_run": True}}
+    )
+    assert key == "probe_could_not_run"
+    assert "probe" in phrase
+
+
+def test_fall_open_reason_probe_takes_precedence_over_all_skipped():
+    _, key = ci_resolution.classify_unverified_fall_open_reason(
+        {
+            "detected": False,
+            "noTestsReason": "all_skipped",
+            "probe": {"ran": True, "passed": True, "could_not_run": False},
+        }
+    )
+    assert key == "probe_passed"
+
+
+def test_fall_open_reason_no_probe_keeps_all_skipped():
+    # Without a probe the all-skipped reason is unchanged.
+    _, key = ci_resolution.classify_unverified_fall_open_reason(
+        {"detected": False, "noTestsReason": "all_skipped"}
+    )
+    assert key == "suite_all_skipped"
+
+
+# ── Declared build_cmd probe: operator-visible wording (key unchanged) ────────
+def test_fall_open_reason_declared_build_passed_wording():
+    phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+        {
+            "detected": False,
+            "probe": {
+                "ran": True,
+                "passed": True,
+                "could_not_run": False,
+                "declared": True,
+                "label": "npm run build (admin-ui)",
+            },
+        }
+    )
+    # Key stays backward-compatible; only the human phrase distinguishes declared.
+    assert key == "probe_passed"
+    assert "declared build command passed" in phrase
+    assert "npm run build (admin-ui)" in phrase
+
+
+def test_fall_open_reason_declared_build_could_not_run_wording():
+    phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+        {
+            "detected": False,
+            "probe": {
+                "ran": True,
+                "passed": False,
+                "could_not_run": True,
+                "declared": True,
+                "label": "make build (root)",
+            },
+        }
+    )
+    assert key == "probe_could_not_run"
+    assert "declared build command could not run" in phrase
+    assert "make build (root)" in phrase
+
+
+def test_fall_open_reason_generic_probe_unchanged_when_not_declared():
+    # A generic probe (no declared marker) keeps the original phrasing.
+    phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+        {"detected": False, "probe": {"ran": True, "passed": True, "could_not_run": False}}
+    )
+    assert key == "probe_passed"
+    assert phrase == "acceptance probe passed (changed code compiles/builds)"
+
+
+def test_classify_verdict_declared_build_fail_carries_declared_detail():
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": False,
+            "probe": {
+                "ran": True,
+                "passed": False,
+                "could_not_run": False,
+                "declared": True,
+                "label": "npm run build (admin-ui)",
+                "output": "webpack: build error in module foo",
+            },
+        }
+    )
+    assert outcome == "fail"
+    assert "Declared build command `npm run build (admin-ui)` failed" in detail
+    assert "webpack: build error in module foo" in detail
+
+
+def test_classify_verdict_declared_build_fail_blank_output_fallback():
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": False,
+            "probe": {
+                "ran": True,
+                "passed": False,
+                "could_not_run": False,
+                "declared": True,
+                "label": "make (root)",
+                "output": "",
+            },
+        }
+    )
+    assert outcome == "fail"
+    assert "Declared build command `make (root)` failed" in detail
+
+
+# ---------------------------------------------------------------------------
+# record_no_ci_gate_runtime / merge_gate_runtime_block — rolling history,
+# per-reason tally, and the derived at-a-glance summary. These are pure
+# in-memory operations on project.merge_gate_runtime (no DB needed): the
+# recorder is best-effort and stages the project; the block normalizer reads
+# the in-memory column back.
+# ---------------------------------------------------------------------------
+
+
+def _record(project, *, verified, reason, when):
+    ci_resolution.record_no_ci_gate_runtime(
+        None,
+        project,
+        executed_real_tests=verified,
+        unverified_reason=reason,
+        when=when,
+    )
+
+
+def test_runtime_history_keeps_four_legacy_keys_and_adds_outcome():
+    project = _proj()
+    _record(project, verified=False, reason="undetected_runtime", when="2026-06-01T00:00:00")
+    block = ci_resolution.merge_gate_runtime_block(project)
+    # Legacy keys unchanged.
+    assert block["last_run_at"] == "2026-06-01T00:00:00"
+    assert block["executed_real_tests"] is False
+    assert block["last_unverified_at"] == "2026-06-01T00:00:00"
+    assert block["last_unverified_reason"] == "undetected_runtime"
+    # New rolling history present with one entry.
+    assert block["recent_outcomes"] == [
+        {"at": "2026-06-01T00:00:00", "verified": False, "reason": "undetected_runtime"}
+    ]
+    assert block["unverified_reason_counts"] == {"undetected_runtime": 1}
+
+
+def test_runtime_verified_entry_has_no_reason_and_no_tally():
+    project = _proj()
+    _record(project, verified=True, reason=None, when="2026-06-02T00:00:00")
+    block = ci_resolution.merge_gate_runtime_block(project)
+    assert block["recent_outcomes"] == [
+        {"at": "2026-06-02T00:00:00", "verified": True, "reason": None}
+    ]
+    # A verified run never creates the tally.
+    assert "unverified_reason_counts" not in block
+    assert block["summary"]["verified_runs"] == 1
+    assert block["summary"]["fell_open_runs"] == 0
+    assert block["summary"]["total_fall_opens"] == 0
+    assert block["summary"]["most_common_reason"] is None
+
+
+def test_runtime_history_bounded_at_cap_drops_oldest():
+    project = _proj()
+    # Record well past the cap; oldest must be evicted, newest retained.
+    total = ci_resolution._RECENT_OUTCOMES_CAP + 5
+    for i in range(total):
+        _record(project, verified=True, reason=None, when=f"2026-06-05T00:00:{i:02d}")
+    block = ci_resolution.merge_gate_runtime_block(project)
+    outcomes = block["recent_outcomes"]
+    assert len(outcomes) == ci_resolution._RECENT_OUTCOMES_CAP
+    # Oldest dropped, newest kept (most recent last).
+    assert outcomes[0]["at"] == f"2026-06-05T00:00:{(total - ci_resolution._RECENT_OUTCOMES_CAP):02d}"
+    assert outcomes[-1]["at"] == f"2026-06-05T00:00:{(total - 1):02d}"
+
+
+def test_runtime_tally_accumulates_per_reason_across_repeated_fall_opens():
+    project = _proj()
+    _record(project, verified=False, reason="undetected_runtime", when="2026-06-01T00:00:01")
+    _record(project, verified=False, reason="undetected_runtime", when="2026-06-01T00:00:02")
+    _record(project, verified=False, reason="suite_all_skipped", when="2026-06-01T00:00:03")
+    _record(project, verified=True, reason=None, when="2026-06-01T00:00:04")
+    block = ci_resolution.merge_gate_runtime_block(project)
+    assert block["unverified_reason_counts"] == {
+        "undetected_runtime": 2,
+        "suite_all_skipped": 1,
+    }
+    summary = block["summary"]
+    assert summary["window"] == 4
+    assert summary["verified_runs"] == 1
+    assert summary["fell_open_runs"] == 3
+    assert summary["total_fall_opens"] == 3
+    # Most-tallied reason wins the at-a-glance line.
+    assert summary["most_common_reason"] == "undetected_runtime"
+
+
+def test_runtime_total_fall_opens_can_exceed_window_after_eviction():
+    project = _proj()
+    # First fall-open of a rare reason, then flood the window with verified runs
+    # so the rare fall-open is evicted from recent_outcomes but stays tallied.
+    _record(project, verified=False, reason="suite_all_skipped", when="2026-06-05T00:00:00")
+    for i in range(1, ci_resolution._RECENT_OUTCOMES_CAP + 1):
+        _record(project, verified=True, reason=None, when=f"2026-06-05T00:01:{i:02d}")
+    block = ci_resolution.merge_gate_runtime_block(project)
+    # Evicted from the window...
+    assert all(o["reason"] != "suite_all_skipped" for o in block["recent_outcomes"])
+    assert block["summary"]["fell_open_runs"] == 0
+    # ...but the all-time tally still remembers it.
+    assert block["unverified_reason_counts"] == {"suite_all_skipped": 1}
+    assert block["summary"]["total_fall_opens"] == 1
+    assert block["summary"]["most_common_reason"] == "suite_all_skipped"
+
+
+def test_runtime_block_none_when_never_run():
+    project = _proj()
+    assert project.merge_gate_runtime is None
+    assert ci_resolution.merge_gate_runtime_block(project) is None
+
+
+def test_runtime_block_legacy_four_key_record_omits_new_fields():
+    """A record written by the old code (four keys only) normalizes without the
+    new history fields — backward compatible."""
+    project = _proj()
+    project.merge_gate_runtime = {
+        "last_run_at": "2026-06-01T00:00:00",
+        "executed_real_tests": False,
+        "last_unverified_at": "2026-06-01T00:00:00",
+        "last_unverified_reason": "undetected_runtime",
+    }
+    block = ci_resolution.merge_gate_runtime_block(project)
+    assert block["last_unverified_reason"] == "undetected_runtime"
+    assert "recent_outcomes" not in block
+    assert "unverified_reason_counts" not in block
+    assert "summary" not in block
+
+
+def test_runtime_block_malformed_history_is_defensive():
+    """Non-list recent_outcomes / non-dict tally are ignored, not raised on."""
+    project = _proj()
+    project.merge_gate_runtime = {
+        "last_run_at": "2026-06-01T00:00:00",
+        "executed_real_tests": True,
+        "recent_outcomes": "not-a-list",
+        "unverified_reason_counts": ["not", "a", "dict"],
+    }
+    block = ci_resolution.merge_gate_runtime_block(project)
+    assert "recent_outcomes" not in block
+    assert "unverified_reason_counts" not in block
+    assert "summary" not in block

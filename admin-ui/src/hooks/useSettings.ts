@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import type { AuthMode, CategoryRoutingEntry, MaxPlanAccount, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
+import type { AuthMode, CategoryRoutingEntry, MaxPlanAccount, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskCapabilityContract, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
+import { resolveTaskCapabilities } from '../taskCapabilities';
 import type { NotificationConfig } from '../components/SettingsNotificationsSection';
 import type { BuildConfig } from '../types/project';
 import { API_BASE_URL, authHeaders, authGet } from '../api';
@@ -47,6 +48,10 @@ export function useSettings(addToast: AddToast) {
   const [providerSelectionMode, setProviderSelectionMode] = useState<'balanced' | 'preferred' | 'exclusive'>('balanced');
   const [crossProviderFallbackEnabled, setCrossProviderFallbackEnabled] = useState(true);
   const [providers, setProviders] = useState<Record<string, ProviderCatalogEntry>>({});
+  // Backend-published task-capability contract. Null until the first settings
+  // fetch resolves (or when an older backend omits the key) — consumers fall
+  // back to the built-in capability table in that case.
+  const [taskCapabilityContract, setTaskCapabilityContract] = useState<TaskCapabilityContract | null>(null);
   // Settings-bag system: provider-specific defaults + sparse per-task-type
   // overrides. Replaces the retired task_type_models/task_type_efforts and
   // task_type_execution_defaults / provider_execution_modes keys.
@@ -92,6 +97,11 @@ export function useSettings(addToast: AddToast) {
         setProviderSelectionMode(resolvedMode);
         setCrossProviderFallbackEnabled(data.cross_provider_fallback_enabled ?? (resolvedMode !== 'exclusive'));
         setProviders(data.providers ?? {});
+        setTaskCapabilityContract(
+          data.task_capabilities && typeof data.task_capabilities === 'object'
+            ? (data.task_capabilities as TaskCapabilityContract)
+            : null,
+        );
         setProviderSettingsDefaults((data.provider_settings_defaults ?? {}) as ProviderSettingsDefaults);
         setTaskTypeProviderOverrides((data.task_type_provider_overrides ?? {}) as TaskTypeProviderOverrides);
         setGithubAccount(data.github_account || null);
@@ -666,8 +676,12 @@ export function useSettings(addToast: AddToast) {
   };
 
   const updateReservedSlotsForTypes = async (value: Record<string, number>) => {
+    // Allowlist derives from the published contract's reservable flag (falling
+    // back to the built-in table) so a newly registered reservable type is
+    // accepted without editing this guard — mirroring the backend validator.
+    const reservableIds = resolveTaskCapabilities(taskCapabilityContract).reservableIds;
     const sanitized: Record<string, number> = {};
-    for (const key of ['create', 'research', 'plan'] as const) {
+    for (const key of reservableIds) {
       const n = value[key];
       if (typeof n === 'number' && n > 0) sanitized[key] = Math.max(0, Math.min(10, Math.floor(n)));
     }
@@ -756,6 +770,7 @@ export function useSettings(addToast: AddToast) {
     providerSettingsByEffort,
     providerSelectionMode,
     crossProviderFallbackEnabled, providers,
+    taskCapabilityContract,
     providerSettingsDefaults, setProviderSettingsDefaults,
     taskTypeProviderOverrides, setTaskTypeProviderOverrides,
     buildConfig, setBuildConfig,

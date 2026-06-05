@@ -76,6 +76,7 @@ export interface TestRunner {
   args: string[];
   cwd: string;
   label: string;
+  installCmd?: string;
 }
 
 /** Returns true if the runner invokes Docker or the backend test shell script. */
@@ -162,25 +163,29 @@ function tokenizeCommand(cmd: string): string[] {
   return tokens;
 }
 
-/** Build a TestRunner argv from an operator-configured test command.
+/** Build a safe execFile argv from an operator-configured shell command.
  *
- *  - A command needing shell features (operators, substitutions, redirections,
+  *  - A command needing shell features (operators, substitutions, redirections,
  *    globs, backslash escapes) is wrapped as `{cmd:'bash', args:['-c', cmd]}` so
- *    the operator's own command runs verbatim under a shell. The runner is
- *    executed via execFile (NOT a shell), so the command string is passed as a
+  *    the operator's own command runs verbatim under a shell. The runner is
+  *    executed via execFile (NOT a shell), so the command string is passed as a
  *    single argv element and is never re-interpreted — injection-safe.
  *  - A plain command is tokenized quote-aware so `pytest -k "not slow"` yields
  *    `{cmd:'pytest', args:['-k','not slow']}`. Plain commands keep their
  *    historical `{cmd,args}` shape byte-for-byte, so pytest-selector targeting
  *    and family-parity invariants are unchanged. */
-function runnerFromTestCmd(testCmd: string, cwd: string): { cmd: string; args: string[]; cwd: string } {
-  if (SHELL_OPERATORS_RE.test(testCmd)) {
-    return { cmd: 'bash', args: ['-c', testCmd], cwd };
+export function runnerFromCommand(command: string, cwd: string): { cmd: string; args: string[]; cwd: string } {
+  if (SHELL_OPERATORS_RE.test(command)) {
+    return { cmd: 'bash', args: ['-c', command], cwd };
   }
-  const tokens = tokenizeCommand(testCmd);
-  if (tokens.length === 0) return { cmd: 'bash', args: ['-c', testCmd], cwd };
+  const tokens = tokenizeCommand(command);
+  if (tokens.length === 0) return { cmd: 'bash', args: ['-c', command], cwd };
   return { cmd: tokens[0], args: tokens.slice(1), cwd };
 }
+
+// Backward-compatible alias for older internal callers that still use the
+// prior helper name.
+export const runnerFromTestCmd = runnerFromCommand;
 
 export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
   const { existsSync, readFileSync, readdirSync } = fs;
@@ -191,7 +196,11 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
     for (const dir of buildConfig.directories) {
       if (dir.test_cmd) {
         const cwd = dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE;
-        runners.push({ ...runnerFromTestCmd(dir.test_cmd, cwd), label: `${dir.test_cmd} (${dir.path || 'root'})` });
+        runners.push({
+          ...runnerFromCommand(dir.test_cmd, cwd),
+          label: `${dir.test_cmd} (${dir.path || 'root'})`,
+          installCmd: dir.install_cmd,
+        });
       }
     }
   }
@@ -564,6 +573,593 @@ export function detectAutoTestRunners(): TestRunner[] {
   return detectTestRunners(undefined);
 }
 
+// True when the directory contains any *.sln / *.csproj — the glob signal the
+// .NET suite detector (detectExtraFamilyRunner) keys off. The project file name
+// is arbitrary, so the directory listing is globbed name-based rather than
+// checking a fixed manifest. Defensive against fs errors (treated as "absent").
+function hasDotnetProject(absDir: string): boolean {
+  try {
+    const entries = fs.readdirSync(absDir) as unknown as string[];
+    return Array.isArray(entries) && entries.some(
+      n => typeof n === 'string' && (n.endsWith('.sln') || n.endsWith('.csproj')),
+    );
+  } catch {
+    return false;
+  }
+}
+
+// ── Dependency provisioning (no-CI verify gate) ──────────────────────────────
+// Before the no-CI verify gate runs the detected suite OR the declared build
+// probe, the project's dependencies must be installed — otherwise both fail to
+// RUN for environment reasons and the gate falls open UNVERIFIED even though the
+// code is fine. A provisioning step is a single install command run under a
+// bounded timeout; a failure routes through the EXISTING setup-failure path.
+export interface ProvisioningStep {
+  cmd: string;
+  args: string[];
+  cwd: string;
+  label: string;
+  // True when this step runs the operator's OWN declared ``install_cmd`` rather
+  // than an auto-detected fallback (currently the pyproject-only ``pip install .``).
+  declared?: boolean;
+}
+
+/**
+ * Detect dependency-provisioning steps the no-CI verify gate must run BEFORE the
+ * detected suite and the declared build probe, so both execute against a
+ * provisioned environment instead of a missing-dependency one.
+ *
+ * Two sources, in precedence order:
+ *  1) The operator's declared ``install_cmd`` per build_config directory — the
+ *     authoritative provisioning step. Wrapped exactly like ``test_cmd``
+ *     (bash -c for shell operators, quote-aware tokenize otherwise) and run via
+ *     execFile (no shell interpolation).
+ *  2) A pyproject.toml-only Python project (no committed ``poetry.lock`` and no
+ *     ``requirements.txt``) — the common modern layout the per-runner hardcoded
+ *     installs (poetry.lock / requirements.txt) miss entirely. Provisioned with
+ *     ``pip install .`` so the declared package + its dependencies are present
+ *     before pytest collects. A directory that already declares its own
+ *     ``install_cmd`` is NOT given this fallback (the operator's command wins).
+ *  3) Extra-ecosystem manifests whose suite command does NOT self-install deps —
+ *     Ruby (Gemfile → ``bundle install``), Gradle (build.gradle[.kts] →
+ *     ``./gradlew dependencies``), Maven (pom.xml → ``mvn dependency:go-offline``),
+ *     Elixir (mix.exs → ``mix deps.get``), PHP (composer.json → ``composer
+ *     install``). Detected from the SAME signals the suite detector uses, skipped
+ *     when the operator declared an install_cmd for that directory.
+ *  4) Node/JS projects (package.json) — node_modules install previously fired
+ *     ONLY in the per-runner suite loop and ONLY for a literal ``npm`` command,
+ *     so a ``yarn``/``pnpm``/direct-``vitest`` suite and the cheap goal-level
+ *     probes ran unprovisioned. Provisioned ONCE here per Node directory, with
+ *     the committed lockfile selecting the package manager (package-lock.json →
+ *     ``npm ci``, yarn.lock → ``yarn install --frozen-lockfile``, pnpm-lock.yaml
+ *     → ``pnpm install --frozen-lockfile``; bare package.json → ``npm install``).
+ *     Skipped when the operator declared an install_cmd for that directory.
+ *
+ * Deduped by ``cwd``; inspects ONLY the local filesystem (zero GitHub-API cost).
+ */
+export function detectProvisioningSteps(buildConfig?: BuildConfig): ProvisioningStep[] {
+  const exists = (p: string): boolean => {
+    try { return fs.existsSync(p); } catch { return false; }
+  };
+  const steps: ProvisioningStep[] = [];
+  const seenCwds = new Set<string>();
+  const add = (step: ProvisioningStep): void => {
+    if (seenCwds.has(step.cwd)) return;
+    seenCwds.add(step.cwd);
+    steps.push(step);
+  };
+
+  // 1) Operator-declared install commands take precedence.
+  const declaredCwds = new Set<string>();
+  if (buildConfig?.directories) {
+    for (const dir of buildConfig.directories) {
+      const installCmd = (dir.install_cmd || '').trim();
+      if (!installCmd) continue;
+      const abs = dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE;
+      declaredCwds.add(abs);
+      const runner = runnerFromTestCmd(installCmd, abs);
+      add({ cmd: runner.cmd, args: runner.args, cwd: abs, label: `${installCmd} (${dir.path || 'root'})`, declared: true });
+    }
+  }
+
+  // 2) pyproject-only Python auto-provision. Only when no lockfile/requirements.txt
+  //    is present (those are handled by the per-runner installs) and the directory
+  //    did not already declare its own install_cmd.
+  const pyprojectOnly = (absDir: string): boolean =>
+    exists(`${absDir}/pyproject.toml`) &&
+    !exists(`${absDir}/poetry.lock`) &&
+    !exists(`${absDir}/requirements.txt`);
+  const addPyprojectAuto = (absDir: string, label: string): void => {
+    if (declaredCwds.has(absDir) || !pyprojectOnly(absDir)) return;
+    add({ cmd: 'pip', args: ['install', '.'], cwd: absDir, label: `pip install . (${label})` });
+  };
+  if (buildConfig?.directories) {
+    for (const dir of buildConfig.directories) {
+      if (dir.type !== 'python') continue;
+      addPyprojectAuto(dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE, dir.path || 'root');
+    }
+  }
+  // Repo root covers the auto-detected (no build_config) case.
+  addPyprojectAuto(WORKSPACE, 'root');
+
+  // 3) Extra-ecosystem auto-provision (Ruby/Gradle/Maven/Elixir/PHP). The suite
+  //    detector LAUNCHES these runners (detectExtraFamilyRunner) but their test
+  //    commands (`bundle exec rake test`, `./gradlew test`, `mvn test`,
+  //    `mix test`, `composer test`) do NOT install their own dependencies. Without
+  //    a pre-install step the suite runs against an UNPROVISIONED workspace and
+  //    fails on dependency resolution — which the env-failure classifier
+  //    deliberately treats as a REAL red test (blocking the merge AND spawning a
+  //    code-fix agent against code that isn't broken). Auto-provision from the
+  //    SAME local manifest signals the suite detector keys off, skipping any dir
+  //    that already declared its own install_cmd (the operator's command wins) and
+  //    any cwd already provisioned above (deduped by `add`). First match wins per
+  //    dir; mirrors detectExtraFamilyRunner's detection order. A provisioning
+  //    FAILURE flows through the existing setup-failure path exactly like a failed
+  //    declared install or pip/poetry install — never a blocking test failure.
+  const addExtraFamilyAuto = (absDir: string, label: string): void => {
+    if (declaredCwds.has(absDir)) return;
+    // Ruby: Gemfile → `bundle install`.
+    if (exists(`${absDir}/Gemfile`)) {
+      add({ cmd: 'bundle', args: ['install'], cwd: absDir, label: `bundle install (${label})` });
+      return;
+    }
+    // Gradle: build.gradle / build.gradle.kts → prefetch dependencies so the
+    // suite's first run does not fail on initial dependency download.
+    if (exists(`${absDir}/build.gradle`) || exists(`${absDir}/build.gradle.kts`)) {
+      add({ cmd: './gradlew', args: ['dependencies', '--no-daemon'], cwd: absDir, label: `./gradlew dependencies (${label})` });
+      return;
+    }
+    // Maven: pom.xml → resolve all dependencies for an offline-ready clean run.
+    if (exists(`${absDir}/pom.xml`)) {
+      add({ cmd: 'mvn', args: ['-B', 'dependency:go-offline'], cwd: absDir, label: `mvn dependency:go-offline (${label})` });
+      return;
+    }
+    // Elixir: mix.exs → `mix deps.get`.
+    if (exists(`${absDir}/mix.exs`)) {
+      add({ cmd: 'mix', args: ['deps.get'], cwd: absDir, label: `mix deps.get (${label})` });
+      return;
+    }
+    // .NET: any *.sln / *.csproj at this dir → `dotnet restore`. The project file
+    // name is arbitrary, so glob the directory listing (name-based, like the suite
+    // detector's detectExtraFamilyRunner) rather than checking a fixed manifest.
+    // Without a restore step the suite/probe run against an unprovisioned NuGet
+    // cache and fail on first-run dependency resolution.
+    if (hasDotnetProject(absDir)) {
+      add({ cmd: 'dotnet', args: ['restore'], cwd: absDir, label: `dotnet restore (${label})` });
+      return;
+    }
+    // PHP: composer.json → `composer install`.
+    if (exists(`${absDir}/composer.json`)) {
+      add({ cmd: 'composer', args: ['install'], cwd: absDir, label: `composer install (${label})` });
+      return;
+    }
+    // Go: go.mod → `go mod download` (pre-fetch modules so the suite and
+    // acceptance probe run provisioned). Without this, a repo with no unit suite
+    // (or a thin/skipped suite) runs its `go build` probe unprovisioned and fails
+    // on first-download, silently downgrading to could_not_run.
+    if (exists(`${absDir}/go.mod`)) {
+      add({ cmd: 'go', args: ['mod', 'download'], cwd: absDir, label: `go mod download (${label})` });
+      return;
+    }
+    // Rust: Cargo.toml → `cargo fetch` (pre-fetch crates). Without this, a repo
+    // with no unit suite (or a thin/skipped suite) runs its `cargo check` probe
+    // unprovisioned and fails on first-download, silently downgrading to
+    // could_not_run.
+    if (exists(`${absDir}/Cargo.toml`)) {
+      add({ cmd: 'cargo', args: ['fetch'], cwd: absDir, label: `cargo fetch (${label})` });
+      return;
+    }
+  };
+  if (buildConfig?.directories) {
+    for (const dir of buildConfig.directories) {
+      addExtraFamilyAuto(dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE, dir.path || 'root');
+    }
+  }
+  // Repo root covers the auto-detected (no build_config) case.
+  addExtraFamilyAuto(WORKSPACE, 'root');
+
+  // 4) Node/JS auto-provision. Node is the most common external-repo ecosystem,
+  //    yet node_modules install previously lived ONLY in the per-runner suite
+  //    loop and fired ONLY when the resolved test command was literally `npm`.
+  //    So a suite invoked as `yarn test` / `pnpm test` / a direct `vitest`/`jest`
+  //    never got deps, and the cheap goal-level probes (acceptance type-check +
+  //    documented/PR-introduced command) ran with no node_modules and silently
+  //    degraded to "could not run". Provision node_modules ONCE here so BOTH the
+  //    suite (regardless of which test command was detected) AND the probes run
+  //    against a provisioned environment. The committed lockfile selects the
+  //    package manager exactly like the per-runner backstop in test-fix-loop.ts:
+  //    yarn.lock → `yarn install --frozen-lockfile`, pnpm-lock.yaml →
+  //    `pnpm install --frozen-lockfile`, package-lock.json → `npm ci`; a bare
+  //    package.json with no lockfile falls back to `npm install` (npm ci REQUIRES
+  //    a lockfile and would hard-fail). Skips any dir that declared its own
+  //    install_cmd (operator's command wins) and any cwd already provisioned
+  //    above (deduped by `add`). A provisioning FAILURE flows through the existing
+  //    setup-failure path — never a blocking test failure. The per-runner npm
+  //    fallback stays as a harmless idempotent backstop (it no-ops once
+  //    node_modules is present).
+  const addNodeAuto = (absDir: string, label: string): void => {
+    if (declaredCwds.has(absDir)) return;
+    if (!exists(`${absDir}/package.json`)) return;
+    if (exists(`${absDir}/yarn.lock`)) {
+      add({ cmd: 'yarn', args: ['install', '--frozen-lockfile'], cwd: absDir, label: `yarn install --frozen-lockfile (${label})` });
+      return;
+    }
+    if (exists(`${absDir}/pnpm-lock.yaml`)) {
+      add({ cmd: 'pnpm', args: ['install', '--frozen-lockfile'], cwd: absDir, label: `pnpm install --frozen-lockfile (${label})` });
+      return;
+    }
+    if (exists(`${absDir}/package-lock.json`)) {
+      add({ cmd: 'npm', args: ['ci'], cwd: absDir, label: `npm ci (${label})` });
+      return;
+    }
+    // Bare package.json, no committed lockfile: npm ci would fail, so npm install.
+    add({ cmd: 'npm', args: ['install'], cwd: absDir, label: `npm install (${label})` });
+  };
+  if (buildConfig?.directories) {
+    for (const dir of buildConfig.directories) {
+      addNodeAuto(dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE, dir.path || 'root');
+    }
+  }
+  // Repo root covers the auto-detected (no build_config) case.
+  addNodeAuto(WORKSPACE, 'root');
+
+  return steps;
+}
+
+// ── Cheap acceptance probe (no-CI merge gate goal-level check) ───────────────
+// When the no-CI merge gate finds no unit suite (or the suite is thin / fully
+// skipped), the PR ships with ZERO execution signal. The acceptance probe is a
+// bounded, CPU-cheap, goal-level check of the most basic claim every code
+// change makes: that the code still loads / compiles / builds. It is NOT an
+// environment fixer (that is the greenfield setup-repair direction) and NOT a
+// full build pipeline — it runs in seconds under the same bounded-timeout
+// discipline the suite already uses. Language is detected from the SAME signals
+// the suite detector uses.
+export interface AcceptanceProbe {
+  cmd: string;
+  args: string[];
+  cwd: string;
+  // The ecosystem bucket the probe belongs to (used for dedup + the operator
+  // display label). ``'build'`` is the catch-all for an operator-declared
+  // ``build_cmd`` whose directory ``type`` is none of python/node/go/rust
+  // (e.g. ``other``).
+  ecosystem: 'python' | 'node' | 'go' | 'rust' | 'dotnet' | 'gradle' | 'maven' | 'elixir' | 'build';
+  label: string;
+  // True when this probe runs the project's OWN declared ``build_cmd`` (the
+  // operator's authoritative "does this deliverable build" claim) rather than a
+  // generic per-ecosystem compile check. A declared build is classified
+  // authoritatively (a clean non-zero exit is a real FAILURE, see
+  // ``classifyProbeOutcome``); generic probes stay conservative (fall-open).
+  declared?: boolean;
+}
+
+/**
+ * Compare two `git status --porcelain --ignored` snapshots (each the raw stdout
+ * string of one observation) and report whether the AFTER snapshot contains at
+ * least one status line not present BEFORE — i.e. the build wrote something
+ * (a new untracked/ignored file, or a modification to a tracked one).
+ *
+ * Used by the no-CI merge gate's DECLARED build probe to tell a genuine build
+ * apart from a no-op one (an empty Makefile recipe, a script that silently does
+ * nothing) that exits 0 yet emits no artifact. A bare "tree is empty" check
+ * would false-positive on pre-existing warm-VM cache directories (node_modules,
+ * .vitest_cache, .pnpm-store, .testmondata) that survive `git clean -fdx` and
+ * already show up as ignored entries; a before/after DIFF ignores those because
+ * they appear identically in BOTH snapshots. Returns false only when AFTER
+ * introduces no new line relative to BEFORE (the build wrote nothing new).
+ */
+export function buildWroteNewOutput(before: string, after: string): boolean {
+  const lines = (s: string): Set<string> =>
+    new Set(
+      s
+        .split('\n')
+        .map(line => line.replace(/\r$/, ''))
+        .filter(line => line.trim().length > 0),
+    );
+  const beforeLines = lines(before);
+  for (const line of lines(after)) {
+    if (!beforeLines.has(line)) return true;
+  }
+  return false;
+}
+
+// Hard cap on probes emitted so a large monorepo cannot fan out an unbounded
+// set of probe processes. The handler additionally slices to a small per-run
+// budget (see verify-tests.ts).
+const ACCEPTANCE_PROBE_MAX = 6;
+
+/**
+ * Detect cheap, goal-level acceptance probes for the cloned workspace's
+ * ecosystem(s). Mirrors the suite detector's manifest signals but emits a
+ * *compile/build* command rather than a test command:
+ *
+ *   - Python → ``python3 -m compileall`` (byte-compile; never imports, so a
+ *     missing runtime dependency cannot make it fail — only a real SyntaxError
+ *     does). Vendored/build trees are excluded so a large repo stays bounded.
+ *   - Node/TS → ``npx --no-install tsc --noEmit`` (no-emit type-check), emitted
+ *     ONLY when a tsconfig.json is present. ``--no-install`` fails fast
+ *     (could-not-run) when tsc is absent instead of triggering a network
+ *     install. A plain-JS package has nothing cheap+safe to "compile" (requiring
+ *     its entrypoint could boot a server) so none is emitted.
+ *   - Go → ``go build ./...`` (compiles every package without running tests).
+ *   - Rust → ``cargo check`` (type/borrow-check without producing a binary).
+ *
+ * CONSERVATIVE + bounded: probes are deduped by ``ecosystem:cwd``, capped at
+ * ``ACCEPTANCE_PROBE_MAX``, and the auto-scan is depth-1 with the same
+ * vendored/dot-dir skip list as the suite detector. Inspects ONLY the local
+ * filesystem (zero GitHub-API cost).
+ */
+export function detectAcceptanceProbes(buildConfig?: BuildConfig): AcceptanceProbe[] {
+  const { existsSync, readdirSync } = fs;
+  const probes: AcceptanceProbe[] = [];
+  const seen = new Set<string>();
+  // Directories whose own declared ``build_cmd`` ran as the authoritative probe.
+  // The generic ecosystem probe(s) and the depth-1 auto-scan are suppressed for
+  // these cwds so the operator's declared build is the preferred goal-level check.
+  const declaredCwds = new Set<string>();
+
+  const has = (absDir: string, name: string): boolean => {
+    try { return existsSync(`${absDir}/${name}`); } catch { return false; }
+  };
+  const add = (probe: AcceptanceProbe): void => {
+    if (probes.length >= ACCEPTANCE_PROBE_MAX) return;
+    const key = `${probe.ecosystem}:${probe.cwd}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    probes.push(probe);
+  };
+
+  // Map a build_config directory ``type`` to its probe ecosystem bucket. A type
+  // with no dedicated language bucket (``other`` / unknown) collapses to the
+  // ``'build'`` catch-all — the probe still runs the declared command verbatim.
+  const ecosystemForType = (type?: string): AcceptanceProbe['ecosystem'] => {
+    switch (type) {
+      case 'python': return 'python';
+      case 'node': return 'node';
+      case 'go': return 'go';
+      case 'rust': return 'rust';
+      default: return 'build';
+    }
+  };
+
+  // 0) Operator-declared build commands take precedence. Any build_config
+  //    directory that declares its own ``build_cmd`` runs THAT as the
+  //    authoritative goal-level probe (the operator's "does this deliverable
+  //    build" claim), and suppresses the generic ecosystem probe(s) for the same
+  //    directory. Commands may carry shell features (`&&`, `--features x`,
+  //    quotes) so they are wrapped exactly like ``test_cmd`` (bash -c for shell
+  //    operators, quote-aware tokenize otherwise) and run via execFile — no shell
+  //    interpolation.
+  if (buildConfig?.directories) {
+    for (const dir of buildConfig.directories) {
+      const buildCmd = (dir.build_cmd || '').trim();
+      if (!buildCmd) continue;
+      const abs = dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE;
+      const runner = runnerFromTestCmd(buildCmd, abs);
+      add({
+        ecosystem: ecosystemForType(dir.type),
+        cmd: runner.cmd,
+        args: runner.args,
+        cwd: abs,
+        label: `${buildCmd} (${dir.path || 'root'})`,
+        declared: true,
+      });
+      declaredCwds.add(abs);
+    }
+  }
+
+  // Emit every ecosystem probe a directory supports. ``typeHint`` is the stored
+  // build_config directory ``type`` (python|node|go|rust|other) when available.
+  const probeDir = (absDir: string, label: string, typeHint?: string): void => {
+    // A directory with its own declared build_cmd already emitted the
+    // authoritative probe above — never add a competing generic probe for it.
+    if (declaredCwds.has(absDir)) return;
+    if (
+      typeHint === 'python' ||
+      has(absDir, 'pyproject.toml') || has(absDir, 'setup.py') ||
+      has(absDir, 'setup.cfg') || has(absDir, 'pytest.ini')
+    ) {
+      add({
+        ecosystem: 'python',
+        cmd: 'python3',
+        // -x EXCLUDES vendored/build trees (regex over the file path). Passed as
+        // a single argv element via execFile (no shell), so no escape pass.
+        args: ['-m', 'compileall', '-q', '-x', '(\\.venv|venv|node_modules|\\.git|build|dist)', absDir],
+        cwd: absDir,
+        label: `python3 -m compileall (${label})`,
+      });
+    }
+    if (has(absDir, 'tsconfig.json')) {
+      add({
+        ecosystem: 'node',
+        cmd: 'npx',
+        args: ['--no-install', 'tsc', '--noEmit'],
+        cwd: absDir,
+        label: `tsc --noEmit (${label})`,
+      });
+    }
+    if (has(absDir, 'go.mod')) {
+      add({
+        ecosystem: 'go',
+        cmd: 'go',
+        args: ['build', './...'],
+        cwd: absDir,
+        label: `go build ./... (${label})`,
+      });
+    }
+    if (has(absDir, 'Cargo.toml')) {
+      add({
+        ecosystem: 'rust',
+        cmd: 'cargo',
+        args: ['check', '--quiet'],
+        cwd: absDir,
+        label: `cargo check (${label})`,
+      });
+    }
+    // .NET → `dotnet build` (compiles every project without running tests).
+    // Glob-detected (*.sln/*.csproj) like the suite detector, since the project
+    // file name is arbitrary. `--nologo` keeps output terse for the classifier.
+    if (hasDotnetProject(absDir)) {
+      add({
+        ecosystem: 'dotnet',
+        cmd: 'dotnet',
+        args: ['build', '--nologo'],
+        cwd: absDir,
+        label: `dotnet build (${label})`,
+      });
+    }
+    // Compiled extra-family ecosystems the suite detector also launches. Each
+    // runs the CHEAPEST compile-only task (compile/classes, not a full build or
+    // test run), keyed off the same manifest the suite detector + provisioning
+    // use. A genuine compile error classifies as a real FAILURE; a missing
+    // toolchain / unprovisioned deps degrades to could_not_run (fall-open).
+    //
+    // Gradle: build.gradle[.kts] → `./gradlew classes` (compile main sources,
+    // no tests, no daemon — matches the provisioning step's `--no-daemon`).
+    if (has(absDir, 'build.gradle') || has(absDir, 'build.gradle.kts')) {
+      add({
+        ecosystem: 'gradle',
+        cmd: './gradlew',
+        args: ['classes', '--no-daemon'],
+        cwd: absDir,
+        label: `gradlew classes (${label})`,
+      });
+    }
+    // Maven: pom.xml → `mvn -o -B test-compile` (offline compile of main+test
+    // sources; -o never hits the network so unfetched deps fall open, not block).
+    if (has(absDir, 'pom.xml')) {
+      add({
+        ecosystem: 'maven',
+        cmd: 'mvn',
+        args: ['-o', '-B', 'test-compile'],
+        cwd: absDir,
+        label: `mvn -o test-compile (${label})`,
+      });
+    }
+    // Elixir: mix.exs → `mix compile` (compiles the project without running the
+    // ExUnit suite).
+    if (has(absDir, 'mix.exs')) {
+      add({
+        ecosystem: 'elixir',
+        cmd: 'mix',
+        args: ['compile'],
+        cwd: absDir,
+        label: `mix compile (${label})`,
+      });
+    }
+  };
+
+  // 1) Stored build_config directories carry an explicit language type hint.
+  if (buildConfig?.directories) {
+    for (const dir of buildConfig.directories) {
+      const abs = dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE;
+      probeDir(abs, dir.path || 'root', dir.type);
+    }
+  }
+
+  // 2) Auto-detect at the repo root + one level of subdirectories so an external
+  //    repo with no stored build_config still gets a probe. Bounded depth-1,
+  //    capped, skipping vendored/dot dirs.
+  probeDir(WORKSPACE, 'root');
+  const SKIP_DIRS = new Set(['node_modules', 'vendor', '.venv', 'venv', 'target', 'dist', 'build']);
+  const skip = (name: string): boolean => name.startsWith('.') || SKIP_DIRS.has(name);
+  let entries: string[] = [];
+  try { entries = readdirSync(WORKSPACE) as unknown as string[]; } catch { entries = []; }
+  if (Array.isArray(entries)) {
+    let inspected = 0;
+    for (const entry of entries) {
+      if (typeof entry !== 'string' || skip(entry)) continue;
+      if (inspected >= 40 || probes.length >= ACCEPTANCE_PROBE_MAX) break;
+      inspected++;
+      probeDir(`${WORKSPACE}/${entry}`, entry);
+    }
+  }
+
+  return probes;
+}
+
+/**
+ * Classify an acceptance-probe run into ``pass`` | ``fail`` | ``could_not_run``.
+ *
+ * ``exitErr`` is null when the probe exited 0 (``pass``). Otherwise it is the
+ * rejected ``execFileAsync`` error (carrying ``.code`` / ``.stdout`` / etc.).
+ *
+ * CONSERVATIVE BY DESIGN — to avoid false merge blocks, a GENERIC probe's
+ * non-zero exit maps to ``fail`` ONLY on an unambiguous compile/build-error
+ * signature. Spawn/timeout failures, missing-tool / missing-dependency /
+ * unprovisioned-setup signatures, and any unrecognized non-zero exit all degrade
+ * to ``could_not_run`` so the gate falls open rather than hard-blocking.
+ *
+ * ``declared`` widens step (3) ONLY: when the probe runs the project's OWN
+ * declared ``build_cmd``, the operator declared it authoritative, so a CLEAN
+ * non-zero exit (NOT one of the missing-tool/dep/setup signatures and NOT a
+ * spawn/timeout) is a REAL build FAILURE → ``fail`` (block the merge). The
+ * missing-tool/dep/setup degrades (step 1) and the spawn/timeout degrades still
+ * map to ``could_not_run`` for declared commands too — a build that needs
+ * uninstalled deps must fall open, not block. Generic-probe semantics
+ * (``declared=false``, the default) are byte-for-byte unchanged.
+ */
+export function classifyProbeOutcome(
+  output: string,
+  exitErr: (Error & { code?: string; status?: number | null }) | null,
+  declared = false,
+): 'pass' | 'fail' | 'could_not_run' {
+  if (exitErr == null) return 'pass';
+  // Spawn / timeout / OOM — the probe could not execute to a verdict.
+  const code = exitErr.code;
+  if (code === 'ENOENT' || code === 'ETIMEDOUT' || code === 'EOOM') return 'could_not_run';
+  const lower = `${output}\n${exitErr.message}`.toLowerCase();
+
+  // (1) Missing-tool / missing-dependency / unprovisioned-setup signatures →
+  //     could_not_run (degrade to fall-open; NEVER hard-block on these). Checked
+  //     BEFORE the failure signatures so e.g. a tsc "Cannot find module" run
+  //     (TS2307, prints `error TS…`) is treated as unprovisioned deps, not a
+  //     real type failure.
+  const couldNotRunSignatures = [
+    'command not found',
+    'could not determine executable',
+    'is not recognized as an internal or external',
+    'permission denied',
+    'no module named',
+    'modulenotfounderror',
+    'cannot find module',
+    'cannot find type definition file',
+    'cannot find package',
+    'no required module provides package',
+    'missing go.sum entry',
+    'go: downloading',
+    'failed to load source',
+    'no matching package named',
+    'failed to download',
+    'spurious network error',
+    'could not find `cargo.toml`',
+  ];
+  if (couldNotRunSignatures.some(sig => lower.includes(sig))) return 'could_not_run';
+
+  // (2) Unambiguous compile/build FAILURE signatures → fail (block the gate).
+  const failureSignatures = [
+    'syntaxerror',        // python compileall
+    'indentationerror',
+    'taberror',
+    'error ts',           // tsc: "error TS2322: ..."
+    'error[e',            // rustc: "error[E0425]: ..."
+    'undefined:',         // go build: "undefined: Foo"
+    'error cs',           // C# (dotnet build): "error CS0103: ..."
+    'compilation error',  // Maven javac / Gradle-Kotlin: "COMPILATION ERROR"
+    'compilation failed', // Gradle javac: "Compilation failed; see the compiler error output"
+    'compileerror',       // Elixir: "** (CompileError) ..."
+  ];
+  if (failureSignatures.some(sig => lower.includes(sig))) return 'fail';
+
+  // (3) Non-zero exit we cannot positively attribute to a clean compile error.
+  //     - GENERIC probe: CONSERVATIVE default could_not_run, so an unrecognized
+  //       environment failure never hard-blocks a merge.
+  //     - DECLARED build_cmd: the operator declared this build authoritative, so
+  //       a clean non-zero exit (not a missing-tool/dep/setup or spawn/timeout
+  //       degrade above) is a REAL build FAILURE → fail (block the merge).
+  return declared ? 'fail' : 'could_not_run';
+}
+
 /**
  * Map a detected `TestRunner` back to a project build_config directory entry
  * (repo-root-relative path, language type, reconstructed test command) so the
@@ -625,6 +1221,120 @@ function runnerKindFromCmd(cmd: string): string {
 }
 
 /**
+ * Detect environment/infrastructure failure signatures in test runner output.
+ *
+ * Returns true when the output shows a setup or infrastructure failure —
+ * missing shared library, missing system runtime, spawn ENOENT, the dash/sh
+ * "<tool>: not found" missing-executable phrasing, the Docker daemon being
+ * unavailable on the gate VM, or an out-of-memory kill (exit 137 / SIGKILL /
+ * signal 9) — rather than a genuine test failure. Repo dependency / packaging
+ * regressions are
+ * intentionally EXCLUDED here: a bare `ModuleNotFoundError`, `Cannot find
+ * module`, or missing Go package/module line from the suite itself must stay on
+ * the red-suite lane so the no-CI gate blocks broken repo changes instead of
+ * downgrading them to setupFailed/UNVERIFIED. CONSERVATIVE: returns false
+ * whenever real test failure evidence is present (FAILED/error-count lines), so
+ * a test that quotes an env phrase as assertion data stays a real run.
+ * Patterns are checked per-line so a phrase mid-line in an assertion diff never
+ * triggers a misroute.
+ *
+ * Mirrors backend/app/failure_layer_classifier.py _AGENT_VM_PATTERNS — keep
+ * the two in sync. The cross-language contract is pinned by the CI source-scan
+ * in backend/testing/test_invariants.py.
+ */
+export function matchesEnvironmentFailureSignature(output: string): boolean {
+  if (!output) return false;
+  const trimmedLines = output.split(/\r?\n/).map(line => line.trim());
+  // Real-failure evidence guard — same logic as classifyTestExecution's
+  // hasRealFailureEvidence. When a FAILED/error-count line is present the env
+  // phrase was quoted inside assertion data, not an infrastructure error.
+  const hasRealFailureEvidence = trimmedLines.some(line => (
+    /^FAILED\s+\S+/.test(line) ||
+    /^FAIL\s{2,}\S+/.test(line) ||
+    /^[✕✗×⨯]\s+\S+/.test(line) ||
+    /\b[1-9]\d*\s+failed\b/i.test(line) ||
+    /\b[1-9]\d*\s+failures?\b/i.test(line) ||
+    /^--- FAIL:/.test(line) ||
+    /^FAIL\t\S/.test(line) ||
+    /\bFailed:\s+[1-9]\d*\b/i.test(line) ||
+    /\bFailures:\s+[1-9]\d*\b/i.test(line) ||
+    /\bErrors:\s+[1-9]\d*\b/i.test(line) ||
+    /\b[1-9]\d*\s+errors?\b/i.test(line)
+  ));
+  if (hasRealFailureEvidence) return false;
+  // Environment failure patterns — checked per-line.
+  // Mirrors _AGENT_VM_PATTERNS in backend/app/failure_layer_classifier.py.
+  return trimmedLines.some(line => (
+    // Shared-library load errors (.so not installed on the gate VM)
+    /error while loading shared librar/i.test(line) ||
+    /cannot open shared object file/i.test(line) ||
+    /no such file or directory.*\.so\b/i.test(line) ||
+    /libatk[-\w]*\.so/i.test(line) ||
+    /missing.*system.*librar/i.test(line) ||
+    // Spawn failure: binary not found (OS could not exec the process)
+    /\bspawn\b.+\bENOENT\b/i.test(line) ||
+    // System runtimes not on PATH (VM-level, not test-runner-level)
+    /\bnode:\s+command not found/i.test(line) ||
+    /\bpython3?:\s+command not found/i.test(line) ||
+    // dash/sh phrase the missing-executable diagnostic as "<tool>: not found"
+    // (Debian's /bin/sh is dash). Anchored to the shell prefix so it can only
+    // be a shell missing-binary error, never a repo dependency error
+    // ("No module named …") or a test assertion that merely contains the words.
+    /^(?:\/(?:usr\/)?bin\/)?(?:sh|bash|dash|ash):\s*(?:\d+:\s*)?\S+:\s+not found\s*$/i.test(line) ||
+    // Docker daemon unavailable on the gate VM — repos whose test command shells
+    // out to Docker cannot run, but that is the VM's missing daemon, not the code.
+    /cannot connect to the docker daemon/i.test(line) ||
+    /is the docker daemon running/i.test(line) ||
+    /docker daemon is not running/i.test(line) ||
+    // Out-of-memory kills: the OOM killer reaps the runner (exit 137 / signal 9 /
+    // SIGKILL) with no test-failure summary. Surface forms vary per ecosystem;
+    // all are VM resource exhaustion, never a repo assertion failure.
+    /^killed\s*$/i.test(line) ||
+    /\bsignal:\s*killed\b/i.test(line) ||
+    /\bsigkill\b/i.test(line) ||
+    /\bsignal 9\b/i.test(line) ||
+    /\b(?:exit(?:ed with)?|exit code|exit status|code|status)\s+137\b/i.test(line) ||
+    /\boomkilled\b/i.test(line) ||
+    /out of memory:\s*kill/i.test(line) ||
+    /javascript heap out of memory/i.test(line) ||
+    /java\.lang\.outofmemoryerror/i.test(line) ||
+    /cannot allocate memory/i.test(line) ||
+    // Disk/quota/space failures (host resource exhaustion on the gate VM)
+    /no space left on device/i.test(line) ||
+    /disk quota exceeded/i.test(line) ||
+    /filesystem (is )?full/i.test(line) ||
+    /enospc/i.test(line) ||
+    // Permission denied / access failures (read-only fs, insufficient perms)
+    /permission denied/i.test(line) ||
+    /eacces/i.test(line) ||
+    /read-only file system/i.test(line) ||
+    /erofs/i.test(line)
+  ));
+}
+
+/**
+ * Detect bootstrap/setup failures that mean the verify VM is missing the tool
+ * needed to even attempt dependency installation or suite startup.
+ *
+ * This is deliberately narrower than repo dependency resolution: missing `pip`,
+ * `npm`, `poetry`, or the language runtime itself is infrastructure, while a
+ * missing repo package (`sqlalchemy`, `typescript`, a Go module) is a genuine
+ * project failure that must block the gate.
+ */
+export function classifySetupFailure(output: string): boolean {
+  if (!output) return false;
+  const trimmedLines = output.split(/\r?\n/).map(line => line.trim());
+  const missingToolPatterns = [
+    /^(?:bash|sh):(?:\s+line\s+\d+:)?\s*(?:python(?:3)?|go|cargo|node|npm|pnpm|yarn|pip|poetry):\s+command not found\s*$/i,
+    /^(?:python(?:3)?|go|cargo|node|npm|pnpm|yarn|pip|poetry):\s+command not found\s*$/i,
+    /^zsh:\s+command not found:\s+(?:python(?:3)?|go|cargo|node|npm|pnpm|yarn|pip|poetry)\s*$/i,
+    /^ModuleNotFoundError:\s+No module named ['"]pip['"]\s*$/i,
+    /^ImportError:\s+No module named ['"]pip['"]\s*$/i,
+  ];
+  return trimmedLines.some(line => missingToolPatterns.some(pattern => pattern.test(line)));
+}
+
+/**
  * Classify whether a test runner's output indicates that real tests actually
  * executed, or that the command was a placeholder / collected zero tests.
  *
@@ -639,12 +1349,18 @@ function runnerKindFromCmd(cmd: string): string {
  * target does not exist) as a no-tests case so the gate falls back to
  * proceed-without-checks rather than blocking the merge on an invocation error.
  *
- * CONSERVATIVE BY DESIGN: returns 'no_tests' ONLY on a positive signature match.
- * Anything else — including a genuine failure like "1 failed" or "2 passed",
- * empty output, or an unrecognized format — defaults to 'ran' so that a real
- * verdict is never misread as "no tests".
+ * Returns 'all_skipped' for a run that COLLECTED tests but executed NONE
+ * because every test was skipped / deselected / ignored / filtered — the same
+ * honest no-real-tests-executed case as 'no_tests' (callers treat both as "not
+ * a real run"), but distinguished so the verdict can surface "suite present but
+ * every test skipped" versus "no detectable suite / zero collection".
+ *
+ * CONSERVATIVE BY DESIGN: returns 'no_tests'/'all_skipped' ONLY on a positive
+ * signature match. Anything else — including a genuine failure like "1 failed"
+ * or "2 passed", empty output, or an unrecognized format — defaults to 'ran' so
+ * that a real verdict is never misread as "no tests".
  */
-export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
+export function classifyTestExecution(output: string): 'ran' | 'no_tests' | 'all_skipped' {
   const lower = output.toLowerCase();
   const lines = output.split(/\r?\n/);
   const trimmedLines = lines.map(line => line.trim());
@@ -693,10 +1409,7 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
     // only failure signal is a non-zero error count is still real-failure
     // evidence and must not fall open to no_tests.
     // Maven/Gradle/JUnit/PHPUnit: "Tests run: X, Failures: 0, Errors: N" — non-zero.
-    /\bErrors:\s+[1-9]\d*\b/i.test(line) ||
-    // Minitest/ExUnit count summaries: "1 runs, .., 0 failures, 1 errors, .." /
-    // "N errors" — non-zero (the failure-count rule above misses an error-only run).
-    /\b[1-9]\d*\s+errors?\b/i.test(line)
+    /\bErrors:\s+[1-9]\d*\b/i.test(line)
   ));
   const noTestSpecified = /^(?:npm (?:ERR!|error)\s+)?error:\s*no test specified\s*$/i;
   if (!hasRealFailureEvidence && trimmedLines.some(line => noTestSpecified.test(line))) return 'no_tests';
@@ -718,10 +1431,12 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
   // Match only those line shapes so a failing suite that QUOTES the literal
   // phrase "command not found" (or that merely contains `command` and `not
   // found` elsewhere on the line) stays a real run.
+  // Runtime commands (`python3`, `go`, `cargo`, `node`) are EXCLUDED here: a
+  // missing runtime is a setup failure, not a placeholder/no-tests signal.
   const missingCommandPatterns = [
-    /^(?:bash|sh):\s+\S+:\s+command not found\s*$/i,
-    /^zsh:\s+command not found:\s+\S+\s*$/i,
-    /^error:\s+command not found:\s+\S+\s*$/i,
+    /^(?:bash|sh):\s+(?!python(?:3)?\b|go\b|cargo\b|node\b)\S+:\s+command not found\s*$/i,
+    /^zsh:\s+command not found:\s+(?!python(?:3)?\b|go\b|cargo\b|node\b)\S+\s*$/i,
+    /^error:\s+command not found:\s+(?!python(?:3)?\b|go\b|cargo\b|node\b)\S+\s*$/i,
     /^error\s+command\s+["'][^"']+["']\s+not\s+found\.?\s*$/i,
   ];
   if (!hasRealFailureEvidence && trimmedLines.some(line => missingCommandPatterns.some(pattern => pattern.test(line)))) return 'no_tests';
@@ -741,6 +1456,79 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
   // vitest: "No test files found, exiting with code 1". Line-anchored so an
   // assertion quoting the bare phrase "no test files" mid-line stays a real run.
   if (!hasRealFailureEvidence && trimmedLines.some(line => /^no test files found\b/i.test(line))) return 'no_tests';
+  // ── All-skipped / fully-skipped run (collected tests but executed NONE) ──
+  // A suite that COLLECTED tests but ran NONE of them because every test was
+  // skipped / deselected / ignored / filtered (e.g. an integration suite gated
+  // on an env var or a service the cold verify VM has not provisioned)
+  // exercises ZERO real tests — the SAME honest non-verification case as a
+  // zero-collection run, and must NOT be recorded as a verified pass.
+  //
+  // STRICTLY conservative: classify all_skipped ONLY when there is zero
+  // real-pass AND zero real-failure evidence AND at least one
+  // skip/deselect/ignore/filter signal. A run where even one test passed or
+  // failed ("5 passed, 1500 skipped") keeps its real signal and stays 'ran'.
+  // hasRealPassEvidence mirrors hasRealFailureEvidence: line-anchored, non-zero.
+  const hasRealPassEvidence = trimmedLines.some(line => (
+    /\b[1-9]\d*\s+passed\b/i.test(line) ||   // pytest / vitest / Rust "N passed"
+    /\bPassed:\s+[1-9]\d*\b/i.test(line) ||  // .NET `dotnet test` "Passed: N"
+    /^--- PASS:/.test(line)                  // Go verbose per-test pass marker
+  ));
+  if (!hasRealFailureEvidence && !hasRealPassEvidence) {
+    // Standalone skip tokens: the family reports any passing test as its OWN
+    // "N passed" / "Passed: N" / "--- PASS:" token (already excluded above), so
+    // a non-zero skip/deselect/ignore/filter count here is decisive.
+    //   pytest "5 skipped" / "3 deselected"; vitest "5 skipped"; Rust "N ignored"
+    //   / "N filtered out"; Go verbose "--- SKIP:".
+    const standaloneSkip = trimmedLines.some(line => (
+      /\b[1-9]\d*\s+skipped\b/i.test(line) ||
+      /\b[1-9]\d*\s+deselected\b/i.test(line) ||
+      /\b[1-9]\d*\s+ignored\b/i.test(line) ||
+      /\b[1-9]\d*\s+filtered out\b/i.test(line) ||
+      /^\s*--- SKIP:/.test(line)
+    ));
+    // Aggregate families report a TOTAL count (not a separate pass token), so a
+    // bare "Skipped: N" could co-exist with passes counted only in the total.
+    // Classify all-skip ONLY when total === skip on the SAME line (zero pass/
+    // fail already guaranteed by the guards above), so "Tests run: 5, .., Skipped:
+    // 3" (2 passed) stays 'ran' while "Tests run: 5, .., Skipped: 5" is all-skip.
+    // The (totalRe, skipRe) family table is shared between the all-skip check
+    // (total === skip) and the multi-class pass guard (total > skip) below.
+    const AGGREGATE_FAMILIES: Array<[RegExp, RegExp]> = [
+      // Ruby/RSpec: "5 examples, 0 failures, 5 pending"
+      [/\b(\d+)\s+examples?\b/i, /\b(\d+)\s+pending\b/i],
+      // Ruby/Minitest: "5 runs, .., 0 failures, 0 errors, 5 skips"
+      [/\b(\d+)\s+runs?\b/i, /\b(\d+)\s+skips\b/i],
+      // Elixir/ExUnit: "5 tests, 0 failures, 5 skipped" / ".., 5 excluded"
+      [/\b(\d+)\s+tests?\b/i, /\b(\d+)\s+(?:skipped|excluded)\b/i],
+      // Gradle/Maven (Surefire/JUnit): "Tests run: 5, Failures: 0, Errors: 0, Skipped: 5"
+      [/Tests run:\s*(\d+)/i, /Skipped:\s*(\d+)/i],
+      // .NET: "Passed: 0, Failed: 0, Skipped: 5, Total: 5"
+      [/\bTotal:\s*(\d+)/i, /Skipped:\s*(\d+)/i],
+      // PHPUnit: "OK, but incomplete, skipped, or risky tests!" → "Tests: 5, .., Skipped: 5"
+      [/\bTests:\s*(\d+)/i, /Skipped:\s*(\d+)/i],
+    ];
+    // Compare the total and skip counts on the SAME line across all aggregate
+    // families; `cmp` selects all-skip (===) vs has-passes (>).
+    const aggregateMatch = (cmp: (total: number, skip: number) => boolean): boolean =>
+      AGGREGATE_FAMILIES.some(([totalRe, skipRe]) =>
+        trimmedLines.some(line => {
+          const t = line.match(totalRe);
+          const s = line.match(skipRe);
+          return Boolean(t && s && Number(t[1]) > 0 && cmp(Number(t[1]), Number(s[1])));
+        }),
+      );
+    const allSkipByTotal = aggregateMatch((total, skip) => total === skip);
+    // Multi-class / multi-project guard: Maven/Surefire/Gradle (and dotnet test)
+    // print ONE aggregate summary line PER class/project. A sibling class that
+    // PASSED ("Tests run: 3, .., Skipped: 0") shows total > skip on its own line
+    // but — for the Surefire family — emits NO "N passed" token, so it evades
+    // hasRealPassEvidence above. Since we are already inside !hasRealFailureEvidence
+    // (zero failures/errors anywhere), any line with total > skip means real tests
+    // passed. Treat that as pass evidence so one fully-skipped class can never
+    // short-circuit the scan and flip a run with passing siblings to all_skipped.
+    const aggregatePass = aggregateMatch((total, skip) => total > skip);
+    if ((standaloneSkip || allSkipByTotal) && !aggregatePass) return 'all_skipped';
+  }
   // Go: `go test` on an empty package reports `? pkg [no test files]`.
   // The default reporter also emits `ok pkg ...` lines when real tests ran,
   // so only classify as no_tests when every observed package line is empty or
@@ -773,6 +1561,109 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
     return 'no_tests';
   }
   return 'ran';
+}
+
+/**
+ * Best-effort parse of pass / skip / total counts from test-runner output.
+ *
+ * Companion to ``classifyTestExecution`` for the no-CI merge gate: where the
+ * classifier only decides ran / no_tests / all_skipped, this keeps the ACTUAL
+ * counts so a green PASS that exercised a tiny fraction of its suite (e.g.
+ * "5 passed, 1500 skipped") is no longer indistinguishable from a fully
+ * exercised pass. Reuses the SAME token/regex families the classifier
+ * understands:
+ *   - Standalone-token families (pytest, vitest, Rust, Go verbose) print
+ *     discrete "N passed" / "N skipped|deselected|ignored|filtered out" tokens
+ *     and Go verbose "--- PASS:" / "--- SKIP:" markers; counts are SUMMED across
+ *     lines / projects (one summary per class/project — exactly how the
+ *     classifier reasons about multi-class runs).
+ *   - Aggregate families (RSpec, Minitest, ExUnit, Surefire/Maven, .NET,
+ *     PHPUnit) print a single summary line carrying a TOTAL plus a skip count;
+ *     passed is derived as total - skipped - failures - errors.
+ * ``skipped`` is the UNION of skipped / deselected / ignored / filtered-out /
+ * pending / excluded — the same set the classifier folds together.
+ *
+ * CONSERVATIVE BY DESIGN: returns null when the output carries no recognizable
+ * count tokens, when a detected family's counts are internally inconsistent
+ * (skipped > total), or when two aggregate families disagree on the total.
+ * Callers treat null as "no coverage signal" and omit the field entirely, so an
+ * ambiguous parse never invents numbers.
+ */
+export function extractTestCoverage(
+  output: string,
+): { passed: number; skipped: number; total: number } | null {
+  if (!output) return null;
+  const trimmedLines = output.split(/\r?\n/).map(line => line.trim());
+
+  // First count match on a line, or 0. (RegExp.match returns only the first
+  // occurrence, which is what every per-class summary line carries.)
+  const countOnLine = (line: string, patterns: RegExp[]): number => {
+    for (const p of patterns) {
+      const m = line.match(p);
+      if (m) return Number(m[1]);
+    }
+    return 0;
+  };
+
+  // ── Aggregate families (single summary line carrying a TOTAL) ──────────────
+  // Each entry is [totalRe, skipRe]; mirrors AGGREGATE_FAMILIES in
+  // classifyTestExecution. A family fires only on lines carrying BOTH tokens,
+  // and counts are summed across all such lines (one per class/project).
+  const AGGREGATE_FAMILIES: Array<[RegExp, RegExp]> = [
+    [/\b(\d+)\s+examples?\b/i, /\b(\d+)\s+pending\b/i],            // Ruby/RSpec
+    [/\b(\d+)\s+runs?\b/i, /\b(\d+)\s+skips\b/i],                  // Ruby/Minitest
+    [/\b(\d+)\s+tests?\b/i, /\b(\d+)\s+(?:skipped|excluded)\b/i],  // Elixir/ExUnit
+    [/Tests run:\s*(\d+)/i, /Skipped:\s*(\d+)/i],                  // Surefire/Maven
+    [/\bTotal:\s*(\d+)/i, /Skipped:\s*(\d+)/i],                    // .NET
+    [/\bTests:\s*(\d+)/i, /Skipped:\s*(\d+)/i],                    // PHPUnit
+  ];
+  const failPatterns = [/\b(?:Failures?|Failed):\s*(\d+)\b/i, /\b(\d+)\s+failures?\b/i];
+  const errPatterns = [/\bErrors?:\s*(\d+)\b/i, /\b(\d+)\s+errors?\b/i];
+  const aggregateResults: Array<{ passed: number; skipped: number; total: number }> = [];
+  for (const [totalRe, skipRe] of AGGREGATE_FAMILIES) {
+    const familyLines = trimmedLines.filter(line => totalRe.test(line) && skipRe.test(line));
+    if (familyLines.length === 0) continue;
+    let total = 0, skipped = 0, failed = 0, errored = 0;
+    for (const line of familyLines) {
+      const t = line.match(totalRe);
+      const s = line.match(skipRe);
+      if (t) total += Number(t[1]);
+      if (s) skipped += Number(s[1]);
+      failed += countOnLine(line, failPatterns);
+      errored += countOnLine(line, errPatterns);
+    }
+    if (total <= 0 || skipped > total) continue; // inconsistent — ignore family
+    aggregateResults.push({ passed: Math.max(0, total - skipped - failed - errored), skipped, total });
+  }
+  if (aggregateResults.length > 0) {
+    // Ambiguous when two families disagree on the total.
+    if (new Set(aggregateResults.map(r => r.total)).size > 1) return null;
+    return aggregateResults[0];
+  }
+
+  // ── Standalone-token families (pytest / vitest / Rust / Go verbose) ────────
+  // Exclude vitest/jest FILE- or SUITE-level summary lines so their "N passed"
+  // counts (files/suites, not tests) are not double-counted into the totals.
+  const countLines = trimmedLines.filter(line => !/^Test (?:Files\b|Suites:)/i.test(line));
+  const sum = (re: RegExp): number => countLines.reduce((acc, line) => {
+    const m = line.match(re);
+    return m ? acc + Number(m[1]) : acc;
+  }, 0);
+  const passed =
+    sum(/\b(\d+)\s+passed\b/i) +
+    countLines.filter(line => /^--- PASS:/.test(line)).length;
+  const skipped =
+    sum(/\b(\d+)\s+skipped\b/i) +
+    sum(/\b(\d+)\s+deselected\b/i) +
+    sum(/\b(\d+)\s+ignored\b/i) +
+    sum(/\b(\d+)\s+filtered out\b/i) +
+    countLines.filter(line => /^--- SKIP:/.test(line)).length;
+  const failed =
+    sum(/\b(\d+)\s+failed\b/i) +
+    countLines.filter(line => /^--- FAIL:/.test(line)).length;
+  const total = passed + skipped + failed;
+  if (total <= 0) return null;
+  return { passed, skipped, total };
 }
 
 /**
@@ -885,3 +1776,564 @@ export function buildTargetedPytestRunners(runners: TestRunner[], selectors: str
 
 // isDockerRunner is used by callers in index.ts via re-export
 export { isDockerRunner };
+
+// ── Diff-aware documented / PR-introduced command discovery ──────────────────
+// The no-CI merge gate runs the repo's STORED suite + a cheap acceptance probe,
+// but it never executes commands the PR ITSELF introduces or documents — a newly
+// added package.json script, a newly added Makefile/justfile/Taskfile target, a
+// newly declared console-script entrypoint, or a command shown in a touched
+// README/docs usage block. So a PR can document/add a command, claim it works,
+// and merge with that claim entirely unexercised. These helpers discover that
+// small set of commands CONSERVATIVELY (structured sources preferred over
+// free-text prose) and ALLOWLISTED (every candidate is refused unless it clears
+// the destructive/network/privilege denylist), so the gate can run them. The
+// execution + timeout discipline lives in the verify-tests handler; this module
+// is the pure, unit-testable discovery + safety logic.
+
+/** A single command the PR introduces/documents, ready to run by the gate. */
+export interface DocumentedCommand {
+  /** Shell command string to execute (e.g. ``npm run build``, ``make test``). */
+  command: string;
+  /** Absolute working directory to run it from. */
+  cwd: string;
+  /** Where it was discovered (``package.json scripts.build``, ``make target test``…). */
+  source: string;
+  /** Human label surfaced in the verdict (``npm run build (agent/package.json)``). */
+  label: string;
+  /** Heavier build commands get the larger build timeout; cheap ones the baseline. */
+  heavy: boolean;
+}
+
+// Hard cap on discovered commands so a PR touching many manifests cannot fan out
+// an unbounded set of probe processes. The handler runs each ONCE under a
+// bounded timeout (no retries beyond the gate's existing discipline).
+export const MAX_DOCUMENTED_COMMANDS = 4;
+
+// Executables that are destructive, escalate privilege, touch the network, or
+// mutate global state. A documented/PR-introduced command — OR any sub-command
+// it chains into, OR the BODY of a script/target it would invoke — that runs one
+// of these is refused outright.
+const UNSAFE_EXECUTABLES = new Set([
+  'rm', 'rmdir', 'sudo', 'su', 'doas', 'curl', 'wget', 'nc', 'ncat', 'netcat',
+  'ssh', 'scp', 'sftp', 'telnet', 'ftp', 'rsync', 'docker', 'podman', 'kubectl',
+  'helm', 'systemctl', 'service', 'mkfs', 'dd', 'chmod', 'chown', 'chgrp',
+  'kill', 'killall', 'pkill', 'reboot', 'shutdown', 'poweroff', 'halt', 'mount',
+  'umount', 'apt', 'apt-get', 'yum', 'dnf', 'pacman', 'apk', 'brew', 'snap',
+  'git', 'gh', 'aws', 'gcloud', 'az', 'terraform', 'ansible',
+]);
+
+// Sub-command verbs that fetch from the network, escalate, or publish/deploy.
+// Refused wherever they appear as a token after the runner — covers
+// ``npm publish``, ``pip install x``, ``cargo install``, ``go get``, and any
+// ``<runner> deploy|release|publish`` shape.
+const UNSAFE_VERBS = new Set([
+  'install', 'publish', 'deploy', 'release', 'add', 'get', 'push', 'login',
+  'logout', 'uninstall', 'remove', 'update', 'upgrade', 'token', 'audit',
+]);
+
+// Leading ``NAME=value`` env-assignment tokens (``FOO=1 rm -rf /``) hide the
+// real executable from a head-only check — strip them before inspecting.
+const ENV_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+// Wrapper commands that run ANOTHER command passed as their argument
+// (``env curl …``, ``timeout 5 rm …``, ``xargs rm``). They mask the real
+// executable, so a documented/introduced command that leads with one is
+// refused outright rather than trying to peel and re-validate the inner shape.
+const WRAPPER_COMMANDS = new Set([
+  'env', 'time', 'timeout', 'xargs', 'nice', 'ionice', 'command', 'exec',
+  'nohup', 'setsid', 'stdbuf', 'chrt', 'sudo', 'su', 'doas',
+]);
+
+// Basename of a token, lowercased — so an absolute/relative path (``/bin/rm``,
+// ``./curl``) is matched against the denylist by its final component.
+function commandBasename(token: string): string {
+  const slash = token.lastIndexOf('/');
+  return (slash >= 0 ? token.slice(slash + 1) : token).toLowerCase();
+}
+
+function isSafeSubCommand(sub: string): boolean {
+  let tokens = sub.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return false;
+  // Strip leading env-assignment tokens so ``FOO=1 rm -rf /`` is judged on ``rm``.
+  while (tokens.length > 0 && ENV_ASSIGN_RE.test(tokens[0])) tokens = tokens.slice(1);
+  if (tokens.length === 0) return false;
+  const head = commandBasename(tokens[0]);
+  // Reject wrapper commands that hide the real executable (``env``, ``timeout``,
+  // ``xargs``, ``sudo`` …) before any other check.
+  if (WRAPPER_COMMANDS.has(head)) return false;
+  // Check the basename of EVERY token (not just the head) against the denylist
+  // so an absolute path (``/bin/rm``), a wrapper-smuggled executable, or a
+  // chained dangerous binary that survived sub-command splitting is refused.
+  if (tokens.some(t => UNSAFE_EXECUTABLES.has(commandBasename(t)))) return false;
+  // Inline code-eval (``bash -c``, ``node -e``, ``python -c`` …) executes
+  // arbitrary code — refuse regardless of what follows.
+  if (
+    /^(bash|sh|zsh|ksh|node|deno|bun|python3?|perl|ruby|php)$/.test(head) &&
+    tokens.slice(1).some(t => /^(-c|-e|--eval|--command|--exec)$/i.test(t))
+  ) {
+    return false;
+  }
+  if (tokens.slice(1).some(t => UNSAFE_VERBS.has(t.toLowerCase()))) return false;
+  return true;
+}
+
+/**
+ * Whether a command (or a script/target body the gate would invoke) is safe to
+ * run. CONSERVATIVE — refuses command substitution, redirection to absolute /
+ * system paths, and any sub-command that invokes a destructive/network/privilege
+ * executable or a network-install / deploy / publish verb. A chain of SAFE
+ * commands (``tsc && vite build``) is allowed; a chain that smuggles a dangerous
+ * command (``build && rm -rf /``) is refused. When in doubt, returns false.
+ */
+export function isSafeDocumentedCommand(command: string): boolean {
+  const cmd = (command || '').trim();
+  if (!cmd) return false;
+  // Command substitution — hidden execution.
+  if (/`|\$\(/.test(cmd)) return false;
+  // Output redirection to an absolute / system path (``> /etc/x``, ``>>/usr/…``).
+  if (/>>?\s*\//.test(cmd)) return false;
+  // Validate EACH chained sub-command.
+  const subs = cmd.split(/&&|\|\||;|\|/).map(s => s.trim()).filter(Boolean);
+  if (subs.length === 0) return false;
+  return subs.every(isSafeSubCommand);
+}
+
+// Known-safe runner first-tokens for LAST-RESORT free-text (README/docs)
+// extraction. A prose command is considered only when its first token is one of
+// these AND it additionally clears ``isSafeDocumentedCommand``. Structured
+// sources do NOT use this list — they are preferred and gated on the body
+// denylist instead.
+const ALLOWLISTED_RUNNERS = new Set([
+  'npm', 'yarn', 'pnpm', 'npx', 'node', 'make', 'just', 'task', 'cargo', 'go',
+  'python', 'python3', 'pytest', 'tox', 'nox', 'bundle', 'rake', 'mix',
+  'dotnet', 'mvn', 'gradle', './gradlew', 'gradlew', 'composer', 'poetry',
+  'ruff', 'eslint', 'tsc', 'vitest', 'jest', 'deno', 'bun',
+]);
+
+/** Whether a free-text command's first token is a known-safe runner shape. */
+export function isAllowlistedRunnerShape(command: string): boolean {
+  const tokens = command.trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return false;
+  return ALLOWLISTED_RUNNERS.has(tokens[0].toLowerCase());
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// The script/target names worth exercising — the verbs the direction cares about
+// (test/build/lint/check + type-check aliases). Bounded so a manifest declaring
+// dozens of scripts cannot fan out.
+const INTERESTING_NAMES = ['test', 'build', 'lint', 'check', 'typecheck', 'type-check'];
+
+// A name is "newly introduced" when a declaration line for it appears in the
+// PR's added diff lines. Matches both quoted JSON keys (``"build":``) and bare
+// target/key declarations (``build:`` / ``  build:``).
+function addedDeclaresName(addedLines: string[], name: string): boolean {
+  const esc = escapeRegExp(name);
+  const jsonKey = new RegExp(`"${esc}"\\s*:`);
+  const decl = new RegExp(`(^|\\s)${esc}\\s*[:=]`);
+  return addedLines.some(l => jsonKey.test(l) || decl.test(l));
+}
+
+function parsePackageJsonCommands(
+  text: string, addedLines: string[], cwd: string, label: string,
+): DocumentedCommand[] {
+  let parsed: unknown;
+  try { parsed = JSON.parse(text); } catch { return []; }
+  const scripts = (parsed && typeof parsed === 'object'
+    ? (parsed as { scripts?: Record<string, unknown> }).scripts
+    : undefined);
+  if (!scripts || typeof scripts !== 'object') return [];
+  const out: DocumentedCommand[] = [];
+  for (const name of INTERESTING_NAMES) {
+    const body = scripts[name];
+    if (typeof body !== 'string' || !body.trim()) continue;
+    if (!addedDeclaresName(addedLines, name)) continue;   // not newly introduced
+    if (!isSafeDocumentedCommand(body)) continue;         // script BODY denylist
+    const command = name === 'test' ? 'npm test' : `npm run ${name}`;
+    out.push({
+      command, cwd, source: `package.json scripts.${name}`,
+      label: `${command} (${label})`, heavy: name === 'build',
+    });
+  }
+  return out;
+}
+
+function indentWidth(line: string): number {
+  const m = line.match(/^[ \t]*/);
+  return m ? m[0].length : 0;
+}
+
+// The body lines belonging to a make/just/task target: every line after the
+// declaration that is MORE indented than the declaration, until a same-or-less
+// indented (non-blank) line. Works for tab-indented make recipes, indented just
+// recipes, and nested Taskfile ``cmds:`` blocks.
+function targetBodyLines(lines: string[], declIndex: number): string[] {
+  const baseIndent = indentWidth(lines[declIndex]);
+  const body: string[] = [];
+  for (let i = declIndex + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) continue;                 // blanks don't end the block
+    if (indentWidth(line) <= baseIndent) break; // dedent → block ended
+    body.push(line.trim());
+  }
+  return body;
+}
+
+function parseTargetCommands(
+  text: string, addedLines: string[], cwd: string, label: string,
+  kind: 'make' | 'just' | 'task',
+): DocumentedCommand[] {
+  const lines = text.split(/\r?\n/);
+  const runner = kind === 'make' ? 'make' : kind === 'just' ? 'just' : 'task';
+  // make/just targets sit at column 0; Taskfile targets are indented under
+  // ``tasks:``. Both forms end in ``:``.
+  const declRe = (name: string): RegExp => kind === 'task'
+    ? new RegExp(`^\\s+${escapeRegExp(name)}\\s*:`)
+    : new RegExp(`^${escapeRegExp(name)}\\s*:`);
+  const out: DocumentedCommand[] = [];
+  for (const name of INTERESTING_NAMES) {
+    const re = declRe(name);
+    const declIndex = lines.findIndex(l => re.test(l));
+    if (declIndex < 0) continue;
+    if (!addedDeclaresName(addedLines, name)) continue;   // not newly introduced
+    // Refuse if any recipe/command line in the target body is dangerous.
+    const body = targetBodyLines(lines, declIndex)
+      .map(l => l.replace(/^[-*]\s*/, '').replace(/^cmd:\s*/, '').trim())
+      .filter(Boolean);
+    if (!body.every(isSafeDocumentedCommand)) continue;
+    const command = `${runner} ${name}`;
+    out.push({
+      command, cwd, source: `${kind} target ${name}`,
+      label: `${command} (${label})`, heavy: name === 'build',
+    });
+  }
+  return out;
+}
+
+// Console-script / entrypoint names declared in pyproject.toml
+// (``[project.scripts]`` / ``[tool.poetry.scripts]``) or setup.cfg
+// (``console_scripts`` under ``[options.entry_points]``).
+function parseConsoleScriptNames(text: string, kind: 'pyproject' | 'setup.cfg'): string[] {
+  const lines = text.split(/\r?\n/);
+  const names: string[] = [];
+  if (kind === 'pyproject') {
+    let inScripts = false;
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (/^\[/.test(line)) {
+        inScripts = /^\[(project\.scripts|tool\.poetry\.scripts)\]/.test(line);
+        continue;
+      }
+      if (!inScripts) continue;
+      const m = line.match(/^([A-Za-z][\w.-]*)\s*=/);
+      if (m) names.push(m[1]);
+    }
+    return names;
+  }
+  // setup.cfg: a ``console_scripts =`` key whose entries are indented beneath it.
+  let inConsole = false;
+  let consoleIndent = -1;
+  for (const raw of lines) {
+    if (!raw.trim()) continue;
+    const indent = indentWidth(raw);
+    const trimmed = raw.trim();
+    if (inConsole) {
+      if (indent <= consoleIndent) {
+        inConsole = false; // dedent — re-evaluate this line below
+      } else {
+        const m = trimmed.match(/^([A-Za-z][\w.-]*)\s*=/);
+        if (m) names.push(m[1]);
+        continue;
+      }
+    }
+    if (/^console_scripts\s*=/.test(trimmed)) {
+      inConsole = true;
+      consoleIndent = indent;
+    }
+  }
+  return names;
+}
+
+function parseConsoleScriptCommands(
+  text: string, addedLines: string[], cwd: string, label: string,
+  kind: 'pyproject' | 'setup.cfg',
+): DocumentedCommand[] {
+  const out: DocumentedCommand[] = [];
+  for (const name of parseConsoleScriptNames(text, kind)) {
+    if (!/^[A-Za-z][\w.-]*$/.test(name)) continue;        // sane binary name only
+    if (!addedDeclaresName(addedLines, name)) continue;   // not newly introduced
+    // Exercise the entrypoint cheaply + safely: ``<name> --help``. The entrypoint
+    // must be installed (provisioning runs the project install), so a missing
+    // binary degrades to could_not_run downstream rather than blocking.
+    const command = `${name} --help`;
+    if (!isSafeDocumentedCommand(command)) continue;
+    out.push({
+      command, cwd, source: `console_script ${name}`,
+      label: `${command} (${label})`, heavy: false,
+    });
+  }
+  return out;
+}
+
+// Lines inside fenced code blocks (``` / ~~~), trimmed. Used for LAST-RESORT
+// README/docs extraction.
+function extractFencedCommandLines(text: string): string[] {
+  const lines = text.split(/\r?\n/);
+  const out: string[] = [];
+  let inFence = false;
+  for (const raw of lines) {
+    const trimmed = raw.trim();
+    if (/^(```|~~~)/.test(trimmed)) { inFence = !inFence; continue; }
+    if (inFence && trimmed) out.push(trimmed);
+  }
+  return out;
+}
+
+function parseDocumentedProseCommands(
+  text: string, addedLines: string[], cwd: string, label: string,
+): DocumentedCommand[] {
+  const addedSet = new Set(addedLines.map(l => l.trim()));
+  const out: DocumentedCommand[] = [];
+  for (const line of extractFencedCommandLines(text)) {
+    // Only commands the PR NEWLY documented (the fenced line is in the diff).
+    if (!addedSet.has(line)) continue;
+    // Strip a leading shell prompt (``$ `` / ``> ``).
+    const cmd = line.replace(/^[$>]\s+/, '').trim();
+    if (!cmd) continue;
+    if (!isAllowlistedRunnerShape(cmd)) continue;         // strict runner shape
+    if (!isSafeDocumentedCommand(cmd)) continue;          // denylist
+    out.push({
+      command: cmd, cwd, source: `documented command (${label})`,
+      label: `${cmd} (${label})`, heavy: /(^|\s)build(\s|$)/.test(cmd),
+    });
+  }
+  return out;
+}
+
+/** Input for {@link discoverDocumentedCommands}. */
+export interface DiscoverDocumentedCommandsInput {
+  /** PR-vs-base changed files, repo-root-relative (``git diff --name-only``). */
+  changedFiles: string[];
+  /** Added diff lines (``+`` lines, ``+`` stripped, trimmed). */
+  addedLines: string[];
+  /**
+   * Added diff lines keyed by the repo-relative file they belong to. When
+   * present, a script/target/entrypoint is judged "newly introduced" ONLY when
+   * its declaration appears in the added lines of the SAME manifest being
+   * parsed — so a matching declaration shape in an unrelated file cannot make a
+   * pre-existing script in a separately-changed manifest look new. Falls back to
+   * the global {@link addedLines} when a file has no entry (keeps callers/tests
+   * that pass only the flat list working unchanged).
+   */
+  addedLinesByFile?: Record<string, string[]>;
+  /** Read a repo-relative file's text; return null when absent/unreadable. */
+  readFile: (relPath: string) => string | null;
+  /** Workspace root (absolute). Defaults to the module workspace. */
+  workspace?: string;
+  /** Max commands to return. Defaults to {@link MAX_DOCUMENTED_COMMANDS}. */
+  max?: number;
+}
+
+/**
+ * Discover the small, allowlisted set of commands a PR INTRODUCES or DOCUMENTS,
+ * diffing against the base. STRUCTURED sources (added package.json scripts,
+ * added Makefile/justfile/Taskfile targets, declared console-script entrypoints)
+ * are preferred; free-text README/docs extraction is LAST-RESORT and only pulls
+ * fenced-block lines matching a strict runner allowlist. Every candidate clears
+ * the destructive/network/privilege denylist (script/target BODIES too). Bounded
+ * to ``max`` commands and deduped by cwd+command. Pure — all filesystem access
+ * goes through the injected ``readFile`` so the logic is unit-testable.
+ */
+export function discoverDocumentedCommands(
+  input: DiscoverDocumentedCommandsInput,
+): DocumentedCommand[] {
+  const workspace = input.workspace ?? WORKSPACE;
+  const max = input.max ?? MAX_DOCUMENTED_COMMANDS;
+  const out: DocumentedCommand[] = [];
+  const seen = new Set<string>();
+  const push = (c: DocumentedCommand): void => {
+    if (out.length >= max) return;
+    const key = `${c.cwd}::${c.command}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(c);
+  };
+  const dirOf = (relPath: string): string => {
+    const slash = relPath.lastIndexOf('/');
+    const dir = slash >= 0 ? relPath.slice(0, slash) : '';
+    return dir ? `${workspace}/${dir}` : workspace;
+  };
+
+  // Added lines scoped to ONE file: the per-file map when supplied, else the
+  // global list (so a declaration shape in an unrelated changed file cannot make
+  // a pre-existing script in a separately-changed manifest look newly added).
+  const addedFor = (rel: string): string[] =>
+    input.addedLinesByFile?.[rel] ?? input.addedLines;
+
+  // Structured sources first; defer README/docs to a last-resort pass.
+  const proseFiles: string[] = [];
+  for (const rel of input.changedFiles) {
+    if (out.length >= max) break;
+    const slash = rel.lastIndexOf('/');
+    const base = slash >= 0 ? rel.slice(slash + 1) : rel;
+    const lower = base.toLowerCase();
+    const cwd = dirOf(rel);
+    const added = addedFor(rel);
+    if (lower === 'package.json') {
+      const text = input.readFile(rel);
+      if (text != null) for (const c of parsePackageJsonCommands(text, added, cwd, rel)) push(c);
+    } else if (lower === 'makefile' || lower === 'gnumakefile') {
+      const text = input.readFile(rel);
+      if (text != null) for (const c of parseTargetCommands(text, added, cwd, rel, 'make')) push(c);
+    } else if (lower === 'justfile') {
+      const text = input.readFile(rel);
+      if (text != null) for (const c of parseTargetCommands(text, added, cwd, rel, 'just')) push(c);
+    } else if (lower === 'taskfile.yml' || lower === 'taskfile.yaml') {
+      const text = input.readFile(rel);
+      if (text != null) for (const c of parseTargetCommands(text, added, cwd, rel, 'task')) push(c);
+    } else if (lower === 'pyproject.toml' || lower === 'setup.cfg') {
+      const text = input.readFile(rel);
+      if (text != null) for (const c of parseConsoleScriptCommands(text, added, cwd, rel, lower === 'setup.cfg' ? 'setup.cfg' : 'pyproject')) push(c);
+    } else if (/\.(md|markdown|rst)$/i.test(lower) || lower === 'readme') {
+      proseFiles.push(rel);
+    }
+  }
+
+  // Last-resort: free-text README/docs. Prose commands run from the repo root
+  // (docs commonly live under docs/ but are invoked from the project root).
+  if (out.length < max) {
+    for (const rel of proseFiles) {
+      if (out.length >= max) break;
+      const text = input.readFile(rel);
+      if (text != null) for (const c of parseDocumentedProseCommands(text, addedFor(rel), workspace, rel)) push(c);
+    }
+  }
+
+  return out;
+}
+
+// ── Newly-introduced test-skip / disable marker discovery ────────────────────
+// The inverse of the documented-command probe: a PR can make a red suite look
+// green by DISABLING tests instead of fixing them. This is a VISIBILITY-FIRST
+// signal — it never blocks the merge — so an operator can see "this PR disables
+// N test(s)" in the merge-gate verdict.
+
+/** One newly-introduced test-skip / disable marker, enough to render a row. */
+export interface DisabledTestMarker {
+  /** Repo-relative path of the TEST file the marker was added to. */
+  file: string;
+  /** The marker kind that matched (``it.skip``, ``@pytest.mark.skip`` …). */
+  marker: string;
+  /** The trimmed offending added line. */
+  line: string;
+}
+
+// Hard cap on reported markers so a PR that mass-disables a suite cannot fan out
+// an unbounded list into the verdict artifact (subject to the payload budget).
+export const MAX_DISABLED_TEST_MARKERS = 20;
+
+// Path heuristics for "this is a TEST file" — restrict the scan so unrelated
+// prose or a non-test ``# ignore``-style comment cannot false-positive. Mirrors
+// the common ecosystem conventions: ``*.test.*`` / ``*.spec.*`` (JS/TS), Go
+// ``*_test.go``, Python ``test_*.py`` / ``*_test.py``, Ruby ``*_spec.rb``, and
+// anything under a ``tests/`` / ``__tests__/`` / ``spec/`` directory.
+const TEST_FILE_PATTERNS: RegExp[] = [
+  /\.(test|spec)\.[a-z0-9]+$/i,
+  /_test\.go$/i,
+  /(^|\/)test_[^/]*\.py$/i,
+  /_test\.py$/i,
+  /_spec\.rb$/i,
+  /(^|\/)(tests?|__tests__|spec)\//i,
+];
+
+/** Whether a repo-relative path is a TEST file by the conventions above. */
+export function isTestFilePath(relPath: string): boolean {
+  const p = (relPath || '').trim();
+  if (!p) return false;
+  return TEST_FILE_PATTERNS.some(re => re.test(p));
+}
+
+// Each marker is anchored so it matches REAL usage (``it.skip(`` …), not a
+// substring inside an identifier or a longer marker name. ``kind`` is the
+// human-facing label surfaced in the verdict.
+const DISABLED_TEST_MARKERS: Array<{ kind: string; re: RegExp }> = [
+  // JS / TS (Jest / Vitest / Mocha / Jasmine).
+  { kind: 'it.skip', re: /\bit\.skip\b/ },
+  { kind: 'test.skip', re: /\btest\.skip\b/ },
+  { kind: 'describe.skip', re: /\bdescribe\.skip\b/ },
+  { kind: 'context.skip', re: /\bcontext\.skip\b/ },
+  { kind: 'xit', re: /\bxit\s*\(/ },
+  { kind: 'xdescribe', re: /\bxdescribe\s*\(/ },
+  { kind: 'xtest', re: /\bxtest\s*\(/ },
+  // Python — pytest markers and unittest decorators.
+  { kind: '@pytest.mark.skipif', re: /@pytest\.mark\.skipif\b/ },
+  { kind: '@pytest.mark.skip', re: /@pytest\.mark\.skip\b/ },
+  { kind: '@pytest.mark.xfail', re: /@pytest\.mark\.xfail\b/ },
+  { kind: '@unittest.skip', re: /@(?:unittest\.)?skip(?:If|Unless)?\b/ },
+  // Go — testing.T skip calls.
+  { kind: 't.Skip()', re: /\b[a-zA-Z_]\w*\.Skip(?:Now)?\s*\(/ },
+  // Rust — ignored test attribute.
+  { kind: '#[ignore]', re: /#\[\s*ignore\b/ },
+  // JUnit (Java/Kotlin).
+  { kind: '@Disabled', re: /@Disabled\b/ },
+  { kind: '@Ignore', re: /@Ignore\b/ },
+  // RSpec (Ruby) — ``pending`` marks an example as not-yet-passing.
+  { kind: 'pending', re: /\bpending\b/ },
+];
+
+// Whether a (trimmed) added line is a comment we should NOT scan for markers —
+// so prose like ``// it.skip is deprecated`` does not false-positive. Careful
+// about Rust attributes: ``#[ignore]`` leads with ``#[`` and is NOT a comment,
+// whereas a Python/Ruby ``# ignore`` comment is.
+function isCommentLine(line: string): boolean {
+  if (line.startsWith('//') || line.startsWith('*') || line.startsWith('/*')) return true;
+  if (line.startsWith('#') && !line.startsWith('#[')) return true;
+  return false;
+}
+
+/** Input for {@link discoverNewlyDisabledTests}. */
+export interface DiscoverDisabledTestsInput {
+  /** PR-vs-base changed files, repo-root-relative (``git diff --name-only``). */
+  changedFiles: string[];
+  /**
+   * Added diff lines keyed by the repo-relative file they belong to. ONLY a
+   * file's OWN added lines are scanned, so a pre-existing legitimate skip (an
+   * unchanged line, or a skip in an unrelated file) is never reported.
+   */
+  addedLinesByFile: Record<string, string[]>;
+  /** Max markers to return. Defaults to {@link MAX_DISABLED_TEST_MARKERS}. */
+  max?: number;
+}
+
+/**
+ * Discover the test-skip / disable markers a PR NEWLY introduces. Scans ONLY the
+ * added lines (``+`` lines) of changed TEST files, so pre-existing skips and
+ * non-test files are ignored. Anchored, ecosystem-aware marker matching keeps
+ * prose / comments from false-positiving. Pure — no filesystem access — so it is
+ * directly unit-testable. Bounded to ``max`` markers.
+ */
+export function discoverNewlyDisabledTests(
+  input: DiscoverDisabledTestsInput,
+): DisabledTestMarker[] {
+  const max = input.max ?? MAX_DISABLED_TEST_MARKERS;
+  const out: DisabledTestMarker[] = [];
+  for (const rel of input.changedFiles) {
+    if (out.length >= max) break;
+    if (!isTestFilePath(rel)) continue;
+    // A changed test file may have no added-lines entry (binary / deletion / a
+    // change with no ``+`` lines) — guard the lookup before indexing.
+    if (!Object.prototype.hasOwnProperty.call(input.addedLinesByFile, rel)) continue;
+    const added = input.addedLinesByFile[rel];
+    if (added.length === 0) continue;
+    for (const raw of added) {
+      if (out.length >= max) break;
+      const line = (raw || '').trim();
+      if (!line || isCommentLine(line)) continue;
+      const hit = DISABLED_TEST_MARKERS.find(m => m.re.test(line));
+      if (hit) out.push({ file: rel, marker: hit.kind, line });
+    }
+  }
+  return out;
+}

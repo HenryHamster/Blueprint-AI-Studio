@@ -7360,7 +7360,181 @@ def _extract_classifier_region(source: str) -> str:
     end = source.find("\n}", end) + 1
     return source[start:end]
 
+def _extract_setup_classifier_region(source: str) -> str:
+    """Extract the classifySetupFailure function from test-runners.ts.
 
+    Finds the function by its export declaration and extracts it by locating
+    the module-level closing brace. This boundary detection is robust to
+    refactoring of the final return statement.
+    """
+    start = source.find("export function classifySetupFailure")
+    if start == -1:
+        raise ValueError(
+            "Could not find `export function classifySetupFailure` anchor in "
+            "agent/src/utils/test-runners.ts — the setup classifier function "
+            "was renamed or removed. Update _extract_setup_classifier_region in "
+            "backend/testing/test_invariants.py to match."
+        )
+
+    # Find the closing brace of the function. Since the function body is indented
+    # (2-space indent per TypeScript convention), the closing brace appears on
+    # its own line with no leading whitespace: \n}. This is more robust than
+    # looking for a specific return statement, since the final return value may
+    # change without affecting the function boundary.
+    end = source.find("\n}", start)
+    if end == -1:
+        raise ValueError(
+            "Could not find the closing brace of classifySetupFailure in "
+            "agent/src/utils/test-runners.ts — the function's structure changed. "
+            "Update _extract_setup_classifier_region."
+        )
+    # Include the closing brace in the extracted region (+ 2 for \n and })
+    end = end + 2
+    return source[start:end]
+
+
+def _extract_env_failure_region(source: str) -> str:
+    """Extract the matchesEnvironmentFailureSignature function from test-runners.ts.
+
+    The function must be defined immediately before classifyTestExecution so the
+    region boundary is [matchesEnvironmentFailureSignature .. classifyTestExecution).
+    Raises ValueError with a clear message on parse miss.
+    """
+    start = source.find("export function matchesEnvironmentFailureSignature")
+    if start == -1:
+        raise ValueError(
+            "Could not find `export function matchesEnvironmentFailureSignature` anchor "
+            "in agent/src/utils/test-runners.ts — the function was renamed or removed. "
+            "Update _extract_env_failure_region in backend/testing/test_invariants.py."
+        )
+    end = source.find("\nexport function classifyTestExecution", start)
+    if end == -1:
+        raise ValueError(
+            "Could not find `export function classifyTestExecution` terminator after "
+            "matchesEnvironmentFailureSignature in agent/src/utils/test-runners.ts. "
+            "Ensure matchesEnvironmentFailureSignature is defined immediately before "
+            "classifyTestExecution in the file."
+        )
+    return source[start:end]
+
+
+class TestAgentEnvFailureSignatureParity:
+    """SOURCE-SCAN: when agent/src is mounted, the agent-side env-failure
+    signature list stays in sync with the backend's _AGENT_VM_PATTERNS in
+    backend/app/failure_layer_classifier.py.
+
+    A pattern in the backend that is absent from the agent means a VM-level
+    failure (missing .so, runtime absent on PATH, spawn ENOENT) is misrouted to
+    the code-fix loop instead of the setup-escalation path, burning agent
+    budget on an unfixable problem.
+
+    Skips in CI Docker contexts where agent/src is absent, exactly like the
+    sibling ``TestAgentTestRunnerSourceParity`` class.
+    """
+
+    @staticmethod
+    def _read_agent_source() -> str:
+        path = _resolve_agent_test_runners_ts_path()
+        if path is None:
+            pytest.skip(
+                "agent/src/utils/test-runners.ts not available in this test "
+                "environment (CI docker context is ./backend; run locally or via "
+                "scripts/test-backend.sh from a checkout for enforcement)"
+            )
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_env_failure_function_exists_and_is_exported(self):
+        """matchesEnvironmentFailureSignature must be defined and exported."""
+        source = self._read_agent_source()
+        region = _extract_env_failure_region(source)  # raises (loud) on parse miss
+        assert "export function matchesEnvironmentFailureSignature" in region, (
+            "agent/src/utils/test-runners.ts no longer exports "
+            "matchesEnvironmentFailureSignature. Restore the export so the "
+            "no-CI gate can route env failures to setupErrors."
+        )
+
+    def test_env_failure_real_failure_guard_present(self):
+        """The function must gate on a hasRealFailureEvidence check so a test
+        that quotes an env phrase as assertion data stays a real test failure."""
+        source = self._read_agent_source()
+        region = _extract_env_failure_region(source)
+        assert "hasRealFailureEvidence" in region, (
+            "agent/src/utils/test-runners.ts matchesEnvironmentFailureSignature "
+            "no longer defines a real-failure evidence guard. Without this guard "
+            "a genuine failing suite whose output quotes an env phrase would be "
+            "misrouted to the setup-failure escalation path."
+        )
+        assert "if (hasRealFailureEvidence) return false;" in region, (
+            "agent/src/utils/test-runners.ts matchesEnvironmentFailureSignature "
+            "no longer short-circuits on real failure evidence. Restore the "
+            "`if (hasRealFailureEvidence) return false;` guard."
+        )
+
+    def test_env_failure_patterns_mirror_agent_vm_patterns(self):
+        """Key patterns from _AGENT_VM_PATTERNS must appear in the agent function.
+
+        The backend is the source of truth for what counts as a VM-level failure.
+        A pattern present in the backend but absent from the agent means that
+        failure class silently falls through to the code-fix loop.
+        """
+        source = self._read_agent_source()
+        region = _extract_env_failure_region(source)
+
+        # Each entry: (human label, canonical substring that must appear in region).
+        # Substrings are key phrases from _AGENT_VM_PATTERNS (failure_layer_classifier.py).
+        # Use raw strings to match backslash-escaped regex literals in the TS source.
+        required_patterns = [
+            ("shared-library load error", "error while loading shared librar"),
+            ("shared-object open failure", "cannot open shared object file"),
+            ("no-such-file .so", r"\.so"),
+            ("spawn ENOENT", "ENOENT"),
+            # TS source uses regex literals: \bnode:\s+command not found
+            ("node runtime missing", r"\bnode:"),
+            ("python3 runtime missing", "python3"),
+            # dash/sh "<tool>: not found" missing-executable phrasing
+            ("dash not-found", "not found"),
+            # Docker daemon unavailable on the gate VM
+            ("docker daemon unavailable", "cannot connect to the docker daemon"),
+            # OOM kills (exit 137 / SIGKILL / signal 9)
+            ("OOM sigkill", "sigkill"),
+            ("OOM signal killed", r"signal:\s*killed"),
+            ("OOM exit 137", "137"),
+            # Disk/quota/space failures (host resource exhaustion)
+            ("disk no space", "no space left on device"),
+            ("disk quota exceeded", "disk quota exceeded"),
+            ("filesystem full", "filesystem (is )?full"),
+            ("disk ENOSPC", "enospc"),
+            # Permission denied / access failures (read-only fs, insufficient perms)
+            ("permission denied", "permission denied"),
+            ("permission EACCES", "eacces"),
+            ("read-only filesystem", "read-only file system"),
+            ("read-only EROFS", "erofs"),
+        ]
+        missing = [
+            label
+            for label, phrase in required_patterns
+            if phrase not in region
+        ]
+        assert not missing, (
+            "agent/src/utils/test-runners.ts matchesEnvironmentFailureSignature "
+            "is missing pattern(s) that mirror backend _AGENT_VM_PATTERNS: "
+            f"{missing}. Add the missing patterns to keep the two banks in sync."
+        )
+
+    def test_extract_env_failure_region_raises_on_missing_anchor(self):
+        """Parser raises loudly when the function anchor is absent."""
+        with pytest.raises(ValueError, match="matchesEnvironmentFailureSignature"):
+            _extract_env_failure_region(
+                "export function classifyTestExecution(output: string) {}"
+            )
+
+    def test_extract_env_failure_region_raises_on_missing_terminator(self):
+        """Parser raises loudly when classifyTestExecution is absent after anchor."""
+        with pytest.raises(ValueError, match="classifyTestExecution"):
+            _extract_env_failure_region(
+                "export function matchesEnvironmentFailureSignature(output: string) {}"
+            )
 class TestAgentTestRunnerTableParity:
     """ALWAYS-ON: the backend-resident agent runner table is pinned to the shared
     fixture. Runs in plain GitHub CI (no agent/src required).
@@ -7842,6 +8016,58 @@ class TestAgentTestRunnerSourceParity:
                 "invariant to match the classifier if the signal moved."
             )
 
+    def test_setup_classifier_requires_line_anchored_patterns(self):
+        """The setup-failure classifier must stay line-anchored and pattern-based.
+
+        Loose whole-output substring scans would false-positive on a real test
+        that merely QUOTES a setup-like line ("bash: python3: command not
+        found", "ModuleNotFoundError: No module named 'pip'") in an assertion
+        body.
+        """
+        source = self._read_agent_source()
+        region = _extract_setup_classifier_region(source)
+
+        for forbidden in [
+            "output.includes(",
+            "lower.includes(",
+            "trimmedLines.some(line => line.includes(",
+        ]:
+            assert forbidden not in region, (
+                "agent/src/utils/test-runners.ts classifySetupFailure uses loose "
+                f"substring matching ({forbidden!r}); keep setup detection "
+                "line-anchored via regex patterns."
+            )
+
+        assert "missingToolPatterns" in region, (
+            "agent/src/utils/test-runners.ts classifySetupFailure must define a "
+            "missingToolPatterns set of line-anchored regexes."
+        )
+        assert "trimmedLines.some(line => missingToolPatterns.some(pattern => pattern.test(line)))" in region, (
+            "agent/src/utils/test-runners.ts classifySetupFailure must test "
+            "missingToolPatterns per line, not against the whole output."
+        )
+        for required in [
+            "command not found",
+            "python(?:3)?|go|cargo|node|npm|pnpm|yarn|pip|poetry",
+            "^(?:bash|sh):",
+            """No module named ['"]pip['"]""",
+        ]:
+            assert required in region, (
+                "agent/src/utils/test-runners.ts classifySetupFailure no longer "
+                f"contains the setup-failure signature {required!r}; update this "
+                "invariant if the signal legitimately moved."
+            )
+        for forbidden in [
+            "/^ModuleNotFoundError:\\s+No module named ['\"][^'\"]+['\"]\\s*$/i",
+            "/^ImportError:\\s+No module named ['\"][^'\"]+['\"]\\s*$/i",
+            "/^Error:\\s+Cannot find module ['\"](?![./])[^'\"]+['\"]\\s*$/i",
+            "/^(?:go:\\s+)?missing go\\.sum entry for module providing package\\b.*$/i",
+        ]:
+            assert forbidden not in region, (
+                "agent/src/utils/test-runners.ts classifySetupFailure must not "
+                f"treat generic repo dependency failures as setup infra ({forbidden!r})."
+            )
+
     def test_classifier_real_failure_guard_covers_every_runner_family(self):
         """COUPLED INVARIANT: the no-CI gate's runner detection can launch many
         ecosystems (Go, Ruby/Rake, Gradle, Maven, Elixir, .NET, PHPUnit) beyond
@@ -7919,6 +8145,82 @@ class TestAgentTestRunnerSourceParity:
                 "be misread as a real failure and hard-block an empty repo."
             )
 
+    def test_classifier_all_skipped_signals_cover_every_family(self):
+        """COUPLED INVARIANT (mirror of the real-failure-guard scan): a run that
+        COLLECTED tests but executed NONE because every test was skipped /
+        deselected / ignored / filtered is the SAME honest no-real-tests case as a
+        zero-collection run, and the cold no-CI gate must NOT record it as a
+        verified pass. The runner detection can launch every family below, so the
+        all-skipped classifier (returning 'all_skipped') MUST recognize each one;
+        a future edit that silently drops a family's all-skip signature re-opens
+        the false-'verified' path and fails here.
+
+        STRICTLY conservative: all_skipped is gated on a real-PASS guard
+        (hasRealPassEvidence) AND the existing real-FAILURE guard, so a run where
+        even one test passed or failed ("5 passed, 1500 skipped") stays 'ran'.
+        """
+        source = self._read_agent_source()
+        region = _extract_classifier_region(source)  # raises (loud) on parse miss
+
+        # The all_skipped verdict and its conservative real-pass guard must exist.
+        assert "all_skipped" in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution no longer "
+            "returns 'all_skipped'; an all-skipped suite would be recorded as a "
+            "vacuous verified pass. Restore the all-skip classification."
+        )
+        for guard in ["hasRealPassEvidence", "!hasRealPassEvidence"]:
+            assert guard in region, (
+                "agent/src/utils/test-runners.ts classifyTestExecution no longer "
+                f"defines/uses the real-pass guard {guard!r}. all_skipped must be "
+                "gated by a real-pass check so a mixed pass-with-skips run stays "
+                "a real 'ran' verdict."
+            )
+        # The non-zero real-pass signatures (so a zero-count pass token is never
+        # treated as a real pass that would suppress all-skip detection).
+        for pass_sig in [r"[1-9]\d*\s+passed", r"Passed:\s+[1-9]"]:
+            assert pass_sig in region, (
+                "agent/src/utils/test-runners.ts classifyTestExecution dropped the "
+                f"real-pass signature {pass_sig!r}; without it a mixed pass-with-"
+                "skips run could be misread as all_skipped."
+            )
+
+        # Per-family all-skip signatures: at least one candidate per family must
+        # be present, covering the SAME family set as the real-failure guard.
+        required_skip_signatures = [
+            ("pytest all-skipped/deselected", [r"[1-9]\d*\s+skipped", r"[1-9]\d*\s+deselected"]),
+            ("vitest all-skipped", [r"[1-9]\d*\s+skipped"]),
+            ("Rust all-ignored/filtered", [r"[1-9]\d*\s+ignored", r"[1-9]\d*\s+filtered out"]),
+            ("Go verbose --- SKIP:", [r"--- SKIP:"]),
+            ("Ruby/RSpec all-pending", [r"(\d+)\s+pending"]),
+            ("Ruby/Minitest all-skips", [r"(\d+)\s+skips"]),
+            ("Elixir/ExUnit all-excluded", [r"skipped|excluded"]),
+            ("Gradle/Maven Surefire Tests-run/Skipped", [r"Tests run:\s*(\d+)", r"Skipped:\s*(\d+)"]),
+            (".NET Total:/Skipped:", [r"Total:\s*(\d+)"]),
+            ("PHPUnit Tests:/Skipped:", [r"Tests:\s*(\d+)"]),
+        ]
+        missing = [
+            label
+            for label, candidates in required_skip_signatures
+            if not any(candidate in region for candidate in candidates)
+        ]
+        assert not missing, (
+            "agent/src/utils/test-runners.ts classifyTestExecution's all-skip "
+            "detection no longer recognizes a fully-skipped run for runner family/"
+            f"families: {missing}. The no-CI gate's runner detection can still "
+            "launch these ecosystems, so dropping their all-skip signature re-opens "
+            "the false-'verified' fall-open (an all-skipped suite recorded as a "
+            "verified pass). Restore the line-anchored all-skip signature(s)."
+        )
+
+        # The aggregate-family detection MUST compare total === skip (not a bare
+        # non-zero Skipped count), so a MIXED run ("Tests run: 5, .., Skipped: 3")
+        # with passes counted only in the total stays a real 'ran' verdict.
+        assert "allSkipByTotal" in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution dropped the "
+            "allSkipByTotal total===skip comparison; a bare non-zero 'Skipped: N' "
+            "would misclassify a mixed pass-with-skips run as all_skipped."
+        )
+
 
 class TestAgentTestRunnerParseHelpers:
     """ALWAYS-ON unit tests for the source-scan parser, driven by synthetic
@@ -7990,6 +8292,18 @@ class TestAgentTestRunnerParseHelpers:
                 "return 'no_tests'; }"
             )
 
+    def test_extract_setup_classifier_region_raises_on_missing_anchor(self):
+        with pytest.raises(ValueError, match="classifySetupFailure"):
+            _extract_setup_classifier_region(
+                "export function classifyTestExecution(output: string) { return 'ran'; }"
+            )
+
+    def test_extract_setup_classifier_region_raises_on_missing_closing_brace(self):
+        with pytest.raises(ValueError, match="closing brace"):
+            _extract_setup_classifier_region(
+                "export function classifySetupFailure(output: string) { return true;"
+            )
+
     def test_classifier_region_contains_missing_command_check(self):
         """A synthetic classifier region with the correct pattern passes."""
         synthetic = (
@@ -8002,3 +8316,167 @@ class TestAgentTestRunnerParseHelpers:
         assert "missingCommand" in region
         assert ".some(line => missingCommand.test(line))" in region
         assert r"\bcommand\b" in region
+
+    def test_setup_classifier_region_contains_line_anchored_patterns(self):
+        synthetic = (
+            "export function classifySetupFailure(output: string) {\n"
+            "  const trimmedLines = output.split(/\\r?\\n/).map(line => line.trim());\n"
+            "  const missingToolPatterns = [/^(?:bash|sh):(?:\\s+line\\s+\\d+:)?\\s*(?:python(?:3)?|go|cargo|node|npm|pnpm|yarn|pip|poetry):\\s+command not found\\s*$/i];\n"
+            "  if (trimmedLines.some(line => missingToolPatterns.some(pattern => pattern.test(line)))) return true;\n"
+            "  return false;\n"
+            "}\n"
+        )
+        region = _extract_setup_classifier_region(synthetic)
+        assert "missingToolPatterns" in region
+        assert ".some(line => missingToolPatterns.some(pattern => pattern.test(line)))" in region
+
+# ── No-CI UNVERIFIED-merge reason-label parity ────────────────────────────────
+# The orchestrator writes a stable reason KEY into
+# review_loop["unverified_merge_reason"] at each no-CI fall-open decision site.
+# Three operator-facing surfaces humanize that key: the backend unverified-merge
+# alert (alert_dispatch._UNVERIFIED_REASON_LABELS), the per-task Merge Test Gate
+# panel, and the project merge-verification banner (both frontend, sharing
+# admin-ui/src/utils/unverifiedReasonLabels.ts). These tests pin the label maps
+# to the full set of emitted keys so a new reason can never ship showing a raw
+# token (e.g. "suite_all_skipped") or a positive-sounding key ("probe_passed")
+# verbatim to an operator.
+
+# Canonical set of fall-open reason keys, with their emit sites:
+#   internal_staging_base / kill_switch_off / no_detectable_test_command /
+#   verify_setup_failed        -> app/orchestrator.py no-CI gate
+#   undetected_runtime / suite_all_skipped / probe_passed / probe_could_not_run /
+#   probe_no_artifact / documented_command_could_not_run /
+#   documented_command_passed  -> ci_resolution.classify_unverified_fall_open_reason
+_UNVERIFIED_REASON_KEYS = frozenset(
+    {
+        "no_detectable_test_command",
+        "kill_switch_off",
+        "internal_staging_base",
+        "undetected_runtime",
+        "suite_all_skipped",
+        "verify_setup_failed",
+        "probe_passed",
+        "probe_could_not_run",
+        "probe_no_artifact",
+        "documented_command_could_not_run",
+        "documented_command_passed",
+    }
+)
+
+
+def _frontend_unverified_reason_keys() -> "set[str] | None":
+    """Extract the key set of the frontend UNVERIFIED_REASON_LABELS map.
+
+    Returns ``None`` when admin-ui/src is not on disk (CI docker context is
+    ./backend) so the caller can skip, mirroring the frontend size guardrails.
+    """
+    if _ADMIN_UI_SRC_ROOT is None:
+        return None
+    path = _get_frontend_path(os.path.join("utils", "unverifiedReasonLabels.ts"))
+    source = Path(path).read_text(encoding="utf-8")
+    # Isolate the object literal body so we only read declared keys, not the
+    # JSDoc that names other keys in prose.
+    match = re.search(
+        r"UNVERIFIED_REASON_LABELS:\s*Record<string,\s*string>\s*=\s*\{(.*?)\n\};",
+        source,
+        re.DOTALL,
+    )
+    assert match, "UNVERIFIED_REASON_LABELS object literal not found in frontend util"
+    body = match.group(1)
+    return set(re.findall(r"^\s*([A-Za-z_][A-Za-z0-9_]*):", body, re.MULTILINE))
+
+
+def test_unverified_reason_labels_backend_covers_all_keys():
+    """The backend alert label map labels every emitted fall-open reason key."""
+    from app.alert_dispatch import _UNVERIFIED_REASON_LABELS
+
+    missing = _UNVERIFIED_REASON_KEYS - set(_UNVERIFIED_REASON_LABELS)
+    assert not missing, (
+        "backend _UNVERIFIED_REASON_LABELS (app/alert_dispatch.py) is missing "
+        f"labels for emitted reason keys: {sorted(missing)}"
+    )
+
+
+def test_unverified_reason_labels_frontend_backend_parity():
+    """Frontend and backend reason-label maps must cover the same key set.
+
+    Guards against the drift in this task: the frontend map had fallen behind
+    the backend (missing suite_all_skipped / verify_setup_failed / probe_*),
+    showing raw tokens to operators.
+    """
+    frontend_keys = _frontend_unverified_reason_keys()
+    if frontend_keys is None:
+        pytest.skip(
+            "admin-ui/src not available in this test environment "
+            "(CI docker context is ./backend; mount via test-backend.sh)"
+        )
+    from app.alert_dispatch import _UNVERIFIED_REASON_LABELS
+
+    backend_keys = set(_UNVERIFIED_REASON_LABELS)
+    assert frontend_keys == backend_keys, (
+        "no-CI UNVERIFIED reason-label maps drifted — frontend "
+        "(admin-ui/src/utils/unverifiedReasonLabels.ts) and backend "
+        "(app/alert_dispatch._UNVERIFIED_REASON_LABELS) must label the same keys. "
+        f"frontend-only={sorted(frontend_keys - backend_keys)} "
+        f"backend-only={sorted(backend_keys - frontend_keys)}"
+    )
+    # And both must cover the full canonical emitted set.
+    assert _UNVERIFIED_REASON_KEYS <= frontend_keys, (
+        "frontend reason-label map missing canonical keys: "
+        f"{sorted(_UNVERIFIED_REASON_KEYS - frontend_keys)}"
+    )
+
+
+# Canonical set of degraded no-CI reasons that escalate to ERROR severity.
+# These are environment/setup failures where verification was expected but
+# could not proceed due to infrastructure/tooling issues.
+_DEGRADED_REASON_KEYS = frozenset(
+    {
+        "verify_setup_failed",
+        "undetected_runtime",
+        "suite_all_skipped",
+        "probe_could_not_run",
+        "probe_no_artifact",
+        "documented_command_could_not_run",
+    }
+)
+
+
+def test_unverified_reason_severity_covers_all_keys():
+    """The severity map must classify every canonical emitted fall-open reason key.
+
+    Without this guard, a new reason key can be added with a label but no severity
+    entry and will silently default to WARNING, potentially downgrading degraded
+    environment/setup failures (which should be ERROR) to benign warnings. This test
+    ensures that is impossible: every canonical key must have an explicit severity.
+    """
+    from app.alert_dispatch import _UNVERIFIED_REASON_SEVERITY
+
+    missing = _UNVERIFIED_REASON_KEYS - set(_UNVERIFIED_REASON_SEVERITY)
+    assert not missing, (
+        "no-CI reason severity map (_UNVERIFIED_REASON_SEVERITY in "
+        "app/alert_dispatch.py) is missing severity entries for emitted reason keys: "
+        f"{sorted(missing)}. Every canonical reason must have an explicit severity "
+        "classification (ERROR for degraded environment/setup failures, WARNING for benign)."
+    )
+
+
+def test_unverified_reason_severity_degraded_are_error():
+    """Known degraded reasons (environment/setup failures) must be classified ERROR.
+
+    Degraded reasons represent cases where verification was expected but could not
+    proceed due to infrastructure/tooling issues (setup failures, suite collection
+    failures, build artifacts missing, etc.). These escalate to ERROR to alert the
+    operator loudly. This test ensures no degraded reason accidentally downgrades
+    to WARNING, either by missing from the map (caught by the prior test) or by
+    being mis-classified.
+    """
+    from app.alert_dispatch import _UNVERIFIED_REASON_SEVERITY, AlertSeverity
+
+    for reason in _DEGRADED_REASON_KEYS:
+        severity = _UNVERIFIED_REASON_SEVERITY.get(reason)
+        assert severity == AlertSeverity.ERROR, (
+            f"no-CI degraded reason '{reason}' must be classified ERROR in "
+            "_UNVERIFIED_REASON_SEVERITY (app/alert_dispatch.py), but got {severity}. "
+            "Degraded environment/setup failures must escalate loudly to ERROR, not WARNING."
+        )

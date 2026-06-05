@@ -130,6 +130,74 @@ export async function apiFetch(
   return dedupKey ? res.clone() : res;
 }
 
+/**
+ * One entry of the backend task-type registry catalog. Mirrors the dict shape
+ * emitted by `task_type_catalog()` in backend/app/task_capabilities.py — keep
+ * the field names in sync with `_capability_to_catalog_entry` there. This is
+ * the single backend source of truth for the operator catalog and the task
+ * launcher, so the admin-ui static `taskCapabilities.ts` list cannot drift.
+ */
+export interface TaskTypeCatalogEntry {
+  id: string;
+  label: string;
+  description: string;
+  agent_mode: 'write' | 'read_only';
+  default_category: string | null;
+  user_launchable: boolean;
+  provider_configurable: boolean;
+  filter_visible: boolean;
+  run_shape: 'single_agent' | 'workflow' | 'experiment_loop';
+  output_kind: 'pr' | 'artifact' | 'knowledge' | 'verdict' | 'none';
+  requires_code: boolean;
+  requires_web: boolean;
+  requires_compute: boolean;
+  evaluation_strategy: 'ci_and_review' | 'review_only' | 'forward_quality' | 'metric' | 'none';
+  cost_ceiling_usd: number | null;
+}
+
+/**
+ * Fetch the enriched task-type registry catalog from the backend. The endpoint
+ * is static and project-agnostic; consumers can render the catalog or derive
+ * the launchable-type allowlist from it.
+ */
+export async function fetchTaskTypeCatalog(
+  signal?: AbortSignal,
+): Promise<TaskTypeCatalogEntry[]> {
+  const res = await apiFetch('/api/admin/task-types', undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch task-type catalog: ${res.status}`);
+  const data = await res.json();
+  return Array.isArray(data?.task_types) ? data.task_types : [];
+}
+
+export interface TaskTypeCostAdherenceEntry {
+  id: string;
+  declared_ceiling_usd: number | null;
+  avg_cost_usd: number | null;
+  p95_cost_usd: number | null;
+  sample_count: number;
+  over_ceiling: boolean;
+}
+
+/**
+ * Fetch per-task-type actual VM cost (avg/p95 over a recent window) versus the
+ * declared ceiling. DB-backed sibling of {@link fetchTaskTypeCatalog}; the
+ * catalog endpoint stays DB-free, so actual-cost adherence lives here.
+ */
+export async function fetchTaskTypeCostAdherence(
+  signal?: AbortSignal,
+): Promise<TaskTypeCostAdherenceEntry[]> {
+  const res = await apiFetch(
+    '/api/admin/task-types/cost-adherence',
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch task-type cost adherence: ${res.status}`);
+  const data = await res.json();
+  return Array.isArray(data?.task_types) ? data.task_types : [];
+}
+
 export async function fetchTask(taskId: string): Promise<import('./components/TaskCard').Task> {
   const res = await apiFetch(`/api/admin/tasks/${encodeURIComponent(taskId)}`);
   if (!res.ok) throw new Error(`Failed to fetch task: ${res.status}`);
@@ -921,7 +989,7 @@ export interface VersionQualificationSubScores {
 export type QualificationStatus =
   | 'not_promoted'
   | 'dry_run'
-  | 'already_dry_run'
+  | 'cached_verdict'
   | 'promoted'
   | 'promotion_failed'
   | 'error'
@@ -960,6 +1028,9 @@ export interface VersionQualification {
   ci_resolution: CiResolution | null;
   blocker: string | null;
   finalized_at: string | null;
+  // The candidate commit this qualification was evaluated against. Used to detect
+  // when the latest audit's findings were computed against a different commit.
+  candidate_sha?: string | null;
   // Infra-failure context (populated only when status=infra_failure).
   error?: string | null;
   consecutive_infra_errors?: number | null;
@@ -971,15 +1042,31 @@ export interface VersionQualification {
   audit_findings?: AuditFinding[] | null;
 }
 
+export interface QualificationState {
+  state: string;
+  summary: string;
+  promotion_pr_number?: number | null;
+  promotion_pr_url?: string | null;
+  error?: string | null;
+  blocker?: string | null;
+}
+
 export interface CurrentVersion {
   version_number: number;
   phase: string;
   phase_changed_at: string | null;
   phase_reasoning: string | null;
   goal: string | null;
+  goal_updated_at?: string | null;
+  goal_editor_info?: string | null;
+  live_current_focus?: string | null;
   opened_at: string;
   qualification_attempts: number;
   merged_task_count: number;
+  /** Non-terminal tasks still in flight against this version. A version cut does
+   *  not stop them — they continue and land against the freshly-opened version. */
+  in_flight_task_count?: number;
+  qualification_state?: QualificationState | null;
   last_qualification: VersionQualification | null;
   latest_audit?: LatestAudit | null;
 }
@@ -991,6 +1078,9 @@ export interface RecentVersion {
   promoted_at: string | null;
   qualification_attempts: number;
   last_qualification: VersionQualification | null;
+  abandoned_at?: string | null;
+  abandoned_by?: string | null;
+  abandon_reason?: string | null;
 }
 
 export interface PromotionReadinessConfidence {
@@ -1014,11 +1104,48 @@ export interface PromotionReadiness {
   thresholds: Record<string, number>;
 }
 
+export interface StagedDirection {
+  id: string | null;
+  text: string | null;
+  priority: string | null;
+  staged_for_version: number | null;
+  staged_at: string | null;
+  staged_age_days: number | null;
+}
+
 export interface VersionLifecycleResponse {
   current_version: CurrentVersion | null;
   recent_versions: RecentVersion[];
   promotion_enabled?: boolean;
+  /** The promotion gate value actually consulted for this project (override when set, else fleet default). */
+  promotion_enabled_effective?: boolean;
+  /** The explicit per-project override, or null when the project rides the fleet default. */
+  promotion_enabled_override?: boolean | null;
+  /** Which value is in effect: a per-project override or the fleet-wide default. */
+  promotion_enabled_source?: 'project' | 'fleet';
   promotion_readiness?: PromotionReadiness | null;
+  staged_directions?: StagedDirection[];
+}
+
+export interface SetPromotionEnabledResponse {
+  project_id: string;
+  override: boolean | null;
+  effective: boolean;
+  source: 'project' | 'fleet';
+  cleared: boolean;
+}
+
+/** Arm (true), hold (false), or clear (null) this project's per-project live-promotion override. */
+export async function setProjectPromotionEnabled(
+  projectId: string,
+  enabled: boolean | null,
+): Promise<SetPromotionEnabledResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/promotion-enabled`, {
+    method: 'POST',
+    body: JSON.stringify({ enabled }),
+  });
+  if (!res.ok) throw new Error(`Failed to set promotion enablement: ${res.status}`);
+  return res.json();
 }
 
 export async function fetchVersionLifecycle(projectId: string): Promise<VersionLifecycleResponse> {
@@ -1047,6 +1174,54 @@ export async function setVersionPhase(
   return res.json();
 }
 
+export interface SetVersionGoalResponse {
+  version_number: number;
+  goal: string | null;
+  goal_updated_at: string | null;
+  goal_editor_info: string | null;
+}
+
+export async function setVersionGoal(
+  projectId: string,
+  goal: string | null,
+): Promise<SetVersionGoalResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/version-goal`, {
+    method: 'POST',
+    body: JSON.stringify({ goal: goal ?? null }),
+  });
+  if (!res.ok) throw new Error(`Failed to set version goal: ${res.status}`);
+  return res.json();
+}
+
+export interface CutVersionResponse {
+  abandoned_version: {
+    version_number: number;
+    status: string;
+  };
+  new_version: {
+    version_number: number;
+    phase: string;
+    goal: string | null;
+    opened_at: string;
+  };
+}
+
+export async function cutVersion(
+  projectId: string,
+  reason?: string,
+): Promise<CutVersionResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/version-cut`, {
+    method: 'POST',
+    body: JSON.stringify({ reason: reason ?? '' }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = data?.detail || data?.error?.message || `Failed to cut version: ${res.status}`;
+    throw new Error(detail);
+  }
+  return data;
+}
+
 export type QualifyTriggerStatus =
   | 'wrong_phase'
   | 'already_pending'
@@ -1054,7 +1229,7 @@ export type QualifyTriggerStatus =
   | 'no_credentials'
   | 'sha_error'
   | 'version_not_found'
-  | 'already_dry_run'
+  | 'cached_verdict'
   | 'spawn_failed'
   | 'not_promoted'
   | 'dry_run'
@@ -1461,6 +1636,15 @@ export async function fetchWarmPoolTargets(): Promise<WarmPoolTargets> {
   };
 }
 
+export async function patchAdminSettings(settings: { promotion_enabled: boolean }): Promise<unknown> {
+  const res = await apiFetch('/api/admin/settings', {
+    method: 'PATCH',
+    body: JSON.stringify(settings),
+  });
+  if (!res.ok) throw new Error(`Failed to patch admin settings: ${res.status}`);
+  return res.json();
+}
+
 // Set (targetSize 0..50) or clear (null) a single project's explicit warm-pool
 // target. Backs POST /api/admin/projects/{id}/warm-pool/target with body
 // {target_size}. Clearing falls the project back to the global default.
@@ -1522,4 +1706,185 @@ export async function fetchSrReviewerDisagreementTasks(
   const res = await apiFetch(url);
   if (!res.ok) throw new Error(`Failed to fetch SR reviewer disagreement tasks: ${res.status}`);
   return res.json();
+}
+
+// ── Compute jobs ────────────────────────────────────────────────────────────
+
+export interface ComputeJob {
+  id: string;
+  project_id: string;
+  task_id: string | null;
+  backend: string;
+  external_compute_id: string | null;
+  machine_type: string | null;
+  status: 'QUEUED' | 'STARTING' | 'RUNNING' | 'POLLING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | 'TIMED_OUT';
+  terminal_reason: string | null;
+  outcome: 'SUCCESS' | 'FAILURE' | 'CANCELLED' | 'TIMED_OUT' | 'SPEND_CAP_EXCEEDED' | null;
+  spend_cap_usd: number | null;
+  wall_clock_deadline: string | null;
+  created_at: string;
+  updated_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  last_polled_at: string | null;
+  accrued_cost_usd: number | null;
+  final_cost_usd: number | null;
+  result_reference: string | null;
+  // Augmented by the admin list endpoint from the launching Task.
+  task_title: string | null;
+  task_type: string | null;
+}
+
+export async function fetchComputeJobs(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ComputeJob[]> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/compute-jobs`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch compute jobs: ${res.status}`);
+  const data = await res.json();
+  return Array.isArray(data.compute_jobs) ? data.compute_jobs : [];
+}
+
+export async function killComputeJob(jobId: string): Promise<ComputeJob> {
+  const res = await apiFetch(
+    `/api/admin/compute-jobs/${encodeURIComponent(jobId)}/kill`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.error?.message || data?.detail || `Failed to kill compute job: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to kill compute job: ${res.status}`);
+  }
+  const data = await res.json();
+  return data.compute_job;
+}
+
+// --- Knowledge documents (durable, queryable home for web_research output) ---
+
+/** A single knowledge document. List responses omit `body`; get-by-id includes it. */
+/**
+ * Citation-grounding probe detail, present for BOTH knowledge kinds when the
+ * agent stamped a grounding result (absent only for older / un-probed docs):
+ * for `design` the counts are file-reference citations resolved against the
+ * repo; for `web_research` they are cited URLs probed for reachability. The
+ * field names are shared across both kinds — `file_citations` is the number of
+ * citations checked, `grounded` the number confirmed (resolved files / reachable
+ * URLs).
+ */
+export interface KnowledgeGroundingProbe {
+  file_citations: number;
+  grounded: number;
+  /** Citation strings that did NOT ground: absent repo paths / dead URLs. */
+  unresolved: string[];
+}
+
+/** Topic-responsiveness probe detail: keyword overlap between request and document. */
+export interface KnowledgeTopicResponsivenessProbe {
+  passed: boolean;
+  overlap: number;
+  total: number;
+}
+
+/** Goal-level acceptance-probe detail persisted under the verdict's `probes` key. */
+export interface KnowledgeAcceptanceProbes {
+  grounding?: KnowledgeGroundingProbe | null;
+  topic_responsiveness?: KnowledgeTopicResponsivenessProbe | null;
+}
+
+/**
+ * Forward-quality verdict persisted on a knowledge document. All fields are
+ * optional/nullable so documents persisted before a given field existed (e.g.
+ * pre-`probes` docs) render without errors. The index signature keeps it
+ * structurally compatible with the opaque `Record<string, unknown>` this used
+ * to be.
+ */
+export interface KnowledgeForwardQualityVerdict {
+  passed?: boolean;
+  reason?: string;
+  strategy?: string;
+  grader_task_id?: string;
+  probes?: KnowledgeAcceptanceProbes | null;
+  [key: string]: unknown;
+}
+
+export interface KnowledgeDocument {
+  id: string;
+  title: string;
+  summary: string | null;
+  topic: string | null;
+  /** Strategic direction key (e.g. `d-1a2b3c4d`) that motivated the producing task, or null. */
+  direction_id: string | null;
+  tags: string[];
+  source_citations: unknown[];
+  source_task_id: string | null;
+  authoring_branch?: string | null;
+  head_sha?: string | null;
+  /** Which kind of task produced this document. `string` keeps it forward-compatible. */
+  source_kind?: 'design' | 'web_research' | 'unknown' | string;
+  created_at: string | null;
+  updated_at: string | null;
+  forward_quality_verdict: KnowledgeForwardQualityVerdict | null;
+  /** Only present on get-by-id (the full markdown body). */
+  body?: string;
+}
+
+export interface KnowledgeDocumentsResponse {
+  documents: KnowledgeDocument[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+/** List / search a project's knowledge documents, newest-first. `q` drives full-text/tag/topic search. */
+export async function fetchKnowledgeDocuments(
+  projectId: string,
+  params?: { q?: string; topic?: string; tag?: string; direction?: string; source_kind?: string; limit?: number; offset?: number },
+): Promise<KnowledgeDocumentsResponse> {
+  const sp = new URLSearchParams();
+  if (params?.q) sp.set('q', params.q);
+  if (params?.topic) sp.set('topic', params.topic);
+  if (params?.tag) sp.set('tag', params.tag);
+  if (params?.direction) sp.set('direction', params.direction);
+  if (params?.source_kind) sp.set('source_kind', params.source_kind);
+  if (params?.limit !== undefined) sp.set('limit', String(params.limit));
+  if (params?.offset !== undefined) sp.set('offset', String(params.offset));
+  const query = sp.toString();
+  const url = `/api/admin/projects/${encodeURIComponent(projectId)}/knowledge-documents${query ? `?${query}` : ''}`;
+  const res = await apiFetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch knowledge documents: ${res.status}`);
+  return res.json();
+}
+
+/** Fetch a single knowledge document including its markdown body. */
+export async function fetchKnowledgeDocument(
+  projectId: string,
+  documentId: string,
+): Promise<KnowledgeDocument> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/knowledge-documents/${encodeURIComponent(documentId)}`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch knowledge document: ${res.status}`);
+  return res.json();
+}
+
+/** Operator-steering strategic-refresh marker persisted on `project.vision._strategic_refresh`.
+ *  Armed when operator steering wakes the strategist; cleared backend-side when the
+ *  autonomous loop consumes it. Returned (inside `vision`) by GET /api/admin/projects/{id}. */
+export interface StrategicRefreshMarker {
+  requested_at?: string;
+  reason?: string;
+  origin?: string;
+  count?: number;
+  excerpt?: string;
+  /** Timestamp when a prior marker was consumed by the strategic loop (receipt field). */
+  last_fired_at?: string;
+  /** Origin of the last consumed marker ('operator' or 'qualification'). Lets the UI
+   *  attribute receipts correctly — only operator-origin consumes show 'Steer picked up'. */
+  last_fired_origin?: string;
 }

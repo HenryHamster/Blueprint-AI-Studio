@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { timeAgo } from '../utils/time';
-import { USER_LAUNCHABLE_TASK_TYPE_OPTIONS } from '../taskCapabilities';
+import { useTaskCapabilities } from '../taskCapabilities';
 import type { UserLaunchableTaskType } from '../taskCapabilities';
 import type { ViewMode } from '../hooks/useViewPreferences';
 
@@ -77,6 +77,7 @@ export function SettingsGeneralSection({
   onUpdateNotifyOnHighSignalMessage,
   onNavigateToNotifications,
 }: SettingsGeneralSectionProps) {
+  const { userLaunchableOptions } = useTaskCapabilities();
   const [refreshInputVal, setRefreshInputVal] = useState('');
   const [pageSizeInputVal, setPageSizeInputVal] = useState('');
   const [defaultModel, setDefaultModel] = useState<string>(
@@ -115,7 +116,7 @@ export function SettingsGeneralSection({
               onChange={e => onUpdateDefaultTaskType(e.target.value as UserLaunchableTaskType)}
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
             >
-              {USER_LAUNCHABLE_TASK_TYPE_OPTIONS.map(option => (
+              {userLaunchableOptions.map(option => (
                 <option key={option.value} value={option.value}>{option.label}</option>
               ))}
             </select>

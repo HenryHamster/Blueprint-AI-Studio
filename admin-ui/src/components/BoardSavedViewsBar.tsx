@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Save, MoreVertical, Pencil, Trash2 } from 'lucide-react';
 import type { DateRange } from '../hooks/useSearchFilters';
 import type { TaskSortBy } from '../utils/taskCsv';
-import { FILTER_TASK_TYPE_IDS } from '../taskCapabilities';
+import { useTaskCapabilities } from '../taskCapabilities';
 import { STATUS_OPTIONS } from '../constants';
 import { SaveViewDialog } from './SaveViewDialog';
 import {
@@ -35,19 +35,6 @@ interface BoardSavedViewsBarProps {
   current: BoardFilterSnapshot;
   onApply: (snapshot: BoardFilterSnapshot) => void;
 }
-
-const DEFAULT_SNAPSHOT: BoardFilterSnapshot = {
-  query: '',
-  taskTypeFilter: [...FILTER_TASK_TYPE_IDS],
-  statusFilter: STATUS_OPTIONS.map(o => o.value),
-  dateRange: 'all',
-  blocked: false,
-  requiresApproval: false,
-  stuck: false,
-  stuckMinSeconds: 0,
-  failureClassFilter: [],
-  sortBy: 'newest',
-};
 
 function sameSet(a: string[], b: string[]): boolean {
   if (a.length !== b.length) return false;
@@ -85,11 +72,11 @@ function viewToSnapshot(view: BoardSavedView): BoardFilterSnapshot {
   };
 }
 
-function snapshotSummary(s: BoardFilterSnapshot): string {
+function snapshotSummary(s: BoardFilterSnapshot, allTaskTypeIds: readonly string[]): string {
   const parts: string[] = [];
   parts.push(s.query.trim() ? `Search: ${s.query.trim().slice(0, 40)}` : 'No search');
   if (s.statusFilter.length < STATUS_OPTIONS.length) parts.push(`${s.statusFilter.length} statuses`);
-  if (s.taskTypeFilter.length < FILTER_TASK_TYPE_IDS.length) parts.push(`${s.taskTypeFilter.length} types`);
+  if (s.taskTypeFilter.length < allTaskTypeIds.length) parts.push(`${s.taskTypeFilter.length} types`);
   if (s.dateRange !== 'all') parts.push(s.dateRange);
   if (s.blocked) parts.push('blocked');
   if (s.requiresApproval) parts.push('needs review');
@@ -100,10 +87,23 @@ function snapshotSummary(s: BoardFilterSnapshot): string {
 }
 
 export function BoardSavedViewsBar({ userId, projectId, current, onApply }: BoardSavedViewsBarProps) {
+  const { filterIds } = useTaskCapabilities();
   const [savedViews, setSavedViews] = useState<BoardSavedView[]>(() => loadBoardSavedViews(userId, projectId));
   const [activeViewId, setActiveViewId] = useState<string>(DEFAULT_VIEW_ID);
   const [openKebabId, setOpenKebabId] = useState<string | null>(null);
   const kebabRef = useRef<HTMLDivElement>(null);
+  const defaultSnapshot = useMemo<BoardFilterSnapshot>(() => ({
+    query: '',
+    taskTypeFilter: [...filterIds],
+    statusFilter: STATUS_OPTIONS.map(o => o.value),
+    dateRange: 'all',
+    blocked: false,
+    requiresApproval: false,
+    stuck: false,
+    stuckMinSeconds: 0,
+    failureClassFilter: [],
+    sortBy: 'newest',
+  }), [filterIds]);
 
   // Save/rename dialog state — mirrors MessagesPanel's single-dialog approach.
   const [showSaveDialog, setShowSaveDialog] = useState(false);
@@ -136,16 +136,16 @@ export function BoardSavedViewsBar({ userId, projectId, current, onApply }: Boar
   // The active tab is "modified" when live filters diverge from its snapshot.
   // For Default the baseline is the cleared/initial filter state.
   const activeTabModified = useMemo(() => {
-    if (activeViewId === DEFAULT_VIEW_ID) return !snapshotMatches(DEFAULT_SNAPSHOT, current);
+    if (activeViewId === DEFAULT_VIEW_ID) return !snapshotMatches(defaultSnapshot, current);
     if (!activeView) return false;
     return !snapshotMatches(viewToSnapshot(activeView), current);
-  }, [activeView, activeViewId, current]);
+  }, [activeView, activeViewId, current, defaultSnapshot]);
 
   function applyView(viewId: string) {
     setOpenKebabId(null);
     if (viewId === DEFAULT_VIEW_ID) {
       setActiveViewId(DEFAULT_VIEW_ID);
-      onApply(DEFAULT_SNAPSHOT);
+      onApply(defaultSnapshot);
       return;
     }
     const view = savedViews.find(v => v.id === viewId);
@@ -313,7 +313,7 @@ export function BoardSavedViewsBar({ userId, projectId, current, onApply }: Boar
           name={saveDialogName}
           description={saveDialogDescription}
           error={saveDialogError}
-          summaryText={snapshotSummary(current)}
+          summaryText={snapshotSummary(current, filterIds)}
           onNameChange={value => { setSaveDialogName(value); setSaveDialogError(null); }}
           onDescriptionChange={setSaveDialogDescription}
           onCommit={commitSaveDialog}

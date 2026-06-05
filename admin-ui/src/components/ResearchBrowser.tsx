@@ -1,9 +1,11 @@
 import { useState, useMemo, useEffect } from 'react';
 import { X, ChevronDown, ChevronRight, Compass, Search, CheckCircle, Clock, XCircle, Minus, ExternalLink, BarChart2 } from 'lucide-react';
-import type { Task, ResearchFinding } from './TaskCard';
+import type { ResearchFinding } from './TaskCard';
 import { TaskTypeBadge, isSafeUrl, FAILURE_CLASS_CONFIG } from './TaskCard';
 import { API_BASE_URL, authHeaders, fetchRecentFindings, type RecentFindingsResponse } from '../api';
 import { parseTimestamp } from '../utils/time';
+import { formatVerdict, verdictToneBadgeClass } from '../utils/verdictFormatting';
+import type { Task, TaskEvaluationSummary } from '../types/task';
 
 interface Direction {
   id: string;
@@ -19,7 +21,7 @@ interface EnrichedFinding {
   taskCreatedAt: string;
   findingIndex: number;
   /** Info about the child task that implemented this finding, if any. */
-  outcome?: { status: string; taskType?: string; taskId: string; prUrl?: string; failureClass?: string };
+  outcome?: { status: string; taskType?: string; taskId: string; prUrl?: string; failureClass?: string; evaluationSummary?: TaskEvaluationSummary | null };
 }
 
 /** Findings grouped under a direction (or "undirected"). */
@@ -188,6 +190,26 @@ function EvidencePanel({ finding, repoUrl }: { finding: ResearchFinding; repoUrl
   );
 }
 
+function OutcomeSummaryPills({ summary }: { summary: TaskEvaluationSummary }) {
+  const highlights = summary.highlights ?? [];
+  const { label: verdictLabel, tone: verdictToneId } = formatVerdict(summary.verdict);
+  return (
+    <div className="flex flex-wrap gap-1.5 text-[10px]">
+      <span className="rounded bg-neutral-800/80 px-1.5 py-0.5 text-neutral-300 uppercase tracking-wide">
+        {summary.status}
+      </span>
+      <span className={`rounded border px-1.5 py-0.5 uppercase tracking-wide ${verdictToneBadgeClass(verdictToneId)}`}>
+        {verdictLabel}
+      </span>
+      {highlights.slice(0, 2).map((item, i) => (
+        <span key={i} className="rounded bg-neutral-900/70 px-1.5 py-0.5 text-neutral-400 border border-neutral-800">
+          <span className="text-neutral-500">{item.label}</span> {item.value}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 type OutcomeFilter = 'all' | 'shipped' | 'in_progress' | 'proposed' | 'failed' | 'findings_documented';
 
 const IN_PROGRESS_OUTCOMES = new Set(['IN_PROGRESS', 'EVALUATING', 'QUEUED', 'PROVISIONING']);
@@ -256,7 +278,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
   // Build the map of finding key -> child task info from the project-wide feed when available.
   const implementedFindings = useMemo(() => {
     const outcomeFeed = researchFeed ?? tasks;
-    const map = new Map<string, { status: string; taskType?: string; taskId: string; prUrl?: string; failureClass?: string }>();
+    const map = new Map<string, { status: string; taskType?: string; taskId: string; prUrl?: string; failureClass?: string; evaluationSummary?: TaskEvaluationSummary | null }>();
     for (const task of outcomeFeed) {
       const ctx = task.context as Record<string, unknown> | undefined;
       if (ctx?.research_task_id && ctx?.finding_index !== undefined) {
@@ -267,6 +289,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
           taskId: task.id,
           prUrl: task.pr_url,
           failureClass: task.failure_class ?? undefined,
+          evaluationSummary: task.evaluation_summary ?? undefined,
         });
       }
     }
@@ -658,13 +681,16 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                                     'bg-emerald-900/40 text-emerald-400'
                                   }`}>{ef.finding.scope}/{ef.finding.risk}</span>
                                 )}
-                                {ef.finding.type && (
-                                  <span className="px-1 py-0.5 rounded bg-neutral-800 text-neutral-400">{ef.finding.type}</span>
-                                )}
-                                {ef.finding.priority && ef.finding.priority !== 'medium' && (
-                                  <span className={ef.finding.priority === 'high' ? 'text-amber-400' : 'text-neutral-500'}>{ef.finding.priority} priority</span>
-                                )}
-                              </div>
+                              {ef.finding.type && (
+                                <span className="px-1 py-0.5 rounded bg-neutral-800 text-neutral-400">{ef.finding.type}</span>
+                              )}
+                              {ef.finding.priority && ef.finding.priority !== 'medium' && (
+                                <span className={ef.finding.priority === 'high' ? 'text-amber-400' : 'text-neutral-500'}>{ef.finding.priority} priority</span>
+                              )}
+                            </div>
+                              {ef.outcome?.evaluationSummary && (
+                                <OutcomeSummaryPills summary={ef.outcome.evaluationSummary} />
+                              )}
                               <EvidencePanel finding={ef.finding} repoUrl={repoUrl} />
                               {/* Downstream task chain */}
                               {ef.outcome && (

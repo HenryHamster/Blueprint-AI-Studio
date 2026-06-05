@@ -37,6 +37,7 @@ vi.mock('../api', () => ({
     data_sufficient: true,
   }),
   setVersionPhase: vi.fn(),
+  setVersionGoal: vi.fn(),
   triggerQualify: vi.fn(),
 }));
 
@@ -959,6 +960,7 @@ describe('DashboardHome', () => {
       apiFetchMock.mockImplementation((url: string) => {
         if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse(baseDigest));
         if (url.includes('/diagnostics')) return Promise.resolve(jsonResponse(makeDiagnostics()));
+        if (url.includes('/health-overview')) return Promise.resolve(jsonResponse({ overall_status: 'healthy', success_rate: { current: null, trend: null, window_hours: 24 }, queue_depth: { queued: 0, active: 0, evaluating: 0 }, actionable_issues: [] }));
         return Promise.resolve(notFoundResponse());
       });
 

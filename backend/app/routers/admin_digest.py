@@ -49,6 +49,7 @@ from app.digest_metrics import (
     _stash_projected_task_fields,
     _task_prompt_fingerprint,  # noqa: F401  re-exported for external importers
     compute_anomaly_adjustment_summary,  # noqa: F401  re-exported for external importers
+    compute_dependency_health_signals,
     compute_digest_cost_economics,
     compute_digest_trend_history,  # noqa: F401  re-exported for external importers
     compute_direction_progress,
@@ -753,6 +754,13 @@ async def _compute_digest(
                 "review_iterations": (t.context or {})
                 .get("review_loop", {})
                 .get("iteration", 0),
+                # No-CI merge gate fall-open reason KEY (None for verified /
+                # older merges). Read the same way admin.py reads it so the
+                # Recent Merges timeline stays consistent with the per-task
+                # Merge Test Gate panel.
+                "unverified_merge_reason": (t.context or {})
+                .get("review_loop", {})
+                .get("unverified_merge_reason"),
             }
         )
 
@@ -1212,6 +1220,13 @@ async def _compute_digest(
     # --- Anomaly-driven pipeline adjustment snapshot ---
     anomaly_adjustment_summary = compute_anomaly_adjustment_summary()
 
+    # --- Dependency-health observability (parked blockers + duplicated
+    # foundations) — read-only signals so the two otherwise-invisible failure
+    # modes the foundation-resolution work prevents become measurable. ---
+    dependency_health_signals = await compute_dependency_health_signals(
+        session, project_id
+    )
+
     _review_quality = compute_review_quality_metrics(completed_tasks + failed_tasks)
     _self_review_skip_rate = _compute_sr_skip_rate(completed_tasks + failed_tasks)
     _sr_disallowed_blind_spot_rate = _compute_sr_disallowed_blind_spot_rate(
@@ -1329,6 +1344,7 @@ async def _compute_digest(
         "remediation_funnel": remediation_funnel,
         "investigation_conversion": investigation_conversion,
         "anomaly_adjustment": anomaly_adjustment_summary,
+        "dependency_health_signals": dependency_health_signals,
         "migration_health": migration_health,
         "prediction_calibration_factor": prediction_calibration["factor"]
         if prediction_calibration

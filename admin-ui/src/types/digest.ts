@@ -23,6 +23,7 @@
 // `DirectionProgress`. `DigestData` is therefore generic in that element type so
 // each consumer keeps its own strict typing without an unsafe widen/downcast.
 
+import type { OutcomeKindBreakdown } from '../utils/outcomeKinds';
 import type { EdgesTrend } from '../components/SrTrendBreakdown';
 import type { SrTrendWithFixIterations } from '../components/ReviewQualitySection';
 import type { ActiveTask } from '../components/CatchUpInProgressSection';
@@ -62,6 +63,10 @@ export interface RecentCompletion {
   scope?: string | null;
   duration_seconds?: number | null;
   review_iterations?: number | null;
+  // No-CI merge gate fall-open reason KEY; null/undefined for verified and
+  // older merges. Rendered as a compact UNVERIFIED indicator in the Recent
+  // Merges timeline (label via humanizeUnverifiedReason).
+  unverified_merge_reason?: string | null;
 }
 
 interface LatestCycle {
@@ -144,6 +149,14 @@ export interface DigestData<DP = unknown> {
   overall_product_ratio?: number | null;
   pipeline_conversion_rate?: number | null;
   pipeline_acceptance_rate?: number | null;
+  // Generalized (cross-task-type) success rolled up across all directions.
+  // `pipeline_generalized_successes` counts every evaluator-positive terminal
+  // outcome (code merges + research/audit/memo/verification successes);
+  // `pipeline_generalized_health_rate` is successes / terminal outcomes. The
+  // per-kind breakdown drives the dual-metric summary alongside PR merges.
+  pipeline_generalized_successes?: number | null;
+  pipeline_generalized_health_rate?: number | null;
+  pipeline_outcome_kind_breakdown?: OutcomeKindBreakdown | null;
   overall_type_distribution?: Record<string, number> | null;
   narrative_summary?: string | null;
   latest_cycle?: LatestCycle | null;

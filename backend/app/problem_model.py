@@ -158,6 +158,31 @@ class GapHistoryEvent(BaseModel):
     note: str | None = None
 
 
+class GapDeferral(BaseModel):
+    """An acknowledged, intentional decision to NOT staff a gap this cycle.
+
+    Lets the strategist record "this gap is real and still open, but we are
+    deliberately not working on it right now" without fabricating a direction
+    just to keep the gap from looking orphaned in the reconciliation view. An
+    active gap carrying a ``deferral`` is *intentionally* without an active
+    direction — distinct from a gap that drifted unstaffed by neglect.
+
+    Default-empty and optional so every stored JSONB model and older agent
+    payload validates unchanged. The agent clears it (sets ``deferral`` back to
+    ``None`` via a model write) when it picks the gap back up.
+    """
+
+    rationale: str = ""
+    """Why the gap is intentionally unstaffed this cycle."""
+
+    hold_until: str | None = None
+    """Optional ISO-8601 (or free-form milestone) marking when to revisit —
+    e.g. a date, a version tag, or a condition the agent will re-evaluate."""
+
+    created_at: str = ""
+    """ISO-8601 when the deferral was recorded."""
+
+
 class Gap(BaseModel):
     """A specific delta between intent and capabilities.
 
@@ -198,6 +223,15 @@ class Gap(BaseModel):
     """direction_ids that previously worked on this gap (merged or failed)."""
 
     history: list[GapHistoryEvent] = Field(default_factory=list)
+
+    deferral: GapDeferral | None = None
+    """Set when the gap is intentionally left unstaffed this cycle (see
+    :class:`GapDeferral`). ``None`` means the gap is either being actively
+    worked (has ``active_moves``) or is a genuine orphan — the reconciliation
+    view distinguishes a deferred gap from a drifted one by this field. As a
+    plain proposed-wins field it threads through :func:`_merge_gap` and
+    ``apply_agent_update`` with no extra merge logic: the agent sets it to
+    record a deferral and clears it (``None``) when it resumes the gap."""
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +396,67 @@ GAP_PAST_MOVES_DURABLE_MAX = 200
 """Cap on a surviving gap's durable ``past_moves`` after write-back restore —
 see :data:`GAP_HISTORY_DURABLE_MAX`."""
 
+GAP_APPEND_ONLY_GC_FLOOR = 12
+"""Per-active-gap floor kept by the byte GC for ``history`` / ``past_moves``."""
+
+
+ARCHIVED_GAPS_DURABLE_MAX = 200
+"""Hard cap on the durable ``archived_gaps`` collection — the only durable
+collection that grows without limit forever.
+
+Closed/abandoned gaps are moved into ``archived_gaps`` every cycle and the
+prior archive is unioned forward on every agent write (see
+:func:`apply_agent_update`), so without a backstop the JSONB column grows
+unboundedly and eventually the model can no longer round-trip in a single
+payload pass. This cap mirrors the append-log caps
+(:data:`GAP_HISTORY_DURABLE_MAX` / :data:`GAP_PAST_MOVES_DURABLE_MAX`): it is
+generous but finite, and eviction is oldest-first by ``closed``/``opened``
+timestamp. ``archived_gaps`` is pure history — closed/abandoned, reference-only,
+and individually re-fetchable by id — so rolling the oldest off is safe in a
+way that evicting active gaps/capabilities/friction would not be.
+
+This is a STRUCTURAL backstop applied by the backend on every write-back,
+independent of whether the agent voluntarily prunes. Active, semantically
+meaningful state (active gaps, capabilities, pending confirmations) is never
+evicted here — only history/archive."""
+
+
+PROBLEM_MODEL_BYTE_BUDGET = 90_000
+"""Serialized-byte budget for the durable problem model, set safely under the
+strategic write cap.
+
+The strategic op endpoint enforces a 100KB limit on the INCOMING agent payload
+(``admin_agent_ops`` ``set_problem_model``), but the persisted post-merge model
+— after ``archived_gaps`` are unioned forward — is never byte-checked, so the
+durable model can silently exceed the size that could ever be written back
+through the cap. :func:`gc_problem_model` measures the serialized model after
+the count caps run and, while it exceeds this budget, evicts oldest archived
+gaps and trims the rejected-agent-edits ledger (both history/reference-only) so
+the durable model stays round-trippable. Set ~10KB under the 100KB cap to leave
+headroom for the revision-log entry appended in the same write."""
+
+
+CAPABILITIES_DURABLE_MAX = 200
+"""Hard cap on the durable ``capabilities`` collection.
+
+Capabilities are merged non-destructively every cycle (see
+:func:`_merge_capabilities`), so on a mature project they accumulate without an
+intrinsic bound and — once read-side skeletonization is removed — a
+capability-heavy model can exceed the strategic payload budget and be dropped
+whole. This cap is the write-side backstop: generous (far above the advisory
+:data:`MODEL_SIZE_HEALTHY_CAPABILITIES`) but finite. Eviction is restricted to
+``planned`` capabilities (terminal/low-value — described but not yet built);
+live ``working``/``partial`` capabilities are never evicted, so an all-live
+collection may legitimately remain above this cap."""
+
+
+FRICTION_DURABLE_MAX = 200
+"""Hard cap on the durable ``friction`` collection — see
+:data:`CAPABILITIES_DURABLE_MAX`. Eviction is restricted to terminal
+``resolved`` then ``mitigated`` friction (reference-only, like archived gaps);
+``active`` friction is live high-value state and is never evicted, so an
+all-active collection may legitimately remain above this cap."""
+
 
 class SelfReflectionEntry(BaseModel):
     """Agent-written reflection about what was hard this cycle.
@@ -423,6 +518,277 @@ def archive_closed_gaps(model: ProblemModel) -> ProblemModel:
     return model
 
 
+def _archived_gap_recency_key(gap: Gap) -> str:
+    """Sort key for archived-gap eviction — most recent first when sorted
+    descending. Prefers ``closed`` (when it was archived), falling back to
+    ``opened``; a gap with neither timestamp sorts oldest and is evicted
+    first. Empty string sorts below any ISO-8601 timestamp."""
+    return gap.closed or gap.opened or ""
+
+
+def _active_gap_recency_key(gap: Gap) -> str:
+    """Sort key for active-gap tail trimming — oldest active gaps first."""
+    return gap.opened or (gap.history[0].ts if gap.history else "")
+
+
+def _trim_gap_append_only_tail(gap: Gap) -> dict[str, Any] | None:
+    """Trim one active gap to the durable append-only floor."""
+    trimmed: dict[str, Any] = {"gap_id": gap.id}
+    if len(gap.history) > GAP_APPEND_ONLY_GC_FLOOR:
+        trimmed["history_trimmed"] = len(gap.history) - GAP_APPEND_ONLY_GC_FLOOR
+        gap.history = gap.history[-GAP_APPEND_ONLY_GC_FLOOR:]
+    if len(gap.past_moves) > GAP_APPEND_ONLY_GC_FLOOR:
+        trimmed["past_moves_trimmed"] = (
+            len(gap.past_moves) - GAP_APPEND_ONLY_GC_FLOOR
+        )
+        gap.past_moves = gap.past_moves[-GAP_APPEND_ONLY_GC_FLOOR:]
+    return trimmed if len(trimmed) > 1 else None
+
+
+def _serialized_model_bytes(model: ProblemModel) -> int:
+    """Serialized byte length of the durable model, matching how the strategic
+    op endpoint measures an incoming payload (``json.dumps(..., default=str)``)."""
+    return len(json.dumps(model.model_dump(), default=str))
+
+
+def _is_evictable_capability(cap: Capability) -> bool:
+    """A capability the byte GC may evict: ``planned`` only — described but not
+    yet built, so terminal/low-value. ``working``/``partial`` are live
+    high-value state the agent owns and are never evicted."""
+    return cap.status == "planned"
+
+
+def _is_evictable_friction(fric: Friction) -> bool:
+    """Friction the byte GC may evict: ``resolved`` or ``mitigated`` —
+    terminal/reference-only, like an archived gap. ``active`` friction is live
+    high-value state and is never evicted."""
+    return fric.status in ("resolved", "mitigated")
+
+
+def _evict_one_terminal_capfriction(
+    model: ProblemModel,
+) -> tuple[str, str] | None:
+    """Evict the single most-disposable terminal capability/friction entry,
+    mutating ``model`` in place.
+
+    Priority (most disposable first): ``resolved`` friction, then ``mitigated``
+    friction, then ``planned`` capabilities — friction before any capability,
+    mirroring how archived gaps are the first reference-only state to roll off.
+    Within a status, oldest-first (list order, the merge-insertion order). Live
+    state (``working``/``partial`` capabilities, ``active`` friction) is never
+    touched. Returns ``(kind, identifier)`` of what was evicted —
+    ``("friction", id)`` or ``("capability", name)`` — or ``None`` when nothing
+    is evictable."""
+    for i, fric in enumerate(model.friction):
+        if fric.status == "resolved":
+            model.friction.pop(i)
+            return ("friction", fric.id)
+    for i, fric in enumerate(model.friction):
+        if fric.status == "mitigated":
+            model.friction.pop(i)
+            return ("friction", fric.id)
+    for i, cap in enumerate(model.capabilities):
+        if cap.status == "planned":
+            model.capabilities.pop(i)
+            return ("capability", cap.name)
+    return None
+
+
+def _cap_count_cap(model: ProblemModel) -> list[str]:
+    """Evict terminal (``planned``) capabilities oldest-first when the
+    collection exceeds :data:`CAPABILITIES_DURABLE_MAX`. Live working/partial
+    capabilities are never evicted, so the collection may remain above the cap
+    when it is all-live. Returns the evicted capability names."""
+    overage = len(model.capabilities) - CAPABILITIES_DURABLE_MAX
+    if overage <= 0:
+        return []
+    evicted: list[str] = []
+    kept: list[Capability] = []
+    for cap in model.capabilities:
+        if len(evicted) < overage and _is_evictable_capability(cap):
+            evicted.append(cap.name)
+        else:
+            kept.append(cap)
+    model.capabilities = kept
+    return evicted
+
+
+def _friction_count_cap(model: ProblemModel) -> list[str]:
+    """Evict terminal friction when the collection exceeds
+    :data:`FRICTION_DURABLE_MAX`, ``resolved`` before ``mitigated`` and
+    oldest-first within each. Active friction is never evicted, so the
+    collection may remain above the cap when it is all-active. Returns the
+    evicted friction ids (in surviving-list order)."""
+    overage = len(model.friction) - FRICTION_DURABLE_MAX
+    if overage <= 0:
+        return []
+    resolved = [i for i, f in enumerate(model.friction) if f.status == "resolved"]
+    mitigated = [i for i, f in enumerate(model.friction) if f.status == "mitigated"]
+    evict_idx = set((resolved + mitigated)[:overage])
+    evicted: list[str] = []
+    kept: list[Friction] = []
+    for i, fric in enumerate(model.friction):
+        if i in evict_idx:
+            evicted.append(fric.id)
+        else:
+            kept.append(fric)
+    model.friction = kept
+    return evicted
+
+
+def _byte_evictable(model: ProblemModel) -> bool:
+    """Whether the byte pass can actually bring ``model`` under the budget.
+
+    The byte pass touches only reference-only / terminal state — ``archived_gaps``,
+    the ``rejected_agent_edits`` ledger, the oldest active-gap append-only tails,
+    and terminal capabilities/friction (``planned`` capabilities, ``resolved``/
+    ``mitigated`` friction). If the live/active state alone (everything that
+    survives once those are reduced to their durable floor) already exceeds the
+    budget, evicting that history cannot get the model under the cap; doing so
+    would be futile destruction of re-fetchable reference state on every mature
+    project (a healthy within-caps model carries enough active gaps/history to
+    exceed the budget on its own). So gate eviction on it actually being
+    achievable: measure the floor with the evictable collections cleared and
+    active tails trimmed, restore the model, and only let the caller evict when
+    that floor fits. The legitimate target — a model whose archived/ledger/
+    terminal cap/friction bulk is large enough to blow the cap despite a small
+    live core — still has a sub-budget floor and is GC'd normally.
+
+    Crucially, the floor must drop terminal capabilities/friction too: without
+    that, a model whose bulk IS its ``planned`` capabilities or ``resolved``/
+    ``mitigated`` friction would measure an over-budget floor and the gate would
+    wrongly skip — leaving it oversized in the durable store (the precise gap
+    this backstop closes)."""
+    floor_model = model.model_copy(deep=True)
+    floor_model.archived_gaps = []
+    floor_model.rejected_agent_edits = []
+    floor_model.capabilities = [
+        c for c in floor_model.capabilities if not _is_evictable_capability(c)
+    ]
+    floor_model.friction = [
+        f for f in floor_model.friction if not _is_evictable_friction(f)
+    ]
+    for gap in sorted(floor_model.gaps, key=_active_gap_recency_key):
+        _trim_gap_append_only_tail(gap)
+    floor_bytes = _serialized_model_bytes(floor_model)
+    return floor_bytes <= PROBLEM_MODEL_BYTE_BUDGET
+
+
+def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
+    """Structurally bound the durable model so it round-trips in a single pass.
+
+    Pure backend backstop — mutates ``model`` in place and returns a small
+    summary of what was evicted (empty dict when nothing was dropped, so the
+    caller can keep the diff/output byte-identical on the no-op path).
+
+    Two passes, both touching ONLY history/reference-only/terminal state:
+
+    1. **Count cap** — bounds the durable collections that grow without limit:
+       ``archived_gaps`` at :data:`ARCHIVED_GAPS_DURABLE_MAX` (evicting the oldest
+       by ``closed``/``opened`` timestamp), and ``capabilities`` / ``friction``
+       at :data:`CAPABILITIES_DURABLE_MAX` / :data:`FRICTION_DURABLE_MAX`. The
+       cap/friction count caps evict ONLY terminal entries — ``planned``
+       capabilities and ``resolved``/``mitigated`` friction — oldest-first, so an
+       all-live collection may legitimately remain above the cap (live state is
+       never dropped to satisfy a count).
+    2. **Byte cap** — after the count caps, measures the serialized model and,
+       while it exceeds :data:`PROBLEM_MODEL_BYTE_BUDGET` (set safely under the
+       100KB write cap), evicts the oldest archived gaps, then trims the oldest
+       rejected-agent-edits ledger entries, then trims the oldest active gaps'
+       append-only tails, and finally — as a last resort — evicts terminal
+       capabilities/friction (``resolved``/``mitigated`` friction first, then
+       ``planned`` capabilities) until the model fits. This guards models whose
+       bulk is large individual entries or accumulated terminal cap/friction
+       despite being under the count caps, so the durable model stays writable
+       back through the strategic op endpoint. The byte pass is gated on
+       :func:`_byte_evictable`: it runs ONLY when emptying the evictable
+       reference-only/terminal collections and reducing active tails to the
+       durable floor could actually bring the model under budget. A healthy
+       within-caps model can carry enough live state to exceed the budget on its
+       own, and the byte pass cannot touch that live state — so evicting
+       reference history there is futile destruction and is skipped.
+
+    It deliberately does NOT touch active gaps, live capabilities
+    (``working``/``partial``), active friction, or pending confirmations — those
+    are live, semantically meaningful state that the agent owns and merges
+    non-destructively; dropping them could lose entries the agent never saw.
+    ``archived_gaps`` is pure history (closed/abandoned, reference-only,
+    re-fetchable by id), ``rejected_agent_edits`` is agent-readable bookkeeping,
+    and terminal capabilities/friction are reference-only (the work is done or
+    abandoned) — so oldest-first eviction of any of these is safe.
+
+    Returns a dict like ``{"archived_gaps_evicted": ["g-x"],
+    "rejected_agent_edits_trimmed": 2, "friction_evicted": ["f-y"]}`` recording
+    what rolled off, suitable for folding into the revision-log diff.
+    """
+    summary: dict[str, Any] = {}
+    evicted_ids: list[str] = []
+    active_gap_tails_trimmed: list[dict[str, Any]] = []
+    capabilities_evicted: list[str] = []
+    friction_evicted: list[str] = []
+
+    if len(model.archived_gaps) > ARCHIVED_GAPS_DURABLE_MAX:
+        # Stable sort newest-last by recency, then keep the most-recent N.
+        ordered = sorted(model.archived_gaps, key=_archived_gap_recency_key)
+        evicted = ordered[:-ARCHIVED_GAPS_DURABLE_MAX]
+        kept = ordered[-ARCHIVED_GAPS_DURABLE_MAX:]
+        model.archived_gaps = kept
+        evicted_ids.extend(g.id for g in evicted)
+
+    # Terminal-only count caps for the two non-destructively-merged collections.
+    capabilities_evicted.extend(_cap_count_cap(model))
+    friction_evicted.extend(_friction_count_cap(model))
+
+    # Byte cap: only re-order/evict when we are genuinely over budget so the
+    # no-op path leaves the model byte-identical (no spurious archived re-sort).
+    ledger_trimmed = 0
+    if _serialized_model_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET and _byte_evictable(
+        model
+    ):
+        # Oldest-first so list.pop(0) drops the oldest archived gap.
+        model.archived_gaps = sorted(
+            model.archived_gaps, key=_archived_gap_recency_key
+        )
+        while _serialized_model_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET and (
+            model.archived_gaps or model.rejected_agent_edits
+        ):
+            if model.archived_gaps:
+                evicted_ids.append(model.archived_gaps.pop(0).id)
+            else:
+                model.rejected_agent_edits.pop(0)
+                ledger_trimmed += 1
+        for gap in sorted(model.gaps, key=_active_gap_recency_key):
+            if _serialized_model_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET:
+                break
+            if trimmed := _trim_gap_append_only_tail(gap):
+                active_gap_tails_trimmed.append(trimmed)
+        # Last resort: evict terminal capabilities/friction. Live state
+        # (working/partial caps, active friction) is never reached because
+        # _evict_one_terminal_capfriction only ever returns terminal entries.
+        while _serialized_model_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET:
+            ev = _evict_one_terminal_capfriction(model)
+            if ev is None:
+                break
+            kind, ident = ev
+            if kind == "capability":
+                capabilities_evicted.append(ident)
+            else:
+                friction_evicted.append(ident)
+
+    if evicted_ids:
+        summary["archived_gaps_evicted"] = evicted_ids
+    if ledger_trimmed:
+        summary["rejected_agent_edits_trimmed"] = ledger_trimmed
+    if active_gap_tails_trimmed:
+        summary["active_gap_tails_trimmed"] = active_gap_tails_trimmed
+    if capabilities_evicted:
+        summary["capabilities_evicted"] = capabilities_evicted
+    if friction_evicted:
+        summary["friction_evicted"] = friction_evicted
+
+    return summary
+
+
 def append_revision_log(
     model: ProblemModel,
     summary: str,
@@ -456,6 +822,140 @@ def append_self_reflection(
     if len(log) > SELF_REFLECTION_LOG_MAX:
         log = log[-SELF_REFLECTION_LOG_MAX:]
     return log
+
+
+# ---------------------------------------------------------------------------
+# Model size / health signal
+# ---------------------------------------------------------------------------
+
+MODEL_SIZE_HEALTHY_GAPS = 12
+"""At or below this many ACTIVE gaps (archived excluded) the gap dimension is
+``healthy``. Chosen so the thinker can audit every active gap in one pass."""
+
+MODEL_SIZE_HEALTHY_CAPABILITIES = 20
+"""At or below this many capabilities the capability dimension is ``healthy``."""
+
+MODEL_SIZE_HEALTHY_FRICTION = 8
+"""At or below this many ACTIVE friction items (status=='active') the friction
+dimension is ``healthy``."""
+
+MODEL_SIZE_HEALTHY_BYTES = 40_000
+"""At or below this many serialized bytes the byte dimension is ``healthy``.
+Set well under the 90KB PROBLEM_MODEL_BYTE_BUDGET to signal when the model
+is approaching the structural limit even if entry counts look healthy."""
+
+MODEL_SIZE_GROWING_MULTIPLIER = 1.5
+"""A dimension at >= 1.5x its healthy threshold is at least ``growing``."""
+
+MODEL_SIZE_LARGE_MULTIPLIER = 2.0
+"""A dimension at >= 2x its healthy threshold is at least ``large``."""
+
+MODEL_SIZE_OVERSIZED_MULTIPLIER = 3.0
+"""A dimension at >= 3x its healthy threshold is ``oversized``."""
+
+ModelSizeStatus = Literal["healthy", "growing", "large", "oversized"]
+
+# Per-entry token weights for the APPROXIMATE footprint estimate. These are
+# deliberately round order-of-magnitude guesses, NOT measured token counts —
+# the estimate exists only to give the thinker a rough sense of how heavy the
+# model is to read, never as a precise budget. A gap costs a base (name +
+# description + evidence) plus a per-history-event increment; capabilities and
+# friction items each cost a flat approximate amount. Text content in free-form
+# fields (descriptions, evidence, notes) is approximated by dividing byte count
+# by TEXT_BYTES_PER_TOKEN to avoid models with verbose entries masquerading as
+# healthy.
+_TOKENS_PER_GAP_BASE = 60
+_TOKENS_PER_GAP_HISTORY_ENTRY = 20
+_TOKENS_PER_CAPABILITY = 25
+_TOKENS_PER_FRICTION = 30
+_TEXT_BYTES_PER_TOKEN = 4  # Rough estimate: 1 token ≈ 4 characters
+
+
+def _dimension_status(count: int, healthy: int) -> ModelSizeStatus:
+    """Classify one dimension against its healthy threshold and the shared
+    growing/large/oversized multipliers. Worst-case ordering is
+    healthy < growing < large < oversized."""
+    if count >= healthy * MODEL_SIZE_OVERSIZED_MULTIPLIER:
+        return "oversized"
+    if count >= healthy * MODEL_SIZE_LARGE_MULTIPLIER:
+        return "large"
+    if count >= healthy * MODEL_SIZE_GROWING_MULTIPLIER:
+        return "growing"
+    return "healthy"
+
+
+def compute_model_size_signal(model: ProblemModel) -> dict[str, Any]:
+    """Compute a SOFT size/health signal for a problem model.
+
+    Pure and side-effect-free — takes a parsed :class:`ProblemModel` (the
+    DURABLE model, not the trimmed agent view, so counts are honest) and
+    returns a small dict the strategic payload injects under ``model_health``:
+
+      - ``active_gap_count`` — number of active gaps (status=='active', archived_gaps excluded)
+      - ``capability_count`` — number of capabilities
+      - ``active_friction_count`` — friction items with ``status == 'active'``
+      - ``estimated_token_footprint`` — an EXPLICITLY APPROXIMATE estimate of how
+        many tokens the model costs to read (see the ``_TOKENS_PER_*`` weights);
+        do not treat it as precise
+      - ``serialized_bytes`` — the durable model's actual serialized byte length,
+        which is what determines whether it fits the strategic-cycle payload
+      - ``model_size_status`` — worst-dimension-wins classification, one of
+        ``healthy`` / ``growing`` / ``large`` / ``oversized``. Now byte-aware:
+        a model that is heavy by bytes but light by count will be classified as
+        ``large`` or ``oversized`` to signal the byte pressure
+
+    The status is purely advisory: it tells the thinker the model is getting
+    expensive to audit, never a hard cap that blocks opening new gaps. The
+    healthy thresholds and multipliers are exported as module constants so the
+    agent prompt can cite the same numbers.
+    """
+    active_gaps = [g for g in model.gaps if g.status == "active"]
+    active_gap_count = len(active_gaps)
+    capability_count = len(model.capabilities)
+    active_friction_count = sum(1 for f in model.friction if f.status == "active")
+
+    # Approximate token footprint — includes both entry count and text content.
+    # Text content is approximated via byte length divided by TEXT_BYTES_PER_TOKEN
+    # so a model with verbose entries scores higher than one with terse entries.
+    estimated_token_footprint = (
+        sum(
+            _TOKENS_PER_GAP_BASE
+            + len(g.history) * _TOKENS_PER_GAP_HISTORY_ENTRY
+            + (len(g.description) + len(g.evidence)) // _TEXT_BYTES_PER_TOKEN
+            for g in active_gaps
+        )
+        + sum(
+            _TOKENS_PER_CAPABILITY + (len(c.notes or "") // _TEXT_BYTES_PER_TOKEN)
+            for c in model.capabilities
+        )
+        + sum(
+            _TOKENS_PER_FRICTION + (len(f.description) // _TEXT_BYTES_PER_TOKEN)
+            for f in model.friction
+            if f.status == "active"
+        )
+    )
+
+    # Byte-aware dimension: the serialized model size relative to the byte budget.
+    serialized_bytes = _serialized_model_bytes(model)
+    byte_status = _dimension_status(serialized_bytes, MODEL_SIZE_HEALTHY_BYTES)
+
+    statuses = (
+        _dimension_status(active_gap_count, MODEL_SIZE_HEALTHY_GAPS),
+        _dimension_status(capability_count, MODEL_SIZE_HEALTHY_CAPABILITIES),
+        _dimension_status(active_friction_count, MODEL_SIZE_HEALTHY_FRICTION),
+        byte_status,
+    )
+    order: list[ModelSizeStatus] = ["healthy", "growing", "large", "oversized"]
+    model_size_status = max(statuses, key=order.index)
+
+    return {
+        "active_gap_count": active_gap_count,
+        "capability_count": capability_count,
+        "active_friction_count": active_friction_count,
+        "estimated_token_footprint": estimated_token_footprint,
+        "serialized_bytes": serialized_bytes,
+        "model_size_status": model_size_status,
+    }
 
 
 def is_empty(model: ProblemModel) -> bool:
@@ -542,6 +1042,16 @@ def _diff_summary(diff: dict[str, Any]) -> str:
         parts.append("intent updated")
     if caps := diff.get("capabilities_changed"):
         parts.append(f"{len(caps)} capability status changes")
+    if evicted := diff.get("archived_gaps_evicted"):
+        parts.append(f"GC evicted {len(evicted)} archived gap(s)")
+    if trimmed := diff.get("rejected_agent_edits_trimmed"):
+        parts.append(f"GC trimmed {trimmed} rejected-edit ledger entry(ies)")
+    if tails := diff.get("active_gap_tails_trimmed"):
+        parts.append(f"GC trimmed {len(tails)} active gap tail(s)")
+    if caps_evicted := diff.get("capabilities_evicted"):
+        parts.append(f"GC evicted {len(caps_evicted)} terminal capability(ies)")
+    if friction_evicted := diff.get("friction_evicted"):
+        parts.append(f"GC evicted {len(friction_evicted)} terminal friction")
     return "; ".join(parts) if parts else "no structural changes"
 
 
@@ -894,6 +1404,48 @@ def _upsert_by_key(
     return result
 
 
+# Floor-strippable detail that the read-time agent-view floor reduces away under
+# byte pressure (mirrors strategic_spawning's _FLOOR_SHRINK_LEVELS gap fields,
+# _CAP_SKELETON_KEEP, and _FRICTION_SKELETON_KEEP — these are the fields NOT kept
+# in each skeleton). When the agent edits and resubmits an entry it only ever saw
+# in floored/skeleton form, a blank value for one of these fields means "I never
+# received it", NOT "clear it" — so the merge restores the durable value instead
+# of letting the skeleton silently overwrite it. This is keyed off the floor's
+# own ``_agent_view_floor_applied`` marker (echoed back in the proposal) so a
+# genuine clear of a field the agent actually SAW (no floor, or this field not
+# stripped) still applies — empty is not blindly treated as keep.
+_GAP_FLOOR_FIELDS = ("description", "evidence", "active_moves")
+_CAP_FLOOR_FIELDS = ("notes", "backing_paths", "source")
+_FRICTION_FLOOR_FIELDS = (
+    "description",
+    "seen_in",
+    "mitigations_tried",
+    "source",
+    "promoted_to_gap_id",
+)
+
+
+def _is_blank_floor_field(value: Any) -> bool:
+    """A floor-strippable field value the agent may never have received: ``None``
+    or an empty string/list/dict. A populated ``Source`` model is non-blank."""
+    if value is None:
+        return True
+    return isinstance(value, (str, list, dict)) and len(value) == 0
+
+
+def _restore_floored_fields(
+    current: BaseModel, proposed: BaseModel, fields: tuple[str, ...]
+) -> None:
+    """Copy each of *fields* from *current* onto *proposed* when proposed's value
+    is blank but current's is not, so a resubmitted floor skeleton cannot wipe
+    durable detail the agent could not have seen. Mutates *proposed* in place."""
+    for name in fields:
+        if _is_blank_floor_field(getattr(proposed, name, None)) and not (
+            _is_blank_floor_field(getattr(current, name, None))
+        ):
+            setattr(proposed, name, getattr(current, name))
+
+
 def _merge_gap(current: Gap, proposed: Gap) -> Gap:
     """Upsert one gap: proposed wins for every field EXCEPT the append-only
     logs (``history``, ``past_moves``), which union current+proposed so a
@@ -912,26 +1464,74 @@ def _merge_gap(current: Gap, proposed: Gap) -> Gap:
 
 
 def _merge_agent_owned_collections(
-    current: ProblemModel, proposed: ProblemModel, deletions: Any
+    current: ProblemModel,
+    proposed: ProblemModel,
+    deletions: Any,
+    floor: Any = None,
 ) -> None:
     """Replace ``proposed``'s agent-owned collections with a non-destructive
     merge over ``current`` (mutates ``proposed`` in place). Removal is explicit
     via ``deletions`` — a dict of ``{capabilities|gaps|friction|
     pending_user_confirmation: [key, ...]}``. ``constraints`` is NOT here: it is
-    operator-owned and handled by the 3-way merge / blank backstop."""
+    operator-owned and handled by the 3-way merge / blank backstop.
+
+    ``floor`` is the read-time ``_agent_view_floor_applied`` marker the agent
+    echoes back (or ``None``). When it records that a field/section was
+    floor-stripped before the agent saw it, a blank value for that field in a
+    resubmitted entry preserves the durable detail instead of wiping it (see
+    :func:`_restore_floored_fields`). Gap preservation is per-field-precise
+    (``stripped_gap_fields`` is uniform across gaps); capability/friction
+    preservation gates on whether that section was skeletonized this cycle
+    (``summarized_*`` > 0) — the floor records a count, not per-entry keys, and
+    over-preserving a field the agent meant to clear is the safe direction (no
+    durable loss, recoverable next cycle) versus silently wiping detail."""
     del_caps = set(_as_str_list(deletions, "capabilities"))
     del_gaps = set(_as_str_list(deletions, "gaps"))
     del_friction = set(_as_str_list(deletions, "friction"))
     del_pending = set(_as_str_list(deletions, "pending_user_confirmation"))
 
+    floor = floor if isinstance(floor, dict) else {}
+    stripped_gap = set(floor.get("stripped_gap_fields") or [])
+    gap_floor_fields = tuple(f for f in _GAP_FLOOR_FIELDS if f in stripped_gap)
+    caps_floored = bool(floor.get("summarized_capabilities"))
+    friction_floored = bool(floor.get("summarized_friction"))
+
+    def _merge_gap_preserving(c: Gap, p: Gap) -> Gap:
+        merged = _merge_gap(c, p)
+        if gap_floor_fields:
+            _restore_floored_fields(c, merged, gap_floor_fields)
+        return merged
+
+    def _merge_cap_preserving(c: Capability, p: Capability) -> Capability:
+        if caps_floored:
+            _restore_floored_fields(c, p, _CAP_FLOOR_FIELDS)
+        return p
+
+    def _merge_friction_preserving(c: Friction, p: Friction) -> Friction:
+        if friction_floored:
+            _restore_floored_fields(c, p, _FRICTION_FLOOR_FIELDS)
+        return p
+
     proposed.capabilities = _upsert_by_key(
-        current.capabilities, proposed.capabilities, lambda c: c.name, del_caps
+        current.capabilities,
+        proposed.capabilities,
+        lambda c: c.name,
+        del_caps,
+        merge_fn=_merge_cap_preserving,
     )
     proposed.gaps = _upsert_by_key(
-        current.gaps, proposed.gaps, lambda g: g.id, del_gaps, merge_fn=_merge_gap
+        current.gaps,
+        proposed.gaps,
+        lambda g: g.id,
+        del_gaps,
+        merge_fn=_merge_gap_preserving,
     )
     proposed.friction = _upsert_by_key(
-        current.friction, proposed.friction, lambda f: f.id, del_friction
+        current.friction,
+        proposed.friction,
+        lambda f: f.id,
+        del_friction,
+        merge_fn=_merge_friction_preserving,
     )
     proposed.pending_user_confirmation = _upsert_by_key(
         current.pending_user_confirmation,
@@ -1014,6 +1614,13 @@ def apply_agent_update(
     # part of the durable model (extra="forbid" would reject it).
     proposed_raw = dict(proposed_raw)
     deletions = proposed_raw.pop("_deletions", None)
+    # Read-time agent-view markers the packer injects into the floored model the
+    # agent sees. They are not part of the durable model (extra="forbid" would
+    # reject them), so lift them out before validation. ``_agent_view_floor_applied``
+    # drives floor-aware field preservation below; ``_gap_memory_trimmed`` is
+    # purely informational and discarded.
+    floor_applied = proposed_raw.pop("_agent_view_floor_applied", None)
+    proposed_raw.pop("_gap_memory_trimmed", None)
 
     proposed = ProblemModel.model_validate(proposed_raw)
     current = parse_problem_model(current_raw)
@@ -1044,7 +1651,7 @@ def apply_agent_update(
     # Non-destructive merge of agent-owned collections: an agent acting on a
     # trimmed/dropped payload view must not wipe entries it never saw. Runs
     # before the diff so the diff reflects the true merged state.
-    _merge_agent_owned_collections(current, proposed, deletions)
+    _merge_agent_owned_collections(current, proposed, deletions, floor_applied)
 
     # Compute diff before archival so closed gaps are still visible on
     # proposed.gaps — otherwise _compute_diff can't see what got closed
@@ -1063,14 +1670,26 @@ def apply_agent_update(
 
     archive_closed_gaps(proposed)
 
-    append_revision_log(proposed, summary=_diff_summary(diff), changes=diff)
-
     # Carry the durable rejected-agent-edits ledger forward and append any new
     # overrides, capped — mirrors archived_gaps/revision_log preservation. The
     # agent's own submission of this field is ignored (agent-readable, not
-    # agent-writable bookkeeping).
+    # agent-writable bookkeeping). Set BEFORE the GC so the byte-aware pass can
+    # see the full durable model (the ledger stores sizable operator+agent
+    # blobs) and trim this reference-only state if the model is over budget.
     ledger = list(current.rejected_agent_edits) + rejected_edits
     proposed.rejected_agent_edits = ledger[-REJECTED_AGENT_EDITS_MAX:]
+
+    # Structural GC backstop: bound the durable history/archive collections so
+    # the model round-trips in a single pass regardless of whether the agent
+    # voluntarily pruned. Runs AFTER archival (so this cycle's just-closed gaps
+    # are eligible) and BEFORE the revision-log append so the eviction is
+    # recorded in the same revision that performed it. Folds what was dropped
+    # into the diff so the GC is observable in the revision log.
+    gc_summary = gc_problem_model(proposed)
+    if gc_summary:
+        diff.update(gc_summary)
+
+    append_revision_log(proposed, summary=_diff_summary(diff), changes=diff)
 
     result = proposed.model_dump()
     # Keep output byte-identical to the pre-merge behavior on the no-conflict /

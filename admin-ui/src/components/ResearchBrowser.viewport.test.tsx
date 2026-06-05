@@ -71,6 +71,30 @@ const sampleTasks: Task[] = [
     ],
   },
   {
+    id: 'task-impl-1',
+    title: 'Implement connection pooling fix',
+    description: 'Implementation task',
+    status: 'COMPLETED',
+    task_type: 'create',
+    created_by: 'agent',
+    requires_approval: false,
+    created_at: '2026-05-06T06:00:00Z',
+    context: {
+      research_task_id: 'task-research-1',
+      finding_index: 0,
+    },
+    evaluation_summary: {
+      status: 'COMPLETED',
+      verdict: 'pass',
+      evidence: [
+        { label: 'Tests', value: '23 passed, 0 failed' },
+      ],
+      highlights: [
+        { label: 'Top', value: 'full suite green' },
+      ],
+    },
+  },
+  {
     id: 'task-research-2',
     title: 'Research: cross-cutting pipeline reliability findings',
     description: 'Cross-cutting research',
@@ -154,6 +178,36 @@ describe('ResearchBrowser — viewport regression', () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 50));
       });
     }, { waitMs: 50 });
+  });
+
+  test('evaluation summary chips render without horizontal overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <ResearchBrowser
+            tasks={sampleTasks}
+            selectedProjectId="project-test"
+            onClose={() => {}}
+            onNavigateToTask={() => {}}
+          />,
+        );
+      });
+
+      const buttons = host.querySelectorAll('button');
+      const findingButton = Array.from(buttons).find(b => b.textContent?.includes('Connection pool exhaustion under sustained load'));
+      if (findingButton) {
+        await act(async () => {
+          findingButton.click();
+        });
+      }
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    });
   });
 
   test('interactive controls meet 44px touch target at 375px', async () => {

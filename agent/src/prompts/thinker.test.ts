@@ -61,6 +61,7 @@ describe('buildThinkerPrompt', () => {
     rejectedProposalsSection: '',
     operatorOverridesSection: '',
     portfolioCompositionText: 'No active directions — portfolio is empty.',
+    modelHealthSection: '',
     systemMaturitySection: '',
     driftSection: '',
     recentWorkSection: '',
@@ -93,6 +94,17 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('## 6. Problem model');
   });
 
+  it('documents the gap deferral shape and the direction→gap linkage', () => {
+    const prompt = buildThinkerPrompt(base);
+    // Gap quick-reference lists the optional deferral field.
+    expect(prompt).toContain('deferral?');
+    // The deferral gloss explains intentional non-staffing and how to clear it.
+    expect(prompt).toContain('{rationale, hold_until?, created_at?}');
+    expect(prompt).toContain('intentionally');
+    // The gap_id linkage on direction ops is documented for reconciliation.
+    expect(prompt).toContain('gap_id');
+  });
+
   it('section ordering is stable: key sections appear in expected sequence', () => {
     const prompt = buildThinkerPrompt(base);
     const idx = (s: string) => prompt.indexOf(s);
@@ -106,20 +118,36 @@ describe('buildThinkerPrompt', () => {
     expect(idx('## 1. State assessment')).toBeLessThan(idx('## 6. Problem model'));
   });
 
-  it('renders verificationFailuresSection before # Your job when provided', () => {
+  it('renders cycleStartReconciliationSection after the problem_model and before # Your job', () => {
     const prompt = buildThinkerPrompt({
       ...base,
-      verificationFailuresSection: '\n## Capability Verification (advisory)\nflagged capability\n',
+      cycleStartReconciliationSection: '\n## Cycle-start reconciliation (your starting state)\nflagged conflict\n',
     });
-    const verificationIdx = prompt.indexOf('## Capability Verification (advisory)');
+    const reconIdx = prompt.indexOf('## Cycle-start reconciliation (your starting state)');
+    const modelIdx = prompt.indexOf('## Your current understanding (problem_model)');
     const jobIdx = prompt.indexOf('# Your job');
-    expect(verificationIdx).toBeGreaterThan(-1);
-    expect(verificationIdx).toBeLessThan(jobIdx);
+    expect(reconIdx).toBeGreaterThan(-1);
+    expect(reconIdx).toBeGreaterThan(modelIdx);
+    expect(reconIdx).toBeLessThan(jobIdx);
   });
 
-  it('omits verificationFailuresSection when empty', () => {
-    const prompt = buildThinkerPrompt({ ...base, verificationFailuresSection: '' });
-    expect(prompt).not.toContain('## Capability Verification (advisory)');
+  it('omits cycleStartReconciliationSection when empty', () => {
+    const prompt = buildThinkerPrompt({ ...base, cycleStartReconciliationSection: '' });
+    expect(prompt).not.toContain('## Cycle-start reconciliation');
+  });
+
+  it('renders pruneCandidatesSection content when provided', () => {
+    const prompt = buildThinkerPrompt({
+      ...base,
+      pruneCandidatesSection: '\n## Concrete prune candidates (model is oversized)\nclose g-ret\n',
+    });
+    expect(prompt).toContain('## Concrete prune candidates (model is oversized)');
+    expect(prompt).toContain('close g-ret');
+  });
+
+  it('omits pruneCandidatesSection when absent or empty', () => {
+    expect(buildThinkerPrompt(base)).not.toContain('## Concrete prune candidates');
+    expect(buildThinkerPrompt({ ...base, pruneCandidatesSection: '' })).not.toContain('## Concrete prune candidates');
   });
 
   it('problem_model section uses bootstrap text when problemModelSection signals empty', () => {
@@ -197,6 +225,46 @@ describe('buildThinkerPrompt', () => {
 
     const without = buildThinkerPrompt({ ...base, systemMaturitySection: '' });
     expect(without).not.toContain('## System Maturity');
+  });
+
+  it('model health section rendered only when modelHealthSection is non-empty', () => {
+    const with_ = buildThinkerPrompt({ ...base, modelHealthSection: '\n## Problem-model size (soft signal)\nStatus: **large**\n' });
+    expect(with_).toContain('## Problem-model size (soft signal)');
+
+    const without = buildThinkerPrompt({ ...base, modelHealthSection: '' });
+    expect(without).not.toContain('## Problem-model size (soft signal)');
+  });
+
+  it('includes standing model-size hygiene guidance citing thresholds', () => {
+    const prompt = buildThinkerPrompt(base);
+    expect(prompt).toContain('Model-size hygiene (soft)');
+    expect(prompt).toContain('<=12 active gaps');
+    expect(prompt).toContain('never a hard cap');
+  });
+
+  it('staged directions section rendered only when stagedDirectionsSection is non-empty', () => {
+    const with_ = buildThinkerPrompt({ ...base, stagedDirectionsSection: '## Staged for next version\n- d-x [high] — work (auto-activates when v3 promotes)' });
+    expect(with_).toContain('## Staged for next version');
+    expect(with_).toContain('auto-activates when v3 promotes');
+
+    const without = buildThinkerPrompt({ ...base, stagedDirectionsSection: '' });
+    expect(without).not.toContain('## Staged for next version');
+  });
+
+  it('always includes the Section 3 staging guidance reconciling staging with no-defer', () => {
+    const prompt = buildThinkerPrompt(base);
+    expect(prompt).toContain('**Staging (next-version work).**');
+    expect(prompt).toContain('Staging is NOT deferral');
+  });
+
+  it('staging guidance directs new next-version ideas to the atomic staged flag (not create-then-stage)', () => {
+    const prompt = buildThinkerPrompt(base);
+    // A genuinely new idea is created with the staged flag in a single atomic
+    // op — never created active then staged (which would briefly expose it as
+    // research-eligible).
+    expect(prompt).toContain('"staged": true');
+    expect(prompt).toContain('single atomic op');
+    expect(prompt).not.toContain('create-then-stage');
   });
 
   it('operator overrides section rendered only when operatorOverridesSection is non-empty', () => {
@@ -515,6 +583,7 @@ describe('buildThinkerPrompt on_automain annotation', () => {
     rejectedProposalsSection: '',
     operatorOverridesSection: '',
     portfolioCompositionText: 'No active directions — portfolio is empty.',
+    modelHealthSection: '',
     systemMaturitySection: '',
     driftSection: '',
     recentWorkSection: '',
@@ -572,6 +641,7 @@ describe('buildThinkerPrompt + renderStrategicPromptSuffix (strategic handler co
     rejectedProposalsSection: '',
     operatorOverridesSection: '',
     portfolioCompositionText: 'No active directions — portfolio is empty.',
+    modelHealthSection: '',
     systemMaturitySection: '',
     driftSection: '',
     recentWorkSection: '',

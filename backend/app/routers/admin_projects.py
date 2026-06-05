@@ -38,6 +38,7 @@ from app.ci_resolution import (
     compute_merge_verification_verdict,
     merge_gate_runtime_block,
 )
+from app.problem_model import compute_model_size_signal, ProblemModel
 
 router = APIRouter(
     prefix="/api/admin",
@@ -169,6 +170,14 @@ async def get_project(
     if row is None:
         raise HTTPException(status_code=404, detail="Project not found")
     project, role = row
+    problem_model_dict = project.problem_model or {}
+    size_health = None
+    if problem_model_dict:
+        try:
+            pm = ProblemModel(**problem_model_dict)
+            size_health = compute_model_size_signal(pm)
+        except Exception:
+            pass
     return {
         "id": str(project.id),
         "name": project.name,
@@ -180,7 +189,8 @@ async def get_project(
         "directions": project.directions,
         "vision": project.vision or {},
         "design_doc": project.design_doc or {},
-        "problem_model": project.problem_model or {},
+        "problem_model": problem_model_dict,
+        "problem_model_size_health": size_health,
         "running_update": project.running_update,
         "running_update_acknowledged_at": (
             project.running_update_acknowledged_at.isoformat()
@@ -1116,6 +1126,119 @@ async def set_project_paused(
     session.add(project)
     await session.commit()
     return {"paused": project.paused}
+
+
+@router.get("/task-types")
+@limiter.limit("30/minute")
+async def get_task_types(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the enriched task-type registry as an operator catalog.
+
+    Project-agnostic and static (the registry lives in code), so this performs
+    no DB query — it serializes ``task_type_catalog()`` directly. It is the
+    single backend source of truth the admin-ui catalog and task launcher read
+    so the frontend capability list cannot drift from the backend registry.
+    Gated by the router-level ``Depends(get_current_user)`` like its siblings.
+    """
+    from app.task_capabilities import task_type_catalog
+
+    return {"task_types": task_type_catalog()}
+
+
+@router.get("/task-types/cost-adherence")
+@limiter.limit("30/minute")
+async def get_task_type_cost_adherence(
+    request: Request,
+    days: int = Query(14, ge=1, le=90),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Per-task-type actual VM cost vs the declared registry ceiling.
+
+    DB-backed sibling of ``/task-types`` (which is intentionally DB-free): the
+    catalog endpoint stays fast and static while the actual-cost comparison —
+    which requires scanning recent terminal tasks — lives here. Returns, per
+    registered task type, the average and p95 actual VM cost (including banked
+    retry spend) over the last ``days`` days, a sample count, and an
+    ``over_ceiling`` flag that fires only once a type has enough samples and its
+    average exceeds its declared ceiling. Read-only and additive.
+
+    The query explicitly loads every column the VM-cost accessor reads so the
+    synchronous compute path never lazy-loads off the async session
+    (MissingGreenlet). Scoped to the caller's projects.
+    """
+    from app.digest_metrics import compute_task_type_cost_adherence
+    from app.models import ComputeJob
+    from app.models import get_task_total_vm_cost_usd_or_none  # noqa: F401  (accessor used in compute fn)
+    from app.task_capabilities import TASK_CAPABILITY_BY_VALUE
+
+    window_start = _utcnow() - timedelta(days=days)
+    user_pids = _user_project_ids(current_user["user_id"])
+
+    result = await session.execute(
+        select(Task)
+        .where(
+            Task.project_id.in_(user_pids),
+            Task.created_at >= window_start,
+            Task.status.in_(
+                [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+            ),
+        )
+        .options(
+            load_only(
+                Task.id,
+                Task.status,
+                Task.created_at,
+                Task.payloads,
+                Task.context,
+                Task.vm_provisioned_at,
+                Task.vm_stopped_at,
+                Task.vm_spot,
+                Task.vm_machine_type,
+                Task.vm_runtime_cost_banked_db,
+            )
+        )
+        .limit(10000)
+    )
+    tasks = result.scalars().all()
+
+    # Off-VM task types (e.g. compute_experiment) hold only a lightweight
+    # monitoring VM; their real spend lives on the linked compute jobs' durable
+    # ``final_cost_usd`` ledger. Aggregate that spend per task so the compute
+    # function can measure those types honestly instead of from Task VM fields.
+    # Lightweight second query (sum grouped by task_id, scoped to user projects);
+    # keeps the compute transform DB-free.
+    compute_cost_result = await session.execute(
+        select(
+            ComputeJob.task_id,
+            func.coalesce(func.sum(ComputeJob.final_cost_usd), 0.0).label("spend"),
+        )
+        .where(
+            ComputeJob.project_id.in_(user_pids),
+            ComputeJob.task_id.isnot(None),
+            ComputeJob.final_cost_usd.isnot(None),
+        )
+        .group_by(ComputeJob.task_id)
+    )
+    compute_job_cost_by_task = {
+        str(task_id): float(spend)
+        for task_id, spend in compute_cost_result.all()
+        if task_id is not None
+    }
+
+    ceilings = {
+        value: cap.cost_ceiling_usd
+        for value, cap in TASK_CAPABILITY_BY_VALUE.items()
+    }
+    rows = compute_task_type_cost_adherence(
+        tasks,
+        window_start=window_start,
+        ceilings=ceilings,
+        compute_job_cost_by_task=compute_job_cost_by_task,
+    )
+    return {"window_days": days, "task_types": rows}
 
 
 @router.get("/autonomous-status")

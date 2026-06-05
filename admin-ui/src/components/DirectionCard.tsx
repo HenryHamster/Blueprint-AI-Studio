@@ -4,8 +4,9 @@ import { AlertTriangle, Check, ChevronDown, ChevronRight, ChevronUp, Loader2, Pe
 import { BarChart, Bar, Cell, ResponsiveContainer, Tooltip as RechartsTooltip } from 'recharts';
 import type { Direction } from './DirectionsPanel';
 import type { DirectionCategory } from '../hooks/useDirectionForm';
-import { formatRelativeTime, formatTimeRemaining, getCooldownStatus, priorityColors, statusColors } from '../utils/directionHelpers';
+import { formatRelativeTime, formatTimeRemaining, getCooldownStatus, getStagedWaitingInfo, STAGED_STALE_DAYS, priorityColors, statusColors } from '../utils/directionHelpers';
 import { parseTimestamp } from '../utils/time';
+import { healthRateColorClass, summarizeOutcomeKinds } from '../utils/outcomeKinds';
 
 const TAXONOMY_ORDER = ['scope_related', 'review_quality', 'infra_related', 'code_defect'] as const;
 const TAXONOMY_LABELS: Record<string, string> = {
@@ -70,7 +71,7 @@ export interface DirectionCardProps {
   editingId: string | null;
   editText: string;
   editPriority: 'high' | 'medium' | 'low';
-  editStatus: 'active' | 'completed' | 'paused' | 'proposed' | 'expired';
+  editStatus: 'active' | 'completed' | 'paused' | 'proposed' | 'expired' | 'staged';
   editCategory: DirectionCategory;
   editPathTags: string[];
   editPathInput: string;
@@ -79,7 +80,7 @@ export interface DirectionCardProps {
   setEditingId: React.Dispatch<React.SetStateAction<string | null>>;
   setEditText: React.Dispatch<React.SetStateAction<string>>;
   setEditPriority: React.Dispatch<React.SetStateAction<'high' | 'medium' | 'low'>>;
-  setEditStatus: React.Dispatch<React.SetStateAction<'active' | 'completed' | 'paused' | 'proposed' | 'expired'>>;
+  setEditStatus: React.Dispatch<React.SetStateAction<'active' | 'completed' | 'paused' | 'proposed' | 'expired' | 'staged'>>;
   setEditCategory: React.Dispatch<React.SetStateAction<DirectionCategory>>;
   setEditPathTags: React.Dispatch<React.SetStateAction<string[]>>;
   setEditPathInput: React.Dispatch<React.SetStateAction<string>>;
@@ -92,6 +93,9 @@ export interface DirectionCardProps {
   rejectProposal: (id: string) => Promise<void>;
   reviveProposal: (id: string) => Promise<void>;
   reactivateDirection: (id: string) => Promise<void>;
+  activateStagedDirection: (id: string) => Promise<void>;
+  retargetStagedDirection?: (id: string, version: number) => Promise<void>;
+  cancelStagedDirection: (id: string) => Promise<void>;
   unholdDirection: (id: string) => Promise<void>;
   markDirectionComplete: (id: string) => Promise<void>;
   quickToggleStatus: (id: string, status: 'active' | 'paused') => Promise<void>;
@@ -109,6 +113,10 @@ export interface DirectionCardProps {
   // Force confirm popover
   forceConfirmId: string | null;
   setForceConfirmId: React.Dispatch<React.SetStateAction<string | null>>;
+  // Open release version to stage against, or null when none is open. When null,
+  // the edit-form "Staged" status option is disabled (the backend rejects staging
+  // with no open version).
+  stageTargetVersion?: number | null;
   // Navigation callbacks
   onViewFindings?: (directionId: string) => void;
   onNavigateToTask?: (taskId: string) => void;
@@ -122,10 +130,11 @@ function DirectionCardImpl({
   setEditingId, setEditText, setEditPriority, setEditStatus, setEditCategory, setEditPathTags, setEditPathInput, setEditCompletionCriteria, setEditCostBudget,
   startEdit,
   updateDirection, approveProposal, rejectProposal, reviveProposal,
-  reactivateDirection, unholdDirection, markDirectionComplete, quickToggleStatus, deleteDirection,
+  reactivateDirection, activateStagedDirection, retargetStagedDirection, cancelStagedDirection, unholdDirection, markDirectionComplete, quickToggleStatus, deleteDirection,
   applyDirectionUpdate, dismissDirectionUpdate, triggerResearch, reorderDirections,
   taskCounts, activeTasks, cooldownMinutes, researchingIds, researchSuccessIds,
   forceConfirmId, setForceConfirmId,
+  stageTargetVersion,
   onViewFindings, onNavigateToTask,
 }: DirectionCardProps) {
   const forceConfirmRef = useRef<HTMLDivElement | null>(null);
@@ -134,11 +143,22 @@ function DirectionCardImpl({
   const [historyOpen, setHistoryOpen] = useState(false);
   const [expandedRemediationIds, setExpandedRemediationIds] = useState<Record<string, boolean>>({});
   const showAllRemediation = Boolean(expandedRemediationIds[d.id]);
+  // Pending retarget version for a staged direction (the version input draft).
+  const [retargetVersion, setRetargetVersion] = useState<string>('');
 
   const autoRecoveryLine = useMemo(
     () => formatAutoRecoveryLine(d.held_until),
     [d.held_until],
   );
+
+  // Generalized cross-task-type outcome lanes. Only surfaced when a non-code-
+  // merge lane has terminal outcomes — otherwise the count equals merged PRs
+  // and the existing PR badges already represent it (honest legacy degrade).
+  const outcomeRows = useMemo(
+    () => summarizeOutcomeKinds(d.outcome_kind_breakdown),
+    [d.outcome_kind_breakdown],
+  );
+  const showGeneralized = outcomeRows.some(row => row.kind !== 'code_merge');
 
   const remediationSummaryRows = useMemo<RemediationSummaryRow[]>(() => {
     const history = Array.isArray(d.remediation_history) ? d.remediation_history : [];
@@ -245,7 +265,7 @@ function DirectionCardImpl({
   }, [forceConfirmId, d.id, setForceConfirmId]);
 
   return (
-    <div className={`border rounded-lg p-2 ${d.status === 'proposed' ? 'bg-purple-950/20 border-purple-900/40' : d.status === 'expired' ? 'bg-neutral-900/30 border-neutral-800/40 opacity-70' : 'bg-neutral-900/50 border-neutral-800/50'}`}>
+    <div className={`border rounded-lg p-2 ${d.status === 'proposed' ? 'bg-purple-950/20 border-purple-900/40' : d.status === 'expired' ? 'bg-neutral-900/30 border-neutral-800/40 opacity-70' : d.status === 'staged' ? 'bg-sky-950/20 border-sky-900/40' : 'bg-neutral-900/50 border-neutral-800/50'}`}>
       {d.status === 'proposed' ? (
         /* Proposed direction — approve or reject */
         <div>
@@ -348,6 +368,103 @@ function DirectionCardImpl({
             )}
           </div>
         </div>
+      ) : d.status === 'staged' ? (
+        /* Staged direction — waiting for the next version; activate now or cancel */
+        <div>
+          <div className="flex items-start gap-2">
+            <p className="text-sm text-neutral-200 flex-1">{d.text}</p>
+            <div className="flex items-center gap-1 shrink-0">
+              {/* reason: inline direction action button in dense card; text-[10px] py-0.5 matches card density */}
+              <button
+                data-viewport-allow-small-target
+                onClick={() => activateStagedDirection(d.id)}
+                title="Activate now — start this direction immediately instead of waiting for the next version"
+                className="text-[10px] px-2 py-0.5 rounded border font-medium transition-colors bg-emerald-950/60 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/50"
+              >
+                Activate now
+              </button>
+              {/* reason: inline direction action button in dense card; text-[10px] py-0.5 matches card density */}
+              <button
+                data-viewport-allow-small-target
+                onClick={() => cancelStagedDirection(d.id)}
+                title="Cancel — remove this staged direction so it will not auto-activate"
+                className="text-[10px] px-2 py-0.5 rounded border font-medium transition-colors bg-red-950/60 border-red-900/50 text-red-400 hover:bg-red-900/50"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+          {d.completion_criteria && (
+            <p className="mt-1.5 text-[11px] text-neutral-500 leading-relaxed">
+              <span className="font-medium text-neutral-600">Done when: </span>
+              <span className="italic">{d.completion_criteria}</span>
+            </p>
+          )}
+          <div className="flex flex-wrap items-center gap-2 mt-2 min-w-0">
+            <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${priorityColors[d.priority]}`}>
+              {d.priority}
+            </span>
+            <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${statusColors.staged}`}>
+              Staged
+            </span>
+            {d.staged_for_version != null && (
+              <span
+                className="text-[10px] text-sky-400/80"
+                title={`Auto-activates when version ${d.staged_for_version} promotes and the next version opens`}
+              >
+                Waiting for v{d.staged_for_version} to promote
+              </span>
+            )}
+            {(() => {
+              const waiting = getStagedWaitingInfo(d);
+              if (!waiting) return null;
+              return (
+                <span
+                  className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${
+                    waiting.isStale
+                      ? 'bg-red-950/40 text-red-400 border-red-900/50'
+                      : 'bg-neutral-800/40 text-neutral-400 border-neutral-700/50'
+                  }`}
+                  title={
+                    waiting.isStale
+                      ? `Stalling — waiting ${waiting.days}d for promotion, past the ${STAGED_STALE_DAYS}d threshold (operator alert fires ~21d)`
+                      : `Waiting ${waiting.days}d since staged`
+                  }
+                >
+                  {waiting.label}
+                </span>
+              );
+            })()}
+          </div>
+          {/* Retarget — bind this staged direction to a different (current-or-
+              later) version. Defaults the input to the currently-open version. */}
+          {retargetStagedDirection && (
+            <div className="flex items-center gap-1.5 mt-2">
+              <span className="text-[10px] text-neutral-500">Retarget to v</span>
+              <input
+                type="number"
+                min={stageTargetVersion ?? 1}
+                value={retargetVersion}
+                placeholder={stageTargetVersion != null ? String(stageTargetVersion) : ''}
+                onChange={e => setRetargetVersion(e.target.value)}
+                title="Bind this staged direction to a different version (current open or later)"
+                className="w-16 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-0.5 text-[10px] focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
+              />
+              <button
+                data-viewport-allow-small-target
+                disabled={!retargetVersion.trim() || Number.isNaN(Number(retargetVersion))}
+                onClick={() => {
+                  const v = Number(retargetVersion);
+                  if (Number.isInteger(v)) retargetStagedDirection(d.id, v);
+                  setRetargetVersion('');
+                }}
+                className="text-[10px] px-2 py-0.5 rounded border font-medium transition-colors bg-sky-950/60 border-sky-900/50 text-sky-400 hover:bg-sky-900/50 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Retarget
+              </button>
+            </div>
+          )}
+        </div>
       ) : editingId === d.id ? (
         /* Edit mode */
         <div className="space-y-2">
@@ -393,7 +510,7 @@ function DirectionCardImpl({
               className="flex-1 min-w-[120px] bg-transparent text-neutral-100 text-xs focus:outline-none placeholder-neutral-600"
             />
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <select
               value={editPriority}
               onChange={e => setEditPriority(e.target.value as 'high' | 'medium' | 'low')}
@@ -405,12 +522,24 @@ function DirectionCardImpl({
             </select>
             <select
               value={editStatus}
-              onChange={e => setEditStatus(e.target.value as 'active' | 'completed' | 'paused')}
+              onChange={e => setEditStatus(e.target.value as 'active' | 'completed' | 'paused' | 'staged')}
               className="bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
             >
               <option value="active">Active</option>
               <option value="completed">Completed</option>
               <option value="paused">Paused</option>
+              {/* Stage for the next version — disabled when no version is open to
+                  stage against, since the backend rejects that case. The selected
+                  target version is surfaced in the hint below the row. */}
+              <option
+                value="staged"
+                disabled={stageTargetVersion == null}
+                title={stageTargetVersion == null
+                  ? 'No open release version to stage against'
+                  : `Stage to begin when v${stageTargetVersion} promotes and the next version opens`}
+              >
+                Staged
+              </option>
             </select>
             <select
               value={editCategory ?? ''}
@@ -444,6 +573,15 @@ function DirectionCardImpl({
               <X className="w-3.5 h-3.5" />
             </button>
           </div>
+          {stageTargetVersion == null ? (
+            <p className="text-[10px] text-neutral-500 leading-relaxed">
+              No open release version to stage against.
+            </p>
+          ) : editStatus === 'staged' && (
+            <p className="text-[10px] text-sky-400/80 leading-relaxed">
+              Will stage to begin after v{stageTargetVersion} promotes and the next version opens.
+            </p>
+          )}
         </div>
       ) : (
         /* View mode */
@@ -654,12 +792,10 @@ function DirectionCardImpl({
                   )}
                   {(d.remediation_attempts ?? 0) > 0 && (() => {
                     const attempts = d.remediation_attempts ?? 0;
-                    const result = d.last_remediation_result;
-                    const color = result === 'merged' ? 'emerald' : result === 'failed' ? 'red' : 'amber';
-                    const label = result === 'merged' ? 'merged' : result === 'failed' ? 'failed' : 'pending';
+                    const resultMeta = remediationResultMeta(d.last_remediation_result);
                     return (
-                      <span className={`inline-block text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}>
-                        Remediation {attempts}× · {label}
+                      <span className={`inline-block text-[10px] px-1.5 py-0.5 rounded border font-medium ${resultMeta.badgeClass}`}>
+                        Remediation {attempts}× · {resultMeta.resultLabel}
                       </span>
                     );
                   })()}
@@ -755,6 +891,25 @@ function DirectionCardImpl({
                 </span>
               );
             })()}
+            {/* Generalized cross-task-type success — distinct from the PR-merge
+                count; shown only when a non-code-merge lane has outcomes. */}
+            {showGeneralized && (
+              <span
+                title="Generalized success across task types (code merges + research/audit/memo/verification), distinct from the PR-merge count"
+                className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-neutral-800/60 border-neutral-700/60 ${healthRateColorClass(d.generalized_health_rate)}`}
+              >
+                {d.generalized_successes ?? 0} eval{typeof d.generalized_health_rate === 'number' ? ` · ${Math.round(d.generalized_health_rate * 100)}%` : ''}
+              </span>
+            )}
+            {/* Accumulated knowledge documents (web_research output) for this direction */}
+            {typeof d.knowledge_document_count === 'number' && d.knowledge_document_count > 0 && (
+              <span
+                title="Durable knowledge documents accumulated by this direction's web_research tasks"
+                className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-blue-950/40 border-blue-900/50 text-blue-300"
+              >
+                {d.knowledge_document_count} doc{d.knowledge_document_count !== 1 ? 's' : ''}
+              </span>
+            )}
             {/* Reactivate button for auto-paused directions */}
             {d.auto_paused && key === 'paused' && (
               // reason: inline direction action chip; text-[10px] py-0.5 matches card density
@@ -862,8 +1017,8 @@ function DirectionCardImpl({
                 </>
               );
             })()}
-            {/* Cooldown badge */}
-            {key === 'active' && (() => {
+            {/* Cooldown badge — suppressed when direction is held */}
+            {key === 'active' && !d.held && (() => {
               const cooldownStatus = getCooldownStatus(d, cooldownMinutes);
               if (cooldownStatus === 'cooling') {
                 return (
@@ -950,6 +1105,27 @@ function DirectionCardImpl({
               </span>
             )}
           </div>
+          {showGeneralized && (
+            <div className="flex flex-wrap gap-1 mt-1.5">
+              {outcomeRows.map(row => {
+                const rate = row.terminal > 0 ? row.success / row.terminal : 0;
+                const color = rate >= 0.7
+                  ? 'bg-emerald-950/40 border-emerald-900/50 text-emerald-400'
+                  : rate >= 0.4
+                    ? 'bg-amber-950/40 border-amber-900/50 text-amber-400'
+                    : 'bg-neutral-800/60 border-neutral-700/60 text-neutral-400';
+                return (
+                  <span
+                    key={row.kind}
+                    title={`${row.label}: ${row.success} success / ${row.neutral} neutral / ${row.failure} failure (${Math.round(rate * 100)}%)`}
+                    className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${color}`}
+                  >
+                    {row.label} {row.success}/{row.terminal}
+                  </span>
+                );
+              })}
+            </div>
+          )}
           {d.paths && d.paths.length > 0 && (
             <div className="flex flex-wrap gap-1 mt-1.5">
               {d.paths.map(p => (

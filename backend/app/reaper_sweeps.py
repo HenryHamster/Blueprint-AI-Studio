@@ -7,12 +7,14 @@ and commit/error-handling behaviour.
 """
 
 import asyncio
+import contextlib
 import logging
 import uuid
 from datetime import datetime, timedelta
 
 from sqlmodel import select
 
+from app.depends_on_provenance import remember_structural_depends_on
 from app.models import Task, TaskStatus
 from app.time_utils import _utcnow
 
@@ -504,6 +506,33 @@ _BLOCKED_ESCALATE_AFTER = timedelta(hours=6)
 # were re-locked every cycle and could crowd genuinely-due rechecks out of the
 # batch-size window. Recovery has given up on these; an operator re-queues them.
 _BLOCKED_ESCALATED_PARK = timedelta(days=3650)
+# A parked (escalated) blocker that STILL carries a machine-resolvable need is
+# re-examined at this LOW, bounded cadence instead of the multi-year park
+# horizon, so that when the foundation it waited on finally lands — a sibling
+# task, a merged PR, or shipped code now reachable on integration — the task
+# resumes automatically rather than waiting for a manual operator requeue. The
+# re-evaluation is cheap (one conservative exact-match pass) and never
+# re-escalates or re-alerts, so it does not reintroduce per-cycle churn. Parked
+# blockers with NO need keep the multi-year horizon and stay for the operator.
+_BLOCKED_PARKED_REEVAL_INTERVAL = timedelta(hours=6)
+# Bounded number of parked re-evaluations a still-unsatisfiable need is given
+# before the dependent is terminated. A need that never becomes satisfiable —
+# e.g. a capability no task ever advertises — would otherwise re-arm the parked
+# re-evaluation at the low cadence forever. After this many parked re-evals with
+# no resolution and no provably-dead foundation, the dependent reaches a bounded
+# TERMINAL (CANCELLED) outcome instead of parking forever. The legitimate
+# "foundation might still appear" case keeps its resume behavior within the
+# bound — only an exhausted, never-satisfiable need terminates.
+_BLOCKED_PARKED_REEVAL_CAP = 4
+# A no-dependency agent/lifecycle blocker is often a TRANSIENT infra failure
+# (orchestrator ./pr open 5xx, git push stale-lease) that clears on its own, but
+# can also be a durable precondition (missing base branch/file). We can't tell
+# them apart, so we optimistically requeue such a blocker up to this many times —
+# a transient blip recovers on retry; a durable blocker re-blocks and, once the
+# budget is spent, parks for the normal backoff + 6h operator escalation. The cap
+# is deliberately small: re-dispatch costs a full agent VM run, so this trades a
+# few wasted runs for auto-recovery instead of a multi-hour operator wedge.
+_BLOCKED_OPTIMISTIC_RETRY_CAP = 3
 
 
 def _next_recheck_delay(attempts: int) -> timedelta:
@@ -519,6 +548,9 @@ async def _blocked_precondition_state(task, session, verify_pr_merged) -> str:
       - ``"clear"``   — the precondition is satisfied (or is a transient conflict
                         with no dependency edge); requeue and let dispatch run/
                         re-judge it.
+      - ``"retry"``   — a no-dependency agent/lifecycle blocker that may be a
+                        transient infra failure; the driver optimistically
+                        requeues it a bounded number of times before parking.
       - ``"waiting"`` — an upstream dependency is still in flight; stay BLOCKED.
       - ``"dead"``    — an upstream dependency genuinely failed / was cancelled,
                         so this work is impossible; escalate terminally.
@@ -563,10 +595,22 @@ async def _blocked_precondition_state(task, session, verify_pr_merged) -> str:
             return "re_evaluate"
         if verify_pr_merged is None:
             return "waiting"
-        # Agent/lifecycle blockers with no explicit dependency edge are durable
-        # preconditions (missing base branch/file, upstream PR not yet landed).
-        # Keep them parked and back off; the deadline escalation path surfaces
-        # long-lived blockers for operator intervention.
+        # AGENT-surfaced "BLOCKER:" with no explicit dependency edge (source set
+        # by agent_status.py): these are often TRANSIENT infra failures
+        # (orchestrator ./pr open 5xx, git push stale-lease) that clear on their
+        # own, but can also be durable preconditions (missing base branch/file).
+        # We can't reliably tell them apart from here, so signal a BOUNDED
+        # optimistic requeue: the driver retries up to
+        # _BLOCKED_OPTIMISTIC_RETRY_CAP times before parking + escalating. A
+        # transient blip recovers on retry; a durable blocker re-blocks and is
+        # parked once the retry budget is spent. (Previously this returned
+        # "waiting" unconditionally, which left a transient infra blip wedging
+        # its EVALUATING rollup parent for hours until an operator manually
+        # requeued — incident 2026-06-04, tasks 87ddb2a4/18c8c195.) Scoped to
+        # source=="agent" so parent-source blockers and metadata-less blocked
+        # subtasks keep their existing "wait for explicit recovery" semantics.
+        if blocker_source == "agent":
+            return "retry"
         return "waiting"
     if verify_pr_merged is None:
         return "waiting"
@@ -625,9 +669,455 @@ def _clear_blocked_fields(task, *, preserve_first_blocked: bool = False) -> None
     ]
     if not preserve_first_blocked:
         keys.append("_blocked_first_at")
+        # The optimistic-retry budget is preserved across an onset-preserving
+        # requeue (so a transient agent/lifecycle blocker keeps counting toward
+        # its cap), but wiped on a genuine dependency clear so a later, unrelated
+        # block starts with a fresh budget.
+        keys.append("_blocked_optimistic_retries")
     for k in keys:
         ctx.pop(k, None)
     task.context = ctx
+
+
+async def _fetch_active_candidates(session, project_id) -> list:
+    """Active/in-flight tasks in a project — the foundations a need can resolve to.
+
+    Statuses mirror ``blocked_need_resolution.ACTIVE_CANDIDATE_STATUSES``: a need
+    can only resolve onto work that is still going to land (QUEUED/PROVISIONING/
+    IN_PROGRESS/EVALUATING), never onto already-terminal rows.
+    """
+    from app.blocked_need_resolution import ACTIVE_CANDIDATE_STATUSES
+
+    active = [TaskStatus(s) for s in ACTIVE_CANDIDATE_STATUSES]
+    return (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.status.in_(active),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def _resolve_need_into_dep_edge(
+    task, ctx, session, *, candidate_cache: dict
+) -> bool:
+    """Turn a blocked task's machine-resolvable need into a real depends_on edge.
+
+    Returns ``True`` when a foundation was matched and an edge wired (the caller
+    then requeues the task to QUEUED and SHORT-CIRCUITS the optimistic-retry /
+    escalate-and-park path). Returns ``False`` (no mutation) when the task has no
+    need, already carries a dependency edge, or no conservative match exists — so
+    the existing precondition machinery runs unchanged.
+    """
+    from app.task_blocked import get_blocker_metadata
+    from app.blocked_need_resolution import resolve_blocked_need
+
+    # Only attempt resolution for a need with NO existing edge: a task that
+    # already depends on something is carried by the structural-wait path.
+    if task.depends_on:
+        return False
+    need = get_blocker_metadata(task).get("need")
+    if not isinstance(need, dict):
+        return False
+
+    candidates = candidate_cache.get(task.project_id)
+    if candidates is None:
+        candidates = await _fetch_active_candidates(session, task.project_id)
+        candidate_cache[task.project_id] = candidates
+
+    match = resolve_blocked_need(task, need, candidates)
+    if match is None:
+        return False
+
+    # Idempotently add the foundation as a dependency. Full-list reassignment so
+    # SQLAlchemy observes the JSONB change (flag_modified is applied by callers).
+    match_id = str(match.id)
+    existing = [str(d) for d in (task.depends_on or [])]
+    if match_id not in existing:
+        task.depends_on = existing + [match_id]
+    remember_structural_depends_on(task, match_id)
+    return True
+
+
+async def sweep_converge_duplicate_foundations(session, now=None) -> int:
+    """Step 15: serialize HIGH-CONFIDENCE duplicate foundations behind the canonical.
+
+    The duplicate-foundation observability signal flags cross-parent active
+    write-tasks with overlapping related files, but that signal is dashboard-only
+    because the pipeline intentionally lets independent tasks edit shared-infra
+    files in parallel and reconcile at merge. This sweep converges only the
+    genuine duplicates the signal catches that slip past spawn-time dedup — a
+    shared finding origin, a shared capability marker, or near-identical file sets
+    (see ``digest_metrics.compute_foundation_convergence_actions``). For each, it
+    wires a ``depends_on`` edge from the later task onto the earlier (canonical)
+    one, so the existing held-lane / cross-base re-cut path rebases the duplicate
+    on the canonical's landed foundation and builds-on instead of rebuilding.
+
+    Conservative and observable: below the genuine-duplicate predicate the pair is
+    left untouched (still merely surfaced by the signal); a self-edge or an edge
+    that would close a ``depends_on`` cycle is refused; every wired edge logs and
+    stamps the dependent's context so an operator can see why it was serialized.
+    Returns the number of edges wired.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.blocked_need_resolution import (
+        ACTIVE_CANDIDATE_STATUSES,
+        _would_create_cycle,
+    )
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    active = [TaskStatus(s) for s in ACTIVE_CANDIDATE_STATUSES]
+    rows = (
+        (await session.execute(select(Task).where(Task.status.in_(active))))
+        .scalars()
+        .all()
+    )
+    by_project: dict = {}
+    for t in rows:
+        by_project.setdefault(t.project_id, []).append(t)
+
+    wired = 0
+    pending_broadcasts: list[tuple[str, dict]] = []
+    for pid, tasks in by_project.items():
+        if len(tasks) < 2:
+            continue
+        by_id = {str(t.id): t for t in tasks}
+        for action in compute_foundation_convergence_actions(tasks):
+            dependent = by_id.get(action["dependent_id"])
+            foundation = by_id.get(action["foundation_id"])
+            if dependent is None or foundation is None:
+                continue
+            found_id = str(foundation.id)
+            if found_id == str(dependent.id):  # defensive self-edge guard
+                continue
+            existing = [str(d) for d in (dependent.depends_on or [])]
+            if found_id in existing:
+                continue
+            if _would_create_cycle(dependent, foundation, tasks):
+                logger.info(
+                    f"[REAPER] Step 15: skipped converging {dependent.id} -> "
+                    f"{found_id} — edge would close a depends_on cycle"
+                )
+                continue
+            dependent.depends_on = existing + [found_id]
+            remember_structural_depends_on(dependent, found_id)
+            ctx = dependent.context or {}
+            ctx["_foundation_converged"] = {
+                "foundation_id": found_id,
+                "reason": action["reason"],
+                "shared_files": action["shared_files"],
+            }
+            dependent.context = ctx
+            flag_modified(dependent, "depends_on")
+            flag_modified(dependent, "context")
+            session.add(dependent)
+            wired += 1
+            logger.info(
+                f"[REAPER] Step 15: converged duplicate foundation — task "
+                f"{dependent.id} now depends on {found_id} ({action['reason']})"
+            )
+            pending_broadcasts.append(
+                (
+                    str(pid),
+                    {
+                        "task_id": str(dependent.id),
+                        "depends_on": dependent.depends_on,
+                        "message": f"Serialized behind duplicate foundation: {action['reason']}",
+                    },
+                )
+            )
+
+    if wired:
+        await session.commit()
+        for project_id, payload in pending_broadcasts:
+            with contextlib.suppress(Exception):
+                await _bcast(project_id, "task_updated", payload)
+        logger.info(f"[REAPER] Step 15: converged {wired} duplicate foundation(s)")
+    return wired
+
+
+async def _fetch_completed_candidates(session, project_id) -> list:
+    """Completed/merged tasks in a project — foundations that have already LANDED.
+
+    Statuses mirror ``blocked_need_resolution.COMPLETED_CANDIDATE_STATUSES``: a
+    parked blocker's need may now be satisfied by work that has since completed
+    (a sibling task done, the PR it named merged), which the active-candidate
+    matcher never sees.
+    """
+    from app.blocked_need_resolution import COMPLETED_CANDIDATE_STATUSES
+
+    completed = [TaskStatus(s) for s in COMPLETED_CANDIDATE_STATUSES]
+    return (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.status.in_(completed),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def _completed_foundation_base_safe(task, need, completed, session) -> bool:
+    """Re-cut a resuming dependent's base when its landed foundation is cross-base.
+
+    A blocked dependent that resumes because its need is satisfied by ALREADY-
+    completed work carries NO ``depends_on`` edge, so the dispatch-time re-cut
+    (which only inspects edged candidates) can never fire for it. If the completed
+    foundation that satisfied the need is a GENUINE cross-base code dependency that
+    has landed on integration, the dependent would otherwise dispatch against a
+    staging base forked before the foundation landed — exactly the failure the
+    re-cut machinery exists to prevent.
+
+    Resolve the actual landed foundation and run it through the SAME shared re-cut
+    helper the dispatch/completion paths use (``ensure_dependent_base_recut``):
+
+      * Same-base or ordering-only foundation → no re-cut needed → returns ``True``
+        (the dependent resumes exactly as before — no false serialization).
+      * Cross-base code foundation, re-cut succeeds → ``True`` (base now contains
+        the landed code; safe to resume).
+      * Cross-base code foundation, re-cut conflicts or hits a transient error →
+        ``False`` — the caller must HOLD the dependent (keep it blocked / re-park
+        and retry next cycle), never resume against an un-recut base.
+    """
+    from app.blocked_need_resolution import completed_foundation_for_need
+    from app.orchestrator_health import ensure_dependent_base_recut
+
+    foundation = completed_foundation_for_need(task, need, completed)
+    if foundation is None:  # defensive — caller already confirmed satisfaction
+        return True
+    return await ensure_dependent_base_recut(task, [foundation], session)
+
+
+async def _fetch_dead_candidates(session, project_id) -> list:
+    """Terminally failed/cancelled tasks — foundations that have definitively DIED.
+
+    Statuses mirror ``blocked_need_resolution.TERMINAL_CANDIDATE_STATUSES``: a
+    blocked dependent whose named foundation reached one of these states will
+    never be satisfied by it, so the dependent is terminated (CANCELLED) rather
+    than parked to re-arm forever.
+    """
+    from app.blocked_need_resolution import TERMINAL_CANDIDATE_STATUSES
+
+    dead = [TaskStatus(s) for s in TERMINAL_CANDIDATE_STATUSES]
+    return (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.status.in_(dead),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def _cancel_blocker_as_dead(
+    task, session, *, detail: str, message: str, pending_broadcasts: list
+) -> None:
+    """Terminally CANCEL a blocked dependent that can provably never resume.
+
+    Mirrors the dispatch-time cascade-cancel of an edged dead dependency
+    (``orchestrator._cascade_cancel_dependent`` sets CANCELLED): a needed-but-
+    never-edged foundation that has definitively FAILED/CANCELLED — or a need that
+    has outlived its bounded parked re-evaluations without ever becoming
+    satisfiable — makes this work impossible. Raises ONE deduplicated operator
+    alert (so the auto-cancel is visible) and clears the blocker metadata.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.alert_dispatch import _maybe_create_blocked_escalation_alert
+
+    await _maybe_create_blocked_escalation_alert(
+        task,
+        session,
+        blocker_kind=task.blocker_kind or "upstream dependency",
+        detail=detail,
+    )
+    _clear_blocked_fields(task, preserve_first_blocked=False)
+    task.status = TaskStatus.CANCELLED
+    task.latest_status_message = message
+    flag_modified(task, "context")
+    session.add(task)
+    pending_broadcasts.append(
+        (
+            str(task.project_id),
+            {"task_id": str(task.id), "status": "CANCELLED", "message": message},
+        )
+    )
+
+
+async def _maybe_cancel_unresumable_blocker(
+    task, ctx, session, *, dead_cache: dict, pending_broadcasts: list, parked: bool
+) -> bool:
+    """Terminate a blocker that can provably never resume; else no-op.
+
+    Two unresumable cases (the legitimate foundation-might-still-appear case is
+    left untouched — it keeps parking/resuming as before):
+
+      1. The need names a foundation that has reached a terminal FAILED/CANCELLED
+         state. It matches neither the active nor the completed candidate set, so
+         it can never be satisfied — cancel the dependent the same way the dispatch
+         path cascade-cancels an edged dead dependency, promptly (not only once
+         parked).
+      2. (parked only) The need has outlived ``_BLOCKED_PARKED_REEVAL_CAP`` parked
+         re-evaluations without ever becoming satisfiable — cancel rather than
+         re-arm the parked re-evaluation forever.
+
+    Returns ``True`` when the task was cancelled (caller should ``continue``);
+    ``False`` (only a bumped re-eval counter in the parked case) otherwise, so the
+    caller's existing park/recheck logic runs unchanged.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.task_blocked import get_blocker_metadata
+    from app.blocked_need_resolution import need_matched_dead_foundation
+
+    need = get_blocker_metadata(task).get("need")
+    # Only the missing-edge need case — an edged dead dependency is already
+    # handled by the dispatch cascade-cancel / "dead" precondition state.
+    if not isinstance(need, dict) or task.depends_on:
+        return False
+
+    dead = dead_cache.get(task.project_id)
+    if dead is None:
+        dead = await _fetch_dead_candidates(session, task.project_id)
+        dead_cache[task.project_id] = dead
+    if need_matched_dead_foundation(task, need, dead):
+        await _cancel_blocker_as_dead(
+            task,
+            session,
+            detail=(
+                "Needed foundation has terminally failed or was cancelled — this "
+                "task can never run as-is. Auto-cancelled (re-scope, re-point the "
+                "need, or recreate the foundation to retry)."
+            ),
+            message="Cancelled — needed foundation terminally failed/cancelled",
+            pending_broadcasts=pending_broadcasts,
+        )
+        return True
+
+    if not parked:
+        return False
+
+    reevals = int(ctx.get("_blocked_parked_reevals", 0)) + 1
+    if reevals >= _BLOCKED_PARKED_REEVAL_CAP:
+        await _cancel_blocker_as_dead(
+            task,
+            session,
+            detail=(
+                f"Blocked need was never satisfiable after {reevals} parked "
+                "re-evaluations — no task ever provided it. Auto-cancelled "
+                "(re-scope or re-point the need to retry)."
+            ),
+            message="Cancelled — blocked need never became satisfiable",
+            pending_broadcasts=pending_broadcasts,
+        )
+        return True
+    ctx["_blocked_parked_reevals"] = reevals
+    task.context = ctx
+    flag_modified(task, "context")
+    return False
+
+
+async def _maybe_resume_parked_blocker(
+    task,
+    ctx,
+    session,
+    now,
+    *,
+    candidate_cache: dict,
+    completed_cache: dict,
+    pending_broadcasts: list,
+) -> bool:
+    """Re-evaluate a PARKED (escalated) blocker against the live foundation set.
+
+    A parked blocker that carries a machine-resolvable need is rechecked at the
+    low parked cadence. If its need now resolves to an in-flight foundation, wire
+    a ``depends_on`` edge and requeue — the dispatch-time gate then holds the task
+    until the foundation lands. If the need is instead already satisfied by
+    completed/merged work, requeue with NO edge so the task simply proceeds. Either
+    way the parked/escalated state is cleared cleanly (so the task is no longer
+    counted as parked) and the stale 'permanently blocked' operator alert is
+    reconciled. Returns ``True`` when the task resumed.
+
+    Conservative by construction: only a task with a structured need and NO
+    existing dependency edge is considered, resolution uses the SAME exact-match
+    signal as the live need-resolution path (never a fuzzy guess), and resume
+    never re-escalates or re-alerts. Returns ``False`` (no mutation) otherwise, so
+    a need-less or still-unsatisfiable blocker stays parked for the operator.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.task_blocked import get_blocker_metadata
+    from app.blocked_need_resolution import need_satisfied_by_completed
+    from app.alert_dispatch import _resolve_blocked_escalation_alert
+
+    # Only resume the missing-edge case — a parked task that already carries an
+    # edge is a different (dead-dependency) failure mode left for the operator.
+    if task.depends_on:
+        return False
+    need = get_blocker_metadata(task).get("need")
+    if not isinstance(need, dict):
+        return False
+
+    # 1) In-flight foundation: wire the edge; the dispatch gate holds the task.
+    wired = await _resolve_need_into_dep_edge(
+        task, ctx, session, candidate_cache=candidate_cache
+    )
+    if wired:
+        message = "Resumed from parked — need resolved into dependency edge, requeued"
+    else:
+        # 2) Already satisfied by completed/merged work: requeue with NO edge.
+        completed = completed_cache.get(task.project_id)
+        if completed is None:
+            completed = await _fetch_completed_candidates(session, task.project_id)
+            completed_cache[task.project_id] = completed
+        if not need_satisfied_by_completed(task, need, completed):
+            return False
+        # The completed foundation carries no edge, so the dispatch-time re-cut
+        # cannot fire. If it is a cross-base genuine code dependency, re-cut the
+        # base from integration BEFORE resuming; hold (stay parked) on conflict/
+        # error so we never resume against a base missing the landed code.
+        if not await _completed_foundation_base_safe(task, need, completed, session):
+            return False
+        message = "Resumed from parked — need satisfied by completed work, requeued"
+
+    # Clear parked/escalated state cleanly: _blocked_escalated, the structured
+    # blocker record (incl. its escalated flag), and recheck_after are all reset
+    # so the task is no longer counted as parked and never re-locked at the park
+    # horizon.
+    _clear_blocked_fields(task, preserve_first_blocked=False)
+    task.status = TaskStatus.QUEUED
+    task.latest_status_message = message
+    flag_modified(task, "context")
+    if wired:
+        flag_modified(task, "depends_on")
+    session.add(task)
+    pending_broadcasts.append(
+        (
+            str(task.project_id),
+            {
+                "task_id": str(task.id),
+                "status": "QUEUED",
+                "message": message,
+            },
+        )
+    )
+    # Reconcile the now-stale 'permanently blocked' operator alert. Best-effort:
+    # a reconcile failure must never abort the resume that triggered it.
+    with contextlib.suppress(Exception):
+        await _resolve_blocked_escalation_alert(task, session)
+    return True
 
 
 async def sweep_unblock_blocked_tasks(
@@ -648,6 +1138,7 @@ async def sweep_unblock_blocked_tasks(
     from sqlalchemy.orm.attributes import flag_modified
     from app.alert_dispatch import _maybe_create_blocked_escalation_alert
     from app.broadcast import broadcast_to_project as _bcast
+    from app.task_blocked import get_blocker_metadata
 
     if verify_pr_merged is None:
         from app.rollup_pr_verification import _verify_pr_merged
@@ -673,6 +1164,16 @@ async def sweep_unblock_blocked_tasks(
     # admin UI (which refetches task/digest data on these events) never observes
     # a stale BLOCKED row — or, on rollback, a transition that never persisted.
     pending_broadcasts: list[tuple[str, dict]] = []
+    # Active-candidate lists are fetched at most once per project across the batch
+    # (only when a task actually has a resolvable need with no edge). The
+    # completed-candidate cache is the parked-resume counterpart: a parked
+    # blocker's need may now be satisfied by already-merged/shipped work.
+    candidate_cache: dict = {}
+    completed_cache: dict = {}
+    # Terminally-dead foundations (FAILED/CANCELLED): a needed-but-never-edged
+    # foundation that has definitively died makes its dependent impossible — it is
+    # cancelled rather than parked to re-arm forever.
+    dead_cache: dict = {}
 
     async def _escalate_blocked_task(
         task,
@@ -681,7 +1182,7 @@ async def sweep_unblock_blocked_tasks(
         blocker_kind: str,
         detail: str,
     ) -> None:
-        from app.task_blocked import mark_blocker_escalated
+        from app.task_blocked import get_blocker_metadata, mark_blocker_escalated
 
         await _maybe_create_blocked_escalation_alert(
             task,
@@ -696,7 +1197,14 @@ async def sweep_unblock_blocked_tasks(
         # than leaving the in-transition's escalated=False stale.
         mark_blocker_escalated(task, detail=detail, now=now)
         flag_modified(task, "context")
-        task.recheck_after = now + _BLOCKED_ESCALATED_PARK
+        # A parked blocker that still carries a machine-resolvable need is parked
+        # at the LOW re-evaluation cadence (so it comes back due and resumes when
+        # its foundation lands), not the multi-year horizon. A need-less blocker
+        # keeps the far-future park and stays for the operator exactly as today.
+        has_need = isinstance(get_blocker_metadata(task).get("need"), dict)
+        task.recheck_after = now + (
+            _BLOCKED_PARKED_REEVAL_INTERVAL if has_need else _BLOCKED_ESCALATED_PARK
+        )
         session.add(task)
 
     for task in due:
@@ -707,10 +1215,162 @@ async def sweep_unblock_blocked_tasks(
         # recheck_after let one resurface here, evict it the same way so it
         # stops being re-SELECTed and FOR UPDATE-locked every reaper cycle.
         if ctx.get("_blocked_escalated"):
+            # Parked-blocker auto-resume: a parked blocker that carries a still-
+            # satisfiable machine-resolvable need is resumed (edge + requeue, or
+            # proceed when satisfied by completed work) and its stale alert is
+            # reconciled. Runs at the low parked cadence — never re-escalates.
+            if await _maybe_resume_parked_blocker(
+                task,
+                ctx,
+                session,
+                now,
+                candidate_cache=candidate_cache,
+                completed_cache=completed_cache,
+                pending_broadcasts=pending_broadcasts,
+            ):
+                requeued += 1
+                changed = True
+                continue
+            # Not resumable by an in-flight/landed foundation. Before re-parking,
+            # check whether the dependent can provably NEVER resume — its named
+            # foundation has terminally died, or its need has outlived the bounded
+            # parked re-evaluations without ever becoming satisfiable — and if so
+            # terminate it (CANCELLED) instead of re-arming the parked re-eval
+            # forever.
+            if await _maybe_cancel_unresumable_blocker(
+                task,
+                ctx,
+                session,
+                dead_cache=dead_cache,
+                pending_broadcasts=pending_broadcasts,
+                parked=True,
+            ):
+                changed = True
+                continue
+            # Not resumable — re-park without re-alerting. A blocker that still
+            # carries a need is re-examined at the low cadence so it resumes once
+            # its foundation lands; one with no (or an unsatisfiable) need keeps
+            # the multi-year horizon and stays parked for the operator as today.
             if task.recheck_after is None or task.recheck_after <= now:
-                task.recheck_after = now + _BLOCKED_ESCALATED_PARK
+                has_need = isinstance(
+                    get_blocker_metadata(task).get("need"), dict
+                )
+                task.recheck_after = now + (
+                    _BLOCKED_PARKED_REEVAL_INTERVAL
+                    if has_need
+                    else _BLOCKED_ESCALATED_PARK
+                )
                 session.add(task)
                 changed = True
+            continue
+
+        # Cross-task RESOLUTION (runs BEFORE the optimistic-retry / escalate path):
+        # if this task's machine-resolvable need names an in-flight foundation,
+        # wire a real depends_on edge onto it and requeue. The dispatch-time
+        # dependency gate then holds the task until the foundation lands and the
+        # blocked-resume machinery carries it — no wasted re-dispatch. A successful
+        # resolution SHORT-CIRCUITS the bounded optimistic retry below.
+        if await _resolve_need_into_dep_edge(
+            task, ctx, session, candidate_cache=candidate_cache
+        ):
+            _clear_blocked_fields(task, preserve_first_blocked=False)
+            task.status = TaskStatus.QUEUED
+            task.latest_status_message = (
+                "Unblocked — need resolved into dependency edge, requeued"
+            )
+            flag_modified(task, "context")
+            flag_modified(task, "depends_on")
+            session.add(task)
+            requeued += 1
+            changed = True
+            pending_broadcasts.append(
+                (
+                    str(task.project_id),
+                    {
+                        "task_id": str(task.id),
+                        "status": "QUEUED",
+                        "message": task.latest_status_message,
+                    },
+                )
+            )
+            continue
+
+        # Foundation already landed: if the need is satisfied by completed/merged
+        # work, requeue with no edge (the work is already done). Reuses the same
+        # exact-match check as the parked-resume path, never a fuzzy guess.
+        from app.task_blocked import get_blocker_metadata
+        from app.blocked_need_resolution import need_satisfied_by_completed
+
+        need = get_blocker_metadata(task).get("need")
+        if isinstance(need, dict) and not task.depends_on:
+            completed = completed_cache.get(task.project_id)
+            if completed is None:
+                completed = await _fetch_completed_candidates(
+                    session, task.project_id
+                )
+                completed_cache[task.project_id] = completed
+            if need_satisfied_by_completed(task, need, completed):
+                # The satisfying foundation carries no edge, so the dispatch-time
+                # re-cut cannot fire. If it is a cross-base genuine code
+                # dependency, re-cut the base from integration BEFORE leaving
+                # BLOCKED; on conflict/transient error HOLD (re-arm a backed-off
+                # recheck) so we never dispatch against a base missing the landed
+                # code. Same-base / ordering-only foundations need no re-cut and
+                # resume exactly as before.
+                if not await _completed_foundation_base_safe(
+                    task, need, completed, session
+                ):
+                    # _completed_foundation_base_safe -> ensure_dependent_base_recut
+                    # REPLACES and COMMITS task.context with a fresh dict carrying the
+                    # _recut_* escalation accounting on a HOLD. Re-read it here so the
+                    # stale loop-local `ctx` (captured before the call) does not clobber
+                    # those counters when we stamp the blocked-recheck backoff below —
+                    # otherwise the consecutive-conflict counter resets every cycle and
+                    # a persistently-conflicting dependent never escalates.
+                    ctx = task.context or {}
+                    attempts = int(ctx.get("_blocked_recheck_attempts", 0)) + 1
+                    ctx["_blocked_recheck_attempts"] = attempts
+                    task.context = ctx
+                    task.recheck_after = now + _next_recheck_delay(attempts)
+                    flag_modified(task, "context")
+                    session.add(task)
+                    changed = True
+                    continue
+                _clear_blocked_fields(task, preserve_first_blocked=False)
+                task.status = TaskStatus.QUEUED
+                task.latest_status_message = (
+                    "Unblocked — need satisfied by completed work, requeued"
+                )
+                flag_modified(task, "context")
+                session.add(task)
+                requeued += 1
+                changed = True
+                pending_broadcasts.append(
+                    (
+                        str(task.project_id),
+                        {
+                            "task_id": str(task.id),
+                            "status": "QUEUED",
+                            "message": task.latest_status_message,
+                        },
+                    )
+                )
+                continue
+
+        # Foundation definitively DIED before an edge was wired: a need naming a
+        # task/PR now in a terminal failed/cancelled state can never be satisfied
+        # (it matches neither the active nor the completed set). Cancel the
+        # dependent the same way the dispatch path cascade-cancels an edged dead
+        # dependency, rather than letting it park and re-arm forever.
+        if await _maybe_cancel_unresumable_blocker(
+            task,
+            ctx,
+            session,
+            dead_cache=dead_cache,
+            pending_broadcasts=pending_broadcasts,
+            parked=False,
+        ):
+            changed = True
             continue
 
         state = await _blocked_precondition_state(task, session, verify_pr_merged)
@@ -804,13 +1464,52 @@ async def sweep_unblock_blocked_tasks(
                 ),
             )
             changed = True
-        else:  # "waiting" — re-arm a later recheck with backoff.
-            # Deadline escalation stays active for blockers that are still
-            # genuinely unresolved at the 6h mark.
-            if (
+        else:  # "retry" or "waiting"
+            past_deadline = (
                 task.blocked_at is not None
                 and (now - task.blocked_at) >= _BLOCKED_ESCALATE_AFTER
+            )
+            optimistic_used = int(ctx.get("_blocked_optimistic_retries", 0))
+            # "retry": a no-dep agent/lifecycle blocker that may be a transient
+            # infra failure — optimistically requeue (bounded) so a passing blip
+            # auto-recovers instead of wedging its rollup parent until an operator
+            # intervenes. Preserve the first-blocked onset so the 6h deadline
+            # still measures from true onset across the requeue episodes.
+            if (
+                state == "retry"
+                and not past_deadline
+                and optimistic_used < _BLOCKED_OPTIMISTIC_RETRY_CAP
             ):
+                ctx["_blocked_optimistic_retries"] = optimistic_used + 1
+                task.context = ctx
+                # _clear_blocked_fields preserves _blocked_optimistic_retries on
+                # an onset-preserving requeue (it is only wiped on a genuine
+                # dependency clear), so the budget keeps counting across re-blocks.
+                _clear_blocked_fields(task, preserve_first_blocked=True)
+                task.status = TaskStatus.QUEUED
+                task.latest_status_message = (
+                    f"Unblocked — optimistic infra-precondition retry "
+                    f"{optimistic_used + 1}/{_BLOCKED_OPTIMISTIC_RETRY_CAP}"
+                )
+                flag_modified(task, "context")
+                session.add(task)
+                requeued += 1
+                changed = True
+                pending_broadcasts.append(
+                    (
+                        str(task.project_id),
+                        {
+                            "task_id": str(task.id),
+                            "status": "QUEUED",
+                            "message": task.latest_status_message,
+                        },
+                    )
+                )
+                continue
+            # "waiting" (or a retry that exhausted its budget): re-arm a later
+            # recheck with backoff. Deadline escalation stays active for blockers
+            # still genuinely unresolved at the 6h mark.
+            if past_deadline:
                 await _escalate_blocked_task(
                     task,
                     ctx,
@@ -847,3 +1546,793 @@ async def sweep_unblock_blocked_tasks(
     if requeued:
         logger.info(f"[REAPER] Step 12: unblocked {requeued} task(s) → QUEUED")
     return requeued
+
+
+# ── Step 13: staged-direction auto-activation backstop ─────────────────────
+#
+# A "staged" direction (status="staged", staged_for_version=N) is inert work
+# marked to begin only after the version that was OPEN when it was staged
+# promotes.  The promotion success path activates eligible staged directions at
+# the version-open transition, but a single failure there must never strand
+# staged work forever.  This periodic sweep mirrors the proven BLOCKED-task
+# pattern (apply at the event AND self-heal via a periodic sweep): for every
+# project that still has a staged direction, it re-checks whether the target
+# version has already promoted and activates via the SAME shared idempotent
+# helper.  Idempotent — re-running on an already-active direction is a no-op.
+async def sweep_activate_staged_directions(session) -> int:
+    """Step 13: activate staged directions whose target version already opened.
+
+    For every project with at least one ``staged`` direction, reads the current
+    open version and activates any staged direction whose ``staged_for_version``
+    is at or below the most-recently-promoted version (``current_open_version -
+    1``) via :func:`directions_repo.activate_eligible_staged_directions`.
+
+    Best-effort per project (a failure on one project never aborts the sweep).
+    Returns the total number of directions activated across all projects.
+    """
+    from app.directions_repo import activate_eligible_staged_directions
+    from app.models import Direction
+    from app.release_version import current_open_version
+
+    # Prefilter candidate projects via the normalised direction table (dual-
+    # written under the same project lock as the authoritative blob).  The
+    # helper re-reads the blob under the lock, so a momentarily-stale table only
+    # affects which projects are visited, not correctness.
+    project_ids = (
+        (
+            await session.execute(
+                select(Direction.project_id)
+                .where(Direction.status == "staged")
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not project_ids:
+        return 0
+
+    total_activated = 0
+    for pid in project_ids:
+        try:
+            open_version = await current_open_version(session, pid)
+            if open_version is None:
+                continue
+            # The most-recently-promoted version is one below the open version.
+            # A staged_for_version equal to the open version stays staged (its
+            # target version has not promoted yet).
+            promoted_n = open_version.version_number - 1
+            if promoted_n < 1:
+                continue  # no version has promoted yet
+            activated = await activate_eligible_staged_directions(
+                session, pid, promoted_n
+            )
+            total_activated += len(activated)
+        except Exception as e:
+            logger.error(
+                "[REAPER] Staged-direction activation sweep error for project "
+                "%s: %s",
+                pid,
+                e,
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
+    if total_activated:
+        logger.info(
+            "[REAPER] Step 13: activated %d staged direction(s) across %d "
+            "candidate project(s)",
+            total_activated,
+            len(project_ids),
+        )
+    return total_activated
+
+
+# ── Step 14: stale-staged-direction staleness alerting ─────────────────────
+#
+# Step 13 solves the HAPPY path: a staged direction auto-activates the moment
+# its target version promotes.  The UNHAPPY path is that the target version can
+# stay open far longer than the ~14-day build-to-stabilize stall gate (deferred
+# by repeated qualification failures or operator inaction).  When that happens
+# the staged direction waits indefinitely and invisibly — the "perpetually
+# deferred" failure mode the staging spine set out to eliminate, merely
+# relocated from the strategist's head into a forever-staged row.  This sweep
+# makes that stall VISIBLE and ACTIONABLE: for every project that still has a
+# staged direction whose target version has NOT promoted, it computes how long
+# the work has waited (anchored on ``staged_at``, fail-safe to a config age when
+# absent) and, past a configurable threshold, raises ONE deduplicated operator
+# alert per direction.  Alerting only — it never changes activation semantics.
+async def sweep_stale_staged_directions(session) -> int:
+    """Step 14: alert on staged directions stalled past the staleness threshold.
+
+    For every project with at least one ``staged`` direction, reads the current
+    open version and, for each staged direction whose target version has NOT yet
+    promoted (``staged_for_version >= current_open_version``), computes the days
+    waited from ``staged_at`` (fail-safe to ``staged_direction_stale_fallback_days``
+    when the timestamp is missing or unparseable). When that age is at or beyond
+    ``staged_direction_stale_alert_days`` it raises a deduplicated operator alert
+    via :func:`alert_dispatch._maybe_create_stale_staged_direction_alert`.
+
+    Best-effort per project (a failure on one project never aborts the sweep).
+    Returns the total number of NEW stale alerts created across all projects.
+    """
+    from app.alert_dispatch import _maybe_create_stale_staged_direction_alert
+    from app.models import Direction
+    from app.release_version import current_open_version
+    from app.shared_state import runtime_config
+    from app.time_utils import _coerce_naive_utc
+
+    stale_days = int(runtime_config.get("staged_direction_stale_alert_days", 21))
+    fallback_days = int(
+        runtime_config.get("staged_direction_stale_fallback_days", 21)
+    )
+
+    # Same prefilter as the activation sweep: candidate projects via the
+    # normalised direction table. We read the staged rows' ``data`` blobs here
+    # (verbatim ``Project.directions`` shape) rather than the project blob.
+    rows = (
+        (
+            await session.execute(
+                select(Direction).where(Direction.status == "staged")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return 0
+
+    # Group staged rows by project so each project reads its open version once.
+    by_project: dict = {}
+    for r in rows:
+        by_project.setdefault(r.project_id, []).append(r)
+
+    now = _utcnow()
+    total_alerts = 0
+    for pid, staged_rows in by_project.items():
+        try:
+            open_version = await current_open_version(session, pid)
+            open_n = open_version.version_number if open_version else None
+            for row in staged_rows:
+                d = row.data or {}
+                target = d.get("staged_for_version")
+                try:
+                    target_n = int(target)
+                except (TypeError, ValueError):
+                    # Unparseable marker is fail-OPEN-activated by Step 13, so it
+                    # is never genuinely stranded — don't alert on it here.
+                    continue
+                # Only directions whose target version has NOT promoted are
+                # stalled. The activation condition is target < open_version
+                # (i.e. target <= open-1); its complement is target >= open.
+                if open_n is not None and target_n < open_n:
+                    continue
+                # Days waited, anchored on the staging timestamp. A missing or
+                # unparseable timestamp is fail-safe: assume the fallback age so
+                # malformed/legacy staged rows still surface rather than waiting
+                # silently forever.
+                staged_at_raw = d.get("staged_at")
+                waited_days: int
+                if staged_at_raw:
+                    try:
+                        staged_at = _coerce_naive_utc(
+                            datetime.fromisoformat(str(staged_at_raw))
+                        )
+                        waited_days = max(0, (now - staged_at).days)
+                    except (TypeError, ValueError):
+                        waited_days = fallback_days
+                else:
+                    waited_days = fallback_days
+                if waited_days < stale_days:
+                    continue
+                created = await _maybe_create_stale_staged_direction_alert(
+                    session,
+                    pid,
+                    direction_id=str(d.get("id") or row.direction_key),
+                    direction_text=d.get("text"),
+                    waited_days=waited_days,
+                    staged_for_version=target_n,
+                    open_version=open_n,
+                )
+                if created:
+                    total_alerts += 1
+        except Exception as e:
+            logger.error(
+                "[REAPER] Stale-staged-direction sweep error for project %s: %s",
+                pid,
+                e,
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
+    if total_alerts:
+        logger.info(
+            "[REAPER] Step 14: raised %d stale-staged-direction alert(s) across "
+            "%d candidate project(s)",
+            total_alerts,
+            len(by_project),
+        )
+    return total_alerts
+
+
+# ── Step 15: linked bug-class message convergence / resurfacing sweep ────────
+#
+# A BUG_REPORT or BLOCKER message placed in 'linked' state has a durable forward
+# link recorded in its JSONB context (see message_convergence.py). This sweep
+# closes the loop: it reads the owning outcome's current lifecycle state and
+# either terminally resolves the message (CONVERGENCE) or reopens it (RESURFACING).
+#
+# CONVERGENCE fires when the owning outcome actually *lands*:
+#   - Direction: status == 'completed'
+#   - Task: is_merged_completion(task) — COMPLETED AND carries the landed
+#     signal (app.landed_signal). COMPLETED-but-not-landed is treated as
+#     still in-flight, never converged.
+#
+# RESURFACING fires when the owning outcome ended without landing (failed,
+# cancelled, retired, rejected, expired, superseded), went missing, or has been
+# in-flight longer than _CONVERGENCE_RESURFACE_AFTER without delivering.
+#
+# Operator-resolved messages (status == 'resolved', not 'linked') are never
+# touched — only 'linked' messages participate.  The sweep is idempotent: both
+# the convergence and resurfacing transitions change the message status away from
+# 'linked', so re-running on the same message is a no-op.
+
+# Default time bound: a linked message whose owning outcome has not yet landed
+# after this many days is resurfaced so the strategist can reassign the fix.
+_CONVERGENCE_RESURFACE_AFTER = timedelta(days=7)
+
+# Direction statuses that indicate the direction ended without landing the fix.
+_DIRECTION_FAILED_STATUSES: frozenset[str] = frozenset(
+    {"retired", "rejected", "expired", "superseded"}
+)
+
+
+def _converge_message(msg, now: datetime, rationale: str) -> None:
+    """Stamp msg as resolved — the owning outcome landed.
+
+    Mutates msg.status, msg.resolution, msg.resolved_at, and msg.context in
+    place.  Does NOT call session.add() or commit.
+    """
+    msg.status = "resolved"
+    msg.resolution = f"Owned outcome landed: {rationale}"
+    msg.resolved_at = now
+    ctx = dict(msg.context or {})
+    ctx["_convergence_converged_at"] = now.isoformat()
+    msg.context = ctx
+
+
+def _resurface_message(msg, now: datetime, reason: str) -> None:
+    """Reopen a linked bug-class message — owning outcome failed/missing/stale.
+
+    Moves the stale forward link to ``_convergence_link_stale`` (audit trail),
+    records why it came back, and sets status back to 'open'.
+    Does NOT call session.add() or commit.
+    """
+    msg.status = "open"
+    ctx = dict(msg.context or {})
+    old_link = ctx.pop("_convergence_link", None)
+    if old_link:
+        ctx["_convergence_link_stale"] = old_link
+    ctx["_convergence_resurfaced_at"] = now.isoformat()
+    ctx["_convergence_resurfaced_reason"] = reason
+    msg.context = ctx
+
+
+async def sweep_converge_linked_bug_messages(
+    session,
+    now: datetime,
+    *,
+    batch_size: int = 200,
+) -> int:
+    """Step 15: reconcile linked BUG_REPORT/BLOCKER messages with owned outcomes.
+
+    For each 'linked' bug-class message:
+    - CONVERGE to 'resolved' when the owning outcome lands.
+    - RESURFACE to 'open' when the owning outcome fails, is cancelled/retired/
+      rejected/expired/superseded, goes missing, or has been in-flight for longer
+      than _CONVERGENCE_RESURFACE_AFTER without delivering.
+    - Leave untouched when the owning outcome is still legitimately in-flight
+      within the time bound.
+
+    Returns the number of messages acted on (converged + resurfaced).
+    """
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.models import Direction, ProjectMessage
+    from app.message_convergence import BUG_CLASS_TYPES, LINKED_STATUS, get_message_link
+    from app.landed_signal import is_merged_completion
+    from app.time_utils import _coerce_naive_utc
+    from app.shared_state import runtime_config
+
+    resurface_days = int(
+        runtime_config.get(
+            "convergence_resurface_after_days", _CONVERGENCE_RESURFACE_AFTER.days
+        )
+    )
+    resurface_after = timedelta(days=resurface_days)
+
+    msgs = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.status == LINKED_STATUS,
+                    ProjectMessage.message_type.in_(list(BUG_CLASS_TYPES)),
+                )
+                .order_by(ProjectMessage.created_at)
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(msgs) >= batch_size:
+        logger.warning(
+            "[REAPER] convergence sweep hit cap=%d linked bug-class messages — "
+            "result truncated; next cycle continues",
+            batch_size,
+        )
+
+    if not msgs:
+        return 0
+
+    acted = 0
+    pending_broadcasts: list[tuple[str, dict]] = []
+
+    for msg in msgs:
+        link = get_message_link(msg)
+        if not link:
+            continue
+
+        kind = link.get("kind")
+        outcome_id = link.get("id")
+        linked_at_raw = link.get("linked_at")
+
+        if not kind or not outcome_id:
+            continue
+
+        linked_at: datetime | None = None
+        if linked_at_raw:
+            try:
+                linked_at = _coerce_naive_utc(
+                    datetime.fromisoformat(str(linked_at_raw))
+                )
+            except (ValueError, TypeError):
+                linked_at = None
+
+        if kind == "direction":
+            dir_row = (
+                (
+                    await session.execute(
+                        select(Direction).where(
+                            Direction.project_id == msg.project_id,
+                            Direction.direction_key == outcome_id,
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+
+            if dir_row is None:
+                reason = f"Owning direction '{outcome_id}' no longer exists"
+                _resurface_message(msg, now, reason)
+                session.add(msg)
+                pending_broadcasts.append(
+                    (str(msg.project_id), {"message_id": str(msg.id)})
+                )
+                acted += 1
+                logger.info(
+                    "[REAPER] Step 15: resurfaced message %s — direction '%s' missing",
+                    msg.id,
+                    outcome_id,
+                )
+                continue
+
+            dir_status = dir_row.status or "active"
+
+            if dir_status == "completed":
+                rationale = f"Direction '{outcome_id}' reached completed status"
+                _converge_message(msg, now, rationale)
+                session.add(msg)
+                pending_broadcasts.append(
+                    (str(msg.project_id), {"message_id": str(msg.id)})
+                )
+                acted += 1
+                logger.info(
+                    "[REAPER] Step 15: converged message %s — direction '%s' completed",
+                    msg.id,
+                    outcome_id,
+                )
+            elif dir_status in _DIRECTION_FAILED_STATUSES:
+                reason = (
+                    f"Owning direction '{outcome_id}' ended with status "
+                    f"'{dir_status}' without landing"
+                )
+                _resurface_message(msg, now, reason)
+                session.add(msg)
+                pending_broadcasts.append(
+                    (str(msg.project_id), {"message_id": str(msg.id)})
+                )
+                acted += 1
+                logger.info(
+                    "[REAPER] Step 15: resurfaced message %s — direction '%s' ended '%s'",
+                    msg.id,
+                    outcome_id,
+                    dir_status,
+                )
+            elif linked_at is not None and (now - linked_at) >= resurface_after:
+                reason = (
+                    f"Owning direction '{outcome_id}' still in status "
+                    f"'{dir_status}' after {(now - linked_at).days} days "
+                    f"without delivering the fix"
+                )
+                _resurface_message(msg, now, reason)
+                session.add(msg)
+                pending_broadcasts.append(
+                    (str(msg.project_id), {"message_id": str(msg.id)})
+                )
+                acted += 1
+                logger.info(
+                    "[REAPER] Step 15: resurfaced message %s — direction '%s' "
+                    "still in-flight after %d days",
+                    msg.id,
+                    outcome_id,
+                    (now - linked_at).days,
+                )
+            # else: in-flight within time bound — leave linked
+
+        elif kind == "task":
+            try:
+                task_uuid = uuid.UUID(str(outcome_id))
+            except (ValueError, AttributeError):
+                reason = f"Owning task id '{outcome_id}' is not a valid UUID"
+                _resurface_message(msg, now, reason)
+                session.add(msg)
+                pending_broadcasts.append(
+                    (str(msg.project_id), {"message_id": str(msg.id)})
+                )
+                acted += 1
+                logger.info(
+                    "[REAPER] Step 15: resurfaced message %s — task id '%s' "
+                    "is not a valid UUID",
+                    msg.id,
+                    outcome_id,
+                )
+                continue
+
+            task_row = await session.get(Task, task_uuid)
+
+            if task_row is None:
+                reason = f"Owning task '{outcome_id}' no longer exists"
+                _resurface_message(msg, now, reason)
+                session.add(msg)
+                pending_broadcasts.append(
+                    (str(msg.project_id), {"message_id": str(msg.id)})
+                )
+                acted += 1
+                logger.info(
+                    "[REAPER] Step 15: resurfaced message %s — task '%s' missing",
+                    msg.id,
+                    outcome_id,
+                )
+                continue
+
+            task_status = task_row.status
+
+            # CONVERGENCE requires a genuine *landing*, not merely COMPLETED.
+            # COMPLETED != merged is a deliberate invariant in this codebase:
+            # a fix task can reach COMPLETED with an open, unmerged PR (whose
+            # URL canonically lives in the Artifact table, not task.context), so
+            # deriving "landed" from a context pr_url heuristic would silently
+            # close a live bug report. Reuse the canonical landed detector.
+            if is_merged_completion(task_row):
+                rationale = f"Owning task '{outcome_id}' completed and PR merged"
+                _converge_message(msg, now, rationale)
+                session.add(msg)
+                pending_broadcasts.append(
+                    (str(msg.project_id), {"message_id": str(msg.id)})
+                )
+                acted += 1
+                logger.info(
+                    "[REAPER] Step 15: converged message %s — task '%s' landed",
+                    msg.id,
+                    outcome_id,
+                )
+
+            elif task_status == TaskStatus.COMPLETED:
+                # COMPLETED but not landed (PR open / unmerged) — treat as still
+                # in-flight, subject to the time-bound resurfacing below.
+                if linked_at is not None and (now - linked_at) >= resurface_after:
+                    reason = (
+                        f"Owning task '{outcome_id}' completed but did not land "
+                        f"(PR not merged) after {(now - linked_at).days} days"
+                    )
+                    _resurface_message(msg, now, reason)
+                    session.add(msg)
+                    pending_broadcasts.append(
+                        (str(msg.project_id), {"message_id": str(msg.id)})
+                    )
+                    acted += 1
+                    logger.info(
+                        "[REAPER] Step 15: resurfaced message %s — task '%s' "
+                        "completed but did not land after %d days",
+                        msg.id,
+                        outcome_id,
+                        (now - linked_at).days,
+                    )
+                # else: COMPLETED but not landed yet, within time bound — leave linked
+
+            elif task_status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                status_str = getattr(task_status, "value", str(task_status))
+                reason = (
+                    f"Owning task '{outcome_id}' ended with status "
+                    f"'{status_str}' without landing"
+                )
+                _resurface_message(msg, now, reason)
+                session.add(msg)
+                pending_broadcasts.append(
+                    (str(msg.project_id), {"message_id": str(msg.id)})
+                )
+                acted += 1
+                logger.info(
+                    "[REAPER] Step 15: resurfaced message %s — task '%s' %s",
+                    msg.id,
+                    outcome_id,
+                    status_str,
+                )
+            elif linked_at is not None and (now - linked_at) >= resurface_after:
+                status_str = getattr(task_status, "value", str(task_status))
+                reason = (
+                    f"Owning task '{outcome_id}' still in status "
+                    f"'{status_str}' after {(now - linked_at).days} days"
+                )
+                _resurface_message(msg, now, reason)
+                session.add(msg)
+                pending_broadcasts.append(
+                    (str(msg.project_id), {"message_id": str(msg.id)})
+                )
+                acted += 1
+                logger.info(
+                    "[REAPER] Step 15: resurfaced message %s — task '%s' "
+                    "still in-flight after %d days",
+                    msg.id,
+                    outcome_id,
+                    (now - linked_at).days,
+                )
+            # else: in-flight within time bound — leave linked
+
+    if acted:
+        await session.commit()
+        for project_id, payload in pending_broadcasts:
+            try:
+                await _bcast(project_id, "message_updated", payload)
+            except Exception as _bcast_err:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] convergence broadcast failed for message %s: %s",
+                    payload.get("message_id"),
+                    _bcast_err,
+                )
+        logger.info(
+            "[REAPER] Step 15: acted on %d linked bug-class message(s) "
+            "(converged or resurfaced)",
+            acted,
+        )
+
+    return acted
+
+
+# ── Step 17: auto-resolve OPEN owned bug-class messages on owner success ──────
+#
+# A BUG_REPORT/BLOCKER created in the 'open' state carries machine-readable
+# ownership context stamped at CREATION time (NOT the strategist's
+# _convergence_link, which the Step-15 linked sweep owns):
+#   - Direction-owned: context['direction_id']  (pause/escalation posters in
+#     notification_dispatch.py; the dedup-deadlock BUG_REPORT in
+#     research_direction_state.py).
+#   - PR/task-owned:    context['pr_number'] + context['source_task_id']
+#     (the repeat-fingerprint halt BLOCKER in review_pipeline.py).
+#
+# Nothing on the integration branch ever resolves these open owned messages:
+# the routine-message retention sweep deliberately skips BUG_REPORT/BLOCKER, and
+# the Step-15 linked sweep only acts on messages the strategist has explicitly
+# moved to the 'linked' state. So once the owner genuinely LANDS — the owning
+# direction reaches 'completed', or the owning PR's source task is a merged
+# completion — the open message lingers forever in the strategist's inbox as
+# noise. This sweep closes only that loop, and ONLY on genuine SUCCESS.
+#
+# SUCCESS-ONLY, by construction: a message is resolved ONLY when the owning
+# direction's status == 'completed' OR the owning PR's source task satisfies the
+# canonical landed detector ``landed_signal.is_merged_completion`` (COMPLETED AND
+# carries the integration-branch landed signal). An owner that ended WITHOUT
+# delivering the fix — a retired/rejected/expired/superseded direction; a
+# failed/cancelled/missing task; a COMPLETED-but-unmerged task; an unknown,
+# malformed, or still-in-flight owner — leaves the message OPEN. Reaching some
+# terminal status is NOT enough; only landing resolves.
+#
+# Fail-safe: per-message owner resolution is wrapped so one bad row can never
+# abort the batch, and any error or ambiguity leaves the message open.
+#
+# Idempotent: resolution moves status off 'open', so the next pass (which filters
+# on status == 'open') skips already-resolved rows — re-running is a no-op.
+
+# Context audit keys stamped on an auto-resolution (traceability + idempotency).
+_OWNED_AUTO_RESOLVED_AT_KEY = "_owned_auto_resolved_at"
+_OWNED_AUTO_RESOLUTION_KEY = "_owned_auto_resolution"
+
+
+async def _owned_message_resolution(session, msg, *, verify_pr_merged) -> str | None:
+    """High-confidence audit string when ``msg``'s owner genuinely LANDED, else None.
+
+    Reads ownership context stamped at message creation (``direction_id`` first,
+    then ``pr_number`` + ``source_task_id``). Direction ownership wins when both
+    are present. Returns ``None`` — fail-safe, leaving the message open — for any
+    missing/unknown/malformed/still-in-flight owner or any owner that ended
+    without landing the fix.
+    """
+    from app.landed_signal import is_merged_completion
+    from app.models import Direction
+
+    ctx = msg.context if isinstance(msg.context, dict) else {}
+
+    # 1) Direction-owned: resolve ONLY on status == 'completed'. A direction that
+    #    was retired/rejected/expired/superseded ended WITHOUT landing the fix and
+    #    must leave the message open.
+    direction_id = ctx.get("direction_id")
+    if direction_id:
+        dir_row = (
+            (
+                await session.execute(
+                    select(Direction).where(
+                        Direction.project_id == msg.project_id,
+                        Direction.direction_key == str(direction_id),
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if dir_row is not None and (dir_row.status or "active") == "completed":
+            return f"Auto-resolved: owning direction '{direction_id}' completed"
+        # Direction owner present but not completed (or missing) — fail-safe open.
+        # Fall through only when there is NO direction owner at all.
+        if dir_row is not None:
+            return None
+
+    # 2) PR/task-owned: resolve ONLY when the source task is a merged completion.
+    #    Never infer 'merged' from a pr_url heuristic; never treat a
+    #    COMPLETED-but-unmerged task as success.
+    pr_number = ctx.get("pr_number")
+    source_task_id = ctx.get("source_task_id")
+    if pr_number is None or not source_task_id:
+        return None
+    try:
+        task_uuid = uuid.UUID(str(source_task_id))
+    except (ValueError, AttributeError, TypeError):
+        return None
+    task = await session.get(Task, task_uuid)
+    if task is None:
+        return None
+    # Primary detector: context-based, side-effect-free, identical to the Step-15
+    # linked sweep ("COMPLETED AND carries the landed signal"). A merged PR's
+    # source task is stamped landed at merge time.
+    if is_merged_completion(task):
+        return f"Auto-resolved: owning PR #{pr_number} merged"
+    # Secondary confirmation via the GitHub-backed verifier ONLY for a task that
+    # is already COMPLETED (so a still-active task is never probed and a
+    # COMPLETED-but-unmerged task is left open unless the verifier confirms the
+    # merge). Any verifier error is fail-safe (leaves the message open).
+    if task.status == TaskStatus.COMPLETED and verify_pr_merged is not None:
+        try:
+            if await verify_pr_merged(task, session):
+                return f"Auto-resolved: owning PR #{pr_number} merged"
+        except Exception:
+            return None
+    return None
+
+
+async def sweep_resolve_open_owned_bug_messages(
+    session,
+    now: datetime,
+    *,
+    batch_size: int = 200,
+    verify_pr_merged=None,
+) -> int:
+    """Step 17: auto-resolve OPEN owned BUG_REPORT/BLOCKER messages on owner success.
+
+    Selects up to ``batch_size`` OPEN, system/agent-authored bug-class messages
+    (DISJOINT from the Step-15 'linked' sweep) and resolves each one whose owning
+    outcome — read from creation-time context — has genuinely landed: the owning
+    direction reached 'completed', or the owning PR's source task is a merged
+    completion. Everything else (owner ended without landing, COMPLETED-but-
+    unmerged, missing/unknown/malformed/still-active, or any lookup error) leaves
+    the message OPEN.
+
+    Returns the number of messages auto-resolved.
+    """
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.models import ProjectMessage
+    from app.message_convergence import BUG_CLASS_TYPES, OPEN_STATUS, SYSTEM_AUTHORED_FROM_TYPES
+
+    if verify_pr_merged is None:
+        from app.rollup_pr_verification import _verify_pr_merged
+        verify_pr_merged = _verify_pr_merged
+
+    msgs = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.status == OPEN_STATUS,
+                    ProjectMessage.from_type.in_(list(SYSTEM_AUTHORED_FROM_TYPES)),
+                    ProjectMessage.message_type.in_(list(BUG_CLASS_TYPES)),
+                )
+                .order_by(ProjectMessage.created_at)
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(msgs) >= batch_size:
+        logger.warning(
+            "[REAPER] open-owned-message sweep hit cap=%d open bug-class messages — "
+            "result truncated; next cycle continues",
+            batch_size,
+        )
+
+    if not msgs:
+        return 0
+
+    resolved = 0
+    pending_broadcasts: list[tuple[str, dict]] = []
+    for msg in msgs:
+        # Fail-safe: one malformed/unreadable owner must never abort the batch.
+        try:
+            audit = await _owned_message_resolution(
+                session, msg, verify_pr_merged=verify_pr_merged
+            )
+        except Exception:
+            logger.warning(
+                "[REAPER] Step 17: owner resolution failed for message %s — "
+                "leaving open",
+                msg.id,
+                exc_info=True,
+            )
+            continue
+        if audit is None:
+            continue
+        msg.status = "resolved"
+        msg.resolution = audit
+        msg.resolved_at = now
+        ctx = dict(msg.context or {})
+        ctx[_OWNED_AUTO_RESOLVED_AT_KEY] = now.isoformat()
+        ctx[_OWNED_AUTO_RESOLUTION_KEY] = audit
+        msg.context = ctx
+        session.add(msg)
+        resolved += 1
+        pending_broadcasts.append(
+            (str(msg.project_id), {"message_id": str(msg.id)})
+        )
+        logger.info(
+            "[REAPER] Step 17: auto-resolved owned message %s — %s",
+            msg.id,
+            audit,
+        )
+
+    if resolved:
+        await session.commit()
+        for project_id, payload in pending_broadcasts:
+            try:
+                await _bcast(project_id, "message_updated", payload)
+            except Exception as _bcast_err:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] Step 17: broadcast failed for message %s: %s",
+                    payload.get("message_id"),
+                    _bcast_err,
+                )
+        logger.info(
+            "[REAPER] Step 17: auto-resolved %d open owned bug-class message(s)",
+            resolved,
+        )
+
+    return resolved

@@ -72,6 +72,23 @@ describe('writeStrategicHelpers', () => {
     expect(content).toContain('direction');
     expect(content).toContain('playbook');
     expect(content).toContain('gap');
+    expect(content).toContain('message');
+  });
+
+  it('supports fetching a message by short ref via the messages endpoint', () => {
+    const taskId = 'test-task-123';
+    const projectId = 'test-project-456';
+    writeStrategicHelpers(taskId, projectId, testWorkspace);
+
+    const content = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
+    // The new subcommand maps `fetch message <ref>` to the read-only lookup
+    // endpoint that resolves a short ref or full UUID backend-side.
+    expect(content).toContain('message)    PATH_SUFFIX="messages/$ID"');
+    expect(content).toContain('fetch problem-model|direction|playbook|gap|message|section [id]');
+    // Reuses the existing X-Agent-Token GET path — no new auth/curl block.
+    expect(content).toContain('-H "X-Agent-Token: $TOKEN"');
+    // The shared id-required guard covers `message` (only problem-model is id-less).
+    expect(content).toContain('fetch $KIND requires an id argument');
   });
 
   it('allows fetching the full problem model without an id', () => {
@@ -80,8 +97,21 @@ describe('writeStrategicHelpers', () => {
     writeStrategicHelpers(taskId, projectId, testWorkspace);
 
     const content = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
-    expect(content).toContain('Usage: fetch problem-model|direction|playbook|gap [id]');
+    expect(content).toContain('Usage: fetch problem-model|direction|playbook|gap|message|section [id]');
     expect(content).toContain('problem-model) PATH_SUFFIX="problem-model"');
+    expect(content).toContain('fetch $KIND requires an id argument');
+  });
+
+  it('maps `fetch section <key>` to the read-only design-doc endpoint', () => {
+    const taskId = 'test-task-123';
+    const projectId = 'test-project-456';
+    writeStrategicHelpers(taskId, projectId, testWorkspace);
+
+    const content = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
+    // `fetch section systems/auth` -> GET .../design-doc/systems/auth (key may
+    // contain a slash; the backend route is `{key:path}`).
+    expect(content).toContain('section)    PATH_SUFFIX="design-doc/$ID"');
+    // Section requires an id (key) — covered by the shared id-required guard.
     expect(content).toContain('fetch $KIND requires an id argument');
   });
 
@@ -182,5 +212,44 @@ describe('writeStrategicHelpers', () => {
     const content = fs.readFileSync(`${testWorkspace}/design-doc`, 'utf-8');
     expect(content).toContain('design-doc');
     expect(content).toContain('/api/agent/design-doc');
+  });
+
+  it('handles HTTP 409 (ambiguous ref) on message fetch with clear signal', () => {
+    const taskId = 'test-task-123';
+    const projectId = 'test-project-456';
+    writeStrategicHelpers(taskId, projectId, testWorkspace);
+
+    const content = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
+    // Verify the fetch script captures HTTP status and handles 409
+    expect(content).toContain('http_code=$(printf');
+    expect(content).toContain('if [ "$http_code" -eq 409 ]');
+    expect(content).toContain('[AMBIGUOUS]');
+    expect(content).toContain('multiple candidates found');
+    // 409 should exit with error code (exit 1) so agent knows to retry
+    expect(content).toContain('exit 1');
+  });
+
+  it('handles HTTP 404 and other non-2xx errors on fetch', () => {
+    const taskId = 'test-task-123';
+    const projectId = 'test-project-456';
+    writeStrategicHelpers(taskId, projectId, testWorkspace);
+
+    const content = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
+    // Verify the fetch script has generic error handling for non-2xx responses
+    expect(content).toContain('[ERROR] fetch $KIND failed');
+    expect(content).toContain('HTTP $http_code');
+    // Non-success responses should exit with error (exit 1)
+    expect(content).toMatch(/exit 1[\s\n]*$/);
+  });
+
+  it('fetch script returns 0 only on 2xx success', () => {
+    const taskId = 'test-task-123';
+    const projectId = 'test-project-456';
+    writeStrategicHelpers(taskId, projectId, testWorkspace);
+
+    const content = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
+    // First success path should be 2xx check with exit 0
+    expect(content).toContain('if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]');
+    expect(content).toContain('exit 0');
   });
 });

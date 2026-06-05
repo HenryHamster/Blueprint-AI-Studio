@@ -17,7 +17,7 @@ import {
 } from '../json-extract.js';
 import {
   PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, isGreenfieldRepo, verifyCloneDelivered, configureAgentPermissions,
-  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, type PlaybookEntry,
+  writePlaybookHelper, writeMessagesHelper, writeDesignDocHelper, formatPlaybook, buildRetryContext, type PlaybookEntry,
 } from '../prompt.js';
 import { parseBackendTimestamp } from '../utils/time.js';
 import { reconcileSystemEntry, reconcileMissingCapabilities } from '../utils/design-doc-presence.js';
@@ -735,11 +735,12 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
     ? lastQualification.status
     : null;
   const qualificationPending = qualStatus === 'pending';
-  // A finalized dry-run already fully evaluated the candidate it scored. In the
+  // A finalized conclusive verdict (dry_run, not_promoted, or promoted) means
+  // the candidate has been fully evaluated and the outcome is settled. In the
   // shipped-dark default (promotion_enabled=False) a passing candidate records
   // status='dry_run' and the version stays open + stabilize. Re-emitting
   // `qualify_request` for the SAME candidate just re-spawns two agent VMs for
-  // an identical, already-scored commit — the orchestrator's already_dry_run
+  // an identical, already-scored commit — the orchestrator's cached_verdict
   // guard ignores it. Only a candidate change (new work merged onto the
   // integration branch) makes a fresh qualification meaningful.
   const qualificationDryRun = qualStatus === 'dry_run';
@@ -1211,6 +1212,9 @@ export async function handlePlan(
   verifyCloneDelivered(task, baseBranch);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  // The plan prompt advertises `./design-doc get <key>` for architectural
+  // grounding; provision the read-only helper so that contract is honest.
+  writeDesignDocHelper(taskId, WORKSPACE, { readOnly: true });
   const disallowedTools = configureAgentPermissions('plan');
   const promptFingerprint = computeResearchPlanPromptFingerprint('plan');
   const setPromptFingerprint = (indexMod as { setCurrentPromptFingerprint?: (fp: string) => void }).setCurrentPromptFingerprint;
@@ -1304,6 +1308,7 @@ Rules:
 - Keep prompts concise — describe what to achieve, not step-by-step how
 - Order subtasks so that dependencies flow forward (a subtask can only depend on earlier subtasks)
 - If subtasks involve structural refactors of the same files (renames, interface changes, restructuring), set depends_on_indices between them. Small additive changes to shared files can stay parallel.
+- BUILD-ON ordering (critical): if a subtask CONSUMES code or artifacts another subtask produces — it imports a module/file the other creates, calls a new function/class it adds, or builds a feature on top of its output — set depends_on_indices so the consumer comes AFTER the producer, EVEN IF the two touch DIFFERENT files. Sibling subtasks run concurrently against a clone of the same base; if the producer has not merged, the consumer's clone is missing the new code and it will fail to import it or re-create a conflicting stub. Genuinely independent subtasks (including small additive edits to shared infra) MUST stay parallel — only order true producer→consumer relationships, and make the consumer's related_files/prompt name the producer's file so the ordering is explicit.
 - Aim for 1-4 subtasks. Prefer 1-2 large subtasks over 4-6 small ones. If the task can be one PR, output a single subtask.
 - Do NOT include review, testing, or deployment subtasks — those are handled automatically by the pipeline
 - Use effort=high only for complex architectural subtasks. Leave null for simple additive changes — the orchestrator resolves the model from provider routing.
@@ -1394,6 +1399,9 @@ export async function handleResearch(
   verifyCloneDelivered(task, baseBranch);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  // The research prompt advertises `./design-doc get <key>` for architectural
+  // grounding; provision the read-only helper so that contract is honest.
+  writeDesignDocHelper(taskId, WORKSPACE, { readOnly: true });
   const researchMode = strVal(payload.research_mode as string, 'research');
   const disallowedTools = configureAgentPermissions(researchMode);
   const promptFingerprint = computeResearchPlanPromptFingerprint('research');
@@ -1824,8 +1832,11 @@ implementation findings. Add metadata alongside them when relevant.
   "risk": "low|medium|high",
   "priority": "high|medium|low",
   "actionability_grade": "HIGH|MEDIUM|LOW",
+  "verification_basis": "code_verified|path_verified|pattern_inferred|deduced",
   "related_files": ["path/to/file.py"],
   "depends_on_indices": [],
+  "prerequisite": null,
+  "provides_capability": null,
   "direction_id": "d-xxx or null",
   "effort": "high|medium|low|null",
   "claims": ["short factual assertion backed by your investigation (omit when synthesizing)"],
@@ -1837,10 +1848,20 @@ implementation findings. Add metadata alongside them when relevant.
 
 **sources** (optional, provenance only): Cite a specific origin when you have one. type 'file': a file you read, 'pr': a merged PR number, 'log': a pipeline log line, 'message': a user message. Omit the field when synthesizing. excerpt is optional — include only a directly relevant short quote.
 
+**prerequisite** (optional, default null): Declare a FOUNDATION this finding depends on that is being (or was) built OUTSIDE this batch — an earlier or concurrently-in-flight cycle, or a named capability. Shape: \`{"kind": "task", "ref": "<task-id or finding-hash>"}\` to gate on a specific in-flight/queued task, or \`{"kind": "capability", "ref": "<capability-name>"}\` to gate on whichever task advertises that capability. When it resolves to a real foundation the dependent is structurally gated (depends_on edge) so it does not run against a base missing the foundation or duplicate it; when it does not resolve the dependent enters a BLOCKED state with the unmet prerequisite recorded as a machine-resolvable need, and is resumed when the foundation appears or escalated to the operator after a timeout. Use ONLY for cross-cycle / cross-batch foundations or named capabilities — for ordering findings WITHIN this batch, use depends_on_indices instead (NOT prerequisite). Omit (or null) when there is no external foundation.
+
+**provides_capability** (optional, default null): A short capability name this finding's task advertises (e.g. "payment-core"), so a sibling finding declaring \`{"kind": "capability", "ref": "payment-core"}\` can depend on it. Omit unless another finding needs to gate on this one by capability.
+
 **actionability_grade rubric** (required on every finding):
 - HIGH: problem statement is clear, desired outcome is clear, related files identified, no major unknowns blocking implementation.
 - MEDIUM: problem clear but solution path uncertain, OR small unknowns the implementer can resolve with brief exploration.
 - LOW: vague or exploratory, or requires sub-research before code can land. Consider emitting a research sub-finding instead.
+
+**verification_basis rubric** (OPTIONAL — defaults to pattern_inferred when omitted): how you established the underlying claim, i.e. the STRENGTH OF EVIDENCE behind it. This is ORTHOGONAL to actionability_grade — actionability_grade is about how implementable the finding is, verification_basis is about how well-evidenced the claim is. A finding can be HIGH actionability but only pattern_inferred, or LOW actionability but code_verified. Do not conflate them.
+- code_verified: you read the actual source and confirmed the claim directly.
+- path_verified: you confirmed the relevant file paths are present/absent via the file tree, but did not read their contents.
+- pattern_inferred: structural inference from naming/architecture patterns, with no direct inspection. This is the default — use it (or omit the field) when uncertain.
+- deduced: derived from adjacent evidence (e.g. another finding, a log line) without directly inspecting the subject.
 
 Scope: small (<50 lines, 1 file), medium (2-5 files, 50-200 lines), large (cross-component, 200+ lines).
 Risk: low (cosmetic), medium (logic/endpoints), high (core logic, auth, data models).

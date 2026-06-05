@@ -4,13 +4,19 @@ import type { useDirectionForm } from '../hooks/useDirectionForm';
 export interface DirectionsAddFormProps {
   form: ReturnType<typeof useDirectionForm>;
   addDirection: () => void;
+  // Open release version to stage against, or null when none is open. When null,
+  // the "Stage for next version" control is disabled (the backend rejects an
+  // atomic staged create with no open version), mirroring the edit-form option.
+  stageTargetVersion?: number | null;
 }
 
 /**
  * Add-direction form: text input, priority/category selects, path-tag editor,
  * and completion-criteria textarea. Extracted verbatim from DirectionsPanel.
  */
-export function DirectionsAddForm({ form, addDirection }: DirectionsAddFormProps) {
+export function DirectionsAddForm({ form, addDirection, stageTargetVersion }: DirectionsAddFormProps) {
+  const canStage = stageTargetVersion != null;
+  const staged = canStage && form.newStaged;
   return (
     <div className="px-5 py-3 border-b border-neutral-800 shrink-0">
       <div className="flex flex-wrap gap-2">
@@ -86,6 +92,33 @@ export function DirectionsAddForm({ form, addDirection }: DirectionsAddFormProps
         rows={2}
         className="mt-1.5 w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600 resize-y"
       />
+      {/* Born-staged create: stage the new direction for the next version in a
+          single create call. Disabled (and explained) when no version is open to
+          stage against, mirroring the edit-form "Staged" status option. */}
+      <label
+        className={`mt-1.5 flex items-center gap-2 text-xs ${canStage ? 'text-neutral-300 cursor-pointer' : 'text-neutral-600 cursor-not-allowed'}`}
+        title={canStage
+          ? `Create as staged to begin when v${stageTargetVersion} promotes and the next version opens`
+          : 'No open release version to stage against'}
+      >
+        <input
+          type="checkbox"
+          checked={staged}
+          disabled={!canStage}
+          onChange={e => form.setNewStaged(e.target.checked)}
+          className="accent-sky-500 disabled:opacity-40"
+        />
+        Stage for next version
+      </label>
+      {!canStage ? (
+        <p className="mt-1 text-[10px] text-neutral-500 leading-relaxed">
+          No open release version to stage against.
+        </p>
+      ) : staged && (
+        <p className="mt-1 text-[10px] text-sky-400/80 leading-relaxed">
+          Will stage to begin after v{stageTargetVersion} promotes and the next version opens.
+        </p>
+      )}
     </div>
   );
 }

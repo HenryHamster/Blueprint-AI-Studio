@@ -672,7 +672,10 @@ describe('WarmVmPanel — warm-pool retarget toggles + per-account misses', () =
     render(<WarmVmPanel onViewTask={() => {}} />);
 
     const acct = await screen.findByTestId('warm-pool-account-retarget-toggle');
-    expect(acct.textContent).toBe('RETARGET');
+    // The toggle mounts with its default label before authGet resolves; wait for the
+    // fetched state to flush rather than asserting against the pre-fetch render (race
+    // surfaces under full-suite CPU contention).
+    await waitFor(() => expect(acct.textContent).toBe('RETARGET'));
     expect(screen.getByTestId('warm-pool-cross-provider-retarget-toggle').textContent).toBe('X-PROV');
 
     // Flipping an enabled flag DISABLEs it (and only it).

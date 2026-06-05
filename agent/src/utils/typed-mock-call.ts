@@ -12,8 +12,10 @@ type AnyFn = (...args: any[]) => any;
  *
  * Constrains the asserted argument list to `Parameters<F>`, so any future
  * signature change that is not reflected in the assertion becomes a tsc error
- * caught by the existing CI agent job — without requiring the Vitest suite to
- * run in CI.
+ * caught by the existing CI agent job — a type-level safety net that holds even
+ * before a test runs. (The Vitest suite itself is now enforced too: `./check`
+ * runs `npx vitest run` on agent-touching changes and fails closed, and the
+ * `CI / Agent` job runs it as a complementary backstop.)
  *
  * Use for project-internal functions that get refactored (e.g. `setupWorkspace`,
  * `captureTestBaseline`). Leave raw `toHaveBeenCalledWith` in place for

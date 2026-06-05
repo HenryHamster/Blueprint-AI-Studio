@@ -49,6 +49,9 @@ vi.mock('../utils/time.js', () => ({
 
 vi.mock('../utils/design-doc-presence.js', () => ({
   reconcileDesignDocPresence: (doc: unknown) => doc,
+  // Identity stub: the handler now reconciles the compact index. Return it
+  // unchanged so the overview-rendering assertions see the payload's index.
+  reconcileDesignDocIndex: (index: unknown) => index,
 }));
 
 vi.mock('./research-direction-context.js', () => ({
@@ -88,7 +91,13 @@ vi.mock('./research-plan.js', () => ({
 
 vi.mock('./strategic-sections.js', () => ({
   buildSystemMaturitySection: () => '',
-  buildCapabilityVerificationSection: () => '',
+  // Echo presence so wiring tests can assert the handler passes
+  // payload.cycle_start_reconciliation through to this builder.
+  buildCycleStartReconciliationSection: (recon: Record<string, unknown> | undefined) =>
+    recon ? `RECON(${Object.keys(recon).length})` : '',
+  buildPruneCandidatesSection: (prune: Record<string, unknown> | undefined) =>
+    prune ? `PRUNE(${Object.keys(prune).length})` : '',
+  buildModelHealthSection: () => '',
   buildDriftSection: () => '',
   buildOutcomeSection: () => '',
   buildClockAndRecentWorkSection: () => ({ clockHeader: '', recentWorkSection: '' }),
@@ -99,7 +108,88 @@ vi.mock('./strategic-sections.js', () => ({
   buildDirHealthSummary: () => '',
 }));
 
-import { renderStrategicPromptSuffix, handleStrategic } from './strategic.js';
+import {
+  renderStrategicPromptSuffix,
+  buildStagedDirectionsSection,
+  renderDesignDocIndexOverview,
+  handleStrategic,
+} from './strategic.js';
+import { runClaudeCode } from '../index.js';
+import { runThinkerWithGate } from '../prompts/thinker.js';
+
+describe('buildStagedDirectionsSection', () => {
+  it('returns empty string when nothing is staged', () => {
+    expect(buildStagedDirectionsSection([])).toBe('');
+    expect(buildStagedDirectionsSection(undefined as unknown as Array<Record<string, unknown>>)).toBe('');
+  });
+
+  it('renders staged entries with their target version and the no-defer framing', () => {
+    const out = buildStagedDirectionsSection([
+      { id: 'd-1', text: 'next-version feature', priority: 'high', staged_for_version: 4 },
+    ]);
+    expect(out).toContain('## Staged for next version');
+    expect(out).toContain('d-1 [high] — next-version feature (auto-activates when v4 promotes)');
+    expect(out).toContain('not a way to defer');
+  });
+});
+
+describe('renderDesignDocIndexOverview', () => {
+  it('returns empty string for an absent or section-less index', () => {
+    expect(renderDesignDocIndexOverview(undefined)).toBe('');
+    expect(renderDesignDocIndexOverview({})).toBe('');
+    expect(renderDesignDocIndexOverview({ sections: [] })).toBe('');
+  });
+
+  it('renders systems/capabilities as a status catalog, not raw JSON', () => {
+    const out = renderDesignDocIndexOverview({
+      sections: [
+        {
+          key: 'systems/auth',
+          status: 'mature',
+          summary: 'Session + token auth',
+          modules: ['backend/app/auth.py'],
+        },
+        {
+          key: 'capabilities/login',
+          status: 'working',
+          summary: 'Users can log in',
+        },
+        { key: 'notes/strategic-context', summary: 'v5 stabilize' },
+      ],
+    });
+    expect(out).toContain('### Systems');
+    expect(out).toContain('`systems/auth`');
+    expect(out).toContain('[mature]');
+    expect(out).toContain('Session + token auth');
+    expect(out).toContain('modules: backend/app/auth.py');
+    expect(out).toContain('### Capabilities');
+    expect(out).toContain('`capabilities/login`');
+    expect(out).toContain('[working]');
+    expect(out).toContain('### Other sections');
+    expect(out).toContain('`notes/strategic-context`');
+    // It is an overview, not a JSON dump.
+    expect(out).not.toContain('"key":');
+    expect(out).not.toContain('{');
+    // Teaches on-demand fetch by key.
+    expect(out).toContain('./design-doc get <key>');
+    expect(out).toContain('./design-doc list');
+  });
+
+  it('surfaces a presence_warning on a downgraded entry', () => {
+    const out = renderDesignDocIndexOverview({
+      sections: [
+        {
+          key: 'systems/ghost',
+          status: 'missing',
+          modules: ['backend/app/ghost.py'],
+          presence_warning: 'all referenced module file(s) are absent',
+        },
+      ],
+    });
+    expect(out).toContain('`systems/ghost`');
+    expect(out).toContain('all referenced module file(s) are absent');
+  });
+});
 
 describe('renderStrategicPromptSuffix', () => {
   it('renders prompt_suffix as an "Additional instructions" block', () => {
@@ -194,6 +284,42 @@ describe('handleStrategic problem_model recovery framing', () => {
   });
 });
 
+describe('handleStrategic executor prompt: atomic staged create-direction', () => {
+  it('documents create-direction with "staged": true as a single atomic op (no create-then-stage)', async () => {
+    vi.mocked(runClaudeCode).mockClear();
+    // Let the thinker gate pass so the executor prompt is actually built and
+    // handed to runClaudeCode (its first arg is the executor prompt).
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+    } as unknown as { ok: boolean; analysisText: string });
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '',
+    });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-staged-exec',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    expect(executorPrompt).toBeDefined();
+    expect(executorPrompt).toContain('"staged": true');
+    expect(executorPrompt).toContain('one atomic op');
+    // Steers AWAY from the old create-then-stage sequence for new ideas.
+    expect(executorPrompt).toContain('Do NOT create-then-stage');
+  });
+});
+
 describe('handleStrategic operator_overrides wiring', () => {
   beforeEach(() => {
     capturedThinkerParams = undefined;
@@ -221,6 +347,38 @@ describe('handleStrategic operator_overrides wiring', () => {
 
     const params = capturedThinkerParams;
     expect(params?.operatorOverridesSection).toBe('');
+  });
+});
+
+describe('handleStrategic cycle_start_reconciliation wiring', () => {
+  beforeEach(() => {
+    capturedThinkerParams = undefined;
+  });
+
+  it('threads payload.cycle_start_reconciliation into the thinker params', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      cycle_start_reconciliation: {
+        capability_contradictions: [],
+        orphaned_gaps: [{ gap_id: 'g-1', name: 'x' }],
+        ungrounded_directions: [],
+        direction_pipeline: [],
+        counts: { active_directions: 3 },
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-recon', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const params = capturedThinkerParams;
+    expect(params?.cycleStartReconciliationSection).toBe('RECON(5)');
+  });
+
+  it('passes an empty section when cycle_start_reconciliation is absent', async () => {
+    const payload: Record<string, unknown> = { project_name: 'Blueprint' };
+    const statusRef = { value: '' };
+    await handleStrategic('task-recon-empty', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(capturedThinkerParams?.cycleStartReconciliationSection).toBe('');
   });
 });
 
@@ -306,6 +464,84 @@ describe('handleStrategic per-gap memory pre-trim wiring', () => {
     await handleStrategic('task-gm-mal', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
 
     expect(capturedThinkerParams?.gapMemoryTrimmedGapIds).toEqual(['g-a', 'g-b']);
+  });
+});
+
+describe('handleStrategic design_doc index rendering', () => {
+  beforeEach(() => {
+    capturedThinkerParams = undefined;
+  });
+
+  it('renders the design_doc index as an architecture overview (not raw JSON) into designDocJson', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      design_doc: {
+        sections: [
+          {
+            key: 'systems/auth',
+            status: 'mature',
+            summary: 'Session + token auth',
+            modules: ['backend/app/auth.py'],
+          },
+          { key: 'capabilities/login', status: 'working', summary: 'Users can log in' },
+        ],
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-dd', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const rendered = String(capturedThinkerParams?.designDocJson);
+    // Architecture catalog form, not a JSON dump of the index object.
+    expect(rendered).toContain('### Systems');
+    expect(rendered).toContain('`systems/auth`');
+    expect(rendered).toContain('[mature]');
+    expect(rendered).toContain('### Capabilities');
+    expect(rendered).not.toContain('"sections"');
+    expect(rendered).not.toContain('"key":');
+    // Teaches on-demand fetch by key.
+    expect(rendered).toContain('./design-doc get <key>');
+    expect(rendered).toContain('./design-doc list');
+  });
+
+  it('does not crash and renders empty designDocJson on the new shape when sections are absent', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      design_doc: { sections: [] },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-dd-empty', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(capturedThinkerParams).toBeDefined();
+    expect(capturedThinkerParams?.designDocJson).toBe('');
+  });
+
+  it('derives strategicContext from the notes/strategic-context index entry with a fetch hint', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      design_doc: {
+        sections: [
+          { key: 'notes/strategic-context', summary: 'v5 stabilize — harden toward qualification' },
+        ],
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-sc', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const ctx = String(capturedThinkerParams?.strategicContext);
+    expect(ctx).toContain('v5 stabilize — harden toward qualification');
+    // Cross-cycle running context is not silently lost — a fetch hint remains.
+    expect(ctx).toContain('./design-doc get notes/strategic-context');
+  });
+
+  it('emits empty strategicContext when no notes/strategic-context entry exists', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      design_doc: { sections: [{ key: 'systems/auth', status: 'mature' }] },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-sc-none', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(capturedThinkerParams?.strategicContext).toBe('');
   });
 });
 

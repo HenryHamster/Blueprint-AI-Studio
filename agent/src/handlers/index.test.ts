@@ -79,7 +79,13 @@ vi.mock('ws', () => ({
 // ── Import under test ─────────────────────────────────────────────────────────
 import { ALL_AGENT_TASK_TYPES } from '../taskCapabilities.js';
 import type { AgentTaskType } from '../taskCapabilities.js';
-import { handlers } from './index.js';
+import {
+  handlers,
+  resolveHandler,
+  resolveGenericRunner,
+  resolveTaskCapabilityContract,
+  type TaskCapabilityContract,
+} from './index.js';
 import { persistAndPostStatus } from '../index.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 
@@ -87,12 +93,25 @@ import { expectCalledWith } from '../utils/typed-mock-call.js';
 describe('handlers registry', () => {
   const EXPECTED_TYPES = ALL_AGENT_TASK_TYPES;
 
-  it('has exactly 21 handler entries', () => {
-    expect(Object.keys(handlers)).toHaveLength(21);
+  // 25 BESPOKE handlers are hand-registered today. This is no longer the
+  // launchability gate — dispatch falls back to contract-driven GENERIC runners
+  // for registered types with no bespoke handler (see the contract-driven
+  // dispatch suite below). The count still documents the bespoke set so a
+  // dropped/duplicated bespoke entry is caught.
+  it('has exactly 25 bespoke handler entries', () => {
+    expect(Object.keys(handlers)).toHaveLength(25);
   });
 
-  it.each(EXPECTED_TYPES)('contains handler for task type "%s"', (taskType) => {
+  it.each(EXPECTED_TYPES)('contains bespoke handler for task type "%s"', (taskType) => {
     expect(handlers).toHaveProperty(taskType);
+  });
+
+  // The launchability invariant, restated for contract-driven dispatch: every
+  // type in the shared capability table must resolve to SOME runner (bespoke or
+  // generic) — NOT necessarily a bespoke handler.
+  it.each(EXPECTED_TYPES)('every registered type "%s" resolves to a runner (bespoke or generic)', (taskType) => {
+    const resolution = resolveHandler(taskType, {}, { type: taskType });
+    expect(resolution.handler, `"${taskType}" must resolve to a runner`).toBeTypeOf('function');
   });
 
   it('every registered handler is a function', () => {
@@ -122,6 +141,200 @@ describe('handlers registry', () => {
   });
 });
 
+// ── Contract-driven generic dispatch ──────────────────────────────────────────
+// A task type the backend REGISTERS but that the agent has no bespoke handler for
+// must still be runnable: it routes to a GENERIC runner selected from the
+// published `task_capability` contract (run_shape × agent_mode × output_kind),
+// instead of throwing "Unknown task type". The generic runners reuse existing
+// machinery exactly — read-only knowledge → handleInvestigate (handlers.investigate),
+// write/PR → handleCreate (handlers.create) — so the declared output is persisted
+// and graded by the type's evaluator with NO bespoke completion handler required.
+describe('contract-driven generic dispatch', () => {
+  const knowledgeContract: TaskCapabilityContract = {
+    id: 'research',
+    label: 'Research',
+    description: 'Analyze the codebase and produce findings.',
+    default_category: 'strategic',
+    user_launchable: true,
+    provider_configurable: true,
+    filter_visible: true,
+    run_shape: 'single_agent',
+    agent_mode: 'read_only',
+    output_kind: 'knowledge',
+    requires_code: true,
+    requires_web: false,
+    requires_compute: false,
+    evaluation_strategy: 'forward_quality',
+    cost_ceiling_usd: 4,
+    is_bespoke_dispatch: false,
+  };
+  // The backend emits run_shape='workflow' for every PR-producing write type
+  // (create, fix, qa, deps, docs, migrate, refactor) — see RunShape in
+  // backend/app/task_capabilities.py. The generic write/PR runner keys off that
+  // exact shape, so this fixture mirrors what the backend actually publishes.
+  const writeContract: TaskCapabilityContract = {
+    id: 'create',
+    label: 'Create',
+    description: 'Implement new functionality and open a PR.',
+    default_category: 'build',
+    user_launchable: true,
+    provider_configurable: true,
+    filter_visible: true,
+    run_shape: 'workflow',
+    agent_mode: 'write',
+    output_kind: 'pr',
+    requires_code: true,
+    requires_web: false,
+    requires_compute: false,
+    evaluation_strategy: 'ci_and_review',
+    cost_ceiling_usd: 8,
+    is_bespoke_dispatch: false,
+  };
+
+  it('routes an UNKNOWN read-only knowledge type to the generic investigate runner (no throw)', () => {
+    const payload = { type: 'knowledge_probe', prompt: 'investigate X' };
+    const task = { task_capability: knowledgeContract };
+    const resolution = resolveHandler('knowledge_probe', task, payload);
+    expect(resolution.dispatch).toBe('generic');
+    // Generic read-only knowledge reuses the SAME machinery as `investigate`,
+    // so it persists its output via the status/artifact path identically.
+    expect(resolution.handler).toBe(handlers.investigate);
+    if (resolution.dispatch === 'generic') {
+      expect(resolution.runnerLabel).toContain('read-only knowledge');
+    }
+  });
+
+  it('routes an UNKNOWN write/PR type to the generic create runner (no throw)', () => {
+    const payload = { type: 'scaffold_feature', prompt: 'build Y' };
+    const task = { task_capability: writeContract };
+    const resolution = resolveHandler('scaffold_feature', task, payload);
+    expect(resolution.dispatch).toBe('generic');
+    // Generic write/PR reuses the SAME machinery as `create`, so it pushes a
+    // branch and opens a PR identically — honored by the backend PR pipeline.
+    expect(resolution.handler).toBe(handlers.create);
+    if (resolution.dispatch === 'generic') {
+      expect(resolution.runnerLabel).toContain('write/PR');
+    }
+  });
+
+  it('accepts the hyphenated run-shape spelling ("single-agent")', () => {
+    const payload = { type: 'knowledge_probe', prompt: 'investigate X' };
+    const task = { task_capability: { ...knowledgeContract, run_shape: 'single-agent' } };
+    const resolution = resolveHandler('knowledge_probe', task, payload);
+    expect(resolution.dispatch).toBe('generic');
+    expect(resolution.handler).toBe(handlers.investigate);
+  });
+
+  it('preserves extra backend-published catalog fields while normalizing dispatch keys', () => {
+    const payload = { type: 'research', prompt: 'findings' };
+    const task = {
+      task_capability: {
+        ...knowledgeContract,
+        run_shape: 'single-agent',
+        description: 'Analyze the codebase and produce findings.',
+      },
+    };
+    const contract = resolveTaskCapabilityContract(task, payload);
+
+    expect(contract).toMatchObject({
+      id: 'research',
+      label: 'Research',
+      description: 'Analyze the codebase and produce findings.',
+      default_category: 'strategic',
+      user_launchable: true,
+      provider_configurable: true,
+      filter_visible: true,
+      agent_mode: 'read_only',
+      output_kind: 'knowledge',
+      requires_code: true,
+      requires_web: false,
+      requires_compute: false,
+      evaluation_strategy: 'forward_quality',
+      cost_ceiling_usd: 4,
+      run_shape: 'single_agent',
+      is_bespoke_dispatch: false,
+    });
+  });
+
+  it('treats output_kind in {none, verdict} as generic knowledge too', () => {
+    for (const output_kind of ['none', 'verdict']) {
+      const task = { task_capability: { ...knowledgeContract, output_kind } };
+      const resolution = resolveHandler('probe_' + output_kind, task, { type: 'probe_' + output_kind, prompt: 'x' });
+      expect(resolution.handler, `output_kind=${output_kind} should route to generic knowledge`).toBe(handlers.investigate);
+    }
+  });
+
+  it('a BESPOKE handler still wins over the contract (precedence preserved)', () => {
+    // create has a bespoke handler; even with a read-only contract present, the
+    // bespoke handler must be chosen so existing behavior is preserved exactly.
+    const task = { task_capability: knowledgeContract };
+    const resolution = resolveHandler('create', task, { type: 'create', prompt: 'x' });
+    expect(resolution.dispatch).toBe('bespoke');
+    expect(resolution.handler).toBe(handlers.create);
+  });
+
+  it('fails LOUDLY (clear message, no silent wrong work) for a run-shape with no generic runner yet', () => {
+    // Use a type with NO bespoke handler so dispatch falls through to the
+    // contract-driven generic path (every registered type has a bespoke
+    // handler that would win first — see the precedence test above).
+    for (const run_shape of ['multi_agent', 'experiment_loop']) {
+      const task = { task_capability: { ...writeContract, run_shape } };
+      const resolution = resolveHandler('unmapped_shape_type', task, { type: 'unmapped_shape_type', prompt: 'x' });
+      expect(resolution.handler, `${run_shape} must not resolve to a runner yet`).toBeNull();
+      if (resolution.handler === null) {
+        expect(resolution.reason).toContain(run_shape);
+        expect(resolution.reason).toContain('unmapped_shape_type');
+      }
+    }
+  });
+
+  it('fails loudly for an unsupported single-agent output_kind (e.g. write→artifact)', () => {
+    const task = { task_capability: { ...writeContract, output_kind: 'artifact' } };
+    const resolution = resolveHandler('artifact_builder', task, { type: 'artifact_builder', prompt: 'x' });
+    expect(resolution.handler).toBeNull();
+  });
+
+  describe('contract ABSENT — fallback to local table + payload', () => {
+    it('derives read_only/knowledge for a locally-known read-only type', () => {
+      const contract = resolveTaskCapabilityContract({}, { type: 'investigate' });
+      expect(contract.agent_mode).toBe('read_only');
+      expect(contract.output_kind).toBe('knowledge');
+      expect(contract.run_shape).toBe('single_agent');
+    });
+
+    it('derives workflow write/pr for a type unknown to the local table', () => {
+      const contract = resolveTaskCapabilityContract({}, { type: 'brand_new_type' });
+      expect(contract.agent_mode).toBe('write');
+      expect(contract.output_kind).toBe('pr');
+      // Mirrors the backend run_shape for write/PR types so the derived contract
+      // routes through the same generic workflow runner a published contract would.
+      expect(contract.run_shape).toBe('workflow');
+    });
+
+    it('an unknown write type with NO contract still resolves to the generic create runner', () => {
+      const resolution = resolveHandler('brand_new_type', {}, { type: 'brand_new_type', prompt: 'x' });
+      expect(resolution.dispatch).toBe('generic');
+      expect(resolution.handler).toBe(handlers.create);
+    });
+  });
+
+  describe('resolveGenericRunner unit', () => {
+    it('returns null for reserved/unknown run shapes (experiment_loop)', () => {
+      expect(resolveGenericRunner({ ...writeContract, run_shape: 'experiment_loop' })).toBeNull();
+    });
+
+    it('returns the investigate handler for single-agent read-only knowledge', () => {
+      const runner = resolveGenericRunner(knowledgeContract);
+      expect(runner?.handler).toBe(handlers.investigate);
+    });
+
+    it('returns the create handler for workflow write/pr', () => {
+      const runner = resolveGenericRunner(writeContract);
+      expect(runner?.handler).toBe(handlers.create);
+    });
+  });
+});
+
 // ── Task class classification (cross-cutting structural invariants) ───────────
 // Maps every registered task type to its prompt-safety class. When a new type
 // is added to handlers/index.ts, these tests fail until the owner declares which
@@ -146,8 +359,9 @@ const TASK_CLASS_MAP = {
   docs:              'code-change',
   qa:                'code-change',
   deps:              'code-change',
-  // Read-only / investigative (9): analysis only, must not push code
+  // Read-only / investigative (10): analysis only, must not push code
   review:            'read-only',
+  panel_review:      'read-only',
   security_audit:    'read-only',
   self_audit:        'read-only',
   release_audit:     'read-only',
@@ -156,12 +370,15 @@ const TASK_CLASS_MAP = {
   perf:              'read-only',
   investigate:       'read-only',
   verify_tests:      'read-only',
-  // Research / planning (5): read-heavy, no code shipped
+  compute_experiment:'read-only',
+  // Research / planning (7): read-heavy, no code shipped
   plan:              'research',
   research:          'research',
   strategic_review:  'research',
   design_doc_update: 'research',
   memo:              'research',
+  web_research:      'research',
+  design:            'research',
 } as const satisfies Record<AgentTaskType, TaskClass>;
 
 describe('task type class classification — cross-cutting invariants', () => {
@@ -178,12 +395,12 @@ describe('task type class classification — cross-cutting invariants', () => {
     }
   });
 
-  it('class distribution is 7 code-change + 9 read-only + 5 research = 21 total', () => {
+  it('class distribution is 7 code-change + 11 read-only + 7 research = 25 total', () => {
     const counts: Record<TaskClass, number> = { 'code-change': 0, 'read-only': 0, research: 0 };
     for (const cls of Object.values(TASK_CLASS_MAP)) counts[cls]++;
     expect(counts['code-change']).toBe(7);
-    expect(counts['read-only']).toBe(9);
-    expect(counts['research']).toBe(5);
+    expect(counts['read-only']).toBe(11);
+    expect(counts['research']).toBe(7);
   });
 
   it('no task type belongs to more than one class', () => {

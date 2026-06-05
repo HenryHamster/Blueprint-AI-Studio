@@ -1,6 +1,6 @@
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
-import { Activity, Network, Compass, Microscope, Archive, Plus, MoreHorizontal, Settings, LayoutGrid, LayoutDashboard, MessageSquare, CalendarClock } from 'lucide-react';
+import { Activity, Network, Compass, Microscope, BookOpen, Archive, Plus, MoreHorizontal, Settings, LayoutGrid, LayoutDashboard, MessageSquare, CalendarClock } from 'lucide-react';
 import { MetricsBar } from './MetricsBar';
 import { AutonomousStatus } from './AutonomousStatus';
 import { SettingsDropdown, type MaxPlanAccount, type SectionId } from './SettingsDropdown';
@@ -24,6 +24,8 @@ export interface HeaderBarProps {
   onSetViewMode: (mode: ViewMode) => void;
   showResearchBrowser: boolean;
   onToggleResearchBrowser: () => void;
+  showKnowledgeBrowser: boolean;
+  onToggleKnowledgeBrowser: () => void;
   showArchive: boolean;
   onToggleArchive: () => void;
   showMessages: boolean;
@@ -206,6 +208,8 @@ export function HeaderBar(props: HeaderBarProps) {
     onSetViewMode,
     showResearchBrowser,
     onToggleResearchBrowser,
+    showKnowledgeBrowser,
+    onToggleKnowledgeBrowser,
     showArchive,
     onToggleArchive,
     showMessages,
@@ -659,6 +663,16 @@ export function HeaderBar(props: HeaderBarProps) {
               </span>
             )}
           </button>
+          {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
+          <button
+            onClick={onToggleKnowledgeBrowser}
+            className={`p-2 rounded-md text-xs transition-colors flex items-center ${
+              showKnowledgeBrowser ? 'text-violet-400 bg-violet-500/10' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'
+            }`}
+            title="Knowledge Library"
+          >
+            <BookOpen className="w-4 h-4" />
+          </button>
         </div>
 
         {/* Mobile-only autonomy control — full MetricsBar is desktop-only, but autonomy on/off must be reachable on mobile */}
@@ -720,6 +734,13 @@ export function HeaderBar(props: HeaderBarProps) {
                     {pendingFindingsCount}
                   </span>
                 )}
+              </button>
+              <button
+                onClick={() => { onToggleKnowledgeBrowser(); setShowMobileMenu(false); }}
+                className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${showKnowledgeBrowser ? 'text-violet-400 bg-violet-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
+              >
+                <BookOpen className="w-4 h-4 shrink-0" />
+                <span>Knowledge Library</span>
               </button>
               <button
                 onClick={() => { onToggleArchive(); setShowMobileMenu(false); }}

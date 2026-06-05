@@ -10,6 +10,7 @@ import { DirectionsQuickLinks } from './DirectionsQuickLinks';
 import { DirectionsList, type DirectionCategoryFilter } from './DirectionsList';
 import { useDirectionsData } from '../hooks/useDirectionsData';
 import type { Project } from '../types/project';
+import type { OutcomeKindBreakdown } from '../utils/outcomeKinds';
 
 export interface ResearchHistoryEntry {
   timestamp: string;
@@ -46,8 +47,14 @@ export interface Direction {
   text: string;
   priority: 'high' | 'medium' | 'low';
   added_at: string;
-  status: 'active' | 'completed' | 'paused' | 'proposed' | 'expired';
+  status: 'active' | 'completed' | 'paused' | 'proposed' | 'expired' | 'staged';
   category?: 'product' | 'structural' | 'mixed' | null;
+  // When status is 'staged', the version_number this direction is waiting to be
+  // promoted past; it auto-activates when that version promotes and the next opens.
+  staged_for_version?: number | null;
+  // ISO timestamp stamped when the direction entered the 'staged' status (set on
+  // every staging path: operator add, status-change-to-staged, agent create/stage).
+  staged_at?: string | null;
   completion_criteria?: string | null;
   paths?: string[];
   last_researched_at?: string | null;
@@ -111,6 +118,15 @@ export interface Direction {
   budget_utilization_pct?: number | null;
   budget_exceeded?: boolean;
   quality_score?: number | null;
+  // Generalized cross-task-type success metrics, emitted by GET /directions
+  // alongside the legacy PR-merge counters. `outcome_kind_breakdown` is keyed
+  // by outcome kind (code_merge, research_quality, audit_findings, …).
+  generalized_successes?: number | null;
+  generalized_health_rate?: number | null;
+  outcome_kind_breakdown?: OutcomeKindBreakdown | null;
+  // Count of durable knowledge documents (web_research output) accumulated by
+  // this direction, emitted by GET /directions.
+  knowledge_document_count?: number | null;
   cost_per_merged_pr?: number | null;
   cost_per_merge_exceeds_threshold?: boolean;
   // Per-(provider, model) cost breakdown for the digest window. Keys are
@@ -161,9 +177,10 @@ export interface Direction {
 }
 
 
-const STATUS_GROUPS: Array<{ key: 'proposed' | 'active' | 'paused' | 'completed' | 'expired'; label: string }> = [
+const STATUS_GROUPS: Array<{ key: 'proposed' | 'active' | 'staged' | 'paused' | 'completed' | 'expired'; label: string }> = [
   { key: 'proposed', label: 'Proposed by Agent' },
   { key: 'active', label: 'Active' },
+  { key: 'staged', label: 'Staged for next version' },
   { key: 'paused', label: 'Paused' },
   { key: 'completed', label: 'Completed' },
   { key: 'expired', label: 'Expired' },
@@ -221,6 +238,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
           activeTab={activeTab}
           setActiveTab={setActiveTab}
           problemModel={data.problemModel}
+          sizeHealth={data.problemModelSizeHealth}
           designDoc={data.designDoc}
           runningUpdate={data.runningUpdate}
           triggerCycle={data.triggerCycle}
@@ -301,7 +319,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
 
         {/* Add direction form */}
         {selectedProjectId && (
-          <DirectionsAddForm form={form} addDirection={data.addDirection} />
+          <DirectionsAddForm form={form} addDirection={data.addDirection} stageTargetVersion={data.openVersionNumber} />
         )}
 
         {/* Error banner */}
@@ -341,6 +359,9 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
             rejectProposal={data.rejectProposal}
             reviveProposal={data.reviveProposal}
             reactivateDirection={data.reactivateDirection}
+            activateStagedDirection={data.activateStagedDirection}
+            retargetStagedDirection={data.retargetStagedDirection}
+            cancelStagedDirection={data.cancelStagedDirection}
             unholdDirection={data.unholdDirection}
             markDirectionComplete={data.markDirectionComplete}
             quickToggleStatus={data.quickToggleStatus}
@@ -356,6 +377,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
             researchSuccessIds={data.researchSuccessIds}
             forceConfirmId={data.forceConfirmId}
             setForceConfirmId={data.setForceConfirmId}
+            stageTargetVersion={data.openVersionNumber}
             onViewFindings={onViewFindings}
             onNavigateToTask={onNavigateToTask}
           />

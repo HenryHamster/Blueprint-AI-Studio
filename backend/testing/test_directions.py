@@ -17,7 +17,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 
-from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
+from app.models import Alert, AlertSeverity, Direction, Project, Task, TaskStatus
 from app.autonomous_research import _spawn_research_task
 from app.direction_lifecycle import _process_direction_lifecycle
 from app.research_completion import (
@@ -96,6 +96,12 @@ async def _add_direction(
     return resp.json()["direction"]
 
 
+async def _load_project_and_direction(db_session, project_id: str, direction_id: str):
+    project = (await db_session.execute(select(Project).where(Project.id == uuid.UUID(project_id)))).scalar_one()
+    direction_row = (await db_session.execute(select(Direction).where(Direction.project_id == uuid.UUID(project_id), Direction.direction_key == direction_id))).scalar_one_or_none()
+    return project, direction_row
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. CRUD
 # ─────────────────────────────────────────────────────────────────────────────
@@ -131,6 +137,54 @@ async def test_create_direction(client: AsyncClient, mocker):
 
 
 @pytest.mark.asyncio
+async def test_create_direction_is_idempotent_with_idempotency_key(
+    client: AsyncClient, mocker
+):
+    """POST with idempotency_key returns existing direction on duplicate submit."""
+    project_id = await _deploy_project(client, mocker)
+    idem_key = "test-key-12345"
+    # First submit
+    resp1 = await client.post(
+        f"/api/admin/projects/{project_id}/directions",
+        json={
+            "text": "Improve test coverage",
+            "priority": "high",
+            "paths": ["src/"],
+            "idempotency_key": idem_key,
+        },
+    )
+    assert resp1.status_code == 200
+    d1 = resp1.json()["direction"]
+    direction_id_1 = d1["id"]
+    assert d1["idempotency_key"] == idem_key
+
+    # Duplicate submit with same key should return the existing direction
+    resp2 = await client.post(
+        f"/api/admin/projects/{project_id}/directions",
+        json={
+            "text": "Improve test coverage",
+            "priority": "high",
+            "paths": ["src/"],
+            "idempotency_key": idem_key,
+        },
+    )
+    assert resp2.status_code == 200
+    d2 = resp2.json()["direction"]
+    # Should be the same direction (same id)
+    assert d2["id"] == direction_id_1
+    assert d2["idempotency_key"] == idem_key
+    # Response should indicate it's a duplicate
+    assert resp2.json().get("status") == "duplicate"
+
+    # Verify only one direction was created (not two)
+    resp_list = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp_list.status_code == 200
+    directions = resp_list.json()["directions"]
+    assert len(directions) == 1
+    assert directions[0]["id"] == direction_id_1
+
+
+@pytest.mark.asyncio
 async def test_get_directions_returns_created(client: AsyncClient, mocker):
     """GET returns directions that were previously POSTed."""
     project_id = await _deploy_project(client, mocker)
@@ -143,6 +197,52 @@ async def test_get_directions_returns_created(client: AsyncClient, mocker):
     directions = resp.json()["directions"]
     assert len(directions) == 1
     assert directions[0]["id"] == direction["id"]
+
+
+@pytest.mark.asyncio
+async def test_get_directions_includes_knowledge_document_count(
+    client: AsyncClient, db_session, mocker
+):
+    """GET /directions enriches each direction with its accumulated
+    knowledge-document count, keyed by the string direction id."""
+    from app.models import KnowledgeDocument
+
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Has knowledge")
+
+    task = Task(project_id=uuid.UUID(project_id), status=TaskStatus.COMPLETED)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    for i in range(2):
+        db_session.add(
+            KnowledgeDocument(
+                project_id=uuid.UUID(project_id),
+                source_task_id=task.id,
+                direction_id=direction["id"],
+                title=f"Doc {i}",
+                summary="S",
+                body="B",
+            )
+        )
+    # A document with no direction must not be counted against this direction.
+    db_session.add(
+        KnowledgeDocument(
+            project_id=uuid.UUID(project_id),
+            source_task_id=task.id,
+            direction_id=None,
+            title="Unlinked",
+            summary="S",
+            body="B",
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp.status_code == 200
+    d = next(x for x in resp.json()["directions"] if x["id"] == direction["id"])
+    assert d["knowledge_document_count"] == 2
 
 
 @pytest.mark.asyncio
@@ -482,17 +582,233 @@ async def test_update_direction_priority(client: AsyncClient, mocker):
 
 
 @pytest.mark.asyncio
-async def test_update_direction_status(client: AsyncClient, mocker):
-    """PATCH updates direction status to paused."""
+async def test_update_direction_status_stage_sets_version_marker(
+    client: AsyncClient, db_session, mocker
+):
+    """PATCH status='staged' stamps the current open version onto the direction."""
     project_id = await _deploy_project(client, mocker)
+    project_uuid = uuid.UUID(project_id)
+    from app import release_version as rv
+    from app.task_locking import with_directions_locked
+
+    await rv.open_version(db_session, project_uuid, version_number=7)
+    await db_session.commit()
+
     direction = await _add_direction(client, project_id)
+    direction_id = direction["id"]
+
+    def _seed_residue(dirs):
+        dirs[0].update(
+            {
+                "paused_reason": "cooldown residue",
+                "paused_at": "2026-06-01T00:00:00",
+                "auto_paused": True,
+                "expired_at": "2026-06-01T01:00:00",
+                "needs_manual_intervention": True,
+                "needs_manual_intervention_at": "2026-06-01T02:00:00",
+                "escalation_notification_pending": True,
+                "escalation_notification_retries": 2,
+                "last_researched_at": "2026-06-01T03:00:00",
+                "staged_activated_at": "2026-06-01T04:00:00",
+                "remediation_attempts": 4,
+            }
+        )
+
+    await with_directions_locked(db_session, project_uuid, _seed_residue)
+    await db_session.commit()
 
     resp = await client.patch(
         f"/api/admin/projects/{project_id}/directions/{direction['id']}",
-        json={"status": "paused"},
+        json={"status": "staged"},
     )
     assert resp.status_code == 200
-    assert resp.json()["direction"]["status"] == "paused"
+    body = resp.json()["direction"]
+    assert body["status"] == "staged"
+    assert body["staged_for_version"] == 7
+    assert "staged_activated_at" not in body
+    for field in (
+        "paused_reason",
+        "needs_manual_intervention",
+        "escalation_notification_pending",
+        "last_researched_at",
+    ):
+        assert field not in body
+    assert body["remediation_attempts"] == 0
+
+    project, row = await _load_project_and_direction(db_session, project_id, direction_id)
+    blob = next(d for d in project.directions or [] if d.get("id") == direction_id)
+    assert blob["status"] == "staged"
+    assert blob["staged_for_version"] == 7
+    assert "staged_activated_at" not in blob
+    assert row is not None
+    assert row.status == "staged"
+    assert row.data["staged_for_version"] == 7
+
+
+@pytest.mark.asyncio
+async def test_update_direction_stage_for_explicit_future_version(
+    client: AsyncClient, db_session, mocker
+):
+    """PATCH status='staged' with an explicit future staged_for_version stamps
+    that version rather than the current open one."""
+    project_id = await _deploy_project(client, mocker)
+    project_uuid = uuid.UUID(project_id)
+    from app import release_version as rv
+
+    await rv.open_version(db_session, project_uuid, version_number=3)
+    await db_session.commit()
+
+    direction = await _add_direction(client, project_id)
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"status": "staged", "staged_for_version": 5},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["direction"]["staged_for_version"] == 5
+
+
+@pytest.mark.asyncio
+async def test_update_direction_stage_rejects_already_promoted_version(
+    client: AsyncClient, db_session, mocker
+):
+    """A staged_for_version below the current open version (already promoted) is
+    rejected with 400 rather than auto-activating on the next sweep."""
+    project_id = await _deploy_project(client, mocker)
+    project_uuid = uuid.UUID(project_id)
+    from app import release_version as rv
+
+    await rv.open_version(db_session, project_uuid, version_number=4)
+    await db_session.commit()
+
+    direction = await _add_direction(client, project_id)
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"status": "staged", "staged_for_version": 2},
+    )
+    assert resp.status_code == 400
+    assert "already promoted" in resp.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_update_direction_retarget_staged_direction(
+    client: AsyncClient, db_session, mocker
+):
+    """PATCH staged_for_version on an already-staged direction retargets it to a
+    new version without changing its status."""
+    project_id = await _deploy_project(client, mocker)
+    project_uuid = uuid.UUID(project_id)
+    from app import release_version as rv
+
+    await rv.open_version(db_session, project_uuid, version_number=6)
+    await db_session.commit()
+
+    direction = await _add_direction(client, project_id)
+    direction_id = direction["id"]
+    await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"status": "staged"},
+    )
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"staged_for_version": 8},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()["direction"]
+    assert body["status"] == "staged"
+    assert body["staged_for_version"] == 8
+
+    _, row = await _load_project_and_direction(db_session, project_id, direction_id)
+    assert row is not None and row.data["staged_for_version"] == 8
+
+
+@pytest.mark.asyncio
+async def test_update_direction_retarget_rejects_non_staged(
+    client: AsyncClient, db_session, mocker
+):
+    """Retargeting (staged_for_version without a status change) is rejected with
+    409 when the direction is not currently staged."""
+    project_id = await _deploy_project(client, mocker)
+    project_uuid = uuid.UUID(project_id)
+    from app import release_version as rv
+
+    await rv.open_version(db_session, project_uuid, version_number=6)
+    await db_session.commit()
+
+    direction = await _add_direction(client, project_id)
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"staged_for_version": 7},
+    )
+    assert resp.status_code == 409
+    assert "staged direction" in resp.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_update_direction_status_activate_now_clears_stage_marker(
+    client: AsyncClient, db_session, mocker
+):
+    """PATCH status='active' reactivates a staged direction and clears staging residue."""
+    project_id = await _deploy_project(client, mocker)
+    project_uuid = uuid.UUID(project_id)
+    from app import release_version as rv
+    from app.task_locking import with_directions_locked
+
+    await rv.open_version(db_session, project_uuid, version_number=8)
+    await db_session.commit()
+
+    direction = await _add_direction(client, project_id)
+    direction_id = direction["id"]
+
+    await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"status": "staged"},
+    )
+
+    def _seed_staged_residue(dirs):
+        dirs[0].update(
+            {
+                "paused_reason": "stale pause",
+                "paused_at": "2026-06-01T05:00:00",
+                "auto_paused": True,
+                "needs_manual_intervention": True,
+                "needs_manual_intervention_at": "2026-06-01T06:00:00",
+                "escalation_notification_pending": True,
+                "escalation_notification_retries": 1,
+                "last_researched_at": "2026-06-01T07:00:00",
+                "staged_activated_at": "2026-06-01T08:00:00",
+                "remediation_attempts": 5,
+            }
+        )
+
+    await with_directions_locked(db_session, project_uuid, _seed_staged_residue)
+    await db_session.commit()
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"status": "active"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()["direction"]
+    assert body["status"] == "active"
+    assert "staged_for_version" not in body
+    assert "staged_activated_at" not in body
+    for field in (
+        "paused_reason",
+        "needs_manual_intervention",
+        "escalation_notification_pending",
+        "last_researched_at",
+    ):
+        assert field not in body
+    assert body["remediation_attempts"] == 0
+
+    project, row = await _load_project_and_direction(db_session, project_id, direction_id)
+    blob = next(d for d in project.directions or [] if d.get("id") == direction_id)
+    assert blob["status"] == "active"
+    assert "staged_for_version" not in blob
+    assert row is not None
+    assert row.status == "active"
+    assert "staged_for_version" not in row.data
 
 
 @pytest.mark.asyncio
@@ -524,20 +840,37 @@ async def test_update_direction_paths(client: AsyncClient, mocker):
 
 
 @pytest.mark.asyncio
-async def test_delete_direction_removes_it(client: AsyncClient, mocker):
-    """DELETE removes the direction from the project."""
+async def test_delete_direction_removes_it(client: AsyncClient, db_session, mocker):
+    """DELETE tombstones a staged direction to prevent re-staging."""
     project_id = await _deploy_project(client, mocker)
+    project_uuid = uuid.UUID(project_id)
+    from app import release_version as rv
+
+    await rv.open_version(db_session, project_uuid, version_number=9)
+    await db_session.commit()
     direction = await _add_direction(client, project_id)
+    direction_id = direction["id"]
+
+    stage_resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"status": "staged"},
+    )
+    assert stage_resp.status_code == 200
+    assert stage_resp.json()["direction"]["status"] == "staged"
 
     resp = await client.delete(
-        f"/api/admin/projects/{project_id}/directions/{direction['id']}"
+        f"/api/admin/projects/{project_id}/directions/{direction_id}"
     )
     assert resp.status_code == 200
     assert resp.json()["message"] == "Direction removed"
 
-    get_resp = await client.get(f"/api/admin/projects/{project_id}/directions")
-    ids = [d["id"] for d in get_resp.json()["directions"]]
-    assert direction["id"] not in ids
+    project, row = await _load_project_and_direction(db_session, project_id, direction_id)
+    tombstone = next(d for d in project.directions or [] if d.get("id") == direction_id)
+    assert tombstone["status"] == "rejected"
+    assert "staged_for_version" not in tombstone
+    assert row is not None
+    assert row.status == "rejected"
+    assert row.data["status"] == "rejected"
 
 
 @pytest.mark.asyncio
@@ -2174,6 +2507,184 @@ async def test_merge_rate_in_list(client: AsyncClient, db_session, mocker):
     target = next(d for d in dirs if d["id"] == direction_id)
     assert "merge_rate" in target
     assert abs(target["merge_rate"] - 0.5) < 0.001  # 1 merged / 2 cycles = 0.5
+
+
+@pytest.mark.asyncio
+async def test_generalized_metrics_in_list_use_lifetime_and_legacy_fallback(
+    client: AsyncClient, db_session, mocker
+):
+    """GET directions exposes additive generalized metrics across history + aggregate."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Direction with evals")
+    direction_id = direction["id"]
+
+    from app.models import Project as ProjectModel
+    from sqlmodel import select as sa_select
+
+    result = await db_session.execute(
+        sa_select(ProjectModel).where(ProjectModel.id == uuid.UUID(project_id))
+    )
+    project = result.scalars().first()
+    updated_directions = list(project.directions or [])
+    for d in updated_directions:
+        if d["id"] == direction_id:
+            d["research_history"] = [
+                {"prs_merged": 1},
+                {
+                    "generalized_successes": 3,
+                    "tasks_completed": 3,
+                    "outcome_kind_breakdown": {
+                        "research_quality": {
+                            "success": 3,
+                            "neutral": 0,
+                            "failure": 0,
+                        }
+                    },
+                },
+            ]
+            d["history_aggregate"] = {
+                "total_generalized_successes": 2,
+                "total_generalized_terminal_outcomes": 4,
+                "outcome_kind_breakdown": {
+                    "audit_findings": {"success": 1, "neutral": 0, "failure": 1}
+                },
+            }
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project.directions = updated_directions
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp.status_code == 200
+    dirs = resp.json()["directions"]
+    target = next(d for d in dirs if d["id"] == direction_id)
+
+    assert target["generalized_successes"] == 6
+    assert target["generalized_health_rate"] == 0.75
+    assert target["outcome_kind_breakdown"] == {
+        "code_merge": {"success": 1, "neutral": 0, "failure": 0},
+        "research_quality": {"success": 3, "neutral": 0, "failure": 0},
+        "audit_findings": {"success": 1, "neutral": 0, "failure": 1},
+        "read_only_unclassified": {"success": 1, "neutral": 1, "failure": 0},
+    }
+
+
+@pytest.mark.asyncio
+async def test_generalized_metrics_in_list_merge_legacy_aggregate_breakdown(
+    client: AsyncClient, db_session, mocker
+):
+    """Legacy aggregate merge counts still appear in the breakdown beside live typed outcomes."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Direction with legacy agg")
+    direction_id = direction["id"]
+
+    from app.models import Project as ProjectModel
+    from sqlmodel import select as sa_select
+
+    result = await db_session.execute(
+        sa_select(ProjectModel).where(ProjectModel.id == uuid.UUID(project_id))
+    )
+    project = result.scalars().first()
+    updated_directions = list(project.directions or [])
+    for d in updated_directions:
+        if d["id"] == direction_id:
+            d["research_history"] = [
+                {
+                    "generalized_successes": 3,
+                    "tasks_completed": 3,
+                    "outcome_kind_breakdown": {
+                        "research_quality": {
+                            "success": 3,
+                            "neutral": 0,
+                            "failure": 0,
+                        }
+                    },
+                }
+            ]
+            d["history_aggregate"] = {
+                "total_prs_merged": 2,
+                "total_tasks_completed": 2,
+                "total_tasks_failed": 1,
+            }
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project.directions = updated_directions
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp.status_code == 200
+    dirs = resp.json()["directions"]
+    target = next(d for d in dirs if d["id"] == direction_id)
+
+    assert target["generalized_successes"] == 5
+    assert target["generalized_health_rate"] == round(5 / 6, 3)
+    assert target["outcome_kind_breakdown"] == {
+        "code_merge": {"success": 2, "neutral": 0, "failure": 0},
+        "research_quality": {"success": 3, "neutral": 0, "failure": 0},
+        "read_only_unclassified": {"success": 0, "neutral": 1, "failure": 0},
+    }
+
+
+@pytest.mark.asyncio
+async def test_generalized_metrics_in_list_backfills_sparse_aggregate_breakdown(
+    client: AsyncClient, db_session, mocker
+):
+    """Aggregate generalized totals without typed buckets stay visible in the breakdown."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(
+        client, project_id, text="Direction with sparse aggregate evals"
+    )
+    direction_id = direction["id"]
+
+    from app.models import Project as ProjectModel
+    from sqlmodel import select as sa_select
+
+    result = await db_session.execute(
+        sa_select(ProjectModel).where(ProjectModel.id == uuid.UUID(project_id))
+    )
+    project = result.scalars().first()
+    updated_directions = list(project.directions or [])
+    for d in updated_directions:
+        if d["id"] == direction_id:
+            d["research_history"] = [
+                {
+                    "generalized_successes": 1,
+                    "tasks_completed": 1,
+                    "outcome_kind_breakdown": {
+                        "memo_artifact": {
+                            "success": 1,
+                            "neutral": 0,
+                            "failure": 0,
+                        }
+                    },
+                }
+            ]
+            d["history_aggregate"] = {
+                "total_generalized_successes": 4,
+                "total_generalized_terminal_outcomes": 6,
+            }
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project.directions = updated_directions
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp.status_code == 200
+    dirs = resp.json()["directions"]
+    target = next(d for d in dirs if d["id"] == direction_id)
+
+    assert target["generalized_successes"] == 5
+    assert target["generalized_health_rate"] == round(5 / 7, 3)
+    assert target["outcome_kind_breakdown"] == {
+        "memo_artifact": {"success": 1, "neutral": 0, "failure": 0},
+        "read_only_unclassified": {"success": 4, "neutral": 2, "failure": 0},
+    }
 
 
 @pytest.mark.asyncio
@@ -8156,6 +8667,64 @@ async def test_operator_message_arms_strategic_refresh(
     # live-steering feature). Without this wiring the marker defaulted to
     # qualification origin and the feature was dead in production.
     assert marker["origin"] == "operator"
+
+
+@pytest.mark.asyncio
+async def test_operator_message_idempotency_key_dedupes(
+    client: AsyncClient, db_session, mocker
+):
+    """Mirrors the live-chat idempotency test: a double-send of the same
+    steering instruction with one idempotency key collapses to a single
+    message row and a single strategist arming, instead of duplicating the
+    operator message and re-quoting it as the priority directive."""
+    from sqlalchemy import func as sa_func
+    from app.models import ProjectMessage
+
+    project_id = await _deploy_project(client, mocker)
+    body = {
+        "content": "Please refocus on the auth bug",
+        "message_type": "FEEDBACK",
+        "idempotency_key": "key-double-submit-1",
+    }
+
+    first = await client.post(
+        f"/api/admin/projects/{project_id}/messages", json=body
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["status"] == "created"
+    assert first.json()["arming"] == "steering"
+    first_id = first.json()["id"]
+
+    # Identical retry with the same key — idempotent success, same row, and the
+    # duplicate does NOT re-arm the strategist.
+    second = await client.post(
+        f"/api/admin/projects/{project_id}/messages", json=body
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["status"] == "duplicate"
+    assert second.json()["id"] == first_id
+    assert second.json()["arming"] == "duplicate"
+
+    # Exactly one row landed for this project.
+    count = await db_session.scalar(
+        select(sa_func.count())
+        .select_from(ProjectMessage)
+        .where(ProjectMessage.project_id == uuid.UUID(project_id))
+    )
+    assert count == 1
+
+    # Exactly one arming: the marker coalesced count stays at 1.
+    vision = await _reload_vision(db_session, project_id)
+    assert vision["_strategic_refresh"]["count"] == 1
+
+    # A different key on the same content does create a second message.
+    third = await client.post(
+        f"/api/admin/projects/{project_id}/messages",
+        json={**body, "idempotency_key": "key-double-submit-2"},
+    )
+    assert third.status_code == 200, third.text
+    assert third.json()["status"] == "created"
+    assert third.json()["id"] != first_id
 
 
 @pytest.mark.asyncio

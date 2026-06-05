@@ -39,8 +39,41 @@ from app.max_plan_pool import (
     provider_selection_mode as _provider_selection_mode_from_config,
 )
 from app.providers.registry import get_provider, list_providers
+from app.task_capabilities import (
+    ALL_TASK_TYPES,
+    PERIODIC_TASK_TYPES,
+    PROVIDER_CONFIGURABLE_TASK_TYPES,
+    RESERVABLE_TASK_TYPES,
+    task_capability_contract,
+)
 
 _VALID_PROVIDER_SELECTION_MODES = frozenset({"balanced", "preferred", "exclusive"})
+
+
+def _reject_unknown_task_types(
+    field: str, keys, allowed: frozenset[str] | set[str] | tuple[str, ...]
+) -> None:
+    """Reject a task-type-keyed settings map whose keys aren't registry-allowed.
+
+    ``allowed`` is the registry-derived set of task types permitted for THIS
+    surface (e.g. ``ALL_TASK_TYPES`` for categorization, the provider-configurable
+    subset for routing, ``RESERVABLE_TASK_TYPES`` for reserved slots). Keys are
+    checked against it so a typoed or unknown task type is a 400 instead of a
+    silently-stored no-op, and a surface only accepts types whose declared
+    capability flags permit that usage. Deriving ``allowed`` from the registry
+    means a newly registered task type is honored automatically — no per-surface
+    allowlist edit required.
+    """
+    allowed_set = frozenset(allowed)
+    invalid = sorted(str(k) for k in keys if str(k) not in allowed_set)
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{field}: unknown or ineligible task type(s) {invalid}; "
+                f"must be one of {sorted(allowed_set)}"
+            ),
+        )
 
 # Every runtime-config key the PATCH /api/admin/settings handler (_apply_settings)
 # knows how to validate + apply. A payload key NOT in this set is a typo or a
@@ -86,6 +119,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "notification_config",
         "productive_direction_cooldown_minutes",
         "promotion_enabled",
+        "promotion_enabled_by_project",
         "promotion_threshold",
         "promotion_weights",
         "provider_selection_mode",
@@ -280,6 +314,11 @@ async def get_settings(
         )
         in ("balanced", "preferred"),
         "providers": _build_provider_catalog(_runtime_config),
+        # Published, backend-owned task-capability contract. Operator/agent
+        # surfaces consume this map instead of maintaining private task-type
+        # tables; it is purely additive so existing settings consumers are
+        # unaffected. Also available standalone at GET /api/admin/task-capabilities.
+        "task_capabilities": task_capability_contract(),
         "provider_settings_defaults": _runtime_config.get(
             "provider_settings_defaults", {}
         ),
@@ -314,6 +353,12 @@ async def get_settings(
             "ci_backstop_timeout_minutes", 60
         ),
         "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
+        "promotion_enabled_by_project": {
+            str(k): bool(v)
+            for k, v in (
+                _runtime_config.get("promotion_enabled_by_project") or {}
+            ).items()
+        },
         "smoketest_enabled": bool(_runtime_config.get("smoketest_enabled", False)),
         "promotion_threshold": _runtime_config.get("promotion_threshold"),
         "promotion_weights": _runtime_config.get("promotion_weights"),
@@ -483,6 +528,19 @@ async def get_provider_catalog(
     return {"providers": _build_provider_catalog(_runtime_config)}
 
 
+@router.get("/task-capabilities")
+async def get_task_capabilities(
+    current_user: dict = Depends(require_admin),
+):
+    """Publish the authoritative task-capability contract.
+
+    Mirrors the ``task_capabilities`` key embedded in GET /settings, exposed as
+    a standalone, backend-owned endpoint so operator and agent surfaces can fetch
+    the capability contract without pulling the full settings payload.
+    """
+    return {"task_capabilities": task_capability_contract()}
+
+
 @router.patch("/settings")
 @limiter.limit("30/minute")
 async def update_settings(
@@ -625,6 +683,33 @@ async def _apply_settings(
         _runtime_config["promotion_enabled"] = bool(payload["promotion_enabled"])
     if "smoketest_enabled" in payload:
         _runtime_config["smoketest_enabled"] = bool(payload["smoketest_enabled"])
+    if "promotion_enabled_by_project" in payload:
+        raw = payload["promotion_enabled_by_project"]
+        # Per-project live-promotion overrides: a mapping of project-id strings to
+        # booleans. An empty map means every project falls back to the fleet-wide
+        # promotion_enabled. Validated strictly (reject 400 on a non-mapping or an
+        # empty key) then normalized to bools before storing.
+        if not isinstance(raw, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "promotion_enabled_by_project must be a mapping of "
+                    "project-id strings to booleans"
+                ),
+            )
+        cleaned_promo: dict[str, bool] = {}
+        for key, value in raw.items():
+            sid = str(key).strip()
+            if not sid:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "promotion_enabled_by_project keys must be "
+                        "non-empty project ids"
+                    ),
+                )
+            cleaned_promo[sid] = bool(value)
+        _runtime_config["promotion_enabled_by_project"] = cleaned_promo
     if "promotion_threshold" in payload:
         try:
             val = float(payload["promotion_threshold"])
@@ -1098,6 +1183,12 @@ async def _apply_settings(
                     status_code=400,
                     detail=f"task_type_categories[{category}] must be a list of task-type strings",
                 )
+            # Members are task types — reject typoed/unknown ones. Every
+            # registered task type can be categorized, so the allowlist is the
+            # full registry.
+            _reject_unknown_task_types(
+                f"task_type_categories[{category}]", members, ALL_TASK_TYPES
+            )
         _runtime_config["task_type_categories"] = val
     if "category_routing" in payload:
         val = payload["category_routing"]
@@ -1153,6 +1244,11 @@ async def _apply_settings(
             )
         valid_providers = {p.value for p in LLMProviderName}
         valid_effort = {"low", "medium", "high", "max"}
+        # Keys are task types whose provider routing is being overridden — gate
+        # on the registry's provider-configurable subset.
+        _reject_unknown_task_types(
+            "task_type_routing", val.keys(), PROVIDER_CONFIGURABLE_TASK_TYPES
+        )
         for task_type, entry in val.items():
             if not isinstance(task_type, str) or not task_type:
                 raise HTTPException(
@@ -1205,6 +1301,13 @@ async def _apply_settings(
                 status_code=400, detail="task_type_model_preferences must be a dict"
             )
         valid_providers = {p.value for p in LLMProviderName}
+        # Keys are task types whose model preferences are being configured — gate
+        # on the registry's provider-configurable subset.
+        _reject_unknown_task_types(
+            "task_type_model_preferences",
+            val.keys(),
+            PROVIDER_CONFIGURABLE_TASK_TYPES,
+        )
         for task_type, prefs in val.items():
             if not isinstance(task_type, str) or not task_type:
                 raise HTTPException(
@@ -1294,6 +1397,13 @@ async def _apply_settings(
                 status_code=400, detail="task_type_provider_overrides must be a dict"
             )
         valid_providers = {p.value for p in LLMProviderName}
+        # Keys are task types whose provider settings are being overridden — gate
+        # on the registry's provider-configurable subset.
+        _reject_unknown_task_types(
+            "task_type_provider_overrides",
+            val.keys(),
+            PROVIDER_CONFIGURABLE_TASK_TYPES,
+        )
         cleaned_overrides: dict[str, dict[str, dict]] = {}
         for task_type, per_provider in val.items():
             if not isinstance(task_type, str) or not task_type:
@@ -1389,12 +1499,12 @@ async def _apply_settings(
             raise HTTPException(
                 status_code=400, detail="autonomous_periodic_tasks must be a dict"
             )
-        VALID_TYPES = {"security_audit", "qa", "deps"}
+        # Periodic-eligibility is registry-derived (capability.periodic_eligible),
+        # not a hardcoded tuple.
+        _reject_unknown_task_types(
+            "autonomous_periodic_tasks", val.keys(), PERIODIC_TASK_TYPES
+        )
         for type_key, type_cfg in val.items():
-            if type_key not in VALID_TYPES:
-                raise HTTPException(
-                    status_code=400, detail=f"Invalid task type: {type_key}"
-                )
             if not isinstance(type_cfg, dict):
                 raise HTTPException(
                     status_code=400, detail=f"Config for {type_key} must be a dict"
@@ -1623,14 +1733,14 @@ async def _apply_settings(
             raise HTTPException(
                 status_code=400, detail="reserved_slots_for_types must be a dict"
             )
-        VALID_RESERVED_TYPES = {"create", "research", "plan"}
+        # Reserved-slot eligibility is registry-derived (capability.reservable),
+        # not a hardcoded tuple — a newly registered reservable type is accepted
+        # here automatically.
+        _reject_unknown_task_types(
+            "reserved_slots_for_types", val.keys(), RESERVABLE_TASK_TYPES
+        )
         normalized: Dict[str, int] = {}
         for type_key, count in val.items():
-            if type_key not in VALID_RESERVED_TYPES:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"reserved_slots_for_types: invalid task type {type_key}; must be one of {sorted(VALID_RESERVED_TYPES)}",
-                )
             try:
                 cnt = int(count)
             except (ValueError, TypeError):
@@ -2047,6 +2157,17 @@ async def _apply_settings(
                     "promotion_enabled": bool(
                         _runtime_config.get("promotion_enabled", False)
                     ),
+                    # Persist the per-project live-promotion overrides so a
+                    # per-project arm/hold (set via /promotion-enabled or the raw
+                    # PATCH) survives a Cloud Run restart. runtime_config_state.
+                    # sync_* reads this key back on boot; without it the in-memory
+                    # map reverts to {} (all-fleet-default) and overrides are lost.
+                    "promotion_enabled_by_project": {
+                        str(k): bool(v)
+                        for k, v in (
+                            _runtime_config.get("promotion_enabled_by_project") or {}
+                        ).items()
+                    },
                     "smoketest_enabled": bool(
                         _runtime_config.get("smoketest_enabled", False)
                     ),

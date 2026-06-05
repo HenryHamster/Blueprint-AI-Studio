@@ -56,13 +56,21 @@ npm run dev
 
 ### 3. Creating a Feature Branch
 
+For Blueprint's own self-repo (which uses multi-branch promotion):
 ```bash
-git checkout -b feature/my-feature automain
+git checkout -b feature/my-feature automain  # Integration branch for self-repo
 # ... make changes ...
 git add <files>
 git commit -m "Describe the change"
 git push origin feature/my-feature
 ```
+
+For other repositories:
+```bash
+git checkout -b feature/my-feature main  # Or your project's integration branch
+```
+
+See [DATA_MODELS.md — integration_branch](DATA_MODELS.md#project) for details on per-project branching configuration.
 
 ### 4. Running Tests
 

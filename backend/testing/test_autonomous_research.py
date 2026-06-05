@@ -317,6 +317,59 @@ async def test_spawn_skipped_when_all_directions_non_active(db_session):
 
 
 @pytest.mark.asyncio
+async def test_blocked_research_lane_keeps_direction_out_of_respawn(db_session):
+    """A direction whose prior research task is BLOCKED on an upstream
+    prerequisite stays structurally occupied — even past cooldown — so the
+    autonomous loop does not open a fresh research cycle on it."""
+    direction = {
+        **_active_direction("d-blocked1", "Parked on prerequisite"),
+        # 5h ago — well past the 4h direction cooldown, so the ONLY thing that
+        # can hold this direction is the BLOCKED lane itself.
+        "last_researched_at": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+    }
+    project = Project(
+        name="Blocked Lane Hold",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},  # Non-empty vision so force_strategic doesn't fire
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    blocked = Task(
+        project_id=project.id,
+        title="Research: parked",
+        payloads=[
+            {
+                "type": "research",
+                "current_direction_id": "d-blocked1",
+                "directions": [direction],
+                "base_branch": "main",
+            }
+        ],
+        status=TaskStatus.BLOCKED,
+        blocker_kind="upstream_dependency",
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(blocked)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research_tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research_tasks) == 1, (
+        "No fresh research cycle should spawn while the direction's prior lane is "
+        "BLOCKED on an upstream prerequisite — only the pre-existing blocked task remains"
+    )
+    assert research_tasks[0].id == blocked.id
+
+
+@pytest.mark.asyncio
 async def test_all_paused_directions_still_get_strategic_via_backstop(db_session, mocker):
     """Regression: when every active direction is recommended_mode=pause, the
     wall-clock strategic backstop must still fire a strategic cycle.
@@ -4630,6 +4683,56 @@ async def test_research_history_entry_has_correct_fields(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_research_history_verification_basis_distribution(db_session, mocker):
+    """research_history entry carries a per-direction verification_basis_distribution
+    counting each basis, with missing/invalid coerced to pattern_inferred."""
+    direction_id = "d-vbasis1"
+    direction = {
+        **_active_direction(direction_id, "Verification basis direction"),
+        "research_history": [],
+    }
+    project = Project(
+        name="Verification Basis Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    code_f = {**_make_finding("Code verified finding", direction_id),
+              "verification_basis": "code_verified"}
+    path_f = {**_make_finding("Path verified finding", direction_id),
+              "verification_basis": "path_verified"}
+    missing_f = _make_finding("Missing basis finding", direction_id)
+    invalid_f = {**_make_finding("Invalid basis finding", direction_id),
+                 "verification_basis": "guessed"}
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[code_f, path_f, missing_f, invalid_f],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    updated = next(d for d in project.directions if d["id"] == direction_id)
+    history = updated.get("research_history", [])
+    assert len(history) == 1
+    dist = history[0].get("verification_basis_distribution")
+    assert dist is not None
+    assert dist["code_verified"] == 1
+    assert dist["path_verified"] == 1
+    # Missing + invalid both coerce to pattern_inferred.
+    assert dist["pattern_inferred"] == 2
+    assert dist["deduced"] == 0
+
+
+@pytest.mark.asyncio
 async def test_research_history_capped_at_10_entries(db_session, mocker):
     """research_history is truncated to 10 entries — oldest entry is dropped."""
     direction_id = "d-histcap1"
@@ -5688,9 +5791,10 @@ async def test_type_distribution_and_product_ratio(db_session):
     assert type_dist.get("fix") == 1, f"Expected 1 fix task, got {type_dist}"
     assert type_dist.get("refactor") == 1, f"Expected 1 refactor task, got {type_dist}"
 
-    # product_ratio: 2 product (create) out of 4 total = 0.5
+    # product_ratio now follows PRODUCT_TASK_TYPES: create/create/fix are
+    # product, refactor is structural.
     product_ratio = entry.get("product_ratio")
-    assert product_ratio == 0.5, f"Expected product_ratio=0.5, got {product_ratio}"
+    assert product_ratio == 0.75, f"Expected product_ratio=0.75, got {product_ratio}"
 
     # type_breakdown: per-type created/merged/failed counts so research agents
     # can see which finding types ship vs fail.

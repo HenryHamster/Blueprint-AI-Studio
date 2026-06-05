@@ -60,6 +60,7 @@ vi.mock('../prompt.js', async (importOriginal) => {
     configureAgentPermissions: vi.fn().mockReturnValue([]),
     writePlaybookHelper: vi.fn(),
     writeMessagesHelper: vi.fn(),
+    writeDesignDocHelper: vi.fn(),
     excludeAgentHelpers: vi.fn(),
     buildRetryContext: vi.fn().mockReturnValue(''),
     formatPlaybook: vi.fn().mockReturnValue(''),
@@ -71,6 +72,8 @@ import { runClaudeCode, persistAndPostStatus, getProviderRunner } from '../index
 import { execFileSync } from 'child_process';
 import { handlePlan, handleResearch } from './research-plan.js';
 import { handleStrategic } from './strategic.js';
+import { writeDesignDocHelper } from '../prompt.js';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 import {
   calcMessageAge,
   parseResearchContext,
@@ -1395,8 +1398,8 @@ describe('buildVersionPhaseSection', () => {
   it('renders a dry_run last_qualification and instructs the agent NOT to re-emit qualify_request', () => {
     // A finalized dry-run already fully evaluated its candidate. Re-emitting
     // qualify_request for the SAME candidate re-spawns agent VMs for nothing
-    // (the orchestrator's already_dry_run guard ignores it) — the prompt must
-    // discourage it. H1: extends the pending-only guard to dry_run.
+    // (the orchestrator's cached_verdict guard ignores it) — the prompt must
+    // discourage it. H1: extends the pending-only guard to conclusive verdicts.
     const result = buildVersionPhaseSection({
       version_number: 6,
       phase: 'stabilize',
@@ -1976,12 +1979,32 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     vi.mocked(fs.readFileSync).mockReturnValue('');
   });
 
+  // ── design-doc helper provisioning (prompt contract honesty) ─────────────────
+  // The plan/research prompt advertises `./design-doc get <key>`; the workspace
+  // must actually provision that helper (read-only) so the contract is honest.
+  it('handlePlan provisions the read-only ./design-doc helper it advertises', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    expectCalledWith(writeDesignDocHelper, FP_TASK_ID, expect.anything(), { readOnly: true });
+  });
+
+  it('handleResearch provisions the read-only ./design-doc helper it advertises', async () => {
+    await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    expectCalledWith(writeDesignDocHelper, FP_TASK_ID, expect.anything(), { readOnly: true });
+  });
+
   // ── handlePlan fingerprints ──────────────────────────────────────────────────
 
   it('handlePlan prompt contains depends_on_indices (plan output schema cue)', async () => {
     await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
     const p = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(p).toContain('depends_on_indices');
+  });
+
+  it('handlePlan prompt instructs cross-file BUILD-ON ordering (consumer after producer)', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('BUILD-ON ordering');
+    expect(p).toContain('DIFFERENT files');
   });
 
   it('handlePlan prompt contains "subtasks" (plan JSON output schema root key)', async () => {
@@ -2056,6 +2079,19 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
     const p = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(p).toContain('actionability_grade');
+  });
+
+  it('handleResearch prompt contains verification_basis schema field, all four enum values, and the orthogonality note', async () => {
+    await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('verification_basis');
+    expect(p).toContain('code_verified');
+    expect(p).toContain('path_verified');
+    expect(p).toContain('pattern_inferred');
+    expect(p).toContain('deduced');
+    // Orthogonal to actionability_grade and optional with a pattern_inferred default.
+    expect(p).toContain('ORTHOGONAL');
+    expect(p).toContain('defaults to pattern_inferred');
   });
 
   it('handleResearch prompt contains /tmp/research_progress_ second output file', async () => {

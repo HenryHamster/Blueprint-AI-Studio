@@ -5,10 +5,12 @@ import { ColumnsPicker } from './components/ColumnsPicker';
 import type { ColumnPref } from './components/ColumnsPicker';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { useAppState } from './useAppState';
+import { matchesTaskTypeFilter, resolveTaskCapabilities, TaskCapabilitiesProvider } from './taskCapabilities';
 import { usePoller, DEFAULT_POLL_MS } from './hooks/usePoller';
 import { DirectionsPanel } from './components/DirectionsPanel';
 import TaskStreamPanel from './components/TaskStreamPanel';
 import { ResearchBrowser } from './components/ResearchBrowser';
+import { KnowledgeBrowser } from './components/KnowledgeBrowser';
 import { PipelineView } from './components/PipelineView';
 import { ProjectDashboard } from './components/ProjectDashboard';
 import { auth, signInWithGoogle, signOut } from './firebase';
@@ -49,8 +51,8 @@ import { VersionMismatchBanner } from './components/VersionMismatchBanner';
 import { DiagnosticsPanel } from './components/DiagnosticsPanel';
 import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPanel';
 import { PlaybookPanel } from './components/PlaybookPanel';
+import { TaskTypeCatalogPanel } from './components/TaskTypeCatalogPanel';
 import { WarmVmPanel } from './components/WarmVmPanel';
-import { FILTER_TASK_TYPE_IDS } from './taskCapabilities';
 import { parseTimestamp } from './utils/time';
 
 const COLUMNS: KanbanColumn[] = [
@@ -98,6 +100,11 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(SORT_KEY, sortBy);
   }, [sortBy]);
+  const resolvedTaskCapabilities = useMemo(
+    () => resolveTaskCapabilities(s.taskCapabilityContract),
+    [s.taskCapabilityContract],
+  );
+  const filterTaskTypeIds = resolvedTaskCapabilities.filterIds;
 
   // Snapshot of the full task-board filter combination + sort, fed to the saved-views
   // switcher so it can detect "modified" state and capture new views.
@@ -437,8 +444,7 @@ export default function App() {
     const cutoff = s.dateRange !== 'all' ? now - dateRangeCutoffs[s.dateRange] : null;
     return s.tasks.filter(t => {
       const taskType = t.task_type || (t.payloads?.[0] as Record<string, unknown>)?.type as string || 'create';
-      const knownTypes: readonly string[] = FILTER_TASK_TYPE_IDS;
-      const typeMatch = s.taskTypeFilter.includes(taskType) || (!knownTypes.includes(taskType) && s.taskTypeFilter.length === knownTypes.length);
+      const typeMatch = matchesTaskTypeFilter(taskType, s.taskTypeFilter, filterTaskTypeIds);
       const statusMatch = s.statusFilter.includes(t.status);
       const query = s.searchQuery.toLowerCase();
       const searchMatch = !query || t.id.toLowerCase().includes(query) || (t.title?.toLowerCase().includes(query)) || (t.description?.toLowerCase().includes(query)) || (t.latest_status_message?.toLowerCase().includes(query));
@@ -453,7 +459,7 @@ export default function App() {
       return typeMatch && statusMatch && searchMatch && projectMatch && dateMatch && blockedMatch && approvalMatch && failureClassMatch && stuckMatch;
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [s.tasks, s.taskTypeFilter, s.statusFilter, s.searchQuery, s.selectedProjectId, s.dateRange, s.blockedFilter, s.requiresApproval, s.stuckFilter, s.stuckMinSeconds, stuckTaskIds, s.failureClassFilter]);
+  }, [s.tasks, s.taskTypeFilter, s.statusFilter, s.searchQuery, s.selectedProjectId, s.dateRange, s.blockedFilter, s.requiresApproval, s.stuckFilter, s.stuckMinSeconds, stuckTaskIds, s.failureClassFilter, filterTaskTypeIds]);
 
   const orderedExportTasks = useMemo(() => {
     if (s.viewMode !== 'kanban') return filteredTasks;
@@ -524,6 +530,7 @@ export default function App() {
 
   return (
     <ErrorBoundary>
+    <TaskCapabilitiesProvider contract={s.taskCapabilityContract}>
     <div className="flex flex-col bg-neutral-950 text-neutral-200 font-sans p-3 md:p-6 min-h-screen md:h-screen md:overflow-hidden">
       {s.refreshing && (
         <div className="fixed top-0 left-0 right-0 z-50 h-0.5 bg-neutral-800 overflow-hidden">
@@ -556,6 +563,8 @@ export default function App() {
         onSetViewMode={s.setViewMode}
         showResearchBrowser={s.showResearchBrowser}
         onToggleResearchBrowser={() => s.setShowResearchBrowser(prev => !prev)}
+        showKnowledgeBrowser={s.showKnowledgeBrowser}
+        onToggleKnowledgeBrowser={() => s.setShowKnowledgeBrowser(prev => !prev)}
         showArchive={s.showArchive}
         onToggleArchive={() => s.setShowArchive(!s.showArchive)}
         showMessages={s.showMessages}
@@ -738,6 +747,7 @@ export default function App() {
       <ProjectDashboard
         projects={s.projects}
         tasks={s.tasks}
+        dataStale={s.projectsFetchError != null}
         selectedProjectId={s.selectedProjectId}
         onSelectProject={s.setSelectedProjectId}
         userRole={s.userRole}
@@ -993,13 +1003,14 @@ export default function App() {
 
           {s.viewMode === 'home' ? (
             <>
-              <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} projects={s.projects} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onCategoryClick={(cat) => { setSrMissedCategory(cat); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} onScopeClick={(scope) => { setSrMissedScope(scope); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} onConfigureTargets={handleConfigureTargets} onSpawnOrphanFix={(pr) => s.openPrefilledTaskModal({ taskType: 'fix', title: pr.pr_title, prompt: `PR #${pr.pr_number} is open but has no active task — investigate and either close or push remediation. PR: ${pr.pr_url}`, prNumber: pr.pr_number, prBranch: pr.pr_branch })} /></ErrorBoundary>
+              <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} projects={s.projects} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onCategoryClick={(cat) => { setSrMissedCategory(cat); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} onScopeClick={(scope) => { setSrMissedScope(scope); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} onConfigureTargets={handleConfigureTargets} onSpawnOrphanFix={(pr) => s.openPrefilledTaskModal({ taskType: 'fix', title: pr.pr_title, prompt: `PR #${pr.pr_number} is open but has no active task — investigate and either close or push remediation. PR: ${pr.pr_url}`, prNumber: pr.pr_number, prBranch: pr.pr_branch })} onPanelReviewPr={(pr) => s.openPrefilledTaskModal({ taskType: 'panel_review', title: `Panel review PR #${pr.pr_number}`, prompt: '', prNumber: pr.pr_number, prBranch: pr.pr_branch, baseBranch: pr.pr_base_branch })} userRole={s.userRole} /></ErrorBoundary>
               {s.userRole === 'admin' && s.selectedProjectId && (
                 <ErrorBoundary level="panel">
                   <SrMissedRetrospectivesPanel selectedProjectId={s.selectedProjectId} onSelectTask={handleViewTask} activeCategory={srMissedCategory} activeScope={srMissedScope} activeInvestigationTaskIds={srInvestigationTaskIds} />
                 </ErrorBoundary>
               )}
               <PlaybookPanel selectedProjectId={s.selectedProjectId} />
+              <TaskTypeCatalogPanel />
               {s.selectedProjectId && (
                 <div ref={srMissedRef} className="shrink-0 mt-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
                   <button
@@ -1132,6 +1143,7 @@ export default function App() {
           useManualBranch={s.useManualBranch}
           setUseManualBranch={s.setUseManualBranch}
           setBranchOptions={s.setBranchOptions}
+          launchableTaskTypeOptions={s.launchableTaskTypeOptions}
           taskBranchDefaultsReady={s.taskBranchDefaultsReady}
           taskBranchDefaultsLoading={s.taskBranchDefaultsLoading}
           taskBranchDefaultsError={s.taskBranchDefaultsError}
@@ -1175,6 +1187,25 @@ export default function App() {
         />
       )}
 
+      {s.showKnowledgeBrowser && (
+        <KnowledgeBrowser
+          selectedProjectId={s.selectedProjectId}
+          onClose={() => s.setShowKnowledgeBrowser(false)}
+          onLaunchWebResearchTask={s.openWebResearchTaskModal}
+          onNavigateToTask={(taskId) => {
+            s.setShowKnowledgeBrowser(false);
+            const target = s.tasks.find(t => t.id === taskId);
+            if (target) {
+              s.handleViewLogs(target);
+            } else {
+              fetchTask(taskId).then(s.handleViewLogs).catch(() => {
+                s.addToast('Could not load task — it may have been deleted', 'error');
+              });
+            }
+          }}
+        />
+      )}
+
       {s.logTask && (
         <ErrorBoundary level="panel">
         <TaskDetailDrawer
@@ -1194,6 +1225,18 @@ export default function App() {
           onEditPrompt={s.handleEditPrompt}
           onDismiss={s.handleDismiss}
           onDuplicate={s.openDuplicateTaskModal}
+          onPanelReview={(task) => {
+            const payload = (task.payloads?.[0] ?? {}) as Record<string, unknown>;
+            const prNumber = payload.pr_number as number | undefined;
+            s.openPrefilledTaskModal({
+              taskType: 'panel_review',
+              title: `Panel review PR #${prNumber ?? ''}`,
+              prompt: '',
+              prNumber,
+              prBranch: payload.branch as string | undefined,
+              baseBranch: payload.base_branch as string | undefined,
+            });
+          }}
           onWidthChange={setDrawerWidth}
           onNavigateToTask={(taskId) => {
             const target = s.tasks.find(t => t.id === taskId);
@@ -1287,6 +1330,7 @@ export default function App() {
         />
       )}
     </div>
+    </TaskCapabilitiesProvider>
     </ErrorBoundary>
   );
 }

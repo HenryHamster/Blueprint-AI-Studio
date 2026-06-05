@@ -38,6 +38,7 @@ def _invalid(raw: dict) -> str:
 EXPECTED_TYPES = {
     "create",
     "review",
+    "panel_review",
     "fix",
     "plan",
     "research",
@@ -57,10 +58,13 @@ EXPECTED_TYPES = {
     "release_audit",
     "memo",
     "verify_tests",
+    "compute_experiment",
+    "web_research",
+    "design",
 }
 
 
-def test_task_type_enum_has_all_21_types():
+def test_task_type_enum_has_all_expected_types():
     values = {t.value for t in TaskType}
     assert values == EXPECTED_TYPES
 
@@ -76,10 +80,10 @@ def test_model_for_type_covers_all_task_types():
     assert set(_MODEL_FOR_TYPE.keys()) == set(TaskType)
 
 
-def test_model_for_type_count_is_21():
+def test_model_for_type_count_matches_enum():
     from app.payload_schemas import _MODEL_FOR_TYPE
 
-    assert len(_MODEL_FOR_TYPE) == 21
+    assert len(_MODEL_FOR_TYPE) == len(TaskType)
 
 
 # ---------------------------------------------------------------------------
@@ -132,11 +136,78 @@ def test_fix_passes():
         "perf",
         "self_audit",
         "verify_tests",
+        "compute_experiment",
     ],
 )
 def test_system_populated_types_pass_with_no_extra_fields(task_type):
     result = _valid({"type": task_type})
     assert result["type"] == task_type
+
+
+def test_compute_experiment_payload_carries_launch_and_benchmark_fields():
+    raw = {
+        "type": "compute_experiment",
+        "command": "python bench.py --suite full",
+        "machine_type": "e2-standard-8",
+        "spend_cap_usd": 2.5,
+        "deadline_seconds": 1800,
+        "experiment": "perf-sweep-v3",
+        "benchmark": "throughput",
+        "metric": "tokens_per_sec",
+    }
+    result = _valid(raw)
+    assert result["type"] == "compute_experiment"
+    assert result["command"] == "python bench.py --suite full"
+    assert result["spend_cap_usd"] == 2.5
+    assert result["deadline_seconds"] == 1800
+    assert result["experiment"] == "perf-sweep-v3"
+
+
+def test_compute_experiment_payload_tolerates_extra_benchmark_fields():
+    # Backward-compatible extra-field tolerance: a new benchmark field that the
+    # schema does not declare must round-trip rather than be rejected/dropped.
+    raw = {
+        "type": "compute_experiment",
+        "command": "run-eval",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 600,
+        "dataset_shards": [1, 2, 3],
+    }
+    result = _valid(raw)
+    assert result["dataset_shards"] == [1, 2, 3]
+
+
+def test_compute_experiment_payload_accepts_success_criterion():
+    # A well-formed goal-level acceptance criterion round-trips through the schema.
+    raw = {
+        "type": "compute_experiment",
+        "command": "run-eval",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 600,
+        "success_criterion": {
+            "metric": "accuracy",
+            "operator": ">=",
+            "threshold": 0.9,
+        },
+    }
+    result = _valid(raw)
+    assert result["success_criterion"]["metric"] == "accuracy"
+    assert result["success_criterion"]["operator"] == ">="
+    assert result["success_criterion"]["threshold"] == 0.9
+
+
+def test_compute_experiment_payload_rejects_unknown_criterion_operator():
+    # The operator is a closed Literal set — an unrecognized operator is rejected.
+    raw = {
+        "type": "compute_experiment",
+        "command": "run-eval",
+        "success_criterion": {
+            "metric": "accuracy",
+            "operator": "approx",
+            "threshold": 0.9,
+        },
+    }
+    _invalid(raw)
 
 
 def test_verify_tests_payload_with_branch_and_pr_number():
@@ -623,9 +694,14 @@ def test_fix_omit_optional_fields_passes():
 
 
 def test_perf_prompt_optional_accepted():
-    raw = {"type": "perf", "prompt": "Profile the hot path"}
+    raw = {
+        "type": "perf",
+        "prompt": "Profile the hot path",
+        "max_severity": "medium",
+    }
     result = _valid(raw)
     assert result["prompt"] == "Profile the hot path"
+    assert result["max_severity"] == "medium"
 
 
 def test_perf_omit_prompt_passes():
@@ -828,6 +904,65 @@ def test_base_branch_explicit_value_preserved():
     """Explicitly supplied base_branch values are still accepted and returned."""
     result = _valid({"type": "create", "prompt": "x", "base_branch": "trunk"})
     assert result["base_branch"] == "trunk"
+
+
+# ---------------------------------------------------------------------------
+# Registry-tolerant fallback for unregistered payload models
+# ---------------------------------------------------------------------------
+
+
+def test_registered_type_without_bespoke_model_uses_base_payload():
+    """When a task type is registered in the enum but absent from
+    _MODEL_FOR_TYPE, validation should fall back to BasePayload
+    (extra='allow' + shared constraints) rather than crashing with KeyError.
+
+    This enables new task types to be runnable by registration alone.
+    """
+    from app.payload_schemas import _MODEL_FOR_TYPE
+
+    # Temporarily remove a system-populated type from the dispatch to simulate
+    # a newly-registered type that hasn't been added to the dispatch yet.
+    original = _MODEL_FOR_TYPE.pop(TaskType.debug, None)
+    try:
+        # Should validate against BasePayload, not crash with KeyError
+        result = _valid({"type": "debug"})
+        assert result["type"] == "debug"
+
+        # Extra fields should be preserved (BasePayload has extra='allow')
+        result = _valid({"type": "debug", "custom_field": "custom_value"})
+        assert result["custom_field"] == "custom_value"
+
+        # Base-payload constraints (e.g., effort pattern) still apply
+        msg = _invalid({"type": "debug", "effort": "invalid_effort"})
+        assert "debug" in msg
+    finally:
+        # Restore the original entry
+        if original is not None:
+            _MODEL_FOR_TYPE[TaskType.debug] = original
+
+
+def test_registered_type_without_model_still_enforces_size_budget():
+    """When a type falls back to BasePayload, the size-budget gate
+    must still reject payloads that exceed _MAX_PAYLOAD_BYTES.
+    """
+    from app.payload_schemas import _MODEL_FOR_TYPE
+
+    # Temporarily remove a type to force BasePayload fallback
+    original = _MODEL_FOR_TYPE.pop(TaskType.qa, None)
+    try:
+        # Build an oversized payload
+        big_blob = {"data": ["x" * 100] * 5000}
+        raw = {"type": "qa", "custom_huge_field": big_blob}
+
+        # Should fail on size, not validate silently
+        with pytest.raises(PayloadTooLargeError) as exc_info:
+            validate_task_payload(raw)
+        err = exc_info.value
+        assert err.size > _MAX_PAYLOAD_BYTES
+        assert "custom_huge_field" in [k for k, _ in err.top_keys]
+    finally:
+        if original is not None:
+            _MODEL_FOR_TYPE[TaskType.qa] = original
 
 
 # ---------------------------------------------------------------------------

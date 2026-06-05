@@ -2,6 +2,12 @@ import { useState, useEffect, useMemo } from 'react';
 import { ChevronDown, ChevronUp } from 'lucide-react';
 import { timeAgo } from '../utils/time';
 import { TAXONOMY_ORDER, TAXONOMY_LABELS, TAXONOMY_COLORS, STAGE_ORDER, STAGE_COLORS } from './taxonomyConstants';
+import {
+  hasNonCodeMergeOutcomes,
+  healthRateColorClass,
+  summarizeOutcomeKinds,
+  type OutcomeKindBreakdown,
+} from '../utils/outcomeKinds';
 
 export interface DirectionProgress {
   direction_id: string;
@@ -56,6 +62,11 @@ export interface DirectionProgress {
   lifetime_prs_rejected?: number;
   lifetime_tasks_failed?: number;
   lifetime_conversion_rate?: number | null;
+  // Generalized cross-task-type success, surfaced alongside the PR-merge count.
+  generalized_successes?: number | null;
+  generalized_terminal_outcomes?: number | null;
+  generalized_health_rate?: number | null;
+  outcome_kind_breakdown?: OutcomeKindBreakdown | null;
   review_quality?: {
     reviews_dismissed?: number;
     reviews_overridden?: number;
@@ -176,6 +187,14 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                 {typeof dp.prs_rejected === 'number' && dp.prs_rejected > 0 && (
                   <span className="text-[9px] bg-red-500/10 text-red-400 border border-red-500/20 px-1.5 py-0.5 rounded" title="PRs rejected">
                     {dp.prs_rejected} rejected
+                  </span>
+                )}
+                {hasNonCodeMergeOutcomes(dp.outcome_kind_breakdown) && (
+                  <span
+                    className={`text-[9px] bg-neutral-700/30 border border-neutral-700/30 px-1.5 py-0.5 rounded ${healthRateColorClass(dp.generalized_health_rate)}`}
+                    title="Generalized success across task types (code merges + research/audit/memo/verification), distinct from PR merges"
+                  >
+                    {dp.generalized_successes ?? 0} eval{typeof dp.generalized_health_rate === 'number' ? ` · ${Math.round(dp.generalized_health_rate * 100)}%` : ''}
                   </span>
                 )}
                 {dp.possibly_saturated && (
@@ -357,6 +376,20 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                         </span>
                       );
                     })}
+                  </div>
+                )}
+                {hasNonCodeMergeOutcomes(dp.outcome_kind_breakdown) && (
+                  <div className="flex flex-wrap items-center gap-1">
+                    <span className="text-[9px] text-neutral-600 uppercase tracking-wide">outcomes:</span>
+                    {summarizeOutcomeKinds(dp.outcome_kind_breakdown).map(row => (
+                      <span
+                        key={row.kind}
+                        className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded"
+                        title={`${row.label}: ${row.success} success / ${row.neutral} neutral / ${row.failure} failure`}
+                      >
+                        {row.label} {row.success}/{row.terminal}
+                      </span>
+                    ))}
                   </div>
                 )}
                 {dp.taxonomy_summary && Object.keys(dp.taxonomy_summary).length > 0 && (

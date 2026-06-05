@@ -15,6 +15,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
+from sqlalchemy import and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -1061,7 +1062,68 @@ def compute_outer_loop_convergence(
         "convergence_rate": convergence_rate,
         "non_converged_total": non_converged_total,
         "dominant_blocker": dominant_blocker,
+        # Non-code outcomes — ADDITIVE. Tasks without a review_loop context
+        # (research, audit, memo, verify_tests, etc.) are not part of the PR
+        # review chain and are absent from convergence_rate. This sub-dict
+        # surfaces their generalized outcome so they are visible alongside the
+        # PR-chain metrics rather than silently excluded from the digest view.
+        "non_code_outcomes": _compute_non_code_outcomes(all_tasks, window_start),
     }
+
+
+def _compute_non_code_outcomes(
+    all_tasks: List[Task], window_start: "datetime"
+) -> Dict[str, Any]:
+    """Summarize terminal outcomes of tasks that are NOT part of PR review chains.
+
+    Uses evaluate_task_outcome so each task type contributes its own honest
+    success signal rather than appearing as a zero-output in the PR-based view.
+    Returns an empty dict when no qualifying tasks exist in the window.
+    """
+    from app.task_outcomes import evaluate_task_outcome  # noqa: PLC0415
+
+    success = 0
+    neutral = 0
+    failure = 0
+    by_kind: Dict[str, Dict[str, int]] = {}
+    for t in all_tasks:
+        # Only terminal tasks have an honest evaluation outcome — in-flight
+        # (RUNNING/PENDING/BLOCKED) tasks would otherwise be scored 'neutral'
+        # and inflate total/neutrals. Mirrors the terminal filter in
+        # direction_outcomes._update_direction_research_outcomes.
+        if t.status not in (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        ):
+            continue
+        if isinstance((t.context or {}).get("review_loop"), dict):
+            continue
+        if t.created_at is not None and t.created_at < window_start:
+            continue
+        outcome = evaluate_task_outcome(t)
+        kind = outcome.kind
+        if kind not in by_kind:
+            by_kind[kind] = {"success": 0, "neutral": 0, "failure": 0}
+        by_kind[kind][outcome.status] += 1
+        if outcome.status == "success":
+            success += 1
+        elif outcome.status == "failure":
+            failure += 1
+        else:
+            neutral += 1
+    total = success + neutral + failure
+    if total == 0:
+        return {}
+    result: Dict[str, Any] = {
+        "total": total,
+        "successes": success,
+        "neutrals": neutral,
+        "failures": failure,
+    }
+    if by_kind:
+        result["by_kind"] = by_kind
+    return result
 
 
 def compute_resurrection_outcome_summary(
@@ -1147,6 +1209,290 @@ def compute_anomaly_adjustment_summary() -> Dict[str, Any]:
             "forced_restoration_count", 0
         ),
         "forced_restored_at": _anomaly_adjustments.get("forced_restored_at"),
+    }
+
+
+# ── Dependency-health observability (read-only) ────────────────────────────
+#
+# Two failure modes the foundation-resolution work exists to prevent are
+# otherwise invisible to operators and to the pipeline's own metrics:
+#   1. PARKED BLOCKERS — a BLOCKED task that outlived its escalation deadline is
+#      escalated once (ERROR alert) and then parked by pushing recheck_after far
+#      into the future (``reaper_sweeps._BLOCKED_ESCALATED_PARK``), dropping it
+#      off the recovery sweep's due-queue until a manual operator requeue. Nothing
+#      counts how many tasks sit in this parked state.
+#   2. DUPLICATED FOUNDATIONS — the file-conflict filter deliberately lets two
+#      write-tasks under DIFFERENT parents touch the same files in parallel and
+#      reconcile at merge, so two tasks independently building the same foundation
+#      are never flagged.
+# Both helpers below are READ-ONLY and observational: they make the patterns
+# measurable without changing resume or conflict-resolution behavior.
+
+# Code-change ("write") task types — the ones that produce a PR and can build a
+# foundation. Mirrors ``sr_review_quality_metrics._SR_CODE_CHANGE_TYPES``.
+_WRITE_TASK_TYPES = frozenset({"create", "fix", "refactor", "migrate"})
+# Two active write-tasks under DIFFERENT parents whose related-file sets overlap
+# by at least this Jaccard ratio are surfaced as a candidate duplicated
+# foundation. Deliberately conservative (strong overlap only) so the signal
+# flags genuine duplication rather than incidental shared-file edits.
+_FOUNDATION_OVERLAP_THRESHOLD = 0.5
+# Defensive caps on the surfaced lists so a large backlog never bloats the digest.
+_PARKED_BLOCKER_LIST_LIMIT = 100
+_DUPLICATE_FOUNDATION_LIST_LIMIT = 50
+
+
+def _task_related_files(t: "Task") -> set:
+    """Best-effort related-file set for a task (context first, then payload)."""
+    files = (t.context or {}).get("related_files")
+    if not isinstance(files, list):
+        files = (t.first_payload or {}).get("related_files")
+    if not isinstance(files, list):
+        return set()
+    return {f for f in files if isinstance(f, str) and f}
+
+
+def compute_parked_blocker_summary(blocked_tasks: List[Task]) -> Dict[str, Any]:
+    """Count and list BLOCKED tasks and base-re-cut-held tasks that are parked.
+
+    Pure function — no database calls. A *parked* item is either:
+      * A BLOCKED task whose context carries ``_blocked_escalated`` (set by
+        ``reaper_sweeps._escalate_blocked_task`` after an operator escalation alert),
+        which stops rechecking and pushes ``recheck_after`` far into the future, OR
+      * A task (any status) with ``_recut_escalated`` marker (set by
+        ``orchestrator_health._record_recut_failure`` when a cross-base re-cut hits
+        conflict threshold), which indicates a persistent base re-cut failure.
+
+    Returns the total count plus a capped list with enough context to find and
+    requeue each one. Newest-parked first.
+    """
+    parked: List[Dict[str, Any]] = []
+    for t in blocked_tasks:
+        ctx = t.context or {}
+        is_blocked_escalated = bool(ctx.get("_blocked_escalated"))
+        is_recut_escalated = bool(ctx.get("_recut_escalated"))
+
+        if not (is_blocked_escalated or is_recut_escalated):
+            continue
+
+        blocked_at = getattr(t, "blocked_at", None)
+        recheck_after = getattr(t, "recheck_after", None)
+
+        # For re-cut holds, use created_at as the "blocked_at" equivalent
+        if is_recut_escalated and not blocked_at:
+            blocked_at = getattr(t, "created_at", None)
+
+        hold_reason = None
+        if is_recut_escalated:
+            outcome = ctx.get("_recut_last_outcome", "unknown")
+            hold_reason = f"Base re-cut {outcome}" if outcome != "unknown" else "Base re-cut hold"
+        elif is_blocked_escalated:
+            hold_reason = None  # blocked_reason will be populated from blocker_kind
+
+        parked.append(
+            {
+                "task_id": str(t.id),
+                "title": t.title or str(t.id)[:8],
+                "project_id": str(t.project_id)
+                if getattr(t, "project_id", None) is not None
+                else None,
+                "blocker_kind": hold_reason or getattr(t, "blocker_kind", None),
+                "blocked_reason": getattr(t, "blocked_reason", None)
+                or t.latest_status_message,
+                "blocked_at": blocked_at.isoformat() if blocked_at else None,
+                "recheck_after": recheck_after.isoformat() if recheck_after else None,
+                "direction_id": ctx.get("direction_id"),
+            }
+        )
+    parked.sort(key=lambda r: r["blocked_at"] or "", reverse=True)
+    return {"total": len(parked), "tasks": parked[:_PARKED_BLOCKER_LIST_LIMIT]}
+
+
+def compute_duplicate_foundation_signal(
+    active_write_tasks: List[Task],
+) -> Dict[str, Any]:
+    """Count candidate duplicated foundations among concurrently-active write-tasks.
+
+    Pure function — no database calls. A *candidate* is a pair of active
+    code-change tasks under DIFFERENT parents whose related-file sets overlap by at
+    least ``_FOUNDATION_OVERLAP_THRESHOLD`` (Jaccard). Same-parent siblings are
+    skipped — those are intra-decomposition work gated by explicit ``depends_on``
+    edges, not the silent cross-parent duplication this signal surfaces. Returns
+    the candidate-pair count plus a capped list (the two task ids, the overlap
+    ratio, and the shared files). Observational only — the pipeline still lets the
+    tasks proceed and reconcile at merge.
+    """
+    enriched = [
+        (t, _task_related_files(t))
+        for t in active_write_tasks
+        if (t.first_payload or {}).get("type") in _WRITE_TASK_TYPES
+    ]
+    enriched = [(t, files) for t, files in enriched if files]
+
+    candidates: List[Dict[str, Any]] = []
+    for i in range(len(enriched)):
+        ti, fi = enriched[i]
+        pi = getattr(ti, "parent_task_id", None)
+        for j in range(i + 1, len(enriched)):
+            tj, fj = enriched[j]
+            pj = getattr(tj, "parent_task_id", None)
+            # Different parents only — same non-None parent reconciles by design.
+            if pi is not None and pi == pj:
+                continue
+            inter = fi & fj
+            if not inter:
+                continue
+            union = fi | fj
+            overlap = len(inter) / len(union)
+            if overlap < _FOUNDATION_OVERLAP_THRESHOLD:
+                continue
+            candidates.append(
+                {
+                    "task_ids": [str(ti.id), str(tj.id)],
+                    "overlap_ratio": round(overlap, 3),
+                    "shared_files": sorted(inter),
+                }
+            )
+    candidates.sort(key=lambda c: c["overlap_ratio"], reverse=True)
+    return {
+        "total": len(candidates),
+        "candidates": candidates[:_DUPLICATE_FOUNDATION_LIST_LIMIT],
+    }
+
+
+# Action-confidence threshold for *converging* (serializing) a pair — strictly
+# ABOVE the observability threshold. Strong overlap alone is intentionally NOT
+# enough: the pipeline lets independent tasks edit shared-infrastructure files in
+# parallel and reconcile at merge. We only auto-serialize a pair on a genuine-
+# duplicate signal (shared finding origin, shared capability marker, or
+# near-identical file sets at this near-1.0 Jaccard), so legitimate parallel work
+# is never needlessly serialized.
+_FOUNDATION_CONVERGE_THRESHOLD = 0.85
+
+
+def _genuine_duplicate_reason(ti: "Task", fi: set, tj: "Task", fj: set):
+    """Return a short reason if ``(ti, tj)`` are a HIGH-CONFIDENCE genuine
+    duplicate foundation, else ``None``. Pure. Any one signal suffices:
+
+      * a shared finding origin (identical non-empty ``finding_hash``),
+      * a shared explicit capability marker, or
+      * near-identical related-file sets (Jaccard >= the convergence threshold).
+
+    Strong-but-partial file overlap below the convergence threshold is NOT
+    genuine — that is the incidental shared-infra case the pipeline reconciles at
+    merge — so it returns ``None`` and the pair is left untouched.
+    """
+    from app.finding_deduplication import _task_finding_hash, _task_capability_markers
+
+    hi, hj = _task_finding_hash(ti), _task_finding_hash(tj)
+    if hi and hi == hj:
+        return f"shared finding origin {hi}"
+    shared_caps = _task_capability_markers(ti) & _task_capability_markers(tj)
+    if shared_caps:
+        return f"shared capability '{sorted(shared_caps)[0]}'"
+    union = fi | fj
+    if union and len(fi & fj) / len(union) >= _FOUNDATION_CONVERGE_THRESHOLD:
+        return f"near-identical file sets ({round(len(fi & fj) / len(union), 3)} Jaccard)"
+    return None
+
+
+def compute_foundation_convergence_actions(
+    active_write_tasks: List[Task],
+) -> List[Dict[str, Any]]:
+    """High-confidence genuine duplicate-foundation pairs to serialize. Pure.
+
+    For each cross-parent pair of active write-tasks that passes
+    :func:`_genuine_duplicate_reason`, emit an action that makes the LATER task
+    (by ``created_at``, id-tiebroken) depend on the earlier — the canonical
+    foundation — so the duplicate rebases on the canonical's landed work and
+    builds-on instead of rebuilding. Earlier-is-canonical ordering keeps the edge
+    direction deterministic and the wired graph acyclic by construction. The
+    caller still applies a self-edge / cycle guard before wiring.
+    """
+    enriched = [
+        (t, _task_related_files(t))
+        for t in active_write_tasks
+        if (t.first_payload or {}).get("type") in _WRITE_TASK_TYPES
+    ]
+
+    def _order_key(t: "Task"):
+        return (getattr(t, "created_at", None) or datetime.min, str(t.id))
+
+    actions: List[Dict[str, Any]] = []
+    for i in range(len(enriched)):
+        ti, fi = enriched[i]
+        pi = getattr(ti, "parent_task_id", None)
+        for j in range(i + 1, len(enriched)):
+            tj, fj = enriched[j]
+            pj = getattr(tj, "parent_task_id", None)
+            if pi is not None and pi == pj:
+                continue
+            reason = _genuine_duplicate_reason(ti, fi, tj, fj)
+            if reason is None:
+                continue
+            canonical, dependent = sorted((ti, tj), key=_order_key)
+            actions.append(
+                {
+                    "dependent_id": str(dependent.id),
+                    "foundation_id": str(canonical.id),
+                    "reason": reason,
+                    "shared_files": sorted(fi & fj),
+                }
+            )
+    return actions
+
+
+async def compute_dependency_health_signals(
+    session: AsyncSession,
+    project_id: "uuid.UUID | None" = None,
+) -> Dict[str, Any]:
+    """Surface the parked-blocker and duplicate-foundation observability signals.
+
+    Read-only: runs two small self-contained queries (parked tasks; active
+    IN_PROGRESS tasks) and delegates to the pure summarizers above. Never mutates
+    state. Scoped to ``project_id`` when provided, else fleet-wide.
+
+    The parked query matches BOTH parked classes the summarizer handles:
+      * BLOCKED tasks carrying ``_blocked_escalated`` (operator-escalated blocks), AND
+      * any-status tasks carrying ``_recut_escalated`` (persistent base re-cut holds,
+        set by ``orchestrator_health._record_recut_failure`` on the dependent —
+        which may be QUEUED or BLOCKED-without-``_blocked_escalated``).
+    Without the ``_recut_escalated`` arm the summarizer's re-cut branch would be
+    unreachable in production.
+    """
+    parked_predicate = or_(
+        and_(
+            Task.status == TaskStatus.BLOCKED,
+            Task.context["_blocked_escalated"].astext == "true",
+        ),
+        Task.context["_recut_escalated"].astext == "true",
+    )
+    blocked_filters = [parked_predicate]
+    if project_id is not None:
+        blocked_filters.append(Task.project_id == project_id)
+    blocked = (
+        (
+            await session.execute(
+                select(Task).where(*blocked_filters).limit(_PARKED_BLOCKER_LIST_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    active_filters = [Task.status == TaskStatus.IN_PROGRESS]
+    if project_id is not None:
+        active_filters.append(Task.project_id == project_id)
+    active = (
+        (await session.execute(select(Task).where(*active_filters).limit(1000)))
+        .scalars()
+        .all()
+    )
+
+    return {
+        "parked_blockers": compute_parked_blocker_summary(list(blocked)),
+        "duplicate_foundation_candidates": compute_duplicate_foundation_signal(
+            list(active)
+        ),
     }
 
 
@@ -1498,12 +1844,37 @@ def compute_digest_cost_economics(
     pipeline_operator_action_count = sum(
         d.get("operator_action_count") or 0 for d in direction_progress_list
     )
+    pipeline_generalized_successes = sum(
+        d.get("generalized_successes", d.get("prs_merged", 0)) or 0
+        for d in direction_progress_list
+    )
+    pipeline_generalized_terminal_outcomes = sum(
+        d.get("generalized_terminal_outcomes", 0) or 0 for d in direction_progress_list
+    )
+    pipeline_generalized_health_rate = (
+        round(
+            pipeline_generalized_successes / pipeline_generalized_terminal_outcomes, 3
+        )
+        if pipeline_generalized_terminal_outcomes > 0
+        else None
+    )
     overall_type_distribution: Dict[str, int] = {}
     for d in direction_progress_list:
         for ttype, cnt in (d.get("type_distribution") or {}).items():
             overall_type_distribution[ttype] = (
                 overall_type_distribution.get(ttype, 0) + cnt
             )
+
+    pipeline_outcome_kind_breakdown: Dict[str, Dict[str, int]] = {}
+    for d in direction_progress_list:
+        for kind, counts in (d.get("outcome_kind_breakdown") or {}).items():
+            bucket = pipeline_outcome_kind_breakdown.setdefault(
+                kind, {"success": 0, "neutral": 0, "failure": 0}
+            )
+            if not isinstance(counts, dict):
+                continue
+            for status in ("success", "neutral", "failure"):
+                bucket[status] += counts.get(status, 0) or 0
 
     pipeline_filter_funnel: Dict[str, int] = {}
     for d in direction_progress_list:
@@ -1528,6 +1899,9 @@ def compute_digest_cost_economics(
         "pipeline_autonomous_prs_merged": pipeline_autonomous_prs_merged,
         "pipeline_assisted_prs_merged": pipeline_assisted_prs_merged,
         "pipeline_operator_action_count": pipeline_operator_action_count,
+        "pipeline_generalized_successes": pipeline_generalized_successes,
+        "pipeline_generalized_health_rate": pipeline_generalized_health_rate,
+        "pipeline_outcome_kind_breakdown": pipeline_outcome_kind_breakdown,
         "overall_type_distribution": overall_type_distribution,
         "pipeline_filter_funnel": pipeline_filter_funnel,
     }
@@ -2045,3 +2419,126 @@ async def compute_release_qualifier_infra_metrics(
         "smoketest_report_missing_count": smoketest_report_missing_count,
         "release_infra_failure_streak_max": release_infra_failure_streak_max,
     }
+
+
+# Minimum number of in-window samples before a task type's average actual cost is
+# allowed to flag as over its declared ceiling. A type that has only run once or
+# twice in the window is too noisy to call "chronically over budget".
+TASK_TYPE_COST_ADHERENCE_MIN_SAMPLES = 3
+
+
+def _cost_pct_float(values: List[float], p: int) -> Optional[float]:
+    """Nearest-rank percentile over a list of floats (None when empty)."""
+    if not values:
+        return None
+    s = sorted(values)
+    return s[min(int(len(s) * p / 100), len(s) - 1)]
+
+
+def compute_task_type_cost_adherence(
+    tasks: List["Task"],
+    *,
+    window_start: datetime,
+    ceilings: Dict[str, Optional[float]],
+    min_samples: int = TASK_TYPE_COST_ADHERENCE_MIN_SAMPLES,
+    compute_job_cost_by_task: Optional[Dict[str, float]] = None,
+) -> List[Dict[str, Any]]:
+    """Per-task-type actual cost (avg/p95/sample count) vs the declared ceiling.
+
+    Pure transform over already-loaded ``Task`` rows — no DB access. Buckets
+    terminal, in-window tasks by their declared type (``first_payload['type']``)
+    and compares the per-type average against the declared ``cost_ceiling_usd``
+    for that type.
+
+    Cost source is type-dependent so the surface is honest for off-VM types:
+
+    * Task types that run on the **compute-job substrate** (registry predicate
+      ``runs_on_compute_substrate`` — ``requires_compute AND NOT requires_code``,
+      e.g. ``compute_experiment``) hold only a lightweight monitoring VM; their
+      real spend lives on the linked ``ComputeJob.final_cost_usd``. For these we
+      source cost from ``compute_job_cost_by_task`` (keyed by ``str(task.id)``),
+      NOT from the task's VM fields. A task with no entry there — or a
+      non-positive entry — contributes no sample (the compute job has not yet
+      reported durable spend).
+    * All other types use ``get_task_total_vm_cost_usd_or_none`` (which includes
+      banked retry spend), as before.
+
+    ``compute_job_cost_by_task`` maps ``str(task_id) -> summed final_cost_usd`` for
+    that task's compute jobs; the caller aggregates it from the ``ComputeJob``
+    ledger. ``None`` (the default) means "no compute-job ledger supplied" — every
+    compute-substrate task then yields no sample, keeping legacy callers valid.
+
+    ``ceilings`` maps task-type id -> declared ceiling (or None for types with no
+    declared ceiling). The returned rows cover every type present in ``ceilings``
+    so the operator catalog can render a row per registered type even when a type
+    has no in-window runs (``sample_count == 0``). ``over_ceiling`` is True only
+    once a type has at least ``min_samples`` observed runs AND its average exceeds
+    a positive declared ceiling — a None or non-positive ceiling never flags, and
+    a thin sample never flags.
+
+    Tasks whose cost is None (never provisioned a VM, no banked spend) contribute
+    no sample. The caller MUST load the columns the cost accessor reads
+    (``vm_provisioned_at``, ``vm_stopped_at``, ``vm_spot``, ``vm_machine_type``,
+    ``vm_runtime_cost_banked`` and ``context``) or SQLAlchemy will lazy-load them
+    off an async session and raise MissingGreenlet.
+    """
+    from app.models import (
+        TaskStatus,
+        get_task_total_vm_cost_usd_or_none,
+    )
+    from app.task_capabilities import runs_on_compute_substrate
+
+    compute_job_cost_by_task = compute_job_cost_by_task or {}
+    _terminal = (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
+    costs_by_type: Dict[str, List[float]] = defaultdict(list)
+    for t in tasks:
+        if t.status not in _terminal:
+            continue
+        if t.created_at is None or t.created_at < window_start:
+            continue
+        task_type = (t.first_payload or {}).get("type", "create")
+        if runs_on_compute_substrate(task_type):
+            # Off-VM type: honest spend lives on the linked compute job, not the
+            # lightweight monitoring VM. No (or non-positive) ledger entry => no
+            # sample.
+            cost = compute_job_cost_by_task.get(str(t.id))
+            if cost is None or cost <= 0:
+                continue
+        else:
+            cost = get_task_total_vm_cost_usd_or_none(t)
+            if cost is None:
+                continue
+        costs_by_type[task_type].append(cost)
+
+    rows: List[Dict[str, Any]] = []
+    # Render a row for every registered type, plus any observed type not in the
+    # registry (so unexpected types are still visible rather than silently dropped).
+    type_ids = list(ceilings.keys())
+    for extra in costs_by_type:
+        if extra not in ceilings:
+            type_ids.append(extra)
+
+    for type_id in type_ids:
+        samples = costs_by_type.get(type_id, [])
+        ceiling = ceilings.get(type_id)
+        sample_count = len(samples)
+        avg_cost = round(sum(samples) / sample_count, 4) if sample_count else None
+        p95_cost = _cost_pct_float(samples, 95)
+        over_ceiling = bool(
+            sample_count >= min_samples
+            and ceiling is not None
+            and ceiling > 0
+            and avg_cost is not None
+            and avg_cost > ceiling
+        )
+        rows.append(
+            {
+                "id": type_id,
+                "declared_ceiling_usd": ceiling,
+                "avg_cost_usd": avg_cost,
+                "p95_cost_usd": round(p95_cost, 4) if p95_cost is not None else None,
+                "sample_count": sample_count,
+                "over_ceiling": over_ceiling,
+            }
+        )
+    return rows

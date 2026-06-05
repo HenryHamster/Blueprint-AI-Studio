@@ -265,6 +265,83 @@ async def test_count_merged_since_zero_when_no_tasks(db_session):
 
 
 # ===========================================================================
+# count_in_flight_tasks — non-terminal task count for the version-cut disclosure
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_count_in_flight_counts_all_non_terminal_statuses(db_session):
+    """Every non-terminal status (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING/
+    BLOCKED) is counted as in flight."""
+    project = await _make_project(db_session)
+    now = _utcnow()
+    for status in (
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+        TaskStatus.BLOCKED,
+    ):
+        await _make_task(
+            db_session, project, status=status, context={}, updated_at=now
+        )
+
+    count = await rv.count_in_flight_tasks(db_session, project.id)
+    assert count == 5
+
+
+@pytest.mark.asyncio
+async def test_count_in_flight_excludes_terminal_statuses(db_session):
+    """COMPLETED/FAILED/CANCELLED tasks are terminal and not counted."""
+    project = await _make_project(db_session)
+    now = _utcnow()
+    for status in (
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    ):
+        await _make_task(
+            db_session, project, status=status, context={}, updated_at=now
+        )
+    # One live task to prove the query selects the right rows.
+    await _make_task(
+        db_session, project, status=TaskStatus.IN_PROGRESS, context={}, updated_at=now
+    )
+
+    count = await rv.count_in_flight_tasks(db_session, project.id)
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_count_in_flight_scoped_to_project(db_session):
+    """In-flight tasks are counted per-project, not globally."""
+    project_a = await _make_project(db_session, name="RV-A")
+    project_b = await _make_project(db_session, name="RV-B")
+    now = _utcnow()
+    await _make_task(
+        db_session, project_a, status=TaskStatus.IN_PROGRESS, context={}, updated_at=now
+    )
+    await _make_task(
+        db_session, project_b, status=TaskStatus.QUEUED, context={}, updated_at=now
+    )
+    await _make_task(
+        db_session, project_b, status=TaskStatus.BLOCKED, context={}, updated_at=now
+    )
+
+    assert await rv.count_in_flight_tasks(db_session, project_a.id) == 1
+    assert await rv.count_in_flight_tasks(db_session, project_b.id) == 2
+
+
+@pytest.mark.asyncio
+async def test_count_in_flight_zero_when_no_tasks(db_session):
+    """An empty project returns 0, not None."""
+    project = await _make_project(db_session)
+    count = await rv.count_in_flight_tasks(db_session, project.id)
+    assert count == 0
+    assert isinstance(count, int)
+
+
+# ===========================================================================
 # open_version / current_open_version
 # ===========================================================================
 
@@ -456,6 +533,75 @@ def test_set_version_phase_truncates_long_reasoning():
     rv.set_version_phase(version, "stabilize", reasoning=long_reason)
     assert version.phase_reasoning is not None
     assert len(version.phase_reasoning) == rv._PHASE_REASONING_MAX
+
+
+# ===========================================================================
+# set_version_goal
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_set_version_goal_operator_edit_stamps_editor_and_timestamp(db_session):
+    """An operator edit stamps goal, goal_updated_at, and goal_editor_info."""
+    project = await _make_project(db_session)
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    rv.set_version_goal(version, "Refine the objective", editor_id="op@example.com")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert version.goal == "Refine the objective"
+    assert version.goal_updated_at is not None
+    assert version.goal_editor_info == "[operator:op@example.com]"
+
+
+@pytest.mark.asyncio
+async def test_open_version_auto_derived_goal_leaves_editor_fields_null(db_session):
+    """A goal supplied at open time is NOT an operator edit: editor fields stay null."""
+    project = await _make_project(db_session)
+    version = await rv.open_version(
+        db_session, project.id, version_number=1, goal="Auto-derived objective"
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert version.goal == "Auto-derived objective"
+    # open_version does not go through set_version_goal, so the operator-edit
+    # provenance columns remain null until an operator actually edits.
+    assert version.goal_updated_at is None
+    assert version.goal_editor_info is None
+
+
+def test_set_version_goal_idempotent_noop():
+    """Setting the goal to its current value is a no-op (no timestamp / editor bump)."""
+    version = ReleaseVersion(
+        version_number=1,
+        phase="build",
+        status="open",
+        opened_at=_utcnow(),
+        goal="steady goal",
+    )
+    rv.set_version_goal(version, "steady goal", editor_id="op@example.com")
+    # No-op: editor provenance is not stamped because the goal matched.
+    assert version.goal == "steady goal"
+    assert version.goal_updated_at is None
+    assert version.goal_editor_info is None
+
+
+def test_set_version_goal_truncates_long_goal():
+    """A goal longer than the cap is truncated before storage."""
+    version = ReleaseVersion(
+        version_number=1,
+        phase="build",
+        status="open",
+        opened_at=_utcnow(),
+    )
+    rv.set_version_goal(version, "g" * 5000, editor_id="op@example.com")
+    assert version.goal is not None
+    assert len(version.goal) == rv._GOAL_MAX
 
 
 # ===========================================================================
@@ -889,3 +1035,228 @@ async def test_ensure_initial_release_version_creates_when_promotion_target_diff
     assert version.version_number == 1
     assert version.phase == "stabilize"
     assert version.status == "open"
+
+
+# ===========================================================================
+# abandon_current_version — operator-initiated version cut
+# ===========================================================================
+
+
+async def _make_open_version_row(
+    db_session,
+    project,
+    *,
+    version_number: int = 1,
+    base_sha: str | None = "basesha1",
+    phase: str = "stabilize",
+) -> ReleaseVersion:
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=version_number,
+        phase=phase,
+        status="open",
+        base_sha=base_sha,
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    return version
+
+
+@pytest.mark.asyncio
+async def test_abandon_current_version_closes_open_and_opens_next(db_session):
+    """Abandon flips the open row to status='abandoned' (recording provenance in
+    last_qualification) and opens a fresh next-numbered open row in build."""
+    project = await _make_project(db_session)
+    await _make_open_version_row(db_session, project, version_number=3)
+
+    abandoned, new_version = await rv.abandon_current_version(
+        db_session,
+        project.id,
+        reason="pivoted away from this candidate",
+        operator_id="op@example.com",
+    )
+    await db_session.commit()
+
+    assert abandoned is not None and new_version is not None
+    await db_session.refresh(abandoned)
+    await db_session.refresh(new_version)
+
+    # Old row is terminal with provenance recorded in the JSONB store.
+    assert abandoned.status == "abandoned"
+    assert abandoned.version_number == 3
+    rec = abandoned.last_qualification
+    assert rec["status"] == "abandoned"
+    assert rec["reason"] == "pivoted away from this candidate"
+    assert rec["operator"] == "op@example.com"
+    assert rec["abandoned_at"]
+
+    # New row is open in build at the next number.
+    assert new_version.version_number == 4
+    assert new_version.status == "open"
+    assert new_version.phase == "build"
+    # base_sha falls back to the abandoned row's (no GitHub creds in tests).
+    assert new_version.base_sha == "basesha1"
+
+    # current_open_version now returns the new row (old one is closed).
+    current = await rv.current_open_version(db_session, project.id)
+    assert current.version_number == 4
+
+
+@pytest.mark.asyncio
+async def test_abandon_current_version_noop_when_no_open_row(db_session):
+    """With no open version the cut is a NO-OP returning (None, None)."""
+    project = await _make_project(db_session)
+
+    result = await rv.abandon_current_version(
+        db_session, project.id, reason="x", operator_id="op@example.com"
+    )
+    await db_session.commit()
+
+    assert result == (None, None)
+    # No version row was created.
+    assert await rv.current_open_version(db_session, project.id) is None
+
+
+@pytest.mark.asyncio
+async def test_abandon_current_version_noop_when_already_closed(db_session):
+    """A version already promoted/abandoned is untouched and no duplicate vN+1
+    is opened (double-cut race guard)."""
+    project = await _make_project(db_session)
+    closed = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="stabilize",
+        status="promoted",
+        base_sha="sha2",
+    )
+    db_session.add(closed)
+    await db_session.commit()
+
+    abandoned, new_version = await rv.abandon_current_version(
+        db_session, project.id, reason="late cut", operator_id="op@example.com"
+    )
+    await db_session.commit()
+
+    assert abandoned is None and new_version is None
+    # The promoted row is untouched and remains the only row.
+    await db_session.refresh(closed)
+    assert closed.status == "promoted"
+    all_rows = await rv.recent_closed_versions(db_session, project.id, limit=10)
+    assert [v.version_number for v in all_rows] == [2]
+
+
+@pytest.mark.asyncio
+async def test_abandon_stamps_reason_and_operator(db_session):
+    """The human reason is mirrored into phase_reasoning with the operator
+    convention, and the reason is truncated to the phase-reasoning cap."""
+    project = await _make_project(db_session)
+    await _make_open_version_row(db_session, project, version_number=1)
+
+    long_reason = "z" * 800
+    abandoned, _new = await rv.abandon_current_version(
+        db_session, project.id, reason=long_reason, operator_id="alice@example.com"
+    )
+    await db_session.commit()
+    await db_session.refresh(abandoned)
+
+    assert abandoned.phase_reasoning.startswith("[operator:alice@example.com] abandoned")
+    # Truncated to the phase-reasoning cap.
+    assert len(abandoned.phase_reasoning) <= rv._PHASE_REASONING_MAX
+    assert len(abandoned.last_qualification["reason"]) <= rv._PHASE_REASONING_MAX
+
+
+@pytest.mark.asyncio
+async def test_abandon_without_reason_still_cuts(db_session):
+    """A cut with no reason still abandons the version and opens the next, with
+    a null reason recorded."""
+    project = await _make_project(db_session)
+    await _make_open_version_row(db_session, project, version_number=5)
+
+    abandoned, new_version = await rv.abandon_current_version(
+        db_session, project.id, reason=None, operator_id="op@example.com"
+    )
+    await db_session.commit()
+    await db_session.refresh(abandoned)
+
+    assert abandoned.status == "abandoned"
+    assert abandoned.last_qualification["reason"] is None
+    assert abandoned.phase_reasoning == "[operator:op@example.com] abandoned"
+    assert new_version.version_number == 6
+
+
+@pytest.mark.asyncio
+async def test_abandon_activates_staged_directions(db_session):
+    """An abandon counts as the awaited version resolving: staged directions
+    gated on the abandoned version are activated, not orphaned."""
+    project = Project(
+        name="RV-Abandon-Staged",
+        user_id="rv-user",
+        autonomous_enabled=True,
+        directions=[
+            {
+                "id": "d-staged",
+                "text": "Staged work",
+                "status": "staged",
+                "staged_for_version": 2,
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+            }
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _make_open_version_row(db_session, project, version_number=2)
+
+    # The staged-activation step runs in its OWN AsyncSessionLocal session
+    # (mirroring the promotion path). Bind the lazy production engine to the
+    # test engine so that session reaches the same DB (the per-test teardown
+    # fixture may have nulled it from a prior test).
+    import app.database as _app_db  # noqa: PLC0415
+
+    _app_db._LazyEngine._engine = db_session.bind
+
+    abandoned, new_version = await rv.abandon_current_version(
+        db_session, project.id, reason="cut", operator_id="op@example.com"
+    )
+    await db_session.commit()
+
+    assert abandoned is not None and new_version.version_number == 3
+    # The staged direction (staged_for_version=2 <= 2) was activated.
+    await db_session.refresh(project)
+    by_id = {d["id"]: d for d in project.directions}
+    assert by_id["d-staged"]["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_late_qualifier_finalize_inert_after_abandon(db_session):
+    """A qualifier finalize that lands AFTER the version was abandoned is inert:
+    the existing ``status != 'open'`` guard makes it a no-op, leaving the
+    abandoned terminal state untouched."""
+    from app.release_qualifier import _finalize_locked_version  # noqa: PLC0415
+
+    project = await _make_project(db_session)
+    # Simulate a version that was mid-qualification (pending) when abandoned.
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="abandoned",
+        base_sha="sha1",
+        last_qualification={"status": "pending", "candidate_sha": "sha1"},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await _finalize_locked_version(db_session, version.id, None)
+
+    # The guard skips finalize entirely — no promotion, no status change.
+    assert result is None
+    await db_session.refresh(version)
+    assert version.status == "abandoned"
+    # No duplicate next version was opened.
+    assert await rv.current_open_version(db_session, project.id) is None

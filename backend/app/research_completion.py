@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.depends_on_provenance import remember_structural_depends_on
 from app.findings_index import (  # noqa: F401 — re-exported for callers/tests
     lookup_findings_by_source_ref,
     query_findings_index,
@@ -51,6 +52,8 @@ from app.finding_deduplication import (
     extract_archived_diagnoses,
     finding_hash as _finding_hash,  # noqa: F401 — re-exported for callers/tests
     is_duplicate as _is_duplicate,  # noqa: F401 — re-exported for callers/tests
+    normalize_prerequisite,
+    resolve_prerequisite_task,
 )
 from app.payload_schemas import validate_internal_payload
 from app.playbook_learning import (
@@ -133,6 +136,71 @@ MEDIUM_EXPLORATION_FLOOR = 0.05
 # than stampeding memo creation.
 MEMO_SPAWN_CAP_PER_CYCLE = 5
 
+# Verification-basis tiers, ordered from highest evidence (the finding's claim
+# was checked against real code) to lowest (asserted/deduced). Defined once here
+# so the normalization and the HEAD-reconciliation below share a single source
+# of truth instead of repeating the literal tier strings.
+VERIFICATION_BASIS_TIERS = (
+    "code_verified",
+    "path_verified",
+    "pattern_inferred",
+    "deduced",
+)
+VALID_VERIFICATION_BASES = frozenset(VERIFICATION_BASIS_TIERS)
+# Tiers that assert the finding was verified against real code. A self-reported
+# value in this set is only honest if the finding's own citations resolve at
+# HEAD; when they don't, it is capped to _DOWNGRADED_VERIFICATION_BASIS.
+_HIGH_EVIDENCE_BASES = frozenset({"code_verified", "path_verified"})
+# Honest fallback when a high-evidence self-claim is contradicted by broken
+# citations: the highest tier that does NOT assert verification-against-code.
+_DOWNGRADED_VERIFICATION_BASIS = "pattern_inferred"
+
+
+def _reconcile_verification_basis(
+    finding: Dict[str, Any],
+    broken_provenance: Optional[Dict[str, Any]],
+    ungrounded: Optional[Dict[str, Any]],
+) -> bool:
+    """Cap a self-reported high-evidence verification_basis against HEAD truth.
+
+    The tiers in :data:`_HIGH_EVIDENCE_BASES` assert the finding was checked
+    against real code. When the already-computed ingestion validation marks the
+    finding's file sources invalid (``broken_provenance`` from
+    :func:`summarize_broken_refs`) or finds ungrounded ``path:symbol`` claims
+    (``ungrounded`` from :func:`_summarize_ungrounded_claims_grounded`), that
+    self-assertion is contradicted by ground truth, so the stored basis is
+    downgraded to :data:`_DOWNGRADED_VERIFICATION_BASIS` — an honest tier that
+    makes no verified-against-code claim.
+
+    Findings with no citations, or whose citations validate cleanly, keep their
+    reported basis (both args are None). Mutates ``finding`` in place; returns
+    True when a downgrade occurred.
+    """
+    current = finding.get("verification_basis")
+    if current not in _HIGH_EVIDENCE_BASES:
+        return False
+    if not broken_provenance and not ungrounded:
+        return False
+    broken_count = int((broken_provenance or {}).get("broken_source_ref_count", 0) or 0)
+    ungrounded_count = int((ungrounded or {}).get("ungrounded_claim_count", 0) or 0)
+    finding["verification_basis_downgraded_from"] = current
+    finding["verification_basis_downgrade_reason"] = (
+        "HEAD validation failed: "
+        f"{broken_count} broken source ref{'s' if broken_count != 1 else ''}, "
+        f"{ungrounded_count} ungrounded claim{'s' if ungrounded_count != 1 else ''}"
+    )
+    finding["verification_basis"] = _DOWNGRADED_VERIFICATION_BASIS
+    logger.info(
+        "[RESEARCH] Capping verification_basis %s→%s for '%s' "
+        "(citations unresolved at HEAD: broken_refs=%d, ungrounded_claims=%d)",
+        current,
+        _DOWNGRADED_VERIFICATION_BASIS,
+        finding.get("title", "<untitled>"),
+        broken_count,
+        ungrounded_count,
+    )
+    return True
+
 
 def _trim_finding_for_memo(finding: Dict[str, Any]) -> Dict[str, Any]:
     """Trim a dropped finding to a bounded dict for embedding in a MemoPayload.
@@ -149,6 +217,7 @@ def _trim_finding_for_memo(finding: Dict[str, Any]) -> Dict[str, Any]:
         "risk",
         "priority",
         "actionability_grade",
+        "verification_basis",
         "direction_id",
     ):
         val = finding.get(key)
@@ -766,8 +835,97 @@ async def _summarize_ungrounded_claims_grounded(
     }
 
 
+# Finding ``type`` values that are processed separately and never spawn an
+# implementation/child task (direction proposals/notes, design-doc observations,
+# direction updates). Used by the blast-radius predicate below.
+_NON_SPAWNING_FINDING_TYPES = frozenset(
+    {
+        "direction_proposal",
+        "direction_note",
+        "design_doc_observation",
+        "direction_update",
+        "note",
+    }
+)
+
+
+def _research_findings_would_spawn(findings: List[Dict[str, Any]]) -> bool:
+    """True if at least one finding would spawn downstream implementation work.
+
+    This is a blast-radius predicate, not the exact spawn decision (dedup and
+    confidence gating still run in the spawn loop). It deliberately over-counts
+    rather than under-counts: it is better to grade a research artifact that
+    later dedups to zero children than to let an ungraded finding spawn a PR.
+    """
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        if (f.get("type") or "") in _NON_SPAWNING_FINDING_TYPES:
+            continue
+        if not str(f.get("prompt") or "").strip():
+            continue
+        if f.get("already_spawned"):
+            continue
+        if f.get("actionability_grade") == "LOW":
+            continue
+        return True
+    return False
+
+
 async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
-    """Parse research findings and create tasks from them."""
+    """Parse research findings and create tasks from them.
+
+    Forward-quality gate (escalated path): when the research-quality grader is
+    enabled and the parsed findings would spawn downstream implementation work,
+    this handler does NOT spawn children on the first pass. It instead spawns an
+    INDEPENDENT grader task and parks itself EVALUATING. The grader's verdict
+    returns through the re-entrant completion path, which re-invokes this
+    handler with ``context['quality_grader']`` set:
+      * verdict PASS  -> proceed to the normal spawn-on-findings path;
+      * verdict FAIL  -> fail the research task and spawn NOTHING (unverified
+        findings must never launch work).
+    Findings that would not spawn anything (pure observations) keep the cheap
+    synchronous check and never escalate — the gate is proportional to blast
+    radius, as the framework intends.
+    """
+    from app.task_evaluators import (
+        QUALITY_GRADER_VERDICT_KEY,
+        EvaluationVerdict,
+        record_failed_gate,
+        spawn_forward_quality_grader,
+    )
+
+    # Re-entry signal: the independent grader has returned its verdict.
+    _grader_verdict = (task.context or {}).get(QUALITY_GRADER_VERDICT_KEY)
+    if _grader_verdict is not None and not _grader_verdict.get("passed", False):
+        # FAILED forward-quality gate: do NOT spawn implementation tasks and do
+        # NOT complete clean. Mark FAILED so the research is not trusted, and
+        # record the verdict for observability + direction-health accounting.
+        record_failed_gate(
+            task,
+            EvaluationVerdict(
+                False,
+                str(_grader_verdict.get("reason") or "forward-quality grade failed"),
+                "forward-quality",
+            ),
+        )
+        session.add(task)
+        await session.commit()
+        try:
+            await _record_research_task_failure(task, session)
+        except Exception:  # noqa: BLE001 — failure accounting must not crash the gate
+            logger.debug(
+                "[RESEARCH] failure accounting after failed quality gate raised",
+                exc_info=True,
+            )
+        logger.info(
+            "[RESEARCH] Task %s failed the forward-quality gate; spawned no "
+            "implementation tasks: %s",
+            task.id,
+            _grader_verdict.get("reason"),
+        )
+        return
+
     # Increment _research_spawn_count on completion (variable name is legacy;
     # see autonomous_research.py:837 — semantic is "completed research cycles
     # since last strategic refresh"). The strategic_research_frequency gate
@@ -780,7 +938,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     def _increment_research_spawn_count(vision: dict) -> None:
         vision["_research_spawn_count"] = (vision.get("_research_spawn_count") or 0) + 1
 
-    if project_obj is not None:
+    # Only on the FIRST pass — a re-entrant resume after grading must not
+    # re-count the cycle (the grader verdict is already present in context).
+    if project_obj is not None and _grader_verdict is None:
         await with_vision_locked(
             session, task.project_id, _increment_research_spawn_count
         )
@@ -806,6 +966,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # actually completed. Drop them here.
     if findings:
         findings = [f for f in findings if isinstance(f, dict)]
+    if not findings and _grader_verdict is not None and isinstance(task.plan_output, list):
+        # Grader resume: the re-dispatch reconstructs the artifact from the
+        # findings stored on the first pass. If that reconstruction does not
+        # round-trip through the findings parser, fall back to the stored
+        # findings directly so a PASSING grade can never silently spawn nothing.
+        findings = [f for f in task.plan_output if isinstance(f, dict)]
     if not findings:
         task.latest_status_message = "Research completed with no actionable findings"
         task.plan_output = []
@@ -826,6 +992,23 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 _g,
             )
             _f["actionability_grade"] = "MEDIUM"
+
+    # Normalize verification_basis: how the finding's claim was established
+    # (evidence strength), orthogonal to actionability_grade (implementability).
+    # Any missing or invalid value defaults to the lowest-evidence tier
+    # (pattern_inferred) so legacy findings are never mis-promoted. A non-missing
+    # invalid value is logged just like the grade path.
+    for _f in findings:
+        _vb = _f.get("verification_basis")
+        if _vb not in VALID_VERIFICATION_BASES:
+            if _vb is not None:
+                logger.warning(
+                    "[RESEARCH] Finding '%s' has invalid verification_basis=%r; "
+                    "defaulting to pattern_inferred",
+                    _f.get("title", "<untitled>"),
+                    _vb,
+                )
+            _f["verification_basis"] = "pattern_inferred"
 
     # Resolve the project's real integration-branch verification context once so
     # file-type source refs validate against the GitHub tree rather than a local
@@ -890,6 +1073,31 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _f["_provenance_warnings"] = {**_broken_provenance, **_ungrounded}
         elif _broken_provenance or _ungrounded:
             _f["_provenance_warnings"] = _broken_provenance or _ungrounded
+        # Reconcile the self-reported verification_basis against the validation
+        # just computed: a finding cannot honestly claim a verified-against-code
+        # tier while its own citations are absent at HEAD. Reuses the broken-ref
+        # and ungrounded-claim signals already in hand (no new I/O).
+        _reconcile_verification_basis(_f, _broken_provenance, _ungrounded)
+
+    # Normalize an optional declared prerequisite (machine-resolvable {kind, ref}
+    # need) onto each finding. A finding may name an in-flight foundation task or
+    # a named capability it depends on; malformed/unknown-kind declarations are
+    # dropped so only explicit references ever drive a dependency edge later.
+    for _f in findings:
+        _prereq_raw = _f.get("prerequisite") or _f.get("requires")
+        _prereq = normalize_prerequisite(_prereq_raw)
+        if _prereq is not None:
+            _f["_prerequisite"] = _prereq
+        else:
+            _f.pop("_prerequisite", None)
+        # An explicit capability a finding's task advertises, so a sibling
+        # finding declaring {kind:capability, ref:<name>} can structurally
+        # depend on it (intra-batch foundation sharing). Explicit string only.
+        _cap = _f.get("provides_capability") or _f.get("capability")
+        if isinstance(_cap, str) and _cap.strip():
+            _f["_provides_capability"] = _cap.strip()
+        else:
+            _f.pop("_provides_capability", None)
 
     _structural_downgrades = _apply_structural_actionability_downgrade(findings)
 
@@ -901,6 +1109,29 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     }
     session.add(task)
     await session.commit()
+
+    # Forward-quality ESCALATION gate (blast-radius-proportional). When enabled
+    # and these findings would spawn downstream implementation work, do not
+    # spawn anything yet: stand up an INDEPENDENT grader and park this task
+    # EVALUATING. The grader's verdict returns via the re-entrant completion
+    # path, which re-invokes this handler with the verdict in context (the
+    # `_grader_verdict is None` guard below is what lets the resume pass fall
+    # through to the spawn loop instead of escalating again). Findings that
+    # would spawn nothing keep the cheap synchronous check and never escalate.
+    if (
+        _grader_verdict is None
+        and _runtime_config.get("research_quality_grader_enabled", False)
+        and _research_findings_would_spawn(findings)
+    ):
+        grader = await spawn_forward_quality_grader(task, json.dumps(findings), session)
+        if grader is not None:
+            logger.info(
+                "[RESEARCH] Task %s parked awaiting forward-quality grade "
+                "(grader %s) before spawning implementation tasks",
+                task.id,
+                grader.id,
+            )
+            return
 
     # Separate direction proposals and notes from actionable findings — these are processed
     # separately and must not enter the hash-based deduplication loop (they never create tasks,
@@ -2249,6 +2480,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "related_files": related_files,
                 "finding_hash": fhash,
                 **(
+                    {"provides_capability": finding["_provides_capability"]}
+                    if finding.get("_provides_capability")
+                    else {}
+                ),
+                **(
                     {"direction_id": direction_id}
                     if direction_id
                     else (
@@ -2484,7 +2720,163 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         ]
         if explicit_deps:
             ct.depends_on = explicit_deps
+            remember_structural_depends_on(ct, explicit_deps)
             session.add(ct)
+
+    # Foundation-aware cross-task wiring: when a finding declares an EXPLICIT
+    # {kind, ref} prerequisite, resolve it against (a) tasks already active /
+    # queued / in-flight in this project and (b) the sibling tasks just spawned
+    # in this batch, then append the matched foundation's id to depends_on. This
+    # lets a finding that requires a shared foundation depend on the single task
+    # already building it — in-flight or a sibling — instead of each dependent
+    # rebuilding the foundation. Conservative: explicit references only (see
+    # resolve_prerequisite_task); never overwrites the explicit_deps above.
+    # Any edge is acyclicity-checked with the SAME predicate the runtime
+    # need-resolution path applies (blocked_need_resolution._would_create_cycle),
+    # so a declared prerequisite that would close a depends_on cycle is refused at
+    # the structural source rather than deferred to the dispatch-time cycle breaker.
+    from app.blocked_need_resolution import _would_create_cycle  # noqa: PLC0415
+    from app.task_blocked import build_need, enter_blocked_state  # noqa: PLC0415
+
+    _prereq_candidates = list(existing_tasks) + list(child_tasks)
+    for ci, ct in enumerate(child_tasks):
+        fi = finding_indices[ci]
+        dep_indices = findings[fi].get("depends_on_indices", [])
+        missing_dep_indices = [j for j in dep_indices if j not in finding_to_child]
+        if missing_dep_indices:
+            missing_fi = missing_dep_indices[0]
+            missing_finding = findings[missing_fi] if missing_fi < len(findings) else {}
+            missing_title = missing_finding.get("title", f"#{missing_fi}")
+            missing_hash = _finding_hash(
+                str(missing_title),
+                str(
+                    missing_finding.get(
+                        "description", missing_finding.get("prompt", "")
+                    )
+                    or ""
+                ),
+            )
+            ctx = dict(ct.context or {})
+            unresolved = ctx.get("unresolved_prerequisite") or []
+            unresolved_list = unresolved if isinstance(unresolved, list) else [unresolved]
+            unresolved_list.append(
+                {
+                    "finding_index": missing_fi,
+                    "title": missing_title,
+                    "finding_hash": missing_hash,
+                }
+            )
+            ctx["unresolved_prerequisite"] = unresolved_list
+            ct.context = ctx
+            need = build_need("task", missing_hash, label=missing_title)
+            if need:
+                enter_blocked_state(
+                    ct,
+                    waiting_on=f"foundation task:{missing_hash}",
+                    reason=(
+                        f"Finding '{findings[fi].get('title', f'#{fi}')}' declared sibling "
+                        f"prerequisite '{missing_title}' but it was not spawned this cycle; "
+                        "blocked until the prerequisite appears or the blocked-resume sweep resolves it."
+                    ),
+                    source="research_prerequisite",
+                    blocker_kind="upstream_dependency",
+                    need=need,
+                )
+            session.add(ct)
+            logger.warning(
+                "[RESEARCH] Finding '%s' declared sibling prerequisite '%s' but it was not spawned; "
+                "dependent BLOCKED on the unresolved need",
+                findings[fi].get("title", f"#{fi}"),
+                missing_title,
+            )
+            continue
+        prereq = findings[fi].get("_prerequisite")
+        if not prereq:
+            continue
+        foundation = resolve_prerequisite_task(prereq, _prereq_candidates)
+        if foundation is None or foundation.id == ct.id:
+            # Unresolved prerequisite: a finding declared an explicit {kind, ref}
+            # foundation it must build on, but no in-flight or sibling task
+            # matched. Rather than spawn the dependent as immediately-runnable
+            # (which lets it rebuild the very foundation it declared it needs —
+            # the "blocked dependents duplicating foundations" failure), block it
+            # on the normalized prerequisite as a machine-resolvable NEED and let
+            # the mature blocked-resume sweep gate it: the sweep wires a real
+            # depends_on edge the moment a matching foundation appears in flight
+            # (reaper_sweeps._resolve_need_into_dep_edge), resumes it with no edge
+            # when the foundation has already landed as completed/merged work
+            # (need_satisfied_by_completed), and escalates loudly to the operator
+            # if the foundation never appears within the deadline.
+            #
+            # Policy: BOTH prerequisite kinds (task, capability) trigger blocking.
+            # Prereq kinds are a subset of NEED_KINDS, so the normalized
+            # prerequisite is already a valid need. A kind=capability ref could in
+            # principle already be satisfied by code that was never a task; the
+            # escalation/auto-resume path is the backstop that clears genuinely-
+            # independent or already-satisfied work rather than parking it forever.
+            # We still stamp context['unresolved_prerequisite'] for operator
+            # visibility in addition to entering BLOCKED.
+            if foundation is None:
+                ctx = dict(ct.context or {})
+                unresolved = ctx.get("unresolved_prerequisite") or {}
+                unresolved_list = unresolved if isinstance(unresolved, list) else [unresolved] if unresolved else []
+                unresolved_list.append(prereq)
+                ctx["unresolved_prerequisite"] = unresolved_list
+                ct.context = ctx
+                need = build_need(
+                    prereq.get("kind"),
+                    prereq.get("ref"),
+                    label=prereq.get("label"),
+                )
+                if need:
+                    enter_blocked_state(
+                        ct,
+                        waiting_on=f"foundation {need['kind']}:{need['ref']}",
+                        reason=(
+                            f"Finding '{findings[fi].get('title', f'#{fi}')}' declared "
+                            f"prerequisite {need['kind']}:{need['ref']} but no candidate "
+                            f"matched at spawn; blocked until the foundation appears or "
+                            f"the operator escalation fires."
+                        ),
+                        source="research_prerequisite",
+                        blocker_kind="upstream_dependency",
+                        need=need,
+                    )
+                session.add(ct)
+                logger.warning(
+                    "[RESEARCH] Finding '%s' declared prerequisite %s:%s but no candidate matched; "
+                    "dependent BLOCKED on the unresolved need (blocked-resume sweep will wire "
+                    "the edge or escalate)",
+                    findings[fi].get("title", f"#{fi}"),
+                    prereq.get("kind"),
+                    prereq.get("ref"),
+                )
+            continue
+        if _would_create_cycle(ct, foundation, _prereq_candidates):
+            logger.warning(
+                "[RESEARCH] Finding '%s' prerequisite %s:%s resolved to foundation %s "
+                "but the edge would close a depends_on cycle — refused at spawn (no edge)",
+                findings[fi].get("title", f"#{fi}"),
+                prereq.get("kind"),
+                prereq.get("ref"),
+                foundation.id,
+            )
+            continue
+        foundation_id = str(foundation.id)
+        existing_dep = list(ct.depends_on or [])
+        if foundation_id not in existing_dep:
+            existing_dep.append(foundation_id)
+            ct.depends_on = existing_dep
+            remember_structural_depends_on(ct, foundation_id)
+            session.add(ct)
+            logger.info(
+                "[RESEARCH] Wired finding '%s' depends_on foundation %s "
+                "(prerequisite %s:%s)",
+                findings[fi].get("title", f"#{fi}"),
+                foundation_id,
+                prereq.get("kind"),
+                prereq.get("ref"),
+            )
 
     # Chain auto-decomposed siblings: when a finding is split into N sub-tasks
     # by cochange/path clustering, run them serially rather than in parallel.
@@ -2503,6 +2895,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if prev_id not in existing:
             existing.append(prev_id)
             child_tasks[ci].depends_on = existing
+            remember_structural_depends_on(child_tasks[ci], prev_id)
             session.add(child_tasks[ci])
 
     # Log file overlap warnings for observability and surface them to agents

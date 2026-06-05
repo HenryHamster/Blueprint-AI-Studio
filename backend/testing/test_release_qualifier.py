@@ -1190,6 +1190,91 @@ class TestScoreAuditVerification:
         assert rq._audit_missing_reason(report) == "all_findings_unverified"
 
 
+class TestScoreAuditAuthorizedDivergence:
+    """An authorized, registry-listed Alembic revision-identity divergence is
+    owned by the deterministic migration-identity gate, so the release audit
+    scorer must NOT deduct for it (no double-counting). Unrelated findings and
+    genuine migration-body defects still deduct."""
+
+    _AUTH_VNOTE = (
+        "Read git diff main...candidate: the old 0143 migration is replaced by a "
+        "new 0143 plus a renumbered 0144 — revision-identity collision vs deployed main."
+    )
+
+    def test_authorized_renumber_finding_not_deducted(self):
+        """A medium finding whose subject is the authorized 0143 renumber does
+        not deduct — the gate owns it."""
+        report = {
+            "findings": [
+                {
+                    "severity": "medium",
+                    "summary": "The 0143 back-merge renumber reuses revision id 0143 and renumbers 0144.",
+                    "file": "backend/alembic/versions/0143_add_compute_job_persistence.py",
+                    "verification_note": self._AUTH_VNOTE,
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0), "authorized revision-identity divergence must not deduct"
+
+    def test_authorized_divergence_excluded_but_unrelated_finding_still_deducts(self):
+        """The authorized renumber is delegated to the gate; an unrelated medium
+        finding in the same report still deducts normally."""
+        report = {
+            "findings": [
+                {
+                    "severity": "medium",
+                    "summary": "0143 revision-identity collision: revision id reused on the back-merge.",
+                    "file": "backend/alembic/versions/0143_add_compute_job_persistence.py",
+                    "verification_note": self._AUTH_VNOTE,
+                },
+                {
+                    "severity": "medium",
+                    "summary": "Missing null check.",
+                    "file": "app/api.py",
+                    "verification_note": "Read app/api.py lines 55-70: payload.user may be None, dereferenced without guard.",
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        # Only the unrelated medium deducts: 1.0 - 0.07
+        assert audit == pytest.approx(1.0 - 0.07)
+
+    def test_genuine_migration_body_defect_still_deducts(self):
+        """A real migration-BODY defect on the same 0143 file (missing downgrade)
+        is NOT a revision-identity concern and must still deduct."""
+        report = {
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "0143 add_compute_job_persistence has no downgrade — irreversible, data-loss on rollback.",
+                    "file": "backend/alembic/versions/0143_add_compute_job_persistence.py",
+                    "verification_note": "Read 0143: downgrade() is a bare pass so the computejob table is never dropped — destructive rollback risk.",
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0 - 0.15), "migration-body defect must still deduct"
+
+    def test_helper_matches_authorized_and_rejects_unrelated(self):
+        """_finding_subject_is_authorized_divergence: matches a listed-revision
+        renumber finding, rejects an unrelated finding and a same-file body defect."""
+        auth = {
+            "severity": "medium",
+            "summary": "0143 revision-identity collision (renumber).",
+            "verification_note": self._AUTH_VNOTE,
+        }
+        unrelated = {"severity": "medium", "summary": "Missing null check in app/api.py."}
+        body_defect = {
+            "severity": "high",
+            "summary": "0143 add_compute_job_persistence has no downgrade().",
+            "verification_note": "downgrade() is a bare pass — destructive.",
+        }
+        assert rq._finding_subject_is_authorized_divergence(auth) is True
+        assert rq._finding_subject_is_authorized_divergence(unrelated) is False
+        assert rq._finding_subject_is_authorized_divergence(body_defect) is False
+
+
 class TestScoreAuditComputedErosion:
     """_score_audit prefers computed_test_erosion (authoritative, deterministic
     from git diff) over the LLM's self-reported test_erosion when the key is present."""
@@ -2387,6 +2472,18 @@ def _qualifier_ci_resolves_green(mocker):
         "app.github.get_pr_files",
         new=AsyncMock(return_value=[]),
     )
+    # Default the finalize-time deterministic Alembic revision-identity gate to
+    # CLEAN: _finalize_qualification lists the candidate's and the promotion
+    # target's migration filenames via github.list_versions_at_ref and runs
+    # find_content_divergent_revisions over them. Returning the SAME list for
+    # every ref means no revision id diverges, so the gate is "ok" and the
+    # finalize proceeds to the quality composite for the majority of tests where
+    # migration safety is incidental. Tests exercising the gate re-patch this in
+    # their own body (branch-aware / raising); the later patch wins.
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=AsyncMock(return_value=["0001_init.py", "0002_feature.py"]),
+    )
 
 
 # ===========================================================================
@@ -2982,12 +3079,13 @@ async def test_run_qualification_version_vanished_before_lock(db_session, mocker
 
 
 @pytest.mark.asyncio
-async def test_run_qualification_already_dry_run_same_sha_is_noop(db_session, mocker):
-    """Audit H1: when the prior qualification finalized as a dry_run and
-    automain HEAD still equals the recorded candidate_sha, run_qualification
-    early-returns already_dry_run and spawns nothing — the strategic agent
+async def test_run_qualification_cached_dry_run_same_sha_is_noop(db_session, mocker):
+    """Idempotent qualification: when a conclusive dry_run verdict exists for
+    this candidate_sha and automain HEAD still equals it, run_qualification
+    early-returns cached_verdict and spawns nothing — the strategic agent
     re-emitting qualify_request every cycle must not re-spawn 2 agent VMs for
-    an identical, already-scored commit while promotion ships dark."""
+    an identical, already-scored commit. Relying on lucky re-rolls is not a
+    sound gate; the next automain advance will trigger a fresh qualification."""
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
     dry_run_sha = "drc0de00" * 5  # 40-char placeholder SHA
@@ -3021,7 +3119,8 @@ async def test_run_qualification_already_dry_run_same_sha_is_noop(db_session, mo
     result = await rq.run_qualification(db_session, project.id, version)
     await db_session.commit()
 
-    assert result["status"] == "already_dry_run"
+    assert result["status"] == "cached_verdict"
+    assert result["cached_verdict_status"] == "dry_run"
 
     await db_session.refresh(version)
     # The dry_run record is untouched, attempts NOT bumped.
@@ -3084,6 +3183,179 @@ async def test_run_qualification_dry_run_but_automain_moved_runs_fresh(
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "pending"
     assert version.last_qualification["candidate_sha"] == new_sha
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_cached_not_promoted_same_sha_is_noop(db_session, mocker):
+    """Idempotent qualification: when a conclusive not_promoted verdict exists
+    for this candidate_sha and automain HEAD still equals it, run_qualification
+    early-returns cached_verdict and spawns nothing — a candidate that scored
+    below the promotion bar is not re-audited on the same commit."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "notprom0" * 5  # 40-char placeholder SHA
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "ci_green": True,
+        "confidence": 0.82,
+        "threshold": 0.90,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    attempts_before = version.qualification_attempts
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    # automain HEAD still equals the not_promoted candidate.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate_sha),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "cached_verdict"
+    assert result["cached_verdict_status"] == "not_promoted"
+
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "not_promoted"
+    assert version.qualification_attempts == attempts_before
+
+    # No child tasks spawned.
+    from sqlmodel import select
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_cached_promoted_same_sha_is_noop(db_session, mocker):
+    """Idempotent qualification: when a conclusive promoted verdict exists
+    for this candidate_sha and automain HEAD still equals it, run_qualification
+    early-returns cached_verdict and spawns nothing — a successfully promoted
+    commit is not re-audited."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "promot00" * 5  # 40-char placeholder SHA
+    version.last_qualification = {
+        "status": "promoted",
+        "candidate_sha": candidate_sha,
+        "ci_green": True,
+        "confidence": 0.95,
+        "threshold": 0.90,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    attempts_before = version.qualification_attempts
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    # automain HEAD still equals the promoted candidate.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate_sha),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "cached_verdict"
+    assert result["cached_verdict_status"] == "promoted"
+
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "promoted"
+    assert version.qualification_attempts == attempts_before
+
+    # No child tasks spawned.
+    from sqlmodel import select
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_non_conclusive_error_always_retries(db_session, mocker):
+    """Non-idempotent infra/error verdicts: when a prior qualification
+    finalized with an error status (not a conclusive verdict) and the
+    candidate_sha is unchanged, run_qualification proceeds with a fresh run
+    (not cached) because the error produced no real quality verdict."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "errorsh0" * 5  # 40-char placeholder SHA
+    version.last_qualification = {
+        "status": "error",
+        "error": "spawn_failed",
+        "candidate_sha": candidate_sha,
+        "started_at": "2026-05-19T00:00:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Create a mock audit task to return from spawn.
+    audit_task = Task(
+        project_id=project.id,
+        title="audit-retry",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit-retry",
+        status=TaskStatus.QUEUED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    # automain HEAD still equals the error candidate.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate_sha),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+    mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(return_value=audit_task),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    # Not cached — a fresh qualification spawned despite unchanged sha.
+    assert result["status"] == "spawned"
 
 
 # ===========================================================================
@@ -3298,6 +3570,149 @@ async def test_finalize_not_promoted_on_blocker_sets_stabilize(db_session):
     assert version.phase == "stabilize"
     assert version.last_qualification["status"] == "not_promoted"
     assert version.last_qualification["blocker"] == "test_file_deleted"
+
+
+def _versions_by_ref(*, main_list: list[str], candidate_list: list[str]) -> AsyncMock:
+    """Branch-keyed ``list_versions_at_ref``: deployed promotion target vs candidate.
+
+    The finalize-time migration-identity gate lists the candidate's migrations
+    at ``candidate_sha`` and the deployed promotion target's at ``"main"`` — so
+    a ``ref == "main"`` request answers with the deployed list and everything
+    else (the candidate SHA) answers with the candidate list. ``ref`` is the 4th
+    positional arg of ``list_versions_at_ref``.
+    """
+
+    async def _side(token, owner, repo, ref, project_id=None):
+        return list(main_list) if ref == "main" else list(candidate_list)
+
+    return AsyncMock(side_effect=_side)
+
+
+@pytest.mark.asyncio
+async def test_finalize_blocks_on_migration_identity_collision(db_session, mocker):
+    """An UNAUTHORIZED revision-identity collision (a revision id reused for
+    different content, NOT on the authorized-reconciliation registry) must be a
+    HARD qualification blocker end-to-end: deployed main keeps revision 0138 ==
+    digest_cache_table, the candidate reassigned 0138 to task_blocked_state_fields.
+    An otherwise-clean candidate (audit 1.0, smoketest pass, CI green) must be
+    HARD-blocked at qualification: confidence forced to 0, promote False, and the
+    blocker names the diverging revision — never a soft audit deduction.
+
+    (The revision-0143 renumber is the ONE authorized, deploy-time-reconciled
+    divergence — its non-blocking path is covered by
+    ``test_qualification_gate_authorizes_reconciled_0143_divergence`` in
+    test_migration_divergence.py; using it here would no longer block.)"""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        # A pristine quality profile — without the migration gate this candidate
+        # would promote, isolating the migration collision as the sole blocker.
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Deployed main keeps 0138 == digest_cache_table; the candidate reused 0138
+    # for a DIFFERENT migration (task_blocked_state_fields) — an unrelated
+    # revision-identity collision the deterministic detector flags, and one NOT
+    # on the authorized-reconciliation registry (so it still hard-blocks).
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_ref(
+            main_list=["0138_digest_cache_table.py"],
+            candidate_list=["0138_task_blocked_state_fields.py"],
+        ),
+    )
+
+    # A real collision must NEVER promote, even with promotion enabled.
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "migration_identity_collision"
+    assert result["confidence"] == 0.0
+    promote_spy.assert_not_called()
+
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["status"] == "not_promoted"
+    assert lq["blocker"] == "migration_identity_collision"
+    assert lq["confidence"] == 0.0
+    assert version.phase == "stabilize"
+    # The detail names the specific diverging revision (0138) so the operator
+    # sees WHICH revision collides, not just a generic blocker label.
+    assert lq["migration_safety"] == "block"
+    detail = lq["migration_safety_detail"]
+    assert "0138" in detail
+    assert "digest_cache_table" in detail
+
+
+@pytest.mark.asyncio
+async def test_finalize_holds_when_migration_listing_fetch_fails(db_session, mocker):
+    """Fail-safe: when the candidate's / target's migration list cannot be
+    fetched, migration safety is UNKNOWN — the release is HELD (deferred to the
+    next cycle) rather than waved through. A fetch error is not 'no collision'."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # The migration listing fetch fails transiently — uncertainty must HOLD.
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=AsyncMock(side_effect=RuntimeError("GitHub 502")),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Held as an infra failure — no quality verdict, never promoted.
+    assert result["status"] == "infra_failure"
+    assert result["error"] == "migration_identity_check_unavailable"
+    promote_spy.assert_not_called()
+
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+    assert version.last_qualification["status"] == "infra_failure"
 
 
 @pytest.mark.asyncio

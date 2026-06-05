@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { auth } from '../firebase';
-import { apiFetch, API_BASE_URL, authHeaders } from '../api';
-import { parseTimestamp } from '../utils/time';
+import { apiFetch, API_BASE_URL, authHeaders, type StrategicRefreshMarker } from '../api';
+import { parseTimestamp, timeAgo } from '../utils/time';
 import { type EventPref, loadEventPrefs, saveEventPrefs, effectiveSignal, getToastSeverity, countHighSignalMessages } from './eventPrefs';
 import { type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow } from './muteWindow';
 import { type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP } from './savedViews';
@@ -20,6 +20,15 @@ import { MessagesBatchActionBar } from './MessagesBatchActionBar';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 
 const DEFAULT_VIEW_ID = '__default__';
+
+// Generate a client idempotency key for a message send. Prefers the native
+// UUID generator and falls back to a timestamp+random token for older runtimes
+// (and JSDOM, where crypto.randomUUID may be absent).
+function generateIdempotencyKey(): string {
+  const c = typeof globalThis !== 'undefined' ? globalThis.crypto : undefined;
+  if (c && typeof c.randomUUID === 'function') return c.randomUUID();
+  return `idem-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
 
 function viewSummaryLine(query: string, prefs: Record<string, EventPref>, sort: 'importance' | 'recent', showResolved: boolean, showOnlyNew?: boolean): string {
   const parts: string[] = [];
@@ -118,12 +127,24 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const [newType, setNewType] = useState('FEEDBACK');
   const [newContent, setNewContent] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  // Synchronous in-flight guard. `submitting` state updates asynchronously, so
+  // two rapid keypresses (double-Enter) can both read the pre-update value and
+  // each fire a request before React re-renders. This ref is set synchronously
+  // at the very top of handleSubmit and cleared in its finally, closing that
+  // race window so a burst collapses to a single POST on the client side (the
+  // server idempotency key is the backstop for retries that do reach it).
+  const submittingRef = useRef(false);
   const [replyTo, setReplyTo] = useState<{ id: string; content: string; from: string } | null>(null);
   // Real arming outcome the server reported for the last send (null before any
   // send, or after the operator changes the message type so the composer reverts
   // to a fresh type-based prediction).
   const [lastArming, setLastArming] = useState<ArmingOutcome | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Idempotency key for the in-flight draft. Generated once per draft and
+  // reused across retries / a rapid double-submit so the backend collapses
+  // them to one logical message; cleared after a successful send so the next
+  // distinct message gets a fresh key.
+  const idempotencyKeyRef = useRef<string | null>(null);
 
   // Per-message action state
   const [resolvingId, setResolvingId] = useState<string | null>(null);
@@ -159,6 +180,12 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const [sortMode, setSortMode] = useState<'importance' | 'recent'>('importance');
   const [searchQuery, setSearchQuery] = useState('');
   const [webhookStats, setWebhookStats] = useState<WebhookStats | null>(null);
+  // Pending strategic-refresh marker (project.vision._strategic_refresh): set when
+  // operator steering arms a cycle, cleared backend-side once the autonomous loop
+  // consumes it. Drives the "strategic cycle pending" badge until then.
+  const [strategicRefresh, setStrategicRefresh] = useState<StrategicRefreshMarker | null>(null);
+  // In-flight guard for the "cancel armed steer" affordance on the pending badge.
+  const [cancellingRefresh, setCancellingRefresh] = useState(false);
   const [muteWindow, setMuteWindow] = useState<MuteWindow | null>(() => loadMuteWindow(auth.currentUser?.email, selectedProjectId));
   const [tempMutes, setTempMutes] = useState<TemporaryMutes>(() =>
     loadTemporaryMutes(auth.currentUser?.email, selectedProjectId),
@@ -243,6 +270,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     setEventPrefs(localPrefs);
     setTempMutes(loadTemporaryMutes(auth.currentUser?.email, selectedProjectId));
     setWebhookStats(null);
+    setStrategicRefresh(null);
     setMuteWindow(loadMuteWindow(auth.currentUser?.email, selectedProjectId));
     const lastSeen = loadLastSeen(auth.currentUser?.email, selectedProjectId);
     setDividerTime(lastSeen);
@@ -329,6 +357,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // state, effects, and handlers.
   const {
     openMessages,
+    linkedMessages,
     resolvedMessages,
     openFeedbackMessages,
     newHighSignalCount,
@@ -627,6 +656,28 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         const statsRes = await apiFetch(`${API_BASE_URL}/api/admin/notification-dispatch/stats?project_id=${selectedProjectId}`);
         if (statsRes.ok) setWebhookStats(await statsRes.json());
       } catch { /* ignore */ }
+      // Pending strategic-refresh marker — surfaced as a "strategic cycle pending"
+      // badge until the autonomous loop consumes it (when it clears backend-side).
+      // After consumption, shows a receipt via last_fired_at only if it was operator-origin.
+      // Non-critical: errors leave the prior marker state untouched.
+      try {
+        const visRes = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}`);
+        if (visRes.ok) {
+          const proj = await visRes.json() as { vision?: { _strategic_refresh?: StrategicRefreshMarker | null; _strategic_refresh_last_fired_at?: string; _strategic_refresh_last_fired_origin?: string } };
+          const marker = proj.vision?._strategic_refresh;
+          const lastFiredAt = proj.vision?._strategic_refresh_last_fired_at;
+          const lastFiredOrigin = proj.vision?._strategic_refresh_last_fired_origin;
+          // Build marker state: include pending marker if present, or add receipt if it was operator-origin
+          if (marker && typeof marker === 'object') {
+            setStrategicRefresh(marker);
+          } else if (lastFiredAt && typeof lastFiredAt === 'string' && lastFiredOrigin === 'operator') {
+            // No pending marker, but show receipt of prior operator-origin consumption
+            setStrategicRefresh({ last_fired_at: lastFiredAt, last_fired_origin: lastFiredOrigin });
+          } else {
+            setStrategicRefresh(null);
+          }
+        }
+      } catch { /* ignore */ }
     } catch {
       addToastRef.current('Failed to load messages', 'error');
     } finally {
@@ -702,12 +753,22 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
 
   async function handleSubmit() {
     if (!selectedProjectId || !newContent.trim()) return;
+    // Synchronous guard first — reject re-entrant calls before the async
+    // `setSubmitting` has a chance to re-render, so rapid double-Enter cannot
+    // launch two requests.
+    if (submittingRef.current) return;
+    submittingRef.current = true;
     setSubmitting(true);
     try {
       const context: Record<string, unknown> = {};
       if (replyTo) {
         context.reply_to = replyTo.id;
         context.reply_preview = replyTo.content.slice(0, 120);
+      }
+      // Reuse the draft's key across a double-submit / retry so the backend
+      // dedups; only mint a new one when the previous send fully succeeded.
+      if (!idempotencyKeyRef.current) {
+        idempotencyKeyRef.current = generateIdempotencyKey();
       }
       const res = await apiFetch(`${API_BASE_URL}/api/admin/messages`, {
         method: 'POST',
@@ -716,6 +777,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
           project_id: selectedProjectId,
           message_type: newType,
           content: newContent.trim(),
+          idempotency_key: idempotencyKeyRef.current,
           ...(Object.keys(context).length > 0 ? { context } : {}),
         }),
       });
@@ -730,6 +792,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       } catch {
         // No/invalid JSON body — fall back to generic confirmation copy.
       }
+      // Sent cleanly — the next distinct message gets a fresh key.
+      idempotencyKeyRef.current = null;
       setNewContent('');
       setReplyTo(null);
       setLastArming(arming);
@@ -742,7 +806,28 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     } catch {
       addToast('Failed to send message', 'error');
     } finally {
+      submittingRef.current = false;
       setSubmitting(false);
+    }
+  }
+
+  // Retract an armed-but-not-yet-fired strategic steer. Idempotent server-side
+  // (cancelling when nothing is armed is a no-op), so a late/duplicate click is
+  // harmless. Clears the local pending marker immediately, then refetches to
+  // confirm the badge cleared.
+  async function handleCancelStrategicRefresh() {
+    if (!selectedProjectId || cancellingRefresh) return;
+    setCancellingRefresh(true);
+    try {
+      const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}/cancel-strategic-refresh`, { method: 'POST' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setStrategicRefresh(null);
+      addToast('Strategic steer cancelled', 'success');
+      await fetchMessages();
+    } catch {
+      addToast('Failed to cancel strategic steer', 'error');
+    } finally {
+      setCancellingRefresh(false);
     }
   }
 
@@ -975,6 +1060,48 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         onClose={onClose}
       />
 
+      {/* Strategic-refresh indicator: either pending (armed but not yet fired) or
+          a receipt showing when a prior steer was picked up and acted upon. Hidden
+          once the cycle starts (strategistActive), at which point "Strategist working…"
+          takes over. Displays the queued directive excerpt and coalesce count. */}
+      {strategicRefresh && !strategistActive && (
+        <div className={`px-4 md:px-6 py-2 border-b ${strategicRefresh.requested_at ? 'border-neutral-800 bg-amber-950/40' : 'border-green-800 bg-emerald-950/40'} flex items-center gap-2 shrink-0`} role="status" aria-live="polite">
+          <span className={`w-2 h-2 rounded-full ${strategicRefresh.requested_at ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400'}`} aria-hidden="true" />
+          <span className={`text-xs font-medium ${strategicRefresh.requested_at ? 'text-amber-300' : 'text-emerald-300'}`}>
+            {strategicRefresh.requested_at ? (
+              <>
+                Strategic cycle pending{strategicRefresh.origin ? ` · ${strategicRefresh.origin}` : ''}
+                {strategicRefresh.excerpt && (
+                  <>
+                    {' · '}
+                    <span className="italic">{strategicRefresh.excerpt.slice(0, 120)}{strategicRefresh.excerpt.length > 120 ? '…' : ''}</span>
+                  </>
+                )}
+                {strategicRefresh.count && strategicRefresh.count > 1 && (
+                  <> · +{strategicRefresh.count - 1} {strategicRefresh.count - 1 === 1 ? 'steer' : 'steers'} coalesced</>
+                )}
+                {` · armed ${timeAgo(strategicRefresh.requested_at)}`}
+              </>
+            ) : (
+              <>
+                Steer picked up{strategicRefresh.last_fired_at ? ` · strategic cycle ran ${timeAgo(strategicRefresh.last_fired_at)}` : ''}
+              </>
+            )}
+          </span>
+          {strategicRefresh.requested_at && (
+            <button
+              type="button"
+              onClick={() => { void handleCancelStrategicRefresh(); }}
+              disabled={cancellingRefresh}
+              className="ml-auto text-xs font-medium text-amber-300 hover:text-amber-100 underline underline-offset-2 disabled:opacity-50 disabled:no-underline"
+              title="Retract this armed steer so the strategist will not run it"
+            >
+              {cancellingRefresh ? 'Cancelling…' : 'Cancel'}
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Live strategist activity indicator — driven by strategic_cycle_started/completed
           WS events, mirroring the DirectionsPanel affordance. Gives the operator
           at-a-glance context that a steer composed now will queue for the next cycle. */}
@@ -1015,6 +1142,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         newMessageCounts={newMessageCounts}
         highSignalOpen={highSignalOpen}
         routineOpen={routineOpen}
+        linkedMessages={linkedMessages}
         pinnedBlockers={pinnedBlockers}
         pinnedQuestions={pinnedQuestions}
         otherHighSignal={otherHighSignal}

@@ -47,18 +47,50 @@ export async function handleDesignDocUpdate(
   const designDocRetryContext = buildRetryContext(task);
   const designDocFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
 
-  // Build existing pages summary from current design doc
+  // Build existing pages summary from the current design doc. The backend now
+  // ships design_doc as a compact navigation index ({ sections: [...] }) built
+  // by _design_doc_index (backend/app/strategic_spawning.py) instead of the full
+  // per-section prose — bulky reference content is fetched on demand via
+  // `./design-doc get <key>`. Each index entry carries key + optional summary /
+  // reconciled status / backing modules / presence_warning. Render that as the
+  // Current pages list so the curator sees the real systems/*, capabilities/*,
+  // notes/* keys (not one bogus `sections` page). A flat key->value map is still
+  // tolerated as a defensive fallback so this handler never mis-renders if the
+  // backend reverts to the old shape.
   const designDoc = payload.design_doc as Record<string, unknown> | undefined;
   let existingPagesText = 'No pages exist yet. Build the design document from scratch.';
-  if (designDoc && Object.keys(designDoc).length > 0) {
-    const pages = Object.entries(designDoc)
-      .filter(([k]) => !k.startsWith('_'))
-      .map(([k, v]) => {
-        const preview = JSON.stringify(v).slice(0, 200);
-        return `  ${k}: ${preview}${preview.length >= 200 ? '...' : ''}`;
-      });
+  if (designDoc) {
+    const sections = designDoc.sections;
+    let pages: string[];
+    if (Array.isArray(sections)) {
+      // Index shape: one entry per non-internal section.
+      pages = sections
+        .filter((s): s is Record<string, unknown> => !!s && typeof s === 'object')
+        .map((s) => {
+          const key = strVal(s.key as string | undefined);
+          const parts: string[] = [];
+          if (typeof s.status === 'string' && s.status.trim()) parts.push(`status: ${s.status}`);
+          if (typeof s.summary === 'string' && s.summary.trim()) parts.push(s.summary);
+          if (Array.isArray(s.modules) && s.modules.length > 0) {
+            parts.push(`modules: ${(s.modules as unknown[]).filter(m => typeof m === 'string').join(', ')}`);
+          }
+          if (typeof s.presence_warning === 'string' && s.presence_warning.trim()) {
+            parts.push(`⚠ ${s.presence_warning}`);
+          }
+          return `  ${key}${parts.length > 0 ? ` — ${parts.join(' | ')}` : ''}`;
+        })
+        .filter(line => line.trim() !== '');
+    } else {
+      // Defensive fallback: flat key->value map (legacy shape).
+      pages = Object.entries(designDoc)
+        .filter(([k]) => !k.startsWith('_'))
+        .map(([k, v]) => {
+          const preview = JSON.stringify(v).slice(0, 200);
+          return `  ${k}: ${preview}${preview.length >= 200 ? '...' : ''}`;
+        });
+    }
     if (pages.length > 0) {
-      existingPagesText = `${pages.length} pages exist:\n${pages.join('\n')}`;
+      existingPagesText = `${pages.length} pages exist (use \`./design-doc get <key>\` to read a section's full content before editing):\n${pages.join('\n')}`;
     }
   }
 
@@ -132,8 +164,12 @@ Your text output will be DISCARDED. The ONLY way to save your work is the \`./de
 ./design-doc set "risks" '["Risk 1", "Risk 2"]'
 ./design-doc set "notes/observations" '"Any notes for future reference"'
 ./design-doc delete "systems/sys-removed"
+./design-doc get "systems/sys-auth"   # read a section's FULL content (the Current pages list below is only an index)
 ./design-doc list
 \`\`\`
+
+The "Current pages" section below is a compact INDEX (key + one-line summary), not the full prose.
+Before you edit, merge, or delete an existing page, call \`./design-doc get "<key>"\` to read its full content.
 
 Call \`./design-doc set\` AS YOU EXPLORE. Each call saves immediately. Do NOT wait until the end.
 Do NOT create files in the repo. Do NOT commit or push. Only use ./design-doc.

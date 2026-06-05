@@ -2,8 +2,11 @@ import { useEffect, useState } from 'react';
 import { ChevronDown, ChevronUp, FolderKanban, GitBranch, Compass, UserPlus, Plus, Settings, MoreVertical, Trash2, AlertTriangle, RotateCcw, Pause, Play, Archive, ArchiveRestore } from 'lucide-react';
 import type { Task } from './TaskCard';
 import { formatAbsolute, parseTimestamp } from '../utils/time';
-import { projectStatusBadge } from '../utils/projectStatus';
+import { projectStatusBadge, isProjectActive } from '../utils/projectStatus';
+import { humanizeUnverifiedReason } from '../utils/unverifiedReasonLabels';
+import { formatMergeGateSummary } from '../utils/mergeGateSummary';
 import { ProjectApprovalGateSection } from './ProjectApprovalGateSection';
+import { ComputeJobsPanel } from './ComputeJobsPanel';
 import { fetchApprovalGateConfig, updateApprovalGateConfig, deleteProject, resetProject, setProjectPaused, archiveProject, unarchiveProject, fetchArchivedProjects, type ApprovalGateConfigResponse } from '../api';
 
 export type { Project } from '../types/project';
@@ -34,6 +37,11 @@ interface ProjectDashboardProps {
   /** Called after a project is successfully unarchived, so the parent can
    *  refetch the active list (the project reappears in it). */
   onProjectUnarchived?: (projectId: string) => void;
+  /** True when the last project-list refresh failed, so the rendered project
+   *  rows reflect last-known (stale) data. Drives per-card status-badge
+   *  degradation so no green "Running" badge survives a failed fetch without
+   *  a visible staleness marker. Display-only. */
+  dataStale?: boolean;
 }
 
 /** A project is considered "new / setup incomplete" if it was created within the last hour
@@ -59,18 +67,18 @@ function getTaskCounts(tasks: Task[], projectId: string) {
   };
 }
 
-function humanizeMergeGateReason(reason: string): string {
-  return reason.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
-}
-
 function getMergeGateBadge(project: Project) {
   const verdict = project.merge_verification_verdict ?? { state: 'ci_checks' as const, test_commands: [] };
   const buildConfig = project.build_config ?? null;
   const runtime = project.merge_gate_runtime ?? null;
   const lastVerifiedAt = runtime?.executed_real_tests && runtime.last_run_at ? parseTimestamp(runtime.last_run_at) : null;
   const lastUnverifiedAt = runtime?.last_unverified_at ? parseTimestamp(runtime.last_unverified_at) : null;
-  const lastUnverifiedReason = runtime?.last_unverified_reason ? humanizeMergeGateReason(runtime.last_unverified_reason) : null;
+  const lastUnverifiedReason = runtime?.last_unverified_reason ? humanizeUnverifiedReason(runtime.last_unverified_reason) : null;
   const runtimeMismatch = verdict.state === 'tests_gated' && Boolean(lastUnverifiedAt && (!lastVerifiedAt || lastUnverifiedAt.getTime() > lastVerifiedAt.getTime()));
+  // At-a-glance merge-verification-health sentence appended to the badge tooltip.
+  // null (absent/legacy/never-ran runtime) leaves the tooltip exactly as before.
+  const summaryLine = formatMergeGateSummary(runtime?.summary);
+  const withSummary = (title: string) => (summaryLine ? `${title} ${summaryLine}.` : title);
 
   if (
     verdict.state === 'ci_checks' &&
@@ -80,7 +88,7 @@ function getMergeGateBadge(project: Project) {
     return {
       label: 'Stall risk',
       classes: 'bg-red-500/15 text-red-300 border-red-500/20',
-      title: 'No CI detected while required CI checks remain on. PRs will stall until the merge backstop times out.',
+      title: withSummary('No CI detected while required CI checks remain on. PRs will stall until the merge backstop times out.'),
     };
   }
 
@@ -89,7 +97,7 @@ function getMergeGateBadge(project: Project) {
       return {
         label: 'Tests gated?',
         classes: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
-        title: `Config says tests-gated, but the last live merge fell back to UNVERIFIED${lastUnverifiedAt ? ` at ${formatAbsolute(lastUnverifiedAt.getTime())}` : ''}${lastUnverifiedReason ? ` because ${lastUnverifiedReason}.` : '.'}${lastVerifiedAt ? ` Last verified real-test run: ${formatAbsolute(lastVerifiedAt.getTime())}.` : ''}`,
+        title: withSummary(`Config says tests-gated, but the last live merge fell back to UNVERIFIED${lastUnverifiedAt ? ` at ${formatAbsolute(lastUnverifiedAt.getTime())}` : ''}${lastUnverifiedReason ? ` because ${lastUnverifiedReason}.` : '.'}${lastVerifiedAt ? ` Last verified real-test run: ${formatAbsolute(lastVerifiedAt.getTime())}.` : ''}`),
         runtimeState: 'unverified-fallback',
       };
     }
@@ -97,7 +105,7 @@ function getMergeGateBadge(project: Project) {
     return {
       label: 'Tests gated',
       classes: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/20',
-      title: `Blueprint will run the project's detected test command(s) before merging PRs.${lastVerifiedAt ? ` Last verified real-test run: ${formatAbsolute(lastVerifiedAt.getTime())}.` : ''}`,
+      title: withSummary(`Blueprint will run the project's detected test command(s) before merging PRs.${lastVerifiedAt ? ` Last verified real-test run: ${formatAbsolute(lastVerifiedAt.getTime())}.` : ''}`),
       runtimeState: lastVerifiedAt ? 'verified' : (runtime ? 'unknown' : 'absent'),
     };
   }
@@ -106,7 +114,7 @@ function getMergeGateBadge(project: Project) {
     return {
       label: 'UNVERIFIED',
       classes: 'bg-yellow-500/15 text-yellow-300 border-yellow-500/30',
-      title: `No test command was detected. PRs merge without verification.${lastUnverifiedAt ? ` Last live merge fell back to UNVERIFIED at ${formatAbsolute(lastUnverifiedAt.getTime())}.${lastUnverifiedReason ? ` Reason: ${lastUnverifiedReason}.` : ''}` : ''}`,
+      title: withSummary(`No test command was detected. PRs merge without verification.${lastUnverifiedAt ? ` Last live merge fell back to UNVERIFIED at ${formatAbsolute(lastUnverifiedAt.getTime())}.${lastUnverifiedReason ? ` Reason: ${lastUnverifiedReason}.` : ''}` : ''}`),
       runtimeState: lastUnverifiedAt ? 'unverified' : (runtime ? 'unknown' : 'absent'),
     };
   }
@@ -114,12 +122,12 @@ function getMergeGateBadge(project: Project) {
   return {
     label: 'CI gated',
     classes: 'bg-blue-500/15 text-blue-300 border-blue-500/20',
-    title: "Blueprint will wait for the repository's GitHub CI checks before merging PRs.",
+    title: withSummary("Blueprint will wait for the repository's GitHub CI checks before merging PRs."),
     runtimeState: runtime ? 'unknown' : 'absent',
   };
 }
 
-export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectProject, showMembers, onToggleMembers, userRole, onNewProject, onOpenSetupGuide, onProjectDeleted, onProjectReset, onProjectPaused, onProjectArchived, onProjectUnarchived }: ProjectDashboardProps) {
+export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectProject, showMembers, onToggleMembers, userRole, onNewProject, onOpenSetupGuide, onProjectDeleted, onProjectReset, onProjectPaused, onProjectArchived, onProjectUnarchived, dataStale }: ProjectDashboardProps) {
   const [collapsed, setCollapsed] = useState(() => {
     const stored = localStorage.getItem('projectDashboardCollapsed');
     return stored === null ? true : stored === 'true';
@@ -354,7 +362,7 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
         <div className="flex gap-4 px-1 pb-2">
           <span className="bg-neutral-800 rounded px-2 py-0.5 text-xs text-neutral-400 flex items-center gap-1.5">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" />
-            {projects.filter(p => p.status === 'active').length} active
+            {projects.filter(p => isProjectActive({ status: p.status, paused: p.paused, archived: p.archived })).length} active
           </span>
           <span className="bg-neutral-800 rounded px-2 py-0.5 text-xs text-neutral-400 flex items-center gap-1.5">
             <span className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0" />
@@ -423,11 +431,19 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                   </button>
                   <div className="flex items-center gap-1.5 shrink-0">
                     {(() => {
-                      const badge = projectStatusBadge(project.status);
+                      const badge = projectStatusBadge({
+                        status: project.status,
+                        paused: project.paused,
+                        archived: project.archived,
+                        created_at: project.created_at,
+                        stale: dataStale,
+                      });
                       return (
                         <span
                           className={`text-[9px] font-bold rounded px-1 py-0.5 ${badge.classes}`}
-                          title={`Project status: ${badge.label}`}
+                          title={badge.stale
+                            ? `Project status: ${badge.label} (last-known — backend refresh failed)`
+                            : `Project status: ${badge.label}`}
                         >
                           {badge.label}
                         </span>
@@ -710,6 +726,7 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
               />
             </div>
           )}
+          {selectedProject && <ComputeJobsPanel projectId={selectedProject.id} />}
         </>
       )}
 

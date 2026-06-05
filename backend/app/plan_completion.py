@@ -12,8 +12,10 @@ from typing import Any, Dict, List
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.broadcast import broadcast_to_project
+from app.depends_on_provenance import remember_structural_depends_on
 from app.models import Project, Task, TaskHistory, TaskStatus
 from app.payload_schemas import validate_internal_payload
+from app.task_capabilities import PLAN_SUBTASK_TYPES
 from app.shared_state import (
     get_project_integration_branch,
     runtime_config as _runtime_config,
@@ -139,6 +141,56 @@ def _inject_file_overlap_deps(subtasks: List[Dict], label: str = "PLAN") -> None
                 logger.debug(
                     f"[{label}] Serializing subtasks {pred_title!r} → {succ_title!r} due to shared file: {file_path}"
                 )
+
+
+def _inject_build_on_deps(subtasks: List[Dict], label: str = "PLAN") -> List[tuple]:
+    """Serialize cross-file BUILD-ON relationships between subtasks.
+
+    ``_inject_file_overlap_deps`` only orders subtasks that touch a SHARED
+    file. The canonical foundational shape — subtask A creates a brand-new
+    module/file and a LATER subtask B (in a DIFFERENT file) imports or
+    otherwise consumes A's new code — shares no files, so it gets no
+    automatic edge and the same-base siblings would dispatch in parallel.
+
+    This closes that hole conservatively: when a later subtask's prompt
+    references a file that an earlier subtask OWNS in its ``related_files``
+    but the later subtask does NOT edit itself, the later subtask is
+    consuming the earlier one's output and must run after it. Only forward
+    edges (consumer after producer) are added so independent work — and
+    additive edits to shared infra, which the same-file pass already
+    handles — stay parallel.
+
+    Returns the list of (producer_idx, consumer_idx, file) edges added so the
+    caller can observe them. Additive only — merged with existing deps.
+    """
+    added: List[tuple] = []
+    for consumer_idx, consumer in enumerate(subtasks):
+        prompt = consumer.get("prompt", "") or ""
+        if not prompt:
+            continue
+        consumer_files = set(consumer.get("related_files", []))
+        for producer_idx in range(consumer_idx):
+            producer = subtasks[producer_idx]
+            for f in producer.get("related_files", []):
+                # Same-file case is already handled by overlap injection.
+                if f in consumer_files:
+                    continue
+                # Bounded match so a short path (a.py) does not match inside a
+                # longer token (data.py); the consumer must reference the
+                # producer's file as a standalone path.
+                if re.search(rf"(?<![\w/.]){re.escape(f)}(?![\w])", prompt):
+                    existing = consumer.setdefault("depends_on_indices", [])
+                    if producer_idx not in existing:
+                        existing.append(producer_idx)
+                        added.append((producer_idx, consumer_idx, f))
+                        logger.info(
+                            f"[{label}] Build-on edge: "
+                            f"{producer.get('title', f'#{producer_idx}')!r} → "
+                            f"{consumer.get('title', f'#{consumer_idx}')!r} "
+                            f"(consumer prompt consumes producer file: {f})"
+                        )
+                    break  # one edge per producer/consumer pair is enough
+    return added
 
 
 async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
@@ -291,8 +343,79 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     }
     parent_direction_id = (task.context or {}).get("direction_id")
     parent_research_task_id = (task.context or {}).get("research_task_id")
+
+    # Pre-validate: identify which subtasks will be skipped and check for unsatisfiable dependencies.
+    # Do this before creating any child tasks so we can fail cleanly if a spawned subtask
+    # depends on a skipped (non-eligible) producer.
+    skipped_indices = set()
+    for i, subtask_def in enumerate(subtasks):
+        raw_type = subtask_def.get("type", "create")
+        if raw_type not in PLAN_SUBTASK_TYPES:
+            skipped_indices.add(i)
+
+    for i, subtask_def in enumerate(subtasks):
+        if i in skipped_indices:
+            continue
+        dep_indices = subtask_def.get("depends_on_indices", [])
+        for dep_idx in dep_indices:
+            if 0 <= dep_idx < len(subtasks) and dep_idx in skipped_indices:
+                skipped_title = subtasks[dep_idx].get("title", f"#{dep_idx}")
+                skipped_type = subtasks[dep_idx].get("type", "create")
+                dependent_title = subtask_def.get("title", f"#{i}")
+                task.latest_status_message = (
+                    f"Plan has unsatisfiable dependency: {dependent_title!r} "
+                    f"depends on {skipped_title!r} (type {skipped_type!r}, "
+                    f"not a registered plan-spawnable task type)"
+                )[:500]
+                task.status = TaskStatus.FAILED
+                from app.failure_classification import (
+                    classify_failure,
+                    persist_failure_category,
+                )
+                from app.routers.agent_status import record_task_result
+
+                _fc = classify_failure(task)
+                persist_failure_category(task, _fc)
+                record_task_result(
+                    success=False,
+                    failure_class=_fc,
+                    task_id=str(task.id),
+                    task_type=task.first_payload.get("type", ""),
+                )
+                session.add(task)
+                await _maybe_create_failure_alert(
+                    task, session, task.latest_status_message
+                )
+                await session.commit()
+                logger.error(
+                    "[PLAN] Plan %s failed — dependent %r references skipped producer %r",
+                    task.id,
+                    dependent_title,
+                    skipped_title,
+                )
+                return
+
     child_tasks = []
-    for subtask_def in subtasks:
+    for i, subtask_def in enumerate(subtasks):
+        # Gate the child type on the registry-derived plan-subtask allowlist
+        # rather than a hardcoded literal. A requested type outside that set is
+        # SKIPPED with an explicit log — never silently rewritten to "create" — so
+        # a plan that asks for a non-eligible child surfaces the misconfiguration
+        # instead of masquerading as a successfully-spawned create. A ``None``
+        # placeholder keeps ``child_tasks`` index-aligned with ``subtasks`` for the
+        # downstream dependency-injection pass.
+        if i in skipped_indices:
+            raw_type = subtask_def.get("type", "create")
+            logger.warning(
+                "[PLAN] Skipping subtask %r with non-eligible type %r "
+                "(not a registered plan-spawnable write task type) in plan %s",
+                subtask_def.get("title", "Untitled subtask"),
+                raw_type,
+                task.id,
+            )
+            child_tasks.append(None)
+            continue
+        subtask_type = subtask_def.get("type", "create")
         related_files = subtask_def.get("related_files", [])
         prompt_text = subtask_def.get("prompt", "")
         full_prompt = (
@@ -325,9 +448,6 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         child_approval_reason = (
             subtask_def.get("approval_reason") if child_risk == "high" else None
         )
-        _allowed_types = {"create", "refactor", "migrate", "qa"}
-        raw_type = subtask_def.get("type", "create")
-        subtask_type = raw_type if raw_type in _allowed_types else "create"
         # Ignore subtask_def.model and parent plan model — legacy hints
         # that anchored every child to one provider regardless of the
         # operator's category_routing. Respect operator-level
@@ -395,10 +515,14 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         i: list(st.get("depends_on_indices", [])) for i, st in enumerate(subtasks)
     }
     _inject_file_overlap_deps(subtasks, "PLAN")
+    # Close the cross-file build-on hole: a subtask consuming a NEW module a
+    # sibling creates shares no file with it, so the same-file pass above adds
+    # no edge. Order the consumer after the producer it references.
+    _inject_build_on_deps(subtasks, "PLAN")
 
     if not _validate_plan_dependencies(subtasks):
         logger.error(
-            "[PLAN] Circular dependency after file overlap injection — reverting to explicit deps only"
+            "[PLAN] Circular dependency after dependency injection — reverting to explicit deps only"
         )
         for i, st in enumerate(subtasks):
             if original_deps.get(i):
@@ -407,15 +531,24 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 st.pop("depends_on_indices", None)
 
     for i, subtask_def in enumerate(subtasks):
+        if child_tasks[i] is None:
+            continue
         dep_indices = subtask_def.get("depends_on_indices", [])
-        child_tasks[i].depends_on = [
-            str(child_tasks[j].id) for j in dep_indices if 0 <= j < len(child_tasks)
+        dep_ids = [
+            str(child_tasks[j].id)
+            for j in dep_indices
+            if 0 <= j < len(child_tasks) and child_tasks[j] is not None
         ]
+        child_tasks[i].depends_on = dep_ids
+        if dep_ids:
+            remember_structural_depends_on(child_tasks[i], dep_ids)
         session.add(child_tasks[i])
 
     _log_file_overlaps(subtasks, "PLAN")
 
     for ct in child_tasks:
+        if ct is None:
+            continue
         history = TaskHistory(
             task_id=ct.id,
             action="SPAWNED",
@@ -433,10 +566,13 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     await session.commit()
 
     for ct in child_tasks:
+        if ct is None:
+            continue
         await broadcast_to_project(
             str(task.project_id),
             "task_updated",
             {"task_id": str(ct.id), "status": TaskStatus.QUEUED},
         )
 
-    logger.info(f"[PLAN] Created {len(child_tasks)} subtasks from plan {task.id}")
+    spawned_count = sum(1 for ct in child_tasks if ct is not None)
+    logger.info(f"[PLAN] Created {spawned_count} subtasks from plan {task.id}")

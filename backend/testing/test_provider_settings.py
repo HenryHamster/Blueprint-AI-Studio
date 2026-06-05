@@ -1,3 +1,6 @@
+from httpx import ASGITransport, AsyncClient
+
+
 async def test_get_settings_includes_provider_scaffolding(client):
     res = await client.get("/api/admin/settings")
 
@@ -323,6 +326,158 @@ async def test_patch_settings_legacy_cross_provider_fallback_boolean_shim(client
     body = (await client.get("/api/admin/settings")).json()
     assert body["provider_selection_mode"] == "preferred"
     assert body["cross_provider_fallback_enabled"] is True
+
+
+async def test_get_settings_publishes_task_capability_contract(client):
+    """GET /settings embeds the published task-capability contract; it must
+    cover every registered task type and carry the consumed flags."""
+    from app.task_capabilities import ALL_TASK_TYPES
+
+    body = (await client.get("/api/admin/settings")).json()
+    assert "task_capabilities" in body
+    contract = body["task_capabilities"]
+    assert set(contract) == set(ALL_TASK_TYPES)
+    create = contract["create"]
+    assert create["label"] == "Create"
+    assert create["user_launchable"] is True
+    assert create["reservable"] is True
+    assert create["delivers_product"] is True
+    # A read-only, non-launchable type is published with the right flags.
+    assert contract["security_audit"]["periodic_eligible"] is True
+    assert contract["security_audit"]["agent_mode"] == "read_only"
+
+
+async def test_task_capabilities_endpoint_mirrors_settings_contract(client):
+    """The standalone endpoint returns the same contract as GET /settings."""
+    endpoint = (await client.get("/api/admin/task-capabilities")).json()
+    settings = (await client.get("/api/admin/settings")).json()
+    assert endpoint["task_capabilities"] == settings["task_capabilities"]
+
+
+async def test_task_capabilities_endpoint_requires_admin(override_get_session):
+    """Non-admin callers are blocked from the standalone admin contract route."""
+    from fastapi import HTTPException
+
+    from app.auth import get_current_user as _gcu, require_admin as _ra
+    from app.main import app as _app
+
+    async def _non_admin():
+        return {
+            "user_id": "non-admin-user",
+            "email": "user@example.com",
+            "role": "user",
+        }
+
+    async def _reject_admin():
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    _app.dependency_overrides[_gcu] = _non_admin
+    _app.dependency_overrides[_ra] = _reject_admin
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=_app), base_url="http://test"
+        ) as ac:
+            resp = await ac.get("/api/admin/task-capabilities")
+        assert resp.status_code == 403
+    finally:
+        _app.dependency_overrides.pop(_gcu, None)
+        _app.dependency_overrides.pop(_ra, None)
+
+
+async def test_patch_rejects_unknown_task_type_in_routing(client):
+    res = await client.patch(
+        "/api/admin/settings",
+        json={"task_type_routing": {"nonsense_type": {"effort": "low"}}},
+    )
+    assert res.status_code == 400
+    assert "nonsense_type" in res.text
+
+
+async def test_patch_rejects_unknown_task_type_in_model_preferences(client):
+    res = await client.patch(
+        "/api/admin/settings",
+        json={
+            "task_type_model_preferences": {
+                "typoed_type": [{"provider": "anthropic", "model": "claude-opus-4-8"}]
+            }
+        },
+    )
+    assert res.status_code == 400
+    assert "typoed_type" in res.text
+
+
+async def test_patch_rejects_unknown_task_type_in_provider_overrides(client):
+    res = await client.patch(
+        "/api/admin/settings",
+        json={"task_type_provider_overrides": {"bogus": {"anthropic": {}}}},
+    )
+    assert res.status_code == 400
+    assert "bogus" in res.text
+
+
+async def test_patch_rejects_unknown_task_type_in_categories(client):
+    res = await client.patch(
+        "/api/admin/settings",
+        json={"task_type_categories": {"build": ["create", "not_a_type"]}},
+    )
+    assert res.status_code == 400
+    assert "not_a_type" in res.text
+
+
+async def test_patch_rejects_non_reservable_task_type_in_reserved_slots(client):
+    # `review` is a known task type but is NOT reservable — the surface must
+    # reject it on capability-flag grounds, not just unknown-type grounds.
+    res = await client.patch(
+        "/api/admin/settings",
+        json={"reserved_slots_for_types": {"review": 1}},
+    )
+    assert res.status_code == 400
+    assert "review" in res.text
+
+
+async def test_patch_accepts_reservable_task_types(client):
+    res = await client.patch(
+        "/api/admin/settings",
+        json={"reserved_slots_for_types": {"create": 2, "plan": 1, "research": 1}},
+    )
+    assert res.status_code == 200, res.text
+    body = (await client.get("/api/admin/settings")).json()
+    assert body["reserved_slots_for_types"]["plan"] == 1
+
+
+async def test_patch_rejects_non_periodic_task_type(client):
+    # `create` is known but not periodic-eligible.
+    res = await client.patch(
+        "/api/admin/settings",
+        json={"autonomous_periodic_tasks": {"create": {"enabled": True}}},
+    )
+    assert res.status_code == 400
+    assert "create" in res.text
+
+
+async def test_settings_maps_validate_from_registry_without_per_surface_allowlist(
+    client,
+):
+    """A task type's eligibility for each map derives from its capability flags,
+    so the accept/reject decision tracks the registry — no surface keeps its own
+    hand-maintained allowlist. We prove the linkage holds for every registered
+    type against the routing surface (gated on provider_configurable)."""
+    from app.task_capabilities import (
+        PROVIDER_CONFIGURABLE_TASK_TYPES,
+        TASK_CAPABILITIES,
+    )
+
+    configurable = set(PROVIDER_CONFIGURABLE_TASK_TYPES)
+    for cap in TASK_CAPABILITIES:
+        tt = cap.id.value
+        res = await client.patch(
+            "/api/admin/settings",
+            json={"task_type_routing": {tt: {"effort": "low"}}},
+        )
+        if tt in configurable:
+            assert res.status_code == 200, f"{tt}: {res.text}"
+        else:
+            assert res.status_code == 400, f"{tt} should be rejected"
 
 
 async def test_patch_settings_mode_wins_over_legacy_boolean_in_same_payload(client):

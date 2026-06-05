@@ -539,11 +539,13 @@ async def _attempt_merge_with_retry_and_escalation(
         _unverified_reason = ci_loop.get("unverified_merge_reason")
         if _unverified_reason:
             try:
+                from app.alert_dispatch import _severity_for_unverified_reason
                 await _maybe_create_unverified_merge_alert(
                     task,
                     session,
                     pr_number=ci_pr_number,
                     reason=_unverified_reason,
+                    severity=_severity_for_unverified_reason(_unverified_reason),
                 )
             except Exception as _ue:
                 logger.warning(

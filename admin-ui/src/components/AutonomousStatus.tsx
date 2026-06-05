@@ -1,8 +1,29 @@
 import { useState, useEffect, useCallback, useRef, type RefObject } from 'react';
 import { Zap, ZapOff, AlertTriangle, RefreshCw, Lock, Clock, PlayCircle, Gauge, Pause, Server, Compass, CheckCircle2, XCircle, Activity, FileText } from 'lucide-react';
 import { API_BASE_URL, authHeaders, apiFetch } from '../api';
-import { secondsUntil, parseTimestamp } from '../utils/time';
+import { secondsUntil, parseTimestamp, snapshotFreshness } from '../utils/time';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
+
+// Matches _MAX_PAYLOAD_BYTES from backend/app/payload_schemas.py
+const MAX_PAYLOAD_KB = 190;
+
+// A last-successful poll older than this many seconds is presented as stale:
+// the autonomy indicator dims/desaturates and its last-updated label is marked,
+// mirroring the System Health card and per-project status-badge stale pattern so
+// a frozen reading (backgrounded tab, unreachable backend, swallowed error) is
+// never shown as a live one. ~3x DEFAULT_POLL_MS (30s) leaves room for one
+// missed tick before degrading.
+const STATUS_STALE_AFTER_SECONDS = 90;
+
+// How often the component re-renders purely to re-evaluate staleness. A stalled
+// poll loop produces no re-render on its own, so without this tick the stale
+// flag would never flip until the next successful fetch. Clears naturally when
+// fetchStatus sets a fresh lastUpdated.
+const STALE_TICK_MS = 15_000;
+
+// Tailwind classes applied when the reading is stale — desaturate + dim (same
+// affordance as SystemHealthCard / projectStatus.ts STALE_CLASSES).
+const STALE_CLASSES = 'opacity-60 saturate-50';
 
 interface ProjectAutonomousStatus {
   project_id: string;
@@ -88,6 +109,24 @@ interface PayloadBloatSkip {
   top_contributors?: { key: string; size: number }[];
 }
 
+interface ProblemModelTrim {
+  status: 'full' | 'summarized' | 'floor' | 'dropped';
+  budget_total?: number | null;
+  budget_used?: number | null;
+  gap_memory_trimmed_count?: number;
+  floor?: {
+    floor_bytes?: number | null;
+    stripped_gap_fields?: string[];
+    dropped_gaps?: number;
+    summarized_capabilities_count?: number;
+    summarized_friction_count?: number;
+    still_over_floor?: boolean;
+  };
+  dropped_reason?: string;
+  task_status?: string;
+  assembled_at?: string | null;
+}
+
 interface StrategicCycleEntry {
   cycle_id?: string;
   started_at?: string;
@@ -104,6 +143,7 @@ interface StrategicDebug {
   phase: number;
   blocking_guards: StrategicBlockingGuard[];
   payload_bloat_skip?: PayloadBloatSkip | null;
+  problem_model_trim?: ProblemModelTrim | null;
   has_purpose: boolean;
   research_spawn_count: number;
   strategic_cycle_count: number;
@@ -451,7 +491,7 @@ function PayloadBloatIndicator({ skip }: { skip: PayloadBloatSkip }) {
         )}
       </div>
       <p className="text-[11px] leading-tight text-amber-300 mt-1">
-        Assembled payload{sizeKb != null ? ` (${sizeKb} KB)` : ''} exceeds the 256 KB cap, so strategic refresh is frozen.
+        Assembled payload{sizeKb != null ? ` (${sizeKb} KB)` : ''} exceeds the {MAX_PAYLOAD_KB} KB cap, so strategic refresh is frozen.
         Compact{' '}
         {contributors.length > 0
           ? contributors.map((c) => c.key).join(', ')
@@ -462,13 +502,79 @@ function PayloadBloatIndicator({ skip }: { skip: PayloadBloatSkip }) {
   );
 }
 
+const TRIM_STATUS_META: Record<ProblemModelTrim['status'], { label: string; tone: string }> = {
+  full: { label: 'shipped in full', tone: 'text-emerald-400' },
+  summarized: { label: 'summarized to fit budget', tone: 'text-amber-400' },
+  floor: { label: 'degraded to read-time floor', tone: 'text-amber-400' },
+  dropped: { label: 'dropped from payload', tone: 'text-red-400' },
+};
+
+function ProblemModelTrimIndicator({ trim }: { trim: ProblemModelTrim }) {
+  const meta = TRIM_STATUS_META[trim.status] ?? TRIM_STATUS_META.full;
+  // "full" is the healthy case — show a compact one-liner; trimmed states get a
+  // callout box explaining what the strategist actually saw.
+  if (trim.status === 'full') {
+    const trimmedGaps = trim.gap_memory_trimmed_count ?? 0;
+    return (
+      <div className="flex items-center justify-between text-[11px] text-neutral-500">
+        <span className="flex items-center gap-1">
+          <FileText className="w-3 h-3 shrink-0" />Problem model
+        </span>
+        <span className="font-mono text-[10px] text-emerald-400">
+          full{trimmedGaps > 0 ? ` · ${trimmedGaps} gap${trimmedGaps === 1 ? '' : 's'} trimmed` : ''}
+        </span>
+      </div>
+    );
+  }
+  const floor = trim.floor;
+  const droppedGaps = floor?.dropped_gaps ?? 0;
+  const summarizedCapabilities = floor?.summarized_capabilities_count ?? 0;
+  const summarizedFriction = floor?.summarized_friction_count ?? 0;
+  const skeletonizedSummaryParts: string[] = [];
+  if (summarizedCapabilities > 0) {
+    skeletonizedSummaryParts.push(
+      `${summarizedCapabilities} ${summarizedCapabilities === 1 ? 'capability' : 'capabilities'}`,
+    );
+  }
+  if (summarizedFriction > 0) {
+    skeletonizedSummaryParts.push(
+      `${summarizedFriction} ${summarizedFriction === 1 ? 'friction item' : 'friction items'}`,
+    );
+  }
+  const stripped = floor?.stripped_gap_fields ?? [];
+  return (
+    <div className="rounded-md bg-amber-500/10 border border-amber-500/30 px-2.5 py-2">
+      <div className="flex items-center justify-between">
+        <span className={`text-[10px] font-semibold uppercase tracking-wider flex items-center gap-1 ${meta.tone}`}>
+          <AlertTriangle className="w-3 h-3 shrink-0" />Problem model {meta.label}
+        </span>
+        {trim.assembled_at && (
+          <span className="font-mono text-[10px] text-amber-400/70">{formatTimeAgoShort(trim.assembled_at)}</span>
+        )}
+      </div>
+      <p className="text-[11px] leading-tight text-amber-300 mt-1">
+        Read-time packing trimmed the problem_model, so the strategist saw a reduced view.
+        {trim.status === 'dropped' && (trim.dropped_reason ? ` ${trim.dropped_reason}.` : ' It was omitted entirely.')}
+        {trim.status === 'floor' && droppedGaps > 0 && ` Dropped ${droppedGaps} low-priority gap${droppedGaps === 1 ? '' : 's'}.`}
+        {trim.status === 'floor' && stripped.length > 0 && ` Stripped per-gap ${stripped.join(', ')}.`}
+        {trim.status === 'floor' && skeletonizedSummaryParts.length > 0 && ` Skeletonized ${skeletonizedSummaryParts.join(' and ')}.`}
+        {floor?.still_over_floor && ' Still over the floor after trimming.'}
+      </p>
+    </div>
+  );
+}
+
 function StrategicSection({ strategic }: { strategic: StrategicDebug }) {
   const bloat = strategic.payload_bloat_skip;
+  const trim = strategic.problem_model_trim;
   const otherGuards = strategic.blocking_guards.filter((g) => g.guard !== 'payload_bloat_skip');
   return (
     <div className="mt-3 pt-3 border-t border-neutral-800 space-y-1.5">
       {/* Payload-bloat stall takes precedence over the green countdown */}
       {bloat && <PayloadBloatIndicator skip={bloat} />}
+
+      {/* Last read-time packing verdict for the problem_model the strategist saw */}
+      {trim && <ProblemModelTrimIndicator trim={trim} />}
 
       {/* Active task or next countdown */}
       {strategic.active_task ? (
@@ -574,6 +680,9 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
   const [toggling, setToggling] = useState<string | null>(null);
   const [resettingBreaker, setResettingBreaker] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  // Bumped on a slow interval so staleness is re-evaluated even when the poll
+  // loop has stalled (no fetch -> no re-render of its own).
+  const [, setStaleTick] = useState(0);
   const containerRef = useRef<HTMLDivElement>(null);
 
   const fetchStatus = useCallback(async () => {
@@ -618,6 +727,14 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
   }, []);
 
   usePoller(fetchStatus, { intervalMs: DEFAULT_POLL_MS, deps: [fetchStatus] });
+
+  // Keep the staleness flag honest even when the poll loop has gone quiet: a
+  // stalled/paused poll produces no re-render, so without this the indicator
+  // would look live indefinitely. Cleared implicitly on the next fresh fetch.
+  useEffect(() => {
+    const id = setInterval(() => setStaleTick(t => t + 1), STALE_TICK_MS);
+    return () => clearInterval(id);
+  }, []);
 
   // Close dropdown on outside click
   useEffect(() => {
@@ -698,6 +815,17 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
   const anyEnabled = projects.some(p => p.autonomous_enabled);
   const anyCircuitBreaker = projects.some(p => p.consecutive_failures >= 2);
 
+  // The displayed reading goes stale once the last successful poll is older than
+  // the threshold. Reuse the shared freshness helper (same as SystemHealthCard)
+  // by deriving its args from lastUpdated; null until the first successful poll,
+  // so a never-yet-loaded indicator is not marked stale.
+  const ageSeconds = lastUpdated ? (Date.now() - lastUpdated.getTime()) / 1000 : null;
+  const { stale } = snapshotFreshness(
+    lastUpdated ? lastUpdated.toISOString() : null,
+    ageSeconds,
+    STATUS_STALE_AFTER_SECONDS,
+  );
+
   const formatTimeAgo = (iso: string) => {
     const diff = Date.now() - parseTimestamp(iso).getTime();
     const mins = Math.floor(diff / 60000);
@@ -716,7 +844,10 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
         title="Autonomous Pipeline Status"
       >
         <span className="text-[10px] text-neutral-500 font-semibold uppercase tracking-wider mb-1">Autonomy</span>
-        <span className="text-xl font-bold font-mono leading-none flex items-center gap-1.5">
+        <span
+          className={`text-xl font-bold font-mono leading-none flex items-center gap-1.5 ${stale ? STALE_CLASSES : ''}`}
+          title={stale ? 'Last autonomy reading is stale — poll may have stalled' : undefined}
+        >
           {anyEnabled ? (
             <>
               <Zap className={`w-4 h-4 ${anyCircuitBreaker ? 'text-amber-400' : 'text-emerald-400'}`} />
@@ -740,8 +871,13 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
             <h3 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">Autonomous Pipeline — Tactical · Strategic · Architecture</h3>
             <span className="flex items-center gap-1.5">
               {lastUpdated && (
-                <span className="text-[10px] text-neutral-600 font-mono">
+                <span
+                  className={`text-[10px] font-mono ${stale ? 'text-amber-400 font-semibold' : 'text-neutral-600'}`}
+                  title={stale ? 'Last successful update is stale — poll may have stalled' : 'Last successful update'}
+                >
+                  {stale && '⚠ '}
                   {lastUpdated.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                  {stale && ' · stale'}
                 </span>
               )}
               <button onClick={fetchStatus} className="text-neutral-500 hover:text-neutral-300 transition-colors">
@@ -761,6 +897,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
             <p className="text-xs text-neutral-600">No projects found</p>
           )}
 
+          <div className={stale ? STALE_CLASSES : undefined}>
           {projects.map(p => {
             const debug = debugData[p.project_id];
             const strategic = strategicData[p.project_id];
@@ -847,6 +984,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
               </div>
             );
           })}
+          </div>
         </div>
       )}
     </div>

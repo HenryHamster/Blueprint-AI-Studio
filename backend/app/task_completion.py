@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -28,6 +29,7 @@ from app.github import (
     create_pr_comment,
     get_branch_sha,
     get_open_pull_requests,
+    submit_pr_review,
 )
 from app.models import (
     Project,
@@ -35,7 +37,15 @@ from app.models import (
     TaskHistory,
     TaskStatus,
 )
+from app.compute_jobs import stamp_compute_job_result_reference
 from app.task_capabilities import WRITE_TASK_TYPES
+from app.task_evaluators import (
+    EvaluationVerdict,
+    _extract_compute_measurement,
+    evaluate_compute_success_criterion,
+    evaluate_terminal_output,
+    record_failed_gate,
+)
 from app.plan_completion import (
     # Re-exports — task_completion is the canonical completion-API import surface
     # for downstream modules (task_lifecycle, research_completion, tests). The
@@ -44,6 +54,7 @@ from app.plan_completion import (
     # broke every downstream importer. noqa pins them so a future --fix sweep
     # can't repeat the regression.
     _handle_plan_completion,  # noqa: F401
+    _inject_build_on_deps,  # noqa: F401
     _inject_file_overlap_deps,  # noqa: F401
     _log_file_overlaps,  # noqa: F401
     _parse_plan_output,  # noqa: F401
@@ -119,6 +130,20 @@ def _estimated_task_cost_usd(task: Task) -> Optional[float]:
         return None
     rate = get_vm_rate_per_second(spot=task.vm_spot)
     return (task.vm_stopped_at - task.vm_provisioned_at).total_seconds() * rate
+
+
+def _extract_compute_result_reference(logs: str) -> Optional[str]:
+    try:
+        payload = json.loads(logs)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    reference = payload.get("result_reference")
+    if isinstance(reference, str):
+        reference = reference.strip()
+        return reference or None
+    return None
 
 
 def build_blueprint_pr_footer(
@@ -830,6 +855,25 @@ def _extract_json_array(text: str, *required_keys: str) -> Optional[str]:
     return None
 
 
+def _normalize_findings_array(parsed: Any) -> list[dict]:
+    """Filter a parsed findings array to dict-only elements, defensive normalization.
+
+    When _extract_json_array returns a bracket-balanced span containing the
+    required keys, a malformed-but-parseable JSON like [{"severity":"high"}, "stray"],
+    passes isinstance(parsed, list) but contains non-dict elements. Consumers
+    throughout the handlers iterate findings and call .get() on each element,
+    so a single non-dict entry would raise AttributeError and fail the entire
+    task. This helper normalizes at parse time so bad elements are silently
+    skipped rather than crashing the handler.
+
+    Mirrors the pattern already in use by task_outcomes._findings_list and
+    research_completion.py for defensive filtering.
+    """
+    if not isinstance(parsed, list):
+        return []
+    return [f for f in parsed if isinstance(f, dict)]
+
+
 # Round 4 W1 (audit C3): content snapshot used by ``_ensure_branch`` for
 # lock-window-break validation. Heartbeat-driven ``updated_at`` advances
 # every 30s and would false-defer under load. Validate against the fields
@@ -1238,18 +1282,133 @@ async def _maybe_release_safeguard_gate(
             )
 
 
+# ---------------------------------------------------------------------------
+# Cheap always-on acceptance probes for findings-producing task types
+# (security_audit, perf). Mirrors the topic-responsiveness and grounding
+# probes in knowledge_completion.py: deterministic, no external calls, errs
+# toward acceptance — only a CLEAR objective miss or complete lack of file
+# references fails here.
+# ---------------------------------------------------------------------------
+
+_FINDINGS_STOPWORDS = frozenset({
+    "about", "code", "does", "from", "function", "have", "into", "make",
+    "made", "method", "over", "prompt", "report", "should", "state", "such",
+    "than", "that", "their", "them", "then", "there", "these", "they", "this",
+    "those", "topic", "under", "used", "using", "what", "when", "where",
+    "which", "while", "will", "with", "would", "your",
+})
+_FINDINGS_MIN_KWS = 3
+_FINDINGS_MIN_OVERLAP = 0.1
+
+
+def _findings_kws(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(w) >= 4 and w not in _FINDINGS_STOPWORDS}
+
+
+def _findings_responsiveness_miss(task: Task, findings: list) -> str | None:
+    """Return a reason when findings clearly don't match the requested target, else None."""
+    payload = task.first_payload or {}
+    req = _findings_kws(" ".join(str(payload.get(k) or "") for k in ("prompt", "topic", "target")))
+    if len(req) < _FINDINGS_MIN_KWS:
+        return None
+    doc = _findings_kws(" ".join(
+        " ".join(str(f.get(k) or "") for k in ("title", "description", "area")) for f in findings
+    ))
+    overlap = req & doc
+    if len(overlap) / len(req) >= _FINDINGS_MIN_OVERLAP:
+        return None
+    return f"findings not responsive to target ({len(overlap)}/{len(req)} keyword(s) matched in titles/descriptions)"
+
+
+def _findings_grounding_miss(findings: list) -> str | None:
+    """Return a reason when NO finding references a file path (completely ungrounded)."""
+    if not findings or any(str(f.get("file_path") or "").strip() for f in findings):
+        return None
+    return f"findings not grounded in repository: none of {len(findings)} finding(s) cite a file path"
+
+
+def _findings_probe_detail(task: Task, findings: list) -> dict:
+    """Structured probe detail persisted in plan_output for operator visibility."""
+    payload = task.first_payload or {}
+    req = _findings_kws(" ".join(str(payload.get(k) or "") for k in ("prompt", "topic", "target")))
+    doc = _findings_kws(" ".join(
+        " ".join(str(f.get(k) or "") for k in ("title", "description", "area")) for f in findings
+    ))
+    grounded = sum(1 for f in findings if str(f.get("file_path") or "").strip())
+    return {
+        "topic_responsiveness": {
+            "passed": _findings_responsiveness_miss(task, findings) is None,
+            "overlap": len(req & doc), "total": len(req),
+        },
+        "grounding": {
+            "passed": _findings_grounding_miss(findings) is None,
+            "grounded": grounded, "total": len(findings),
+        },
+    }
+
+
 async def _handle_security_audit_completion(
     task: Task, logs: str, session: AsyncSession
 ):
-    """Parse security audit findings and spawn create tasks for critical/high severity issues."""
+    """Parse security audit findings and spawn create tasks for critical/high severity issues.
+
+    Forward-quality gate (escalated path, mirrors _handle_research_completion):
+    a critical/high audit finding spawns code-change (create) PRs — the same
+    blast radius as a research finding — so when the security-audit quality
+    grader is enabled and the audit would spawn implementation work, this
+    handler does NOT spawn children on the first pass. It stands up an
+    INDEPENDENT grader and parks itself EVALUATING. The grader's verdict returns
+    via the re-entrant completion path (task_lifecycle._resolve_quality_grader_completion),
+    which re-invokes this handler with ``context['quality_grader']`` set:
+      * verdict PASS -> proceed to the normal spawn-on-findings path;
+      * verdict FAIL -> mark FAILED and spawn NOTHING (an ungrounded or
+        hallucinated audit must never launch fix PRs on its unverified say-so).
+    Audits with no critical/high findings spawn nothing and never escalate — the
+    gate is proportional to blast radius.
+    """
+    from app.task_evaluators import (
+        QUALITY_GRADER_VERDICT_KEY,
+        spawn_forward_quality_grader,
+    )
+
+    # Re-entry signal: the independent grader has returned its verdict.
+    _grader_verdict = (task.context or {}).get(QUALITY_GRADER_VERDICT_KEY)
+    if _grader_verdict is not None and not _grader_verdict.get("passed", False):
+        # FAILED forward-quality gate: fail closed — do NOT spawn fix tasks and
+        # do NOT complete clean. Record the verdict for observability +
+        # direction-health accounting, release any safeguard gate, end terminal.
+        record_failed_gate(
+            task,
+            EvaluationVerdict(
+                False,
+                str(_grader_verdict.get("reason") or "forward-quality grade failed"),
+                "forward-quality",
+            ),
+        )
+        session.add(task)
+        await session.commit()
+        await _maybe_release_safeguard_gate(task, None, session)
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": TaskStatus.FAILED},
+        )
+        logger.info(
+            "[SECURITY AUDIT] Task %s failed the forward-quality gate; spawned "
+            "no fix tasks: %s",
+            task.id,
+            _grader_verdict.get("reason"),
+        )
+        return
+
     # Parse the JSON findings array from logs
     findings = None
     try:
         json_str = _extract_json_array(logs, "severity")
         if json_str:
             parsed = json.loads(json_str)
-            if isinstance(parsed, list):
-                findings = parsed
+            findings = _normalize_findings_array(parsed)
     except (json.JSONDecodeError, AttributeError):
         pass
 
@@ -1263,12 +1422,27 @@ async def _handle_security_audit_completion(
         await _maybe_release_safeguard_gate(task, findings, session)
         return
 
-    # Store all findings for display — wrapped in a dict so query_findings_index
-    # (which only processes list plan_output) does not treat security audit
-    # findings as research findings.
-    task.plan_output = {"findings": findings}
+    # Store all findings + acceptance-probe detail for operator visibility.
+    # Wrapped in a dict so query_findings_index (which only processes list
+    # plan_output) does not treat security audit findings as research findings.
+    task.plan_output = {"findings": findings, "acceptance_probe": _findings_probe_detail(task, findings)}
     session.add(task)
     await session.commit()
+
+    # Goal-level acceptance probe: cheap deterministic check that findings are
+    # responsive to the audited target and grounded in the repository. Runs
+    # always, regardless of whether the optional quality grader is enabled.
+    # Errs toward acceptance — only a CLEAR miss fails here, preventing an
+    # obviously off-objective or ungrounded audit from spawning fix PRs.
+    _probe_miss = _findings_responsiveness_miss(task, findings) or _findings_grounding_miss(findings)
+    if _probe_miss is not None:
+        record_failed_gate(task, EvaluationVerdict(False, f"security_audit {_probe_miss}", "forward-quality"))
+        session.add(task)
+        await session.commit()
+        await _maybe_release_safeguard_gate(task, None, session)
+        await broadcast_to_project(str(task.project_id), "task_updated", {"task_id": str(task.id), "status": TaskStatus.FAILED})
+        logger.info("[SECURITY AUDIT] Task %s failed acceptance probe: %s", task.id, _probe_miss)
+        return
 
     project = await session.get(Project, task.project_id)
     base_branch = (task.first_payload).get(
@@ -1285,6 +1459,28 @@ async def _handle_security_audit_completion(
         await session.commit()
         await _maybe_release_safeguard_gate(task, findings, session)
         return
+
+    # Forward-quality ESCALATION gate (blast-radius-proportional). When enabled
+    # and these critical/high findings would spawn downstream fix PRs, do not
+    # spawn anything yet: stand up an INDEPENDENT grader and park EVALUATING. The
+    # grader's verdict returns via the re-entrant completion path, which
+    # re-invokes this handler with the verdict in context (the `_grader_verdict
+    # is None` guard lets the resume pass fall through to the spawn loop instead
+    # of escalating again).
+    if _grader_verdict is None and _runtime_config.get(
+        "security_audit_quality_grader_enabled", False
+    ):
+        grader = await spawn_forward_quality_grader(
+            task, json.dumps(findings), session
+        )
+        if grader is not None:
+            logger.info(
+                "[SECURITY AUDIT] Task %s parked awaiting forward-quality grade "
+                "(grader %s) before spawning fix tasks",
+                task.id,
+                grader.id,
+            )
+            return
 
     create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
     child_tasks = []
@@ -1414,17 +1610,43 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
     (which previously spawned one task per finding, each with its own VM, PR, and review).
     Medium/low findings are surfaced as an informational PR comment.
     """
+    # Forward evaluation gate (registry-resolved 'metric' strategy): a perf
+    # report that produced no parseable structured measurement must NOT complete
+    # clean. Mark it FAILED (terminal) — a perf task spawns no children and opens
+    # no PR of its own, so EVALUATING would hang forever. A measurement that
+    # legitimately found zero high-severity issues is still a parseable result
+    # and passes the gate; only a missing/unparseable measurement fails.
+    verdict = evaluate_terminal_output(task, logs)
+    if not verdict.passed:
+        record_failed_gate(task, verdict)
+        task.plan_output = {"findings": []}
+        session.add(task)
+        await session.commit()
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": TaskStatus.FAILED},
+        )
+        logger.info(
+            "[PERF] Task %s did not clear the metric gate: %s",
+            task.id,
+            verdict.reason,
+        )
+        return
+
     findings = None
     try:
         json_str = _extract_json_array(logs, "severity")
         if json_str:
             parsed = json.loads(json_str)
-            if isinstance(parsed, list):
-                findings = parsed
+            findings = _normalize_findings_array(parsed)
     except (json.JSONDecodeError, AttributeError):
         pass
 
     if not findings:
+        # The metric gate passed, so a structured measurement exists; this
+        # branch now only covers the defensive empty-list edge. Keep the
+        # terminal-COMPLETED behavior for a genuinely empty parseable result.
         task.latest_status_message = (
             "Perf analysis completed with no parseable findings"
         )
@@ -1433,12 +1655,26 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
         await session.commit()
         return
 
-    # Store all findings for display — wrapped in a dict so query_findings_index
-    # (which only processes list plan_output) does not treat perf audit findings
-    # as research findings.
-    task.plan_output = {"findings": findings}
+    # Store all findings + acceptance-probe detail for operator visibility.
+    # Wrapped in a dict so query_findings_index (which only processes list
+    # plan_output) does not treat perf audit findings as research findings.
+    task.plan_output = {"findings": findings, "acceptance_probe": _findings_probe_detail(task, findings)}
     session.add(task)
     await session.commit()
+
+    # Goal-level acceptance probe: cheap deterministic check that findings are
+    # responsive to the audited target. Runs always (after the metric structural
+    # gate), regardless of the optional quality grader. Errs toward acceptance —
+    # only a CLEAR miss fails here. Grounding (file_path presence) is NOT
+    # applied here: perf findings are legitimately area-based without file refs.
+    _probe_miss = _findings_responsiveness_miss(task, findings)
+    if _probe_miss is not None:
+        record_failed_gate(task, EvaluationVerdict(False, f"perf {_probe_miss}", "forward-quality"))
+        session.add(task)
+        await session.commit()
+        await broadcast_to_project(str(task.project_id), "task_updated", {"task_id": str(task.id), "status": TaskStatus.FAILED})
+        logger.info("[PERF] Task %s failed acceptance probe: %s", task.id, _probe_miss)
+        return
 
     project = await session.get(Project, task.project_id)
     base_branch = (task.first_payload).get(
@@ -1600,6 +1836,498 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
 
 
 # ---------------------------------------------------------------------------
+# Compute-experiment completion — terminal metric gate, no PR, no children
+# ---------------------------------------------------------------------------
+
+
+async def _handle_compute_experiment_completion(
+    task: Task, logs: str, session: AsyncSession
+):
+    """Gate and persist a compute_experiment task's terminal job result.
+
+    The agent's bespoke compute-experiment handler launches a budgeted,
+    auto-torn-down compute job, polls it to terminal state, and emits a
+    COMPUTE_RESULT artifact: a JSON object carrying the terminal job
+    ``outcome`` plus ``final_cost_usd``/``accrued_cost_usd``. This handler is a
+    thin terminal gate (no children, no PR), modelled on ``_handle_perf_completion``:
+
+      * Forward metric gate (registry-resolved 'metric' strategy, made
+        compute-shape-aware): an experiment that produced no terminal job
+        outcome OR no measured cost must NOT complete clean. Mark it FAILED
+        (terminal) — a compute_experiment spawns no children and opens no PR,
+        so EVALUATING would hang forever and pin its parent.
+      * On pass: store the result on ``task.plan_output`` and mark COMPLETED.
+        Budget/deadline kills carry an honest terminal outcome and a cost, so
+        they pass the gate and surface through the task as COMPLETED with the
+        kill outcome recorded — they are intentional terminal outcomes, not
+        crashes.
+    """
+    verdict = evaluate_terminal_output(task, logs)
+    if not verdict.passed:
+        record_failed_gate(task, verdict)
+        session.add(task)
+        await session.commit()
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": TaskStatus.FAILED},
+        )
+        logger.info(
+            "[COMPUTE] Task %s did not clear the metric gate: %s",
+            task.id,
+            verdict.reason,
+        )
+        return
+
+    # The gate passed, so a terminal, costed result is present. Re-extract it
+    # for display/telemetry (outcome + cost). _extract_compute_measurement is
+    # the same parser the gate used, so the two can never disagree.
+    measurement = _extract_compute_measurement(logs)
+    plan_output = task.plan_output if isinstance(task.plan_output, dict) else {}
+    plan_output = dict(plan_output)
+    if measurement is not None:
+        outcome, cost = measurement
+        compute_result: dict = {"outcome": outcome, "final_cost_usd": cost}
+        # The gate passed, so a declared success criterion (if any) was met —
+        # surface it on the durable result for the operator-visible summary.
+        criterion = evaluate_compute_success_criterion(task, logs)
+        if criterion is not None:
+            compute_result["criterion"] = criterion
+        plan_output["compute_result"] = compute_result
+        task.latest_status_message = (
+            f"Compute experiment terminal: outcome={outcome}, "
+            f"final_cost=${cost}"
+        )[:500]
+    else:  # pragma: no cover - defensive; the gate guarantees a measurement
+        task.latest_status_message = "Compute experiment completed"
+    result_reference = _extract_compute_result_reference(logs)
+    job_id = None
+    try:
+        payload = json.loads(logs)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        raw_job_id = payload.get("job_id")
+        if raw_job_id is not None:
+            try:
+                job_id = uuid.UUID(str(raw_job_id))
+            except (TypeError, ValueError):
+                job_id = None
+    if job_id is not None:
+        await stamp_compute_job_result_reference(
+            session,
+            task_id=task.id,
+            job_id=job_id,
+            result_reference=result_reference,
+        )
+    task.plan_output = plan_output
+    flag_modified(task, "plan_output")
+    task.status = TaskStatus.COMPLETED
+    session.add(task)
+    await session.commit()
+    await broadcast_to_project(
+        str(task.project_id),
+        "task_updated",
+        {"task_id": str(task.id), "status": TaskStatus.COMPLETED},
+    )
+    logger.info(
+        "[COMPUTE] Task %s passed the metric gate and completed", task.id
+    )
+
+
+# ---------------------------------------------------------------------------
+# Panel-review completion — persist a structured verdict artifact, no PR, no children
+# ---------------------------------------------------------------------------
+
+
+_PANEL_REVIEW_REQUIRED_LENSES = (
+    "correctness",
+    "security",
+    "code_quality",
+    "test_coverage",
+)
+_PANEL_REVIEW_ARTIFACT_TYPE = "PANEL_REVIEW_VERDICT"
+
+
+def _extract_json_object(text: str, *required_keys: str) -> Optional[str]:
+    """Find the first balanced JSON object in ``text`` containing ``required_keys``."""
+    text = text[:500_000]
+    for key in required_keys:
+        if f'"{key}"' not in text:
+            return None
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escape_next = False
+        for i in range(start, len(text)):
+            c = text[i]
+            if escape_next:
+                escape_next = False
+                continue
+            if c == "\\" and in_string:
+                escape_next = True
+                continue
+            if c == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : i + 1]
+                    if all(f'"{key}"' in candidate for key in required_keys):
+                        return candidate
+                    break
+        start = text.find("{", start + 1)
+    return None
+
+
+def _normalize_panel_review_verdict(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalize a panel-review verdict and require every declared lens."""
+    overall_verdict = str(raw.get("overall_verdict") or "").strip()
+    if overall_verdict not in {"APPROVE", "REQUEST_CHANGES"}:
+        return None
+
+    raw_lenses = raw.get("lenses")
+    lens_map: Dict[str, Dict[str, Any]] = {}
+    if isinstance(raw_lenses, dict):
+        for name, payload in raw_lenses.items():
+            if isinstance(name, str) and isinstance(payload, dict):
+                lens_map[name] = payload
+    elif isinstance(raw_lenses, list):
+        for item in raw_lenses:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("lens") or item.get("name") or item.get("id")
+            if isinstance(name, str):
+                lens_map[name] = item
+    else:
+        return None
+
+    if any(lens not in lens_map for lens in _PANEL_REVIEW_REQUIRED_LENSES):
+        return None
+
+    normalized_lenses: Dict[str, Dict[str, Any]] = {}
+    for lens in _PANEL_REVIEW_REQUIRED_LENSES:
+        payload = lens_map.get(lens)
+        if not isinstance(payload, dict):
+            return None
+        lens_verdict = str(payload.get("verdict") or "").strip()
+        if not lens_verdict:
+            return None
+        summary = str(
+            payload.get("summary")
+            or payload.get("feedback")
+            or payload.get("reasoning")
+            or ""
+        ).strip()
+        if not summary:
+            return None
+        issues = payload.get("issues")
+        normalized_lenses[lens] = {
+            "verdict": lens_verdict,
+            "summary": summary,
+            "issues": issues if isinstance(issues, list) else [],
+        }
+
+    normalized: Dict[str, Any] = {
+        "overall_verdict": overall_verdict,
+        "summary": str(raw.get("summary") or raw.get("feedback") or "").strip(),
+        "lenses": normalized_lenses,
+    }
+    overall_issues = raw.get("issues")
+    if isinstance(overall_issues, list):
+        normalized["issues"] = overall_issues
+    investigated_files = raw.get("investigated_files")
+    if isinstance(investigated_files, list):
+        normalized["investigated_files"] = [
+            str(path).strip()
+            for path in investigated_files
+            if str(path).strip()
+        ]
+    return normalized
+
+
+def _parse_panel_review_output(text: str | None) -> Optional[Dict[str, Any]]:
+    """Best-effort extract the structured panel-review verdict from agent output."""
+    if not text:
+        return None
+    snippet = text[:500_000]
+    candidates: List[str] = []
+    try:
+        parsed = json.loads(snippet)
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict) and "overall_verdict" in parsed:
+        candidates.append(snippet)
+
+    candidate = _extract_json_object(snippet, "lenses")
+    if candidate and candidate not in candidates:
+        candidates.append(candidate)
+
+    for candidate_text in candidates:
+        try:
+            obj = json.loads(candidate_text)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(obj, dict):
+            normalized = _normalize_panel_review_verdict(obj)
+            if normalized is not None:
+                return normalized
+    return None
+
+
+async def _handle_panel_review_completion(
+    task: Task, logs: str, session: AsyncSession
+):
+    """Persist a terminal structured verdict for ``panel_review`` tasks."""
+    from app.models import Artifact  # noqa: PLC0415
+
+    verdict = evaluate_terminal_output(task, logs)
+    if not verdict.passed:
+        record_failed_gate(task, verdict)
+        session.add(task)
+        await session.commit()
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": TaskStatus.FAILED},
+        )
+        logger.info(
+            "[PANEL_REVIEW] Task %s did not clear the structured-verdict gate: %s",
+            task.id,
+            verdict.reason,
+        )
+        return
+
+    parsed = _parse_panel_review_output(logs)
+    if parsed is None:
+        record_failed_gate(
+            task,
+            EvaluationVerdict(
+                False,
+                "structured verdict output not parseable after gate",
+                "structured-verdict",
+            ),
+        )
+        session.add(task)
+        await session.commit()
+        return
+
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=_PANEL_REVIEW_ARTIFACT_TYPE,
+        logs=json.dumps(parsed),
+    )
+    session.add(artifact)
+
+    task.plan_output = parsed
+    flag_modified(task, "plan_output")
+    task.status = TaskStatus.COMPLETED
+    task.latest_status_message = (
+        f"Panel review verdict recorded ({parsed['overall_verdict']}; "
+        f"{len(parsed['lenses'])} lenses)"
+    )
+    session.add(task)
+    await session.commit()
+
+    await broadcast_to_project(
+        str(task.project_id),
+        "task_updated",
+        {"task_id": str(task.id), "status": TaskStatus.COMPLETED},
+    )
+    logger.info(
+        "[PANEL_REVIEW] Persisted verdict artifact for task %s", task.id
+    )
+
+    # Surface the verdict on the PR (and raise an operator signal for
+    # REQUEST_CHANGES). Best-effort — the durable artifact and COMPLETED
+    # status above are the source of truth and must never be undone by a
+    # transient posting failure.
+    await _post_panel_review_to_pr(task, parsed, session)
+
+
+def _build_panel_review_pr_body(parsed: Dict[str, Any]) -> str:
+    """Render a panel-review verdict into a Markdown PR-review body.
+
+    Clearly labelled "Blueprint Panel Review" so it does not read as a
+    duplicate of the ordinary single-reviewer "Blueprint Code Review"
+    posted by the ``review`` task type.
+    """
+
+    def _render_issues(issues: List[Any]) -> List[str]:
+        rendered: List[str] = []
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            sev = str(issue.get("severity", "minor")).upper()
+            desc = issue.get("description") or issue.get("summary") or ""
+            loc = ""
+            if issue.get("file"):
+                loc = f" (`{issue['file']}`"
+                if issue.get("line"):
+                    loc += f":{issue['line']}"
+                loc += ")"
+            rendered.append(f"- [{sev}] {desc}{loc}")
+        return rendered
+
+    overall = parsed.get("overall_verdict", "")
+    lines: List[str] = [f"## Blueprint Panel Review — {overall}", ""]
+    summary = str(parsed.get("summary") or "").strip()
+    if summary:
+        lines.extend([summary, ""])
+
+    lenses = parsed.get("lenses") or {}
+    for lens, data in lenses.items():
+        if not isinstance(data, dict):
+            continue
+        label = lens.replace("_", " ").title()
+        lines.append(f"### {label} — {data.get('verdict', '')}")
+        lens_summary = str(data.get("summary") or "").strip()
+        if lens_summary:
+            lines.append(lens_summary)
+        lines.extend(_render_issues(data.get("issues") or []))
+        lines.append("")
+
+    top_issues = parsed.get("issues") or []
+    if top_issues:
+        lines.append("### Cross-cutting issues")
+        lines.extend(_render_issues(top_issues))
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+async def _post_panel_review_to_pr(
+    task: Task, parsed: Dict[str, Any], session: AsyncSession
+) -> None:
+    """Best-effort: surface a completed panel-review verdict on its PR.
+
+    Posts the verdict as a real GitHub review (parity with the ordinary
+    ``review`` task type, reusing ``submit_pr_review``) and, for a
+    REQUEST_CHANGES overall verdict, raises an operator ``Alert`` so a
+    blocking panel outcome is visible rather than an indistinguishable
+    COMPLETED. Every failure is swallowed and logged — the durable
+    artifact and COMPLETED status are authoritative and must survive any
+    GitHub/posting error.
+    """
+    from app.models import Alert, AlertSeverity  # noqa: PLC0415
+
+    # Greenlet-safe PR-number fetch. ``task.first_payload`` reads
+    # ``task.payloads``, which is a deferred-loadable column in some dispatch
+    # paths (recovery sweep / load_only projections); touching it implicitly
+    # here would trigger lazy IO outside a greenlet and raise MissingGreenlet
+    # (which previously crashed the reaper). An explicit awaited query is
+    # safe regardless of how the task was loaded.
+    try:
+        row = (
+            await session.execute(select(Task.payloads).where(Task.id == task.id))
+        ).first()
+    except Exception as exc:  # noqa: BLE001 — best-effort surfacing
+        logger.warning(
+            "[PANEL_REVIEW] could not load payload for task %s: %s", task.id, exc
+        )
+        return
+
+    payloads = row[0] if row else None
+    first = (payloads or [{}])[0] if isinstance(payloads, list) and payloads else {}
+    pr_number = first.get("pr_number") if isinstance(first, dict) else None
+    if not pr_number:
+        logger.info(
+            "[PANEL_REVIEW] task %s has no pr_number; skipping PR post", task.id
+        )
+        return
+
+    overall = parsed.get("overall_verdict")
+    event = "APPROVE" if overall == "APPROVE" else "REQUEST_CHANGES"
+
+    # Split located issues into inline comments vs the review body, mirroring
+    # the `review` task type's posting path. Both per-lens issues and any
+    # top-level issues are considered.
+    all_issues: List[Dict[str, Any]] = []
+    for lens_data in (parsed.get("lenses") or {}).values():
+        if isinstance(lens_data, dict):
+            all_issues.extend(
+                i for i in (lens_data.get("issues") or []) if isinstance(i, dict)
+            )
+    all_issues.extend(
+        i for i in (parsed.get("issues") or []) if isinstance(i, dict)
+    )
+    inline_comments: List[Dict[str, Any]] = []
+    for issue in all_issues:
+        if issue.get("file") and issue.get("line"):
+            sev = str(issue.get("severity", "minor")).upper()
+            desc = issue.get("description") or issue.get("summary") or ""
+            inline_comments.append(
+                {
+                    "path": issue["file"],
+                    "line": issue["line"],
+                    "body": f"[{sev}] {desc}",
+                }
+            )
+
+    body = _build_panel_review_pr_body(parsed)
+
+    try:
+        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+        await submit_pr_review(
+            gh_token, owner, repo, int(pr_number), event, body, inline_comments
+        )
+        logger.info(
+            "[PANEL_REVIEW] posted %s review to PR #%s for task %s",
+            event,
+            pr_number,
+            task.id,
+        )
+    except Exception as exc:  # noqa: BLE001 — posting is best-effort
+        logger.warning(
+            "[PANEL_REVIEW] failed to post review to PR #%s for task %s: %s",
+            pr_number,
+            task.id,
+            exc,
+        )
+
+    if event != "REQUEST_CHANGES":
+        return
+
+    # REQUEST_CHANGES → visible, actionable operator signal (parity with other
+    # blocking review outcomes, which raise a WARNING Alert).
+    try:
+        alert = Alert(
+            project_id=task.project_id,
+            severity=AlertSeverity.WARNING,
+            title=f"Panel review requested changes on PR #{pr_number}",
+            message=(
+                f"The multi-lens panel review for PR #{pr_number} returned "
+                "REQUEST_CHANGES. Review the per-lens findings in the task "
+                "detail drawer and on the PR before merging."
+            ),
+            task_id=task.id,
+        )
+        session.add(alert)
+        await session.commit()
+        await broadcast_to_project(
+            str(task.project_id),
+            "alert_created",
+            {
+                "alert_id": str(alert.id),
+                "severity": "WARNING",
+                "title": alert.title,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — surfacing is best-effort
+        logger.warning(
+            "[PANEL_REVIEW] failed to raise REQUEST_CHANGES alert for task %s: %s",
+            task.id,
+            exc,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Memo completion — persist a terminal reasoning artifact, no PR, no children
 # ---------------------------------------------------------------------------
 
@@ -1632,37 +2360,10 @@ def _parse_memo_output(text: str) -> Optional[Dict[str, Any]]:
 
     # Fallback: scan for a balanced JSON object containing "summary"
     # and "reasoning" keys.
-    if not candidates and '"summary"' in snippet and '"reasoning"' in snippet:
-        start = snippet.find("{")
-        while start != -1:
-            depth = 0
-            in_string = False
-            escape_next = False
-            for i in range(start, len(snippet)):
-                c = snippet[i]
-                if escape_next:
-                    escape_next = False
-                    continue
-                if c == "\\" and in_string:
-                    escape_next = True
-                    continue
-                if c == '"':
-                    in_string = not in_string
-                    continue
-                if in_string:
-                    continue
-                if c == "{":
-                    depth += 1
-                elif c == "}":
-                    depth -= 1
-                    if depth == 0:
-                        candidate = snippet[start : i + 1]
-                        if all(f'"{k}"' in candidate for k in ("summary", "reasoning")):
-                            candidates.append(candidate)
-                        break
-            start = snippet.find("{", start + 1)
-            if candidates:
-                break
+    if not candidates:
+        candidate = _extract_json_object(snippet, "summary", "reasoning")
+        if candidate:
+            candidates.append(candidate)
 
     for candidate in candidates:
         try:
@@ -1796,12 +2497,40 @@ async def _handle_memo_completion(task: Task, logs: str, session: AsyncSession):
     # chain (other handlers use the same lazy-import pattern).
     from app.models import Artifact, ArtifactType  # noqa: PLC0415
 
+    # Forward evaluation gate (registry-resolved 'forward-quality' strategy):
+    # an unparseable or empty memo must NOT complete clean. Marking it FAILED
+    # (terminal) is the honest outcome — a memo spawns no children and opens no
+    # PR, so EVALUATING would hang forever. The FAILED-memo error-log recovery
+    # in task_lifecycle still gets a chance on the FAILED payload path; this
+    # gate only catches the case where the COMPLETED-reported output is itself
+    # not a valid memo.
+    verdict = evaluate_terminal_output(task, logs)
+    if not verdict.passed:
+        record_failed_gate(task, verdict)
+        session.add(task)
+        await session.commit()
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": TaskStatus.FAILED},
+        )
+        logger.info(
+            "[MEMO] Task %s did not clear the forward-quality gate: %s",
+            task.id,
+            verdict.reason,
+        )
+        return
+
     parsed = _parse_memo_output(logs)
     if parsed is None:
-        task.latest_status_message = (
-            "Memo task completed with no parseable reasoning JSON"
+        # Defensive: the gate passed, so this should be unreachable. Treat any
+        # residual parse failure as a gate failure rather than completing clean.
+        record_failed_gate(
+            task,
+            EvaluationVerdict(
+                False, "memo output not parseable after gate", "forward-quality"
+            ),
         )
-        task.status = TaskStatus.COMPLETED
         session.add(task)
         await session.commit()
         return

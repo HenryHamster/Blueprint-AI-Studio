@@ -84,11 +84,39 @@ export interface MergeVerificationVerdict {
   test_commands: MergeVerificationTestCommand[];
 }
 
+/** One retained entry in the no-CI merge gate's bounded rolling outcome history.
+ *  `verified` is true when the gate ran real tests; false when it fell open to an
+ *  UNVERIFIED merge (in which case `reason` carries the fall-open reason key). */
+export interface MergeGateOutcome {
+  at: string;
+  verified: boolean;
+  reason?: string | null;
+}
+
+/** Derived at-a-glance aggregate over the retained outcome window. `window` is the
+ *  number of entries retained; `verified_runs` + `fell_open_runs` partition it;
+ *  `total_fall_opens` is the all-time tally (can exceed the window once older
+ *  entries are evicted); `most_common_reason` is the most-tallied fall-open reason
+ *  key (or null when there have been no fall-opens). */
+export interface MergeGateSummary {
+  window: number;
+  verified_runs: number;
+  fell_open_runs: number;
+  total_fall_opens: number;
+  most_common_reason?: string | null;
+}
+
 export interface MergeGateRuntime {
   last_run_at?: string | null;
   executed_real_tests?: boolean;
   last_unverified_at?: string | null;
   last_unverified_reason?: string | null;
+  /** Additive history fields (backend `ci_resolution.merge_gate_runtime_block`).
+   *  Omitted on never-ran projects and legacy four-key-only records, so every
+   *  consumer must guard reads — absence renders exactly as before. */
+  recent_outcomes?: MergeGateOutcome[];
+  unverified_reason_counts?: Record<string, number>;
+  summary?: MergeGateSummary;
 }
 
 export interface Project {

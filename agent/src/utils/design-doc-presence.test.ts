@@ -20,6 +20,7 @@ import {
   reconcileSystemEntry,
   reconcileMissingCapabilities,
   reconcileDesignDocPresence,
+  reconcileDesignDocIndex,
   extractEntryPaths,
 } from './design-doc-presence.js';
 
@@ -174,6 +175,45 @@ describe('reconcileDesignDocPresence', () => {
     const doc = { 'systems/sys-a': { status: 'mature', modules: ['backend/app/gone.py'] } };
     const out = reconcileDesignDocPresence(doc, '/nonexistent/root');
     expect(out).toBe(doc);
+  });
+});
+
+describe('reconcileDesignDocIndex', () => {
+  it('downgrades a systems/* index entry whose modules are all absent', () => {
+    const index = {
+      sections: [
+        { key: 'systems/sys-a', status: 'functional', modules: ['backend/app/gone.py'] },
+        { key: 'capabilities/cap-a', status: 'working', notes: 'backend/app/gone.py' },
+      ],
+    };
+    const out = reconcileDesignDocIndex(index, root) as { sections: Array<Record<string, unknown>> };
+    expect(out.sections[0].status).toBe('missing');
+    expect(out.sections[0].presence_warning).toMatch(/absent/);
+    expect(out.sections[1].status).toBe('missing');
+    // original untouched
+    expect(index.sections[0].status).toBe('functional');
+  });
+
+  it('leaves present-backed entries and non-system/capability entries alone', () => {
+    const index = {
+      sections: [
+        { key: 'systems/sys-b', status: 'functional', modules: ['backend/app/present.py'] },
+        { key: 'notes/strategic-context', summary: 'v5 stabilize' },
+      ],
+    };
+    const out = reconcileDesignDocIndex(index, root) as { sections: Array<Record<string, unknown>> };
+    expect(out.sections[0].status).toBe('functional');
+    expect(out.sections[1].summary).toBe('v5 stabilize');
+  });
+
+  it('no-ops on missing/non-array sections and an invalid root', () => {
+    expect(reconcileDesignDocIndex(undefined, root)).toBeUndefined();
+    const noSections = { foo: 'bar' };
+    expect(reconcileDesignDocIndex(noSections, root)).toBe(noSections);
+    const nonArray = { sections: 'nope' as unknown };
+    expect(reconcileDesignDocIndex(nonArray, root)).toBe(nonArray);
+    const validIndex = { sections: [{ key: 'systems/x', status: 'mature', modules: ['backend/app/gone.py'] }] };
+    expect(reconcileDesignDocIndex(validIndex, '/nonexistent/root')).toBe(validIndex);
   });
 });
 

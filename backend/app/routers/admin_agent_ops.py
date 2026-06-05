@@ -64,6 +64,7 @@ from app.strategic_constants import (
     STRATEGIC_RESOLUTION_MAX,
     STRATEGIC_SYSTEM_ID_MAX,
 )
+from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.task_locking import (
     lock_project_or_429 as _lock_project_or_429,
     with_directions_locked as _with_directions_locked,
@@ -132,9 +133,9 @@ async def update_design_doc(
         raise HTTPException(status_code=404, detail="Task not found")
 
     # Write operations restricted to strategic agents; reads open to all
-    if payload.op not in ("list", "get") and token.get("task_type") not in (
-        "design_doc_update",
-        "strategic_review",
+    if (
+        payload.op not in ("list", "get")
+        and token.get("task_type") not in STRATEGIC_TASK_TYPES
     ):
         raise HTTPException(
             status_code=403,
@@ -256,6 +257,8 @@ class PlaybookUpdate(BaseModel):
     applicable_types: List[str] | None = (
         None  # task types this entry applies to; None = all types
     )
+    branch: str | None = None  # git branch the entry was authored on (provenance)
+    head_sha: str | None = None  # short HEAD sha at write time (provenance)
 
 
 _PLAYBOOK_KEY_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-]{0,49}$")
@@ -319,6 +322,8 @@ async def update_playbook(
                     "content": v.get("content", ""),
                     "updated_at": v.get("updated_at", ""),
                     "source_task_id": v.get("source_task_id", ""),
+                    "branch": v.get("branch", ""),
+                    "head_sha": v.get("head_sha", ""),
                 }
         return {"status": "ok", "op": op, "entries": entries}
 
@@ -367,6 +372,13 @@ async def update_playbook(
         }
         if payload.applicable_types is not None:
             entry["applicable_types"] = payload.applicable_types
+        # Provenance: stamp branch + short HEAD sha captured at write time.
+        # Stored only when supplied — absent leaves a legacy entry untouched,
+        # fully backward compatible. Each set overwrites with current truth.
+        if payload.branch:
+            entry["branch"] = payload.branch[:200]
+        if payload.head_sha:
+            entry["head_sha"] = payload.head_sha[:40]
         # Anti-poisoning: until the source task transitions to COMPLETED,
         # the entry is invisible to other tasks (filtered in the get/list
         # paths above and in prompt builders that surface playbook entries).
@@ -562,7 +574,7 @@ class StrategicOp(BaseModel):
     """Incremental strategic review operation from an agent."""
 
     task_id: uuid.UUID
-    op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "create_message", "resolve_message", "spawn_task"
+    op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "stage_direction", "create_message", "resolve_message", "spawn_task"
     data: Any = {}
 
 
@@ -734,28 +746,64 @@ async def strategic_operation(
                 status_code=400,
                 detail="success_evidence and retirement_condition are required for direction creation",
             )
-        active_count = sum(1 for d in directions if d.get("status") == "active")
-        max_active = _runtime_config.get("max_active_directions", 5)
-        if active_count >= max_active:
-            ctx = task.context or {}
-            task.context = {**ctx, "_strategic_api_called": True}
-            flag_modified(task, "context")
-            session.add(task)
-            await session.commit()
-            return JSONResponse(
-                content=_resp(
-                    {
-                        "status": "skipped",
-                        "reason": f"Direction cap reached: {active_count}/{max_active} active",
-                    }
-                ),
-                status_code=409,
-            )
+        # Atomic create-staged: when ``staged`` is set, the direction is born in
+        # the "staged" state stamped to the CURRENT open version — identical
+        # resolution semantics to ``stage_direction`` — so a next-version idea
+        # never passes through a research-eligible active state (closing the old
+        # create-then-stage race). Resolve the version FIRST so a missing open
+        # version skips cleanly (409) without creating anything.
+        staged_create = bool(data.get("staged"))
+        staged_for_version: int | None = None
+        if staged_create:
+            from app.release_version import current_open_version  # noqa: PLC0415
+
+            open_version = await current_open_version(session, project.id)
+            if open_version is None:
+                # No open version to gate against — staging would have no target
+                # to auto-activate at, so skip (409) rather than silently
+                # creating an active direction the strategist meant for next
+                # version (mirrors stage_direction).
+                ctx = task.context or {}
+                task.context = {**ctx, "_strategic_api_called": True}
+                flag_modified(task, "context")
+                session.add(task)
+                await session.commit()
+                return JSONResponse(
+                    content=_resp(
+                        {
+                            "status": "skipped",
+                            "reason": "No open version to stage against",
+                        }
+                    ),
+                    status_code=409,
+                )
+            staged_for_version = open_version.version_number
+        # The active-direction cap counts active directions only; a staged
+        # create is inert until its target version promotes, so it does not
+        # consume a slot (mirrors the user PATCH / add_direction staged paths).
+        if not staged_create:
+            active_count = sum(1 for d in directions if d.get("status") == "active")
+            max_active = _runtime_config.get("max_active_directions", 5)
+            if active_count >= max_active:
+                ctx = task.context or {}
+                task.context = {**ctx, "_strategic_api_called": True}
+                flag_modified(task, "context")
+                session.add(task)
+                await session.commit()
+                return JSONResponse(
+                    content=_resp(
+                        {
+                            "status": "skipped",
+                            "reason": f"Direction cap reached: {active_count}/{max_active} active",
+                        }
+                    ),
+                    status_code=409,
+                )
         _DIR_FIELD_MAX = 500
         new_dir: dict = {
             "id": f"d-{uuid.uuid4().hex[:8]}",
             "text": text,
-            "status": "active",
+            "status": "staged" if staged_create else "active",
             "priority": priority,
             "notes": (
                 [
@@ -765,6 +813,18 @@ async def strategic_operation(
                     }
                 ]
                 if rationale
+                else []
+            )
+            + (
+                [
+                    {
+                        "text": (
+                            f"Staged to begin after v{staged_for_version} promotes"
+                        ),
+                        "added_at": _utcnow().isoformat(),
+                    }
+                ]
+                if staged_create
                 else []
             )
             + (
@@ -788,6 +848,9 @@ async def strategic_operation(
                 "retirement_condition": retirement_condition[:_DIR_FIELD_MAX],
             },
         }
+        if staged_create:
+            new_dir["staged_for_version"] = staged_for_version
+            new_dir["staged_at"] = _utcnow().isoformat()
         impl_constraints = str(data.get("implementation_constraints", "")).strip()
         if impl_constraints:
             new_dir["context"]["implementation_constraints"] = impl_constraints[
@@ -807,6 +870,11 @@ async def strategic_operation(
             new_dir["system_id"] = _cap_str(
                 data["system_id"], STRATEGIC_SYSTEM_ID_MAX, "system_id", warnings
             )
+        # Persist the direction→gap linkage so reconciliation can map an active
+        # direction back to the problem-model gap it works on. Optional and
+        # string-cast; additive on the JSONB direction dict (no migration).
+        if data.get("gap_id"):
+            new_dir["gap_id"] = str(data["gap_id"])
         if data.get("paths"):
             new_dir["paths"] = data["paths"]
         if data.get("category") and data["category"] in ("product", "structural"):
@@ -821,21 +889,37 @@ async def strategic_operation(
         ctx = task.context or {}
         created_ids = list(ctx.get("_strategic_created_ids", []))
         created_ids.append(new_dir["id"])
-        task.context = {
+        new_ctx = {
             **ctx,
             "_strategic_dirs_created": ctx.get("_strategic_dirs_created", 0) + 1,
             "_strategic_created_ids": created_ids,
         }
+        # An atomic staged create is also a staging decision — record it under
+        # the staged counters too (parity with stage_direction) so the cycle's
+        # staging activity is auditable.
+        if staged_create:
+            staged_ids = list(ctx.get("_strategic_staged_ids", []))
+            staged_ids.append(new_dir["id"])
+            new_ctx["_strategic_dirs_staged"] = ctx.get("_strategic_dirs_staged", 0) + 1
+            new_ctx["_strategic_staged_ids"] = staged_ids
+        task.context = new_ctx
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
         await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
         logger.info(
-            f"[STRATEGIC API] Created direction '{text[:60]}' for project {project.id}"
+            f"[STRATEGIC API] Created direction '{text[:60]}' "
+            f"({'staged for v' + str(staged_for_version) if staged_create else 'active'}) "
+            f"for project {project.id}"
         )
-        return _resp(
-            {"status": "ok", "op": "create_direction", "direction_id": new_dir["id"]}
-        )
+        resp_body: dict = {
+            "status": "ok",
+            "op": "create_direction",
+            "direction_id": new_dir["id"],
+        }
+        if staged_create:
+            resp_body["staged_for_version"] = staged_for_version
+        return _resp(resp_body)
 
     elif payload.op == "update_direction":
         dir_id = data.get("direction_id")
@@ -922,6 +1006,14 @@ async def strategic_operation(
                     mode = _normalize_recommended_mode(changes["recommended_mode"])
                     if mode is not None:
                         d["recommended_mode"] = mode
+                # Allow updating (or clearing) the direction→gap linkage so the
+                # agent can re-ground an existing direction to a different gap.
+                if "gap_id" in changes:
+                    gid = changes["gap_id"]
+                    if gid:
+                        d["gap_id"] = str(gid)
+                    else:
+                        d.pop("gap_id", None)
                 # Handle success_evidence and retirement_condition in context
                 _DIR_FIELD_MAX = 500
                 if "success_evidence" in changes or "retirement_condition" in changes:
@@ -1046,6 +1138,94 @@ async def strategic_operation(
                 f"{MIN_HEALTHY_ACTIVE_DIRECTIONS} active)."
             )
         return _resp({"status": "ok", "op": "retire_direction", "direction_id": dir_id})
+
+    elif payload.op == "stage_direction":
+        # Stage an EXISTING direction for the NEXT version: flip status to
+        # "staged" and stamp ``staged_for_version`` to the CURRENT open
+        # version_number (the version that was open when staging happened). A
+        # staged direction is inert — direction_lifecycle never researches it —
+        # until that version promotes, at which point
+        # ``activate_eligible_staged_directions`` flips it back to "active" at
+        # the version-open transition (with a reaper backstop). To stage a
+        # genuinely next-version idea that does not exist yet, the strategist
+        # creates the direction first (``create_direction``) and then stages it
+        # by id — staging is itself the DECISION that the work belongs to the
+        # next version's scope, not a way to defer a within-cycle call.
+        dir_id = data.get("direction_id")
+        if not dir_id:
+            raise HTTPException(status_code=400, detail="direction_id required")
+        rationale = _cap_str(
+            data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
+        )
+        # Resolve the current open version to stamp the marker. Lazy import so
+        # the common (non-staging) op paths don't pull in release_version.
+        from app.release_version import current_open_version
+
+        open_version = await current_open_version(session, project.id)
+        if open_version is None:
+            # No open version to gate against — staging would have no target to
+            # auto-activate at, so surface a 409 rather than stranding the work.
+            ctx = task.context or {}
+            task.context = {**ctx, "_strategic_api_called": True}
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            return JSONResponse(
+                content=_resp(
+                    {
+                        "status": "skipped",
+                        "reason": "No open version to stage against",
+                    }
+                ),
+                status_code=409,
+            )
+        staged_for_version = open_version.version_number
+        directions = list(project.directions or [])
+        target = next((d for d in directions if d.get("id") == dir_id), None)
+        if not target:
+            raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
+        target["status"] = "staged"
+        target["staged_for_version"] = staged_for_version
+        target["staged_at"] = _utcnow().isoformat()
+        notes = target.get("notes", [])
+        notes.append(
+            {
+                "text": (
+                    f"Staged to begin after v{staged_for_version} promotes"
+                    + (f": {rationale}" if rationale else "")
+                ),
+                "added_at": _utcnow().isoformat(),
+            }
+        )
+        target["notes"] = _cap_list(
+            notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
+        )
+        _d = directions
+        await _with_directions_locked(session, project.id, lambda _: _d)
+        ctx = task.context or {}
+        staged_ids = list(ctx.get("_strategic_staged_ids", []))
+        staged_ids.append(dir_id)
+        task.context = {
+            **ctx,
+            "_strategic_dirs_staged": ctx.get("_strategic_dirs_staged", 0) + 1,
+            "_strategic_staged_ids": staged_ids,
+        }
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
+        logger.info(
+            f"[STRATEGIC API] Staged direction {dir_id} for v{staged_for_version} "
+            f"(project {project.id})"
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "stage_direction",
+                "direction_id": dir_id,
+                "staged_for_version": staged_for_version,
+            }
+        )
 
     elif payload.op == "approve_direction":
         # Approve a proposal from an anomaly detector or research agent:
@@ -1251,16 +1431,43 @@ async def strategic_operation(
         msg_id = data.get("message_id")
         if not msg_id:
             raise HTTPException(status_code=400, detail="message_id required")
-        try:
-            msg = await session.get(ProjectMessage, uuid.UUID(str(msg_id)))
-        except (ValueError, TypeError):
-            raise HTTPException(
-                status_code=400, detail="Invalid message_id"
-            ) from None
-        if not msg or msg.project_id != project.id:
-            raise HTTPException(status_code=404, detail="Message not found")
+        # Accept a full UUID (unchanged behavior) OR a short hex prefix (the
+        # first 8+ hex chars the admin UI surfaces). Resolution is strictly
+        # project-scoped, spans all statuses, and fails loudly on
+        # ambiguous (409) / missing (404) / too-short (400) refs.
+        from app.message_convergence import resolve_message_ref as _resolve_message_ref
+
+        msg = await _resolve_message_ref(session, project.id, str(msg_id))
         if msg.status == "resolved":
             return _resp({"status": "already_resolved"})
+        owned_by_direction = data.get("owned_by_direction")
+        owned_by_task_id = data.get("owned_by_task")
+        from app.message_convergence import (
+            is_bug_class as _is_bug_class,
+            link_message_to_outcome as _link_message_to_outcome,
+        )
+        if _is_bug_class(msg) and (owned_by_direction or owned_by_task_id):
+            # Bug-class message with ownership info: record forward link and move
+            # to 'linked' state. Terminal 'resolved' happens when outcome lands.
+            kind = "direction" if owned_by_direction else "task"
+            identifier = owned_by_direction or owned_by_task_id
+            _link_message_to_outcome(msg, kind, str(identifier))
+            resolution_raw = data.get(
+                "resolution", f"Fix owned by {kind}: {identifier}"
+            )
+            msg.resolution = _cap_str(
+                resolution_raw, STRATEGIC_RESOLUTION_MAX, "resolution", warnings
+            )
+            session.add(msg)
+            await session.commit()
+            return _resp(
+                {
+                    "status": "ok",
+                    "op": "resolve_message",
+                    "message_id": str(msg.id),
+                    "linked_to": {"kind": kind, "id": str(identifier)},
+                }
+            )
         msg.status = "resolved"
         resolution_raw = data.get("resolution", "Addressed by strategic review")
         msg.resolution = _cap_str(

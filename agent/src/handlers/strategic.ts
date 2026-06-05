@@ -14,7 +14,7 @@ import {
 } from '../prompt.js';
 import { writeStrategicHelpers } from './strategic-helpers.js';
 import { parseBackendTimestamp } from '../utils/time.js';
-import { reconcileDesignDocPresence } from '../utils/design-doc-presence.js';
+import { reconcileDesignDocIndex } from '../utils/design-doc-presence.js';
 import {
   formatPreviousDecisionOutcomes,
   formatPastRetirementCritiques,
@@ -40,7 +40,9 @@ import {
 } from './research-plan.js';
 import {
   buildSystemMaturitySection,
-  buildCapabilityVerificationSection,
+  buildCycleStartReconciliationSection,
+  buildPruneCandidatesSection,
+  buildModelHealthSection,
   buildDriftSection,
   buildOutcomeSection,
   buildClockAndRecentWorkSection,
@@ -64,6 +66,88 @@ export function renderStrategicPromptSuffix(payload: Record<string, unknown>): s
   return payload.prompt_suffix
     ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}`
     : '';
+}
+
+/**
+ * Render the backend-supplied `staged_directions` block as a prompt section so
+ * the strategist sees what work is already STAGED for the next version (inert
+ * until that version promotes) and does NOT re-propose it. Returns '' when
+ * nothing is staged so the section is omitted on the common path. Defined here
+ * (not in strategic-sections.ts) so it does not have to be threaded through that
+ * module's exhaustive vi.mock in strategic.test.ts.
+ */
+export function buildStagedDirectionsSection(staged: Array<Record<string, unknown>>): string {
+  if (!Array.isArray(staged) || staged.length === 0) return '';
+  const lines = staged.map(d => {
+    const id = strVal(d.id, '?');
+    const text = strVal(d.text, '(no text)');
+    const priority = strVal(d.priority, 'medium');
+    const v = typeof d.staged_for_version === 'number' ? d.staged_for_version : '?';
+    return `- ${id} [${priority}] — ${text} (auto-activates when v${v} promotes)`;
+  });
+  return [
+    '## Staged for next version',
+    '_These directions are STAGED — inert until the version they are waiting on promotes, then they auto-activate. Do NOT re-propose work already staged here. Staging is a decision that work belongs to the next version, not a way to defer._',
+    ...lines,
+  ].join('\n');
+}
+
+/**
+ * Render the compact design-doc INDEX as a clean architecture overview — NOT a
+ * raw JSON dump. The backend now ships the design doc as a navigation index
+ * (`{ sections: [{ key, summary?, status?, modules?, presence_warning? }] }`,
+ * see `_design_doc_index` in backend/app/strategic_spawning.py): one entry per
+ * non-internal section, with reconciled presence status + backing module paths
+ * for `systems/*` and `capabilities/*`. Full section prose/specs are NO LONGER
+ * inlined — the strategist pulls them on demand via `./design-doc get <key>`.
+ *
+ * Returns '' when the index has no sections so the caller can omit the section.
+ */
+export function renderDesignDocIndexOverview(index: Record<string, unknown> | undefined): string {
+  if (!index || typeof index !== 'object') return '';
+  const sections = index.sections;
+  if (!Array.isArray(sections) || sections.length === 0) return '';
+
+  const systems: string[] = [];
+  const capabilities: string[] = [];
+  const other: string[] = [];
+
+  for (const raw of sections) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const entry = raw as Record<string, unknown>;
+    const key = strVal(entry.key);
+    if (!key) continue;
+    const summary = strVal(entry.summary);
+    const status = strVal(entry.status);
+    const modules = Array.isArray(entry.modules)
+      ? (entry.modules as unknown[]).filter((m): m is string => typeof m === 'string' && !!m.trim())
+      : [];
+    const warning = strVal(entry.presence_warning);
+
+    const parts: string[] = [`- \`${key}\``];
+    if (status) parts.push(`[${status}]`);
+    if (summary) parts.push(`— ${summary}`);
+    let line = parts.join(' ');
+    if (modules.length > 0) line += `\n  - modules: ${modules.join(', ')}`;
+    if (warning) line += `\n  - ⚠ ${warning}`;
+
+    if (key.startsWith('systems/')) systems.push(line);
+    else if (key.startsWith('capabilities/')) capabilities.push(line);
+    else other.push(line);
+  }
+
+  const blocks: string[] = [];
+  if (systems.length > 0) blocks.push(['### Systems', ...systems].join('\n'));
+  if (capabilities.length > 0) blocks.push(['### Capabilities', ...capabilities].join('\n'));
+  if (other.length > 0) blocks.push(['### Other sections', ...other].join('\n'));
+  if (blocks.length === 0) return '';
+
+  blocks.push(
+    '_This is a navigation index — section statuses and backing modules only, not the full prose/specs. ' +
+      'Fetch any section\'s FULL text on demand with `./design-doc get <key>` (e.g. `./design-doc get systems/auth`), ' +
+      'and `./design-doc list` to enumerate all keys. Pull the full text whenever you need a section\'s detailed prose or specs._',
+  );
+  return blocks.join('\n\n');
 }
 
 export async function handleStrategic(
@@ -142,19 +226,31 @@ export async function handleStrategic(
 
     const dirSummaryText = buildDirSummaryText(directionsSummary);
 
-    // Reconcile the design doc's systems/* and capabilities/* statuses against
-    // the cloned file tree BEFORE serializing into the thinker prompt: any
-    // entry marked present (mature/functional/partial / working) whose backing
-    // module files are all absent on the integration branch is downgraded to
-    // `missing` + annotated, so the strategic agent never reasons on a status
-    // the code does not back up.
-    const designDoc = reconcileDesignDocPresence(
+    // Directions already staged for the next version (inert until their target
+    // version promotes). Surfaced so the strategist does not re-propose them.
+    const stagedDirections = Array.isArray(payload.staged_directions)
+      ? payload.staged_directions as Array<Record<string, unknown>>
+      : [];
+    const stagedDirectionsSection = buildStagedDirectionsSection(stagedDirections);
+
+    // The backend now ships the design doc as a COMPACT INDEX (see
+    // `_design_doc_index` in backend/app/strategic_spawning.py): one entry per
+    // non-internal section carrying key + one-line summary, plus reconciled
+    // status + backing module paths for systems/* and capabilities/*. Full
+    // section prose/specs are pulled on demand via `./design-doc get <key>`.
+    //
+    // Run the agent-side presence reconciliation over the cloned file tree as an
+    // optional second pass: the index still carries the declared module paths,
+    // so a systems/* or capabilities/* entry claiming a present status whose
+    // backing modules are all absent on the integration branch is downgraded to
+    // `missing` + annotated — catching code reverted/never-landed since the
+    // server-side grounding pass ran. Then render as a clean architecture
+    // overview (NOT a raw JSON dump).
+    const designDocIndex = reconcileDesignDocIndex(
       payload.design_doc as Record<string, unknown> | undefined,
       WORKSPACE,
     );
-    const designDocJson = designDoc && Object.keys(designDoc).length > 0
-      ? JSON.stringify(designDoc, null, 2)
-      : '';
+    const designDocJson = renderDesignDocIndexOverview(designDocIndex);
 
     // Write strategic helper scripts (strategic, fetch, design-doc)
     const projectMetadataForFetch = task.project_metadata as Record<string, unknown> | undefined;
@@ -183,8 +279,22 @@ export async function handleStrategic(
     );
 
     // ── Running context from prior cycles (design doc notes/strategic-context) ──
-    const strategicContext = designDoc
-      ? strVal((designDoc)['notes/strategic-context'])
+    // The full prose of notes/strategic-context is NO LONGER inlined in the
+    // payload (the design_doc is now a compact index). To avoid silently losing
+    // the cross-cycle running context, surface the index's one-line summary for
+    // that section (when present) and ALWAYS append a fetch hint so the
+    // strategist can pull the full running context on demand. The section may be
+    // absent entirely on a fresh project — in that case emit nothing.
+    const designDocSections = designDocIndex && Array.isArray(designDocIndex.sections)
+      ? designDocIndex.sections as unknown[]
+      : [];
+    const strategicContextEntry = designDocSections.find(
+      (e): e is Record<string, unknown> =>
+        !!e && typeof e === 'object' && !Array.isArray(e) &&
+        strVal((e as Record<string, unknown>).key) === 'notes/strategic-context',
+    );
+    const strategicContext = strategicContextEntry
+      ? `${strVal(strategicContextEntry.summary) || '_(summary unavailable)_'}\n\n_Running context shipped as an index entry this cycle — fetch the FULL prior-cycle context with \`./design-doc get notes/strategic-context\` before relying on it._`
       : '';
 
     // ── Problem model + running update + self-reflection rendering ──
@@ -194,6 +304,16 @@ export async function handleStrategic(
     const problemModelJson = problemModel && Object.keys(problemModel).length > 0
       ? JSON.stringify(problemModel, null, 2)
       : '';
+
+    // ── Problem-model size/health signal (soft) ──
+    // Computed by the backend from the DURABLE pre-trim model (honest counts).
+    // Surfaces how heavy the model is to audit in one pass; rendered into a
+    // concise section that the thinker weighs when deciding whether to prune
+    // before growing. NEVER a hard cap.
+    const modelHealth = payload.model_health && typeof payload.model_health === 'object'
+      ? payload.model_health as Record<string, unknown>
+      : null;
+    const modelHealthSection = buildModelHealthSection(modelHealth);
 
     // ── Per-gap memory pre-trim signal ──
     // The backend's `_agent_view_problem_model` (strategic_spawning.py) trims
@@ -307,6 +427,8 @@ export async function handleStrategic(
         '  - `./fetch direction <id>` — full direction record (research_history capped at 20 cycles)',
         '  - `./fetch playbook <key>` — single playbook entry (e.g. `./fetch playbook frontend-build`)',
         '  - `./fetch gap <id>` — single gap with full history/past_moves/evidence',
+        '  - `./fetch message <ref>` — inspect a message by short ref (8+ hex chars) or UUID, including one aged out of the live thread; then `./messages resolve <ref>` accepts the same ref',
+        '  - `./fetch section <key>` — single design_doc section, full prose/specs, presence-grounded (e.g. `./fetch section systems/auth`); the design_doc ships as a compact index so pull a section before relying on its detail',
         '  - `./fetch problem-model` — the FULL untrimmed problem_model (all gaps, friction, archived) if it was trimmed/dropped above',
       );
       return lines.join('\n');
@@ -346,7 +468,12 @@ export async function handleStrategic(
     } else {
       problemModelSection = `## Your current understanding (problem_model)\n_(empty — this is the first cycle. Bootstrap from the other sections below.)_`;
     }
-    const verificationFailuresSection = buildCapabilityVerificationSection(problemModel);
+    const cycleStartReconciliationSection = buildCycleStartReconciliationSection(
+      payload.cycle_start_reconciliation as Record<string, unknown> | undefined,
+    );
+    const pruneCandidatesSection = buildPruneCandidatesSection(
+      payload.prune_candidates as Record<string, unknown> | undefined,
+    );
 
     const runningUpdateSection = `## Running update (living document — rewrite, don't append)\n${renderRunningUpdateDoc(runningUpdateDoc)}\n\n_This is the document the user currently sees. Refine it this cycle — remove stale content, integrate what's new, keep it coherent and short. It's a current snapshot, not a log._`;
 
@@ -387,7 +514,7 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       problemModelSection,
       problemModelRecovery,
       gapMemoryTrimmedGapIds,
-      verificationFailuresSection,
+      cycleStartReconciliationSection,
       reflectionSection,
       selfImprovementBlock,
       runningUpdateSection,
@@ -404,10 +531,13 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       retiredDirectionsSummarySection: formatRetiredDirectionsSummary(payload.retired_directions_summary),
       dirSummaryText,
       dirHealthSummary,
+      stagedDirectionsSection,
       userPausedSection: buildUserPausedSection(directionsSummary),
       rejectedProposalsSection: buildRejectedProposalsSection(Array.isArray(payload.rejected_proposals) ? payload.rejected_proposals as Array<Record<string, unknown>> : []),
       operatorOverridesSection: buildOperatorOverridesSection(Array.isArray(payload.operator_overrides) ? payload.operator_overrides as Array<Record<string, unknown>> : []),
       portfolioCompositionText,
+      modelHealthSection,
+      pruneCandidatesSection,
       systemMaturitySection,
       driftSection,
       recentWorkSection,
@@ -515,8 +645,19 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # conflicts_with: list direction IDs that touch overlapping code/systems — they won't run in parallel.
 # recommended_mode: audit|fundamentals|ship|pause — your judgment for this direction's system health.
 ./strategic create-direction '{"text": "outcome statement", "priority": "high|medium|low", "category": "product|structural", "gap_id": "g-xxx", "rationale": "...", "conflicts_with": ["d-xxx"], "recommended_mode": "ship", "success_evidence": "observable outcome that proves this direction is done (required)", "retirement_condition": "measurable condition that triggers retirement (required)", "implementation_constraints": "optional constraints for implementors", "dedup_reasoning": {"closest_directions": ["d-xxx"], "distinction": "one-line justification why this is distinct in scope or mechanism"}}'
+# To create a NEW idea that belongs to the NEXT version, pass "staged": true on
+# the SAME create-direction call — it is born staged (inert, gated to the open
+# version) in one atomic op, so it never passes through a research-eligible
+# active state. Requires an open version (skips 409 if none). Do NOT create-then-stage.
 ./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "...", "text": "...", "conflicts_with": [...], "recommended_mode": "audit"}, "rationale": "..."}'
 ./strategic retire-direction '{"direction_id": "d-xxx", "rationale": "..."}'
+# Stage a direction for the NEXT version: it goes inert (no work spawned) and
+# auto-activates when the current version promotes and the next one opens. Use
+# ONLY for work the Thinker DECIDED belongs to the next version (Section 3
+# "Staging") — never to defer a within-cycle call. For an EXISTING active
+# direction, stage it by id below. For a NEW next-version idea, do NOT
+# create-then-stage — pass "staged": true on create-direction (one atomic op).
+./strategic stage-direction '{"direction_id": "d-xxx", "rationale": "why this belongs to the next version"}'
 
 # REQUIRED: Submit the retired-direction critique from Section 3.5.
 # Pass a JSON array of critique objects (or the no-eligible sentinel).
@@ -540,11 +681,24 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # need the detail — extra context hurts reasoning quality.
 ./fetch problem-model              # full durable problem_model for this project
 ./fetch direction <direction_id>   # full direction record
-./fetch playbook <key>             # single playbook entry
+./fetch playbook <key>             # single playbook entry (e.g., frontend-build)
 ./fetch gap <gap_id>               # single problem_model gap
+./fetch message <ref>              # inspect a message by short ref (8+ hex chars) or UUID,
+                                   # even one that has aged out of the live thread
 
-# Respond to or resolve user messages
-./messages resolve <message-id> 'How it was addressed'
+# Operational Knowledge (playbook)
+# You always receive a complete index of playbook keys (playbook_keys_index) —
+# just keys and minimal metadata (source, updated_at). Use this index to:
+# 1. Discover what operational knowledge exists in the playbook
+# 2. Fetch individual entries on demand via ./fetch playbook <key>
+# The full playbook_summary (with entry content) may be dropped under budget,
+# but the compact keys index survives, so you can always discover and retrieve
+# entries even if the summary was dropped.
+
+# Respond to or resolve user messages. <ref> may be a short ref (the first 8+ hex
+# chars shown in the admin UI) or a full UUID — the backend resolves it, so you do
+# NOT need to recover the full UUID out-of-band.
+./messages resolve <ref> 'How it was addressed'
 ./messages send 'Observation or note to the user'
 \`\`\`
 
@@ -574,6 +728,7 @@ ${analysisText.slice(0, 50_000)}
 
    - Does an existing direction already cover this? → UPDATE it; don't duplicate.
    - Does this depend on another direction being done first? → Keep it paused or don't create yet.
+   - Did the Thinker's Section 3 "Staging" decide this work belongs to the NEXT version? → For an existing direction, \`./strategic stage-direction\`. For a NEW idea, \`./strategic create-direction\` with \`"staged": true\` — born staged in ONE atomic op (never create-then-stage, which would briefly expose it as research-eligible). Stage ONLY what the analysis explicitly staged — never to defer a call the analysis left open.
    - Direction text describes OUTCOME ("users can X", "the system handles Y"), not implementation. Implementation details go in rationale.
 
    Priority is scarce:

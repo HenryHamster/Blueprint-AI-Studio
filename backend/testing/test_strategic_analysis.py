@@ -2937,3 +2937,171 @@ def test_retired_summary_uses_recorded_cost_per_merge():
     assert len(result) == 1
     entry = result[0]
     assert entry.get("cost_per_merge") == round(8.00 / 4, 2)
+
+
+# ---------------------------------------------------------------------------
+# Generalized success metrics — mixed-portfolio (non-code + code) directions
+# ---------------------------------------------------------------------------
+
+
+def test_generalized_successes_visible_for_research_only_direction():
+    """A direction with 0 PR merges but research successes shows generalized_successes."""
+    directions = [
+        {
+            "id": "dir-research",
+            "status": "active",
+            "research_history": [
+                {
+                    "timestamp": "2026-01-01T00:00:00",
+                    "prs_merged": 0,
+                    "tasks_failed": 0,
+                    "generalized_successes": 3,  # 3 research tasks produced findings
+                },
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project, [])
+    d = result["directions"][0]
+    # Merged is still zero (PR-based code metric)
+    assert d["merged"] == 0
+    # But generalized_successes shows the non-code contribution
+    assert d.get("generalized_successes") == 3
+    assert "generalized_health_rate" in d
+    assert d["generalized_health_rate"] > 0
+
+
+def test_overall_generalized_success_rate_for_mixed_portfolio():
+    """Overall summary includes generalized_success_rate for mixed portfolios."""
+    directions = [
+        {
+            "id": "dir-code",
+            "status": "active",
+            "research_history": [
+                {
+                    "timestamp": "2026-01-01T00:00:00",
+                    "prs_merged": 2,
+                    "tasks_failed": 1,
+                    "generalized_successes": 2,  # same as prs_merged for code-only
+                },
+            ],
+        },
+        {
+            "id": "dir-research",
+            "status": "active",
+            "research_history": [
+                {
+                    "timestamp": "2026-01-01T00:00:00",
+                    "prs_merged": 0,
+                    "tasks_failed": 0,
+                    "generalized_successes": 3,  # non-code successes only
+                },
+            ],
+        },
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project, [])
+    overall = result["overall"]
+    # PR-based: 2 merges, 1 failure
+    assert overall["merged"] == 2
+    assert overall["success_rate"] == round(2 / (2 + 1), 2)
+    # Generalized: 2 + 3 = 5 successes, 1 failure
+    assert "generalized_successes" in overall
+    assert overall["generalized_successes"] == 5
+    assert overall["generalized_success_rate"] == round(5 / (5 + 1), 2)
+
+
+def test_generalized_success_rate_absent_for_code_only_portfolio():
+    """When all successes are PRs, generalized_success_rate is not added (no new info)."""
+    directions = [
+        {
+            "id": "dir-code",
+            "status": "active",
+            "research_history": [
+                {
+                    "timestamp": "2026-01-01T00:00:00",
+                    "prs_merged": 3,
+                    "tasks_failed": 1,
+                    # No generalized_successes field — legacy entry fallback to prs_merged
+                },
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project, [])
+    overall = result["overall"]
+    # When generalized == merged (fallback), the field is absent
+    assert "generalized_successes" not in overall
+    assert "generalized_success_rate" not in overall
+
+
+def test_decision_accuracy_includes_generalized_success_for_research_direction():
+    """A created direction with research successes (0 PRs) shows generalized_success=True."""
+    directions = [
+        {
+            "id": "dir-research-only",
+            "status": "active",
+            "research_history": [
+                {
+                    "timestamp": "2026-01-01T00:00:00",
+                    "prs_merged": 0,
+                    "generalized_successes": 2,
+                }
+            ],
+        }
+    ]
+    vision = {
+        "_strategic_cycle_history": [
+            {
+                "cycle_id": "c1",
+                "outcome": "completed",
+                "phase2_completed_at": "2026-02-01T00:00:00",
+                "created_direction_ids": ["dir-research-only"],
+                "retired_direction_ids": [],
+            },
+        ]
+    }
+    result = _build_outcome_evaluation(
+        _make_project(directions=directions, vision=vision)
+    )
+    da = result["decision_accuracy"]
+    entry = da["created"][0]
+    # PR-based success is False (0 merges)
+    assert entry["success"] is False
+    # But generalized_success is True (research work succeeded)
+    assert entry["generalized_success"] is True
+    # And the aggregate counters reflect this
+    assert "created_generalized_successful" in da
+    assert da["created_generalized_successful"] == 1
+    assert "generalized_decision_accuracy_rate" in da
+    assert da["generalized_decision_accuracy_rate"] == 1.0
+
+
+def test_code_only_direction_success_and_generalized_success_match():
+    """A code direction that merged should have success == generalized_success == True."""
+    directions = [
+        {
+            "id": "dir-code",
+            "status": "active",
+            "research_history": [{"prs_merged": 2}],
+        }
+    ]
+    vision = {
+        "_strategic_cycle_history": [
+            {
+                "cycle_id": "c1",
+                "outcome": "completed",
+                "created_direction_ids": ["dir-code"],
+                "retired_direction_ids": [],
+            }
+        ]
+    }
+    result = _build_outcome_evaluation(
+        _make_project(directions=directions, vision=vision)
+    )
+    da = result["decision_accuracy"]
+    entry = da["created"][0]
+    assert entry["success"] is True
+    assert entry["generalized_success"] is True
+    # When they match, no extra aggregate fields added
+    assert "created_generalized_successful" not in da

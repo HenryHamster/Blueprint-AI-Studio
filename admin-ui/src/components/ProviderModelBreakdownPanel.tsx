@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { apiFetch } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
+import { parseTimestamp } from '../utils/time';
 import type { AccountHealthEntry } from './PoolAccountHealthPanel';
 
 interface QuarantineStatus {
@@ -45,7 +46,7 @@ function fmtPct(rate: number | null) {
 function fmtDate(iso: string | null) {
   if (!iso) return '—';
   try {
-    return new Date(iso).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    return parseTimestamp(iso).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   } catch {
     return iso;
   }

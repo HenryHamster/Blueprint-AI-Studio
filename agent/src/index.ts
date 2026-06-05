@@ -3,7 +3,11 @@ import { fileURLToPath } from 'url';
 import fs from 'fs';
 import path from 'path';
 import WebSocket from 'ws';
-import { handlers, type Handler } from './handlers/index.js';
+import { handlers, resolveHandler } from './handlers/index.js';
+import {
+  loadTaskCapabilityContract,
+  type TaskCapabilityContract,
+} from './taskCapabilities.js';
 import { extractJsonObject, extractJsonArray, JsonExtractionError } from './json-extract.js';
 import {
   startEventLoopLagMonitor, traceHeartbeat, installExitMarkers, recordFinalState,
@@ -52,7 +56,7 @@ import {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
   parseLLMCliTranslation, matchesRateLimit, RateLimitError, NoProgressTimeoutError,
   refreshRuntimeState,
-  getProviderRunner,
+  getProviderRunner, providerSupportsNativeSubagents,
   __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
   runClaudeCode, runProviderAgent,
   type LLMCliTranslation, type ClaudeOutput, type RunnerCommand,
@@ -63,7 +67,7 @@ export {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
   parseLLMCliTranslation, matchesRateLimit, RateLimitError, NoProgressTimeoutError,
   refreshRuntimeState,
-  getProviderRunner,
+  getProviderRunner, providerSupportsNativeSubagents,
   __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
   runClaudeCode, runProviderAgent,
 };
@@ -905,6 +909,43 @@ function enrichStatusPayload(taskId: string, payload: Record<string, unknown>): 
 
 export async function apiGet(path: string, retries = API_MAX_RETRIES) {
   return apiRequest('GET', path, () => ({ headers: apiHeaders }), retries, API_TIMEOUT);
+}
+
+// ── Task-capability contract (agent permission source of truth) ──────────────
+// The agent derives its read_only/write task partition from the published
+// backend contract (the same registry operator surfaces consume) rather than a
+// hand-maintained agent table. Fetch the contract from the agent-authed
+// endpoint and load it into taskCapabilities once per VM, BEFORE any handler
+// dispatch — so configureAgentPermissions/isReadOnlyTaskType resolve against
+// real backend metadata. A missing or incomplete contract throws, failing the
+// role loudly instead of silently misclassifying permissions.
+
+let _taskCapabilityContractLoaded = false;
+
+export async function fetchTaskCapabilityContract(): Promise<TaskCapabilityContract> {
+  const res = await apiGet('/api/agent/task-capabilities') as { task_capabilities?: TaskCapabilityContract };
+  const contract = res.task_capabilities;
+  if (!contract || typeof contract !== 'object') {
+    throw new Error('GET /api/agent/task-capabilities returned no task_capabilities map');
+  }
+  return contract;
+}
+
+// Idempotent: fetches + loads the contract on first call per VM, then no-ops.
+// The optional fetcher injection point exists for tests; production callers
+// omit it and use the real endpoint fetch.
+export async function ensureTaskCapabilityContractLoaded(
+  fetcher: () => Promise<TaskCapabilityContract> = fetchTaskCapabilityContract,
+): Promise<void> {
+  if (_taskCapabilityContractLoaded) return;
+  const contract = await fetcher();
+  loadTaskCapabilityContract(contract);
+  _taskCapabilityContractLoaded = true;
+}
+
+// Test-only: reset the once-per-VM guard so the load flow can be re-exercised.
+export function __resetTaskCapabilityContractLoadedForTesting(): void {
+  _taskCapabilityContractLoaded = false;
 }
 
 export function log(msg: string) {
@@ -2912,22 +2953,37 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     const { token: ghToken, owner, repo } = ghRes.data;
     log(`GitHub: ${owner}/${repo}`);
 
-    // Dispatch to handler.
-    // Audit 2026-04-25 (W4/C4): unknown task types used to silently fall back
-    // to the `create` handler, which then operated on payloads of the wrong
-    // shape and produced wrong output. Now we throw — the failure surfaces
-    // immediately as a real failure, not silent wrong work. This satisfies
-    // the "fail fast on actual failure" rule from the audit.
-    const handlersMap: Partial<Record<string, Handler>> = handlers;
-    const knownHandler = handlersMap[taskType];
-    if (!knownHandler) {
-      const supported = Object.keys(handlers).sort().join(', ');
-      throw new Error(
-        `Unknown task type "${taskType}". Backend emitted a task type the agent does not handle. ` +
-        `Supported handlers: ${supported}`
-      );
+    // Load the published task-capability contract before any handler runs. The
+    // agent token is valid here (the github/token fetch above just succeeded
+    // with it), and the guard makes this a once-per-VM cost. configureAgentPermissions
+    // / isReadOnlyTaskType throw until this completes, so a missing or incomplete
+    // contract fails the role loudly here rather than silently mis-granting write
+    // permissions to a read-only task.
+    statusRef.value = 'Loading task-capability contract...';
+    await ensureTaskCapabilityContractLoaded();
+
+    // Dispatch to handler — contract-driven (registry-driven task types).
+    //
+    // A BESPOKE handler (exact-type match in the handlers map) preserves all
+    // current behavior. Otherwise we resolve a GENERIC runner from the
+    // backend-published `task_capability` contract (run_shape × agent_mode ×
+    // output_kind), so a task type the backend REGISTERS becomes runnable
+    // WITHOUT an agent code edit + redeploy.
+    //
+    // Audit 2026-04-25 (W4/C4): we still fail fast on a genuinely unrunnable
+    // type — a run-shape with no generic runner yet (the reserved
+    // experiment_loop, or any unrecognized shape) throws with a clear message
+    // rather than silently doing wrong work. But a NEW type of a known shape
+    // (single_agent read-only knowledge, or workflow write/PR) no longer throws.
+    const resolution = resolveHandler(taskType, task, payload);
+    if (!resolution.handler) {
+      throw new Error(resolution.reason);
     }
-    const handler = knownHandler;
+    if (resolution.dispatch === 'generic') {
+      log(`No bespoke handler for "${taskType}" — dispatching via contract-driven generic runner (${resolution.runnerLabel}).`);
+      sendLog(ws, `Dispatching task type "${taskType}" via generic ${resolution.runnerLabel} runner (contract-driven).\n`);
+    }
+    const handler = resolution.handler;
     await handler(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
     // Phase 0 telemetry: t_handler_complete. Captured only on the success
     // path so failures don't pollute the completion-duration histogram.
@@ -3015,7 +3071,7 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     // Per-role /tmp scratch cleanup. Workspace teardown happens at process
     // exit (in main()'s outer finally) so warm continuity preserves it.
     try { fs.unlinkSync(`/tmp/agent_prompt_${taskId}.txt`); } catch { /* ignore */ }
-    for (const name of ['review_verdict', 'plan_output', 'research_findings', 'security_findings', 'smoketest_result', 'verify_tests_result', 'debug_output', 'perf_output', 'investigation_report', 'strategic_output', 'design_doc_output']) {
+    for (const name of ['review_verdict', 'panel_review_lens_correctness', 'panel_review_lens_security', 'panel_review_lens_code_quality', 'panel_review_lens_test_coverage', 'plan_output', 'research_findings', 'security_findings', 'smoketest_result', 'verify_tests_result', 'debug_output', 'perf_output', 'investigation_report', 'strategic_output', 'design_doc_output']) {
       try { fs.unlinkSync(`/tmp/${name}_${taskId}.json`); } catch { /* ignore */ }
     }
   }

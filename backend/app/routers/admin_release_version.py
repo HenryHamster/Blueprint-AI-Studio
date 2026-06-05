@@ -17,7 +17,11 @@ from app.models import (
 )
 from app.auth import get_current_user
 from app.admin import _get_user_project_with_role
-from app.shared_state import runtime_config as _runtime_config
+from app.shared_state import (
+    promotion_enabled_by_project_map,
+    resolve_project_promotion_enabled,
+    runtime_config as _runtime_config,
+)
 from app import release_version as _release_version
 
 router = APIRouter()
@@ -99,6 +103,10 @@ def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
         "ci_resolution": qual.get("ci_resolution"),
         "blocker": qual.get("blocker"),
         "finalized_at": qual.get("finalized_at"),
+        # The candidate commit this qualification was evaluated against. Lets the
+        # operator UI detect when the latest release_audit's findings were computed
+        # against a different (older) commit than the version's evaluated candidate.
+        "candidate_sha": qual.get("candidate_sha"),
         # Infra-failure context (populated only when status=infra_failure).
         "error": qual.get("error"),
         "consecutive_infra_errors": qual.get("consecutive_infra_errors"),
@@ -123,15 +131,26 @@ async def get_version_lifecycle(
     Projects with no version lifecycle return ``null`` for ``current_version``
     and an empty ``recent_versions`` list.
     """
-    from app.release_version import count_merged_since  # noqa: PLC0415
+    from app.release_version import (  # noqa: PLC0415
+        count_merged_since,
+        count_in_flight_tasks,
+    )
     from app.release_qualifier import (  # noqa: PLC0415
         compute_promotion_readiness,
         get_latest_release_audit_report,
+    )
+    from app.models import Project  # noqa: PLC0415
+    from app.strategic_spawning import (  # noqa: PLC0415
+        _build_staged_directions_summary,
     )
 
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, min_role="viewer"
     )
+
+    project_row = (
+        await session.execute(select(Project).where(Project.id == project_id))
+    ).scalar_one_or_none()
 
     open_row = (
         (
@@ -152,11 +171,20 @@ async def get_version_lifecycle(
     current_version_out: Optional[Dict[str, Any]] = None
     if open_row is not None:
         merged_count = await count_merged_since(session, project_id, open_row.opened_at)
+        in_flight_count = await count_in_flight_tasks(session, project_id)
         qual = open_row.last_qualification or {}
+        qual_state = _release_version.summarize_qualification_state(qual)
         # Surface the latest release_audit's actual findings/score so a verdict
         # is explainable (the verdict record only keeps the composite, and the
         # task API strips artifact logs — otherwise operators are blind to WHY).
         latest_audit = await get_latest_release_audit_report(session, project_id)
+
+        # Fetch live current_focus from the project's problem_model
+        live_current_focus = None
+        if project_row and project_row.problem_model:
+            intent = project_row.problem_model.get("intent", {})
+            live_current_focus = intent.get("current_focus")
+
         current_version_out = {
             "version_number": open_row.version_number,
             "phase": open_row.phase,
@@ -165,9 +193,19 @@ async def get_version_lifecycle(
             else None,
             "phase_reasoning": open_row.phase_reasoning,
             "goal": open_row.goal,
+            "goal_updated_at": open_row.goal_updated_at.isoformat()
+            if open_row.goal_updated_at
+            else None,
+            "goal_editor_info": open_row.goal_editor_info,
+            "live_current_focus": live_current_focus,
             "opened_at": open_row.opened_at.isoformat(),
             "qualification_attempts": open_row.qualification_attempts,
             "merged_task_count": merged_count,
+            # In-flight (non-terminal) tasks that a version cut will NOT stop —
+            # they keep running and land against the freshly-opened next version.
+            # Surfaced so the cut confirmation can disclose this consequence.
+            "in_flight_task_count": in_flight_count,
+            "qualification_state": qual_state,
             "last_qualification": _format_qualification(qual) if qual else None,
             "latest_audit": latest_audit,
         }
@@ -202,11 +240,47 @@ async def get_version_lifecycle(
                 "last_qualification": _format_qualification(v.last_qualification)
                 if v.last_qualification
                 else None,
+                "abandoned_at": (
+                    (v.last_qualification or {}).get("abandoned_at")
+                    if v.status == "abandoned"
+                    else None
+                ),
+                "abandoned_by": (
+                    (v.last_qualification or {}).get("operator")
+                    if v.status == "abandoned"
+                    else None
+                ),
+                "abandon_reason": (
+                    (v.last_qualification or {}).get("reason")
+                    if v.status == "abandoned"
+                    else None
+                ),
             }
             for v in history_rows
         ],
         "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
+        # Per-project live-promotion enablement. ``promotion_enabled_effective``
+        # is the value the promotion gate actually consults for THIS project (the
+        # override when set, else the fleet default). ``promotion_enabled_override``
+        # is the explicit per-project value (None when the project rides the fleet
+        # default), and ``promotion_enabled_source`` tells the operator which one
+        # is in effect.
+        "promotion_enabled_effective": resolve_project_promotion_enabled(project_id),
+        "promotion_enabled_override": promotion_enabled_by_project_map().get(
+            str(project_id)
+        ),
+        "promotion_enabled_source": (
+            "project"
+            if str(project_id) in promotion_enabled_by_project_map()
+            else "fleet"
+        ),
         "promotion_readiness": promotion_readiness,
+        # Directions deliberately queued (status=staged) to begin only after the
+        # current version promotes. Surfaced read-only so an operator can confirm
+        # staged work is queued and spot items rotting past their target version.
+        "staged_directions": (
+            _build_staged_directions_summary(project_row) if project_row else []
+        ),
     }
 
 
@@ -260,6 +334,183 @@ async def set_version_phase(
         if open_ver.phase_changed_at
         else None,
         "phase_reasoning": open_ver.phase_reasoning,
+    }
+
+
+class _SetVersionGoalBody(BaseModel):
+    goal: str | None = _Field(default=None, max_length=500)
+
+
+@router.post("/projects/{project_id}/version-goal")
+async def set_version_goal(
+    project_id: uuid.UUID,
+    payload: _SetVersionGoalBody,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Set the goal of the open release version for a project.
+
+    Member+ role required.  Returns 404 when there is no open version.
+    Allows operators to set or refine the version's objective, providing
+    intentional control over the version's stated intent.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+
+    open_ver = await _release_version.current_open_version(session, project_id)
+    if open_ver is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No open release version found for this project.",
+        )
+
+    operator_id = current_user.get("email") or current_user["user_id"]
+    _release_version.set_version_goal(
+        open_ver, payload.goal, editor_id=operator_id
+    )
+    session.add(open_ver)
+    await session.commit()
+    await session.refresh(open_ver)
+    return {
+        "version_number": open_ver.version_number,
+        "goal": open_ver.goal,
+        "goal_updated_at": open_ver.goal_updated_at.isoformat()
+        if open_ver.goal_updated_at
+        else None,
+        "goal_editor_info": open_ver.goal_editor_info,
+    }
+
+
+class _AbandonVersionBody(BaseModel):
+    reason: str | None = _Field(default=None, max_length=500)
+
+
+@router.post("/projects/{project_id}/version-cut")
+async def cut_version(
+    project_id: uuid.UUID,
+    payload: _AbandonVersionBody,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Operator-initiated version cut: abandon the open version, open the next.
+
+    Member+ role required.  Returns 404 when there is no open version to cut.
+    Abandons the current open ``ReleaseVersion`` (status ``abandoned``, recording
+    the operator reason + identity in ``last_qualification`` and
+    ``phase_reasoning``) and opens a fresh next-numbered version in the ``build``
+    phase with a current-focus goal snapshot.  Gives operators a lever to resolve
+    a genuinely-stuck version (wrong goal, pivoted work, un-passable candidate)
+    that the existing stall detection only alerts on.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+
+    operator_id = current_user.get("email") or current_user["user_id"]
+    try:
+        abandoned, new_version = await _release_version.abandon_current_version(
+            session,
+            project_id,
+            reason=payload.reason,
+            operator_id=operator_id,
+        )
+    except _release_version.VersionCutBlockedByPromotion as exc:
+        detail = (
+            "a promotion PR is open and auto-merging — wait for it to land or "
+            "cancel it before cutting"
+        )
+        if exc.promotion_pr_number is not None:
+            detail += f" (PR #{exc.promotion_pr_number}"
+            if exc.promotion_pr_url:
+                detail += f" {exc.promotion_pr_url}"
+            detail += ")"
+        raise HTTPException(status_code=409, detail=detail) from exc
+    if abandoned is None or new_version is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No open release version found for this project.",
+        )
+
+    await session.commit()
+    await session.refresh(abandoned)
+    await session.refresh(new_version)
+    return {
+        "abandoned_version": {
+            "version_number": abandoned.version_number,
+            "status": abandoned.status,
+            "abandoned_at": (abandoned.last_qualification or {}).get("abandoned_at"),
+        },
+        "new_version": {
+            "version_number": new_version.version_number,
+            "phase": new_version.phase,
+            "goal": new_version.goal,
+            "opened_at": new_version.opened_at.isoformat()
+            if new_version.opened_at
+            else None,
+        },
+    }
+
+
+class _SetPromotionEnabledBody(BaseModel):
+    enabled: bool | None = _Field(default=None)
+
+
+@router.post("/projects/{project_id}/promotion-enabled")
+async def set_promotion_enabled(
+    project_id: uuid.UUID,
+    payload: _SetPromotionEnabledBody,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Arm, hold, or clear ONE project's per-project live-promotion override.
+
+    Owner-gated. The request body is ``{"enabled": true | false | null}``:
+
+    * ``true`` arms live promotion for THIS project, ``false`` holds it — either
+      way the project's promotion gate consults that explicit value independently
+      of the fleet-wide ``promotion_enabled`` and of every other project;
+    * ``null`` CLEARS this project's override so it falls back to the fleet-wide
+      default, restoring byte-identical behavior to a project with no override.
+
+    The map is read-modify-written under ``runtime_config_lock`` so a concurrent
+    edit to a DIFFERENT project is never clobbered, then persisted via the durable
+    settings path (:func:`admin_settings._apply_settings`) so the change survives a
+    Cloud Run restart.
+
+    Response keys (additive-only): ``project_id``, ``override`` (the explicit
+    per-project value now stored, or ``None`` when cleared), ``effective`` (the
+    value the gate will consult after fleet fallback), ``source``
+    (``"project"`` | ``"fleet"``), and ``cleared``.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    from app.routers.admin_settings import _apply_settings
+    from app.shared_state import runtime_config, runtime_config_lock
+
+    sid = str(project_id)
+    async with runtime_config_lock:
+        promo_map = dict(promotion_enabled_by_project_map())
+        if payload.enabled is None:
+            cleared = sid in promo_map
+            promo_map.pop(sid, None)
+        else:
+            cleared = False
+            promo_map[sid] = bool(payload.enabled)
+        await _apply_settings(
+            {"promotion_enabled_by_project": promo_map}, session, runtime_config
+        )
+        resulting = promotion_enabled_by_project_map()
+        effective = resolve_project_promotion_enabled(project_id)
+
+    return {
+        "project_id": sid,
+        "override": resulting.get(sid),
+        "effective": effective,
+        "source": "project" if sid in resulting else "fleet",
+        "cleared": cleared,
     }
 
 

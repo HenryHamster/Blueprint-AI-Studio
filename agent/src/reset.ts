@@ -48,6 +48,13 @@ const execFileAsync = promisify(execFile);
 // shutdown cleanup loop). Keep them in sync if either list grows.
 const TMP_OUTPUT_NAMES = [
   'review_verdict',
+  // panel_review writes one scratch file per declared lens
+  // (panelReviewLensOutputType in handlers/panel-review.ts → PANEL_REVIEW_LENSES);
+  // keep these in sync with that lens set.
+  'panel_review_lens_correctness',
+  'panel_review_lens_security',
+  'panel_review_lens_code_quality',
+  'panel_review_lens_test_coverage',
   'plan_output',
   'research_findings',
   'security_findings',

@@ -22,6 +22,8 @@ from app.finding_deduplication import (
     extract_retired_failed_approaches,
     finding_hash,
     is_duplicate,
+    normalize_prerequisite,
+    resolve_prerequisite_task,
 )
 from app.models import Task, TaskStatus
 
@@ -1100,3 +1102,113 @@ def test_deduplicate_findings_filters_archived_diagnosis_match():
     assert len(outcome.deduplicated) == 0
     assert len(outcome.filtered) == 1
     assert outcome.filtered[0]["reason"].startswith("archived diagnosis:")
+
+
+# ---------------------------------------------------------------------------
+# normalize_prerequisite
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_prerequisite_valid_task_kind():
+    out = normalize_prerequisite({"kind": "task", "ref": "abc123"})
+    assert out == {"kind": "task", "ref": "abc123"}
+
+
+def test_normalize_prerequisite_valid_capability_kind():
+    out = normalize_prerequisite({"kind": "capability", "ref": "auth-service"})
+    assert out == {"kind": "capability", "ref": "auth-service"}
+
+
+def test_normalize_prerequisite_strips_whitespace_and_lowercases_kind():
+    out = normalize_prerequisite({"kind": "  TASK  ", "ref": "  xyz  "})
+    assert out == {"kind": "task", "ref": "xyz"}
+
+
+def test_normalize_prerequisite_unknown_kind_returns_none():
+    assert normalize_prerequisite({"kind": "direction", "ref": "d-1"}) is None
+
+
+def test_normalize_prerequisite_non_dict_returns_none():
+    assert normalize_prerequisite(None) is None
+    assert normalize_prerequisite("task:abc") is None
+    assert normalize_prerequisite(["task", "abc"]) is None
+
+
+def test_normalize_prerequisite_missing_or_blank_ref_returns_none():
+    assert normalize_prerequisite({"kind": "task"}) is None
+    assert normalize_prerequisite({"kind": "task", "ref": ""}) is None
+    assert normalize_prerequisite({"kind": "task", "ref": "   "}) is None
+    assert normalize_prerequisite({"kind": "task", "ref": 42}) is None
+
+
+# ---------------------------------------------------------------------------
+# resolve_prerequisite_task
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_prerequisite_task_matches_by_id():
+    foundation = _make_task(status=TaskStatus.IN_PROGRESS)
+    other = _make_task(status=TaskStatus.QUEUED)
+    prereq = {"kind": "task", "ref": str(foundation.id)}
+    assert resolve_prerequisite_task(prereq, [other, foundation]) is foundation
+
+
+def test_resolve_prerequisite_task_matches_by_finding_hash():
+    foundation = _make_task(
+        status=TaskStatus.IN_PROGRESS, context={"finding_hash": "deadbeefcafe0000"}
+    )
+    other = _make_task(status=TaskStatus.QUEUED)
+    prereq = {"kind": "task", "ref": "deadbeefcafe0000"}
+    assert resolve_prerequisite_task(prereq, [other, foundation]) is foundation
+
+
+def test_resolve_prerequisite_task_capability_exact_marker_match():
+    foundation = _make_task(
+        status=TaskStatus.IN_PROGRESS, context={"provides_capability": "Auth-Service"}
+    )
+    # Case-insensitive exact match on the capability name.
+    prereq = {"kind": "capability", "ref": "auth-service"}
+    assert resolve_prerequisite_task(prereq, [foundation]) is foundation
+
+
+def test_resolve_prerequisite_task_capability_list_marker_match():
+    foundation = _make_task(
+        status=TaskStatus.IN_PROGRESS,
+        context={"capability": ["logging", "auth-service"]},
+    )
+    prereq = {"kind": "capability", "ref": "auth-service"}
+    assert resolve_prerequisite_task(prereq, [foundation]) is foundation
+
+
+def test_resolve_prerequisite_task_no_fuzzy_title_match():
+    # A task whose title/context mentions auth must NOT match a capability ref
+    # unless it carries an explicit capability marker.
+    candidate = _make_task(status=TaskStatus.IN_PROGRESS, context={})
+    candidate.title = "Build the auth-service foundation"
+    prereq = {"kind": "capability", "ref": "auth-service"}
+    assert resolve_prerequisite_task(prereq, [candidate]) is None
+
+
+def test_resolve_prerequisite_task_no_candidate_returns_none():
+    prereq = {"kind": "task", "ref": "no-such-id"}
+    assert resolve_prerequisite_task(prereq, []) is None
+    assert resolve_prerequisite_task(prereq, [_make_task()]) is None
+
+
+def test_resolve_prerequisite_task_malformed_prereq_returns_none():
+    foundation = _make_task(status=TaskStatus.IN_PROGRESS)
+    assert resolve_prerequisite_task(None, [foundation]) is None
+    assert resolve_prerequisite_task({"kind": "bogus", "ref": "x"}, [foundation]) is None
+
+
+def test_resolve_prerequisite_task_prefers_first_match_in_order():
+    # Caller controls candidate ordering (e.g. in-flight before sibling batch);
+    # the first explicit match wins.
+    first = _make_task(
+        status=TaskStatus.IN_PROGRESS, context={"finding_hash": "shared-hash-0001"}
+    )
+    second = _make_task(
+        status=TaskStatus.QUEUED, context={"finding_hash": "shared-hash-0001"}
+    )
+    prereq = {"kind": "task", "ref": "shared-hash-0001"}
+    assert resolve_prerequisite_task(prereq, [first, second]) is first

@@ -258,6 +258,301 @@ def test_empty_pre_trim_marker_not_surfaced():
     assert out["_packer_meta"]["gap_memory_trimmed"] == []
 
 
+def test_floor_key_survives_when_higher_volume_siblings_exhaust_budget():
+    """A key with a ``floor`` callback always ships at least its floored value,
+    even when same-tier siblings that sort ahead would otherwise exhaust the
+    budget. Other recoverable context degrades/drops before the floored key.
+
+    This is the in-payload delivery guarantee: without the floor reservation,
+    the big high-tier siblings pack first and ``model`` (whose full size sorts
+    it last in the high tier) would be dropped entirely.
+    """
+    payload = {
+        "model": {"gaps": ["g"] * 400},  # big full value, sorts last in high tier
+        "sibling_a": "x" * 600,
+        "sibling_b": "y" * 600,
+    }
+    schema = {
+        # floor strips the model down to a tiny (~32B) guaranteed working set
+        "model": {
+            "priority": "high",
+            "summarize": lambda v: {"gaps": v["gaps"][:1], "floored": True},
+            "floor": lambda v: {"gaps": v["gaps"][:1], "floored": True},
+        },
+        "sibling_a": {"priority": "high"},
+        "sibling_b": {"priority": "high"},
+    }
+    # Budget is tight: the two ~602B siblings fit with only ~6B to spare — too
+    # little for the ~32B floored model. WITHOUT the reservation the siblings
+    # win the race and the model is dropped; WITH it a sibling drops instead.
+    out = pack_under_budget(payload, schema, budget=1210)
+    assert "model" in out, "floored key was starved out by higher-volume siblings"
+    assert out["model"] == {"gaps": ["g"], "floored": True}
+    dropped_keys = {d["key"] for d in out["_packer_meta"]["dropped"]}
+    assert "model" not in dropped_keys
+    # A recoverable sibling degraded (dropped) before the floored model vanished.
+    assert "sibling_a" not in out or "sibling_b" not in out
+
+
+def test_floor_used_when_summarize_absent_or_raises():
+    """When a floor key has no summarize_fn (or it raises), the floor still
+    ships rather than the key being dropped."""
+    payload = {"model": {"big": "z" * 5000}}
+    schema = {
+        "model": {
+            "priority": "high",
+            "floor": lambda v: {"floored": True},
+        },
+    }
+    out = pack_under_budget(payload, schema, budget=200)
+    assert out["model"] == {"floored": True}
+    assert {"key": "model", "kind": "floored"} in out["_packer_meta"]["trimmed"]
+
+
+def test_floor_full_value_ships_when_budget_allows():
+    """The floor is a guarantee, not a cap — when the budget fits the full
+    value, the full (un-floored) value ships."""
+    payload = {"model": {"gaps": ["g1", "g2", "g3"]}}
+    schema = {
+        "model": {
+            "priority": "high",
+            "floor": lambda v: {"gaps": v["gaps"][:1]},
+        },
+    }
+    out = pack_under_budget(payload, schema, budget=10_000)
+    assert out["model"] == {"gaps": ["g1", "g2", "g3"]}
+    assert out["_packer_meta"]["trimmed"] == []
+
+
+def test_floor_equal_to_full_value_reserves_whole_value_off_the_top():
+    """When the ``floor`` callback returns the FULL value (identity floor), the
+    packer reserves the whole value's bytes off the top of the budget — so the
+    full value ships intact (un-summarized) while higher-volume siblings that
+    sort ahead must yield first.
+
+    This is the reworked strategic ``problem_model`` guarantee: the floor equals
+    the full agent-view model, so the model ordinarily ships WHOLE and recoverable
+    siblings degrade/drop before it is ever reduced. The summarize callback (which
+    would shrink the model) must NOT fire on this path.
+    """
+    full_model = {"gaps": ["g"] * 300}  # big, sorts last in the high tier
+    summarize_calls = []
+
+    def summarize(v):
+        summarize_calls.append(v)
+        return {"gaps": v["gaps"][:1], "floored": True}
+
+    payload = {
+        "model": full_model,
+        "sibling_a": "a" * 1500,
+        "sibling_b": "b" * 1500,
+    }
+    schema = {
+        # Identity floor: reserve the WHOLE value (mirrors the production
+        # _agent_view_problem_model_floor returning the full agent-view model).
+        "model": {
+            "priority": "high",
+            "summarize": summarize,
+            "floor": lambda v: v,
+        },
+        "sibling_a": {"priority": "high"},
+        "sibling_b": {"priority": "high"},
+    }
+    model_bytes = len(json.dumps(full_model, default=str).encode())
+    # Budget fits the whole model plus only ONE ~1.5KB sibling — the other must
+    # yield because the model's full bytes are reserved off the top.
+    out = pack_under_budget(payload, schema, budget=model_bytes + 1800)
+
+    # The WHOLE value shipped (not the floored/summarized 1-gap form).
+    assert out["model"] == full_model, "the full value must ship, un-summarized"
+    assert summarize_calls == [], "summarize must NOT fire when the full value fits"
+    assert out["_packer_meta"]["trimmed"] == []
+    # A higher-volume sibling yielded first.
+    dropped_keys = {d["key"] for d in out["_packer_meta"]["dropped"]}
+    assert "model" not in dropped_keys
+    assert "sibling_a" in dropped_keys or "sibling_b" in dropped_keys, (
+        "a higher-volume sibling must drop before the reserved full model"
+    )
+
+
+def test_full_model_floor_does_not_starve_critical_keys(caplog):
+    """When the full-model floor reservation fits the budget on its own but the
+    model PLUS the always-critical identity/vision keys would not, the packer
+    must drop the floor guarantee (so the model's summarize fires) rather than
+    starve a critical key into a hard PayloadTooLargeError.
+
+    Reproduces the near-budget band: model ~fits-alone, model+vision overflows.
+    The floor reservation is ``reserved_remaining <= budget`` (guarantee kept by
+    the old condition), yet ``vision`` (critical, no summarize/floor) sorts first
+    and would see ``remaining = budget - reserved`` too small to fit. The fix
+    accounts for non-floored critical keys' full bytes in the drop condition, so
+    the model degrades loudly via summarize and the critical key still ships.
+    """
+    big_model = {"gaps": ["g"] * 4000}
+    model_bytes = len(json.dumps(big_model, default=str).encode())
+    vision = "v" * 4000
+    vision_bytes = len(json.dumps(vision, default=str).encode())
+    summarize_calls = []
+
+    def summarize(v):
+        summarize_calls.append(v)
+        return {"gaps": v["gaps"][:1], "_agent_view_floor_applied": {"floored": True}}
+
+    payload = {"vision": vision, "model": big_model}
+    schema = {
+        "vision": {"priority": "critical"},
+        "model": {
+            "priority": "high",
+            "summarize": summarize,
+            "floor": lambda v: v,  # identity floor: reserves the WHOLE model
+        },
+    }
+    # Budget fits the model alone (reservation <= budget) but NOT model+vision.
+    budget = model_bytes + vision_bytes - 50
+    with caplog.at_level(logging.WARNING):
+        out = pack_under_budget(payload, schema, budget=budget)
+
+    # Critical key shipped — no PayloadTooLargeError.
+    assert out["vision"] == vision
+    # Floor guarantee was dropped, so the model degraded via summarize (loudly).
+    assert summarize_calls, "summarize must fire when the floor guarantee is dropped"
+    assert out["model"].get("_agent_view_floor_applied"), (
+        "the degraded model must carry the loud floor-applied marker"
+    )
+    assert {"key": "model", "kind": "summarized"} in out["_packer_meta"]["trimmed"]
+    assert any(
+        "exceed budget" in rec.message and "critical" in rec.message
+        for rec in caplog.records
+    ), "the floor-drop must log that critical headroom forced the drop"
+
+
+def test_degraded_floor_reservation_survives_mixed_high_contention():
+    """If the full-floor reservation must be dropped to preserve critical keys,
+    a smaller summarized reservation still protects the key from same-tier
+    siblings consuming the rest of the budget first.
+
+    Regression for the mixed critical/high band: the old fallback cleared
+    ``floors`` entirely, so two smaller high-priority siblings packed ahead of
+    ``problem_model`` and left too little room for even its summarized form,
+    silently dropping it. The packer must instead reserve the degraded form so
+    the model ships loudly summarized and at least one sibling yields first.
+    """
+    problem_model = {"gaps": ["g" * 200 for _ in range(20)]}
+
+    def summarize(v):
+        return {
+            "gaps": v["gaps"][:1],
+            "_agent_view_floor_applied": {"floored": True},
+        }
+
+    summarized_model = summarize(problem_model)
+    sibling_a = {"body": "a" * 220}
+    sibling_b = {"body": "b" * 220}
+    vision = {"purpose": "v" * 600}
+
+    summarized_size = _size(summarized_model)
+    sibling_a_size = _size(sibling_a)
+    sibling_b_size = _size(sibling_b)
+    critical_size = _size("strategic_review") + _size(vision)
+
+    budget = critical_size + summarized_size + sibling_a_size + sibling_b_size - 1
+    assert budget < critical_size + _size(problem_model), (
+        "fixture must force the full-floor reservation to overflow with critical keys"
+    )
+
+    payload = {
+        "type": "strategic_review",
+        "vision": vision,
+        "sibling_a": sibling_a,
+        "sibling_b": sibling_b,
+        "problem_model": problem_model,
+    }
+    schema = {
+        "type": {"priority": "critical"},
+        "vision": {"priority": "critical"},
+        "sibling_a": {"priority": "high"},
+        "sibling_b": {"priority": "high"},
+        "problem_model": {
+            "priority": "high",
+            "summarize": summarize,
+            "floor": lambda v: v,
+        },
+    }
+
+    out = pack_under_budget(payload, schema, budget=budget)
+
+    assert "problem_model" in out, "degraded reservation must keep problem_model delivered"
+    assert out["problem_model"] == summarized_model
+    assert {"key": "problem_model", "kind": "summarized"} in out["_packer_meta"]["trimmed"]
+    dropped_keys = {d["key"] for d in out["_packer_meta"]["dropped"]}
+    assert "problem_model" not in dropped_keys, f"problem_model dropped: {out['_packer_meta']['dropped']}"
+    assert {"sibling_a", "sibling_b"} & dropped_keys, (
+        "at least one same-tier sibling must yield before the degraded reservation"
+    )
+
+
+def test_degraded_reservation_preserves_floor_without_summarize(caplog):
+    """When the full-floor reservation must be dropped to preserve critical keys,
+    a floored key with NO usable summarized candidate still keeps a reservation
+    for its actual floor value rather than being cleared and silently dropped.
+
+    Regression for the degraded-reservation branch: it previously only reserved
+    ``_compute_summarized_candidate(p)``. A key with a valid floor but no usable
+    summarized form (no summarize_fn here) produced no degraded candidate, so
+    with both floored keys lacking summarizers ``degraded_floors`` stayed empty
+    and ``floors`` was cleared entirely — dropping a floor that fits within
+    ``budget - critical_full``. The fallback must reserve the floor value itself
+    when that is the only viable degraded form.
+    """
+    model_a = {"gaps": ["a" * 200 for _ in range(20)]}
+    model_b = {"gaps": ["b" * 200 for _ in range(20)]}
+    floor_a = {"floored": "a"}
+    floor_b = {"floored": "b"}
+    vision = "v" * 600
+
+    fa_size = _size(floor_a)
+    fb_size = _size(floor_b)
+    critical_size = _size("strategic_review") + _size(vision)
+
+    # Branch fires: full-floor reservations (fa + fb) plus the critical keys
+    # exceed budget by 1. degraded_budget = budget - critical_size = fa + fb - 1,
+    # so model_a's floor fits but model_b's does not (greedy boundary).
+    budget = critical_size + fa_size + fb_size - 1
+    assert fa_size + fb_size + critical_size > budget, (
+        "fixture must force the full-floor reservation to overflow with critical keys"
+    )
+
+    payload = {
+        "type": "strategic_review",
+        "vision": vision,
+        "model_a": model_a,
+        "model_b": model_b,
+    }
+    schema = {
+        "type": {"priority": "critical"},
+        "vision": {"priority": "critical"},
+        # Both floored keys lack a summarize_fn: the floor value is the ONLY
+        # viable degraded reservation form.
+        "model_a": {"priority": "high", "floor": lambda v: floor_a},
+        "model_b": {"priority": "high", "floor": lambda v: floor_b},
+    }
+
+    with caplog.at_level(logging.WARNING):
+        out = pack_under_budget(payload, schema, budget=budget)
+
+    # Critical keys shipped — no PayloadTooLargeError.
+    assert out["vision"] == vision
+    # model_a kept its floor reservation and shipped the floor value (loudly),
+    # instead of being cleared and dropped for lack of a summarized candidate.
+    assert out["model_a"] == floor_a, "floored key must ship its floor value"
+    assert {"key": "model_a", "kind": "floored"} in out["_packer_meta"]["trimmed"]
+    dropped_keys = {d["key"] for d in out["_packer_meta"]["dropped"]}
+    assert "model_a" not in dropped_keys, f"model_a dropped: {out['_packer_meta']['dropped']}"
+    assert any(
+        "preserving degraded reservations" in rec.message for rec in caplog.records
+    ), "the degraded pass must log that it preserved a floor reservation"
+
+
 def test_summarize_returning_larger_value_falls_back_to_original(caplog):
     """If summarize_fn returns something larger (caller bug), use original.
 
@@ -280,3 +575,550 @@ def test_summarize_returning_larger_value_falls_back_to_original(caplog):
         out = pack_under_budget(payload, schema, budget=10)
     assert "items" not in out
     assert any("grew" in rec.message.lower() for rec in caplog.records)
+
+
+def test_floor_survives_when_summarize_raises(caplog):
+    """Floor callback preserves a key even when summarize callback fails.
+
+    This is the critical hardening case: when the summarize callback raises
+    an exception, the packer catches it and abandons the summarize path. But
+    the floor callback is independent, so it still computes and reserves bytes
+    for the floored representation. The floored value ships to the agent with
+    a marker indicating it was floored, so the agent can fetch fuller detail.
+
+    This guarantees the problem_model is NEVER silently dropped due to a
+    failure in the elaborate summarize logic.
+    """
+
+    def broken_summarize(v):
+        """Simulate a failure in the elaborate summarize callback."""
+        raise ValueError("Elaborate summarize logic failed: X happened")
+
+    def working_floor(v):
+        """Simple, independent, can't-fail floor."""
+        return {"floored": True, "minimal": "skeleton"}
+
+    payload = {"model": {"big": "data" * 1000}}  # ~4KB
+    schema = {
+        "model": {
+            "priority": "high",
+            "summarize": broken_summarize,
+            "floor": working_floor,
+        },
+    }
+
+    # Budget is tight, forcing the summarize path. The summarize callback
+    # raises, but the floor callback succeeds and the floored value ships.
+    with caplog.at_level(logging.WARNING):
+        out = pack_under_budget(payload, schema, budget=100)
+
+    # The key is present (not dropped) and holds the floored value.
+    assert "model" in out
+    assert out["model"] == {"floored": True, "minimal": "skeleton"}
+    # The packer logged a warning about the summarize failure.
+    assert any("summarize" in rec.message.lower() and "raised" in rec.message.lower()
+               for rec in caplog.records)
+    # The floored entry is marked as floored in the metadata.
+    assert {"key": "model", "kind": "floored"} in out["_packer_meta"]["trimmed"]
+
+
+def test_floor_survives_when_both_summarize_and_floor_raise():
+    """When both summarize and floor raise, the section is silently dropped.
+
+    This is a catastrophic failure case: the floor function is expected to be
+    simple and can't-fail. If it does raise, the packer logs a warning and
+    the key is dropped entirely (there is no last-resort value to ship). This
+    test documents the boundary condition: the floor MUST be defensively coded
+    to never raise, or the inbound guarantee (model always shipped) is broken.
+    """
+
+    def broken_summarize(v):
+        raise ValueError("Summarize failed")
+
+    def broken_floor(v):
+        raise RuntimeError("Floor failed too")
+
+    payload = {"model": {"data": "x" * 1000}}
+    schema = {
+        "model": {
+            "priority": "high",
+            "summarize": broken_summarize,
+            "floor": broken_floor,
+        },
+    }
+
+    # Both callbacks fail. The section is dropped with warnings about both
+    # failures (first floor, then summarize as a fallback).
+    out = pack_under_budget(payload, schema, budget=200)
+    assert "model" not in out
+    # The packer logs warnings for both the floor and summarize failures.
+    dropped = [d for d in out["_packer_meta"]["dropped"] if d["key"] == "model"]
+    assert len(dropped) == 1
+    # When the summarize callback also fails, that message is recorded.
+    assert "exceeds remaining budget even after summarize" in dropped[0]["reason"]
+
+
+# ---------------------------------------------------------------------------
+# Invariant: a GC'd, worst-case-but-within-caps durable problem_model survives
+# the real strategic single-pass path (GC -> agent-view trim -> pack_under_budget).
+#
+# gc_problem_model's stated purpose is to keep the durable model "small enough
+# to round-trip in a single pass". That round-trip is:
+#   durable model -> _agent_view_problem_model (trim) -> pack_under_budget
+# at the real default budget under the production _STRATEGIC_REVIEW_SCHEMA.
+# The pieces are tested in isolation elsewhere; these tests prove the whole
+# path holds when the model is populated to the documented GC/health caps.
+#
+# All sizes are pulled from the actual cap constants (never magic numbers), so
+# if a cap is raised without the budget still holding, these tests fail and
+# surface the regression instead of CI staying green while the packer silently
+# drops the entire problem_model section.
+# ---------------------------------------------------------------------------
+
+
+def _worst_case_durable_problem_model():
+    """Build a maximal-within-caps durable ProblemModel for the round-trip proof.
+
+    - ``archived_gaps`` filled PAST :data:`ARCHIVED_GAPS_DURABLE_MAX` so GC has
+      to evict down to the cap (exercises the real eviction path).
+    - :data:`MODEL_SIZE_HEALTHY_GAPS` active gaps, each with ``history`` /
+      ``past_moves`` at their durable caps and a substantial ``evidence`` body.
+    - :data:`MODEL_SIZE_HEALTHY_CAPABILITIES` capabilities and
+      :data:`MODEL_SIZE_HEALTHY_FRICTION` active friction at the healthy thresholds.
+
+    Field text is realistic (non-empty descriptions / evidence / notes) so the
+    byte footprint is honest rather than artificially small.
+    """
+    from app.problem_model import (
+        ARCHIVED_GAPS_DURABLE_MAX,
+        GAP_HISTORY_DURABLE_MAX,
+        GAP_PAST_MOVES_DURABLE_MAX,
+        MODEL_SIZE_HEALTHY_CAPABILITIES,
+        MODEL_SIZE_HEALTHY_FRICTION,
+        MODEL_SIZE_HEALTHY_GAPS,
+        Capability,
+        Friction,
+        Gap,
+        GapHistoryEvent,
+        ProblemModel,
+        Source,
+    )
+
+    def _ts(i: int) -> str:
+        # Monotonic ISO-8601 timestamps so archived-gap eviction has a stable
+        # recency order to sort by.
+        return f"2026-{(i % 12) + 1:02d}-{(i % 27) + 1:02d}T12:00:00Z"
+
+    def _history(n: int) -> list:
+        return [
+            GapHistoryEvent(
+                ts=_ts(j),
+                event="move_attached" if j % 2 else "priority_raised",
+                note=(
+                    f"cycle {j}: attempted direction d-{j:04d}; "
+                    "outcome recorded against HEAD with full provenance and "
+                    "a short human-readable rationale for the next strategist."
+                ),
+            )
+            for j in range(n)
+        ]
+
+    def _evidence(gid: str) -> str:
+        # Gap.evidence is a free-text string (not a list) — give it a realistic
+        # multi-sentence body so the per-gap footprint is honest.
+        return (
+            f"Gap {gid} is backed by repeated direction outcomes and operator "
+            "observations across several cycles: the strategic loop kept "
+            "re-deriving cycle state by hand, the problem_model failed to "
+            "round-trip its own setter, and findings carried no verified-vs-HEAD "
+            "provenance. This evidence body is intentionally substantial so the "
+            "worst-case byte footprint reflects a mature project, not a stub."
+        )
+
+    active_gaps = [
+        Gap(
+            id=f"g-active-{i:04d}",
+            name=f"Active gap {i}: durable problem_model round-trip subsystem {i}",
+            description=(
+                f"Active gap {i} describes a concrete delta between strategic "
+                "intent and current capabilities, retained with full append-only "
+                "history so the strategist sees the whole arc across cycles."
+            ),
+            evidence=_evidence(f"g-active-{i:04d}"),
+            priority="high",
+            status="active",
+            opened=_ts(i),
+            source=Source(type="direction_outcome", direction_id=f"d-{i:04d}"),
+            active_moves=[f"d-active-{i:04d}"],
+            past_moves=[f"d-past-{i:04d}-{k:03d}" for k in range(GAP_PAST_MOVES_DURABLE_MAX)],
+            history=_history(GAP_HISTORY_DURABLE_MAX),
+        )
+        for i in range(MODEL_SIZE_HEALTHY_GAPS)
+    ]
+
+    archived_gaps = [
+        Gap(
+            id=f"g-archived-{i:04d}",
+            name=f"Archived gap {i}",
+            description=f"Closed/abandoned gap {i} retained as reference-only history.",
+            evidence=_evidence(f"g-archived-{i:04d}"),
+            status="closed",
+            opened=_ts(i),
+            closed=_ts(i + 1),
+        )
+        # Overfill past the cap so gc_problem_model has to evict.
+        for i in range(ARCHIVED_GAPS_DURABLE_MAX + 25)
+    ]
+
+    capabilities = [
+        Capability(
+            name=f"Capability {i}: registry-derived task-type subsystem {i}",
+            status="working" if i % 2 else "partial",
+            notes=(
+                f"Capability {i} is backed by integration-branch code and a "
+                "shipped PR; notes describe the current honest status and the "
+                "evidence that established it."
+            ),
+            source=Source(type="shipped_change", pr_number=7000 + i),
+            backing_paths=[
+                f"backend/app/subsystem_{i}.py",
+                f"backend/testing/test_subsystem_{i}.py",
+            ],
+        )
+        for i in range(MODEL_SIZE_HEALTHY_CAPABILITIES)
+    ]
+
+    friction = [
+        Friction(
+            id=f"f-{i:04d}",
+            name=f"Friction {i}: recurring blocker observed across moves",
+            description=(
+                f"Friction {i} is a recurring blocker seen across multiple "
+                "directions; described in enough detail to be actionable."
+            ),
+            seen_in=[f"d-{i:04d}", f"d-{i + 1:04d}"],
+            status="active",
+            mitigations_tried=[f"tried approach {k}" for k in range(3)],
+        )
+        for i in range(MODEL_SIZE_HEALTHY_FRICTION)
+    ]
+
+    return ProblemModel(
+        revision=42,
+        gaps=active_gaps,
+        archived_gaps=archived_gaps,
+        capabilities=capabilities,
+        friction=friction,
+    )
+
+
+def test_gcd_problem_model_round_trips_under_single_pass_budget():
+    """A worst-case-but-within-caps durable problem_model survives the real
+    GC + agent-view trim + pack_under_budget path at the default budget.
+
+    This is the invariant gc_problem_model exists to guarantee: after GC the
+    model is "small enough to round-trip in a single pass". We run the exact
+    production wiring (the real ``_STRATEGIC_REVIEW_SCHEMA`` and the default
+    ``pack_under_budget`` budget) and assert the ``problem_model`` section is
+    present in the output and NOT in ``_packer_meta["dropped"]``.
+    """
+    from app.problem_model import (
+        ARCHIVED_GAPS_DURABLE_MAX,
+        PROBLEM_MODEL_BYTE_BUDGET,
+        _serialized_model_bytes,
+        gc_problem_model,
+    )
+    from app.strategic_spawning import (
+        _STRATEGIC_REVIEW_SCHEMA,
+        _agent_view_problem_model,
+    )
+
+    model = _worst_case_durable_problem_model()
+
+    # Real backend GC: the count pass evicts archived_gaps down to the cap, then
+    # the byte pass evicts further (archived below the cap + active-gap
+    # append-only tails) to bring the serialized model under the byte budget.
+    summary = gc_problem_model(model)
+    assert summary.get("archived_gaps_evicted"), (
+        "fixture should overfill archived_gaps so GC actually evicts"
+    )
+    # The byte pass can drive archived_gaps below the count cap (even to empty)
+    # when that is what it takes to fit the budget, so assert the cap is an upper
+    # bound and that the durable model actually fits — the real round-trip
+    # invariant this test guards.
+    assert len(model.archived_gaps) <= ARCHIVED_GAPS_DURABLE_MAX
+    assert _serialized_model_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET
+
+    # Reproduce the production payload wiring: the durable model is dumped,
+    # trimmed by the agent view, and packed under the SAME schema object the
+    # strategic spawn path uses, at the real default budget.
+    payload = {
+        "type": "strategic_review",
+        "research_mode": False,
+        "problem_model": _agent_view_problem_model(model.model_dump()),
+    }
+    # Default budget (120 * 1024) — pass none so the production default applies.
+    out = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA)
+
+    assert out["_packer_meta"]["budget_total"] == 120 * 1024
+    assert "problem_model" in out, (
+        "GC'd worst-case problem_model was dropped under the single-pass budget"
+    )
+    dropped_keys = {d["key"] for d in out["_packer_meta"]["dropped"]}
+    assert "problem_model" not in dropped_keys, (
+        f"problem_model section was dropped by the packer: {out['_packer_meta']['dropped']}"
+    )
+    # The shipped section must still carry the real gaps (not summarized away).
+    assert out["problem_model"].get("gaps"), "packed problem_model lost its active gaps"
+    # archived_gaps is intentionally stripped by the agent view.
+    assert "archived_gaps" not in out["problem_model"]
+
+
+def test_problem_model_survives_bloated_real_payload_with_many_high_sections():
+    """The real strategic payload path: when MANY high-tier sections are present
+    together and collectively blow the budget, the WHOLE problem_model is still
+    delivered in-payload (intact, never floored, never dropped) while other
+    recoverable high-tier context degrades or drops first.
+
+    The floor reservation equals the whole agent-view model, so a healthy mature
+    model (well under the 120KB budget) ships in full and its recoverable siblings
+    yield first — the skeletonizing fallback never fires. This exercises the
+    production ``_STRATEGIC_REVIEW_SCHEMA`` + default budget, not isolated unit
+    inputs — the guarantee must hold under real bloat.
+    """
+    from app.problem_model import gc_problem_model
+    from app.strategic_spawning import (
+        _STRATEGIC_REVIEW_SCHEMA,
+        _agent_view_problem_model,
+    )
+
+    model = _worst_case_durable_problem_model()
+    gc_problem_model(model)
+
+    # A realistic-but-oversized cycle payload: the problem_model alongside
+    # several other high-tier sections each padded with enough bulk that the
+    # sum far exceeds the 120 KB budget, forcing real eviction pressure.
+    bulk = "x" * 45_000
+    payload = {
+        "type": "strategic_review",
+        "research_mode": False,
+        "project_name": "Blueprint",
+        "base_branch": "main",
+        "vision": {"purpose": "demo"},
+        "problem_model": _agent_view_problem_model(model.model_dump()),
+        # High-tier siblings without summarize_fns that would otherwise win the
+        # budget race and starve the problem_model out of the payload.
+        "running_update": bulk,
+        "cycle_start_reconciliation": {"conflicts": [bulk]},
+        "deployment_state": {"deployed": bulk},
+    }
+    out = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA)
+
+    assert "problem_model" in out, (
+        "problem_model was dropped under real multi-high-section budget pressure"
+    )
+    dropped_keys = {d["key"] for d in out["_packer_meta"]["dropped"]}
+    trimmed_keys = {t["key"] for t in out["_packer_meta"]["trimmed"]}
+    assert "problem_model" not in dropped_keys, (
+        f"problem_model dropped by the packer: {out['_packer_meta']['dropped']}"
+    )
+    # The WHOLE model shipped — not the floored/skeletonized fallback.
+    assert "problem_model" not in trimmed_keys, (
+        f"problem_model was degraded instead of shipping whole: {out['_packer_meta']['trimmed']}"
+    )
+    assert "_agent_view_floor_applied" not in out["problem_model"], (
+        "a healthy mature model must ship whole, without the floored marker"
+    )
+    # The delivered model is a meaningful working set (still carries live gaps).
+    assert out["problem_model"].get("gaps"), "delivered problem_model lost its gaps"
+    # Other recoverable context degraded first — at least one high sibling dropped.
+    assert dropped_keys, "expected recoverable siblings to drop before the reserved model"
+    assert out["_packer_meta"]["budget_used"] <= 120 * 1024
+
+
+def test_gap_memory_trimmed_surfaced_for_capped_model():
+    """The agent-view per-gap trim (history/past_moves) is surfaced via
+    ``_packer_meta['gap_memory_trimmed']`` for the worst-case model, so the
+    strategist knows a gap's append-only memory was shortened to a window."""
+    from app.problem_model import (
+        GAP_APPEND_ONLY_GC_FLOOR,
+        gc_problem_model,
+    )
+    from app.strategic_spawning import (
+        _STRATEGIC_REVIEW_SCHEMA,
+        _GAP_HISTORY_KEEP,
+        _agent_view_problem_model,
+    )
+
+    model = _worst_case_durable_problem_model()
+    gc_problem_model(model)
+
+    payload = {
+        "type": "strategic_review",
+        "research_mode": False,
+        "problem_model": _agent_view_problem_model(model.model_dump()),
+    }
+    out = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA)
+
+    gmt = out["_packer_meta"]["gap_memory_trimmed"]
+    assert gmt, "expected per-gap pre-trim markers to be surfaced"
+    pm_entry = next((e for e in gmt if e["key"] == "problem_model"), None)
+    assert pm_entry is not None
+    # The byte pass first trims every active gap's append-only history/past_moves
+    # down to the durable GC floor; the agent view then trims that floor down to
+    # its keep window and surfaces the (post-GC) pre-trim total, which is the GC
+    # floor rather than the durable cap.
+    a_gap = pm_entry["gaps"][0]
+    assert a_gap["fields"]["history"]["shown"] == _GAP_HISTORY_KEEP
+    assert a_gap["fields"]["history"]["total"] == GAP_APPEND_ONLY_GC_FLOOR
+    assert a_gap["fields"]["past_moves"]["total"] == GAP_APPEND_ONLY_GC_FLOOR
+
+
+def test_design_doc_index_and_whole_problem_model_coexist_in_realistic_payload():
+    """Regression: a realistic strategic-review payload ships both the design_doc
+    as a compact index AND the whole agent-view problem_model (not floored) at the
+    real default budget, proving the compact design_doc index successfully reserves
+    headroom for the complete problem_model to fit intact.
+
+    The design_doc was switched from full-content to a bounded navigation index
+    (key + one-line summary + reconciled status/modules) specifically to keep the
+    problem_model from being crowded out of the budget. This test proves that
+    tradeoff works in a realistic end-to-end payload: both the design_doc index
+    and the whole problem_model ship in full, neither is floored or dropped.
+    """
+    from app.problem_model import gc_problem_model
+    from app.strategic_spawning import (
+        _STRATEGIC_REVIEW_SCHEMA,
+        _agent_view_problem_model,
+        _design_doc_index,
+    )
+
+    model = _worst_case_durable_problem_model()
+    gc_problem_model(model)
+
+    # Build a realistic design_doc with multiple sections (systems, capabilities,
+    # notes). Each section carries content so the full doc (before indexing) is
+    # realistic in size.
+    design_doc = {
+        "systems/auth": {
+            "title": "Authentication System",
+            "description": (
+                "OAuth2 integration with external provider, multi-factor "
+                "authentication support, session management, and token refresh logic."
+            ),
+            "status": "working",
+            "modules": ["backend/app/auth.py", "backend/app/auth_handlers.py"],
+        },
+        "systems/api": {
+            "title": "API Layer",
+            "description": "REST API endpoints, OpenAPI schema generation, and request routing.",
+            "status": "working",
+            "modules": ["backend/app/routers/", "backend/app/schemas.py"],
+        },
+        "capabilities/database": {
+            "title": "Database Access Layer",
+            "notes": "SQLAlchemy ORM with async support and connection pooling.",
+            "status": "working",
+        },
+        "notes": "Core platform systems are stable; focus areas for next version.",
+    }
+
+    # Assemble a realistic strategic-review payload with multiple high-tier
+    # sections alongside the problem_model: directions_summary, open_messages,
+    # cycle_start_reconciliation, and model_health. This represents a typical
+    # cycle payload with meaningful context, not a minimal test case.
+    payload = {
+        "type": "strategic_review",
+        "research_mode": False,
+        "project_name": "Blueprint",
+        "base_branch": "main",
+        "model": "opus",
+        "effort": "standard",
+        "enable_self_improvement": False,
+        "vision": {"purpose": "Stabilize platform and add observability hooks"},
+        "problem_model": _agent_view_problem_model(model.model_dump()),
+        # The compact design_doc index — the whole doc is replaced with a bounded
+        # index (one entry per section: key + summary + reconciled status/modules).
+        "design_doc": _design_doc_index(design_doc),
+        # Representative open messages (operator feedback / issues).
+        "open_messages": [
+            {"id": "m1", "type": "NOTE", "title": "Observability gap", "body": "x" * 500},
+            {
+                "id": "m2",
+                "type": "BUG_REPORT",
+                "title": "Session token leak",
+                "body": "y" * 800,
+            },
+        ],
+        # Cycle-start reconciliation summarizing live state.
+        "cycle_start_reconciliation": {
+            "conflicts": ["Direction d-1 conflicts with staged d-2"],
+            "summary": "State aligned; model up-to-date.",
+        },
+        # Soft health signal (advisory).
+        "model_health": {"gaps_count": 5, "capabilities_count": 3},
+    }
+
+    # Pack under the real default budget with the production schema.
+    out = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA)
+
+    # Prove the design_doc index is present.
+    assert "design_doc" in out, "design_doc index was dropped or absent"
+    design_doc_out = out["design_doc"]
+    assert isinstance(design_doc_out, dict), "design_doc should be a dict with sections"
+    assert "sections" in design_doc_out
+    sections = design_doc_out["sections"]
+    assert isinstance(sections, list)
+    assert len(sections) > 0, "design_doc index should have section entries"
+    # Verify the index is compact (bounded summaries, not full prose).
+    for entry in sections:
+        if "summary" in entry:
+            assert len(entry["summary"]) <= 200 + 1, (
+                "design_doc index summaries should be bounded to ~200 chars"
+            )
+
+    # Prove the problem_model ships in full (whole, not floored or dropped).
+    assert "problem_model" in out, (
+        "problem_model was dropped under real multi-section budget pressure"
+    )
+    dropped_keys = {d["key"] for d in out["_packer_meta"]["dropped"]}
+    assert "problem_model" not in dropped_keys, (
+        f"problem_model was dropped by the packer: {out['_packer_meta']['dropped']}"
+    )
+
+    # The delivered model must be whole (not floored). The floor marker is only
+    # present when the packer's summarize callback shrinks the model to fit.
+    pm = out["problem_model"]
+    assert "_agent_view_floor_applied" not in pm, (
+        "problem_model should not be floored when design_doc index reserves "
+        "enough headroom — the floor marker indicates degradation."
+    )
+
+    # Verify the model retains its full structure: gaps, capabilities, friction
+    # are all present (not summarized away or dropped).
+    assert pm.get("gaps"), (
+        "whole problem_model should retain its active gaps list"
+    )
+    assert isinstance(pm["gaps"], list) and len(pm["gaps"]) > 0
+    # Capabilities and friction are present and substantial (not skeletonized).
+    # A skeletonized section would have only name + status; a full one has notes,
+    # descriptions, evidence, backing_paths, etc. Check a sample entry.
+    if pm.get("capabilities"):
+        cap = pm["capabilities"][0]
+        assert isinstance(cap, dict)
+        assert "name" in cap
+        # The whole model has notes/descriptions; floored/skeletonized would not.
+        # If the model is truly whole, at least one capability should have detail
+        # beyond just name+status.
+        has_detail = any(
+            pm["capabilities"][i].get(k)
+            for i in range(len(pm["capabilities"]))
+            for k in ("notes", "source", "backing_paths")
+        )
+        assert has_detail, (
+            "capabilities should retain full detail (notes, source, paths) "
+            "when not floored"
+        )
+
+    # The payload stayed under budget.
+    assert out["_packer_meta"]["budget_used"] <= 120 * 1024

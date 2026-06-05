@@ -1,5 +1,6 @@
 import { AlertTriangle, CheckCircle } from 'lucide-react';
 import { Skeleton } from './DashboardMetricCards';
+import { snapshotFreshness } from '../utils/time';
 import type { Task } from '../types/task';
 
 export interface HealthOverviewIssue {
@@ -15,7 +16,25 @@ export interface HealthOverviewResponse {
   success_rate: { current: number | null; trend: string | null; window_hours: number };
   queue_depth: { queued: number; active: number; evaluating: number };
   actionable_issues: HealthOverviewIssue[];
+  // Precompute provenance, stamped by the backend when the overview is served
+  // from the leader-precomputed cross-instance cache (absent on the on-demand
+  // live-compute path, which is fresh-by-definition). Used to surface when the
+  // snapshot was computed and to degrade the card once it goes stale.
+  precomputed?: boolean;
+  precomputed_at?: string | null;
+  precompute_age_seconds?: number | null;
 }
+
+// A cached snapshot older than this many seconds is presented as stale: the
+// card dims/desaturates and its as-of label is marked, mirroring the
+// per-project status-badge stale pattern so a cached reading is never shown as
+// a live, authoritative one. The dashboard re-polls every ~30s, so a snapshot
+// this old is meaningfully behind real project state.
+const SNAPSHOT_STALE_AFTER_SECONDS = 120;
+
+// Tailwind classes applied to the card body when its snapshot is stale —
+// desaturate + dim (same affordance as projectStatus.ts STALE_CLASSES).
+const STALE_CLASSES = 'opacity-60 saturate-50';
 
 const _HEALTH_SEV_BORDER: Record<string, string> = { critical: 'border-l-red-500', warning: 'border-l-amber-500', info: 'border-l-blue-500' };
 const _HEALTH_SEV_ICON: Record<string, string> = { critical: 'text-red-400', warning: 'text-amber-400', info: 'text-blue-400' };
@@ -43,6 +62,11 @@ export function SystemHealthCard({
   const issues = data?.actionable_issues ?? [];
   const trendColor = sr?.trend === 'improving' ? 'text-emerald-400' : sr?.trend === 'declining' ? 'text-red-400' : 'text-neutral-400';
   const trendIcon = sr?.trend === 'improving' ? '↑' : sr?.trend === 'declining' ? '↓' : '→';
+  const { asOfLabel, stale } = snapshotFreshness(
+    data?.precomputed_at,
+    data?.precompute_age_seconds,
+    SNAPSHOT_STALE_AFTER_SECONDS,
+  );
 
   return (
     <section>
@@ -53,11 +77,24 @@ export function SystemHealthCard({
             {statusStyle.label}
           </span>
         )}
+        {!loading && data && asOfLabel && (
+          <span
+            className={`text-[10px] ${stale ? 'text-amber-400 font-semibold' : 'text-neutral-500'}`}
+            title={stale ? 'Cached snapshot is stale — may not reflect current project state' : 'When this health snapshot was computed'}
+          >
+            {stale && '⚠ '}as of {asOfLabel}{stale && ' · stale'}
+          </span>
+        )}
       </div>
       {loading ? (
         <div className="space-y-2"><Skeleton className="h-10 w-full" /><Skeleton className="h-14 w-full" /></div>
+      ) : !data ? (
+        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 flex items-center gap-2 text-neutral-400 text-xs">
+          <AlertTriangle className="w-4 h-4" />
+          Health data unavailable
+        </div>
       ) : (
-        <>
+        <div className={stale ? STALE_CLASSES : undefined}>
           {data && (sr?.current != null || qd) && (
             <div className="flex flex-wrap gap-2 mb-2">
               {sr?.current != null && (
@@ -117,7 +154,7 @@ export function SystemHealthCard({
               })}
             </div>
           )}
-        </>
+        </div>
       )}
     </section>
   );

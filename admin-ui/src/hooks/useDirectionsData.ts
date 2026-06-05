@@ -1,9 +1,10 @@
 import { useState, useEffect, useRef } from 'react';
-import { apiFetch } from '../api';
+import { apiFetch, fetchVersionLifecycle } from '../api';
 import { useDirectionForm } from './useDirectionForm';
 import { useAutonomousConfig } from './useAutonomousConfig';
+import { usePoller } from './usePoller';
 import type { Direction } from '../components/DirectionsPanel';
-import type { ProblemModel, RunningUpdateReconciliation } from '../types';
+import type { ProblemModel, ProblemModelSizeHealth, RunningUpdateReconciliation } from '../types';
 
 interface UseDirectionsDataDeps {
   selectedProjectId: string | null;
@@ -29,10 +30,15 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
   const [activeTasks, setActiveTasks] = useState<Record<string, Array<{ id: string; status: string; title: string; latest_status_message?: string }>>>({});
   const [designDoc, setDesignDoc] = useState<Record<string, unknown>>({});
   const [problemModel, setProblemModel] = useState<ProblemModel>({});
+  const [problemModelSizeHealth, setProblemModelSizeHealth] = useState<ProblemModelSizeHealth | null>(null);
   const [runningUpdate, setRunningUpdate] = useState<string | null>(null);
   const [runningUpdateAckAt, setRunningUpdateAckAt] = useState<string | null>(null);
   const [runningUpdateReconciliation, setRunningUpdateReconciliation] =
     useState<RunningUpdateReconciliation | null>(null);
+  // The currently-open release version number, used to gate the "stage for next
+  // version" affordance: staging requires an open version (the backend stamps
+  // staged_for_version from it and 404s when none is open).
+  const [openVersionNumber, setOpenVersionNumber] = useState<number | null>(null);
 
   // Error feedback
   const [error, setError] = useState<string | null>(null);
@@ -63,6 +69,22 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedProjectId]);
 
+  // Periodically refresh directions to keep time-derived badges (cooldown countdown,
+  // hold auto-recovery countdown, staged waiting age) live while the panel is open.
+  usePoller(
+    () => {
+      if (selectedProjectId) {
+        return fetchDirectionsLatestRef.current();
+      }
+    },
+    {
+      intervalMs: 10_000,
+      enabled: Boolean(selectedProjectId),
+      leading: false,
+      deps: [selectedProjectId],
+    },
+  );
+
   // Always points at the latest fetchDirections closure (recreated each render).
   const fetchDirectionsLatestRef = useRef(fetchDirections);
   fetchDirectionsLatestRef.current = fetchDirections;
@@ -91,6 +113,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       setAutonomousEnabled(data.autonomous_enabled ?? false);
       setDesignDoc(data.design_doc ?? {});
       setProblemModel(data.problem_model ?? {});
+      setProblemModelSizeHealth(data.problem_model_size_health ?? null);
       setRunningUpdate(typeof data.running_update === 'string' ? data.running_update : null);
       setRunningUpdateAckAt(data.running_update_acknowledged_at ?? null);
       setRunningUpdateReconciliation(data.running_update_reconciliation ?? null);
@@ -102,6 +125,17 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     } catch (err) {
       console.error('Failed to fetch directions:', err);
       addToast('Failed to load directions', 'error');
+    }
+    // Fetch the open version separately so a version-lifecycle failure never
+    // blocks the directions list. A null result simply disables staging in the UI.
+    if (selectedProjectId) {
+      try {
+        const lifecycle = await fetchVersionLifecycle(selectedProjectId);
+        setOpenVersionNumber(lifecycle.current_version?.version_number ?? null);
+      } catch (err) {
+        console.error('Failed to fetch version lifecycle:', err);
+        setOpenVersionNumber(null);
+      }
     }
     setLoading(false);
   }
@@ -139,6 +173,11 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       const body: Record<string, unknown> = { text: form.newText.trim(), priority: form.newPriority, paths: form.newPathTags };
       if (form.newCategory) body.category = form.newCategory;
       body.completion_criteria = form.newCompletionCriteria.trim() || null;
+      // Atomic born-staged create: when the operator opted to stage for the next
+      // version, the backend stamps staged_for_version from the open version in a
+      // single create call (404s if none is open), so the direction never passes
+      // through a research-eligible active state (no create-then-edit race).
+      if (form.newStaged && openVersionNumber != null) body.staged = true;
       const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions`, {
         method: 'POST',
         body: JSON.stringify(body),
@@ -192,6 +231,59 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       fetchDirections();
     } catch {
       setError('Failed to reactivate direction. Please try again.');
+    }
+  }
+
+  // Activate a staged direction immediately instead of waiting for the next
+  // version to open. Reuses the PATCH status:'active' transition.
+  async function activateStagedDirection(id: string) {
+    setError(null);
+    try {
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status: 'active' }),
+      });
+      if (!res.ok) throw new Error('Failed to activate staged direction');
+      addToast('Staged direction activated', 'success');
+      fetchDirections();
+    } catch {
+      setError('Failed to activate staged direction. Please try again.');
+    }
+  }
+
+  // Retarget an already-staged direction to a different (current-or-future)
+  // version. Sends only staged_for_version so the backend keeps the direction
+  // staged and re-binds its marker; it validates the target (rejecting an
+  // already-promoted version) and 409s if the direction is no longer staged.
+  async function retargetStagedDirection(id: string, version: number) {
+    setError(null);
+    try {
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ staged_for_version: version }),
+      });
+      if (!res.ok) throw new Error('Failed to retarget staged direction');
+      addToast(`Retargeted to v${version}`, 'success');
+      fetchDirections();
+    } catch {
+      setError('Failed to retarget staged direction. Please try again.');
+    }
+  }
+
+  // Cancel a staged direction. DELETE leaves a tombstone (handled backend-side)
+  // so the strategist won't immediately re-stage the same idea.
+  async function cancelStagedDirection(id: string) {
+    if (!window.confirm('Cancel this staged direction? It will not auto-activate at the next version.')) return;
+    setError(null);
+    try {
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'DELETE',
+      });
+      if (!res.ok) throw new Error('Failed to cancel staged direction');
+      addToast('Staged direction cancelled', 'info');
+      fetchDirections();
+    } catch {
+      setError('Failed to cancel staged direction. Please try again.');
     }
   }
 
@@ -375,11 +467,13 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     designDoc,
     problemModel,
     setProblemModel,
+    problemModelSizeHealth,
     runningUpdate,
     setRunningUpdate,
     runningUpdateAckAt,
     setRunningUpdateAckAt,
     runningUpdateReconciliation,
+    openVersionNumber,
     error,
     setError,
     researchingIds,
@@ -396,6 +490,9 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     updateDirection,
     quickToggleStatus,
     reactivateDirection,
+    activateStagedDirection,
+    retargetStagedDirection,
+    cancelStagedDirection,
     unholdDirection,
     markDirectionComplete,
     approveProposal,

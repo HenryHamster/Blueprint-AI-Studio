@@ -23,9 +23,14 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
+from app.message_convergence import get_message_link, resolve_message_ref
 from app.models import Project, Task
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
+from app.source_ref_validation import (
+    ground_design_doc_value,
+    resolve_branch_verification_context,
+)
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
@@ -114,6 +119,35 @@ async def agent_fetch_playbook_entry(
     return {"status": "success", "data": {"key": full_key, "entry": entry}}
 
 
+@router.get("/projects/{project_id}/design-doc/{key:path}")
+@limiter.limit("60/minute")
+async def agent_fetch_design_doc_section(
+    request: Request,
+    project_id: uuid.UUID,
+    key: str,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return a single design_doc section by key with its FULL content. Used
+    when the strategic payload ships design_doc as a compact index (one entry
+    per section: key + summary + reconciled status) and the agent needs the
+    full prose/specs of a specific section before acting on it.
+
+    The returned section is presence-grounded against the project's real
+    integration branch via the SAME ``ground_design_doc_value`` path as the
+    write-capable design-doc ``get`` op (admin_agent_ops.py), so the fetched
+    status matches what the index already showed and the agent never sees an
+    un-reconciled status. Cross-project access and missing keys both 404."""
+    project = await _resolve_agent_project(project_id, token, session)
+    doc = project.design_doc or {}
+    value = doc.get(key)
+    if value is None:
+        raise HTTPException(status_code=404, detail="Design doc section not found")
+    verification_kwargs = await resolve_branch_verification_context(session, project)
+    value = await ground_design_doc_value(value, key, **verification_kwargs)
+    return {"status": "success", "data": {"key": key, "value": value}}
+
+
 @router.get("/projects/{project_id}/problem_model")
 @router.get("/projects/{project_id}/problem-model")
 @limiter.limit("60/minute")
@@ -136,6 +170,42 @@ async def agent_fetch_problem_model(
     image-rollover window."""
     project = await _resolve_agent_project(project_id, token, session)
     return {"status": "success", "data": project.problem_model or {}}
+
+
+@router.get("/projects/{project_id}/messages/{ref}")
+@limiter.limit("60/minute")
+async def agent_fetch_message(
+    request: Request,
+    project_id: uuid.UUID,
+    ref: str,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Resolve a project message by short ref (first 8+ hex chars of its UUID)
+    or full UUID and return its content. Used when a message has aged out of
+    the live strategic thread (only status=open messages are loaded into the
+    spawn context) and the agent needs to inspect it before acting on it.
+
+    Project-scoped via ``_resolve_agent_project`` (cross-project → 404). The
+    shared resolver fails loudly on ambiguous (409), missing (404), and
+    too-short (400) refs, and matches across all statuses."""
+    project = await _resolve_agent_project(project_id, token, session)
+    msg = await resolve_message_ref(session, project.id, ref)
+    message_type = msg.message_type
+    type_value = message_type.value if hasattr(message_type, "value") else str(message_type)
+    return {
+        "status": "success",
+        "data": {
+            "id": str(msg.id),
+            "content": msg.content,
+            "type": type_value,
+            "from_type": msg.from_type,
+            "status": msg.status,
+            "resolution": msg.resolution,
+            "convergence_link": get_message_link(msg),
+            "created_at": msg.created_at.isoformat() if msg.created_at else None,
+        },
+    }
 
 
 @router.get("/projects/{project_id}/gaps/{gap_id}")

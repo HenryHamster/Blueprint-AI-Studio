@@ -23,7 +23,6 @@ Pure-function module — no DB, no session, no side effects.
 from __future__ import annotations
 
 import re
-from typing import Any
 
 # ---------------------------------------------------------------------------
 # Canonical layer tags
@@ -67,6 +66,36 @@ _AGENT_VM_PATTERNS: list[re.Pattern] = [
     re.compile(r"node: command not found", re.IGNORECASE),
     re.compile(r"python3?: command not found", re.IGNORECASE),
     re.compile(r"sudo.*sudoers", re.IGNORECASE),
+    # dash/sh missing-executable phrasing ("<tool>: not found"), anchored to the
+    # shell prefix so it cannot match a repo dependency or assertion text.
+    re.compile(
+        r"(?:/(?:usr/)?bin/)?(?:sh|bash|dash|ash):\s*(?:\d+:\s*)?\S+:\s+not found",
+        re.IGNORECASE,
+    ),
+    # Docker daemon unavailable on the gate VM
+    re.compile(r"cannot connect to the docker daemon", re.IGNORECASE),
+    re.compile(r"is the docker daemon running", re.IGNORECASE),
+    re.compile(r"docker daemon is not running", re.IGNORECASE),
+    # Out-of-memory kills (exit 137 / SIGKILL / signal 9)
+    re.compile(r"signal:\s*killed", re.IGNORECASE),
+    re.compile(r"sigkill", re.IGNORECASE),
+    re.compile(r"signal 9", re.IGNORECASE),
+    re.compile(r"(?:exit(?:ed with)?|exit code|exit status|code|status)\s+137", re.IGNORECASE),
+    re.compile(r"oomkilled", re.IGNORECASE),
+    re.compile(r"out of memory:\s*kill", re.IGNORECASE),
+    re.compile(r"javascript heap out of memory", re.IGNORECASE),
+    re.compile(r"java\.lang\.outofmemoryerror", re.IGNORECASE),
+    re.compile(r"cannot allocate memory", re.IGNORECASE),
+    # Disk/quota/space failures (host resource exhaustion on the gate VM)
+    re.compile(r"no space left on device", re.IGNORECASE),
+    re.compile(r"disk quota exceeded", re.IGNORECASE),
+    re.compile(r"filesystem (is )?full", re.IGNORECASE),
+    re.compile(r"enospc", re.IGNORECASE),
+    # Permission denied / access failures (read-only fs, insufficient perms)
+    re.compile(r"permission denied", re.IGNORECASE),
+    re.compile(r"eacces", re.IGNORECASE),
+    re.compile(r"read-only file system", re.IGNORECASE),
+    re.compile(r"erofs", re.IGNORECASE),
 ]
 
 _AGENT_VM_FAILURE_CLASSES: frozenset[str] = frozenset(

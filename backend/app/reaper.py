@@ -891,6 +891,11 @@ from app.reaper_sweeps import (  # noqa: E402
     sweep_stuck_qualifications,
     sweep_routine_message_retention,
     sweep_unblock_blocked_tasks,
+    sweep_activate_staged_directions,
+    sweep_stale_staged_directions,
+    sweep_converge_linked_bug_messages,
+    sweep_converge_duplicate_foundations,
+    sweep_resolve_open_owned_bug_messages,
 )
 
 # Zero-cycle starvation: a project that should be running the strategic loop but
@@ -3799,6 +3804,84 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Unblock sweep error: {e}", exc_info=True
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 13: Staged-direction auto-activation backstop — self-heal
+                # any staged direction whose target version already promoted/opened
+                # in case the promotion-path activation hook failed once.
+                _mark_reaper_progress()
+                try:
+                    await sweep_activate_staged_directions(session)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Staged-direction activation sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 14: Stale-staged-direction alerting — surface staged
+                # work whose target version has stalled (not promoted) past the
+                # configurable staleness threshold so an operator can retarget,
+                # force-activate, or cancel it. Alerting only.
+                _mark_reaper_progress()
+                try:
+                    await sweep_stale_staged_directions(session)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Stale-staged-direction sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 15: Linked bug-class message convergence / resurfacing —
+                # reconcile each 'linked' BUG_REPORT/BLOCKER with its owning
+                # outcome: resolve when landed, reopen when failed/cancelled/
+                # retired/missing, or when in-flight beyond the time bound.
+                _mark_reaper_progress()
+                try:
+                    await sweep_converge_linked_bug_messages(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Linked-message convergence sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 16: Converge duplicate foundations — serialize a high-
+                # confidence cross-parent duplicate code-change task behind its
+                # canonical sibling by wiring a depends_on edge, so the second
+                # task rebases on the first's landed foundation instead of
+                # rebuilding it. Conservative + cycle-guarded; below the action
+                # threshold the pair is left untouched (signal-only).
+                _mark_reaper_progress()
+                try:
+                    await sweep_converge_duplicate_foundations(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Duplicate-foundation convergence sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 17: Auto-resolve OPEN owned bug-class messages — resolve an
+                # open system/agent BUG_REPORT/BLOCKER once the outcome that owns
+                # its fix (a direction or a PR, read from creation-time context)
+                # has genuinely LANDED: direction 'completed' or owning PR merged.
+                # Success-only + fail-safe; an owner that ended without landing
+                # leaves the message open. Disjoint from Step 15 (linked sweep).
+                _mark_reaper_progress()
+                try:
+                    await sweep_resolve_open_owned_bug_messages(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Open-owned-message resolve sweep error: {e}",
+                        exc_info=True,
                     )
                     with contextlib.suppress(Exception):
                         await session.rollback()

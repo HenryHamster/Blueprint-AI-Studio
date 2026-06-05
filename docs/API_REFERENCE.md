@@ -949,7 +949,7 @@ Manual operator escape hatches for the autonomous pipeline.
 |--------|------|-------------|
 | POST | `/api/admin/projects/{project_id}/self-audit` | Enqueue a `self_audit` task for the project. |
 | POST | `/api/admin/projects/{project_id}/qualify` | Manually trigger the release qualifier for the open version. |
-| POST | `/api/admin/projects/{project_id}/clear-wave-deps` | Clear `depends_on` on QUEUED tasks to unblock wave-gated work. |
+| POST | `/api/admin/projects/{project_id}/clear-wave-deps` | Clear only stale/legacy wave serialization edges on QUEUED tasks; structural prerequisites are preserved. |
 | POST | `/api/admin/tasks/{task_id}/rollup` | Manually trigger the rollup PR for an EVALUATING parent task. |
 | GET | `/api/admin/projects/{project_id}/findings` | Structured research findings for a project, with claims and sources. |
 
@@ -966,7 +966,7 @@ Manual operator actions that kick off pipeline work
 
 - **`POST /api/admin/projects/{project_id}/self-audit`** — spawn a self-audit task.
 - **`POST /api/admin/projects/{project_id}/qualify`** — trigger a release-qualification run.
-- **`POST /api/admin/projects/{project_id}/clear-wave-deps`** — clear blocking wave dependencies.
+- **`POST /api/admin/projects/{project_id}/clear-wave-deps`** — clear only stale/legacy wave serialization edges on QUEUED tasks while PRESERVING structural prerequisites (research prerequisites, blocked-need resolution, sibling foundations). Returns `cleared`, `preserved`, and `total_queued`.
 - **`POST /api/admin/tasks/{task_id}/rollup`** — force a rollup of the given task's branch.
 - **`GET /api/admin/projects/{project_id}/findings`** — list audit/research findings.
 

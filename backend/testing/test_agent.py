@@ -15,6 +15,7 @@ from app.main import app
 from app.models import (
     Artifact,
     ArtifactType,
+    ComputeJob,
     LLMAuthMode,
     LLMProviderName,
     MaxPlanAccount,
@@ -25,6 +26,7 @@ from app.models import (
 )
 from app.auth import create_agent_token
 from app.schemas import AgentStatusPayload
+from app.task_capabilities import TaskType, task_type_catalog
 
 
 def _resolve_sr_recent_miss_examples_contract_fixture() -> Path:
@@ -94,6 +96,7 @@ async def test_agent_claim_success(client: AsyncClient, db_session):
     assert data["task_id"] is not None
     assert data["title"] is not None
     assert "payloads" in data
+    assert "task_capability" not in data
 
     await db_session.refresh(task)
     assert task.status == TaskStatus.IN_PROGRESS
@@ -120,6 +123,58 @@ async def test_agent_claim_missing_task_row_returns_401(client: AsyncClient):
     headers = {"x-agent-token": token}
     resp = await client.post("/api/agent/claim", headers=headers)
     assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_includes_task_capability_slice(client: AsyncClient, db_session):
+    project = Project(name="Agent Claim Capability Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "cmd": "ls"}],
+        vm_instance_id="agent-vm-capability",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-capability")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    expected = {entry["id"]: entry for entry in task_type_catalog()}["create"]
+    assert data["task_capability"] == expected
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_includes_compute_experiment_capability_slice(
+    client: AsyncClient, db_session
+):
+    project = Project(name="Agent Claim Compute Capability Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": TaskType.compute_experiment.value}],
+        vm_instance_id="agent-vm-compute-capability",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-compute-capability")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    expected = {entry["id"]: entry for entry in task_type_catalog()}["compute_experiment"]
+    assert data["task_capability"] == expected
 
 
 @pytest.mark.smoketest
@@ -228,6 +283,190 @@ async def test_agent_status_update_persists_runtime_identity(
         .all()
     )
     assert any(t.id == task.id for t in provider_tasks)
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_job_launch_creates_pending_row(client: AsyncClient, db_session):
+    import app.compute_jobs as compute_jobs_module
+
+    project = Project(name="Agent Compute Launch", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": TaskType.compute_experiment.value}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-compute-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-compute-1")
+    resp = await client.post(
+        "/api/agent/compute-jobs",
+        headers={"x-agent-token": token},
+        json={
+            "command": "echo ready",
+            "machine_type": "e2-standard-2",
+            "spend_cap_usd": 9999,
+            "deadline_seconds": 999999,
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()["data"]
+    job = await db_session.get(ComputeJob, uuid.UUID(body["id"]))
+    assert job is not None
+    assert job.task_id == task.id
+    assert job.status == compute_jobs_module.ComputeJobStatus.QUEUED
+    assert job.spend_cap_usd == pytest.approx(
+        compute_jobs_module.MAX_COMPUTE_JOB_SPEND_CAP_USD
+    )
+    deadline_delta = (job.wall_clock_deadline - datetime.utcnow()).total_seconds()
+    assert deadline_delta <= compute_jobs_module.MAX_COMPUTE_JOB_DEADLINE_SECONDS + 5
+    assert body["status"] == compute_jobs_module.ComputeJobStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_job_launch_reuses_existing_active_job(
+    client: AsyncClient, db_session
+):
+    project = Project(name="Agent Compute Launch Idempotent", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": TaskType.compute_experiment.value}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-compute-idempotent",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-compute-idempotent")
+    payload = {
+        "command": "echo ready",
+        "machine_type": "e2-standard-2",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+    }
+
+    first = await client.post(
+        "/api/agent/compute-jobs",
+        headers={"x-agent-token": token},
+        json=payload,
+    )
+    second = await client.post(
+        "/api/agent/compute-jobs",
+        headers={"x-agent-token": token},
+        json=payload,
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["data"]["id"] == second.json()["data"]["id"]
+    jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
+    assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_job_launch_rejects_non_compute_task_type(
+    client: AsyncClient, db_session
+):
+    project = Project(name="Agent Compute Launch Authz", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": TaskType.research.value}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-compute-authz",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-compute-authz")
+    resp = await client.post(
+        "/api/agent/compute-jobs",
+        headers={"x-agent-token": token},
+        json={
+            "command": "echo ready",
+            "machine_type": "e2-standard-2",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+        },
+    )
+
+    assert resp.status_code == 403
+    # Only compute_experiment satisfies the compute-job capability gate
+    # (experiment_loop + verdict + requires_compute, no code/web, metric eval
+    # with a cost ceiling). Assert the concrete allow-list rather than
+    # recomputing the production filter, so a regression in either the filter
+    # or the capability registry is actually caught here.
+    expected_allowed = ["compute_experiment"]
+    assert resp.json()["error"] == {
+        "code": 403,
+        "message": {
+            "error": "task_type_not_allowed_for_compute_jobs",
+            "task_type": TaskType.research.value,
+            "allowed_task_types": expected_allowed,
+        },
+    }
+    jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
+    assert jobs == []
+
+
+@pytest.mark.asyncio
+async def test_agent_compute_job_poll_is_task_scoped(client: AsyncClient, db_session):
+    import app.compute_jobs as compute_jobs_module
+
+    project = Project(name="Agent Compute Poll Scope", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    owner_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-owner",
+    )
+    other_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-other",
+    )
+    db_session.add(owner_task)
+    db_session.add(other_task)
+    await db_session.commit()
+    await db_session.refresh(owner_task)
+    await db_session.refresh(other_task)
+
+    job = await compute_jobs_module.create_compute_job(
+        db_session,
+        owner_task,
+        command="echo scoped",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    token = create_agent_token(str(other_task.id), "agent-vm-other")
+    resp = await client.get(
+        f"/api/agent/compute-jobs/{job.id}",
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -2599,6 +2838,352 @@ async def test_playbook_set_and_get(client: AsyncClient, db_session):
     await db_session.refresh(project)
     assert "playbook/lint-rules" in project.design_doc
     assert "playbook/build-commands" in project.design_doc
+
+
+@pytest.mark.asyncio
+async def test_playbook_set_records_branch_head_provenance(
+    client: AsyncClient, db_session
+):
+    """A set with branch/head_sha stamps provenance; get surfaces it; absent
+    provenance stays backward-compatible (empty strings, no error)."""
+    project = Project(name="Provenance Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do something"}],
+        vm_instance_id="agent-vm-prov",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-prov")
+    headers = {"x-agent-token": token}
+
+    # Set WITH provenance.
+    resp = await client.post(
+        "/api/agent/playbook",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "with-prov",
+            "value": "module X defines Y",
+            "branch": "automain",
+            "head_sha": "abc1234",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+    # Set WITHOUT provenance (legacy callers / non-git workspaces).
+    resp_legacy = await client.post(
+        "/api/agent/playbook",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "no-prov",
+            "value": "run tests with Z",
+        },
+        headers=headers,
+    )
+    assert resp_legacy.status_code == 200
+
+    # Provenance is persisted on the entry.
+    await db_session.refresh(project)
+    stored = project.design_doc["playbook/with-prov"]
+    assert stored["branch"] == "automain"
+    assert stored["head_sha"] == "abc1234"
+    # Legacy entry carries no provenance keys.
+    legacy = project.design_doc["playbook/no-prov"]
+    assert "branch" not in legacy
+    assert "head_sha" not in legacy
+
+    # get surfaces provenance; absent provenance reads back as "".
+    resp_get = await client.post(
+        "/api/agent/playbook",
+        json={"task_id": str(task.id), "op": "get"},
+        headers=headers,
+    )
+    assert resp_get.status_code == 200
+    entries = resp_get.json()["entries"]
+    assert entries["with-prov"]["branch"] == "automain"
+    assert entries["with-prov"]["head_sha"] == "abc1234"
+    assert entries["no-prov"]["branch"] == ""
+    assert entries["no-prov"]["head_sha"] == ""
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_playbook_set_stamps_branch_head_provenance(
+    client: AsyncClient, db_session
+):
+    """Branch + short HEAD sha supplied on set are stored on the entry and
+    surfaced by get; omitting them leaves a legacy entry (no provenance keys)."""
+    project = Project(name="Playbook Provenance", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do something"}],
+        vm_instance_id="agent-vm-prov1",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-prov1")
+    headers = {"x-agent-token": token}
+
+    # Set WITH provenance
+    resp = await client.post(
+        "/api/agent/playbook",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "with-prov",
+            "value": "stamped advice",
+            "branch": "blueprint/task-abc",
+            "head_sha": "deadbee",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+    # Set WITHOUT provenance — stays legacy (no branch/head_sha keys persisted)
+    resp_legacy = await client.post(
+        "/api/agent/playbook",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "no-prov",
+            "value": "legacy advice",
+        },
+        headers=headers,
+    )
+    assert resp_legacy.status_code == 200
+
+    await db_session.refresh(project)
+    stamped = project.design_doc["playbook/with-prov"]
+    assert stamped["branch"] == "blueprint/task-abc"
+    assert stamped["head_sha"] == "deadbee"
+    legacy = project.design_doc["playbook/no-prov"]
+    assert "branch" not in legacy
+    assert "head_sha" not in legacy
+
+    # get surfaces provenance for the stamped entry
+    resp_get = await client.post(
+        "/api/agent/playbook",
+        json={"task_id": str(task.id), "op": "get"},
+        headers=headers,
+    )
+    assert resp_get.status_code == 200
+    entries = resp_get.json()["entries"]
+    assert entries["with-prov"]["branch"] == "blueprint/task-abc"
+    assert entries["with-prov"]["head_sha"] == "deadbee"
+    assert entries["no-prov"]["branch"] == ""
+
+
+async def _claim_with_playbook_provenance(
+    client,
+    db_session,
+    *,
+    entry_branch,
+    source_status,
+    source_landed,
+    source_is_self=False,
+    integration_branch="automain",
+):
+    """Build a project carrying ONE branch-stamped playbook entry whose source
+    task has the given completion/landed state, claim a fresh create task, and
+    return ``(playbook_entry_dict, claim_task_id)`` so the caller can assert the
+    backend's derived ``provenance.diverged`` / ``stale`` values.
+
+    The entry is always authored on a feature branch (``entry_branch``) — the
+    realistic case, since agents never author from the integration branch. The
+    diverged signal must therefore be derived from the source task's landed
+    state, NOT from the branch-name mismatch.
+    """
+    from app.landed_signal import mark_landed_on_integration
+
+    project = Project(
+        name="Playbook Divergence Test",
+        user_id="test-user-123",
+        integration_branch=integration_branch,
+        design_doc={"vision": "v"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # The task that will CLAIM and read the playbook.
+    claim_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "read the playbook"}],
+        vm_instance_id="agent-vm-div-reader",
+    )
+    db_session.add(claim_task)
+
+    # The SOURCE task the playbook entry was authored by (skipped when the entry
+    # is self-authored — then the claiming task is its own source).
+    source_task = None
+    if not source_is_self:
+        source_task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "authored the entry"}],
+            vm_instance_id="agent-vm-div-source",
+            status=source_status,
+        )
+        if source_landed:
+            mark_landed_on_integration(source_task)
+        db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+    if source_task is not None:
+        await db_session.refresh(source_task)
+
+    source_id = str(claim_task.id if source_is_self else source_task.id)
+    entry = {
+        "content": "module X defines helper Y",
+        "source_task_id": source_id,
+        "updated_at": datetime.utcnow().isoformat(),
+        "confirmed_count": 1,
+    }
+    if entry_branch is not None:
+        entry["branch"] = entry_branch
+        entry["head_sha"] = "abc1234"
+    project.design_doc = {**project.design_doc, "playbook/module-x": entry}
+    db_session.add(project)
+    await db_session.commit()
+
+    token = create_agent_token(str(claim_task.id), "agent-vm-div-reader")
+    resp = await client.post(
+        "/api/agent/claim", headers={"x-agent-token": token}
+    )
+    assert resp.status_code == 200, resp.text
+    playbook = resp.json().get("playbook") or {}
+    return playbook, str(claim_task.id)
+
+
+@pytest.mark.asyncio
+async def test_playbook_entry_from_landed_source_not_diverged(
+    client: AsyncClient, db_session
+):
+    """A feature-branch entry whose source task LANDED on integration reads as
+    trustworthy: not diverged, not force-marked stale (the healthy common case)."""
+    playbook, _ = await _claim_with_playbook_provenance(
+        client,
+        db_session,
+        entry_branch="blueprint/task-landed",
+        source_status=TaskStatus.COMPLETED,
+        source_landed=True,
+    )
+    assert "module-x" in playbook
+    entry = playbook["module-x"]
+    assert entry["provenance"]["diverged"] is False
+    assert entry["stale"] is False
+    assert entry["provenance"]["branch"] == "blueprint/task-landed"
+
+
+@pytest.mark.asyncio
+async def test_playbook_entry_from_unlanded_source_diverged(
+    client: AsyncClient, db_session
+):
+    """A feature-branch entry whose source task is genuinely NOT landed (still
+    in-flight) reads as diverged AND force-marked stale."""
+    playbook, _ = await _claim_with_playbook_provenance(
+        client,
+        db_session,
+        entry_branch="blueprint/task-inflight",
+        source_status=TaskStatus.IN_PROGRESS,
+        source_landed=False,
+    )
+    entry = playbook["module-x"]
+    assert entry["provenance"]["diverged"] is True
+    assert entry["stale"] is True
+
+
+@pytest.mark.asyncio
+async def test_playbook_entry_completed_but_non_merge_source_diverged(
+    client: AsyncClient, db_session
+):
+    """COMPLETED-but-never-landed (merge-equivalent non-merge) source still
+    counts as not-present-on-integration, so the entry stays diverged."""
+    playbook, _ = await _claim_with_playbook_provenance(
+        client,
+        db_session,
+        entry_branch="blueprint/task-nonmerge",
+        source_status=TaskStatus.COMPLETED,
+        source_landed=False,
+    )
+    entry = playbook["module-x"]
+    assert entry["provenance"]["diverged"] is True
+    assert entry["stale"] is True
+
+
+@pytest.mark.asyncio
+async def test_playbook_self_authored_entry_not_diverged(
+    client: AsyncClient, db_session
+):
+    """An entry whose source_task_id is the reader's OWN task is on the reader's
+    branch by definition — never diverged regardless of landed state."""
+    playbook, _ = await _claim_with_playbook_provenance(
+        client,
+        db_session,
+        entry_branch="blueprint/task-self",
+        source_status=TaskStatus.IN_PROGRESS,
+        source_landed=False,
+        source_is_self=True,
+    )
+    entry = playbook["module-x"]
+    assert entry["provenance"]["diverged"] is False
+    assert entry["stale"] is False
+
+
+@pytest.mark.asyncio
+async def test_playbook_backend_pattern_entry_no_branch_not_diverged(
+    client: AsyncClient, db_session
+):
+    """A backend-authored / no-branch-provenance entry is unaffected: never
+    diverged even if its source task did not land."""
+    playbook, _ = await _claim_with_playbook_provenance(
+        client,
+        db_session,
+        entry_branch=None,
+        source_status=TaskStatus.IN_PROGRESS,
+        source_landed=False,
+    )
+    entry = playbook["module-x"]
+    assert entry["provenance"]["diverged"] is False
+    assert entry["stale"] is False
+    assert entry["provenance"]["branch"] == ""
+
+
+@pytest.mark.asyncio
+async def test_playbook_diverged_independent_of_integration_branch_name(
+    client: AsyncClient, db_session
+):
+    """Locks the inverse of the old behavior: an entry on a feature branch whose
+    source LANDED stays non-diverged even though its branch != integration_branch
+    (the old code flagged ANY name mismatch as diverged)."""
+    playbook, _ = await _claim_with_playbook_provenance(
+        client,
+        db_session,
+        entry_branch="blueprint/some-feature",
+        source_status=TaskStatus.COMPLETED,
+        source_landed=True,
+        integration_branch="automain",
+    )
+    entry = playbook["module-x"]
+    assert entry["provenance"]["branch"] != "automain"
+    assert entry["provenance"]["diverged"] is False
+    assert entry["stale"] is False
 
 
 @pytest.mark.smoketest
@@ -7125,6 +7710,97 @@ async def test_blocker_lands_blocked_no_retry_no_alert(
     assert task.recheck_after is not None and task.recheck_after > task.blocked_at
     # No failure alert for a non-failure outcome.
     alert_mock.assert_not_called()
+    # Absent-need path: no structured need persisted when none was sent.
+    assert "need" not in blocker
+
+
+def test_blocked_need_schema_parses_valid_and_rejects_malformed():
+    """AgentStatusPayload.blocked_need accepts a well-formed {kind, ref[, label]}
+    need and rejects malformed kinds / empty refs. Backward compat: an absent
+    blocked_need leaves the payload valid with the field None."""
+    from pydantic import ValidationError
+
+    from app.schemas import AgentStatusPayload
+
+    tid = str(uuid.uuid4())
+    base = {"task_id": tid, "status": "FAILED"}
+
+    # Absent need is fine — backward compatible.
+    assert AgentStatusPayload(**base).blocked_need is None
+
+    # Valid need with each recognized kind.
+    for kind, ref in (("task", "t-abc"), ("pr", "7910"), ("capability", "auth")):
+        parsed = AgentStatusPayload(**base, blocked_need={"kind": kind, "ref": ref})
+        assert parsed.blocked_need is not None
+        assert parsed.blocked_need.kind == kind
+        assert parsed.blocked_need.ref == ref
+
+    # Optional human label is accepted.
+    with_label = AgentStatusPayload(
+        **base, blocked_need={"kind": "task", "ref": "t-x", "label": "the foundation"}
+    )
+    assert with_label.blocked_need.label == "the foundation"
+
+    # Malformed: unrecognized kind.
+    with pytest.raises(ValidationError):
+        AgentStatusPayload(**base, blocked_need={"kind": "branch", "ref": "main"})
+    # Malformed: empty ref.
+    with pytest.raises(ValidationError):
+        AgentStatusPayload(**base, blocked_need={"kind": "task", "ref": ""})
+    # Malformed: missing ref.
+    with pytest.raises(ValidationError):
+        AgentStatusPayload(**base, blocked_need={"kind": "task"})
+
+
+@pytest.mark.asyncio
+async def test_blocker_persists_structured_need_into_context(
+    client: AsyncClient, db_session, mocker
+):
+    """A BLOCKER: outcome that carries a structured blocked_need persists the
+    normalized {kind, ref} need into context['blocker']['need'] without changing
+    any BLOCKED-entry behavior."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    project = Project(name="Blocked Need Test", user_id="test-user-blocked-need")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build x"}],
+        vm_instance_id="agent-vm-blocked-need",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-blocked-need")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "failure_category": "BLOCKED_PRECONDITION",
+        "logs": "BLOCKER: waiting on the shared auth foundation",
+        "blocked_need": {"kind": "task", "ref": "t-foundation-1", "label": "auth"},
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+    assert resp.json().get("status") == "blocked"
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.BLOCKED
+    need = ((task.context or {}).get("blocker") or {}).get("need")
+    assert need == {"kind": "task", "ref": "t-foundation-1", "label": "auth"}
 
 
 @pytest.mark.asyncio

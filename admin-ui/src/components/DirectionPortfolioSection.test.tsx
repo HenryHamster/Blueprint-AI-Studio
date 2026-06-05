@@ -136,6 +136,63 @@ describe('DirectionPortfolioSection', () => {
     expect(onDirectionClick).toHaveBeenCalledWith('dir-click');
   });
 
+  it('surfaces generalized eval-success alongside PR metrics when non-code lanes exist', () => {
+    render(
+      <DirectionPortfolioSection
+        directions={[makeDirection({
+          generalized_successes: 5,
+          generalized_terminal_outcomes: 8,
+          generalized_health_rate: 0.625,
+          outcome_kind_breakdown: {
+            code_merge: { success: 2, neutral: 0, failure: 1 },
+            research_quality: { success: 3, neutral: 1, failure: 0 },
+          },
+        })]}
+        loading={false}
+        productPct={null}
+        totalDirPRs={2}
+        hasAttribution={false}
+        totalAutonomousPRs={null}
+        totalAssistedPRs={null}
+        selfSufficientCount={1}
+      />,
+    );
+
+    // PR metric still present (not hidden).
+    expect(screen.getByText('2 PRs merged')).toBeInTheDocument();
+    // Summary eval-success metric.
+    expect(screen.getByText('5 eval-success · 63%')).toBeInTheDocument();
+    // Per-card inline eval badge.
+    expect(screen.getByText('5 eval · 63%')).toBeInTheDocument();
+    // Per-kind breakdown chips.
+    expect(screen.getByText('research 3/4')).toBeInTheDocument();
+    expect(screen.getByText('code 2/3')).toBeInTheDocument();
+  });
+
+  it('hides generalized metrics for legacy data with only code_merge outcomes', () => {
+    render(
+      <DirectionPortfolioSection
+        directions={[makeDirection({
+          generalized_successes: 2,
+          generalized_terminal_outcomes: 2,
+          generalized_health_rate: 1,
+          outcome_kind_breakdown: { code_merge: { success: 2, neutral: 0, failure: 0 } },
+        })]}
+        loading={false}
+        productPct={null}
+        totalDirPRs={2}
+        hasAttribution={false}
+        totalAutonomousPRs={null}
+        totalAssistedPRs={null}
+        selfSufficientCount={1}
+      />,
+    );
+
+    expect(screen.getByText('2 PRs merged')).toBeInTheDocument();
+    expect(screen.queryByText(/eval-success/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/\beval\b/)).not.toBeInTheDocument();
+  });
+
   it('renders SR catch-rate pill when direction-sr-breakdown returns data', async () => {
     apiFetchMock.mockResolvedValue({
       ok: true,

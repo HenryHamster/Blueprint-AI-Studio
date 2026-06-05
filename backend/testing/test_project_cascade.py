@@ -23,6 +23,9 @@ from sqlalchemy import delete as sql_delete, select, text
 
 from app.models import (
     Alert,
+    Artifact,
+    ArtifactType,
+    ComputeJob,
     Project,
     ProjectMember,
     ProjectMessage,
@@ -225,6 +228,150 @@ async def test_task_delete_nulls_alert_task_id(db_session):
         )
     ).scalar_one_or_none()
     assert raw_id == alert_id, "alert row was cascaded away — should have been SET NULL"
+
+
+@pytest.mark.asyncio
+async def test_task_delete_preserves_compute_job_with_task_id_nulled(db_session):
+    """ComputeJob is durable, first-class persistence decoupled from Task: when
+    its originating Task is deleted (or a project reset bulk-deletes tasks), the
+    compute-job row must SURVIVE with ``task_id`` set to NULL — not be cascaded
+    away. This guards the detach-on-delete (SET NULL) FK on ``computejob.task_id``
+    so bulk ``delete(Task)`` cleanup paths never FK-violate."""
+    project = Project(name="cj-task-null-test", user_id="user-cj-null")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute-job parent task",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="gce",
+    )
+    db_session.add(job)
+    await db_session.commit()
+    job_id = job.id
+
+    # Sanity-check: computejob.task_id FK must exist with ondelete=SET NULL.
+    fk_check = (
+        await db_session.execute(
+            text(
+                "SELECT confdeltype FROM pg_constraint "
+                "WHERE conname = 'computejob_task_id_fkey'"
+            )
+        )
+    ).scalar_one_or_none()
+    if isinstance(fk_check, (bytes, bytearray)):
+        fk_check = fk_check.decode("ascii")
+    assert fk_check == "n", (
+        f"computejob_task_id_fkey ondelete is {fk_check!r}, expected 'n' (SET NULL)."
+    )
+
+    await db_session.delete(task)
+    await db_session.commit()
+
+    # Read the column directly via raw SQL to bypass the identity-map cache.
+    raw_task_id = (
+        await db_session.execute(
+            text("SELECT task_id FROM computejob WHERE id = :id"), {"id": job_id}
+        )
+    ).scalar_one_or_none()
+    assert raw_task_id is None, (
+        f"computejob.task_id={raw_task_id!r} after parent task delete, expected NULL "
+        f"(FK ondelete=SET NULL did not fire)"
+    )
+
+    raw_id = (
+        await db_session.execute(
+            text("SELECT id FROM computejob WHERE id = :id"), {"id": job_id}
+        )
+    ).scalar_one_or_none()
+    assert raw_id == job_id, (
+        "compute-job row was cascaded away — should have been SET NULL (history lost)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_delete_preserves_compute_job_with_artifact_id_nulled(db_session):
+    """When a ComputeJob references a task-owned Artifact, deleting the task
+    CASCADE-deletes the artifact (artifact.task_id is ON DELETE CASCADE). The
+    compute-job row must SURVIVE with ``artifact_id`` set to NULL rather than
+    blocking the delete or being cascaded away with the artifact."""
+    project = Project(name="cj-artifact-null-test", user_id="user-cj-art")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="artifact parent task",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    artifact = Artifact(task_id=task.id, artifact_type=ArtifactType.GIT_COMMIT)
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="gce",
+        artifact_id=artifact.id,
+    )
+    db_session.add(job)
+    await db_session.commit()
+    job_id = job.id
+
+    # Sanity-check: computejob.artifact_id FK must exist with ondelete=SET NULL.
+    fk_check = (
+        await db_session.execute(
+            text(
+                "SELECT confdeltype FROM pg_constraint "
+                "WHERE conname = 'computejob_artifact_id_fkey'"
+            )
+        )
+    ).scalar_one_or_none()
+    if isinstance(fk_check, (bytes, bytearray)):
+        fk_check = fk_check.decode("ascii")
+    assert fk_check == "n", (
+        f"computejob_artifact_id_fkey ondelete is {fk_check!r}, "
+        f"expected 'n' (SET NULL)."
+    )
+
+    # Deleting the task cascades the artifact away; the compute job must survive.
+    await db_session.delete(task)
+    await db_session.commit()
+
+    raw_artifact_id = (
+        await db_session.execute(
+            text("SELECT artifact_id FROM computejob WHERE id = :id"), {"id": job_id}
+        )
+    ).scalar_one_or_none()
+    assert raw_artifact_id is None, (
+        f"computejob.artifact_id={raw_artifact_id!r} after artifact cascade-delete, "
+        f"expected NULL (FK ondelete=SET NULL did not fire)"
+    )
+
+    raw_id = (
+        await db_session.execute(
+            text("SELECT id FROM computejob WHERE id = :id"), {"id": job_id}
+        )
+    ).scalar_one_or_none()
+    assert raw_id == job_id, (
+        "compute-job row was cascaded away with its artifact — should have survived"
+    )
 
 
 @pytest.mark.asyncio

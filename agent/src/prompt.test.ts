@@ -63,6 +63,7 @@ import {
   formatProjectBlindSpotSummary,
   formatFixIterationHistory,
   formatSelfReviewCalibrationSection,
+  writeMessagesHelper,
   writeDesignDocHelper,
   CODE_CHANGE_HELPER_GUIDANCE,
   buildCodeChangeHelperGuidance,
@@ -80,7 +81,7 @@ import {
   assembleFailureGuidanceBlocks,
   type FixAttempt,
 } from './prompt.js';
-import { READ_ONLY_TASK_TYPES, WRITE_TASK_TYPES } from './taskCapabilities.js';
+import { getReadOnlyTaskTypes, getWriteTaskTypes } from './taskCapabilities.js';
 import { handlers } from './handlers/index.js';
 
 // ── formatPlaybook ────────────────────────────────────────────────────────────
@@ -157,6 +158,37 @@ describe('formatPlaybook', () => {
     });
     expect(result).toContain('Relevance: same direction; 2 overlapping file(s)');
     expect(result).toContain('use this when touching router code');
+  });
+
+  it('renders branch/HEAD provenance for object entries', () => {
+    const result = formatPlaybook({
+      'prov-tip': {
+        content: 'advice with provenance',
+        effectiveness_score: 0.8,
+        confirmed_count: 5,
+        age_days: 1,
+        stale: false,
+        provenance: { branch: 'automain', head_sha: 'abc1234', diverged: false },
+      },
+    });
+    expect(result).toContain('Recorded on automain @ abc1234');
+    expect(result).not.toContain('Possibly outdated');
+  });
+
+  it('flags divergent-provenance entries as possibly outdated', () => {
+    const result = formatPlaybook({
+      'diverged-tip': {
+        content: 'written on a feature branch',
+        effectiveness_score: 0.9,
+        confirmed_count: 8,
+        age_days: 1,
+        stale: false,
+        provenance: { branch: 'blueprint/feature-x', head_sha: 'def5678', diverged: true },
+      },
+    });
+    expect(result).toContain('Recorded on blueprint/feature-x @ def5678');
+    expect(result).toContain('different branch than yours');
+    expect(result).toContain('Possibly outdated or low confidence');
   });
 });
 
@@ -2126,7 +2158,7 @@ describe('configureAgentPermissions', () => {
     vi.clearAllMocks();
   });
 
-  it.each(READ_ONLY_TASK_TYPES)(
+  it.each(getReadOnlyTaskTypes())(
     'returns [Write, Edit, NotebookEdit] for read-only type "%s"',
     (taskType) => {
       const result = configureAgentPermissions(taskType);
@@ -2134,7 +2166,7 @@ describe('configureAgentPermissions', () => {
     },
   );
 
-  it.each(WRITE_TASK_TYPES)(
+  it.each(getWriteTaskTypes())(
     'returns [] (no restrictions) for write type "%s"',
     (taskType) => {
       const result = configureAgentPermissions(taskType);
@@ -4350,6 +4382,87 @@ describe('writeDesignDocHelper', () => {
     const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
     const realOs = await vi.importActual<typeof import('node:os')>('node:os');
     const tmp = `${realOs.tmpdir().replace(/\\/g, '/')}/design_doc_smoke_${process.pid}_${Date.now()}.sh`;
+    realFs.writeFileSync(tmp, script);
+    try {
+      realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });
+    } finally {
+      try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  });
+
+  // ── Read-only mode (research / plan workspaces) ──────────────────────────────
+  // The research/plan prompt advertises `./design-doc get <key>` (and lists
+  // section keys to read), so those workspaces must provision a working get/list
+  // helper. They must NOT be handed a write path to durable strategic state.
+  describe('readOnly mode', () => {
+    it('provisions the get/list read surface the research/plan prompt advertises', () => {
+      writeDesignDocHelper('task-xyz', '/tmp/workspace', { readOnly: true });
+      const script = capturedScripts['/tmp/workspace/design-doc'];
+      expect(script.startsWith('#!/bin/bash')).toBe(true);
+      expect(script).toContain('design-doc get|list');
+      expect(script).toContain('TASK="task-xyz"');
+      // get and list still route through the fail-fast single-shot helper.
+      expect(script).toContain('_post_once()');
+      expect(script).toMatch(/"op":"list"\}' "\$TASK" \| _post_once/);
+      expect(script).toMatch(/"op":"get","key":"%s"\}' "\$TASK" "\$KEY" \| _post_once/);
+    });
+
+    it('rejects set/delete (no write path, no retry loop) in read-only workspaces', () => {
+      writeDesignDocHelper('task-xyz', '/tmp/workspace', { readOnly: true });
+      const script = capturedScripts['/tmp/workspace/design-doc'];
+      expect(script).toContain('read-only in this workspace');
+      // No durable write path is emitted at all.
+      expect(script).not.toContain('_post_retry');
+      expect(script).not.toContain('"op":"set"');
+      expect(script).not.toContain('"op":"delete"');
+    });
+
+    it('read-only script passes `bash -n` syntax check', async () => {
+      writeDesignDocHelper('task-xyz', '/tmp/workspace', { readOnly: true });
+      const script = capturedScripts['/tmp/workspace/design-doc'];
+      expect(script).toBeDefined();
+
+      const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+      const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+      const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+      const tmp = `${realOs.tmpdir().replace(/\\/g, '/')}/design_doc_ro_smoke_${process.pid}_${Date.now()}.sh`;
+      realFs.writeFileSync(tmp, script);
+      try {
+        realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });
+      } finally {
+        try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
+      }
+    });
+  });
+});
+
+// ── writeMessagesHelper ──────────────────────────────────────────────────────
+describe('writeMessagesHelper', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  it('preserves non-2xx response bodies so ambiguous short refs show backend candidates', async () => {
+    writeMessagesHelper('task-xyz');
+    const script = capturedScripts['/tmp/workspace/messages'];
+    expect(script).toBeDefined();
+    expect(script).toContain('_post_strategic()');
+    expect(script).toContain('if ! response=$(curl $CURL_OPTS -X POST "$API/api/agent/strategic"');
+    expect(script).toContain("-w '\\n%{http_code}'");
+    expect(script).toContain('printf \'%s\\n\' "$body" >&2');
+    expect(script).toContain('[ERROR] messages $OP failed (HTTP $http_code)');
+    expect(script).not.toContain('curl -f -sS');
+
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const tmp = `${realOs.tmpdir().replace(/\\/g, '/')}/messages_smoke_${process.pid}_${Date.now()}.sh`;
     realFs.writeFileSync(tmp, script);
     try {
       realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });

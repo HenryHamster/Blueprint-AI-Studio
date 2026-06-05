@@ -89,6 +89,26 @@ async def test_hotfix_fix_task_rejected_with_400(client: AsyncClient, db_session
 
 
 @pytest.mark.asyncio
+async def test_panel_review_task_requires_branch(client: AsyncClient, db_session):
+    """panel_review manual creation must reject missing branch before persistence."""
+    await _make_project_with_member(db_session, "acme/widget")
+
+    resp = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "title": "Panel review without branch",
+            "prompt": "review this PR",
+            "task_type": "panel_review",
+            "pr_number": 123,
+        },
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert "branch is required for task_type 'panel_review'" in resp.text
+
+
+@pytest.mark.asyncio
 async def test_hotfix_plan_task_accepted(client: AsyncClient, db_session):
     """hotfix=true on a plan task is allowed — the documented hotfix path —
     and the hotfix flag is persisted in the stored task payload so the agent
@@ -229,3 +249,280 @@ async def test_non_hotfix_create_task_still_works(client: AsyncClient, db_sessio
     payloads = get_resp.json()["payloads"]
     assert payloads[0]["type"] == "create"
     assert "hotfix" not in payloads[0]
+
+
+# --- Non-launchable task-type guard (reject doomed compute_experiment) -------
+#
+# The manual creation path only carries the generic CreateTaskPayload fields; it
+# cannot supply the launch contract a compute_experiment needs (non-empty
+# command + positive spend_cap_usd + positive deadline_seconds). The endpoint
+# must reject any task_type the capability registry declares non-launchable BEFORE
+# any Task row is created, rather than enqueueing a task that only fails later on
+# the agent. The gate is registry-driven (USER_LAUNCHABLE_TASK_TYPES), so it
+# generalizes to every non-launchable type, not just compute_experiment.
+
+
+async def _count_tasks(db_session, project_id) -> int:
+    from sqlalchemy import func, select
+
+    from app.models import Task
+
+    return (
+        await db_session.execute(
+            select(func.count(Task.id)).where(Task.project_id == project_id)
+        )
+    ).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_compute_experiment_rejected_at_creation(
+    client: AsyncClient, db_session
+):
+    """compute_experiment is not user_launchable → 400, and no Task is created."""
+    project = await _make_project_with_member(db_session, "acme/widget")
+
+    resp = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "title": "Doomed compute experiment",
+            "prompt": "run the experiment",
+            "base_branch": "main",
+            "task_type": "compute_experiment",
+        },
+    )
+
+    assert resp.status_code == 400, resp.text
+    # HTTPException detail surfaces at error.message (main.py http_exception_handler).
+    message = resp.json()["error"]["message"].lower()
+    assert "compute_experiment" in message
+    assert "launchable" in message
+    # The doomed task must never have been persisted.
+    assert await _count_tasks(db_session, project.id) == 0
+
+
+@pytest.mark.asyncio
+async def test_non_launchable_type_rejected(client: AsyncClient, db_session):
+    """A different non-launchable type (memo) is rejected by the same registry
+    gate — proving the guard is registry-driven, not a compute_experiment
+    special case."""
+    project = await _make_project_with_member(db_session, "acme/widget")
+
+    resp = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "title": "Memo via manual path",
+            "prompt": "reason about a topic",
+            "base_branch": "main",
+            "task_type": "memo",
+        },
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "memo" in resp.json()["error"]["message"].lower()
+    assert await _count_tasks(db_session, project.id) == 0
+
+
+@pytest.mark.asyncio
+async def test_user_launchable_type_still_accepted(client: AsyncClient, db_session):
+    """Regression guard: the non-launchable gate must not over-reject. A
+    user_launchable type (research) is still accepted and persisted."""
+    project = await _make_project_with_member(db_session, "acme/widget")
+
+    resp = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "title": "Codebase research",
+            "prompt": "analyze the codebase",
+            "base_branch": "main",
+            "task_type": "research",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    task_id = resp.json()["id"]
+    get_resp = await client.get(f"/api/admin/tasks/{task_id}")
+    assert get_resp.status_code == 200
+    assert get_resp.json()["payloads"][0]["type"] == "research"
+    assert await _count_tasks(db_session, project.id) == 1
+
+
+# --- Idempotency tests -------------------------------------------------------
+#
+# Manual task creation accepts an optional client-supplied idempotency_key.
+# When provided, duplicate requests with the same key return the existing task
+# instead of creating a new one. This protects against double-click, network
+# retry, and proxy replay scenarios.
+
+
+@pytest.mark.asyncio
+async def test_idempotency_key_dedupes_duplicate_submit(
+    client: AsyncClient, db_session
+):
+    """Two requests with the same idempotency_key return the same task."""
+    await _make_project_with_member(db_session, "acme/widget")
+
+    key = "my-unique-key-001"
+    resp1 = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "title": "Idempotent task",
+            "prompt": "do something",
+            "task_type": "create",
+            "idempotency_key": key,
+        },
+    )
+
+    assert resp1.status_code == 200, resp1.text
+    task_id_1 = resp1.json()["id"]
+    # First response should not have is_duplicate flag (or it's False)
+    assert not resp1.json().get("is_duplicate")
+
+    # Retry with the same key
+    resp2 = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "title": "Idempotent task",
+            "prompt": "do something",
+            "task_type": "create",
+            "idempotency_key": key,
+        },
+    )
+
+    assert resp2.status_code == 200, resp2.text
+    task_id_2 = resp2.json()["id"]
+    # Same task ID returned
+    assert task_id_1 == task_id_2
+    # Second response marked as duplicate
+    assert resp2.json()["is_duplicate"] is True
+
+
+@pytest.mark.asyncio
+async def test_idempotency_key_no_second_task_created(
+    client: AsyncClient, db_session
+):
+    """When idempotency_key dedupes, only one task is persisted."""
+    project = await _make_project_with_member(db_session, "acme/widget")
+
+    key = "my-unique-key-002"
+    await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "title": "First request",
+            "prompt": "do work",
+            "task_type": "create",
+            "idempotency_key": key,
+        },
+    )
+
+    await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "title": "First request",
+            "prompt": "do work",
+            "task_type": "create",
+            "idempotency_key": key,
+        },
+    )
+
+    # Exactly one task created for this project
+    task_count = await _count_tasks(db_session, project.id)
+    assert task_count == 1
+
+
+@pytest.mark.asyncio
+async def test_without_idempotency_key_creates_duplicates(
+    client: AsyncClient, db_session
+):
+    """Regression guard: without idempotency_key, identical requests create
+    separate tasks (the old behavior that the fix addresses)."""
+    project = await _make_project_with_member(db_session, "acme/widget")
+
+    # First request without idempotency_key
+    resp1 = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "title": "Unprotected task",
+            "prompt": "do something",
+            "task_type": "create",
+        },
+    )
+
+    assert resp1.status_code == 200, resp1.text
+    task_id_1 = resp1.json()["id"]
+
+    # Second identical request without idempotency_key
+    resp2 = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "title": "Unprotected task",
+            "prompt": "do something",
+            "task_type": "create",
+        },
+    )
+
+    assert resp2.status_code == 200, resp2.text
+    task_id_2 = resp2.json()["id"]
+
+    # Different task IDs (separate tasks created)
+    assert task_id_1 != task_id_2
+    # No is_duplicate flag when idempotency_key not used
+    assert not resp2.json().get("is_duplicate")
+
+    # Two tasks persisted
+    task_count = await _count_tasks(db_session, project.id)
+    assert task_count == 2
+
+
+@pytest.mark.asyncio
+async def test_idempotency_key_scoped_per_project(client: AsyncClient, db_session):
+    """A client key that collides across projects must NOT dedupe cross-project.
+
+    The stored idempotency_key is namespaced with the project id, so the same
+    user-supplied key in two different projects yields two distinct tasks and
+    never leaks the foreign project's task fields (cross-project info disclosure).
+    """
+    project_a = await _make_project_with_member(db_session, "acme/widget")
+    project_b = await _make_project_with_member(db_session, "acme/gadget")
+
+    key = "shared-client-key-collision"
+    resp_a = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "title": "Task in project A",
+            "prompt": "do A",
+            "task_type": "create",
+            "idempotency_key": key,
+        },
+    )
+    assert resp_a.status_code == 200, resp_a.text
+    assert not resp_a.json().get("is_duplicate")
+
+    resp_b = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/gadget",
+            "title": "Task in project B",
+            "prompt": "do B",
+            "task_type": "create",
+            "idempotency_key": key,
+        },
+    )
+    assert resp_b.status_code == 200, resp_b.text
+    # Same client key but different project → fresh task, no cross-project dedup
+    assert not resp_b.json().get("is_duplicate")
+    assert resp_a.json()["id"] != resp_b.json()["id"]
+    assert resp_b.json()["project_id"] == str(project_b.id)
+
+    # Each project has exactly its own single task
+    assert await _count_tasks(db_session, project_a.id) == 1
+    assert await _count_tasks(db_session, project_b.id) == 1

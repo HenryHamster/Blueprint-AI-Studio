@@ -190,7 +190,7 @@ Configure autonomous mode in the admin UI under Settings > Autonomous.
 Comprehensive documentation is available in the `docs/` directory:
 
 ### Core Architecture & Design
-- **[ARCHITECTURE_OVERVIEW.md](docs/codebase-analysis.md)** — High-level system design and component interactions
+- **[codebase-analysis.md](docs/codebase-analysis.md)** — High-level system design, component interactions, and architecture overview
 - **[BACKEND_MODULES.md](docs/BACKEND_MODULES.md)** — Python module reference for `backend/app/` with responsibilities and key functions
 
 ### Task Execution & Lifecycle
@@ -244,13 +244,13 @@ Key test invariants:
 
 ### Adding Features
 
-1. **Create a branch** from the integration branch (typically `automain`)
+1. **Create a branch** from the project's integration branch (for Blueprint's own repo, this is `automain`; for other projects, check the project settings)
 2. **Implement changes** following [CLAUDE.md](CLAUDE.md) patterns
 3. **Run tests** (`./check` or `bash scripts/test-backend.sh` — see CLAUDE.md for details)
 4. **Self-review** — check for correctness, security, test coverage
 5. **Push** and open a PR
 
-For substantial changes affecting multiple systems (backend + frontend + agent), open the PR to enable CI. See [Deploy.md](Deploy.md) for deployment.
+For substantial changes affecting multiple systems (backend + frontend + agent), open the PR to enable CI. See [Deploy.md](Deploy.md) for deployment. See [docs/DATA_MODELS.md](docs/DATA_MODELS.md#project) for integration branch configuration details.
 
 ### Local Development
 

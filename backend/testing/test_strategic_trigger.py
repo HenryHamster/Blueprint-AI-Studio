@@ -78,6 +78,46 @@ def test_clear_pops_marker_and_stamps_fire_time():
     assert vision["other"] == 1  # untouched
 
 
+def test_clear_persists_operator_origin_for_receipt():
+    """Consuming an operator-origin marker must preserve its origin in
+    _strategic_refresh_last_fired_origin so the UI can attribute receipts
+    (only operator-origin consumes show 'Steer picked up')."""
+    now = _utcnow()
+    vision = {
+        "_strategic_refresh": {
+            "reason": "r",
+            "origin": st.ORIGIN_OPERATOR,
+        }
+    }
+    st.clear_strategic_refresh(vision, now)
+    assert "_strategic_refresh" not in vision
+    assert vision["_strategic_refresh_last_fired_origin"] == st.ORIGIN_OPERATOR
+    assert st.strategic_refresh_last_fired_origin(vision) == st.ORIGIN_OPERATOR
+
+
+def test_clear_persists_qualification_origin_for_attribution():
+    """Consuming a qualification-origin marker must preserve its origin so the UI
+    can withhold the 'Steer picked up' receipt (automated refreshes don't show)."""
+    now = _utcnow()
+    vision = {
+        "_strategic_refresh": {
+            "reason": "r",
+            "origin": st.ORIGIN_QUALIFICATION,
+        }
+    }
+    st.clear_strategic_refresh(vision, now)
+    assert vision["_strategic_refresh_last_fired_origin"] == st.ORIGIN_QUALIFICATION
+    assert st.strategic_refresh_last_fired_origin(vision) == st.ORIGIN_QUALIFICATION
+
+
+def test_clear_defaults_to_qualification_for_legacy_marker():
+    """A marker written before origin existed defaults to qualification on clear."""
+    now = _utcnow()
+    vision = {"_strategic_refresh": {"reason": "r"}}
+    st.clear_strategic_refresh(vision, now)
+    assert vision["_strategic_refresh_last_fired_origin"] == st.ORIGIN_QUALIFICATION
+
+
 def test_clear_noop_when_no_marker_does_not_stamp():
     """Clearing with nothing pending must not stamp a fire time (so the floor
     measures refresh-driven fires, not ordinary cadence spawns)."""
@@ -130,6 +170,24 @@ def test_mark_notified_noop_without_marker():
     vision = {"other": 1}
     st.mark_strategic_refresh_notified(vision)  # must not raise / create a slot
     assert "_strategic_refresh" not in vision
+
+
+def test_last_fired_origin_none_when_never_consumed():
+    """No last_fired_origin when the marker has never been consumed."""
+    assert st.strategic_refresh_last_fired_origin(None) is None
+    assert st.strategic_refresh_last_fired_origin({}) is None
+    # Pending marker with no fire history.
+    vision = {"_strategic_refresh": {"reason": "r"}}
+    assert st.strategic_refresh_last_fired_origin(vision) is None
+
+
+def test_last_fired_origin_reflects_consumed_marker():
+    """The last_fired_origin field shows the origin of the most recently
+    consumed refresh (used by UI to attribute receipts)."""
+    vision = {"_strategic_refresh_last_fired_origin": st.ORIGIN_OPERATOR}
+    assert st.strategic_refresh_last_fired_origin(vision) == st.ORIGIN_OPERATOR
+    vision = {"_strategic_refresh_last_fired_origin": st.ORIGIN_QUALIFICATION}
+    assert st.strategic_refresh_last_fired_origin(vision) == st.ORIGIN_QUALIFICATION
 
 
 def test_clear_drops_origin_and_notified_on_consume():
@@ -562,3 +620,59 @@ async def test_maybe_arm_returns_passive_note_without_requesting(db_session):
         )
     assert outcome == st.ARMING_PASSIVE_NOTE
     req.assert_not_awaited()
+
+
+# ===========================================================================
+# Operator cancel — retract an armed steer without leaving a receipt
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_cancel_clears_pending_marker(db_session):
+    """Cancelling an armed steer removes the pending marker so it will not fire."""
+    project = await _make_project(db_session)
+    await st.request_strategic_refresh(
+        db_session, project.id, "operator_steering", origin=st.ORIGIN_OPERATOR
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+    assert st.strategic_refresh_pending(project.vision) is True
+
+    cleared = await st.cancel_strategic_refresh(db_session, project.id)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert cleared is True
+    assert st.strategic_refresh_pending(project.vision) is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_does_not_leave_receipt(db_session):
+    """A cancelled steer never ran: no last_fired_at/origin stamp (no 'Steer
+    picked up' receipt) and the min-interval floor is not advanced."""
+    project = await _make_project(db_session)
+    await st.request_strategic_refresh(
+        db_session, project.id, "operator_steering", origin=st.ORIGIN_OPERATOR
+    )
+    await db_session.commit()
+
+    await st.cancel_strategic_refresh(db_session, project.id)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert "_strategic_refresh_last_fired_at" not in (project.vision or {})
+    assert st.strategic_refresh_last_fired_origin(project.vision) is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_is_idempotent_noop_when_nothing_armed(db_session):
+    """Cancelling with no marker pending is a harmless no-op returning False,
+    so a duplicate/late client retry cannot error."""
+    project = await _make_project(db_session)
+
+    cleared = await st.cancel_strategic_refresh(db_session, project.id)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert cleared is False
+    assert st.strategic_refresh_pending(project.vision) is False

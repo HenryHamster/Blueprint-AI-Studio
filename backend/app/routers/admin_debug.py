@@ -31,9 +31,16 @@ from app.models import (
     _utcnow,
 )
 from app.auth import get_current_user, require_admin
+from app.knowledge_query import (
+    get_knowledge_document as kq_get_knowledge_document,
+    list_knowledge_documents as kq_list_knowledge_documents,
+    serialize_knowledge_document,
+)
 from app.broadcast import broadcast_to_project
 from app.admin import _get_user_project, _get_user_project_with_role
 from app.reaper import _heartbeat_stale_cutoff
+from app.task_capabilities import STRATEGIC_TASK_TYPES
+from app.payload_schemas import _MAX_PAYLOAD_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +147,46 @@ def _build_direction_remediation_state(
             }
         )
     return entries
+
+
+def _build_direction_portfolio_summary(project: Project) -> List[dict]:
+    """Surface per-direction generalized health for the diagnostics endpoint.
+
+    Returns entries for active/paused directions that have non-code evaluation
+    successes in their recent research_history — i.e. directions whose positive
+    signal would be invisible to PR-only metrics. Only included when the
+    generalized_successes field exceeds prs_merged, so pure code-change
+    directions produce no extra noise in the response.
+
+    Limited to the 3 most recent cycles per direction for a compact summary.
+    """
+    results: list = []
+    for d in project.directions or []:
+        if d.get("status") not in ("active", "paused"):
+            continue
+        history = d.get("research_history") or []
+        if not history:
+            continue
+        recent = history[-3:]
+        gen_successes = sum(
+            h.get("generalized_successes", h.get("prs_merged", 0)) for h in recent
+        )
+        prs_merged = sum(h.get("prs_merged", 0) for h in recent)
+        if gen_successes <= prs_merged:
+            # No non-code contribution beyond PR merges — skip to keep compact.
+            continue
+        results.append(
+            {
+                "direction_id": d.get("id", ""),
+                "direction_text": (d.get("text") or "")[:100],
+                "status": d.get("status", "active"),
+                "recent_cycles": len(recent),
+                "prs_merged_recent": prs_merged,
+                "generalized_successes_recent": gen_successes,
+                "non_code_successes_recent": gen_successes - prs_merged,
+            }
+        )
+    return results
 
 
 def _classify_stuck_failure(task: Task) -> Optional[str]:
@@ -375,6 +422,86 @@ def _format_circuit_breaker(cb: dict) -> CircuitBreakerInfo:
     }
 
 
+def _build_problem_model_trim_verdict(payload: dict) -> Optional[dict]:
+    """Summarize how read-time packing treated the problem_model in a strategic payload.
+
+    Operators already see when a strategic cycle was *skipped* because the assembled
+    payload exceeded the hard cap (``payload_bloat_skip``). They do NOT see when a cycle
+    that actually RAN shipped a summarized / floored / dropped problem_model because the
+    byte-budget packer (``pack_under_budget``) trimmed it to fit. This derives that
+    verdict from the assembled task payload's ``_packer_meta`` plus the agent-view markers
+    the packer leaves on the problem_model itself (``_agent_view_floor_applied`` /
+    ``_gap_memory_trimmed``), so the verdict is visible without inspecting raw payload JSON.
+
+    ``status`` is one of: ``full`` (shipped untrimmed), ``summarized`` (byte-budget
+    summarize ran), ``floor`` (summarize degraded it to the read-time floor), ``dropped``
+    (omitted entirely). Returns None when the payload carries no packer metadata.
+    """
+    meta = payload.get("_packer_meta")
+    if not isinstance(meta, dict):
+        return None
+    pm = payload.get("problem_model")
+    pm = pm if isinstance(pm, dict) else {}
+
+    dropped_entry = next(
+        (
+            d
+            for d in (meta.get("dropped") or [])
+            if isinstance(d, dict) and d.get("key") == "problem_model"
+        ),
+        None,
+    )
+    summarized = any(
+        isinstance(t, dict) and t.get("key") == "problem_model"
+        for t in (meta.get("trimmed") or [])
+    )
+    floor = pm.get("_agent_view_floor_applied")
+    floor = floor if isinstance(floor, dict) else None
+
+    if dropped_entry is not None:
+        status = "dropped"
+    elif floor:
+        status = "floor"
+    elif summarized:
+        status = "summarized"
+    else:
+        status = "full"
+
+    gap_trimmed = pm.get("_gap_memory_trimmed")
+    gap_trimmed_count = len(gap_trimmed) if isinstance(gap_trimmed, list) else 0
+
+    verdict: dict = {
+        "status": status,
+        "budget_total": meta.get("budget_total"),
+        "budget_used": meta.get("budget_used"),
+        "gap_memory_trimmed_count": gap_trimmed_count,
+    }
+
+    def _floor_count(value: object) -> int:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, list):
+            return len(value)
+        return 0
+
+    if floor:
+        verdict["floor"] = {
+            "floor_bytes": floor.get("floor_bytes"),
+            "stripped_gap_fields": floor.get("stripped_gap_fields") or [],
+            "dropped_gaps": int(floor.get("dropped_gaps", 0) or 0),
+            "summarized_capabilities_count": _floor_count(
+                floor.get("summarized_capabilities")
+            ),
+            "summarized_friction_count": _floor_count(
+                floor.get("summarized_friction")
+            ),
+            "still_over_floor": bool(floor.get("still_over_floor")),
+        }
+    if dropped_entry is not None and dropped_entry.get("reason"):
+        verdict["dropped_reason"] = dropped_entry.get("reason")
+    return verdict
+
+
 # ---------------------------------------------------------------------------
 # GET /api/admin/projects/{project_id}/autonomy-debug
 # ---------------------------------------------------------------------------
@@ -473,12 +600,18 @@ async def get_autonomy_debug(
                     TaskStatus.PROVISIONING,
                     TaskStatus.IN_PROGRESS,
                     TaskStatus.EVALUATING,
+                    # BLOCKED research parents still hold their direction (see
+                    # _spawn_research_task_inner): a lane parked on an unresolved
+                    # upstream prerequisite is wanted-but-not-runnable, so the
+                    # direction is structurally occupied and not eligible.
+                    TaskStatus.BLOCKED,
                 ]
             ),
         )
         .limit(1000)
     )
     busy_direction_ids: list[str] = []
+    blocked_direction_ids: set[str] = set()
     active_research_count = 0
     for t in busy_tasks_result.scalars().all():
         payload = t.first_payload
@@ -487,7 +620,10 @@ async def get_autonomy_debug(
         did = payload.get("current_direction_id")
         if did:
             busy_direction_ids.append(did)
-        # Only the VM-consuming statuses count against the parallel cap
+            if t.status == TaskStatus.BLOCKED:
+                blocked_direction_ids.add(did)
+        # Only the VM-consuming statuses count against the parallel cap.
+        # BLOCKED (like EVALUATING) does not consume a VM slot.
         if t.status in (
             TaskStatus.QUEUED,
             TaskStatus.PROVISIONING,
@@ -525,9 +661,15 @@ async def get_autonomy_debug(
             "seconds_until_eligible": seconds_until_eligible,
         }
         if is_busy:
-            entry["busy_reason"] = (
-                "direction has active research task (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING)"
-            )
+            if d.get("id") in blocked_direction_ids:
+                entry["busy_reason"] = (
+                    "direction held by a BLOCKED research task parked on an "
+                    "unresolved upstream prerequisite"
+                )
+            else:
+                entry["busy_reason"] = (
+                    "direction has active research task (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING)"
+                )
         directions_info.append(entry)
 
     eligible_directions = [d for d in directions_info if d["is_eligible"]]
@@ -712,9 +854,7 @@ async def get_strategic_debug(
             Task.status.in_(
                 [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
             ),
-            Task.payloads[0]["type"].astext.in_(
-                ["design_doc_update", "strategic_review"]
-            ),
+            Task.payloads[0]["type"].astext.in_(sorted(STRATEGIC_TASK_TYPES)),
         )
         .limit(1)
     )
@@ -724,6 +864,36 @@ async def get_strategic_debug(
     if result is not None:
         active_strategic_task = result
         active_phase = (result.first_payload).get("type")
+
+    # Last read-time packing verdict for the problem_model: derived from the most
+    # recent strategic task's assembled payload (any status, so the verdict survives
+    # after the cycle completes). Surfaces whether the strategist actually saw the
+    # problem_model in full or a summarized / floored / dropped view — the success-case
+    # complement to the payload_bloat_skip (cap-exceeded skip) signal below.
+    latest_strategic = (
+        await session.execute(
+            select(Task)
+            .where(
+                Task.project_id == project_id,
+                Task.payloads[0]["type"].astext.in_(sorted(STRATEGIC_TASK_TYPES)),
+            )
+            .order_by(Task.created_at.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    problem_model_trim: Optional[dict] = None
+    if latest_strategic is not None:
+        problem_model_trim = _build_problem_model_trim_verdict(
+            latest_strategic.first_payload
+        )
+        if problem_model_trim is not None:
+            problem_model_trim["task_id"] = str(latest_strategic.id)
+            problem_model_trim["task_status"] = latest_strategic.status
+            problem_model_trim["assembled_at"] = (
+                latest_strategic.created_at.isoformat()
+                if latest_strategic.created_at
+                else None
+            )
 
     # Trigger countdowns
     strategic_frequency = vision.get(
@@ -792,12 +962,13 @@ async def get_strategic_debug(
             str(c.get("key")) for c in contributors[:3] if c.get("key")
         )
         size_kb = round((payload_bloat_skip.get("size") or 0) / 1024)
+        max_kb = _MAX_PAYLOAD_BYTES // 1024
         blocking_guards.append(
             {
                 "guard": "payload_bloat_skip",
                 "reason": (
                     f"Strategic paused: assembled payload ({size_kb} KB) exceeds the "
-                    "256 KB cap"
+                    f"{max_kb} KB cap"
                     + (f" — compact {top_names}" if top_names else "")
                 ),
                 "size": payload_bloat_skip.get("size"),
@@ -862,6 +1033,7 @@ async def get_strategic_debug(
         "phase": phase,
         "blocking_guards": blocking_guards,
         "payload_bloat_skip": payload_bloat_skip,
+        "problem_model_trim": problem_model_trim,
         "has_purpose": has_purpose,
         "research_spawn_count": research_spawn_count,
         "strategic_cycle_count": strategic_cycle_count,
@@ -1052,8 +1224,9 @@ async def get_project_diagnostics(
         zone_health = {"available": 0, "exhausted": []}
 
     direction_remediation = _build_direction_remediation_state(project)
+    direction_portfolio = _build_direction_portfolio_summary(project)
 
-    return {
+    response: dict = {
         "project_id": str(project_id),
         "stuck_tasks": stuck_tasks,
         "circuit_breaker": circuit_breaker,
@@ -1067,6 +1240,11 @@ async def get_project_diagnostics(
         "active_tasks_truncated": active_tasks_truncated,
         "active_tasks_cap": max_active_tasks,
     }
+    # direction_portfolio_summary is ADDITIVE — only present when non-code work
+    # exists so the response stays compact for code-only portfolios.
+    if direction_portfolio:
+        response["direction_portfolio_summary"] = direction_portfolio
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -1417,3 +1595,77 @@ async def get_recent_findings(
         "grade_distribution_pct": grade_pct,
         "total": total,
     }
+
+
+# ---------------------------------------------------------------------------
+# Knowledge-document store: list / search / get-by-id
+#
+# Durable, queryable home for web_research output (output_kind='knowledge').
+# Project-scoped (router-level get_current_user + _get_user_project membership
+# check), paginated, newest-first. Search matches title/summary/body/topic via
+# ILIKE (trigram-GIN-backed on Postgres for title/body) plus a tag-list scan.
+# Response shapes are stable for the frontend; the list shape omits the
+# (potentially large) markdown body, which only the get-by-id endpoint returns.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/projects/{project_id}/knowledge-documents")
+async def list_knowledge_documents(
+    project_id: uuid.UUID,
+    q: str | None = Query(default=None, description="Full-text search term"),
+    topic: str | None = Query(default=None, description="Exact topic filter"),
+    tag: str | None = Query(default=None, description="Exact tag filter"),
+    direction: str | None = Query(
+        default=None, description="Exact direction-id filter"
+    ),
+    source_kind: str | None = Query(
+        default=None, description="Exact source-kind filter (design / web_research)"
+    ),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """List / search a project's knowledge documents, newest-first, paginated.
+
+    ``q`` matches title/summary/body/topic (ILIKE, trigram-backed on Postgres)
+    and the tag list. ``topic`` / ``tag`` / ``direction`` / ``source_kind``
+    apply exact filters (``source_kind`` scopes to a single producing task kind,
+    e.g. ``design`` vs ``web_research``). The list shape omits the markdown body
+    — use the get-by-id endpoint for the full document.
+
+    Search/serialization is shared with the agent-facing endpoints via
+    ``app.knowledge_query`` so behavior stays identical across surfaces.
+    """
+    await _get_user_project(project_id, current_user["user_id"], session)
+    return await kq_list_knowledge_documents(
+        session,
+        project_id,
+        q=q,
+        topic=topic,
+        tag=tag,
+        direction=direction,
+        source_kind=source_kind,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/projects/{project_id}/knowledge-documents/{document_id}")
+async def get_knowledge_document(
+    project_id: uuid.UUID,
+    document_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return a single knowledge document (including its markdown body).
+
+    Project-scoped: a document from another project (or a missing id) is a 404
+    even for an authenticated user, after the membership check on the path
+    project.
+    """
+    await _get_user_project(project_id, current_user["user_id"], session)
+    doc = await kq_get_knowledge_document(session, project_id, document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Knowledge document not found")
+    return serialize_knowledge_document(doc, include_body=True)

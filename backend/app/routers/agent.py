@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict
 
-from fastapi import APIRouter, Depends, HTTPException, Header, Request
+from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +26,7 @@ from app.auth import (
     VM_SCOPED_TOKEN_SCOPE,
 )
 from app.database import get_session, AsyncSessionLocal, resolve_dialect_name
+from app.landed_signal import is_merged_completion
 from app.models import (
     Project,
     Task,
@@ -51,6 +52,7 @@ from app.shared_state import (
     get_project_promotion_target,
     get_project_integration_branch,
 )
+from app.task_capabilities import agent_capability_slice
 import app.shared_state as _shared_state
 from app.storage import generate_upload_signed_url, ARTIFACT_BUCKET_NAME
 from app.github import (
@@ -63,6 +65,11 @@ from app.sr_blind_spots import (
     aggregate_sr_co_failure_pairs,
 )
 from app.pipeline_health import compute_pipeline_health_summary
+from app.knowledge_query import (
+    get_knowledge_document as kq_get_knowledge_document,
+    list_knowledge_documents as kq_list_knowledge_documents,
+    serialize_knowledge_document,
+)
 from app.claim_task_helpers import (
     _has_local_cycle,  # noqa: F401 — re-exported for use in task_lifecycle_requeue
     _parse_failed_approach,
@@ -448,6 +455,26 @@ from app.github_token_resolver import (  # noqa: F401,E402
 # ---------------------------------------------------------------------------
 
 
+@router.get("/task-capabilities")
+@limiter.limit("120/minute")
+async def agent_task_capabilities(
+    request: Request,
+    token: dict = Depends(verify_agent_token),
+):
+    """Publish the authoritative task-capability contract to the agent VM.
+
+    Mirrors the operator-facing GET /api/admin/task-capabilities (which is
+    Bearer/Firebase-authed and therefore unreachable with the agent's
+    ``X-Agent-Token`` JWT). The agent consumes this contract to derive its
+    known task types and read_only/write permission partitioning from the
+    single backend-owned registry instead of a hand-maintained agent table,
+    so adding a backend task type does not require an agent-side edit.
+    """
+    from app.task_capabilities import task_capability_contract
+
+    return {"task_capabilities": task_capability_contract()}
+
+
 @router.post("/refresh-token")
 @limiter.limit("120/minute")
 async def agent_refresh_token(
@@ -822,7 +849,10 @@ async def claim_task(
             "integration_branch": project_integration_branch,
         }
 
-    task_type = task.first_payload.get("type", "")
+    task_type = _claimed_first_payload.get("type", "")
+    task_capability = agent_capability_slice(task_type)
+    if task_capability is not None:
+        response["task_capability"] = task_capability
     if task_type in ("research", "plan", "create", "fix", "refactor", "review"):
         # Active tasks (IN_PROGRESS or EVALUATING) in the same project.
         # Phase B4 (H-P6): load_only drops status_log/plan_output JSONB.
@@ -1778,6 +1808,17 @@ async def claim_task(
                     relevance_reasons.append(
                         f"{file_overlap_count} overlapping file(s)"
                     )
+                # Provenance: the branch/HEAD this entry was authored against.
+                # The diverged signal is NOT a raw branch-name comparison —
+                # every task runs on its own short-lived feature branch, so a
+                # name mismatch is the norm, not a divergence. Whether the
+                # referenced work is actually absent from the reader's branch is
+                # derived AFTER capping from the source task's landed/merge state
+                # (see _landed_source_ids batch lookup below). Here we only
+                # capture the raw provenance fields + source id the lookup needs.
+                entry_branch = str(v.get("branch") or "")
+                entry_head_sha = str(v.get("head_sha") or "")
+                entry_source_id = str(v.get("source_task_id") or "")
                 # Age in days for metadata (0 if updated_at unavailable)
                 age_days = 0
                 if updated_at_str:
@@ -1807,6 +1848,9 @@ async def claim_task(
                         age_days,
                         bool(age_penalty or stale_penalty),
                         relevance_reasons,
+                        entry_branch,
+                        entry_head_sha,
+                        entry_source_id,
                     )
                 )
         _playbook_candidates.sort()
@@ -1828,6 +1872,53 @@ async def claim_task(
         _default_caps = {"fix": 8, "qa": 8, "review": 8, "create": 12, "refactor": 12}
         _cap = int(_playbook_caps.get(task_type, _default_caps.get(task_type, 10)))
         _capped_candidates = _playbook_candidates[: max(_cap, 0)]
+        # Derive landed-vs-not-landed for the SMALL capped set with a single
+        # batched query (diverged is not a sort key, so doing this after the cap
+        # is safe and keeps it off the per-entry hot loop). An entry is diverged
+        # only when it carries branch provenance AND its source task did NOT land
+        # on the integration branch — i.e. the referenced work is genuinely still
+        # unmerged / completed-but-non-merge. Squash-merges rewrite commit
+        # identity, so we key on the source task's merge state, never head_sha.
+        _candidate_source_ids: set[str] = set()
+        for _c in _capped_candidates:
+            _branch_v, _src_v = _c[15], _c[17]
+            if _branch_v and _src_v and _src_v != _my_task_id:
+                _candidate_source_ids.add(_src_v)
+        _landed_source_ids: set[str] = set()
+        # When the lookup itself fails we cannot tell landed from unlanded, so
+        # we suppress the diverged signal entirely (favour low false positives
+        # over distrusting healthy entries on a transient DB hiccup).
+        _landed_lookup_failed = False
+        if _candidate_source_ids:
+            _parsed_ids = []
+            for _sid in _candidate_source_ids:
+                try:
+                    _parsed_ids.append(uuid.UUID(_sid))
+                except (ValueError, TypeError):
+                    # Malformed/unresolvable id — skip; the entry will fall
+                    # through to NOT diverged (favouring low false positives).
+                    continue
+            if _parsed_ids:
+                try:
+                    _src_rows = (
+                        await session.execute(
+                            select(Task)
+                            .where(Task.id.in_(_parsed_ids))
+                            .options(load_only(Task.id, Task.status, Task.context))
+                        )
+                    ).scalars()
+                    for _src_task in _src_rows:
+                        if is_merged_completion(_src_task):
+                            _landed_source_ids.add(str(_src_task.id))
+                except Exception:
+                    # A degraded session must not 500 the already-committed
+                    # claim. Mark the lookup failed so provenance-bearing
+                    # entries fall through to NOT diverged (low false positives).
+                    _landed_lookup_failed = True
+                    logger.exception(
+                        "[AGENT] playbook landed-state lookup failed — "
+                        "treating provenance-bearing entries as non-diverged"
+                    )
         for (
             _,
             _,
@@ -1844,16 +1935,36 @@ async def claim_task(
             age_days_val,
             is_stale,
             relevance_reasons,
+            entry_branch_v,
+            entry_head_sha_v,
+            entry_source_id_v,
         ) in _capped_candidates:
+            # Diverged ⇔ branch-bearing entry whose source task is neither the
+            # reader's own task nor a task that landed on the integration
+            # branch. A failed landed-state lookup suppresses the signal.
+            prov_diverged = bool(
+                entry_branch_v
+                and entry_source_id_v
+                and entry_source_id_v != _my_task_id
+                and not _landed_lookup_failed
+                and entry_source_id_v not in _landed_source_ids
+            )
             playbook_entries[short_key] = {
                 "content": content,
                 "effectiveness_score": round(eff_score, 3),
                 "confirmed_count": conf_count,
                 "age_days": age_days_val,
-                "stale": is_stale,
+                # Divergent-provenance entries self-mark as stale so the prompt
+                # renderer surfaces the possibly-outdated caveat automatically.
+                "stale": is_stale or prov_diverged,
                 "relevance": {
                     "reasons": relevance_reasons,
                     "local_match": bool(relevance_reasons),
+                },
+                "provenance": {
+                    "branch": entry_branch_v,
+                    "head_sha": entry_head_sha_v,
+                    "diverged": prov_diverged,
                 },
             }
         if len(_playbook_candidates) > len(_capped_candidates):
@@ -3932,3 +4043,81 @@ async def merge_operator_reviewer_findings(
         {"task_id": str(original_task_id)},
     )
     return {"status": "merged", "finding_count": len(req.reviewer_findings)}
+
+
+# ---------------------------------------------------------------------------
+# Agent-facing knowledge-document query/read API
+#
+# Closes the loop on the knowledge store: web_research tasks produce durable
+# KnowledgeDocument rows, and these endpoints let an authenticated agent query
+# and read them so accumulated knowledge can feed back into the system. The
+# project scope is derived from the AUTHENTICATED TASK (token's ``sub`` →
+# task.project_id), never from the URL/query — an agent can only ever see its
+# own project's documents. Search/serialization is shared with the operator
+# admin endpoints via ``app.knowledge_query`` so behavior is identical.
+# ---------------------------------------------------------------------------
+
+
+async def _resolve_token_project_id(
+    session: AsyncSession, token: dict
+) -> uuid.UUID:
+    """Resolve the authenticated task's project_id from the agent token.
+
+    The agent never supplies a project_id; scope is bound to the task the token
+    was minted for. A missing/unparseable task id is a 404 (the token is no
+    longer usable for project-scoped reads).
+    """
+    task_id = token.get("sub")
+    try:
+        task = await session.get(Task, uuid.UUID(str(task_id)))
+    except (ValueError, TypeError):
+        task = None
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task.project_id
+
+
+@router.get("/knowledge-documents")
+@limiter.limit("120/minute")
+async def agent_list_knowledge_documents(
+    request: Request,
+    q: str | None = Query(default=None, description="Full-text search term"),
+    topic: str | None = Query(default=None, description="Exact topic filter"),
+    tag: str | None = Query(default=None, description="Exact tag filter"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """List / search knowledge documents for the authenticated task's project.
+
+    Mirrors the operator list endpoint (``q`` over title/summary/body/topic/tags,
+    exact ``topic`` / ``tag`` filters, newest-first, limit/offset paginated) but
+    scopes to the token's task project — never a URL-supplied project — so an
+    agent cannot read another project's documents. The list shape omits the
+    markdown body; use get-by-id for the full document.
+    """
+    project_id = await _resolve_token_project_id(session, token)
+    return await kq_list_knowledge_documents(
+        session, project_id, q=q, topic=topic, tag=tag, limit=limit, offset=offset
+    )
+
+
+@router.get("/knowledge-documents/{document_id}")
+@limiter.limit("120/minute")
+async def agent_get_knowledge_document(
+    request: Request,
+    document_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return a single knowledge document (including its markdown body).
+
+    Scoped to the authenticated task's project: a document from another project
+    (or a missing id) is a 404.
+    """
+    project_id = await _resolve_token_project_id(session, token)
+    doc = await kq_get_knowledge_document(session, project_id, document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Knowledge document not found")
+    return serialize_knowledge_document(doc, include_body=True)

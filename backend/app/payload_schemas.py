@@ -2,7 +2,7 @@
 Pydantic-based payload validation for all supported task types.
 
 Provides:
-  - TaskType enum listing all 21 handler types
+  - TaskType enum listing all supported handler types
   - ALL_TASK_TYPES frozenset for backward-compat consumers
   - Per-type payload models with required-field enforcement
   - validate_task_payload()  — strict, raises ValueError on bad input
@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -144,6 +144,10 @@ class ReviewPayload(BasePayload):
     @classmethod
     def _check_branch(cls, v: str) -> str:
         return _validate_branch_name(v)  # type: ignore[return-value]
+
+
+class PanelReviewPayload(ReviewPayload):
+    """Read-only PR review payload for the fixed multi-agent panel workflow."""
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +308,7 @@ class DebugPayload(_SystemPopulated):
 
 class PerfPayload(_SystemPopulated):
     prompt: str | None = None
+    max_severity: Literal["low", "medium", "high", "critical"] | None = None
 
 
 class MemoPayload(BasePayload):
@@ -323,6 +328,96 @@ class MemoPayload(BasePayload):
     prompt: str | None = None
 
 
+class ComputeSuccessCriterion(BaseModel):
+    """A cheap, machine-checkable acceptance criterion for a compute_experiment.
+
+    Declares WHAT success means for the experiment: a numeric ``metric`` (a key
+    read by name out of the terminal COMPUTE_RESULT artifact), one of a small,
+    closed set of comparison ``operator`` values, and a numeric ``threshold``.
+    Deliberately minimal — no expression framework, just enough to express a
+    single numeric/threshold goal the metric gate can check at completion. When
+    absent, the gate keeps its presence-only behavior (terminal outcome + cost).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    metric: str
+    operator: Literal[">=", "<=", ">", "<", "==", "!="]
+    threshold: float
+
+
+class ComputeExperimentPayload(_SystemPopulated):
+    """Reference compute-heavy task (benchmark/evaluation style).
+
+    The agent forwards the launch fields below to ``POST /api/agent/compute-jobs``
+    and then only monitors the job to terminal state — it never holds the heavy
+    VM. The shape is intentionally minimal and inherits ``extra='allow'`` from
+    BasePayload, so new benchmark/evaluation fields can be added without a schema
+    bump (backward-compatible extra-field tolerance).
+
+    All fields are optional + system-populated; the *agent* handler validates the
+    launch requirements (command + a positive spend cap + a positive deadline)
+    and fails loudly on misconfiguration rather than silently spending. The
+    backend launch endpoint re-validates and clamps cap/deadline to safe bounds.
+    """
+
+    # Launch spec — forwarded to the compute-job launch endpoint.
+    command: str | None = None
+    machine_type: str | None = None
+    spend_cap_usd: float | None = None
+    deadline_seconds: int | None = None
+    cwd: str | None = None
+    env: dict[str, str] | None = None
+    backend_name: str | None = None
+    provisioning_model: str | None = None
+    # Benchmark/evaluation metadata — informational; echoed back into the result
+    # artifact so operators can correlate a job with the experiment that ran it.
+    experiment: str | None = None
+    benchmark: str | None = None
+    metric: str | None = None
+    # Optional goal-level acceptance criterion. When declared, the metric gate
+    # checks the reported result against it at completion (a compute artifact
+    # that finishes but misses its declared goal fails the gate honestly);
+    # when absent, the gate preserves presence-based behavior.
+    success_criterion: ComputeSuccessCriterion | None = None
+
+
+class WebResearchPayload(BasePayload):
+    """Payload for a web-first research task that produces a knowledge document.
+
+    The task runs read-only with web access and emits a structured document
+    (title/summary/body/citations/tags/topic) that the forward-quality gate
+    grades before it is persisted as a ``KnowledgeDocument``. ``prompt`` is the
+    research question; the remaining fields are optional routing/labeling
+    context stamped by the spawner (operator or strategic loop).
+    """
+
+    prompt: str | None = None
+    topic: str | None = None
+    tags: list[str] | None = None
+    direction_id: str | None = None
+    project_name: str | None = None
+
+
+class DesignPayload(BasePayload):
+    """Payload for a codebase-internal design task that produces a design doc.
+
+    Modeled on :class:`WebResearchPayload`: the task runs read-only over a clone
+    of the repo and emits a structured knowledge document
+    (title/summary/body/citations/tags/topic) grounded in the actual code. The
+    forward-quality gate grades it before it is persisted as a
+    ``KnowledgeDocument``. ``prompt`` is the design question; the remaining
+    fields are optional routing/labeling context. Extra-field tolerant
+    (``extra='allow'`` via BasePayload) per the registry convention.
+    """
+
+    prompt: str | None = None
+    topic: str | None = None
+    tags: list[str] | None = None
+    direction_id: str | None = None
+    project_name: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
@@ -334,6 +429,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.migrate: MigratePayload,
     TaskType.investigate: InvestigatePayload,
     TaskType.review: ReviewPayload,
+    TaskType.panel_review: PanelReviewPayload,
     TaskType.fix: FixPayload,
     TaskType.research: ResearchPayload,
     TaskType.strategic_review: StrategicReviewPayload,
@@ -349,6 +445,9 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.release_audit: ReleaseAuditPayload,
     TaskType.memo: MemoPayload,
     TaskType.verify_tests: VerifyTestsPayload,
+    TaskType.compute_experiment: ComputeExperimentPayload,
+    TaskType.web_research: WebResearchPayload,
+    TaskType.design: DesignPayload,
 }
 
 
@@ -405,12 +504,21 @@ def pack_under_budget(
     ``summarize: (value) -> trimmed_value`` callback. Missing schema entries
     default to ``priority="low"`` with a logged warning.
 
+    A schema entry may ALSO declare a ``floor: (value) -> floored_value``
+    callback producing a guaranteed-minimum representation. Floored bytes are
+    reserved off the top of the budget so a floored key is NEVER starved out
+    by other sections — even same- or higher-tier ones that sort ahead of it.
+    The floored value always ships (the full/summarized value ships when the
+    remaining budget allows); other recoverable context degrades first. This
+    is the in-payload delivery guarantee for the strategic ``problem_model``.
+
     Algorithm: sort by (tier desc, size asc) so within a tier smaller items
     pack first — a 50KB high won't evict a 5KB high purely by insertion
     order. Then greedy-fill: try full size; if over remaining budget call
-    ``summarize`` once; if still over, drop. Critical-tier items that can't
-    fit (even after summarize) raise :class:`PayloadTooLargeError` —
-    silently dropping critical context is worse than failing loudly.
+    ``summarize`` once; if still over, ship the ``floor`` (if any) or drop.
+    Critical-tier items that can't fit (even after summarize) raise
+    :class:`PayloadTooLargeError` — silently dropping critical context is
+    worse than failing loudly.
 
     Returns a new dict containing the packed keys plus a ``_packer_meta``
     entry describing what was trimmed/dropped and the budget accounting.
@@ -467,6 +575,201 @@ def pack_under_budget(
         )
     )
 
+    def _compute_summarized_candidate(part: dict) -> dict[str, Any] | None:
+        """Compute and cache the summarized form for *part* once.
+
+        The cached candidate is reused both for degraded-floor reservations and
+        for the normal packing path so summarize callbacks are deterministic and
+        warnings are emitted at most once per key.
+        """
+        if part.get("_summarize_computed"):
+            return part.get("_summarize_candidate")
+        part["_summarize_computed"] = True
+
+        summarize_fn = part.get("summarize")
+        if summarize_fn is None:
+            part["_summarize_candidate"] = None
+            return None
+
+        try:
+            trimmed_value = summarize_fn(part["value"])
+        except Exception as exc:  # noqa: BLE001 — summarize fns must not crash the packer
+            logger.warning(
+                "pack_under_budget: summarize for key %r raised %s — dropping",
+                part["key"],
+                exc,
+            )
+            part["_summarize_candidate"] = None
+            return None
+
+        try:
+            trimmed_size = _serialized_size(trimmed_value)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "pack_under_budget: trimmed value for key %r not serializable (%s) — dropping",
+                part["key"],
+                exc,
+            )
+            part["_summarize_candidate"] = None
+            return None
+
+        size = part["size"]
+        assert size is not None
+        trimmed_size_int = trimmed_size
+        # Defensive: never grow the payload by trimming. If a caller's
+        # summarize_fn returns a larger value (caller bug), revert to original
+        # and proceed with the original-size check.
+        if trimmed_size_int > size:
+            logger.warning(
+                "pack_under_budget: summarize for key %r grew value (%d > %d) — using original",
+                part["key"],
+                trimmed_size_int,
+                size,
+            )
+            trimmed_value = part["value"]
+            trimmed_size_int = size
+
+        if isinstance(part["value"], list) and isinstance(trimmed_value, list):
+            trimmed_meta: dict[str, Any] = {
+                "key": part["key"],
+                "kind": "list_trimmed",
+                "shown": len(trimmed_value),
+                "total": len(part["value"]),
+            }
+        else:
+            trimmed_meta = {"key": part["key"], "kind": "summarized"}
+
+        candidate = {
+            "value": trimmed_value,
+            "size": trimmed_size_int,
+            "meta": trimmed_meta,
+        }
+        part["_summarize_candidate"] = candidate
+        return candidate
+
+    # Floor reservations: keys whose schema declares a ``floor`` callback are
+    # GUARANTEED to ship at least their floored representation. We reserve that
+    # many bytes off the top of the budget so other sections — even same- or
+    # higher-tier ones that sort ahead — degrade or drop BEFORE a floored key
+    # disappears. This is the in-payload delivery guarantee for the strategic
+    # problem_model: a cycle never runs with the model dropped entirely.
+    floors: dict[str, dict] = {}
+    for p in parts:
+        if p["unserializable"]:
+            continue
+        floor_fn = (schema.get(p["key"]) or {}).get("floor")
+        if floor_fn is None:
+            continue
+        try:
+            floored = floor_fn(p["value"])
+            floored_size = _serialized_size(floored)
+        except Exception as exc:  # noqa: BLE001 — floor fns must not crash the packer
+            logger.warning(
+                "pack_under_budget: floor for key %r raised %s — no reservation",
+                p["key"],
+                exc,
+            )
+            continue
+        floors[p["key"]] = {"value": floored, "size": floored_size, "source": "floor"}
+    reserved_remaining = sum(f["size"] for f in floors.values())
+    # Critical-tier keys without their own floor reservation (e.g. identity /
+    # vision) MUST ship at full size — they raise PayloadTooLargeError rather
+    # than drop. They are not protected by the reservation mechanism, so they
+    # compete against ``budget - reserved_remaining``. If the floor reservations
+    # leave no room for them, honoring the floor guarantee would starve a
+    # critical key into a hard failure. Account for their full bytes here so we
+    # can drop the guarantee BEFORE that happens.
+    critical_full = sum(
+        p["size"]
+        for p in parts
+        if p["priority"] == "critical"
+        and not p["unserializable"]
+        and p["size"] is not None
+        and p["key"] not in floors
+    )
+    # If the full-floor reservations alone — or those reservations plus the
+    # non-floored critical keys' full bytes — exceed the budget we cannot honor
+    # them all. Before dropping reservations wholesale, try a degraded
+    # reservation pass that reserves each floored key's summarized form (when
+    # smaller) so same-tier siblings cannot still starve it into a silent drop.
+    # This preserves the strategic problem_model's "degrade loudly, don't
+    # disappear" contract even in the mixed critical/high contention band.
+    if reserved_remaining + critical_full > budget:
+        logger.warning(
+            "pack_under_budget: floor reservations (%d) + critical keys (%d) "
+            "exceed budget (%d) — attempting degraded reservations",
+            reserved_remaining,
+            critical_full,
+            budget,
+        )
+        degraded_budget = budget - critical_full
+        degraded_floors: dict[str, dict] = {}
+        degraded_reserved = 0
+        if degraded_budget > 0:
+            for p in parts:
+                if p["key"] not in floors:
+                    continue
+                # Viable degraded reservations for this key, smallest first. The
+                # floor value is ALWAYS available — it is exactly what
+                # ``floors[key]`` holds — so it is the guaranteed fallback form.
+                # The summarized candidate is added only when usable AND strictly
+                # smaller than the full value. Reserving the SMALLEST viable form
+                # leaves the most room for the other floored keys under the tight
+                # degraded budget; whichever we reserve, the packing loop can
+                # still opportunistically ship a richer form if free bytes remain.
+                #
+                # Falling back to the floor value here is essential: a key may
+                # have a valid floor but no usable summarized candidate (no
+                # summarize_fn, the summarizer raised, or it was not smaller).
+                # Without this fallback such a key would be excluded from
+                # ``degraded_floors`` and — if it were the only floored key —
+                # ``floors`` would be cleared entirely, dropping a floor that
+                # would have fit within ``budget - critical_full`` and breaking
+                # the packer's floor guarantee outside the summarize happy path.
+                floor_entry = floors[p["key"]]
+                degraded_candidates = [
+                    {
+                        "value": floor_entry["value"],
+                        "size": floor_entry["size"],
+                        "source": "floor",
+                        "meta": {"key": p["key"], "kind": "floored"},
+                    }
+                ]
+                summarized = _compute_summarized_candidate(p)
+                if summarized is not None and summarized["size"] < (p["size"] or 0):
+                    degraded_candidates.append(
+                        {
+                            "value": summarized["value"],
+                            "size": summarized["size"],
+                            "source": "summarized",
+                            "meta": summarized["meta"],
+                        }
+                    )
+                best = min(degraded_candidates, key=lambda c: c["size"])
+                if degraded_reserved + best["size"] > degraded_budget:
+                    continue
+                degraded_floors[p["key"]] = {
+                    "value": best["value"],
+                    "size": best["size"],
+                    "source": best["source"],
+                    "meta": best["meta"],
+                }
+                degraded_reserved += best["size"]
+
+        if degraded_floors:
+            floors = degraded_floors
+            reserved_remaining = degraded_reserved
+            logger.warning(
+                "pack_under_budget: preserving degraded reservations for keys %s",
+                sorted(degraded_floors.keys()),
+            )
+        else:
+            logger.warning(
+                "pack_under_budget: no degraded reservations fit — dropping the floor guarantee for this pack"
+            )
+            floors = {}
+            reserved_remaining = 0
+
     packed: dict = {}
     used = 0
     trimmed: list[dict] = []
@@ -474,65 +777,47 @@ def pack_under_budget(
 
     for p in parts:
         key = p["key"]
+        floor = floors.get(key)
+        if floor is not None:
+            # Release this key's reservation: those bytes are now claimable by it
+            # while the OTHER floored keys' reservations stay protected.
+            reserved_remaining -= floor["size"]
         if p["unserializable"]:
             dropped.append({"key": key, "reason": "value not JSON-serializable"})
             continue
-        remaining = budget - used
-        if p["size"] <= remaining:
+        size = p["size"]
+        assert size is not None
+        remaining = budget - used - reserved_remaining
+        if size <= remaining:
             packed[key] = p["value"]
-            used += p["size"]
+            used += size
             continue
         included = False
-        if p["summarize"] is not None:
-            try:
-                trimmed_value = p["summarize"](p["value"])
-            except Exception as exc:  # noqa: BLE001 — summarize fns must not crash the packer
-                logger.warning(
-                    "pack_under_budget: summarize for key %r raised %s — dropping",
-                    key,
-                    exc,
-                )
-            else:
-                try:
-                    trimmed_size = _serialized_size(trimmed_value)
-                except (TypeError, ValueError) as exc:
-                    logger.warning(
-                        "pack_under_budget: trimmed value for key %r not serializable (%s) — dropping",
-                        key,
-                        exc,
-                    )
-                    trimmed_size = None
-                if trimmed_size is not None:
-                    # Defensive: never grow the payload by trimming. If a caller's
-                    # summarize_fn returns a larger value (caller bug), revert to
-                    # original and proceed with the normal fits/drops decision.
-                    if trimmed_size > p["size"]:
-                        logger.warning(
-                            "pack_under_budget: summarize for key %r grew value (%d > %d) — using original",
-                            key,
-                            trimmed_size,
-                            p["size"],
-                        )
-                        trimmed_value = p["value"]
-                        trimmed_size = p["size"]
-                    if trimmed_size <= remaining:
-                        packed[key] = trimmed_value
-                        used += trimmed_size
-                        if isinstance(p["value"], list) and isinstance(
-                            trimmed_value, list
-                        ):
-                            trimmed.append(
-                                {
-                                    "key": key,
-                                    "kind": "list_trimmed",
-                                    "shown": len(trimmed_value),
-                                    "total": len(p["value"]),
-                                }
-                            )
-                        else:
-                            trimmed.append({"key": key, "kind": "summarized"})
-                        included = True
+        candidate = floors.get(key)
+        if candidate is not None and candidate.get("source") == "summarized":
+            if candidate["size"] <= remaining:
+                packed[key] = candidate["value"]
+                used += candidate["size"]
+                trimmed.append(candidate["meta"])
+                included = True
         if not included:
+            summarized = _compute_summarized_candidate(p)
+            if summarized is not None and summarized["size"] <= remaining:
+                packed[key] = summarized["value"]
+                used += summarized["size"]
+                trimmed.append(summarized["meta"])
+                included = True
+        if not included:
+            if floor is not None:
+                # Guaranteed-floor fallback: ship the floored value, which is
+                # certain to fit within the bytes reserved for this key (just
+                # released into ``remaining`` above). Reached only when there is
+                # no summarize_fn or it failed/overflowed — the floored value is
+                # the last-resort working set the strategist must always receive.
+                packed[key] = floor["value"]
+                used += floor["size"]
+                trimmed.append({"key": key, "kind": "floored"})
+                continue
             if p["priority"] == "critical":
                 top_keys = sorted(
                     ((pp["key"], pp["size"] or 0) for pp in parts),
@@ -578,6 +863,11 @@ def validate_task_payload(raw: dict) -> dict:
     Returns a plain dict (model_dump).  Raises ValueError on any violation
     (PayloadTooLargeError — a ValueError subclass — on size overflow).
     Extra keys present in *raw* are preserved (extra='allow').
+
+    For task types registered in the capability registry but absent from the
+    payload-model dispatch table, falls back to BasePayload (extra='allow' +
+    shared constraints). This enables a new task type to be runnable by
+    registration alone, without requiring a parallel edit to the dispatch dict.
     """
     type_value = raw.get("type")
     if not type_value:
@@ -591,7 +881,7 @@ def validate_task_payload(raw: dict) -> dict:
             f"Unknown task type {type_value!r}. Valid types: {valid}"
         ) from None
 
-    model_cls = _MODEL_FOR_TYPE[task_type]
+    model_cls = _MODEL_FOR_TYPE.get(task_type, BasePayload)
     try:
         instance = model_cls.model_validate(raw)
     except Exception as exc:
@@ -599,7 +889,7 @@ def validate_task_payload(raw: dict) -> dict:
             f"Invalid payload for task type {type_value!r}: {exc}"
         ) from exc
 
-    result = instance.model_dump(exclude_none=True)
+    result: dict[str, Any] = instance.model_dump(exclude_none=True)
     # Re-inject 'type' — it lives on the raw dict but not on the Pydantic model
     result["type"] = type_value
     _enforce_payload_size(result)

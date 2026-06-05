@@ -2,7 +2,7 @@ import { Search, ChevronDown, Check, GitFork } from 'lucide-react';
 import { useRef, useState, useEffect } from 'react';
 import type { RefObject } from 'react';
 import type { DateRange } from '../hooks/useSearchFilters';
-import { FILTER_TASK_TYPE_OPTIONS } from '../taskCapabilities';
+import { useTaskCapabilities } from '../taskCapabilities';
 import { FAILURE_CLASS_CONFIG } from './TaskCard';
 
 interface SearchFilterBarProps {
@@ -180,7 +180,7 @@ const FAILURE_CLASS_OPTIONS = Object.entries(FAILURE_CLASS_CONFIG).map(([value, 
 
 export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, failureClassFilter = [], onFailureClassFilterChange, dateRange, onDateRangeChange, blockedFilter, onBlockedFilterChange, onDownloadCsv, inputRef }: SearchFilterBarProps) {
   const [inputValue, setInputValue] = useState(searchQuery);
-  const typeOptions = FILTER_TASK_TYPE_OPTIONS;
+  const { filterOptions: typeOptions } = useTaskCapabilities();
   useEffect(() => {
     const timer = setTimeout(() => {
       onSearchChange(inputValue);

@@ -167,6 +167,7 @@ export const TASK_TYPE_HINTS: Record<string, string> = {
 // TASK_TYPE_HINTS or be explicitly opted-out here with justification.
 export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'review',           // Uses review-fix.ts bespoke prompt assembly
+  'panel_review',     // Uses panel-review.ts bespoke fixed-lens review assembly
   'plan',             // Uses research-plan.ts bespoke prompt assembly
   'research',         // Uses research-plan.ts bespoke prompt assembly
   'strategic_review', // Reuses research handler with research_mode branch; uses bespoke assembly
@@ -174,6 +175,9 @@ export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'design_doc_update', // Uses design-doc.ts bespoke prompt assembly
   'memo',             // Uses memo.ts bespoke prompt assembly (no-clone reasoning artifact)
   'verify_tests',     // Uses verify-tests.ts; runs the detected suite directly, no Claude prompt
+  'compute_experiment', // Uses compute-experiment.ts; launches+polls a compute job, no Claude prompt
+  'web_research',     // Uses web-research.ts bespoke prompt assembly (web-first knowledge doc)
+  'design',           // Uses design.ts bespoke prompt assembly (codebase-grounded design doc)
 ]);
 
 // ── Dynamic Task Type Hints (based on project build configuration) ───────────
@@ -564,7 +568,7 @@ export function shellEscapeDoubleQuoted(value: string): string {
   return value.replace(/[\\"`$]/g, '\\$&');
 }
 
-export function writePlaybookHelper(taskIdRaw: string): void {
+export function writePlaybookHelper(taskIdRaw: string, workspace: string = WORKSPACE): void {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
   const helperScript = `#!/bin/bash
 OP="\${1:?Usage: playbook get|set|list [key] [content]}"
@@ -580,8 +584,14 @@ if [ "$OP" = "get" ]; then
       -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
 elif [ "$OP" = "set" ]; then
   [ -z "$KEY" ] || [ -z "$VALUE" ] && { echo "Error: set requires <key> and <content>" >&2; exit 1; }
-  jq -n --arg tid "$TASK" --arg k "$KEY" --arg v "$VALUE" \\
-    '{task_id: $tid, op: "set", key: $k, value: $v}' | \\
+  # Capture branch/HEAD provenance at write time so the backend can stamp it on
+  # the entry. Absent (non-git workspace) => omitted => backend keeps it legacy.
+  BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+  HEAD_SHA=$(git rev-parse --short HEAD 2>/dev/null || true)
+  jq -n --arg tid "$TASK" --arg k "$KEY" --arg v "$VALUE" --arg br "$BRANCH" --arg sha "$HEAD_SHA" \\
+    '{task_id: $tid, op: "set", key: $k, value: $v}
+       + (if $br == "" then {} else {branch: $br} end)
+       + (if $sha == "" then {} else {head_sha: $sha} end)' | \\
     curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
       -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
 elif [ "$OP" = "list" ]; then
@@ -594,45 +604,68 @@ else
 fi
 echo ""
 `;
-  fs.writeFileSync(`${WORKSPACE}/playbook`, helperScript, { mode: 0o755 });
+  fs.writeFileSync(`${workspace}/playbook`, helperScript, { mode: 0o755 });
   excludeAgentHelpers();
 }
 
-export function writeMessagesHelper(taskIdRaw: string): void {
+export function writeMessagesHelper(taskIdRaw: string, workspace: string = WORKSPACE): void {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
   const helperScript = `#!/bin/bash
 # Message tool — send messages to the project owner or resolve open messages
 # Usage:
 #   ./messages send '<content>'                    # send a NOTE message
 #   ./messages send '<content>' QUESTION           # send with specific type (NOTE|QUESTION|FEEDBACK|BUG_REPORT|BLOCKER)
-#   ./messages resolve <message-id> '<resolution>' # resolve an open message
+#   ./messages resolve <ref> '<resolution>'        # resolve an open message; <ref> may be a
+#                                                  #   short ref (first 8+ hex chars of the
+#                                                  #   message UUID, as shown in the admin UI)
+#                                                  #   or a full UUID — the backend resolves it,
+#                                                  #   so no need to recover the full UUID.
 
 OP="\${1:?Usage: messages send|resolve ...}"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 TASK="${taskId}"
-CURL_OPTS="-f -sS --max-time 30 --connect-timeout 10"
+CURL_OPTS="-sS --max-time 30 --connect-timeout 10"
+
+_post_strategic() {
+  local response http_code body
+  if ! response=$(curl $CURL_OPTS -X POST "$API/api/agent/strategic" \\
+    -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" \\
+    --data-binary @- \\
+    -w '\\n%{http_code}'); then
+    return 1
+  fi
+  http_code=$(printf '%s' "$response" | tail -n1)
+  body=$(printf '%s' "$response" | head -n -1)
+  if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+    printf '%s' "$body"
+    return 0
+  fi
+  if [ -n "$body" ]; then
+    printf '%s\\n' "$body" >&2
+  fi
+  echo "[ERROR] messages $OP failed (HTTP $http_code)" >&2
+  return 1
+}
 
 if [ "$OP" = "send" ]; then
   CONTENT="\${2:?send requires '<content>'}"
   MSG_TYPE="\${3:-NOTE}"
   jq -n --arg tid "$TASK" --arg t "$MSG_TYPE" --arg c "$CONTENT" \\
     '{task_id: $tid, op: "create_message", data: {type: $t, content: $c}}' | \\
-    curl $CURL_OPTS -X POST "$API/api/agent/strategic" \\
-      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+    _post_strategic
 elif [ "$OP" = "resolve" ]; then
   MSG_ID="\${2:?resolve requires <message-id>}"
   RESOLUTION="\${3:-Addressed}"
   jq -n --arg tid "$TASK" --arg mid "$MSG_ID" --arg r "$RESOLUTION" \\
     '{task_id: $tid, op: "resolve_message", data: {message_id: $mid, resolution: $r}}' | \\
-    curl $CURL_OPTS -X POST "$API/api/agent/strategic" \\
-      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+    _post_strategic
 else
   echo "Unknown op: $OP. Use send or resolve." >&2; exit 1
 fi
 echo ""
 `;
-  fs.writeFileSync(`${WORKSPACE}/messages`, helperScript, { mode: 0o755 });
+  fs.writeFileSync(`${workspace}/messages`, helperScript, { mode: 0o755 });
   excludeAgentHelpers();
 }
 
@@ -648,37 +681,31 @@ echo ""
 // expecting the client to retry (see backend/app/task_locking.py). A single
 // fail-fast curl would drop the page write silently, so set/delete retry a
 // bounded number of times, honoring Retry-After, before surfacing a real error.
-export function writeDesignDocHelper(taskIdRaw: string, workspace: string = WORKSPACE): void {
+export function writeDesignDocHelper(
+  taskIdRaw: string,
+  workspace: string = WORKSPACE,
+  opts: { readOnly?: boolean } = {},
+): void {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
-  const helperScript = `#!/bin/bash
-# Design doc wiki tool — updates pages incrementally via API
-# Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env (no secrets on disk)
-# Usage:
-#   ./design-doc get <key>                — read a section
+  // Read-only mode (research / plan workspaces): the prompt only promises
+  // `./design-doc get|list`, and these agents must never mutate durable
+  // strategic state. We provision the read subset and reject set/delete with a
+  // clear message instead of silently shipping a write path they shouldn't use.
+  const readOnly = opts.readOnly === true;
+  const usageComment = readOnly
+    ? `#   ./design-doc get <key>                — read a section
+#   ./design-doc list                     — list all section keys`
+    : `#   ./design-doc get <key>                — read a section
 #   ./design-doc set <key> '<json-value>' — write a section (durable: retries on 429/5xx)
 #   ./design-doc delete <key>             — remove a section (durable: retries on 429/5xx)
-#   ./design-doc list                     — list all section keys
+#   ./design-doc list                     — list all section keys`;
+  const usageLine = readOnly ? 'get|list' : 'get|set|delete|list';
 
-OP="\${1:?Usage: design-doc get|set|delete|list <key> [json-value]}"
-KEY="$2"
-VALUE="$3"
-API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
-TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
-TASK="${taskId}"
-
-# Fail-fast POST for read operations (list/get): single curl, no retry.
-_post_once() {
-  curl -f -sS --max-time 30 --connect-timeout 10 \\
-    -X POST "$API/api/agent/design-doc" \\
-    -H "Content-Type: application/json" \\
-    -H "X-Agent-Token: $TOKEN" \\
-    --data-binary @-
-}
-
-# Durable POST for write operations (set/delete). Retries up to 3 times on
-# 429 (lock contention / rate limit) and 5xx (transient), honoring the
-# Retry-After header when present and falling back to linear backoff.
-# Non-retryable responses (other 4xx) surface immediately.
+  // Durable POST for write operations (set/delete). Retries up to 3 times on
+  // 429 (lock contention / rate limit) and 5xx (transient), honoring the
+  // Retry-After header when present and falling back to linear backoff.
+  // Non-retryable responses (other 4xx) surface immediately.
+  const retryFn = readOnly ? '' : `
 _post_retry() {
   local body="$1"
   local attempt=0 max=3 delay http_code response dump
@@ -714,15 +741,9 @@ _post_retry() {
   echo "[ERROR] design-doc $OP failed after $max attempts" >&2
   return 1
 }
-
-if [ "$OP" = "list" ]; then
-  printf '{"task_id":"%s","op":"list"}' "$TASK" | _post_once
-elif [ "$OP" = "get" ]; then
-  if [ -z "$KEY" ]; then
-    echo "Error: get requires <key>" >&2; exit 1
-  fi
-  printf '{"task_id":"%s","op":"get","key":"%s"}' "$TASK" "$KEY" | _post_once
-elif [ "$OP" = "set" ]; then
+`;
+  const writeBranches = readOnly ? `elif [ "$OP" = "set" ] || [ "$OP" = "delete" ]; then
+  echo "Error: ./design-doc is read-only in this workspace ($OP not permitted)." >&2; exit 1` : `elif [ "$OP" = "set" ]; then
   if [ -z "$KEY" ] || [ -z "$VALUE" ]; then
     echo "Error: set requires <key> and <json-value>" >&2; exit 1
   fi
@@ -731,9 +752,40 @@ elif [ "$OP" = "delete" ]; then
   if [ -z "$KEY" ]; then
     echo "Error: delete requires <key>" >&2; exit 1
   fi
-  _post_retry "$(printf '{"task_id":"%s","op":"delete","key":"%s"}' "$TASK" "$KEY")"
+  _post_retry "$(printf '{"task_id":"%s","op":"delete","key":"%s"}' "$TASK" "$KEY")"`;
+  const unknownUsage = readOnly ? 'Use get or list.' : 'Use get, set, delete, or list.';
+  const helperScript = `#!/bin/bash
+# Design doc wiki tool — updates pages incrementally via API
+# Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env (no secrets on disk)
+# Usage:
+${usageComment}
+
+OP="\${1:?Usage: design-doc ${usageLine} <key> [json-value]}"
+KEY="$2"
+VALUE="$3"
+API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
+TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+TASK="${taskId}"
+
+# Fail-fast POST for read operations (list/get): single curl, no retry.
+_post_once() {
+  curl -f -sS --max-time 30 --connect-timeout 10 \\
+    -X POST "$API/api/agent/design-doc" \\
+    -H "Content-Type: application/json" \\
+    -H "X-Agent-Token: $TOKEN" \\
+    --data-binary @-
+}
+${retryFn}
+if [ "$OP" = "list" ]; then
+  printf '{"task_id":"%s","op":"list"}' "$TASK" | _post_once
+elif [ "$OP" = "get" ]; then
+  if [ -z "$KEY" ]; then
+    echo "Error: get requires <key>" >&2; exit 1
+  fi
+  printf '{"task_id":"%s","op":"get","key":"%s"}' "$TASK" "$KEY" | _post_once
+${writeBranches}
 else
-  echo "Unknown op: $OP. Use get, set, delete, or list." >&2; exit 1
+  echo "Unknown op: $OP. ${unknownUsage}" >&2; exit 1
 fi
 # Propagate the helper's exit status so the model sees a real failure after
 # retries are exhausted (the trailing newline must not mask a non-zero rc).
@@ -755,6 +807,15 @@ export interface PlaybookEntry {
     reasons?: string[];
     local_match?: boolean;
   };
+  // Branch/HEAD the entry was authored against, stamped at write time. Absent
+  // for legacy entries written before provenance capture. ``diverged`` is set
+  // by the backend when the origin branch differs from the reader's
+  // integration branch — drives the possibly-outdated caveat below.
+  provenance?: {
+    branch?: string;
+    head_sha?: string;
+    diverged?: boolean;
+  };
 }
 
 export function formatPlaybook(
@@ -774,11 +835,15 @@ export function formatPlaybook(
         const relevanceLine = reasons.length > 0
           ? `> Relevance: ${reasons.join('; ')}\n\n`
           : '';
+        const prov = value.provenance;
+        const provenanceLine = prov && (prov.branch || prov.head_sha)
+          ? `> Recorded on ${prov.branch || 'unknown branch'}${prov.head_sha ? ` @ ${prov.head_sha}` : ''}${prov.diverged ? ' (⚠ different branch than yours — code may not exist on your branch)' : ''}\n\n`
+          : '';
         content = value.content;
-        if (value.stale || value.effectiveness_score < 0.3) {
+        if (value.stale || value.provenance?.diverged || value.effectiveness_score < 0.3) {
           caveat = '> ⚠ Possibly outdated or low confidence — verify before applying.\n\n';
         }
-        caveat = `${relevanceLine}${caveat}`;
+        caveat = `${relevanceLine}${provenanceLine}${caveat}`;
       }
       return `### ${key}\n${caveat}${content}`;
     })

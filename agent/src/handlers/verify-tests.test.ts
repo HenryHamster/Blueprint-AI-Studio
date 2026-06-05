@@ -11,6 +11,10 @@ vi.mock('../index.js', async (importOriginal) => {
     sendLog: vi.fn(),
     persistAndPostStatus: vi.fn().mockResolvedValue(undefined),
     validateBranchName: vi.fn((b: string) => b),
+    // execFileAsync drives the acceptance probe; mocked so the fall-open tests
+    // never shell out. Default resolves (probe pass) but is irrelevant unless a
+    // probe is detected (detectAcceptanceProbes defaults to [] below).
+    execFileAsync: vi.fn().mockResolvedValue(''),
   };
 });
 
@@ -27,7 +31,15 @@ vi.mock('../utils/test-runners.js', async (importOriginal) => {
   // detectAutoTestRunners is mocked so the stale-command recovery path is
   // deterministic (no real filesystem scan). describeRunnerDirectory stays real
   // so recovered_directories reflects the actual cmd→type/path mapping.
-  return { ...actual, detectTestRunners: vi.fn(), detectAutoTestRunners: vi.fn() };
+  // detectAcceptanceProbes is mocked so the fall-open paths never scan the real
+  // filesystem; classifyProbeOutcome stays REAL so the probe verdict reflects the
+  // actual signature classification of the mocked execFileAsync error.
+  return {
+    ...actual,
+    detectTestRunners: vi.fn(),
+    detectAutoTestRunners: vi.fn(),
+    detectAcceptanceProbes: vi.fn(),
+  };
 });
 
 vi.mock('../utils/test-fix-loop.js', async (importOriginal) => {
@@ -42,9 +54,20 @@ vi.mock('fs', () => ({
 }));
 
 import { handleVerifyTests } from './verify-tests.js';
-import { persistAndPostStatus } from '../index.js';
-import { detectTestRunners, detectAutoTestRunners } from '../utils/test-runners.js';
+import { persistAndPostStatus, execFileAsync } from '../index.js';
+import { detectTestRunners, detectAutoTestRunners, detectAcceptanceProbes } from '../utils/test-runners.js';
 import { testFixLoop } from '../utils/test-fix-loop.js';
+
+const PY_PROBE = {
+  cmd: 'python3', args: ['-m', 'compileall', '-q', '/tmp/workspace'],
+  cwd: '/tmp/workspace', ecosystem: 'python' as const, label: 'python3 -m compileall (root)',
+};
+// An operator-declared build command probe (build_cmd).
+const DECLARED_PROBE = {
+  cmd: 'npm', args: ['run', 'build'],
+  cwd: '/tmp/workspace/admin-ui', ecosystem: 'node' as const,
+  label: 'npm run build (admin-ui)', declared: true,
+};
 
 const RUNNER = { cmd: 'npm', args: ['test'], cwd: '/tmp/workspace', label: 'npm test (root)' };
 // A stored runner pointing at a now-stale command (e.g. a dropped Makefile target).
@@ -60,13 +83,20 @@ function lastPostedPayload(): Record<string, unknown> {
   return calls[calls.length - 1][1];
 }
 
+type Probe = {
+  ran: boolean; ecosystem: string; outcome: string;
+  passed: boolean; could_not_run: boolean; output: string; label: string;
+  declared?: boolean; wrote_no_artifact?: boolean;
+};
 function parsedVerdict(): {
   detected: boolean; passed: boolean; tests: unknown[]; output: string;
   recovered?: boolean; recovered_directories?: Array<{ path: string; type: string; test_cmd: string }>;
+  probe?: Probe;
 } {
   return JSON.parse(lastPostedPayload().logs as string) as {
     detected: boolean; passed: boolean; tests: unknown[]; output: string;
     recovered?: boolean; recovered_directories?: Array<{ path: string; type: string; test_cmd: string }>;
+    probe?: Probe;
   };
 }
 
@@ -80,6 +110,10 @@ describe('handleVerifyTests', () => {
     // placeholder/empty fall-open tests behave exactly as before. Recovery
     // tests override this per-case.
     vi.mocked(detectAutoTestRunners).mockReturnValue([]);
+    // Default: no probeable ecosystem, so the existing fall-open tests carry no
+    // probe field and behave exactly as before. Probe tests override this.
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([]);
+    vi.mocked(execFileAsync).mockResolvedValue('');
   });
 
   it('passing suite → COMPLETED with detected=true, passed=true', async () => {
@@ -147,6 +181,55 @@ describe('handleVerifyTests', () => {
     expect(verdict.detected).toBe(false);
     expect(verdict.setupFailed).toBe(true);
     expect(verdict.output).toContain('registry timeout');
+  });
+
+  it('persistent PARTIAL setup failure → FAILED (fails closed, distinguishable via partialSetupFailed)', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+    // A sibling runner ran but another failed setup — the partial-setup signal
+    // persists across the bounded retries. Must fail the gate closed (FAILED
+    // MERGE_TEST_RESULT), NOT report a clean detected=true/passed=true verdict.
+    vi.mocked(testFixLoop).mockResolvedValue({
+      passed: false,
+      testFailuresDetected: false,
+      partialSetupFailed: true,
+      failureSummary: 'Partial setup failure — [pytest (backend)] npm ci failed: registry timeout',
+    });
+
+    await handleVerifyTests('t5p', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const post = lastPostedPayload();
+    expect(post.status).toBe('FAILED');
+    expect(post.artifact_type).toBe('MERGE_TEST_RESULT');
+    const verdict = parsedVerdict() as {
+      detected: boolean; passed: boolean; setupFailed?: boolean; partialSetupFailed?: boolean; output: string;
+    };
+    expect(verdict.detected).toBe(false);
+    expect(verdict.passed).toBe(false);
+    expect(verdict.partialSetupFailed).toBe(true);
+    // An all-runners setupFailed escalation is NOT the same condition.
+    expect(verdict.setupFailed).toBeFalsy();
+    expect(verdict.output).toContain('registry timeout');
+    // Bounded retry fired: testFixLoop was re-invoked past the first attempt.
+    expect(vi.mocked(testFixLoop).mock.calls.length).toBeGreaterThan(1);
+  });
+
+  it('environment-style setup failure output also posts FAILED with setupFailed=true', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+    vi.mocked(testFixLoop).mockResolvedValue({
+      passed: false,
+      testFailuresDetected: false,
+      setupFailed: true,
+      failureSummary: "Traceback (most recent call last):\nModuleNotFoundError: No module named 'sqlalchemy'",
+    });
+
+    await handleVerifyTests('t4b', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const post = lastPostedPayload();
+    expect(post.status).toBe('FAILED');
+    const verdict = parsedVerdict() as { detected: boolean; setupFailed?: boolean; output: string };
+    expect(verdict.detected).toBe(false);
+    expect(verdict.setupFailed).toBe(true);
+    expect(verdict.output).toContain("No module named 'sqlalchemy'");
   });
 
   it('placeholder suite (failed but no real tests) → detected=false (proceed-without-checks fallback)', async () => {
@@ -353,6 +436,215 @@ describe('handleVerifyTests', () => {
     expect(vi.mocked(detectAutoTestRunners)).not.toHaveBeenCalled();
   });
 
+  // ── Acceptance probe on the detected=false fall-open paths ────────────────
+  it('no suite + probe PASSES → detected=false fall-open carries probe.passed=true', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([]);
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([PY_PROBE]);
+    vi.mocked(execFileAsync).mockResolvedValue(''); // compileall exits 0
+
+    await handleVerifyTests('p1', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    expect(lastPostedPayload().status).toBe('COMPLETED');
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(false);
+    expect(verdict.probe).toBeDefined();
+    expect(verdict.probe?.ran).toBe(true);
+    expect(verdict.probe?.passed).toBe(true);
+    expect(verdict.probe?.could_not_run).toBe(false);
+    expect(verdict.probe?.ecosystem).toBe('python');
+    expect(verdict.output).toContain('Acceptance probe passed');
+  });
+
+  it('no suite + probe FAILS (syntax error) → detected=false but probe.passed=false (backend blocks)', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([]);
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([PY_PROBE]);
+    // execFileAsync rejects with a clean compile error → classifyProbeOutcome=fail.
+    const err = Object.assign(new Error('Command failed\n  File "x.py", line 2\n    def\n       ^\nSyntaxError: invalid syntax'), {
+      stdout: '', stderr: 'SyntaxError: invalid syntax', status: 1, code: undefined,
+    });
+    vi.mocked(execFileAsync).mockRejectedValue(err);
+
+    await handleVerifyTests('p2', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    expect(lastPostedPayload().status).toBe('COMPLETED');
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(false);
+    expect(verdict.probe?.ran).toBe(true);
+    expect(verdict.probe?.passed).toBe(false);
+    expect(verdict.probe?.could_not_run).toBe(false);
+    expect(verdict.probe?.outcome).toBe('fail');
+    expect(verdict.probe?.output).toContain('SyntaxError');
+    expect(verdict.output).toContain('Acceptance probe FAILED');
+  });
+
+  it('no suite + probe CANNOT RUN (missing deps) → detected=false fall-open, probe.could_not_run=true (no block)', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([]);
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([PY_PROBE]);
+    const err = Object.assign(new Error('spawn python3 ENOENT'), { code: 'ENOENT' });
+    vi.mocked(execFileAsync).mockRejectedValue(err);
+
+    await handleVerifyTests('p3', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(false);
+    expect(verdict.probe?.ran).toBe(true);
+    expect(verdict.probe?.passed).toBe(false);
+    expect(verdict.probe?.could_not_run).toBe(true);
+    expect(verdict.probe?.outcome).toBe('could_not_run');
+    expect(verdict.output).toContain('Acceptance probe could not run');
+  });
+
+  it('all-skipped suite + probe FAILS → detected=false, all_skipped reason preserved, probe.passed=false', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+    vi.mocked(testFixLoop).mockResolvedValue({
+      passed: true, testFailuresDetected: false, noTestsExecuted: true, noTestsReason: 'all_skipped',
+    });
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([PY_PROBE]);
+    const err = Object.assign(new Error('SyntaxError: invalid syntax'), { stderr: 'SyntaxError: invalid syntax', status: 1 });
+    vi.mocked(execFileAsync).mockRejectedValue(err);
+
+    await handleVerifyTests('p4', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict() as { detected: boolean; noTestsReason?: string; probe?: Probe };
+    expect(verdict.detected).toBe(false);
+    expect(verdict.noTestsReason).toBe('all_skipped');
+    expect(verdict.probe?.passed).toBe(false);
+    expect(verdict.probe?.could_not_run).toBe(false);
+  });
+
+  // ── Declared build_cmd probe on the fall-open paths ───────────────────────
+  it('no suite + declared build PASSES → fall-open carries declared probe + wording', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([]);
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([DECLARED_PROBE]);
+    vi.mocked(execFileAsync).mockResolvedValue(''); // npm run build exits 0
+
+    await handleVerifyTests('d1', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(false);
+    expect(verdict.probe?.ran).toBe(true);
+    expect(verdict.probe?.passed).toBe(true);
+    expect(verdict.probe?.declared).toBe(true);
+    expect(verdict.output).toContain('declared build command `npm run build (admin-ui)`');
+  });
+
+  // Distinguish the git working-tree snapshot calls from the build command so a
+  // test can simulate a real build (tree changes) vs a no-op build (tree static).
+  function mockProbeWithTree(before: string, after: string): void {
+    let gitCalls = 0;
+    vi.mocked(execFileAsync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'git') {
+        gitCalls += 1;
+        return Promise.resolve(gitCalls === 1 ? before : after);
+      }
+      return Promise.resolve(''); // the declared build exits 0
+    });
+  }
+
+  it('no suite + declared build PASSES but wrote NOTHING → wrote_no_artifact flag + no-op wording', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([]);
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([DECLARED_PROBE]);
+    // before === after: the build wrote no new output (no-op build).
+    mockProbeWithTree('!! node_modules/\n', '!! node_modules/\n');
+
+    await handleVerifyTests('noop1', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.probe?.passed).toBe(true);
+    expect(verdict.probe?.declared).toBe(true);
+    expect(verdict.probe?.wrote_no_artifact).toBe(true);
+    expect(verdict.output).toContain('wrote no artifact');
+  });
+
+  it('no suite + declared build PASSES and wrote output → wrote_no_artifact false, normal wording', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([]);
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([DECLARED_PROBE]);
+    // after has a NEW untracked artifact relative to before → real build.
+    mockProbeWithTree('!! node_modules/\n', '!! node_modules/\n?? dist/bundle.js\n');
+
+    await handleVerifyTests('real1', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.probe?.passed).toBe(true);
+    expect(verdict.probe?.wrote_no_artifact).toBe(false);
+    expect(verdict.output).toContain('declared build command `npm run build (admin-ui)` and it passed');
+  });
+
+  it('no suite + declared build PASSES but tree unobservable (git fails) → flag unset', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([]);
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([DECLARED_PROBE]);
+    // git snapshot rejects (not a repo / git unavailable); build still exits 0.
+    vi.mocked(execFileAsync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'git') return Promise.reject(new Error('not a git repository'));
+      return Promise.resolve('');
+    });
+
+    await handleVerifyTests('unobs1', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.probe?.passed).toBe(true);
+    // Observation unavailable → flag must be UNSET so the backend keeps probe_passed.
+    expect(verdict.probe?.wrote_no_artifact).toBeUndefined();
+    expect(verdict.output).toContain('declared build command `npm run build (admin-ui)` and it passed');
+  });
+
+  it('no suite + declared build FAILS (clean non-zero) → probe.passed=false (backend blocks)', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([]);
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([DECLARED_PROBE]);
+    // A clean build error with no missing-tool/dep signature → fail for declared.
+    const err = Object.assign(new Error('Command failed: npm run build\nwebpack: build error'), {
+      stdout: '', stderr: 'webpack: build error in module foo', status: 1, code: undefined,
+    });
+    vi.mocked(execFileAsync).mockRejectedValue(err);
+
+    await handleVerifyTests('d2', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(false);
+    expect(verdict.probe?.ran).toBe(true);
+    expect(verdict.probe?.passed).toBe(false);
+    expect(verdict.probe?.could_not_run).toBe(false);
+    expect(verdict.probe?.outcome).toBe('fail');
+    expect(verdict.probe?.declared).toBe(true);
+    expect(verdict.output).toContain('declared build command `npm run build (admin-ui)` and it FAILED');
+  });
+
+  it('no suite + declared build CANNOT RUN (missing tool) → could_not_run, no block', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([]);
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([DECLARED_PROBE]);
+    const err = Object.assign(new Error('failed'), {
+      stdout: '', stderr: 'bash: npm: command not found', status: 127, code: undefined,
+    });
+    vi.mocked(execFileAsync).mockRejectedValue(err);
+
+    await handleVerifyTests('d3', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(false);
+    expect(verdict.probe?.could_not_run).toBe(true);
+    expect(verdict.probe?.outcome).toBe('could_not_run');
+    expect(verdict.probe?.declared).toBe(true);
+    expect(verdict.output).toContain('could not run');
+  });
+
+  it('detected real pass → no probe run (probe only runs on fall-open)', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+    vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([PY_PROBE]);
+
+    await handleVerifyTests('p5', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(true);
+    expect(verdict.probe).toBeUndefined();
+    // The acceptance probe is never even detected on a real-suite verdict.
+    expect(vi.mocked(detectAcceptanceProbes)).not.toHaveBeenCalled();
+    // The documented-command probe always diffs (git) regardless of the suite
+    // verdict, but no acceptance-probe command should run on a real-suite pass.
+    const nonGitCalls = vi.mocked(execFileAsync).mock.calls.filter(c => c[0] !== 'git');
+    expect(nonGitCalls).toHaveLength(0);
+  });
+
   it('runs testFixLoop once with maxFixAttempts 0 (no fix loop)', async () => {
     vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
     vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
@@ -362,5 +654,106 @@ describe('handleVerifyTests', () => {
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledTimes(1);
     const opts = vi.mocked(testFixLoop).mock.calls[0].at(-1) as { maxFixAttempts: number };
     expect(opts.maxFixAttempts).toBe(0);
+  });
+
+  it('declared build_cmd probe runs under larger timeout than generic probes', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([]);
+    // Return both a generic probe and a declared probe to verify different timeouts
+    const genericProbe = { ...PY_PROBE };
+    const declaredProbe = { ...DECLARED_PROBE };
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([genericProbe, declaredProbe]);
+
+    // Track calls to execFileAsync to verify timeout values
+    const probeCalls: Array<{ cmd: string; timeoutMs?: number }> = [];
+    vi.mocked(execFileAsync).mockImplementation((cmd: unknown, _args: unknown, opts?: unknown) => {
+      probeCalls.push({ cmd: cmd as string, timeoutMs: (opts as { timeoutMs?: number } | undefined)?.timeoutMs });
+      return Promise.resolve('');
+    });
+
+    await handleVerifyTests('timeout1', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    // Filter out the documented-command probe's git-diff calls — this test is
+    // about the two acceptance-probe timeouts (one generic, one declared).
+    const callsWithTimeouts = probeCalls.filter(c => c.cmd !== 'git');
+    expect(callsWithTimeouts).toHaveLength(2);
+    // The generic Python probe should use the smaller timeout (TEST_BASELINE_TIMEOUT = 60_000)
+    expect(callsWithTimeouts[0].timeoutMs).toBe(60_000);
+    // The declared build probe should use the larger timeout (TEST_RUNNER_TIMEOUT = 180_000)
+    expect(callsWithTimeouts[1].timeoutMs).toBe(180_000);
+  });
+
+  // ── Newly-disabled-tests visibility probe (diff-aware, never blocks) ────────
+  describe('disabledTests visibility field', () => {
+    type VerdictWithDisabled = {
+      detected: boolean; passed: boolean;
+      disabledTests?: { count: number; markers: Array<{ file: string; marker: string; line: string }> };
+    };
+    function verdictWithDisabled(): VerdictWithDisabled {
+      return JSON.parse(lastPostedPayload().logs as string) as VerdictWithDisabled;
+    }
+    // Drive the shared PR-diff `git diff` passes (--name-only then --unified=0)
+    // off a per-file added-lines map; every non-git call resolves empty.
+    function mockGitDiff(addedByFile: Record<string, string[]>): void {
+      const files = Object.keys(addedByFile);
+      const unified = files
+        .map(f => `diff --git a/${f} b/${f}\n--- a/${f}\n+++ b/${f}\n@@ -0,0 +1 @@\n${addedByFile[f].map(l => `+${l}`).join('\n')}`)
+        .join('\n');
+      vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
+        if (cmd === 'git') {
+          const a = args as string[];
+          if (a.includes('--name-only')) return Promise.resolve(files.join('\n'));
+          if (a.includes('--unified=0')) return Promise.resolve(unified);
+        }
+        return Promise.resolve('');
+      });
+    }
+
+    it('surfaces disabledTests with the right count when the PR newly skips tests', async () => {
+      vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+      vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
+      mockGitDiff({ 'src/foo.test.ts': ['it.skip("flaky", () => {})', 'describe.skip("grp", () => {})'] });
+
+      await handleVerifyTests('dt1', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+      const verdict = verdictWithDisabled();
+      // Visibility-only: the suite verdict is unchanged (still a clean pass).
+      expect(verdict.detected).toBe(true);
+      expect(verdict.passed).toBe(true);
+      const dt = verdict.disabledTests;
+      expect(dt).toBeDefined();
+      expect(dt?.count).toBe(2);
+      expect(dt?.markers.map(m => m.marker).sort()).toEqual(['describe.skip', 'it.skip']);
+      expect(dt?.markers[0].file).toBe('src/foo.test.ts');
+    });
+
+    it('omits disabledTests entirely when the PR introduces no new skips', async () => {
+      vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+      vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
+      mockGitDiff({ 'src/foo.test.ts': ['expect(value).toBe(1);'] });
+
+      await handleVerifyTests('dt2', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+      expect(verdictWithDisabled().disabledTests).toBeUndefined();
+    });
+
+    it('omits disabledTests when the PR diff cannot be computed (base ref unavailable)', async () => {
+      vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+      vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
+      // The shared diff fails: the --name-only pass rejects → both diff-aware
+      // probes degrade to fall-open and the field is absent.
+      vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
+        if (cmd === 'git' && (args as string[]).includes('--name-only')) {
+          return Promise.reject(new Error('unknown revision origin/main'));
+        }
+        return Promise.resolve('');
+      });
+
+      await handleVerifyTests('dt3', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+      const verdict = verdictWithDisabled();
+      expect(verdict.detected).toBe(true);
+      expect(verdict.passed).toBe(true);
+      expect(verdict.disabledTests).toBeUndefined();
+    });
   });
 });

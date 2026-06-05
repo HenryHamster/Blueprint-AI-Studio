@@ -37,19 +37,38 @@ vi.mock('child_process', () => ({
 
 vi.mock('fs', () => ({
   default: {
-    existsSync: vi.fn(() => true), // node_modules present → skip npm ci
+    // node_modules present → skip npm ci; no pre-install marker files present
+    // so Python/Go/Rust pre-install steps are not triggered in these tests.
+    existsSync: vi.fn((p: unknown) =>
+      typeof p === 'string' && (p.endsWith('/node_modules') || p.includes('/node_modules/')),
+    ),
     readFileSync: vi.fn(() => ''),
     unlinkSync: vi.fn(),
   },
 }));
 
-import { testFixLoop, matchesSizeBreachSignature } from './test-fix-loop.js';
+import fs from 'fs';
+import { testFixLoop, matchesSizeBreachSignature, matchesTransientSetupFailure } from './test-fix-loop.js';
 import { runClaudeCode } from '../providers/runners.js';
 import type { TestRunner } from './test-runners.js';
+
+// Default fs.existsSync behavior matching the module-level mock factory:
+// only node_modules paths "exist" (so npm ci is skipped and no non-npm
+// pre-install marker files are present). Tests that exercise a specific
+// ecosystem's pre-install path override this per-test.
+const defaultExistsSync = (p: unknown): boolean =>
+  typeof p === 'string' && (p.endsWith('/node_modules') || p.includes('/node_modules/'));
 
 const NPM_RUNNER: TestRunner = { cmd: 'npm', args: ['test'], cwd: '/tmp/workspace', label: 'npm test (root)' };
 const PLACEHOLDER_RUNNER: TestRunner = { cmd: 'npm', args: ['test'], cwd: '/tmp/workspace/packages/a', label: 'npm test (packages/a)' };
 const REAL_RUNNER: TestRunner = { cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: '/tmp/workspace/packages/b', label: 'pytest (packages/b)' };
+const INSTALL_RUNNER: TestRunner = {
+  cmd: 'python3',
+  args: ['-m', 'pytest', '-x', '-q'],
+  cwd: '/tmp/workspace/packages/c',
+  label: 'pytest (packages/c)',
+  installCmd: 'python3 -m pip install -e . && python3 -m pip check',
+};
 const statusRef = { value: '' };
 
 describe('testFixLoop — noTestsExecuted aggregation (maxFixAttempts: 0)', () => {
@@ -219,6 +238,116 @@ describe('testFixLoop — noTestsExecuted aggregation (maxFixAttempts: 0)', () =
     expect(result.testFailuresDetected).toBe(true);
     expect(result.noTestsExecuted).toBe(true);
   });
+
+  it('declared install_cmd runs before the suite using the safe shell-wrapper path', async () => {
+    execFileAsync
+      .mockResolvedValueOnce('installed')
+      .mockResolvedValueOnce('1 passed in 0.10s');
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [INSTALL_RUNNER] },
+    );
+
+    expect(result.passed).toBe(true);
+    expect(execFileAsync).toHaveBeenNthCalledWith(
+      1,
+      'bash',
+      ['-c', 'python3 -m pip install -e . && python3 -m pip check'],
+      expect.objectContaining({ cwd: INSTALL_RUNNER.cwd }),
+    );
+    expect(execFileAsync).toHaveBeenNthCalledWith(
+      2,
+      'python3',
+      ['-m', 'pytest', '-x', '-q'],
+      expect.objectContaining({ cwd: INSTALL_RUNNER.cwd }),
+    );
+  });
+
+  it('declared install_cmd failure stays setupFailed when the VM is missing pip itself', async () => {
+    execFileAsync.mockRejectedValueOnce(
+      new Error("Command failed: bash -c python3 -m pip install -e . && python3 -m pip check\nModuleNotFoundError: No module named 'pip'"),
+    );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [INSTALL_RUNNER] },
+    );
+
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(false);
+    expect(result.setupFailed).toBe(true);
+    expect(result.failureSummary).toContain('pip install');
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+    expect(execFileAsync).toHaveBeenCalledTimes(1);
+  });
+
+  it('missing dependency output from the test command stays on the red-suite lane', async () => {
+    execFileAsync.mockRejectedValueOnce(
+      new Error(
+        'Command failed: python3 -m pytest -x -q\nTraceback (most recent call last):\nModuleNotFoundError: No module named \'sqlalchemy\'',
+      ),
+    );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [REAL_RUNNER] },
+    );
+
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(true);
+    expect(result.setupFailed).toBeFalsy();
+    expect(result.failureSummary).toContain("No module named 'sqlalchemy'");
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+  });
+
+  it('spawn-time ENOENT (missing runtime) routes to setupFailed, not the code-fix lane', async () => {
+    // A missing runtime (python3/go/cargo/node not installed) rejects at spawn
+    // time with errno ENOENT BEFORE any suite output exists — there is no shell
+    // "command not found" line for the classifier to match, so this must be
+    // recognized by errno and routed through setupFailed.
+    execFileAsync.mockRejectedValueOnce(
+      Object.assign(new Error('spawn python3 ENOENT'), { code: 'ENOENT' }),
+    );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [REAL_RUNNER] },
+    );
+
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(false);
+    expect(result.setupFailed).toBe(true);
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+  });
+
+  it('mixed real-pass + repo-failing runner → whole run stays red (no false green)', async () => {
+    // One runner executes a real suite cleanly; a second runner hits a repo
+    // dependency failure. Even though a sibling suite passed, the broken suite
+    // must still block verification instead of falling open as setupFailed.
+    const SECOND_RUNNER: TestRunner = { ...REAL_RUNNER, cwd: '/tmp/workspace/packages/d', label: 'pytest (packages/d)' };
+    execFileAsync
+      .mockResolvedValueOnce('Tests  3 passed (3)\nTest Files  1 passed (1)')
+      .mockRejectedValueOnce(
+        new Error("Command failed: python3 -m pytest -x -q\nModuleNotFoundError: No module named 'sqlalchemy'"),
+      );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [REAL_RUNNER, SECOND_RUNNER] },
+    );
+
+    expect(result.passed).toBe(false);
+    expect(result.setupFailed).toBeFalsy();
+    expect(result.testFailuresDetected).toBe(true);
+    expect(result.failureSummary).toContain("No module named 'sqlalchemy'");
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+  });
 });
 
 // The structured assertion test_invariants._size_breach_message emits, verbatim
@@ -367,5 +496,295 @@ describe('testFixLoop — deterministic size-breach remediation', () => {
       ([cmd]) => cmd === 'python3',
     );
     expect(bumpCall).toBeUndefined();
+  });
+});
+
+describe('testFixLoop — non-npm pre-test dependency install (maxFixAttempts: 0)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // clearAllMocks does not reset implementations; restore the default so a
+    // prior test's per-ecosystem override never leaks into this one.
+    vi.mocked(fs.existsSync).mockImplementation(defaultExistsSync);
+  });
+
+  it('Python runner + poetry.lock → `poetry install --no-root` runs, then the suite runs and passes', async () => {
+    vi.mocked(fs.existsSync).mockImplementation(
+      (p: unknown) => typeof p === 'string' && p.endsWith('/poetry.lock'),
+    );
+    execFileAsync.mockImplementation((cmd: string) =>
+      cmd === 'poetry'
+        ? Promise.resolve('Installing dependencies from lock file')
+        : Promise.resolve('Tests  3 passed (3)'),
+    );
+
+    const pyRunner: TestRunner = { cmd: 'pytest', args: ['-q'], cwd: '/tmp/workspace', label: 'pytest (root)' };
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [pyRunner] },
+    );
+
+    const poetryCall = execFileAsync.mock.calls.find(([cmd]) => cmd === 'poetry');
+    expect(poetryCall?.[1]).toEqual(['install', '--no-root']);
+    // The suite itself ran after a successful install.
+    expect(execFileAsync.mock.calls.some(([cmd]) => cmd === 'pytest')).toBe(true);
+    expect(result.passed).toBe(true);
+    expect(result.setupFailed).toBeFalsy();
+  });
+
+  it('Python runner + requirements.txt and a failing pip install stays on the failure lane for repo dependency errors', async () => {
+    vi.mocked(fs.existsSync).mockImplementation(
+      (p: unknown) => typeof p === 'string' && p.endsWith('/requirements.txt'),
+    );
+    execFileAsync.mockImplementation((cmd: string) =>
+      cmd === 'pip'
+        ? Promise.reject(new Error('Command failed: pip install -r requirements.txt\nERROR: Could not find a version that satisfies the requirement foo'))
+        : Promise.resolve('Tests  3 passed (3)'),
+    );
+
+    const pyRunner: TestRunner = { cmd: 'python3', args: ['-m', 'pytest'], cwd: '/tmp/workspace', label: 'pytest (root)' };
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [pyRunner] },
+    );
+
+    const pipCall = execFileAsync.mock.calls.find(([cmd]) => cmd === 'pip');
+    expect(pipCall?.[1]).toEqual(['install', '-r', 'requirements.txt']);
+    // The suite was skipped after the install failure — the runner never ran.
+    expect(execFileAsync.mock.calls.some(([cmd]) => cmd === 'python3')).toBe(false);
+    // Repo dependency resolution must stay red instead of downgrading to setupFailed.
+    expect(result.setupFailed).toBeFalsy();
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(true);
+  });
+
+  it('Go runner + go.mod and a failing `go mod download` → setupErrors → setupFailed', async () => {
+    vi.mocked(fs.existsSync).mockImplementation(
+      (p: unknown) => typeof p === 'string' && p.endsWith('/go.mod'),
+    );
+    execFileAsync.mockImplementation((cmd: string, args: string[]) =>
+      cmd === 'go' && Array.isArray(args) && args[0] === 'mod'
+        ? Promise.reject(new Error('go: example.com/foo@v1.2.3: reading module: connection refused'))
+        : Promise.resolve('ok'),
+    );
+
+    const goRunner: TestRunner = { cmd: 'go', args: ['test', './...'], cwd: '/tmp/workspace', label: 'go test (root)' };
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [goRunner] },
+    );
+
+    const dlCall = execFileAsync.mock.calls.find(
+      ([cmd, args]) => cmd === 'go' && Array.isArray(args) && args[0] === 'mod',
+    );
+    expect(dlCall?.[1]).toEqual(['mod', 'download']);
+    // `go test` never ran — the runner was skipped after the download failure.
+    expect(execFileAsync.mock.calls.some(
+      ([cmd, args]) => cmd === 'go' && Array.isArray(args) && args[0] === 'test',
+    )).toBe(false);
+    expect(result.setupFailed).toBe(true);
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(false);
+  });
+
+  it('Rust runner + Cargo.toml and a bare `failed to fetch` stays a repository failure', async () => {
+    vi.mocked(fs.existsSync).mockImplementation(
+      (p: unknown) => typeof p === 'string' && p.endsWith('/Cargo.toml'),
+    );
+    execFileAsync.mockImplementation((cmd: string, args: string[]) =>
+      cmd === 'cargo' && Array.isArray(args) && args[0] === 'fetch'
+        ? Promise.reject(new Error('error: failed to fetch `https://github.com/rust-lang/crates.io-index`'))
+        : Promise.resolve('ok'),
+    );
+
+    const cargoRunner: TestRunner = { cmd: 'cargo', args: ['test'], cwd: '/tmp/workspace', label: 'cargo test (root)' };
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [cargoRunner] },
+    );
+
+    const fetchCall = execFileAsync.mock.calls.find(
+      ([cmd, args]) => cmd === 'cargo' && Array.isArray(args) && args[0] === 'fetch',
+    );
+    expect(fetchCall?.[1]).toEqual(['fetch', '--manifest-path', '/tmp/workspace/Cargo.toml']);
+    // `cargo test` never ran — skipped after the fetch failure.
+    expect(execFileAsync.mock.calls.some(
+      ([cmd, args]) => cmd === 'cargo' && Array.isArray(args) && args[0] === 'test',
+    )).toBe(false);
+    expect(result.setupFailed).toBeFalsy();
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(true);
+  });
+});
+
+describe('testFixLoop — in-loop environment-failure routing (maxFixAttempts: 0)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(fs.existsSync).mockImplementation(defaultExistsSync);
+  });
+
+  it('runner exits non-zero with a ModuleNotFoundError → red-suite failure, not setupFailed', async () => {
+    execFileAsync.mockRejectedValue(
+      new Error("Command failed: python3 -m pytest -x -q\nModuleNotFoundError: No module named 'pytest'"),
+    );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [REAL_RUNNER] },
+    );
+
+    // Repo dependency regression must stay on the failure lane.
+    expect(result.setupFailed).toBeFalsy();
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(true);
+  });
+
+  it('runner exits non-zero with a missing shared library (.so) → setupErrors → setupFailed', async () => {
+    execFileAsync.mockRejectedValue(
+      new Error('Command failed: npm test\nerror while loading shared libraries: libatk-1.0.so.0: cannot open shared object file: No such file or directory'),
+    );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [NPM_RUNNER] },
+    );
+
+    expect(result.setupFailed).toBe(true);
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(false);
+  });
+
+  it('a real test failure that QUOTES an env phrase stays a code failure (precedence preserved, no fall-open)', async () => {
+    execFileAsync.mockRejectedValue(
+      new Error("Command failed: python3 -m pytest -x -q\nFAILED test_imports.py::test_optional_dep - AssertionError: expected 'No module named foo' in message\n1 failed in 0.12s"),
+    );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [REAL_RUNNER] },
+    );
+
+    // Real-failure evidence (FAILED line + "1 failed") guards against the env
+    // misroute — this stays a genuine test failure, not a setup fall-open.
+    expect(result.setupFailed).toBeFalsy();
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(true);
+  });
+});
+
+describe('matchesTransientSetupFailure', () => {
+  it('bare "failed to fetch" without transport signal is NOT transient (repository failure)', () => {
+    // A missing/renamed crate is a real repo problem, not transient infra.
+    expect(matchesTransientSetupFailure('error: failed to fetch `https://github.com/rust-lang/crates.io-index`')).toBe(false);
+    expect(matchesTransientSetupFailure('error: failed to download package')).toBe(false);
+  });
+
+  it('"failed to fetch" WITH a transport signal IS transient', () => {
+    expect(matchesTransientSetupFailure('error: failed to fetch `https://example.com` — connection refused')).toBe(true);
+    expect(matchesTransientSetupFailure('error: failed to download — timed out')).toBe(true);
+  });
+
+  it('transport signals alone (no fetch/download) are transient', () => {
+    expect(matchesTransientSetupFailure('connection refused')).toBe(true);
+    expect(matchesTransientSetupFailure('Network is unreachable')).toBe(true);
+    expect(matchesTransientSetupFailure('EAI_AGAIN')).toBe(true);
+  });
+});
+
+describe('testFixLoop — partial per-runner setup failure (maxFixAttempts: 0)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(fs.existsSync).mockImplementation(defaultExistsSync);
+  });
+
+  it('one runner setup-fails while a sibling runner passes → partialSetupFailed=true, NOT a clean pass', async () => {
+    // pytest runner hits an environment failure (missing shared library — a true
+    // infrastructure/VM failure, not a repo dependency regression) and is skipped;
+    // the npm sibling runs to a clean pass. The failed runner's suite never
+    // executed, so the result must NOT report an unqualified clean pass.
+    execFileAsync.mockImplementation((cmd: string) =>
+      cmd === 'python3'
+        ? Promise.reject(new Error('Command failed: python3 -m pytest -x -q\nImportError: libpython3.11.so.1.0: cannot open shared object file: No such file or directory'))
+        : Promise.resolve('Tests  3 passed (3)\nTest Files  1 passed (1)'),
+    );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [REAL_RUNNER, NPM_RUNNER] },
+    );
+
+    expect(result.partialSetupFailed).toBe(true);
+    // All-runners-failed escalation must NOT fire — a sibling ran.
+    expect(result.setupFailed).toBeFalsy();
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(false);
+    // The broken runner's error is carried, not silently dropped.
+    expect(result.failureSummary).toContain('cannot open shared object file');
+    expect(result.failureSummary).toContain('pytest (packages/b)');
+  });
+
+  it('one runner setup-fails while a sibling runner has REAL test failures → both surfaced', async () => {
+    // pytest runner hits an environment failure (missing shared library — a true
+    // infrastructure/VM failure, skipped → setupErrors); the npm
+    // sibling runs and a real test fails. The verdict must carry the test
+    // failures AND the partial-setup signal — neither is dropped.
+    execFileAsync.mockImplementation((cmd: string) =>
+      cmd === 'python3'
+        ? Promise.reject(new Error('Command failed: python3 -m pytest -x -q\nImportError: libpython3.11.so.1.0: cannot open shared object file: No such file or directory'))
+        : Promise.reject(new Error('Command failed: npm test\nFAILED src/foo.test.ts > parses_config\nAssertionError: expected 1 to equal 2\n1 failed')),
+    );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [REAL_RUNNER, NPM_RUNNER] },
+    );
+
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(true);
+    expect(result.partialSetupFailed).toBe(true);
+    // Genuine test failure is present...
+    expect(result.failureSummary).toContain('AssertionError');
+    // ...AND the partial-setup error block is appended, not dropped.
+    expect(result.failureSummary).toContain('Partial setup failure');
+    expect(result.failureSummary).toContain('cannot open shared object file');
+  });
+
+  it('genuine clean multi-runner pass with NO setup errors → passed=true, partialSetupFailed falsy', async () => {
+    // Guard against over-firing: when every runner runs cleanly there is no
+    // partial-setup signal and the verdict stays an unqualified pass.
+    execFileAsync.mockResolvedValue('Tests  3 passed (3)\nTest Files  1 passed (1)');
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [REAL_RUNNER, NPM_RUNNER] },
+    );
+
+    expect(result.passed).toBe(true);
+    expect(result.partialSetupFailed).toBeFalsy();
+    expect(result.setupFailed).toBeFalsy();
+    expect(result.testFailuresDetected).toBe(false);
+  });
+});
+
+describe('matchesTransientSetupFailure', () => {
+  it('accepts pure transport errors', () => {
+    expect(matchesTransientSetupFailure('registry timeout: connection refused')).toBe(true);
+  });
+
+  it('does not treat bare fetch/download failures as transient setup', () => {
+    expect(matchesTransientSetupFailure('failed to fetch package from registry')).toBe(false);
+  });
+
+  it('still accepts fetch/download failures when transport evidence is present', () => {
+    expect(matchesTransientSetupFailure('failed to download tarball after econnreset')).toBe(true);
   });
 });

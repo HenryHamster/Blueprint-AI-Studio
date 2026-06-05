@@ -15,7 +15,9 @@ from app.models import DeploymentState, DeploymentStatus
 from app.shared_state import (
     dispatcher_cycle_log,
     get_dispatcher_cycles,
+    promotion_enabled_by_project_map,
     record_dispatcher_cycle,
+    resolve_project_promotion_enabled,
     sync_runtime_config_from_state,
 )
 
@@ -217,6 +219,62 @@ async def test_sync_applies_runtime_config_json():
         "productive_direction_cooldown_minutes",
     ):
         assert key in changed
+
+
+def test_resolve_project_promotion_enabled_falls_back_to_fleet():
+    """With no per-project override the resolver returns the fleet-wide value."""
+    _shared_state.runtime_config["promotion_enabled"] = True
+    _shared_state.runtime_config["promotion_enabled_by_project"] = {}
+    assert resolve_project_promotion_enabled("p-x") is True
+    _shared_state.runtime_config["promotion_enabled"] = False
+    assert resolve_project_promotion_enabled("p-x") is False
+
+
+def test_resolve_project_promotion_enabled_uses_explicit_override():
+    """An explicit per-project override wins over the fleet default, both ways."""
+    _shared_state.runtime_config["promotion_enabled"] = False
+    _shared_state.runtime_config["promotion_enabled_by_project"] = {"p-x": True}
+    assert resolve_project_promotion_enabled("p-x") is True
+    # A project without an override still rides the fleet default.
+    assert resolve_project_promotion_enabled("p-y") is False
+    # Explicit False override holds even when the fleet is live.
+    _shared_state.runtime_config["promotion_enabled"] = True
+    _shared_state.runtime_config["promotion_enabled_by_project"] = {"p-x": False}
+    assert resolve_project_promotion_enabled("p-x") is False
+    assert resolve_project_promotion_enabled("p-y") is True
+
+
+def test_promotion_enabled_by_project_map_normalizes():
+    """The map helper trims keys, coerces bools, and drops blank keys."""
+    _shared_state.runtime_config["promotion_enabled_by_project"] = {
+        " p-a ": 1,
+        "p-b": 0,
+        "": True,  # dropped (blank key)
+    }
+    assert promotion_enabled_by_project_map() == {"p-a": True, "p-b": False}
+
+
+@pytest.mark.asyncio
+async def test_sync_applies_promotion_enabled_by_project():
+    """Per-project promotion overrides round-trip through runtime_config_json."""
+    state = DeploymentState(
+        id=1,
+        status=DeploymentStatus.STABLE,
+        current_revision="rev-1",
+        current_sha="sha-1",
+        last_known_good_revision="rev-1",
+        last_known_good_sha="sha-1",
+        runtime_config_json={
+            "promotion_enabled_by_project": {" p-a ": True, "p-b": 0, "": 1}
+        },
+    )
+    _shared_state.runtime_config["promotion_enabled_by_project"] = {}
+    changed = await sync_runtime_config_from_state(state)
+    assert "promotion_enabled_by_project" in changed
+    assert _shared_state.runtime_config["promotion_enabled_by_project"] == {
+        "p-a": True,
+        "p-b": False,
+    }
 
 
 def test_cochange_decomposition_defaults_off():

@@ -71,6 +71,31 @@ runtime_config: Dict = {
         "COCHANGE_DECOMPOSITION_ENABLED", "false"
     ).lower()
     in ("1", "true", "yes"),
+    # Forward-quality grader for research findings. When True, a research task
+    # whose findings would SPAWN downstream implementation work is gated on an
+    # INDEPENDENT grader (task_evaluators.spawn_forward_quality_grader): the
+    # research task parks EVALUATING, a fresh grader agent scores the findings
+    # against a rubric, and only a PASS verdict lets the findings spawn children
+    # (a FAIL fails the research task and spawns nothing). Ships DARK (default
+    # OFF) — flip on (settable via PATCH /api/admin/settings, no deploy) behind
+    # spawn-quality monitoring. OFF preserves the legacy trust-the-findings
+    # spawn path exactly. Findings that would spawn nothing are never escalated
+    # regardless of this flag (the gate is proportional to blast radius).
+    "research_quality_grader_enabled": os.getenv(
+        "RESEARCH_QUALITY_GRADER_ENABLED", "false"
+    ).lower()
+    in ("1", "true", "yes"),
+    # Same forward-quality escalation for security_audit findings: a critical/high
+    # audit finding spawns code-change (create) PRs, the same blast radius as a
+    # research finding, so the audit output must clear an INDEPENDENT grader before
+    # any fix tasks spawn. Ships DARK (default OFF) — OFF preserves the legacy
+    # trust-the-findings spawn path exactly. Audits with no critical/high findings
+    # are never escalated regardless of this flag (the gate is proportional to
+    # blast radius).
+    "security_audit_quality_grader_enabled": os.getenv(
+        "SECURITY_AUDIT_QUALITY_GRADER_ENABLED", "false"
+    ).lower()
+    in ("1", "true", "yes"),
     # Long-EVALUATING parents stop blocking new research on the same direction
     # once their pipeline-side merge cycle exceeds this threshold. Set above
     # the typical PR lifecycle (CI + review + fix + re-review + merge) so new
@@ -297,6 +322,20 @@ runtime_config: Dict = {
     "strategic_max_interval_minutes": 180,
     "architecture_review_frequency": 3,  # Every Nth strategic cycle includes architecture (design doc) review
     "max_active_directions": 10,
+    # Staleness threshold (days) for staged directions whose target version has
+    # NOT yet promoted. A staged direction is inert work that only begins when
+    # its target version opens; a version can stay open far longer than the
+    # ~14-day build-to-stabilize gate (deferred by repeated qualification
+    # failures or operator inaction), stranding staged work indefinitely. When a
+    # staged direction has waited beyond this age (anchored on its staging
+    # timestamp), the reaper raises a per-direction operator alert so the work
+    # can be retargeted, force-activated, or cancelled. Default 21 (> the
+    # ~14-day stall gate so a normally-stabilizing version never trips it).
+    "staged_direction_stale_alert_days": 21,
+    # Fail-safe age (days) applied when a staged direction is missing or has an
+    # unparseable staging timestamp, so a malformed/legacy staged row can still
+    # be surfaced as stale rather than waiting silently forever.
+    "staged_direction_stale_fallback_days": 21,
     "max_parallel_research_per_project": 6,
     "max_retained_images": 10,  # Agent VM image family pruning (keep N most recent; GCP per-project image quota is tight)
     "require_approval_gates": True,
@@ -554,6 +593,15 @@ runtime_config: Dict = {
     # runtime_config_json; persisted across restarts.
     "promotion_enabled": False,
     "smoketest_enabled": False,
+    # Per-project live-promotion enablement overrides ({project_id: bool}).
+    # An EMPTY map (the default) means every project falls back to the
+    # fleet-wide ``promotion_enabled`` above. A per-project entry arms or holds
+    # live promotion for that single project without touching the fleet default
+    # or any other project — modeled on ``warm_pool_target_size_by_project``.
+    # Persisted in ``runtime_config_json``; read by
+    # ``resolve_project_promotion_enabled``; set via /api/admin/settings and the
+    # per-project promotion-enablement endpoint.
+    "promotion_enabled_by_project": {},
     # Release-qualifier promotion rubric — the composite-confidence THRESHOLD a
     # candidate must clear to promote, plus the per-sub-score WEIGHTS. These are
     # seeded once at module load from backend/promotion_policy.yaml (falling back
@@ -964,6 +1012,8 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "max_rollup_retries",
                     "architecture_review_frequency",
                     "max_active_directions",
+                    "staged_direction_stale_alert_days",
+                    "staged_direction_stale_fallback_days",
                     "max_parallel_research_per_project",
                     "auto_archive_terminal_after_days",
                     "auto_archive_max_terminal_tasks_per_project",
@@ -1022,6 +1072,21 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "smoketest_enabled",
                         bool(config_json["smoketest_enabled"]),
                     )
+                if "promotion_enabled_by_project" in config_json:
+                    # Persisted per-project live-promotion overrides. Normalize to
+                    # a map of trimmed, non-empty string project-id keys to bools —
+                    # mirroring promotion_enabled_by_project_map() / the admin PATCH
+                    # surface — and drop empty keys so a garbage entry can't corrupt
+                    # a project's promotion gate.
+                    raw_promo = config_json["promotion_enabled_by_project"]
+                    if isinstance(raw_promo, dict):
+                        normalized_promo: dict[str, bool] = {}
+                        for proj_key, proj_val in raw_promo.items():
+                            sid = str(proj_key).strip()
+                            if not sid:
+                                continue
+                            normalized_promo[sid] = bool(proj_val)
+                        _set("promotion_enabled_by_project", normalized_promo)
                 # Release-qualifier promotion rubric (admin-tunable, persisted).
                 # A None persisted value means "never overridden" — keep the
                 # boot-seeded YAML/default value rather than clobbering it.
@@ -1090,3 +1155,41 @@ def resolve_retry_budget(failure_class: str, scope: str | None) -> int:
     return runtime_config.get("retry_budgets_by_class", {}).get(
         failure_class, runtime_config["max_retries"]
     )
+
+
+def promotion_enabled_by_project_map() -> Dict[str, bool]:
+    """Per-project live-promotion overrides, as ``{project_id: bool}``.
+
+    Read from the durable ``promotion_enabled_by_project`` runtime-config value
+    (modeled on ``warm_pool.warm_pool_project_target_map``). Normalizes to
+    trimmed, non-empty string project-id keys mapping to bools, silently dropping
+    malformed entries. An EMPTY map (the default) means every project falls back
+    to the fleet-wide ``promotion_enabled``. Parallel to
+    :func:`resolve_project_promotion_enabled`.
+    """
+    raw = runtime_config.get("promotion_enabled_by_project") or {}
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, bool] = {}
+    for key, value in raw.items():
+        sid = str(key).strip()
+        if not sid:
+            continue
+        out[sid] = bool(value)
+    return out
+
+
+def resolve_project_promotion_enabled(project_id) -> bool:
+    """A project's EFFECTIVE live-promotion gate.
+
+    Returns the project's explicit per-project value from
+    ``promotion_enabled_by_project`` when one is set, otherwise falls back to the
+    fleet-wide ``promotion_enabled`` default so behavior is byte-identical for
+    projects without an override. Mirrors
+    :func:`warm_pool.resolve_project_warm_pool_target` for the promotion gate.
+    """
+    per_project = promotion_enabled_by_project_map()
+    sid = str(project_id)
+    if sid in per_project:
+        return per_project[sid]
+    return bool(runtime_config.get("promotion_enabled"))

@@ -1,5 +1,33 @@
 export type ProviderName = 'anthropic' | 'openai' | 'gemini';
 export type AuthMode = 'oauth' | 'api_key' | 'service_account';
+
+// One entry of the backend-published task-capability contract (the
+// `task_capabilities` map embedded in GET /settings, also exposed standalone
+// at GET /api/admin/task-capabilities). Field names mirror the backend
+// `_capability_to_contract` flattener verbatim (snake_case). This is the
+// authoritative, backend-owned metadata the operator UI consumes instead of
+// maintaining a private task-type table. Fields are optional so a partial /
+// older payload still type-checks; the resolver in taskCapabilities.ts applies
+// safe defaults.
+export interface TaskCapabilityContractEntry {
+  type: string;
+  label?: string;
+  badge?: string;
+  agent_mode?: 'write' | 'read_only';
+  default_category?: string | null;
+  description?: string;
+  user_launchable?: boolean;
+  provider_configurable?: boolean;
+  filter_visible?: boolean;
+  delivers_product?: boolean;
+  reservable?: boolean;
+  periodic_eligible?: boolean;
+}
+
+// The published contract keyed by task-type value. Absent / empty when talking
+// to an older backend that does not yet publish the contract — consumers fall
+// back to the built-in capability table in that case.
+export type TaskCapabilityContract = Record<string, TaskCapabilityContractEntry>;
 export type EffortLevel = 'low' | 'medium' | 'high' | 'max';
 export const EFFORT_LEVELS: readonly EffortLevel[] = ['low', 'medium', 'high', 'max'];
 
