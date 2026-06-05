@@ -183,6 +183,16 @@ export function DeploySection({
                     {deployState.health_recovery_streak}/{deployState.health_recovery_streak_required ?? 3} healthy checks
                   </span>
                 </div>
+                {deployState.health_recovery_flap_escalated && (
+                  <p className="text-[11px] text-orange-400 bg-orange-950/20 rounded px-2 py-1 flex items-start gap-1.5">
+                    <Zap className="w-3 h-3 mt-0.5 shrink-0" />
+                    <span>
+                      Recovery bar raised to {deployState.health_recovery_streak_required ?? 3} because the
+                      pipeline has been flapping (repeated auto-pause/resume); the full recent probe history must
+                      pass before it auto-resumes.
+                    </span>
+                  </p>
+                )}
                 <div className="w-full bg-neutral-800 rounded-full h-2">
                   <div
                     className="bg-emerald-500 h-2 rounded-full transition-all duration-500"

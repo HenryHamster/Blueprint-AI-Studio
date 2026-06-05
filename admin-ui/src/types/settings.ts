@@ -65,6 +65,10 @@ export interface DeployState {
   gcp_project_id: string;
   health_recovery_streak: number;
   health_recovery_streak_required: number;
+  // True when the auto-resume gate raised the required healthy-probe count
+  // because the pipeline has been flapping (repeatedly auto-pausing/resuming).
+  // Optional/additive so older payloads still type-check.
+  health_recovery_flap_escalated?: boolean;
   health_recovery_history?: boolean[];
   health_recovery_history_size?: number;
   health_failure_streak: number;

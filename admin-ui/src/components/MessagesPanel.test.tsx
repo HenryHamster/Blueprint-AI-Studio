@@ -3766,26 +3766,44 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
     expect(el.textContent).toContain('…');
   });
 
-  test('displays coalesce count when count > 1', async () => {
+  test('displays coalesce count when operator_count > 1 (operator-origin steers only)', async () => {
     const el = await renderPanel({
       _strategic_refresh: {
         requested_at: new Date(Date.now() - 60_000).toISOString(),
         excerpt: 'Update the problem model for the new version',
-        origin: 'qualification',
+        origin: 'operator',
         count: 3,
+        operator_count: 3,
       },
     });
     expect(el.textContent).toContain('Strategic cycle pending');
     expect(el.textContent).toContain('+2 steers coalesced');
   });
 
-  test('does not display coalesce info when count = 1', async () => {
+  test('does not display coalesce count for qualification-origin markers (automated refreshes excluded)', async () => {
+    // A qualification marker with count > 1 should NOT show coalesce since the label
+    // uses operator_count, which is 0 for automated refreshes.
+    const el = await renderPanel({
+      _strategic_refresh: {
+        requested_at: new Date(Date.now() - 60_000).toISOString(),
+        excerpt: 'Update the problem model for the new version',
+        origin: 'qualification',
+        count: 3,
+        operator_count: 0,
+      },
+    });
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).not.toContain('coalesced');
+  });
+
+  test('does not display coalesce info when operator_count = 1', async () => {
     const el = await renderPanel({
       _strategic_refresh: {
         requested_at: new Date(Date.now() - 60_000).toISOString(),
         excerpt: 'Update the problem model for the new version',
         origin: 'operator',
         count: 1,
+        operator_count: 1,
       },
     });
     expect(el.textContent).toContain('Strategic cycle pending');
@@ -3799,11 +3817,33 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
         excerpt: 'Investigate the performance regression in the query handler',
         origin: 'operator',
         count: 5,
+        operator_count: 5,
       },
     });
     expect(el.textContent).toContain('Strategic cycle pending');
     expect(el.textContent).toContain('Investigate the performance regression in the query handler');
     expect(el.textContent).toContain('+4 steers coalesced');
     expect(el.textContent).toContain('armed 2m ago');
+  });
+
+  test('does not show receipt when last_fired_at is older than 2 hours', async () => {
+    // A stale receipt (> 2h old) must be suppressed — it grows without bound otherwise
+    // and resurfaces confusingly after an operator cancels a fresh steer.
+    const staleAt = new Date(Date.now() - 3 * 3600_000).toISOString(); // 3 hours ago
+    const el = await renderPanel({
+      _strategic_refresh_last_fired_at: staleAt,
+      _strategic_refresh_last_fired_origin: 'operator',
+    });
+    expect(el.textContent).not.toContain('Steer picked up');
+  });
+
+  test('shows receipt when last_fired_at is within 2 hours', async () => {
+    // A recent receipt (< 2h old) must show — the steer just fired and context is fresh.
+    const recentAt = new Date(Date.now() - 30 * 60_000).toISOString(); // 30 minutes ago
+    const el = await renderPanel({
+      _strategic_refresh_last_fired_at: recentAt,
+      _strategic_refresh_last_fired_origin: 'operator',
+    });
+    expect(el.textContent).toContain('Steer picked up');
   });
 });

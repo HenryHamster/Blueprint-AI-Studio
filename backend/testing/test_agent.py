@@ -16,6 +16,8 @@ from app.models import (
     Artifact,
     ArtifactType,
     ComputeJob,
+    DeploymentState,
+    DeploymentStatus,
     LLMAuthMode,
     LLMProviderName,
     MaxPlanAccount,
@@ -66,6 +68,66 @@ def _resolve_sr_recent_miss_examples_contract_fixture() -> Path:
         "SR contract fixture not found in any candidate path: "
         + ", ".join(str(c) for c in candidates)
     )
+
+
+@pytest.fixture
+def deploy_health_state_guard():
+    """Snapshot deploy-health globals and shared state that these endpoint tests mutate."""
+    import copy
+    from app import shared_state
+    import app.deploy_health as deploy_health
+
+    snapshot = {
+        "external_health": copy.deepcopy(shared_state.external_health),
+        "deploy_monitoring": copy.deepcopy(shared_state.deploy_monitoring),
+        "pause_failure_streak": deploy_health._pause_failure_streak,
+        "health_recovery_history": list(deploy_health._health_recovery_history),
+        "last_auto_resume_at": deploy_health._last_auto_resume_at,
+        "recent_auto_resumes": list(deploy_health._recent_auto_resumes),
+        "last_resume_was_forced": deploy_health._last_resume_was_forced,
+        "consecutive_force_resumes": deploy_health._consecutive_force_resumes,
+    }
+    yield
+    shared_state.external_health.clear()
+    shared_state.external_health.update(snapshot["external_health"])
+    shared_state.deploy_monitoring.clear()
+    shared_state.deploy_monitoring.update(snapshot["deploy_monitoring"])
+    deploy_health._pause_failure_streak = snapshot["pause_failure_streak"]
+    deploy_health._health_recovery_history.clear()
+    deploy_health._health_recovery_history.extend(snapshot["health_recovery_history"])
+    deploy_health._last_auto_resume_at = snapshot["last_auto_resume_at"]
+    deploy_health._recent_auto_resumes.clear()
+    deploy_health._recent_auto_resumes.extend(snapshot["recent_auto_resumes"])
+    deploy_health._last_resume_was_forced = snapshot["last_resume_was_forced"]
+    deploy_health._consecutive_force_resumes = snapshot["consecutive_force_resumes"]
+
+
+async def _seed_deploy_state(
+    db_session,
+    *,
+    status: str = DeploymentStatus.PAUSED,
+    pause_reason: str = "External dependency down: dispatch_api",
+    pre_pause_max_vms: int | None = 4,
+    runtime_max_concurrent_vms: int | None = 4,
+    paused_at: datetime | None = None,
+) -> DeploymentState:
+    state = DeploymentState(
+        id=1,
+        current_revision="rev-test-1",
+        current_sha="a" * 40,
+        deployed_at=datetime.utcnow() - timedelta(minutes=10),
+        status=status,
+        last_known_good_revision="rev-good-1",
+        last_known_good_sha="b" * 40,
+        pause_reason=pause_reason,
+        paused_at=paused_at or (datetime.utcnow() - timedelta(minutes=3)),
+        pre_pause_max_vms=pre_pause_max_vms,
+        runtime_max_concurrent_vms=runtime_max_concurrent_vms,
+    )
+    db_session.add(state)
+    await db_session.commit()
+    await db_session.refresh(state)
+    return state
 
 
 @pytest.mark.smoketest
@@ -16512,3 +16574,149 @@ def test_cold_start_manifest_issues_bootstrap_ttl():
     assert abs(ttl - AGENT_BOOTSTRAP_TOKEN_TTL_HOURS * 3600) <= 5, (
         f"cold-start manifest must mint the long bootstrap TTL; got {ttl}s"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("flapping", "expected_required", "expected_escalated"),
+    [(False, 3, False), (True, 5, True)],
+)
+async def test_deploy_state_payload_reports_dynamic_recovery_threshold(
+    client: AsyncClient,
+    db_session,
+    deploy_health_state_guard,
+    flapping: bool,
+    expected_required: int,
+    expected_escalated: bool,
+):
+    from app import shared_state
+    import app.deploy_health as deploy_health
+
+    await _seed_deploy_state(db_session)
+    shared_state.runtime_config["max_concurrent_vms"] = 0
+    shared_state.runtime_config["flap_threshold"] = 3
+    shared_state.runtime_config["flap_window_seconds"] = 1800
+    shared_state.external_health["failed_deps"] = []
+    shared_state.external_health["last_check"] = datetime.utcnow()
+    deploy_health._reset_health_recovery_history()
+    deploy_health._health_recovery_history.extend([True, True, True])
+    deploy_health._recent_auto_resumes.clear()
+    if flapping:
+        now = datetime.utcnow()
+        deploy_health._recent_auto_resumes.extend(
+            [
+                now - timedelta(minutes=15),
+                now - timedelta(minutes=10),
+                now - timedelta(minutes=5),
+            ]
+        )
+
+    resp = await client.get("/api/admin/deploy-state")
+
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    assert payload["health_recovery_streak"] == 3
+    assert payload["health_recovery_history"] == [True, True, True]
+    assert payload["health_recovery_history_size"] == 5
+    assert payload["health_recovery_streak_required"] == expected_required
+    assert payload["health_recovery_flap_escalated"] is expected_escalated
+
+
+@pytest.mark.asyncio
+async def test_deploy_state_broadcast_matches_polled_payload(
+    client: AsyncClient, db_session, deploy_health_state_guard, mocker
+):
+    from app import shared_state
+    from app.deploy_health import broadcast_deploy_state
+    import app.deploy_health as deploy_health
+
+    await _seed_deploy_state(db_session)
+    shared_state.runtime_config["max_concurrent_vms"] = 0
+    shared_state.runtime_config["flap_threshold"] = 3
+    shared_state.runtime_config["flap_window_seconds"] = 1800
+    shared_state.external_health["failed_deps"] = []
+    shared_state.external_health["last_check"] = datetime.utcnow()
+    deploy_health._reset_health_recovery_history()
+    deploy_health._health_recovery_history.extend([True, True, True, True, True])
+    now = datetime.utcnow()
+    deploy_health._recent_auto_resumes.clear()
+    deploy_health._recent_auto_resumes.extend(
+        [
+            now - timedelta(minutes=20),
+            now - timedelta(minutes=10),
+            now - timedelta(minutes=2),
+        ]
+    )
+    broadcast_mock = AsyncMock()
+    mocker.patch("app.deploy_health.manager.broadcast_to_all", new=broadcast_mock)
+
+    poll_resp = await client.get("/api/admin/deploy-state")
+    assert poll_resp.status_code == 200, poll_resp.text
+    polled_payload = poll_resp.json()
+
+    await broadcast_deploy_state()
+
+    broadcast_mock.assert_awaited_once()
+    event_name, broadcast_payload = broadcast_mock.await_args.args
+    assert event_name == "deploy_state"
+    assert broadcast_payload == polled_payload
+
+
+@pytest.mark.asyncio
+async def test_reset_health_clears_flap_escalation_state(
+    client: AsyncClient, db_session, deploy_health_state_guard
+):
+    from app import shared_state
+    import app.deploy_health as deploy_health
+
+    state = await _seed_deploy_state(db_session)
+    shared_state.runtime_config["max_concurrent_vms"] = 0
+    shared_state.runtime_config["flap_threshold"] = 3
+    shared_state.runtime_config["flap_window_seconds"] = 1800
+    shared_state.external_health["failed_deps"] = ["dispatch_api"]
+    shared_state.external_health["last_check"] = datetime.utcnow()
+    deploy_health._pause_failure_streak = 3
+    deploy_health._reset_health_recovery_history()
+    deploy_health._health_recovery_history.extend([True, True, True, True])
+    now = datetime.utcnow()
+    deploy_health._recent_auto_resumes.clear()
+    deploy_health._recent_auto_resumes.extend(
+        [
+            now - timedelta(minutes=18),
+            now - timedelta(minutes=12),
+            now - timedelta(minutes=6),
+        ]
+    )
+    deploy_health._last_resume_was_forced = True
+    deploy_health._consecutive_force_resumes = 2
+
+    reset_resp = await client.post("/api/admin/deploy-state/reset-health")
+
+    assert reset_resp.status_code == 200, reset_resp.text
+    reset_payload = reset_resp.json()
+    assert reset_payload["status"] == DeploymentStatus.STABLE
+    assert reset_payload["health_recovery_streak_required"] == 3
+    assert reset_payload["health_recovery_flap_escalated"] is False
+    assert reset_payload["health_recovery_history"] == []
+    assert list(deploy_health._recent_auto_resumes) == []
+    assert deploy_health._last_resume_was_forced is False
+    assert deploy_health._consecutive_force_resumes == 0
+
+    await db_session.refresh(state)
+    assert state.zone_health_state is not None
+    assert state.zone_health_state["_recent_auto_resumes"] == []
+    assert state.zone_health_state["_last_resume_was_forced"] is False
+    assert state.zone_health_state["_consecutive_force_resumes"] == 0
+
+    state.status = DeploymentStatus.PAUSED
+    state.pause_reason = "External dependency down: dispatch_api"
+    state.pre_pause_max_vms = 4
+    state.paused_at = datetime.utcnow() - timedelta(minutes=2)
+    db_session.add(state)
+    await db_session.commit()
+
+    followup_resp = await client.get("/api/admin/deploy-state")
+    assert followup_resp.status_code == 200, followup_resp.text
+    followup_payload = followup_resp.json()
+    assert followup_payload["health_recovery_streak_required"] == 3
+    assert followup_payload["health_recovery_flap_escalated"] is False

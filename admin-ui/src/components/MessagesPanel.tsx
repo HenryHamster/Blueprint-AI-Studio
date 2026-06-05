@@ -21,6 +21,11 @@ import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 
 const DEFAULT_VIEW_ID = '__default__';
 
+// Receipt shown for at most 2 hours after a steer fires, preventing stale "picked up"
+// messages that grow without bound, and blocking stale receipts from resurfacing after
+// an operator cancels a fresh steer.
+const STEER_RECEIPT_MAX_AGE_MS = 7_200_000;
+
 // Generate a client idempotency key for a message send. Prefers the native
 // UUID generator and falls back to a timestamp+random token for older runtimes
 // (and JSDOM, where crypto.randomUUID may be absent).
@@ -658,7 +663,9 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       } catch { /* ignore */ }
       // Pending strategic-refresh marker — surfaced as a "strategic cycle pending"
       // badge until the autonomous loop consumes it (when it clears backend-side).
-      // After consumption, shows a receipt via last_fired_at only if it was operator-origin.
+      // After consumption, shows a receipt via last_fired_at only if it was operator-origin
+      // AND fired within STEER_RECEIPT_MAX_AGE_MS (prevents stale receipts that grow without
+      // bound, and prevents a just-cancelled steer from showing an old "picked up" receipt).
       // Non-critical: errors leave the prior marker state untouched.
       try {
         const visRes = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}`);
@@ -667,12 +674,17 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
           const marker = proj.vision?._strategic_refresh;
           const lastFiredAt = proj.vision?._strategic_refresh_last_fired_at;
           const lastFiredOrigin = proj.vision?._strategic_refresh_last_fired_origin;
-          // Build marker state: include pending marker if present, or add receipt if it was operator-origin
+          // Build marker state: include pending marker if present, or add receipt if it was
+          // operator-origin AND fired recently (within STEER_RECEIPT_MAX_AGE_MS).
           if (marker && typeof marker === 'object') {
             setStrategicRefresh(marker);
           } else if (lastFiredAt && typeof lastFiredAt === 'string' && lastFiredOrigin === 'operator') {
-            // No pending marker, but show receipt of prior operator-origin consumption
-            setStrategicRefresh({ last_fired_at: lastFiredAt, last_fired_origin: lastFiredOrigin });
+            const ageMs = Date.now() - new Date(lastFiredAt).getTime();
+            if (!isNaN(ageMs) && ageMs <= STEER_RECEIPT_MAX_AGE_MS) {
+              setStrategicRefresh({ last_fired_at: lastFiredAt, last_fired_origin: lastFiredOrigin });
+            } else {
+              setStrategicRefresh(null);
+            }
           } else {
             setStrategicRefresh(null);
           }
@@ -1077,8 +1089,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
                     <span className="italic">{strategicRefresh.excerpt.slice(0, 120)}{strategicRefresh.excerpt.length > 120 ? '…' : ''}</span>
                   </>
                 )}
-                {strategicRefresh.count && strategicRefresh.count > 1 && (
-                  <> · +{strategicRefresh.count - 1} {strategicRefresh.count - 1 === 1 ? 'steer' : 'steers'} coalesced</>
+                {strategicRefresh.operator_count && strategicRefresh.operator_count > 1 && (
+                  <> · +{strategicRefresh.operator_count - 1} {strategicRefresh.operator_count - 1 === 1 ? 'steer' : 'steers'} coalesced</>
                 )}
                 {` · armed ${timeAgo(strategicRefresh.requested_at)}`}
               </>

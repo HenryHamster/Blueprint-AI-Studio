@@ -1970,6 +1970,13 @@ async def build_deploy_state_payload(session: AsyncSession) -> dict:
         if isinstance(_last_check, datetime)
         else _last_check,
     }
+    health_recovery_history = list(
+        getattr(_deploy_health_module, "_health_recovery_history", [])
+    )
+    (
+        health_recovery_streak_required,
+        health_recovery_flap_escalated,
+    ) = _deploy_health_module.get_recovery_threshold_state()
 
     return {
         "current_revision": state.current_revision,
@@ -1998,16 +2005,13 @@ async def build_deploy_state_payload(session: AsyncSession) -> dict:
         "ramp_step_size": ramp_step_size,
         "zone_health": _get_zone_health_summary(),
         "gcp_project_id": os.getenv("GCP_PROJECT_ID", ""),
-        "health_recovery_streak": sum(
-            1
-            for x in getattr(_deploy_health_module, "_health_recovery_history", [])
-            if x
+        "health_recovery_streak": sum(1 for x in health_recovery_history if x),
+        "health_recovery_streak_required": health_recovery_streak_required,
+        "health_recovery_flap_escalated": health_recovery_flap_escalated,
+        "health_recovery_history": health_recovery_history,
+        "health_recovery_history_size": getattr(
+            _deploy_health_module, "_HEALTH_HISTORY_SIZE", 5
         ),
-        "health_recovery_streak_required": 3,
-        "health_recovery_history": list(
-            getattr(_deploy_health_module, "_health_recovery_history", [])
-        ),
-        "health_recovery_history_size": 5,
         "health_failure_streak": getattr(
             _deploy_health_module, "_pause_failure_streak", 0
         ),

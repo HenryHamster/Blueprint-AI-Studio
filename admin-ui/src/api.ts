@@ -1924,6 +1924,10 @@ export interface StrategicRefreshMarker {
   reason?: string;
   origin?: string;
   count?: number;
+  /** Coalesced operator-steering requests only (excludes automated qualification/promotion
+   *  refreshes). The UI badge uses this for the '+N steers coalesced' label so the count
+   *  reflects genuine human steers, not system-triggered refreshes. */
+  operator_count?: number;
   excerpt?: string;
   /** Timestamp when a prior marker was consumed by the strategic loop (receipt field). */
   last_fired_at?: string;

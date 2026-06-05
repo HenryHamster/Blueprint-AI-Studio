@@ -117,6 +117,18 @@ def _is_flapping(now: datetime) -> bool:
     return len(_recent_auto_resumes) >= threshold
 
 
+def get_recovery_threshold_state(now: datetime | None = None) -> tuple[int, bool]:
+    """Return the current healthy-probe requirement and whether flap escalation is active."""
+    current_time = now or _utcnow()
+    flap_escalated = _is_flapping(current_time)
+    healthy_required = (
+        _FLAP_ESCALATED_HEALTHY_REQUIRED
+        if flap_escalated
+        else _HEALTH_HISTORY_HEALTHY_REQUIRED
+    )
+    return healthy_required, flap_escalated
+
+
 def _restore_health_streaks(snapshot: dict) -> None:
     """Restore module-level pause/recovery state from a persisted zone_health_state snapshot.
 
@@ -803,12 +815,7 @@ async def _check_pause_mode():
             pause_duration = (now - paused_at).total_seconds()
 
         # When flapping, tighten the recovery bar so we don't resume on marginal signal.
-        flapping_now = _is_flapping(_utcnow())
-        healthy_required = (
-            _FLAP_ESCALATED_HEALTHY_REQUIRED
-            if flapping_now
-            else _HEALTH_HISTORY_HEALTHY_REQUIRED
-        )
+        healthy_required, flapping_now = get_recovery_threshold_state()
 
         should_force_resume = pause_duration >= max_duration > 0
         should_normal_resume = (
@@ -883,9 +890,7 @@ async def _check_pause_mode():
         now = _utcnow()
         _recent_auto_resumes.append(now)
         _prune_flap_window(now)
-        flap_escalated = len(_recent_auto_resumes) >= _runtime_config.get(
-            "flap_threshold", 3
-        )
+        _, flap_escalated = get_recovery_threshold_state(now)
 
         _last_resume_was_forced = bool(should_force_resume)
 

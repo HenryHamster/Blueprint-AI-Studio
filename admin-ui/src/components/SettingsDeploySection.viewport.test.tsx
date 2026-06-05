@@ -1,4 +1,4 @@
-import { afterEach, describe, test } from 'vitest';
+import { afterEach, describe, expect, test } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { DeploySection } from './SettingsDeploySection';
@@ -182,6 +182,41 @@ describe('SettingsDeploySection — viewport regression', () => {
     });
   });
 
+  test('renders without horizontal overflow at 375px with flap-escalated recovery', async () => {
+    const deployState: DeployState = {
+      ...baseDeployState,
+      status: 'PAUSED',
+      pause_reason: 'Automatic pause due to flapping (repeated auto-pause/resume)',
+      pre_pause_max_vms: 4,
+      health_recovery_streak: 4,
+      health_recovery_streak_required: 5,
+      health_recovery_flap_escalated: true,
+      health_recovery_history: [true, true, true, true, false],
+      health_recovery_history_size: 5,
+      failure_rate: 0.45,
+    };
+
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => {
+        root?.render(
+          <DeploySection
+            deployState={deployState}
+            onPausePipeline={noop}
+            onResumePipeline={noop}
+            onResetHealth={noop}
+            onRollback={noop}
+            onMarkStable={noop}
+            onRepairState={noop}
+            zoneHealth={zoneHealthWithFailures}
+          />
+        );
+      });
+    });
+  });
+
   test('renders without horizontal overflow at 375px with rolled back state', async () => {
     const deployState: DeployState = {
       ...baseDeployState,
@@ -210,6 +245,73 @@ describe('SettingsDeploySection — viewport regression', () => {
         );
       });
     });
+  });
+
+  test('shows escalated denominator and flapping indicator from deployState only', async () => {
+    const deployState: DeployState = {
+      ...baseDeployState,
+      status: 'PAUSED',
+      pre_pause_max_vms: 4,
+      health_recovery_streak: 4,
+      health_recovery_streak_required: 5,
+      health_recovery_flap_escalated: true,
+      health_recovery_history: [true, true, true, true, false],
+      health_recovery_history_size: 5,
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => {
+      root?.render(
+        <DeploySection
+          deployState={deployState}
+          onPausePipeline={noop}
+          onResumePipeline={noop}
+          onResetHealth={noop}
+          onRollback={noop}
+          onMarkStable={noop}
+          onRepairState={noop}
+          zoneHealth={null}
+        />
+      );
+    });
+    const text = host.textContent ?? '';
+    // Denominator reflects the escalated requirement, not a hardcoded 3.
+    expect(text).toContain('4/5 healthy checks');
+    // Flapping indicator explains the raised bar.
+    expect(text.toLowerCase()).toContain('flapping');
+    expect(text).toContain('Recovery bar raised to 5');
+  });
+
+  test('omits flapping indicator when not escalated', async () => {
+    const deployState: DeployState = {
+      ...baseDeployState,
+      status: 'PAUSED',
+      health_recovery_streak: 2,
+      health_recovery_streak_required: 3,
+      health_recovery_history: [true, true, false, false, false],
+      health_recovery_history_size: 5,
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => {
+      root?.render(
+        <DeploySection
+          deployState={deployState}
+          onPausePipeline={noop}
+          onResumePipeline={noop}
+          onResetHealth={noop}
+          onRollback={noop}
+          onMarkStable={noop}
+          onRepairState={noop}
+          zoneHealth={null}
+        />
+      );
+    });
+    const text = host.textContent ?? '';
+    expect(text).toContain('2/3 healthy checks');
+    expect(text.toLowerCase()).not.toContain('flapping');
   });
 
   test('interactive controls meet 44px touch target at 375px', async () => {

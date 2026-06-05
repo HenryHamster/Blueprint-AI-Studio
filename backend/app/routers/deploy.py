@@ -139,6 +139,9 @@ async def reset_deploy_health(
 
         _dh._pause_failure_streak = 0
         _dh._reset_health_recovery_history()
+        _dh._recent_auto_resumes.clear()
+        _dh._last_resume_was_forced = False
+        _dh._consecutive_force_resumes = 0
     except Exception:
         logger.exception("[DEPLOY] Failed to reset deploy_health streak counters")
 
@@ -167,6 +170,12 @@ async def reset_deploy_health(
     state.pre_pause_max_vms = None
     session.add(state)
     await session.commit()
+    try:
+        from app.state_persistence import _persist_zone_health
+
+        await _persist_zone_health()
+    except Exception:
+        logger.exception("[DEPLOY] Failed to persist cleared deploy health state")
 
     logger.warning(
         f"[ADMIN] Health force-reset — pipeline RESUMED (max_concurrent_vms={restore_vms})"
