@@ -842,6 +842,59 @@ async def _resolve_stale_staged_direction_alerts(
     return len(open_alerts)
 
 
+# Shared title prefix for the "permanently blocked" ERROR escalation alert. The
+# create path appends the blocker_kind; the reconcile path matches on the prefix
+# so a resumed task's stale alert is dismissed regardless of which kind it named.
+_BLOCKED_ESCALATION_TITLE_PREFIX = "Task permanently blocked"
+
+
+async def _resolve_blocked_escalation_alert(
+    task: "Task",
+    session: AsyncSession,
+) -> int:
+    """Dismiss any open 'permanently blocked' ERROR alert for a resumed task.
+
+    The companion to :func:`_maybe_create_blocked_escalation_alert`. When a parked
+    (escalated) blocker's need finally becomes satisfiable and the recovery sweep
+    resumes the task, the ERROR alert that declared it permanently blocked no
+    longer describes a real condition and must be reconciled — mirroring how
+    :func:`_resolve_stale_staged_direction_alerts` dismisses its alert once the
+    underlying stall clears.
+
+    Matches on the deterministic title prefix (the create path appends the
+    blocker_kind, which may already have been cleared by the time we resume), so
+    any open ``Task permanently blocked: …`` alert for this task is dismissed.
+    Only open (``dismissed_at IS NULL``), task-scoped alerts are touched, so this
+    is a safe no-op when none exists and idempotent across repeated calls.
+
+    Best-effort contract: the caller wraps this in try/except so a reconcile
+    failure can never abort the resume that triggered it. Returns the number of
+    alerts dismissed.
+    """
+    result = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task.id,
+            Alert.dismissed_at.is_(None),
+            Alert.title.like(f"{_BLOCKED_ESCALATION_TITLE_PREFIX}%"),
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(task.project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(open_alerts)
+
+
 async def _maybe_create_blocked_escalation_alert(
     task: "Task",
     session: AsyncSession,
@@ -865,7 +918,7 @@ async def _maybe_create_blocked_escalation_alert(
     fires exactly once per blocked task and does not re-fire while the operator
     still has the alert open.
     """
-    title = f"Task permanently blocked: {blocker_kind}"[:200]
+    title = f"{_BLOCKED_ESCALATION_TITLE_PREFIX}: {blocker_kind}"[:200]
     existing = await session.execute(
         select(Alert).where(
             Alert.task_id == task.id,

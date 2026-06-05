@@ -505,6 +505,15 @@ _BLOCKED_ESCALATE_AFTER = timedelta(hours=6)
 # were re-locked every cycle and could crowd genuinely-due rechecks out of the
 # batch-size window. Recovery has given up on these; an operator re-queues them.
 _BLOCKED_ESCALATED_PARK = timedelta(days=3650)
+# A parked (escalated) blocker that STILL carries a machine-resolvable need is
+# re-examined at this LOW, bounded cadence instead of the multi-year park
+# horizon, so that when the foundation it waited on finally lands — a sibling
+# task, a merged PR, or shipped code now reachable on integration — the task
+# resumes automatically rather than waiting for a manual operator requeue. The
+# re-evaluation is cheap (one conservative exact-match pass) and never
+# re-escalates or re-alerts, so it does not reintroduce per-cycle churn. Parked
+# blockers with NO need keep the multi-year horizon and stay for the operator.
+_BLOCKED_PARKED_REEVAL_INTERVAL = timedelta(hours=6)
 # A no-dependency agent/lifecycle blocker is often a TRANSIENT infra failure
 # (orchestrator ./pr open 5xx, git push stale-lease) that clears on its own, but
 # can also be a durable precondition (missing base branch/file). We can't tell
@@ -724,6 +733,213 @@ async def _resolve_need_into_dep_edge(
     return True
 
 
+async def sweep_converge_duplicate_foundations(session, now=None) -> int:
+    """Step 15: serialize HIGH-CONFIDENCE duplicate foundations behind the canonical.
+
+    The duplicate-foundation observability signal flags cross-parent active
+    write-tasks with overlapping related files, but that signal is dashboard-only
+    because the pipeline intentionally lets independent tasks edit shared-infra
+    files in parallel and reconcile at merge. This sweep converges only the
+    genuine duplicates the signal catches that slip past spawn-time dedup — a
+    shared finding origin, a shared capability marker, or near-identical file sets
+    (see ``digest_metrics.compute_foundation_convergence_actions``). For each, it
+    wires a ``depends_on`` edge from the later task onto the earlier (canonical)
+    one, so the existing held-lane / cross-base re-cut path rebases the duplicate
+    on the canonical's landed foundation and builds-on instead of rebuilding.
+
+    Conservative and observable: below the genuine-duplicate predicate the pair is
+    left untouched (still merely surfaced by the signal); a self-edge or an edge
+    that would close a ``depends_on`` cycle is refused; every wired edge logs and
+    stamps the dependent's context so an operator can see why it was serialized.
+    Returns the number of edges wired.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.blocked_need_resolution import (
+        ACTIVE_CANDIDATE_STATUSES,
+        _would_create_cycle,
+    )
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    active = [TaskStatus(s) for s in ACTIVE_CANDIDATE_STATUSES]
+    rows = (
+        (await session.execute(select(Task).where(Task.status.in_(active))))
+        .scalars()
+        .all()
+    )
+    by_project: dict = {}
+    for t in rows:
+        by_project.setdefault(t.project_id, []).append(t)
+
+    wired = 0
+    pending_broadcasts: list[tuple[str, dict]] = []
+    for pid, tasks in by_project.items():
+        if len(tasks) < 2:
+            continue
+        by_id = {str(t.id): t for t in tasks}
+        for action in compute_foundation_convergence_actions(tasks):
+            dependent = by_id.get(action["dependent_id"])
+            foundation = by_id.get(action["foundation_id"])
+            if dependent is None or foundation is None:
+                continue
+            found_id = str(foundation.id)
+            if found_id == str(dependent.id):  # defensive self-edge guard
+                continue
+            existing = [str(d) for d in (dependent.depends_on or [])]
+            if found_id in existing:
+                continue
+            if _would_create_cycle(dependent, foundation, tasks):
+                logger.info(
+                    f"[REAPER] Step 15: skipped converging {dependent.id} -> "
+                    f"{found_id} — edge would close a depends_on cycle"
+                )
+                continue
+            dependent.depends_on = existing + [found_id]
+            ctx = dependent.context or {}
+            ctx["_foundation_converged"] = {
+                "foundation_id": found_id,
+                "reason": action["reason"],
+                "shared_files": action["shared_files"],
+            }
+            dependent.context = ctx
+            flag_modified(dependent, "depends_on")
+            flag_modified(dependent, "context")
+            session.add(dependent)
+            wired += 1
+            logger.info(
+                f"[REAPER] Step 15: converged duplicate foundation — task "
+                f"{dependent.id} now depends on {found_id} ({action['reason']})"
+            )
+            pending_broadcasts.append(
+                (
+                    str(pid),
+                    {
+                        "task_id": str(dependent.id),
+                        "depends_on": dependent.depends_on,
+                        "message": f"Serialized behind duplicate foundation: {action['reason']}",
+                    },
+                )
+            )
+
+    if wired:
+        await session.commit()
+        for project_id, payload in pending_broadcasts:
+            with contextlib.suppress(Exception):
+                await _bcast(project_id, "task_updated", payload)
+        logger.info(f"[REAPER] Step 15: converged {wired} duplicate foundation(s)")
+    return wired
+
+
+async def _fetch_completed_candidates(session, project_id) -> list:
+    """Completed/merged tasks in a project — foundations that have already LANDED.
+
+    Statuses mirror ``blocked_need_resolution.COMPLETED_CANDIDATE_STATUSES``: a
+    parked blocker's need may now be satisfied by work that has since completed
+    (a sibling task done, the PR it named merged), which the active-candidate
+    matcher never sees.
+    """
+    from app.blocked_need_resolution import COMPLETED_CANDIDATE_STATUSES
+
+    completed = [TaskStatus(s) for s in COMPLETED_CANDIDATE_STATUSES]
+    return (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.status.in_(completed),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def _maybe_resume_parked_blocker(
+    task,
+    ctx,
+    session,
+    now,
+    *,
+    candidate_cache: dict,
+    completed_cache: dict,
+    pending_broadcasts: list,
+) -> bool:
+    """Re-evaluate a PARKED (escalated) blocker against the live foundation set.
+
+    A parked blocker that carries a machine-resolvable need is rechecked at the
+    low parked cadence. If its need now resolves to an in-flight foundation, wire
+    a ``depends_on`` edge and requeue — the dispatch-time gate then holds the task
+    until the foundation lands. If the need is instead already satisfied by
+    completed/merged work, requeue with NO edge so the task simply proceeds. Either
+    way the parked/escalated state is cleared cleanly (so the task is no longer
+    counted as parked) and the stale 'permanently blocked' operator alert is
+    reconciled. Returns ``True`` when the task resumed.
+
+    Conservative by construction: only a task with a structured need and NO
+    existing dependency edge is considered, resolution uses the SAME exact-match
+    signal as the live need-resolution path (never a fuzzy guess), and resume
+    never re-escalates or re-alerts. Returns ``False`` (no mutation) otherwise, so
+    a need-less or still-unsatisfiable blocker stays parked for the operator.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.task_blocked import get_blocker_metadata
+    from app.blocked_need_resolution import need_satisfied_by_completed
+    from app.alert_dispatch import _resolve_blocked_escalation_alert
+
+    # Only resume the missing-edge case — a parked task that already carries an
+    # edge is a different (dead-dependency) failure mode left for the operator.
+    if task.depends_on:
+        return False
+    need = get_blocker_metadata(task).get("need")
+    if not isinstance(need, dict):
+        return False
+
+    # 1) In-flight foundation: wire the edge; the dispatch gate holds the task.
+    wired = await _resolve_need_into_dep_edge(
+        task, ctx, session, candidate_cache=candidate_cache
+    )
+    if wired:
+        message = "Resumed from parked — need resolved into dependency edge, requeued"
+    else:
+        # 2) Already satisfied by completed/merged work: requeue with NO edge.
+        completed = completed_cache.get(task.project_id)
+        if completed is None:
+            completed = await _fetch_completed_candidates(session, task.project_id)
+            completed_cache[task.project_id] = completed
+        if not need_satisfied_by_completed(task, need, completed):
+            return False
+        message = "Resumed from parked — need satisfied by completed work, requeued"
+
+    # Clear parked/escalated state cleanly: _blocked_escalated, the structured
+    # blocker record (incl. its escalated flag), and recheck_after are all reset
+    # so the task is no longer counted as parked and never re-locked at the park
+    # horizon.
+    _clear_blocked_fields(task, preserve_first_blocked=False)
+    task.status = TaskStatus.QUEUED
+    task.latest_status_message = message
+    flag_modified(task, "context")
+    if wired:
+        flag_modified(task, "depends_on")
+    session.add(task)
+    pending_broadcasts.append(
+        (
+            str(task.project_id),
+            {
+                "task_id": str(task.id),
+                "status": "QUEUED",
+                "message": message,
+            },
+        )
+    )
+    # Reconcile the now-stale 'permanently blocked' operator alert. Best-effort:
+    # a reconcile failure must never abort the resume that triggered it.
+    with contextlib.suppress(Exception):
+        await _resolve_blocked_escalation_alert(task, session)
+    return True
+
+
 async def sweep_unblock_blocked_tasks(
     session,
     now: datetime,
@@ -742,6 +958,7 @@ async def sweep_unblock_blocked_tasks(
     from sqlalchemy.orm.attributes import flag_modified
     from app.alert_dispatch import _maybe_create_blocked_escalation_alert
     from app.broadcast import broadcast_to_project as _bcast
+    from app.task_blocked import get_blocker_metadata
 
     if verify_pr_merged is None:
         from app.rollup_pr_verification import _verify_pr_merged
@@ -768,8 +985,11 @@ async def sweep_unblock_blocked_tasks(
     # a stale BLOCKED row — or, on rollback, a transition that never persisted.
     pending_broadcasts: list[tuple[str, dict]] = []
     # Active-candidate lists are fetched at most once per project across the batch
-    # (only when a task actually has a resolvable need with no edge).
+    # (only when a task actually has a resolvable need with no edge). The
+    # completed-candidate cache is the parked-resume counterpart: a parked
+    # blocker's need may now be satisfied by already-merged/shipped work.
     candidate_cache: dict = {}
+    completed_cache: dict = {}
 
     async def _escalate_blocked_task(
         task,
@@ -778,7 +998,7 @@ async def sweep_unblock_blocked_tasks(
         blocker_kind: str,
         detail: str,
     ) -> None:
-        from app.task_blocked import mark_blocker_escalated
+        from app.task_blocked import get_blocker_metadata, mark_blocker_escalated
 
         await _maybe_create_blocked_escalation_alert(
             task,
@@ -793,7 +1013,14 @@ async def sweep_unblock_blocked_tasks(
         # than leaving the in-transition's escalated=False stale.
         mark_blocker_escalated(task, detail=detail, now=now)
         flag_modified(task, "context")
-        task.recheck_after = now + _BLOCKED_ESCALATED_PARK
+        # A parked blocker that still carries a machine-resolvable need is parked
+        # at the LOW re-evaluation cadence (so it comes back due and resumes when
+        # its foundation lands), not the multi-year horizon. A need-less blocker
+        # keeps the far-future park and stays for the operator exactly as today.
+        has_need = isinstance(get_blocker_metadata(task).get("need"), dict)
+        task.recheck_after = now + (
+            _BLOCKED_PARKED_REEVAL_INTERVAL if has_need else _BLOCKED_ESCALATED_PARK
+        )
         session.add(task)
 
     for task in due:
@@ -804,8 +1031,35 @@ async def sweep_unblock_blocked_tasks(
         # recheck_after let one resurface here, evict it the same way so it
         # stops being re-SELECTed and FOR UPDATE-locked every reaper cycle.
         if ctx.get("_blocked_escalated"):
+            # Parked-blocker auto-resume: a parked blocker that carries a still-
+            # satisfiable machine-resolvable need is resumed (edge + requeue, or
+            # proceed when satisfied by completed work) and its stale alert is
+            # reconciled. Runs at the low parked cadence — never re-escalates.
+            if await _maybe_resume_parked_blocker(
+                task,
+                ctx,
+                session,
+                now,
+                candidate_cache=candidate_cache,
+                completed_cache=completed_cache,
+                pending_broadcasts=pending_broadcasts,
+            ):
+                requeued += 1
+                changed = True
+                continue
+            # Not resumable — re-park without re-alerting. A blocker that still
+            # carries a need is re-examined at the low cadence so it resumes once
+            # its foundation lands; one with no (or an unsatisfiable) need keeps
+            # the multi-year horizon and stays parked for the operator as today.
             if task.recheck_after is None or task.recheck_after <= now:
-                task.recheck_after = now + _BLOCKED_ESCALATED_PARK
+                has_need = isinstance(
+                    get_blocker_metadata(task).get("need"), dict
+                )
+                task.recheck_after = now + (
+                    _BLOCKED_PARKED_REEVAL_INTERVAL
+                    if has_need
+                    else _BLOCKED_ESCALATED_PARK
+                )
                 session.add(task)
                 changed = True
             continue

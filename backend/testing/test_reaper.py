@@ -7908,6 +7908,166 @@ async def test_unblock_sweep_evicts_legacy_escalated_none_recheck(reaper_db, moc
     assert t.recheck_after is not None and t.recheck_after > now
 
 
+async def _parked_blocker(db, project, *, need, now, alert_kind="precondition"):
+    """A BLOCKED task already escalated and parked, carrying ``need`` and a
+    matching open 'permanently blocked' ERROR alert (so resume can reconcile it).
+    Parked due at the low re-eval cadence so the sweep re-examines it."""
+    t = await _blocked_task(
+        db, project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: needs a foundation that never arrived in time",
+        depends_on=[],
+        blocked_at=now - timedelta(hours=7),
+        context={
+            "_blocked_escalated": True,
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "foundation",
+                "escalated": True,
+                "need": need,
+            },
+        },
+        recheck_after=now - timedelta(minutes=1),  # due
+    )
+    alert = Alert(
+        project_id=project.id,
+        severity=AlertSeverity.ERROR,
+        title=f"Task permanently blocked: {alert_kind}",
+        message="automatic recovery has given up",
+        task_id=t.id,
+    )
+    db.add(alert)
+    await db.commit()
+    return t
+
+
+@pytest.mark.asyncio
+async def test_parked_blocker_resumes_when_inflight_need_becomes_satisfiable(
+    reaper_db, mocker
+):
+    """A parked blocker whose need now names an in-flight foundation resumes:
+    a depends_on edge is wired, the parked/escalated marker is cleared, and the
+    stale 'permanently blocked' alert is reconciled."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    foundation = Task(
+        project_id=project.id, title="foundation", description="x",
+        status=TaskStatus.IN_PROGRESS, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}], context={}, status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+    t = await _parked_blocker(
+        reaper_db, project,
+        need={"kind": "task", "ref": str(foundation.id)}, now=now,
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    # Edge wired onto the in-flight foundation; parked/escalated state cleared.
+    assert str(foundation.id) in (t.depends_on or [])
+    assert t.context.get("_blocked_escalated") is None
+    assert "blocker" not in (t.context or {})
+    assert t.recheck_after is None
+    # The stale 'permanently blocked' ERROR alert was reconciled (dismissed).
+    alerts = (
+        await reaper_db.execute(
+            _select(Alert).where(Alert.task_id == t.id)
+        )
+    ).scalars().all()
+    assert len(alerts) == 1 and alerts[0].dismissed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_parked_blocker_resumes_when_need_satisfied_by_completed_work(
+    reaper_db, mocker
+):
+    """A parked blocker whose need is already satisfied by completed/merged work
+    proceeds with NO dangling edge (the foundation is already done)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    merged = Task(
+        project_id=project.id, title="merged-foundation", description="x",
+        status=TaskStatus.COMPLETED, created_by="u", requires_approval=False,
+        payloads=[{"type": "fix", "pr_number": 8123}], context={}, status_log=[],
+    )
+    reaper_db.add(merged)
+    await reaper_db.commit()
+    await reaper_db.refresh(merged)
+    t = await _parked_blocker(
+        reaper_db, project,
+        need={"kind": "pr", "ref": "8123"}, now=now,
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    # Satisfied by completed work — no edge wired, just proceeds.
+    assert not (t.depends_on or [])
+    assert t.context.get("_blocked_escalated") is None
+    assert "blocker" not in (t.context or {})
+
+
+@pytest.mark.asyncio
+async def test_parked_blocker_stays_parked_when_need_unsatisfiable(
+    reaper_db, mocker
+):
+    """A parked blocker whose need matches nothing live stays BLOCKED+escalated,
+    re-parked at the low cadence without re-firing an alert; and a parked blocker
+    with NO structured need keeps the multi-year horizon for the operator."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    from app.reaper_sweeps import _BLOCKED_PARKED_REEVAL_INTERVAL
+
+    # (a) Unsatisfiable capability need — no candidate matches.
+    needful = await _parked_blocker(
+        reaper_db, project,
+        need={"kind": "capability", "ref": "auth-subsystem-that-does-not-exist"},
+        now=now,
+    )
+    # (b) No structured need at all — must keep the far-future park.
+    needless = await _blocked_task(
+        reaper_db, project, depends_on=[],
+        context={"_blocked_escalated": True, "blocker": {"source": "agent"}},
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    await reaper_db.refresh(needful)
+    await reaper_db.refresh(needless)
+    # Needful-but-unsatisfiable: still parked, re-armed at the LOW cadence so it
+    # is re-examined when its foundation eventually lands.
+    assert needful.status == TaskStatus.BLOCKED
+    assert needful.context.get("_blocked_escalated") is True
+    assert needful.recheck_after is not None
+    assert needful.recheck_after <= now + _BLOCKED_PARKED_REEVAL_INTERVAL + timedelta(
+        minutes=1
+    )
+    # No-need blocker: parked far into the future for the operator as before.
+    assert needless.status == TaskStatus.BLOCKED
+    assert needless.recheck_after > now + timedelta(days=3000)
+
+    # Repeated sweeps neither resume, loop, nor create a duplicate alert.
+    await sweep_unblock_blocked_tasks(reaper_db, now + timedelta(hours=7))
+    alerts = (
+        await reaper_db.execute(
+            _select(Alert).where(Alert.task_id == needful.id)
+        )
+    ).scalars().all()
+    assert len(alerts) == 1  # the original escalation alert; no re-fire
+
+
 @pytest.mark.asyncio
 async def test_unblock_sweep_preserves_first_blocked_on_optimistic_requeue(
     reaper_db, mocker
@@ -8155,3 +8315,171 @@ async def test_full_reaper_cycle_does_not_reap_blocked_task(
 
     await reaper_db.refresh(t)
     assert t.status == TaskStatus.BLOCKED
+
+
+# ── Step 15: converge duplicate foundations ───────────────────────────────
+
+
+async def _conv_task(
+    db,
+    project,
+    *,
+    ttype="create",
+    files=None,
+    parent=None,
+    ctx=None,
+    created_at=None,
+    status=TaskStatus.IN_PROGRESS,
+    depends_on=None,
+):
+    """Create an active write-task for the convergence sweep tests."""
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": ttype, "related_files": files or []}],
+        status=status,
+        parent_task_id=parent,
+        context=ctx or {},
+        depends_on=depends_on or [],
+        created_at=created_at or datetime.utcnow(),
+    )
+    db.add(t)
+    await db.commit()
+    await db.refresh(t)
+    return t
+
+
+@pytest.fixture()
+def _no_broadcast(mocker):
+    mocker.patch(
+        "app.broadcast.broadcast_to_project", new_callable=AsyncMock, return_value=None
+    )
+
+
+@pytest.mark.asyncio
+async def test_converge_genuine_cross_parent_duplicate_wires_edge(
+    reaper_db, _no_broadcast
+):
+    """A genuine cross-parent duplicate (near-identical file sets) is serialized:
+    the later task gets a depends_on edge onto the earlier (canonical) one."""
+    from app.reaper_sweeps import sweep_converge_duplicate_foundations
+
+    project = await _make_project(reaper_db)
+    files = ["backend/app/foundation.py", "backend/app/x.py", "backend/app/y.py"]
+    canonical = await _conv_task(
+        reaper_db, project, files=files, created_at=datetime.utcnow() - timedelta(hours=2)
+    )
+    dependent = await _conv_task(
+        reaper_db, project, files=files, created_at=datetime.utcnow()
+    )
+
+    n = await sweep_converge_duplicate_foundations(reaper_db, datetime.utcnow())
+    await reaper_db.refresh(canonical)
+    await reaper_db.refresh(dependent)
+
+    assert n == 1
+    assert str(canonical.id) in [str(d) for d in dependent.depends_on]
+    assert not canonical.depends_on
+    assert dependent.context.get("_foundation_converged", {}).get("foundation_id") == str(
+        canonical.id
+    )
+
+
+@pytest.mark.asyncio
+async def test_converge_shared_finding_origin_wires_edge(reaper_db, _no_broadcast):
+    """Shared finding origin is a genuine-duplicate signal even when file sets differ."""
+    from app.reaper_sweeps import sweep_converge_duplicate_foundations
+
+    project = await _make_project(reaper_db)
+    canonical = await _conv_task(
+        reaper_db,
+        project,
+        files=["backend/app/a.py"],
+        ctx={"finding_hash": "deadbeefcafe0001"},
+        created_at=datetime.utcnow() - timedelta(hours=1),
+    )
+    dependent = await _conv_task(
+        reaper_db,
+        project,
+        files=["backend/app/b.py", "backend/app/c.py"],
+        ctx={"finding_hash": "deadbeefcafe0001"},
+        created_at=datetime.utcnow(),
+    )
+
+    n = await sweep_converge_duplicate_foundations(reaper_db, datetime.utcnow())
+    await reaper_db.refresh(dependent)
+
+    assert n == 1
+    assert str(canonical.id) in [str(d) for d in dependent.depends_on]
+
+
+@pytest.mark.asyncio
+async def test_no_converge_when_only_one_shared_infra_file(reaper_db, _no_broadcast):
+    """Two independent tasks that merely share one infra file are NOT converged."""
+    from app.reaper_sweeps import sweep_converge_duplicate_foundations
+
+    project = await _make_project(reaper_db)
+    t1 = await _conv_task(
+        reaper_db,
+        project,
+        files=["backend/app/shared.py", "backend/app/a.py", "backend/app/b.py"],
+    )
+    t2 = await _conv_task(
+        reaper_db,
+        project,
+        files=["backend/app/shared.py", "backend/app/c.py", "backend/app/d.py"],
+    )
+
+    n = await sweep_converge_duplicate_foundations(reaper_db, datetime.utcnow())
+    await reaper_db.refresh(t1)
+    await reaper_db.refresh(t2)
+
+    assert n == 0
+    assert not t1.depends_on
+    assert not t2.depends_on
+
+
+@pytest.mark.asyncio
+async def test_no_converge_same_parent(reaper_db, _no_broadcast):
+    """Same-parent siblings reconcile by design and are never auto-serialized."""
+    from app.reaper_sweeps import sweep_converge_duplicate_foundations
+
+    project = await _make_project(reaper_db)
+    parent = _uuid_mod.uuid4()
+    files = ["backend/app/foundation.py", "backend/app/x.py"]
+    t1 = await _conv_task(reaper_db, project, files=files, parent=parent)
+    t2 = await _conv_task(reaper_db, project, files=files, parent=parent)
+
+    n = await sweep_converge_duplicate_foundations(reaper_db, datetime.utcnow())
+    await reaper_db.refresh(t1)
+    await reaper_db.refresh(t2)
+
+    assert n == 0
+    assert not t1.depends_on
+    assert not t2.depends_on
+
+
+@pytest.mark.asyncio
+async def test_converge_refuses_cycle(reaper_db, _no_broadcast):
+    """The sweep never closes a depends_on cycle: if the earlier (canonical) task
+    already depends on the later one, no reverse edge is wired."""
+    from app.reaper_sweeps import sweep_converge_duplicate_foundations
+
+    project = await _make_project(reaper_db)
+    files = ["backend/app/foundation.py", "backend/app/x.py", "backend/app/y.py"]
+    later = await _conv_task(reaper_db, project, files=files, created_at=datetime.utcnow())
+    # earlier=canonical, but it already depends on the later task → reverse edge cycles
+    earlier = await _conv_task(
+        reaper_db,
+        project,
+        files=files,
+        created_at=datetime.utcnow() - timedelta(hours=2),
+        depends_on=[str(later.id)],
+    )
+
+    n = await sweep_converge_duplicate_foundations(reaper_db, datetime.utcnow())
+    await reaper_db.refresh(later)
+    await reaper_db.refresh(earlier)
+
+    assert n == 0
+    assert not later.depends_on
+    assert earlier.depends_on == [str(later.id)]

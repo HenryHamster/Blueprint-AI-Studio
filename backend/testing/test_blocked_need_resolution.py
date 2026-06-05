@@ -7,7 +7,10 @@ covered separately in ``test_reaper.py``.
 
 import uuid
 
-from app.blocked_need_resolution import resolve_blocked_need
+from app.blocked_need_resolution import (
+    need_satisfied_by_completed,
+    resolve_blocked_need,
+)
 from app.models import Task, TaskStatus
 
 
@@ -151,3 +154,36 @@ def test_unknown_kind_returns_none():
     blocked = _task(status=TaskStatus.BLOCKED)
     need = {"kind": "branch", "ref": "main"}
     assert resolve_blocked_need(blocked, need, [_task()]) is None
+
+
+# ── need_satisfied_by_completed (parked-resume against landed work) ───────────
+
+def test_completed_task_need_satisfied_by_merged_foundation():
+    done = _task(status=TaskStatus.COMPLETED)
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": str(done.id)}
+    assert need_satisfied_by_completed(blocked, need, [done]) is True
+
+
+def test_completed_pr_need_satisfied_by_owning_completed_task():
+    done = _task(status=TaskStatus.COMPLETED, payloads=[{"type": "fix", "pr_number": 8123}])
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "pr", "ref": "8123"}
+    assert need_satisfied_by_completed(blocked, need, [done]) is True
+
+
+def test_completed_need_unsatisfied_returns_false():
+    done = _task(status=TaskStatus.COMPLETED)
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": str(uuid.uuid4())}
+    assert need_satisfied_by_completed(blocked, need, [done]) is False
+    # Malformed / empty inputs are conservatively unsatisfied.
+    assert need_satisfied_by_completed(blocked, {}, [done]) is False
+    assert need_satisfied_by_completed(blocked, need, []) is False
+
+
+def test_completed_need_never_self_satisfies():
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": str(blocked.id)}
+    # The blocked task itself, even if somehow in the completed set, is excluded.
+    assert need_satisfied_by_completed(blocked, need, [blocked]) is False

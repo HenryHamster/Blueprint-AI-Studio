@@ -36,6 +36,13 @@ from app.models import Task
 # that depends on it.
 ACTIVE_CANDIDATE_STATUSES = ("QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING")
 
+# Statuses a foundation can be in once it has already LANDED. A parked blocker's
+# need may now be satisfied by completed/merged work rather than by an in-flight
+# candidate, so the parked re-evaluation path matches against this set too (see
+# :func:`need_satisfied_by_completed`). A completed foundation needs no edge —
+# the work is already done — so resumption simply lets the task proceed.
+COMPLETED_CANDIDATE_STATUSES = ("COMPLETED",)
+
 
 def _candidate_pr_number(candidate: Task) -> Optional[int]:
     """Return the candidate's owned PR number from its leading payload, if any."""
@@ -115,6 +122,48 @@ def _match_capability(
     return matches[0] if len(matches) == 1 else None
 
 
+def _match_need(need: Dict[str, Any], candidates: List[Task]) -> Optional[Task]:
+    """Return the single candidate satisfying ``need`` by exact signal, or ``None``.
+
+    Pure kind-dispatch over the per-kind matchers — NO self/cycle guard (callers
+    that wire an edge apply those; the completed-work path needs no edge so it
+    has nothing to guard). Conservative throughout: ambiguous or weak signals
+    yield ``None``.
+    """
+    kind = need.get("kind")
+    ref = need.get("ref")
+    if not kind or not ref:
+        return None
+    if kind == "task":
+        return _match_task(ref, candidates)
+    if kind == "pr":
+        return _match_pr(ref, candidates)
+    if kind == "capability":
+        return _match_capability(ref, need, candidates)
+    return None
+
+
+def need_satisfied_by_completed(
+    task: Task, need: Dict[str, Any], completed_candidates: List[Task]
+) -> bool:
+    """True if ``need`` is satisfied by already-completed/merged work.
+
+    The live ``resolve_blocked_need`` path only considers active candidates, but a
+    parked blocker may have outlived the foundation it waited on — the sibling
+    task has since COMPLETED, or the PR it named has merged (its owning task is
+    COMPLETED). In that case there is nothing in flight to depend on; the work is
+    simply done, so the parked task should resume and proceed with no edge.
+
+    Uses the SAME exact-match signals as the live path (task id / PR number /
+    explicit capability marker) — never a fuzzy guess. ``completed_candidates`` is
+    the pre-fetched set of same-project tasks in :data:`COMPLETED_CANDIDATE_STATUSES`.
+    """
+    if not isinstance(need, dict):
+        return False
+    eligible = [c for c in completed_candidates if c.id != task.id]
+    return _match_need(need, eligible) is not None
+
+
 def _would_create_cycle(task: Task, match: Task, candidates: List[Task]) -> bool:
     """True if adding ``task -> match`` would close a ``depends_on`` cycle.
 
@@ -158,22 +207,10 @@ def resolve_blocked_need(
     """
     if not isinstance(need, dict):
         return None
-    kind = need.get("kind")
-    ref = need.get("ref")
-    if not kind or not ref:
-        return None
 
     # Never wire a self-edge: a task can never be its own prerequisite.
     eligible = [c for c in candidates if c.id != task.id]
-
-    if kind == "task":
-        match = _match_task(ref, eligible)
-    elif kind == "pr":
-        match = _match_pr(ref, eligible)
-    elif kind == "capability":
-        match = _match_capability(ref, need, eligible)
-    else:
-        match = None
+    match = _match_need(need, eligible)
 
     if match is None:
         return None

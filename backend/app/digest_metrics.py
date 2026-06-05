@@ -1339,6 +1339,88 @@ def compute_duplicate_foundation_signal(
     }
 
 
+# Action-confidence threshold for *converging* (serializing) a pair — strictly
+# ABOVE the observability threshold. Strong overlap alone is intentionally NOT
+# enough: the pipeline lets independent tasks edit shared-infrastructure files in
+# parallel and reconcile at merge. We only auto-serialize a pair on a genuine-
+# duplicate signal (shared finding origin, shared capability marker, or
+# near-identical file sets at this near-1.0 Jaccard), so legitimate parallel work
+# is never needlessly serialized.
+_FOUNDATION_CONVERGE_THRESHOLD = 0.85
+
+
+def _genuine_duplicate_reason(ti: "Task", fi: set, tj: "Task", fj: set):
+    """Return a short reason if ``(ti, tj)`` are a HIGH-CONFIDENCE genuine
+    duplicate foundation, else ``None``. Pure. Any one signal suffices:
+
+      * a shared finding origin (identical non-empty ``finding_hash``),
+      * a shared explicit capability marker, or
+      * near-identical related-file sets (Jaccard >= the convergence threshold).
+
+    Strong-but-partial file overlap below the convergence threshold is NOT
+    genuine — that is the incidental shared-infra case the pipeline reconciles at
+    merge — so it returns ``None`` and the pair is left untouched.
+    """
+    from app.finding_deduplication import _task_finding_hash, _task_capability_markers
+
+    hi, hj = _task_finding_hash(ti), _task_finding_hash(tj)
+    if hi and hi == hj:
+        return f"shared finding origin {hi}"
+    shared_caps = _task_capability_markers(ti) & _task_capability_markers(tj)
+    if shared_caps:
+        return f"shared capability '{sorted(shared_caps)[0]}'"
+    union = fi | fj
+    if union and len(fi & fj) / len(union) >= _FOUNDATION_CONVERGE_THRESHOLD:
+        return f"near-identical file sets ({round(len(fi & fj) / len(union), 3)} Jaccard)"
+    return None
+
+
+def compute_foundation_convergence_actions(
+    active_write_tasks: List[Task],
+) -> List[Dict[str, Any]]:
+    """High-confidence genuine duplicate-foundation pairs to serialize. Pure.
+
+    For each cross-parent pair of active write-tasks that passes
+    :func:`_genuine_duplicate_reason`, emit an action that makes the LATER task
+    (by ``created_at``, id-tiebroken) depend on the earlier — the canonical
+    foundation — so the duplicate rebases on the canonical's landed work and
+    builds-on instead of rebuilding. Earlier-is-canonical ordering keeps the edge
+    direction deterministic and the wired graph acyclic by construction. The
+    caller still applies a self-edge / cycle guard before wiring.
+    """
+    enriched = [
+        (t, _task_related_files(t))
+        for t in active_write_tasks
+        if (t.first_payload or {}).get("type") in _WRITE_TASK_TYPES
+    ]
+
+    def _order_key(t: "Task"):
+        return (getattr(t, "created_at", None) or datetime.min, str(t.id))
+
+    actions: List[Dict[str, Any]] = []
+    for i in range(len(enriched)):
+        ti, fi = enriched[i]
+        pi = getattr(ti, "parent_task_id", None)
+        for j in range(i + 1, len(enriched)):
+            tj, fj = enriched[j]
+            pj = getattr(tj, "parent_task_id", None)
+            if pi is not None and pi == pj:
+                continue
+            reason = _genuine_duplicate_reason(ti, fi, tj, fj)
+            if reason is None:
+                continue
+            canonical, dependent = sorted((ti, tj), key=_order_key)
+            actions.append(
+                {
+                    "dependent_id": str(dependent.id),
+                    "foundation_id": str(canonical.id),
+                    "reason": reason,
+                    "shared_files": sorted(fi & fj),
+                }
+            )
+    return actions
+
+
 async def compute_dependency_health_signals(
     session: AsyncSession,
     project_id: "uuid.UUID | None" = None,
