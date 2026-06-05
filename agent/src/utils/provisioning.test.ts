@@ -93,8 +93,8 @@ describe('detectProvisioningSteps', () => {
   });
 
   // Extra-ecosystem auto-provision: the suite detector launches these runners
-  // (bundle exec / gradle / mvn / mix / composer) but none of those commands
-  // installs its own deps, so the gate must provision them first.
+  // (bundle exec / gradle / mvn / mix / composer / go / cargo) but none of those
+  // commands installs its own deps, so the gate must provision them first.
   it.each([
     ['Gemfile', 'bundle', ['install']],
     ['build.gradle', './gradlew', ['dependencies', '--no-daemon']],
@@ -102,6 +102,8 @@ describe('detectProvisioningSteps', () => {
     ['pom.xml', 'mvn', ['-B', 'dependency:go-offline']],
     ['mix.exs', 'mix', ['deps.get']],
     ['composer.json', 'composer', ['install']],
+    ['go.mod', 'go', ['mod', 'download']],
+    ['Cargo.toml', 'cargo', ['fetch']],
   ])('auto-provisions an extra-ecosystem manifest %s with %s', (manifest, cmd, args) => {
     mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/${manifest}`);
     const steps = detectProvisioningSteps(undefined);

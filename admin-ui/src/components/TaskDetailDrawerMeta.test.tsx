@@ -158,7 +158,8 @@ describe('DetailsTab — Merge Test Gate', () => {
     });
     render(<DetailsTab task={task} />);
     expect(screen.getByText('Coverage')).toBeInTheDocument();
-    expect(screen.getByText('100 passed · 0 skipped · 100 total')).toBeInTheDocument();
+    // 0 skipped out of 100 = 0%
+    expect(screen.getByText('100 passed · 0 skipped (0%) · 100 total')).toBeInTheDocument();
     expect(screen.queryByText(/most of its tests were skipped/)).toBeNull();
   });
 
@@ -173,7 +174,8 @@ describe('DetailsTab — Merge Test Gate', () => {
       })],
     });
     render(<DetailsTab task={task} />);
-    expect(screen.getByText('5 passed · 1500 skipped · 1505 total')).toBeInTheDocument();
+    // Percentage shown: 1500/1505 ≈ 99.67% rounds to 100%
+    expect(screen.getByText('5 passed · 1500 skipped (100%) · 1505 total')).toBeInTheDocument();
     expect(screen.getByText(/most of its tests were skipped/)).toBeInTheDocument();
     // Still a PASS verdict — visibility only, not a block.
     expect(screen.getByText('Passed')).toBeInTheDocument();
@@ -526,6 +528,95 @@ describe('DetailsTab — Merge Test Gate', () => {
     expect(screen.getByText('Correctness')).toBeInTheDocument();
     expect(screen.getByText('agent/src/handlers/panel-review.ts:120')).toBeInTheDocument();
     expect(screen.queryByText('Plan Output')).toBeNull();
+  });
+
+  it('shows the fall-open reason when a suite was detected but every test was skipped', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({
+        detected: false,
+        passed: false,
+        tests: [],
+        output: '',
+        noTestsReason: 'all_skipped',
+      })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('No suite detected')).toBeInTheDocument();
+    expect(screen.getByText('Fall-open reason')).toBeInTheDocument();
+    expect(screen.getByText(/every test was skipped/)).toBeInTheDocument();
+  });
+
+  it('shows the fall-open reason when no real tests were found (placeholder/empty)', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({
+        detected: false,
+        passed: false,
+        tests: [],
+        output: '',
+        noTestsReason: 'no_real_tests',
+      })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('No suite detected')).toBeInTheDocument();
+    expect(screen.getByText('Fall-open reason')).toBeInTheDocument();
+    expect(screen.getByText(/no real tests were found/)).toBeInTheDocument();
+  });
+
+  it('shows the fall-open reason when genuinely no suite was detectable', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({
+        detected: false,
+        passed: false,
+        tests: [],
+        output: '',
+        noTestsReason: 'no_suite',
+      })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('No suite detected')).toBeInTheDocument();
+    expect(screen.getByText('Fall-open reason')).toBeInTheDocument();
+    expect(screen.getByText(/no suite was detected/)).toBeInTheDocument();
+  });
+
+  it('does not show fall-open reason for legacy artifacts without noTestsReason', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({ detected: false, passed: false, tests: [], output: '' })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('No suite detected')).toBeInTheDocument();
+    expect(screen.queryByText('Fall-open reason')).toBeNull();
+  });
+
+  it('includes skip percentage in coverage display', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({
+        detected: true,
+        passed: true,
+        tests: [],
+        output: '',
+        coverage: { passed: 80, skipped: 20, total: 100 },
+      })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Coverage')).toBeInTheDocument();
+    // Percentage should be shown: 20 skipped out of 100 = 20%
+    expect(screen.getByText('80 passed · 20 skipped (20%) · 100 total')).toBeInTheDocument();
+  });
+
+  it('handles edge case of zero total tests in coverage', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({
+        detected: true,
+        passed: true,
+        tests: [],
+        output: '',
+        coverage: { passed: 0, skipped: 0, total: 0 },
+      })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Coverage')).toBeInTheDocument();
+    // Should show 0% when total is 0
+    expect(screen.getByText('0 passed · 0 skipped (0%) · 0 total')).toBeInTheDocument();
   });
 });
 

@@ -733,6 +733,22 @@ export function detectProvisioningSteps(buildConfig?: BuildConfig): Provisioning
       add({ cmd: 'composer', args: ['install'], cwd: absDir, label: `composer install (${label})` });
       return;
     }
+    // Go: go.mod → `go mod download` (pre-fetch modules so the suite and
+    // acceptance probe run provisioned). Without this, a repo with no unit suite
+    // (or a thin/skipped suite) runs its `go build` probe unprovisioned and fails
+    // on first-download, silently downgrading to could_not_run.
+    if (exists(`${absDir}/go.mod`)) {
+      add({ cmd: 'go', args: ['mod', 'download'], cwd: absDir, label: `go mod download (${label})` });
+      return;
+    }
+    // Rust: Cargo.toml → `cargo fetch` (pre-fetch crates). Without this, a repo
+    // with no unit suite (or a thin/skipped suite) runs its `cargo check` probe
+    // unprovisioned and fails on first-download, silently downgrading to
+    // could_not_run.
+    if (exists(`${absDir}/Cargo.toml`)) {
+      add({ cmd: 'cargo', args: ['fetch'], cwd: absDir, label: `cargo fetch (${label})` });
+      return;
+    }
   };
   if (buildConfig?.directories) {
     for (const dir of buildConfig.directories) {

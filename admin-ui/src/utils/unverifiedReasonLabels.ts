@@ -37,3 +37,20 @@ export function humanizeUnverifiedReason(key: string): string {
     key.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim()
   );
 }
+
+/**
+ * Map a test-not-detected reason to an operator-facing label. Used when a
+ * merge falls open because no usable test suite was found, to distinguish
+ * between "all tests were skipped" (suspicious), "no real tests were present"
+ * (perhaps a placeholder), and "no suite was detectable at all" (fine for
+ * greenfield). Returns null if the reason is not set.
+ */
+export function labelNoTestsReason(reason: string | null | undefined): string | null {
+  if (!reason) return null;
+  const labels: Record<string, string> = {
+    all_skipped: 'a test suite was present but every test was skipped (no real verification ran)',
+    no_real_tests: 'no real tests were found (the suite collected only placeholder/empty tests)',
+    no_suite: 'no suite was detected',
+  };
+  return labels[reason] ?? null;
+}

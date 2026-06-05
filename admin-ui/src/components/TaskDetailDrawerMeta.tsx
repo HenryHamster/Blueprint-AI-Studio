@@ -12,7 +12,7 @@ import { SelfReviewPanel } from './TaskDetailDrawerSelfReview';
 import { TaskDiagnosticsPanel, TaskErrorLogsPanel, getLogEntryColor } from './TaskDetailDrawerDiagnostics';
 import { FailureDetailPanel } from './TaskDetailDrawerFailureDetail';
 import type { PanelReviewIssue, PanelReviewVerdict, Task, TaskEvaluationSummary } from '../types/task';
-import { humanizeUnverifiedReason } from '../utils/unverifiedReasonLabels';
+import { humanizeUnverifiedReason, labelNoTestsReason } from '../utils/unverifiedReasonLabels';
 import {
   parseMergeTestVerdict,
   deriveMergeTestOutcome,
@@ -1153,6 +1153,17 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
                   {v.label}
                 </span>
               </div>
+              {(() => {
+                const fallOpenReason = outcome === 'undetected' && mergeTestVerdict?.noTestsReason
+                  ? labelNoTestsReason(mergeTestVerdict.noTestsReason)
+                  : null;
+                return fallOpenReason ? (
+                  <div className="flex items-start gap-2">
+                    <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Fall-open reason</span>
+                    <span className="text-xs text-neutral-300 break-words">{fallOpenReason}</span>
+                  </div>
+                ) : null;
+              })()}
               {documentedState && (
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="text-xs text-neutral-500 w-28 shrink-0">Documented command</span>
@@ -1175,14 +1186,17 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
                   ⚠ The declared build exited cleanly but wrote no output — possible no-op build (not real verification).
                 </p>
               )}
-              {coverage && (
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span className="text-xs text-neutral-500 w-28 shrink-0">Coverage</span>
-                  <span className={`text-xs font-semibold ${coverageMostlySkipped ? 'text-amber-400' : 'text-neutral-300'}`}>
-                    {coverage.passed} passed · {coverage.skipped} skipped · {coverage.total} total
-                  </span>
-                </div>
-              )}
+              {coverage && (() => {
+                const skipPct = coverage.total > 0 ? Math.round((coverage.skipped / coverage.total) * 100) : 0;
+                return (
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-xs text-neutral-500 w-28 shrink-0">Coverage</span>
+                    <span className={`text-xs font-semibold ${coverageMostlySkipped ? 'text-amber-400' : 'text-neutral-300'}`}>
+                      {coverage.passed} passed · {coverage.skipped} skipped ({skipPct}%) · {coverage.total} total
+                    </span>
+                  </div>
+                );
+              })()}
               {coverageMostlySkipped && (
                 <p className="text-xs text-amber-400 break-words">
                   ⚠ The suite passed but most of its tests were skipped — only a small fraction actually executed (not full verification).
