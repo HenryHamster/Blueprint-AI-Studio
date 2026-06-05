@@ -536,24 +536,33 @@ async def create_message(
     )
     session.add(msg)
     event_type = ctx.get("event_type")
-    if event_type and event_type in ROUTINE_EVENT_TYPES:
-        # The routine-digest append is a read-modify-write on running_update,
-        # which races with concurrent message creates and with the agent's
-        # locked set_running_update reconciliation. Acquire the project row
-        # lock (matching the codebase's existing idiom) so the append reads a
-        # fresh, committed running_update and serializes against other writers;
-        # without it, a stale read could silently drop a digest line or clobber
-        # the agent's reconciled document. populate_existing on the locked read
-        # refreshes the identity-mapped project loaded by _get_user_project.
-        locked_project = await lock_project_or_429(session, project_id)
-        append_routine_digest(locked_project, event_type, content)
+    # Wrap the routine-digest append together with the commit so a concurrent
+    # same-key insert is caught wherever the pending ``msg`` actually flushes.
+    # Under READ COMMITTED a competitor can commit the duplicate after this
+    # request's idempotency pre-check passed, and the unique violation then
+    # surfaces either at the explicit ``commit`` below OR earlier, when
+    # ``lock_project_or_429``'s SELECT autoflushes ``msg`` — so catching only
+    # the commit would let the autoflush variant escape as a 500.
     try:
+        if event_type and event_type in ROUTINE_EVENT_TYPES:
+            # The routine-digest append is a read-modify-write on running_update,
+            # which races with concurrent message creates and with the agent's
+            # locked set_running_update reconciliation. Acquire the project row
+            # lock (matching the codebase's existing idiom) so the append reads a
+            # fresh, committed running_update and serializes against other
+            # writers; without it, a stale read could silently drop a digest line
+            # or clobber the agent's reconciled document. populate_existing on the
+            # locked read refreshes the identity-mapped project loaded by
+            # _get_user_project.
+            locked_project = await lock_project_or_429(session, project_id)
+            append_routine_digest(locked_project, event_type, content)
         await session.commit()
     except IntegrityError:
         # Concurrency backstop: two simultaneous sends sharing the same key
         # both passed the pre-insert query, but the partial unique index lets
-        # only one row land. Roll back and return the winner so the loser is
-        # still an idempotent success rather than a 500.
+        # only one row land. Roll back (discarding any routine-digest append so
+        # the duplicate does not double-apply it) and return the winner so the
+        # loser is still an idempotent success rather than a 500.
         await session.rollback()
         if idem_key:
             existing = (

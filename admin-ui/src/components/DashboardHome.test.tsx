@@ -37,6 +37,7 @@ vi.mock('../api', () => ({
     data_sufficient: true,
   }),
   setVersionPhase: vi.fn(),
+  setVersionGoal: vi.fn(),
   triggerQualify: vi.fn(),
 }));
 

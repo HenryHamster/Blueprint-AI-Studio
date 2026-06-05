@@ -148,15 +148,19 @@ describe('ProjectDashboard', () => {
 
   it('renders a per-project status badge', () => {
     localStorage.setItem('projectDashboardCollapsed', 'false');
+    const recentTime = new Date(Date.now() - 30 * 60 * 1000).toISOString(); // 30 mins ago
     render(
       <ProjectDashboard
-        projects={[makeProject({ status: 'DEPLOYING' }), makeProject({ id: 'proj-2', name: 'Bootstrap', status: 'FAILED' })]}
+        projects={[
+          makeProject({ status: 'DEPLOYING', created_at: recentTime }),
+          makeProject({ id: 'proj-2', name: 'Bootstrap', status: 'FAILED' })
+        ]}
         tasks={[]}
         selectedProjectId={null}
         onSelectProject={vi.fn()}
       />,
     );
-    expect(screen.getByText('Deploying')).toBeInTheDocument();
+    expect(screen.getByText('Bootstrapping')).toBeInTheDocument();
     expect(screen.getByText('Failed')).toBeInTheDocument();
   });
 
@@ -415,8 +419,8 @@ describe('ProjectDashboard', () => {
         onProjectPaused={onProjectPaused}
       />,
     );
-    // The distinct paused pill is visible on the card.
-    expect(screen.getByText('Paused')).toBeInTheDocument();
+    // The distinct paused pill is visible on the card (has the Pause icon and the specific title).
+    expect(screen.getByTitle('Project is paused: no new work will be dispatched')).toBeInTheDocument();
 
     fireEvent.click(screen.getByTitle('Project actions'));
     fireEvent.click(screen.getByTitle(/Resume project/));

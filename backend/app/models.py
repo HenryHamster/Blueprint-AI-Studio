@@ -3132,6 +3132,19 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(Text, nullable=True),
     )
 
+    # Stamped when the goal is edited by an operator.
+    goal_updated_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    # Editor provenance for the goal: "[operator:email]" format, mirroring phase_reasoning.
+    # Populated only when an operator edits the goal; auto-derived goals carry no editor info.
+    goal_editor_info: str | None = Field(
+        default=None,
+        sa_column=Column(String(255), nullable=True),
+    )
+
     opened_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),

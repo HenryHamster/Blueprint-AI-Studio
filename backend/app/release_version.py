@@ -439,3 +439,45 @@ def set_version_phase(
         version.version_number,
         version.project_id,
     )
+
+
+def set_version_goal(
+    version: ReleaseVersion,
+    goal: str | None,
+    *,
+    editor_id: str | None = None,
+) -> None:
+    """Update the goal on an open ``ReleaseVersion`` row.
+
+    Stamps ``goal_updated_at`` to now and records the ``editor_id`` in
+    ``goal_editor_info``.  No-ops silently when ``goal`` is already set
+    to the requested value (idempotent).
+
+    Caller is responsible for ``session.add(version)`` and committing.
+
+    ``editor_id`` should be a user email or unique identifier; it is prefixed
+    with ``[operator:`` and suffixed with ``]`` to match phase_reasoning style.
+    """
+    new_goal = goal[:_GOAL_MAX] if goal else None
+    if version.goal == new_goal:
+        logger.debug(
+            "[RELEASE_VERSION] set_version_goal: version v%d project=%s "
+            "already set to same goal — no-op",
+            version.version_number,
+            version.project_id,
+        )
+        return
+    old_goal = version.goal
+    version.goal = new_goal
+    version.goal_updated_at = _utcnow()
+    if editor_id:
+        version.goal_editor_info = f"[operator:{editor_id}]"
+    logger.info(
+        "[RELEASE_VERSION] goal update for version v%d project=%s "
+        "(old: %.50s) (new: %.50s) editor=%s",
+        version.version_number,
+        version.project_id,
+        old_goal or "(none)",
+        new_goal or "(none)",
+        editor_id or "unknown",
+    )

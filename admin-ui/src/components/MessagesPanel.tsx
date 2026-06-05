@@ -127,6 +127,13 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const [newType, setNewType] = useState('FEEDBACK');
   const [newContent, setNewContent] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  // Synchronous in-flight guard. `submitting` state updates asynchronously, so
+  // two rapid keypresses (double-Enter) can both read the pre-update value and
+  // each fire a request before React re-renders. This ref is set synchronously
+  // at the very top of handleSubmit and cleared in its finally, closing that
+  // race window so a burst collapses to a single POST on the client side (the
+  // server idempotency key is the backstop for retries that do reach it).
+  const submittingRef = useRef(false);
   const [replyTo, setReplyTo] = useState<{ id: string; content: string; from: string } | null>(null);
   // Real arming outcome the server reported for the last send (null before any
   // send, or after the operator changes the message type so the composer reverts
@@ -716,6 +723,11 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
 
   async function handleSubmit() {
     if (!selectedProjectId || !newContent.trim()) return;
+    // Synchronous guard first — reject re-entrant calls before the async
+    // `setSubmitting` has a chance to re-render, so rapid double-Enter cannot
+    // launch two requests.
+    if (submittingRef.current) return;
+    submittingRef.current = true;
     setSubmitting(true);
     try {
       const context: Record<string, unknown> = {};
@@ -764,6 +776,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     } catch {
       addToast('Failed to send message', 'error');
     } finally {
+      submittingRef.current = false;
       setSubmitting(false);
     }
   }

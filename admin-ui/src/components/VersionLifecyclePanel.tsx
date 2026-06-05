@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import {
   fetchQualificationVerdicts,
   setVersionPhase,
+  setVersionGoal,
   triggerQualify,
   type AuditFinding,
   type AuditReconciliation,
@@ -164,10 +165,17 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   const [verdicts, setVerdicts] = useState<QualificationVerdictRecord[]>([]);
+  const [editingGoal, setEditingGoal] = useState<boolean>(false);
+  const [goalInput, setGoalInput] = useState<string>('');
   useEffect(() => {
     if (!projectId) { setVerdicts([]); return; }
     fetchQualificationVerdicts(projectId, 10).then(r => setVerdicts(r.verdicts)).catch(() => {});
   }, [projectId]);
+  useEffect(() => {
+    if (data?.current_version?.goal !== undefined) {
+      setGoalInput(data.current_version.goal || '');
+    }
+  }, [data?.current_version?.goal]);
 
   if (loading || !data || (!data.current_version && data.recent_versions.length === 0)) return null;
   const cv = data.current_version;
@@ -182,6 +190,22 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
     try {
       await setVersionPhase(projectId, phase, 'operator advance');
       setActionMsg(`Phase → ${phase}`);
+      onRefresh();
+    } catch {
+      setActionMsg('Request failed');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleSetGoal = async () => {
+    if (!projectId) return;
+    setActionLoading('goal');
+    setActionMsg(null);
+    try {
+      await setVersionGoal(projectId, goalInput || null);
+      setActionMsg('Goal updated');
+      setEditingGoal(false);
       onRefresh();
     } catch {
       setActionMsg('Request failed');
@@ -225,11 +249,71 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
               <span className="text-[10px] text-neutral-500">{cv.merged_task_count} tasks merged</span>
               {cv.qualification_attempts > 0 && <span className="text-[10px] text-neutral-500">{cv.qualification_attempts} qual{cv.qualification_attempts !== 1 ? 's' : ''}</span>}
             </div>
-            {cv.goal && (
-              <p className="text-[11px] text-neutral-300" title={cv.goal}>
-                <span className="text-neutral-500">Goal: </span>{cv.goal}
-              </p>
-            )}
+            {editingGoal && projectId ? (
+              <div className="flex flex-col gap-1.5">
+                <textarea
+                  value={goalInput}
+                  onChange={(e) => setGoalInput(e.target.value)}
+                  placeholder="Enter version goal..."
+                  maxLength={500}
+                  disabled={actionLoading !== null}
+                  className="text-[11px] bg-neutral-800 border border-neutral-700 text-neutral-300 rounded px-2 py-1 focus:outline-none focus:border-neutral-600 disabled:opacity-50 disabled:cursor-not-allowed resize-none"
+                  rows={2}
+                />
+                <div className="flex gap-1">
+                  {/* eslint-disable-next-line viewport/min-touch-target */}
+                  <button
+                    onClick={handleSetGoal}
+                    disabled={actionLoading !== null}
+                    className="text-[10px] px-2 py-0.5 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {actionLoading === 'goal' ? '…' : 'Save'}
+                  </button>
+                  {/* eslint-disable-next-line viewport/min-touch-target */}
+                  <button
+                    onClick={() => {
+                      setEditingGoal(false);
+                      setGoalInput(cv.goal || '');
+                    }}
+                    disabled={actionLoading !== null}
+                    className="text-[10px] px-2 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : cv.goal ? (
+              <div className="flex flex-col gap-1">
+                <p className="text-[11px] text-neutral-300" title={cv.goal}>
+                  <span className="text-neutral-500">Goal: </span>{cv.goal}
+                </p>
+                {cv.goal_updated_at && (
+                  <p className="text-[10px] text-neutral-600">
+                    {cv.goal_editor_info && <span>{cv.goal_editor_info} </span>}
+                    <span>{timeAgo(cv.goal_updated_at)}</span>
+                  </p>
+                )}
+                {projectId && (
+                  // eslint-disable-next-line viewport/min-touch-target
+                  <button
+                    onClick={() => setEditingGoal(true)}
+                    disabled={actionLoading !== null}
+                    className="text-[10px] px-1.5 py-0.5 w-fit rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    Edit
+                  </button>
+                )}
+              </div>
+            ) : projectId ? (
+              // eslint-disable-next-line viewport/min-touch-target
+              <button
+                onClick={() => setEditingGoal(true)}
+                disabled={actionLoading !== null}
+                className="text-[10px] px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Set goal
+              </button>
+            ) : null}
             {cv.phase_reasoning && (
               <p className="text-[10px] text-neutral-400 italic truncate" title={cv.phase_reasoning}>{cv.phase_reasoning}</p>
             )}

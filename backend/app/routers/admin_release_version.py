@@ -165,6 +165,10 @@ async def get_version_lifecycle(
             else None,
             "phase_reasoning": open_row.phase_reasoning,
             "goal": open_row.goal,
+            "goal_updated_at": open_row.goal_updated_at.isoformat()
+            if open_row.goal_updated_at
+            else None,
+            "goal_editor_info": open_row.goal_editor_info,
             "opened_at": open_row.opened_at.isoformat(),
             "qualification_attempts": open_row.qualification_attempts,
             "merged_task_count": merged_count,
@@ -260,6 +264,51 @@ async def set_version_phase(
         if open_ver.phase_changed_at
         else None,
         "phase_reasoning": open_ver.phase_reasoning,
+    }
+
+
+class _SetVersionGoalBody(BaseModel):
+    goal: str | None = _Field(default=None, max_length=500)
+
+
+@router.post("/projects/{project_id}/version-goal")
+async def set_version_goal(
+    project_id: uuid.UUID,
+    payload: _SetVersionGoalBody,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Set the goal of the open release version for a project.
+
+    Member+ role required.  Returns 404 when there is no open version.
+    Allows operators to set or refine the version's objective, providing
+    intentional control over the version's stated intent.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+
+    open_ver = await _release_version.current_open_version(session, project_id)
+    if open_ver is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No open release version found for this project.",
+        )
+
+    operator_id = current_user.get("email") or current_user["user_id"]
+    _release_version.set_version_goal(
+        open_ver, payload.goal, editor_id=operator_id
+    )
+    session.add(open_ver)
+    await session.commit()
+    await session.refresh(open_ver)
+    return {
+        "version_number": open_ver.version_number,
+        "goal": open_ver.goal,
+        "goal_updated_at": open_ver.goal_updated_at.isoformat()
+        if open_ver.goal_updated_at
+        else None,
+        "goal_editor_info": open_ver.goal_editor_info,
     }
 
 

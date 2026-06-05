@@ -424,7 +424,12 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                   </button>
                   <div className="flex items-center gap-1.5 shrink-0">
                     {(() => {
-                      const badge = projectStatusBadge(project.status);
+                      const badge = projectStatusBadge({
+                        status: project.status,
+                        paused: project.paused,
+                        archived: project.archived,
+                        created_at: project.created_at,
+                      });
                       return (
                         <span
                           className={`text-[9px] font-bold rounded px-1 py-0.5 ${badge.classes}`}

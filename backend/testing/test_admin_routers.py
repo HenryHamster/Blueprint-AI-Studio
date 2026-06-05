@@ -3204,6 +3204,291 @@ class TestMessages:
         assert "first digest line" in project.running_update
         assert "second digest line" in project.running_update
 
+    # ── Idempotent steering-message creation ─────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_idempotent_double_submit_creates_one_row(
+        self, client: AsyncClient, db_session
+    ):
+        """Posting the same intent twice with one idempotency_key dedupes to a
+        single row, and both responses point at that same row."""
+        project = await _make_project(db_session)
+        key = str(uuid.uuid4())
+        body = {
+            "project_id": str(project.id),
+            "message_type": "NOTE",
+            "content": "duplicate steering intent",
+            "idempotency_key": key,
+        }
+
+        first = await client.post("/api/admin/messages", json=body)
+        second = await client.post("/api/admin/messages", json=body)
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+
+        # Same logical message: the first send creates, the retry is recognized
+        # as a duplicate and returns the existing row's id.
+        assert first.json()["status"] == "created"
+        assert second.json()["status"] == "duplicate"
+        assert first.json()["id"] == second.json()["id"]
+
+        rows = (
+            (
+                await db_session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+        assert str(rows[0].id) == first.json()["id"]
+        assert rows[0].idempotency_key == key
+
+    @pytest.mark.asyncio
+    async def test_idempotent_duplicate_arming_coalesces(
+        self, client: AsyncClient, db_session
+    ):
+        """A steering message POSTed twice with the same key arms a SINGLE
+        refresh slot — the first send arms the wake, and the duplicate is
+        recognized as such (``arming == "duplicate"``) rather than opening a
+        second independent wake."""
+        from app.strategic_trigger import strategic_refresh_pending
+
+        project = await _make_project(db_session)
+        key = str(uuid.uuid4())
+        body = {
+            "project_id": str(project.id),
+            "message_type": "FEEDBACK",
+            "content": "Please refocus on the auth bug",
+            "idempotency_key": key,
+        }
+
+        first = await client.post("/api/admin/messages", json=body)
+        second = await client.post("/api/admin/messages", json=body)
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        # The first send arms the strategist; the duplicate short-circuits before
+        # the wake gate and reports the truthful "duplicate" outcome.
+        assert first.json()["arming"] == "steering"
+        assert second.json()["arming"] == "duplicate"
+        assert first.json()["id"] == second.json()["id"]
+
+        vision = await self._reload_vision(db_session, project.id)
+        assert strategic_refresh_pending(vision) is True
+        marker = vision["_strategic_refresh"]
+        assert marker["origin"] == "operator"
+        # Only the first send armed a wake; the duplicate did not re-arm, so the
+        # strategist has a SINGLE pending wake to consume.
+        assert marker["count"] == 1
+
+        # And the dedup still held: exactly one row backs both responses.
+        rows = (
+            (
+                await db_session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_idempotent_different_key_creates_new_message(
+        self, client: AsyncClient, db_session
+    ):
+        """Identical content under two distinct keys is two distinct intents."""
+        project = await _make_project(db_session)
+        base = {
+            "project_id": str(project.id),
+            "message_type": "NOTE",
+            "content": "same words, different intent",
+        }
+
+        first = await client.post(
+            "/api/admin/messages",
+            json={**base, "idempotency_key": str(uuid.uuid4())},
+        )
+        second = await client.post(
+            "/api/admin/messages",
+            json={**base, "idempotency_key": str(uuid.uuid4())},
+        )
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert first.json()["id"] != second.json()["id"]
+
+        rows = (
+            (
+                await db_session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 2
+
+    @pytest.mark.asyncio
+    async def test_no_idempotency_key_creates_new_row_each_time(
+        self, client: AsyncClient, db_session
+    ):
+        """Legacy path: omitting idempotency_key never dedupes (back-compat)."""
+        project = await _make_project(db_session)
+        body = {
+            "project_id": str(project.id),
+            "message_type": "NOTE",
+            "content": "legacy unconditional insert",
+        }
+
+        first = await client.post("/api/admin/messages", json=body)
+        second = await client.post("/api/admin/messages", json=body)
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert first.json()["id"] != second.json()["id"]
+
+        rows = (
+            (
+                await db_session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 2
+        # Both rows persisted with a NULL key (exempt from the partial index).
+        assert all(r.idempotency_key is None for r in rows)
+
+    @pytest.mark.asyncio
+    async def test_idempotent_duplicate_skips_routine_digest(
+        self, client: AsyncClient, db_session
+    ):
+        """A routine-event message POSTed twice with one key appends its digest
+        line exactly once — the duplicate skips the running_update append."""
+        project = await _make_project(db_session)
+        key = str(uuid.uuid4())
+        body = {
+            "project_id": str(project.id),
+            "message_type": "NOTE",
+            "content": "PR #864 merged into main",
+            "context": {"event_type": "pr_merged"},
+            "idempotency_key": key,
+        }
+
+        first = await client.post("/api/admin/messages", json=body)
+        second = await client.post("/api/admin/messages", json=body)
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert first.json()["id"] == second.json()["id"]
+
+        await db_session.refresh(project)
+        assert project.running_update is not None
+        # Appended exactly once despite two POSTs.
+        assert project.running_update.count("PR #864 merged into main") == 1
+
+        rows = (
+            (
+                await db_session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_idempotent_concurrent_insert_recovers_to_200(
+        self, client: AsyncClient, db_session
+    ):
+        """TOCTOU: a competitor commits the same-key row AFTER this request's
+        idempotency pre-check passed but BEFORE its own commit, so the INSERT
+        trips ux_projectmessage_project_idempotency_key. The handler must
+        recover — roll back, re-select the winner, and return the idempotent 200 pointing at
+        the already-committed row — instead of surfacing the IntegrityError as
+        a 500.
+
+        The ``lock_project_or_429`` call (reached only for a routine-event
+        message) is the seam between the pre-check and the commit; we patch it
+        to commit a conflicting row via an INDEPENDENT session, exactly
+        modelling the concurrent in-flight duplicate.
+        """
+        from conftest import TestingSessionLocal
+        import app.routers.admin_notifications as notif
+
+        project = await _make_project(db_session)
+        key = str(uuid.uuid4())
+        real_lock = notif.lock_project_or_429
+        injected = {"done": False}
+
+        async def _commit_conflict_then_lock(session, pid):
+            # Stand in for a concurrent request that won the race: persist the
+            # same-key row in a separate transaction so this request's pending
+            # INSERT violates the unique index on commit.
+            if not injected["done"]:
+                injected["done"] = True
+                async with TestingSessionLocal() as other:
+                    other.add(
+                        ProjectMessage(
+                            project_id=pid,
+                            message_type=MessageType.NOTE,
+                            from_type="user",
+                            content="winner of the race",
+                            context={"event_type": "pr_merged"},
+                            idempotency_key=key,
+                        )
+                    )
+                    await other.commit()
+            return await real_lock(session, pid)
+
+        with patch.object(
+            notif,
+            "lock_project_or_429",
+            AsyncMock(side_effect=_commit_conflict_then_lock),
+        ):
+            resp = await client.post(
+                "/api/admin/messages",
+                json={
+                    "project_id": str(project.id),
+                    "message_type": "NOTE",
+                    "content": "loser of the race",
+                    "context": {"event_type": "pr_merged"},
+                    "idempotency_key": key,
+                },
+            )
+
+        # Recovered to an idempotent 200, not a 500.
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "duplicate"
+
+        # Exactly one row survived, and the response points at the winner.
+        rows = (
+            (
+                await db_session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id,
+                        ProjectMessage.idempotency_key == key,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+        assert rows[0].content == "winner of the race"
+        assert resp.json()["id"] == str(rows[0].id)
+
     @pytest.mark.asyncio
     async def test_resolve_message(self, client: AsyncClient, db_session):
         """An open message can be resolved."""
@@ -6360,6 +6645,110 @@ class TestSetVersionPhase:
         reasoning = resp.json()["phase_reasoning"]
         assert "[operator:" in reasoning
         assert "dry-run calibration" in reasoning
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin_release_version.py — Set Version Goal
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestSetVersionGoal:
+    @pytest.mark.asyncio
+    async def test_set_goal_happy_path_stamps_editor_and_timestamp(
+        self, client: AsyncClient, db_session
+    ):
+        """Member can set the goal; editor info and updated_at are populated."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-goal",
+            json={"goal": "Ship the lifecycle surface"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["goal"] == "Ship the lifecycle surface"
+        assert data["goal_updated_at"] is not None
+        assert data["goal_editor_info"] == f"[operator:{TEST_USER_EMAIL}]"
+
+        # Persisted, not just echoed back.
+        await db_session.refresh(version)
+        assert version.goal == "Ship the lifecycle surface"
+        assert version.goal_updated_at is not None
+        assert version.goal_editor_info == f"[operator:{TEST_USER_EMAIL}]"
+
+    @pytest.mark.asyncio
+    async def test_set_goal_no_open_version_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns 404 when no open release version exists for the project."""
+        project = await _make_project(db_session)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-goal",
+            json={"goal": "anything"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_set_goal_non_member_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """User without project membership cannot set the version goal."""
+        other = Project(name="Other", user_id="other-owner")
+        db_session.add(other)
+        await db_session.commit()
+        await db_session.refresh(other)
+        db_session.add(
+            ProjectMember(project_id=other.id, user_id="other-owner", role="owner")
+        )
+        await _make_open_version(db_session, other.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{other.id}/version-goal",
+            json={"goal": "intrusion"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_set_goal_idempotent_same_goal_no_restamp(
+        self, client: AsyncClient, db_session
+    ):
+        """Re-posting the identical goal is a no-op that does not re-stamp."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        first = await client.post(
+            f"/api/admin/projects/{project.id}/version-goal",
+            json={"goal": "stable goal"},
+        )
+        assert first.status_code == 200
+        await db_session.refresh(version)
+        first_stamp = version.goal_updated_at
+        assert first_stamp is not None
+
+        second = await client.post(
+            f"/api/admin/projects/{project.id}/version-goal",
+            json={"goal": "stable goal"},
+        )
+        assert second.status_code == 200
+        await db_session.refresh(version)
+        # Idempotent no-op: timestamp is unchanged because the goal matched.
+        assert version.goal_updated_at == first_stamp
+
+    @pytest.mark.asyncio
+    async def test_set_goal_too_long_returns_422(
+        self, client: AsyncClient, db_session
+    ):
+        """Goal exceeding the 500-char body limit is rejected by Pydantic."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-goal",
+            json={"goal": "x" * 501},
+        )
+        assert resp.status_code == 422
 
 
 class TestVersionLifecycleInfraFailureFields:

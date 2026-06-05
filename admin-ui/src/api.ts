@@ -1045,6 +1045,8 @@ export interface CurrentVersion {
   phase_changed_at: string | null;
   phase_reasoning: string | null;
   goal: string | null;
+  goal_updated_at?: string | null;
+  goal_editor_info?: string | null;
   opened_at: string;
   qualification_attempts: number;
   merged_task_count: number;
@@ -1112,6 +1114,25 @@ export async function setVersionPhase(
     body: JSON.stringify({ phase, reasoning: reasoning ?? '' }),
   });
   if (!res.ok) throw new Error(`Failed to set version phase: ${res.status}`);
+  return res.json();
+}
+
+export interface SetVersionGoalResponse {
+  version_number: number;
+  goal: string | null;
+  goal_updated_at: string | null;
+  goal_editor_info: string | null;
+}
+
+export async function setVersionGoal(
+  projectId: string,
+  goal: string | null,
+): Promise<SetVersionGoalResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/version-goal`, {
+    method: 'POST',
+    body: JSON.stringify({ goal: goal ?? null }),
+  });
+  if (!res.ok) throw new Error(`Failed to set version goal: ${res.status}`);
   return res.json();
 }
 

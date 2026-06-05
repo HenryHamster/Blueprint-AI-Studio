@@ -459,6 +459,75 @@ def test_set_version_phase_truncates_long_reasoning():
 
 
 # ===========================================================================
+# set_version_goal
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_set_version_goal_operator_edit_stamps_editor_and_timestamp(db_session):
+    """An operator edit stamps goal, goal_updated_at, and goal_editor_info."""
+    project = await _make_project(db_session)
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    rv.set_version_goal(version, "Refine the objective", editor_id="op@example.com")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert version.goal == "Refine the objective"
+    assert version.goal_updated_at is not None
+    assert version.goal_editor_info == "[operator:op@example.com]"
+
+
+@pytest.mark.asyncio
+async def test_open_version_auto_derived_goal_leaves_editor_fields_null(db_session):
+    """A goal supplied at open time is NOT an operator edit: editor fields stay null."""
+    project = await _make_project(db_session)
+    version = await rv.open_version(
+        db_session, project.id, version_number=1, goal="Auto-derived objective"
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert version.goal == "Auto-derived objective"
+    # open_version does not go through set_version_goal, so the operator-edit
+    # provenance columns remain null until an operator actually edits.
+    assert version.goal_updated_at is None
+    assert version.goal_editor_info is None
+
+
+def test_set_version_goal_idempotent_noop():
+    """Setting the goal to its current value is a no-op (no timestamp / editor bump)."""
+    version = ReleaseVersion(
+        version_number=1,
+        phase="build",
+        status="open",
+        opened_at=_utcnow(),
+        goal="steady goal",
+    )
+    rv.set_version_goal(version, "steady goal", editor_id="op@example.com")
+    # No-op: editor provenance is not stamped because the goal matched.
+    assert version.goal == "steady goal"
+    assert version.goal_updated_at is None
+    assert version.goal_editor_info is None
+
+
+def test_set_version_goal_truncates_long_goal():
+    """A goal longer than the cap is truncated before storage."""
+    version = ReleaseVersion(
+        version_number=1,
+        phase="build",
+        status="open",
+        opened_at=_utcnow(),
+    )
+    rv.set_version_goal(version, "g" * 5000, editor_id="op@example.com")
+    assert version.goal is not None
+    assert len(version.goal) == rv._GOAL_MAX
+
+
+# ===========================================================================
 # to_phase_block
 # ===========================================================================
 

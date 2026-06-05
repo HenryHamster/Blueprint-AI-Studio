@@ -256,6 +256,12 @@ vi.mock('../api', () => ({
     phase_changed_at: '2026-05-20T12:00:00Z',
     phase_reasoning: '[operator:test] operator advance',
   })),
+  setVersionGoal: vi.fn(async () => ({
+    version_number: 42,
+    goal: 'Ship the lifecycle surface',
+    goal_updated_at: '2026-05-20T12:00:00Z',
+    goal_editor_info: '[operator:test]',
+  })),
   triggerQualify: vi.fn(async () => ({ status: 'dry_run' })),
   fetchQualificationVerdicts: vi.fn(async () => ({
     verdicts: [
