@@ -196,6 +196,20 @@ def test_metric_with_structured_measurement_passes():
     assert "1 item" in v.reason
 
 
+def test_metric_perf_max_severity_criterion_passes_and_fails():
+    task = Task(payloads=[{"type": "perf", "base_branch": "main", "max_severity": "medium"}])
+    v_pass = MetricStrategy().evaluate(
+        task, json.dumps([{"severity": "low", "title": "slow path"}])
+    )
+    v_fail = MetricStrategy().evaluate(
+        task, json.dumps([{"severity": "high", "title": "slow path"}])
+    )
+    assert v_pass.passed is True
+    assert "max severity medium met" in v_pass.reason
+    assert v_fail.passed is False
+    assert "high exceeds allowed medium" in v_fail.reason
+
+
 # ── MetricStrategy: compute_experiment shape-awareness ──────────────────────
 
 

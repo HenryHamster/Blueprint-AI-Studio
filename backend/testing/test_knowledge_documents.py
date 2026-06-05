@@ -719,6 +719,160 @@ async def test_design_mix_of_real_and_proposed_paths_passes(
     assert task.status == TaskStatus.COMPLETED
 
 
+# ── acceptance-probe DETAIL persisted alongside the pass/fail verdict ────────
+#
+# The forward-quality gate stores a binary pass/fail, but operators also need to
+# judge HOW trustworthy a passing document is. The persisted
+# ``forward_quality_verdict`` blob now carries the structured probe detail under
+# a ``probes`` key (purely additive — the existing passed/reason/strategy/
+# grader_task_id keys are untouched and pass/fail outcomes are unchanged).
+
+
+@pytest.mark.asyncio
+async def test_design_pass_persists_grounding_and_topic_probe_detail(
+    db_session, _quiet_broadcast
+):
+    """A passing design document carries grounding detail (counts + the SPECIFIC
+    unresolved citation strings) and topic-responsiveness detail in its persisted
+    verdict, while the legacy verdict keys remain intact."""
+    project = make_project(name="DSGNprobe")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(
+        project_id=project.id,
+        title="Design: reaper sweep",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "design",
+                "topic": "reaper blocked task sweep design",
+                "base_branch": "main",
+            }
+        ],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    document = {
+        "title": "Design for the reaper blocked-task sweep",
+        "summary": "A codebase-grounded sweep design referencing real modules.",
+        "body": "# Reaper\n\nThe sweep over blocked tasks extends real modules.",
+        "citations": [
+            "backend/app/reaper.py",
+            "backend/app/proposed_sweep.py",
+        ],
+        "tags": ["design"],
+        "topic": "reaper blocked task sweep design",
+        # Agent-stamped grounding: 2 file citations, 1 grounded, 1 unresolved.
+        "_citation_grounding": {
+            "file_citations": 2,
+            "grounded": 1,
+            "checked": True,
+            "unresolved": ["backend/app/proposed_sweep.py"],
+        },
+    }
+    await _handle_design_completion(task, json.dumps(document), db_session)
+
+    docs = await _docs_for(db_session, task.id)
+    assert len(docs) == 1
+    verdict = docs[0].forward_quality_verdict
+    # Legacy keys untouched.
+    assert verdict["passed"] is True
+    assert verdict["strategy"] == "forward-quality"
+    assert verdict["grader_task_id"] is None
+    # Grounding detail carries the counts AND the specific unresolved citation.
+    grounding = verdict["probes"]["grounding"]
+    assert grounding["file_citations"] == 2
+    assert grounding["grounded"] == 1
+    assert grounding["unresolved"] == ["backend/app/proposed_sweep.py"]
+    # Topic-responsiveness detail: passed flag + overlap/total keyword counts.
+    topic = verdict["probes"]["topic_responsiveness"]
+    assert topic["passed"] is True
+    assert topic["total"] >= 3
+    assert topic["overlap"] >= 1
+    assert topic["overlap"] <= topic["total"]
+
+
+@pytest.mark.asyncio
+async def test_web_research_pass_persists_topic_detail_without_grounding(
+    db_session, _quiet_broadcast
+):
+    """A web_research document has no file-citation grounding stamp: the persisted
+    probe detail carries topic-responsiveness but OMITS the grounding key."""
+    project, task = await _make_topic_task(
+        db_session,
+        "the current state of quantum error correction hardware",
+        project_name="WRprobe",
+    )
+    document = {
+        "title": "State of quantum error correction hardware",
+        "summary": "Survey of surface-code error correction on superconducting qubits.",
+        "body": "# Quantum error correction\n\nHardware progress on logical qubits.",
+        "citations": ["https://example.com/qec"],
+        "tags": ["quantum"],
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    docs = await _docs_for(db_session, task.id)
+    assert len(docs) == 1
+    probes = docs[0].forward_quality_verdict["probes"]
+    assert "grounding" not in probes
+    assert probes["topic_responsiveness"]["passed"] is True
+    assert probes["topic_responsiveness"]["total"] >= 3
+
+
+@pytest.mark.asyncio
+async def test_off_topic_design_probe_detail_records_failed_topic_flag(
+    db_session, _quiet_broadcast
+):
+    """The topic-responsiveness detail's ``passed`` flag agrees with the gate: an
+    off-topic design still FAILS the gate (no doc persisted) — the detail is only
+    persisted on a passing document, so this asserts the gate decision is
+    unchanged by the additive probe-detail wiring."""
+    project = make_project(name="DSGNofftopic")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(
+        project_id=project.id,
+        title="Design: reaper sweep",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "design",
+                "topic": "reaper blocked task sweep scheduling design",
+                "base_branch": "main",
+            }
+        ],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    document = {
+        "title": "A guide to organic vegetable gardening",
+        "summary": "How to grow tomatoes, lettuce and carrots in a backyard plot.",
+        "body": "# Gardening\n\nMulch, watering schedules, and companion planting.",
+        "citations": ["backend/app/reaper.py"],
+        "tags": ["gardening"],
+        "topic": "gardening",
+        "_citation_grounding": {
+            "file_citations": 1, "grounded": 1, "checked": True, "unresolved": []
+        },
+    }
+    await _handle_design_completion(task, json.dumps(document), db_session)
+
+    # Unchanged gate decision: a clear topical miss FAILS, no document persists.
+    assert await _docs_for(db_session, task.id) == []
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert "not responsive" in task.context["evaluation_gate"]["reason"]
+
+
 # ── forward-quality grader escalation + resume (flag ON) ────────────────────
 #
 # web_research's honest quality gate has two tiers: the cheap synchronous
@@ -838,6 +992,11 @@ async def test_grader_pass_persists_one_doc_and_records_verdict(
     assert doc.body == document["body"]
     assert doc.forward_quality_verdict["passed"] is True
     assert doc.forward_quality_verdict["grader_task_id"] == grader_id
+    # Probe detail rides the grader-resume persist path too (additive, alongside
+    # the grader verdict's own keys). This web_research doc has no grounding stamp.
+    probes = doc.forward_quality_verdict["probes"]
+    assert "grounding" not in probes
+    assert probes["topic_responsiveness"]["passed"] is True
 
     await db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED

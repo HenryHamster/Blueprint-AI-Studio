@@ -41,8 +41,12 @@ export function readDesignProgress(taskId: string): string | undefined {
 // ignored here. A `file:` scheme prefix is stripped and a trailing `:line` /
 // `#symbol` locator is dropped before the existence check; only path-like
 // references (containing a `/`) are counted as file citations. Stamps a
-// `_citation_grounding` summary {file_citations, grounded, checked} onto the
-// document in place and returns it. web_research never calls this, so its
+// `_citation_grounding` summary {file_citations, grounded, checked, unresolved}
+// onto the document in place and returns it. `unresolved` lists the specific
+// file-reference citation strings that did NOT resolve to a real path — the
+// agent's working tree is the only place that can know this, so it is captured
+// here for the backend to persist as acceptance-probe detail (counts alone
+// cannot say WHICH citations are absent). web_research never calls this, so its
 // external URL citations are completely unaffected.
 export function groundDesignCitations(
   document: Record<string, unknown>, workspace: string = WORKSPACE,
@@ -52,6 +56,7 @@ export function groundDesignCitations(
     : [];
   let fileCitations = 0;
   let grounded = 0;
+  const unresolved: string[] = [];
   for (const raw of cites) {
     if (typeof raw !== 'string') continue;
     const text = raw.trim();
@@ -60,12 +65,15 @@ export function groundDesignCitations(
     ref = ref.split('#')[0].split(':')[0].trim(); // drop #symbol / :line locator
     if (!ref || !ref.includes('/')) continue; // not a path-like file reference
     fileCitations += 1;
+    let resolved = false;
     try {
-      if (fs.existsSync(path.join(workspace, ref))) grounded += 1;
+      if (fs.existsSync(path.join(workspace, ref))) resolved = true;
     } catch { /* unreadable path — treat as ungrounded */ }
+    if (resolved) grounded += 1;
+    else unresolved.push(text); // the offending citation, as written
   }
   document._citation_grounding = {
-    file_citations: fileCitations, grounded, checked: true,
+    file_citations: fileCitations, grounded, checked: true, unresolved,
   };
   return document;
 }

@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { X, Search, BookOpen, ArrowLeft, ExternalLink, Copy, Check, CheckCircle, XCircle, RefreshCw, FileCode, Globe, HelpCircle } from 'lucide-react';
 import { isSafeUrl } from './TaskCard';
 import { MarkdownContent } from './MarkdownContent';
-import { fetchKnowledgeDocuments, fetchKnowledgeDocument, type KnowledgeDocument } from '../api';
+import { fetchKnowledgeDocuments, fetchKnowledgeDocument, type KnowledgeDocument, type KnowledgeForwardQualityVerdict } from '../api';
 import { parseTimestamp } from '../utils/time';
 
 interface KnowledgeBrowserProps {
@@ -63,7 +63,7 @@ function SourceKindBadge({ kind }: { kind?: string }) {
   );
 }
 
-function VerdictBadge({ verdict }: { verdict: Record<string, unknown> | null }) {
+function VerdictBadge({ verdict }: { verdict: KnowledgeForwardQualityVerdict | null }) {
   if (!verdict) return null;
   const passed = verdict.passed === true;
   const reason = typeof verdict.reason === 'string' ? verdict.reason : undefined;
@@ -76,6 +76,61 @@ function VerdictBadge({ verdict }: { verdict: Record<string, unknown> | null }) 
         {strategy && <span className="text-neutral-500 ml-auto">{strategy}</span>}
       </div>
       {reason && <p className="text-neutral-400 mt-1 leading-snug">{reason}</p>}
+    </div>
+  );
+}
+
+/**
+ * Acceptance-probe detail behind the verdict badge: how well the document is
+ * grounded (design docs) and whether it cleared the topic-responsiveness probe.
+ * Purely observational — degrades to nothing when no probe detail is persisted
+ * (web_research docs lack grounding; pre-probe documents lack the whole blob).
+ */
+function ProbeDetail({ verdict }: { verdict: KnowledgeForwardQualityVerdict | null }) {
+  const probes = verdict?.probes;
+  if (!probes) return null;
+  const grounding = probes.grounding;
+  const topic = probes.topic_responsiveness;
+  if (!grounding && !topic) return null;
+
+  // A document is weakly grounded when it has file citations but few resolve.
+  const weaklyGrounded =
+    !!grounding && grounding.file_citations > 0 && grounding.grounded < grounding.file_citations;
+
+  return (
+    <div className="rounded border border-neutral-800 bg-neutral-900/40 px-2 py-1.5 text-[11px] space-y-1.5">
+      <div className="text-[10px] uppercase tracking-wide text-neutral-500">Acceptance probes</div>
+      {grounding && grounding.file_citations > 0 && (
+        <div className="space-y-1">
+          <div className="flex items-center gap-1.5">
+            {weaklyGrounded ? <XCircle className="w-3 h-3 text-amber-400 shrink-0" /> : <CheckCircle className="w-3 h-3 text-emerald-400 shrink-0" />}
+            <span className={weaklyGrounded ? 'text-amber-400 font-medium' : 'text-neutral-300'}>
+              Grounded {grounding.grounded} of {grounding.file_citations} file citation{grounding.file_citations === 1 ? '' : 's'}
+            </span>
+          </div>
+          {grounding.unresolved.length > 0 && (
+            <div className="ml-[18px] space-y-0.5">
+              <div className="text-[10px] text-neutral-500">Unresolved:</div>
+              <ul className="space-y-0.5">
+                {grounding.unresolved.map((u, i) => (
+                  <li key={i} className="font-mono text-[10px] text-amber-300/80 break-all">{u}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+      {topic && (
+        <div className="flex items-center gap-1.5">
+          {topic.passed ? <CheckCircle className="w-3 h-3 text-emerald-400 shrink-0" /> : <XCircle className="w-3 h-3 text-red-400 shrink-0" />}
+          <span className={topic.passed ? 'text-neutral-300' : 'text-red-400 font-medium'}>
+            Topic responsiveness {topic.passed ? 'passed' : 'failed'}
+          </span>
+          {topic.total > 0 && (
+            <span className="text-neutral-500">({topic.overlap}/{topic.total} keywords)</span>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -230,8 +285,9 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
             </div>
 
             <VerdictBadge verdict={selected.forward_quality_verdict} />
+            <ProbeDetail verdict={selected.forward_quality_verdict} />
 
-            {selected.summary && <p className="text-xs text-neutral-400 leading-relaxed italic">{selected.summary}</p>}
+            {selected.summary &&<p className="text-xs text-neutral-400 leading-relaxed italic">{selected.summary}</p>}
 
             {selected.body !== undefined ? (
               <div className="border-t border-neutral-800 pt-3 text-sm text-neutral-200">

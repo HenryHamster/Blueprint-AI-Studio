@@ -196,7 +196,8 @@ class MetricStrategy:
     key = "metric"
 
     def evaluate(self, task: Task, artifact_text: str | None) -> EvaluationVerdict:
-        if _task_type_of(task) == "compute_experiment":
+        task_type = _task_type_of(task)
+        if task_type == "compute_experiment":
             return self._evaluate_compute_experiment(task, artifact_text)
         measurement = _extract_measurement(artifact_text)
         if measurement is None:
@@ -205,6 +206,31 @@ class MetricStrategy:
                 "metric task produced no parseable structured measurement",
                 self.key,
             )
+        if task_type == "perf":
+            ceiling = (task.first_payload or {}).get("max_severity")
+            if isinstance(ceiling, str) and ceiling in _PERF_SEVERITY_RANK:
+                ceiling_rank = _PERF_SEVERITY_RANK[ceiling]
+                for finding in measurement:
+                    sev = str((finding or {}).get("severity") or "").strip().lower()
+                    rank = _PERF_SEVERITY_RANK.get(sev)
+                    if rank is None:
+                        return EvaluationVerdict(
+                            False,
+                            f"declared perf criterion not met: unrecognized severity {sev!r}",
+                            self.key,
+                        )
+                    if rank > ceiling_rank:
+                        return EvaluationVerdict(
+                            False,
+                            f"declared perf criterion not met: worst severity {sev} exceeds allowed {ceiling}",
+                            self.key,
+                        )
+                return EvaluationVerdict(
+                    True,
+                    f"structured measurement produced ({len(measurement)} item(s)); "
+                    f"declared max severity {ceiling} met",
+                    self.key,
+                )
         return EvaluationVerdict(
             True,
             f"structured measurement produced ({len(measurement)} item(s))",
@@ -273,16 +299,14 @@ class StructuredVerdictStrategy:
 
 # Registry of concrete strategy instances, keyed by their declared strategy key.
 # Strategies are stateless, so module-level singletons are safe to share.
-_STRATEGIES: dict[str, EvaluationStrategy] = {
-    s.key: s
-    for s in (
-        NoneStrategy(),
-        CodeCiReviewStrategy(),
-        ForwardQualityStrategy(),
-        MetricStrategy(),
-        StructuredVerdictStrategy(),
-    )
-}
+_STRATEGIES_SRC: tuple[EvaluationStrategy, ...] = (
+    NoneStrategy(),
+    CodeCiReviewStrategy(),
+    ForwardQualityStrategy(),
+    MetricStrategy(),
+    StructuredVerdictStrategy(),
+)
+_STRATEGIES: dict[str, EvaluationStrategy] = {s.key: s for s in _STRATEGIES_SRC}
 
 
 def resolve_evaluation_strategy(task_type: str | None) -> EvaluationStrategy:
@@ -506,6 +530,9 @@ def _format_unmet_criterion(criterion: dict) -> str:
         f"declared success criterion not met: {metric}={value} "
         f"(required {op} {threshold})"
     )
+
+
+_PERF_SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 
 
 def _extract_json_object(artifact_text: str | None) -> dict | None:

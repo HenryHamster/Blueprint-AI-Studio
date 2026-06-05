@@ -1673,6 +1673,43 @@ export async function killComputeJob(jobId: string): Promise<ComputeJob> {
 // --- Knowledge documents (durable, queryable home for web_research output) ---
 
 /** A single knowledge document. List responses omit `body`; get-by-id includes it. */
+/** Codebase-grounding probe detail (design docs only; absent for web_research). */
+export interface KnowledgeGroundingProbe {
+  file_citations: number;
+  grounded: number;
+  /** File-reference citation strings that did NOT resolve to real repo paths. */
+  unresolved: string[];
+}
+
+/** Topic-responsiveness probe detail: keyword overlap between request and document. */
+export interface KnowledgeTopicResponsivenessProbe {
+  passed: boolean;
+  overlap: number;
+  total: number;
+}
+
+/** Goal-level acceptance-probe detail persisted under the verdict's `probes` key. */
+export interface KnowledgeAcceptanceProbes {
+  grounding?: KnowledgeGroundingProbe | null;
+  topic_responsiveness?: KnowledgeTopicResponsivenessProbe | null;
+}
+
+/**
+ * Forward-quality verdict persisted on a knowledge document. All fields are
+ * optional/nullable so documents persisted before a given field existed (e.g.
+ * pre-`probes` docs) render without errors. The index signature keeps it
+ * structurally compatible with the opaque `Record<string, unknown>` this used
+ * to be.
+ */
+export interface KnowledgeForwardQualityVerdict {
+  passed?: boolean;
+  reason?: string;
+  strategy?: string;
+  grader_task_id?: string;
+  probes?: KnowledgeAcceptanceProbes | null;
+  [key: string]: unknown;
+}
+
 export interface KnowledgeDocument {
   id: string;
   title: string;
@@ -1689,7 +1726,7 @@ export interface KnowledgeDocument {
   source_kind?: 'design' | 'web_research' | 'unknown' | string;
   created_at: string | null;
   updated_at: string | null;
-  forward_quality_verdict: Record<string, unknown> | null;
+  forward_quality_verdict: KnowledgeForwardQualityVerdict | null;
   /** Only present on get-by-id (the full markdown body). */
   body?: string;
 }

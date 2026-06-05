@@ -212,6 +212,81 @@ def _design_grounding_miss(document: dict[str, Any]) -> str | None:
     return None
 
 
+def _grounding_probe_detail(document: dict[str, Any]) -> dict[str, Any] | None:
+    """Structured codebase-grounding detail lifted from ``_citation_grounding``.
+
+    Returns the grounding counts plus the specific UNRESOLVED file-reference
+    citation strings the design agent reported absent from its working tree (the
+    agent is the only place that can know which paths are missing). Returns
+    ``None`` when the stamp is absent or unchecked — a ``web_research`` document
+    has no file-citation grounding, so the persisted verdict omits the grounding
+    key entirely rather than carrying an empty one. Purely observational: this
+    NEVER affects the gate decision, which stays in :func:`_design_grounding_miss`.
+    """
+    grounding = document.get("_citation_grounding")
+    if not isinstance(grounding, dict) or not grounding.get("checked"):
+        return None
+    unresolved = grounding.get("unresolved")
+    unresolved_list = (
+        [str(u) for u in unresolved] if isinstance(unresolved, list) else []
+    )
+    return {
+        "file_citations": int(grounding.get("file_citations") or 0),
+        "grounded": int(grounding.get("grounded") or 0),
+        "unresolved": unresolved_list,
+    }
+
+
+def _acceptance_probe_detail(
+    task: Task, document: dict[str, Any], *, kind: str
+) -> dict[str, Any]:
+    """Structured detail behind the goal-level acceptance probes, for persistence.
+
+    Carries the grounding counts + unresolved citations (design only; absent for
+    web_research) and the topic-responsiveness overlap/total keyword counts with
+    a ``passed`` flag. The flag is derived from the SAME gate decider
+    (:func:`_topic_responsiveness_miss`) so the persisted detail can never
+    disagree with the pass/fail decision. This function is purely additive
+    observability — it does NOT influence whether the document passes the gate.
+    """
+    detail: dict[str, Any] = {}
+
+    grounding = _grounding_probe_detail(document)
+    if grounding is not None:
+        detail["grounding"] = grounding
+
+    payload = task.first_payload or {}
+    requested = " ".join(str(payload.get(k) or "") for k in ("topic", "prompt"))
+    request_keywords = _keywords(requested)
+    doc_keywords = _keywords(
+        " ".join(str(document.get(k) or "") for k in ("title", "summary", "body"))
+    )
+    total = len(request_keywords)
+    overlap = len(request_keywords & doc_keywords)
+    detail["topic_responsiveness"] = {
+        # Equal-by-construction to the gate: passed iff the gate found no miss.
+        "passed": _topic_responsiveness_miss(task, document) is None,
+        "overlap": overlap,
+        "total": total,
+    }
+    return detail
+
+
+def _verdict_with_probe_detail(
+    verdict_record: dict[str, Any], task: Task, document: dict[str, Any], *, kind: str
+) -> dict[str, Any]:
+    """Return a copy of ``verdict_record`` with acceptance-probe detail attached.
+
+    Additive only: the existing ``passed`` / ``reason`` / ``strategy`` /
+    ``grader_task_id`` keys are preserved verbatim; the structured detail rides
+    along under a new ``probes`` key. Shared by the first-pass and grader-resume
+    persist paths so the persisted verdict shape is identical either way.
+    """
+    record = dict(verdict_record)
+    record["probes"] = _acceptance_probe_detail(task, document, kind=kind)
+    return record
+
+
 def _topic_responsiveness_miss(task: Task, document: dict[str, Any]) -> str | None:
     """Return an operator-readable reason on a CLEAR topical miss, else ``None``.
 
@@ -497,7 +572,13 @@ async def _handle_knowledge_document_completion(
                 kind,
             )
             return
-        await _persist_document(task, document, grader_verdict, session, kind)
+        await _persist_document(
+            task,
+            document,
+            _verdict_with_probe_detail(grader_verdict, task, document, kind=kind),
+            session,
+            kind,
+        )
         return
 
     # ---- FIRST pass: run the cheap synchronous structural gate. --------------
@@ -607,12 +688,17 @@ async def _handle_knowledge_document_completion(
         # Grader not spawned (already graded / in flight) — fall through and
         # persist with the cheap-gate verdict.
 
-    verdict_record = {
-        "passed": True,
-        "reason": verdict.reason,
-        "strategy": verdict.strategy,
-        "grader_task_id": None,
-    }
+    verdict_record = _verdict_with_probe_detail(
+        {
+            "passed": True,
+            "reason": verdict.reason,
+            "strategy": verdict.strategy,
+            "grader_task_id": None,
+        },
+        task,
+        document,
+        kind=kind,
+    )
     await _persist_document(task, document, verdict_record, session, kind)
 
 

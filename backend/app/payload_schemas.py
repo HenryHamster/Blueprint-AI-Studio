@@ -308,6 +308,7 @@ class DebugPayload(_SystemPopulated):
 
 class PerfPayload(_SystemPopulated):
     prompt: str | None = None
+    max_severity: Literal["low", "medium", "high", "critical"] | None = None
 
 
 class MemoPayload(BasePayload):
@@ -627,10 +628,12 @@ def pack_under_budget(
         if p["unserializable"]:
             dropped.append({"key": key, "reason": "value not JSON-serializable"})
             continue
+        size = p["size"]
+        assert size is not None
         remaining = budget - used - reserved_remaining
-        if p["size"] <= remaining:
+        if size <= remaining:
             packed[key] = p["value"]
-            used += p["size"]
+            used += size
             continue
         included = False
         if p["summarize"] is not None:
@@ -653,21 +656,22 @@ def pack_under_budget(
                     )
                     trimmed_size = None
                 if trimmed_size is not None:
+                    trimmed_size_int = trimmed_size
                     # Defensive: never grow the payload by trimming. If a caller's
                     # summarize_fn returns a larger value (caller bug), revert to
                     # original and proceed with the normal fits/drops decision.
-                    if trimmed_size > p["size"]:
+                    if trimmed_size_int > size:
                         logger.warning(
                             "pack_under_budget: summarize for key %r grew value (%d > %d) — using original",
                             key,
-                            trimmed_size,
-                            p["size"],
+                            trimmed_size_int,
+                            size,
                         )
                         trimmed_value = p["value"]
-                        trimmed_size = p["size"]
-                    if trimmed_size <= remaining:
+                        trimmed_size_int = size
+                    if trimmed_size_int <= remaining:
                         packed[key] = trimmed_value
-                        used += trimmed_size
+                        used += trimmed_size_int
                         if isinstance(p["value"], list) and isinstance(
                             trimmed_value, list
                         ):
@@ -764,7 +768,7 @@ def validate_task_payload(raw: dict) -> dict:
             f"Invalid payload for task type {type_value!r}: {exc}"
         ) from exc
 
-    result = instance.model_dump(exclude_none=True)
+    result: dict[str, Any] = instance.model_dump(exclude_none=True)
     # Re-inject 'type' — it lives on the raw dict but not on the Pydantic model
     result["type"] = type_value
     _enforce_payload_size(result)

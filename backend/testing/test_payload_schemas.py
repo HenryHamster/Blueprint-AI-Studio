@@ -694,9 +694,14 @@ def test_fix_omit_optional_fields_passes():
 
 
 def test_perf_prompt_optional_accepted():
-    raw = {"type": "perf", "prompt": "Profile the hot path"}
+    raw = {
+        "type": "perf",
+        "prompt": "Profile the hot path",
+        "max_severity": "medium",
+    }
     result = _valid(raw)
     assert result["prompt"] == "Profile the hot path"
+    assert result["max_severity"] == "medium"
 
 
 def test_perf_omit_prompt_passes():

@@ -445,6 +445,25 @@ function describeRunnerSetupCommand(runner: TestRunner): { cmd: string; args: st
     };
   }
   if (runner.cmd === 'npm' && !fs.existsSync(`${runner.cwd}/node_modules`)) {
+    // Detect which Node package manager to use based on lockfile presence
+    const hasYarnLock = fs.existsSync(`${runner.cwd}/yarn.lock`);
+    const hasPnpmLock = fs.existsSync(`${runner.cwd}/pnpm-lock.yaml`);
+
+    if (hasYarnLock) {
+      return {
+        cmd: 'yarn',
+        args: ['install', '--frozen-lockfile'],
+        label: 'yarn install --frozen-lockfile',
+      };
+    }
+    if (hasPnpmLock) {
+      return {
+        cmd: 'pnpm',
+        args: ['install', '--frozen-lockfile'],
+        label: 'pnpm install --frozen-lockfile',
+      };
+    }
+    // Default to npm ci (for package-lock.json or as final fallback)
     return {
       cmd: 'npm',
       args: ['ci'],

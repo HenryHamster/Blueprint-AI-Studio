@@ -231,6 +231,7 @@ describe('handleDesign', () => {
     const parsed = JSON.parse(payload.logs as string) as Record<string, unknown>;
     expect(parsed._citation_grounding).toEqual({
       file_citations: 1, grounded: 0, checked: true,
+      unresolved: ['file:backend/app/reaper_sweeps.py'],
     });
   });
 });
@@ -242,12 +243,13 @@ describe('groundDesignCitations', () => {
       source_citations: ['file:backend/app/a.py', 'agent/src/b.ts'],
     };
     groundDesignCitations(doc, '/tmp/workspace');
+    // Fully grounded — no unresolved citations.
     expect(doc._citation_grounding).toEqual({
-      file_citations: 2, grounded: 2, checked: true,
+      file_citations: 2, grounded: 2, checked: true, unresolved: [],
     });
   });
 
-  it('reports zero grounded when no file citation resolves', () => {
+  it('reports zero grounded and lists every unresolved citation', () => {
     vi.mocked(fs.existsSync).mockReturnValue(false);
     const doc: Record<string, unknown> = {
       source_citations: ['file:made/up/path.py', 'hallucinated/x.ts'],
@@ -255,10 +257,12 @@ describe('groundDesignCitations', () => {
     groundDesignCitations(doc, '/tmp/workspace');
     expect(doc._citation_grounding).toEqual({
       file_citations: 2, grounded: 0, checked: true,
+      // Both file refs are absent — captured as written for operator visibility.
+      unresolved: ['file:made/up/path.py', 'hallucinated/x.ts'],
     });
   });
 
-  it('ignores web URLs and accepts a real+proposed mix (>=1 grounded)', () => {
+  it('ignores web URLs and lists only the unresolved ref in a real+proposed mix', () => {
     vi.mocked(fs.existsSync).mockImplementation(
       (p) => String(p).includes('real.py'),
     );
@@ -270,9 +274,11 @@ describe('groundDesignCitations', () => {
       ],
     };
     groundDesignCitations(doc, '/tmp/workspace');
-    // The web URL is not counted; one of two file refs resolves.
+    // The web URL is not counted; one of two file refs resolves, the other is
+    // surfaced in `unresolved` so operators see exactly which path is absent.
     expect(doc._citation_grounding).toEqual({
       file_citations: 2, grounded: 1, checked: true,
+      unresolved: ['backend/proposed/new.py'],
     });
   });
 });
