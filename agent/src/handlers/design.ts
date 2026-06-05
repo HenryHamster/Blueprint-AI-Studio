@@ -12,7 +12,7 @@ import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   configureAgentPermissions, computePromptFingerprint, buildFileTree,
   DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, buildContextPrefix, buildRetryContext, readClaudeMd,
-  writePlaybookHelper,
+  writePlaybookHelper, formatPlaybook, type PlaybookEntry,
 } from '../prompt.js';
 import {
   extractJsonObjectDetailed, describeJsonExtractionResult,
@@ -128,6 +128,7 @@ export async function handleDesign(
 
   const contextPrefix = buildContextPrefix(task);
   const retryContext = buildRetryContext(task);
+  const designPlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const claudeMd = readClaudeMd();
   const claudeMdPrefix = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
   const fileTreeSection = buildFileTree(ws);
@@ -137,7 +138,7 @@ export async function handleDesign(
   const documentPath = `/tmp/design_document_${taskId}.json`;
   const progressPath = `/tmp/design_progress_${taskId}.md`;
 
-  const designPrompt = `${claudeMdPrefix}${retryContext}${contextPrefix}You are a software design agent. Your job is to answer the design question below by GROUNDING your design in the ACTUAL code of this repository, and produce a single structured design DOCUMENT. You operate strictly read-only: you do NOT edit files, you do NOT open a pull request, and you do NOT spawn any follow-up work.
+  const designPrompt = `${claudeMdPrefix}${designPlaybookSection}${retryContext}${contextPrefix}You are a software design agent. Your job is to answer the design question below by GROUNDING your design in the ACTUAL code of this repository, and produce a single structured design DOCUMENT. You operate strictly read-only: you do NOT edit files, you do NOT open a pull request, and you do NOT spawn any follow-up work.
 
 ${topicLine}Design question:
 ${prompt}

@@ -183,6 +183,36 @@ describe('handleVerifyTests', () => {
     expect(verdict.output).toContain('registry timeout');
   });
 
+  it('persistent PARTIAL setup failure → FAILED (fails closed, distinguishable via partialSetupFailed)', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+    // A sibling runner ran but another failed setup — the partial-setup signal
+    // persists across the bounded retries. Must fail the gate closed (FAILED
+    // MERGE_TEST_RESULT), NOT report a clean detected=true/passed=true verdict.
+    vi.mocked(testFixLoop).mockResolvedValue({
+      passed: false,
+      testFailuresDetected: false,
+      partialSetupFailed: true,
+      failureSummary: 'Partial setup failure — [pytest (backend)] npm ci failed: registry timeout',
+    });
+
+    await handleVerifyTests('t5p', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const post = lastPostedPayload();
+    expect(post.status).toBe('FAILED');
+    expect(post.artifact_type).toBe('MERGE_TEST_RESULT');
+    const verdict = parsedVerdict() as {
+      detected: boolean; passed: boolean; setupFailed?: boolean; partialSetupFailed?: boolean; output: string;
+    };
+    expect(verdict.detected).toBe(false);
+    expect(verdict.passed).toBe(false);
+    expect(verdict.partialSetupFailed).toBe(true);
+    // An all-runners setupFailed escalation is NOT the same condition.
+    expect(verdict.setupFailed).toBeFalsy();
+    expect(verdict.output).toContain('registry timeout');
+    // Bounded retry fired: testFixLoop was re-invoked past the first attempt.
+    expect(vi.mocked(testFixLoop).mock.calls.length).toBeGreaterThan(1);
+  });
+
   it('environment-style setup failure output also posts FAILED with setupFailed=true', async () => {
     vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
     vi.mocked(testFixLoop).mockResolvedValue({

@@ -413,6 +413,21 @@ export function condensedAnalysisSections(analysisContext: string): string {
   return wanted.map(s => s.trim()).join('\n\n');
 }
 
+/**
+ * Render the per-runner setup/environment failures recorded during one attempt
+ * into a single operator-facing block (capped to keep the verdict artifact under
+ * the backend payload budget). Used to surface partial-setup failures — a runner
+ * whose environment broke (npm ci / pip / go mod / cargo fetch / runner timeout /
+ * missing-runtime signature) never executed its suite, so a sibling runner's
+ * clean pass must NOT be reported as an unqualified pass.
+ */
+function formatSetupErrors(setupErrors: Array<{ label: string; message: string }>): string {
+  return setupErrors
+    .map(e => `[${e.label}] ${e.message}`)
+    .join('\n\n')
+    .slice(0, 2000);
+}
+
 export interface TestFixLoopOptions {
   targetPytestSelectors?: string[];
   runImpactAfterTargeted?: boolean;
@@ -446,7 +461,7 @@ export async function testFixLoop(
   relatedFiles?: string[],
   analysisContext?: string,
   options: TestFixLoopOptions = {},
-): Promise<{ passed: boolean; testFailuresDetected: boolean; setupFailed?: boolean; failureSummary?: string; noTestsExecuted?: boolean; noTestsReason?: 'all_skipped' | 'no_real_tests' }> {
+): Promise<{ passed: boolean; testFailuresDetected: boolean; setupFailed?: boolean; partialSetupFailed?: boolean; failureSummary?: string; noTestsExecuted?: boolean; noTestsReason?: 'all_skipped' | 'no_real_tests' }> {
   let runners = options.runnersOverride ?? detectTestRunners(buildConfig);
   const targetPytestSelectors = Array.from(new Set(options.targetPytestSelectors ?? []));
 
@@ -757,6 +772,18 @@ export async function testFixLoop(
       }
     }
 
+    // Partial-setup detection: at least one runner ran AND at least one OTHER
+    // runner failed setup/environment. The failed runner's suite never
+    // executed, so any "pass" here is only over the runners that ran — we must
+    // not report an unqualified clean pass. setupSummary carries the broken
+    // runners' errors; setupNote appends them to the test-failure summary on the
+    // real-failure exits so they are surfaced alongside genuine failures.
+    const partialSetupFailed = ranAnyRunner && setupErrors.length > 0;
+    const setupSummary = setupErrors.length > 0 ? formatSetupErrors(setupErrors) : '';
+    const setupNote = setupSummary
+      ? `\n\nPartial setup failure — the following runner(s) never executed (environment/setup error); their suites are UNVERIFIED:\n${setupSummary}`
+      : '';
+
     const reportableFailures = failures.filter(
       failure => classifyTestExecution(failure.message) === 'ran',
     );
@@ -765,22 +792,25 @@ export async function testFixLoop(
     );
 
     if (reportableFailures.length === 0) {
-      // "No reportable test failures" is only a pass if EVERY configured
-      // runner actually got to execute its suite. If ANY runner hit a setup
-      // error (failed install_cmd, missing runtime, missing dependency, spawn
-      // timeout), at least one configured suite never ran — we cannot claim
-      // the whole verification passed, even if a sibling runner executed
-      // cleanly. Route the entire run through the setupFailed retry/escalation
-      // contract so the caller fails the task with an infra category instead
-      // of merging code whose tests were only partially verified. There is
-      // also nothing here for Claude to fix — a setup error is not a code bug.
-      if (setupErrors.length > 0) {
-        const summary = setupErrors
-          .map(e => `[${e.label}] ${e.message}`)
-          .join('\n\n')
-          .slice(0, 2000);
-        sendLog(ws, `Tests could not run cleanly — setup failed for one or more runners. Not invoking fix loop.\n${summary}\n`);
-        return { passed: false, testFailuresDetected: false, setupFailed: true, failureSummary: summary };
+      // "No failures" is only a pass if we actually ran at least one
+      // runner. If every runner hit setup errors (npm ci / spawn
+      // timeout), tests didn't run — we can't claim they passed, and
+      // there's nothing for Claude to fix. Surface as a distinct
+      // setupFailed state so the caller fails the task with an infra
+      // category instead of merging unverified code.
+      if (!ranAnyRunner && setupErrors.length > 0) {
+        sendLog(ws, `Tests could not run — setup failed for all runners. Not invoking fix loop.\n${setupSummary}\n`);
+        return { passed: false, testFailuresDetected: false, setupFailed: true, failureSummary: setupSummary };
+      }
+      // Partial setup failure: some runner(s) ran clean, but at least one
+      // sibling runner failed setup and never executed its suite. Reporting a
+      // clean pass here would silently merge with an entire suite unverified.
+      // Surface a distinct partialSetupFailed signal (passed:false) so the
+      // caller drives the same bounded setup-retry the all-failed case uses and,
+      // once exhausted, fails the gate closed rather than falling open.
+      if (partialSetupFailed) {
+        sendLog(ws, `Tests passed on the runners that ran, but ${setupErrors.length} runner(s) failed setup — not reporting a clean pass.\n${setupSummary}\n`);
+        return { passed: false, testFailuresDetected: false, partialSetupFailed: true, failureSummary: setupSummary };
       }
       if (!anyRealTestExecuted && placeholderFailures.length > 0) {
         const failureSummary = placeholderFailures
@@ -836,6 +866,12 @@ export async function testFixLoop(
       if (newFailures.length === 0) {
         // Every detected failure existed before our changes — task is not responsible
         sendLog(ws, `All ${preExistingFailures.length} test failure(s) are pre-existing and were not caused by this task.\n`);
+        // ...but if a sibling runner failed setup, a suite never ran — surface
+        // the partial-setup signal instead of an unqualified clean pass.
+        if (partialSetupFailed) {
+          sendLog(ws, `However, ${setupErrors.length} runner(s) failed setup and never executed — reporting partial setup failure.\n${setupSummary}\n`);
+          return { passed: false, testFailuresDetected: false, partialSetupFailed: true, failureSummary: setupSummary };
+        }
         return { passed: true, testFailuresDetected: false };
       }
 
@@ -854,8 +890,8 @@ export async function testFixLoop(
         exitReason: 'early_unchanged', startedAt: iterStartedAt,
       });
       sendLog(ws, `Test failures unchanged from previous attempt — exiting early (persistent, unfixable by Claude).\n`);
-      const failureSummary = combinedFailures.slice(-8000);
-      return { passed: false, testFailuresDetected: true, failureSummary };
+      const failureSummary = combinedFailures.slice(-8000) + setupNote;
+      return { passed: false, testFailuresDetected: true, failureSummary, partialSetupFailed: partialSetupFailed || undefined };
     }
     fingerprintHistory.push(fingerprint);
     errorTextHistory.push(combinedFailures);
@@ -867,8 +903,8 @@ export async function testFixLoop(
         exitReason: divergence, startedAt: iterStartedAt,
       });
       sendLog(ws, `Test fix loop divergence detected (${divergence}) — abandoning to avoid wasted iterations.\n`);
-      const failureSummary = combinedFailures.slice(-8000);
-      return { passed: false, testFailuresDetected: true, failureSummary };
+      const failureSummary = combinedFailures.slice(-8000) + setupNote;
+      return { passed: false, testFailuresDetected: true, failureSummary, partialSetupFailed: partialSetupFailed || undefined };
     }
     // On retry (attempt >= 1), record what the previous Claude call
     // actually changed + the test failures that persisted, so the next
@@ -960,7 +996,7 @@ export async function testFixLoop(
         ? `${phasePrefix}Tests failed during focused verification.\n`
         : `WARNING: ${phasePrefix}Tests still failing after ${maxFixAttempts} fix attempts. Proceeding with commit.\n`;
       sendLog(ws, exhaustedMessage);
-      const failureSummary = combinedFailures.slice(-8000);
+      const failureSummary = combinedFailures.slice(-8000) + setupNote;
       // noTestsExecuted: the only "failures" came from placeholder commands
       // (e.g. `npm` "no test specified") — no real test executed, so the
       // focused-verification fail should route to the proceed-without-checks
@@ -969,6 +1005,7 @@ export async function testFixLoop(
       return {
         passed: false, testFailuresDetected: true, failureSummary, noTestsExecuted,
         noTestsReason: noTestsExecuted ? (sawAllSkipped ? 'all_skipped' : 'no_real_tests') : undefined,
+        partialSetupFailed: partialSetupFailed || undefined,
       };
     }
   }

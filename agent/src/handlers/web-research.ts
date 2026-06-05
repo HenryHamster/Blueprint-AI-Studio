@@ -9,6 +9,7 @@ import {
 import {
   configureAgentPermissions, computePromptFingerprint,
   DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, buildContextPrefix, buildRetryContext, readClaudeMd,
+  formatPlaybook, type PlaybookEntry,
 } from '../prompt.js';
 import {
   extractJsonObjectDetailed, describeJsonExtractionResult,
@@ -136,6 +137,7 @@ export async function handleWebResearch(
 
   const contextPrefix = buildContextPrefix(task);
   const retryContext = buildRetryContext(task);
+  const webResearchPlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const claudeMd = readClaudeMd();
   const claudeMdPrefix = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
   const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
@@ -153,7 +155,7 @@ export async function handleWebResearch(
   }
   const priorKnowledgeSection = buildPriorKnowledgeSection(priorDocs);
 
-  const webResearchPrompt = `${claudeMdPrefix}${retryContext}${contextPrefix}You are a web-research agent. Your job is to investigate the topic below WEB-FIRST — drive WebSearch and WebFetch to gather current, authoritative information — and produce a single structured knowledge DOCUMENT. You operate strictly read-only: you do NOT edit files, you do NOT open a pull request, and you do NOT spawn any follow-up work.
+  const webResearchPrompt = `${claudeMdPrefix}${webResearchPlaybookSection}${retryContext}${contextPrefix}You are a web-research agent. Your job is to investigate the topic below WEB-FIRST — drive WebSearch and WebFetch to gather current, authoritative information — and produce a single structured knowledge DOCUMENT. You operate strictly read-only: you do NOT edit files, you do NOT open a pull request, and you do NOT spawn any follow-up work.
 
 ${topicLine}Investigation prompt:
 ${prompt}

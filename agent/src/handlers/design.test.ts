@@ -107,6 +107,48 @@ describe('handleDesign', () => {
     expect(prompt).toContain(`/tmp/design_document_${TASK_ID}.json`);
   });
 
+  it('renders the operational playbook (with provenance caveats) into the prompt', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_DOCUMENT);
+
+    const taskWithPlaybook = {
+      ...BASE_TASK,
+      playbook: {
+        'build-cmd': {
+          content: 'Run the docker test harness via scripts/test-backend.sh.',
+          effectiveness_score: 0.9, confirmed_count: 2, age_days: 1, stale: false,
+        },
+        'stale-fact': {
+          content: 'A fact recorded on a divergent branch.',
+          effectiveness_score: 0.8, confirmed_count: 1, age_days: 3, stale: false,
+          provenance: { branch: 'feature/x', head_sha: 'abc1234', diverged: true },
+        },
+      },
+    };
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design how X should work' },
+      taskWithPlaybook, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('## Operational Playbook (active collective memory)');
+    expect(prompt).toContain('Run the docker test harness via scripts/test-backend.sh.');
+    // Provenance divergence caveat surfaces for the divergent-branch entry.
+    expect(prompt).toContain('⚠ different branch than yours');
+  });
+
+  it('omits the playbook section when no playbook is shipped', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_DOCUMENT);
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design how X should work' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).not.toContain('## Operational Playbook (active collective memory)');
+  });
+
   it('reads the document from the /tmp file and completes with the document JSON in logs', async () => {
     vi.mocked(readHandlerOutput).mockReturnValue(VALID_DOCUMENT);
 

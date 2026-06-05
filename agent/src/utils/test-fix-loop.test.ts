@@ -677,3 +677,81 @@ describe('testFixLoop — in-loop environment-failure routing (maxFixAttempts: 0
     expect(result.testFailuresDetected).toBe(true);
   });
 });
+
+describe('testFixLoop — partial per-runner setup failure (maxFixAttempts: 0)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(fs.existsSync).mockImplementation(defaultExistsSync);
+  });
+
+  it('one runner setup-fails while a sibling runner passes → partialSetupFailed=true, NOT a clean pass', async () => {
+    // pytest runner hits an environment failure (missing shared library — a true
+    // infrastructure/VM failure, not a repo dependency regression) and is skipped;
+    // the npm sibling runs to a clean pass. The failed runner's suite never
+    // executed, so the result must NOT report an unqualified clean pass.
+    execFileAsync.mockImplementation((cmd: string) =>
+      cmd === 'python3'
+        ? Promise.reject(new Error('Command failed: python3 -m pytest -x -q\nImportError: libpython3.11.so.1.0: cannot open shared object file: No such file or directory'))
+        : Promise.resolve('Tests  3 passed (3)\nTest Files  1 passed (1)'),
+    );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [REAL_RUNNER, NPM_RUNNER] },
+    );
+
+    expect(result.partialSetupFailed).toBe(true);
+    // All-runners-failed escalation must NOT fire — a sibling ran.
+    expect(result.setupFailed).toBeFalsy();
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(false);
+    // The broken runner's error is carried, not silently dropped.
+    expect(result.failureSummary).toContain('cannot open shared object file');
+    expect(result.failureSummary).toContain('pytest (packages/b)');
+  });
+
+  it('one runner setup-fails while a sibling runner has REAL test failures → both surfaced', async () => {
+    // pytest runner hits an environment failure (missing shared library — a true
+    // infrastructure/VM failure, skipped → setupErrors); the npm
+    // sibling runs and a real test fails. The verdict must carry the test
+    // failures AND the partial-setup signal — neither is dropped.
+    execFileAsync.mockImplementation((cmd: string) =>
+      cmd === 'python3'
+        ? Promise.reject(new Error('Command failed: python3 -m pytest -x -q\nImportError: libpython3.11.so.1.0: cannot open shared object file: No such file or directory'))
+        : Promise.reject(new Error('Command failed: npm test\nFAILED src/foo.test.ts > parses_config\nAssertionError: expected 1 to equal 2\n1 failed')),
+    );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [REAL_RUNNER, NPM_RUNNER] },
+    );
+
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(true);
+    expect(result.partialSetupFailed).toBe(true);
+    // Genuine test failure is present...
+    expect(result.failureSummary).toContain('AssertionError');
+    // ...AND the partial-setup error block is appended, not dropped.
+    expect(result.failureSummary).toContain('Partial setup failure');
+    expect(result.failureSummary).toContain('cannot open shared object file');
+  });
+
+  it('genuine clean multi-runner pass with NO setup errors → passed=true, partialSetupFailed falsy', async () => {
+    // Guard against over-firing: when every runner runs cleanly there is no
+    // partial-setup signal and the verdict stays an unqualified pass.
+    execFileAsync.mockResolvedValue('Tests  3 passed (3)\nTest Files  1 passed (1)');
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [REAL_RUNNER, NPM_RUNNER] },
+    );
+
+    expect(result.passed).toBe(true);
+    expect(result.partialSetupFailed).toBeFalsy();
+    expect(result.setupFailed).toBeFalsy();
+    expect(result.testFailuresDetected).toBe(false);
+  });
+});

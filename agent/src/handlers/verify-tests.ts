@@ -36,6 +36,14 @@ interface VerifyTestsResult {
   // FAILED verify task to distinguish a transient setup failure from a cold
   // clone crash when labeling an exhausted-retry UNVERIFIED merge.
   setupFailed?: boolean;
+  // Set when SOME-but-not-all test runners failed setup/environment (a polyglot
+  // repo where e.g. the Python suite ran but the TS runner's `npm ci` failed).
+  // Distinct from setupFailed (ALL runners failed): a sibling runner ran, so the
+  // suite is only PARTIALLY verified. The backend
+  // (ci_resolution.classify_merge_test_verdict) must NOT treat this as a clean
+  // pass / undetected fall-open — it fails the gate closed in the same spirit as
+  // setupFailed while staying distinguishable in the artifact.
+  partialSetupFailed?: boolean;
   // Set when the stored test command was STALE (it ran but executed no real
   // tests, or its command was gone) and auto-detection found a DIFFERENT, real
   // suite in the cloned workspace that actually executed. When true,
@@ -99,7 +107,11 @@ async function runVerifyLoop(
   );
 
   let setupRetries = 0;
-  while (loop.setupFailed && setupRetries < MAX_VERIFY_SETUP_RETRIES) {
+  // Retry on EITHER an all-runners setup failure (setupFailed) or a partial
+  // setup failure (partialSetupFailed): both mean a suite did not run because of
+  // environment/setup breakage, which may be transient infra. Same bounded
+  // budget for both.
+  while ((loop.setupFailed || loop.partialSetupFailed) && setupRetries < MAX_VERIFY_SETUP_RETRIES) {
     setupRetries += 1;
     sendLog(ws, `Test runner setup failed (transient infra) — retrying ${retryStatusLabel} (${setupRetries}/${MAX_VERIFY_SETUP_RETRIES})...\n`);
     statusRef.value = `Retrying ${retryStatusLabel} after setup failure (${setupRetries}/${MAX_VERIFY_SETUP_RETRIES})...`;
@@ -247,8 +259,8 @@ async function recoverFromStaleCommand(
     'replacement suite',
   );
 
-  if (loop.setupFailed) {
-    sendLog(ws, 'Replacement suite setup failed after bounded retries — surfacing setupFailed to caller.\n');
+  if (loop.setupFailed || loop.partialSetupFailed) {
+    sendLog(ws, 'Replacement suite setup failed (fully or partially) after bounded retries — surfacing to caller.\n');
     return { kind: 'setupFailed', loop };
   }
 
@@ -414,17 +426,22 @@ export async function handleVerifyTests(
       'detected suite',
     );
 
-    if (loop.setupFailed) {
-      // Setup still failing after the bounded retries. We genuinely could not
-      // run an existing suite due to infrastructure — NOT a no-tests repo.
-      // Post FAILED (keeping the diagnostic artifact) so the orchestrator
-      // routes this through its existing one-shot crash-retry path (re-spawn
-      // the verify task) before any UNVERIFIED downgrade, instead of treating
-      // it as detected=false and failing open immediately.
+    if (loop.setupFailed || loop.partialSetupFailed) {
+      // Setup still failing after the bounded retries. Either EVERY runner
+      // failed setup (setupFailed) or SOME-but-not-all did (partialSetupFailed):
+      // in both cases at least one suite genuinely could not run due to
+      // infrastructure — NOT a no-tests repo. Post FAILED (keeping the
+      // diagnostic artifact) so the orchestrator routes this through its
+      // existing one-shot crash-retry path (re-spawn the verify task) before any
+      // UNVERIFIED downgrade, instead of treating it as detected=false and
+      // failing open immediately. The partial case stays distinguishable in the
+      // artifact via partialSetupFailed so the backend never reads it as a clean
+      // pass.
       const setupResult: VerifyTestsResult = {
         detected: false,
         passed: false,
-        setupFailed: true,
+        setupFailed: loop.setupFailed || undefined,
+        partialSetupFailed: loop.partialSetupFailed || undefined,
         tests: [],
         output: (loop.failureSummary ?? 'Test runner setup failed.').slice(-VERIFY_TESTS_OUTPUT_LIMIT),
       };
@@ -459,7 +476,8 @@ export async function handleVerifyTests(
         const setupResult: VerifyTestsResult = {
           detected: false,
           passed: false,
-          setupFailed: true,
+          setupFailed: recovered.loop.setupFailed || undefined,
+          partialSetupFailed: recovered.loop.partialSetupFailed || undefined,
           tests: [],
           output: (recovered.loop.failureSummary ?? 'Test runner setup failed.').slice(-VERIFY_TESTS_OUTPUT_LIMIT),
         };

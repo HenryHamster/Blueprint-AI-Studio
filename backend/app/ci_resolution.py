@@ -330,6 +330,25 @@ def classify_merge_test_verdict(
     """
     if not isinstance(verdict, dict):
         return ("undetected", "")
+    # Partial-setup failure: SOME-but-not-all test runners failed environment
+    # setup, so at least one suite never executed (a polyglot repo where e.g. the
+    # Python suite ran but the TS runner's ``npm ci`` failed). The runners that
+    # ran may have passed, but a clean ``detected=false`` fall-open here would
+    # silently merge with an entire suite unverified. Treat it as a BLOCK (fail)
+    # — never a clean pass or an undetected fall-open — mirroring the
+    # all-runners-failed escalation while staying distinguishable via the flag.
+    # Checked BEFORE the detected/passed branches so it cannot be masked by a
+    # sibling runner's pass. Defensive about an older agent that never emits the
+    # flag (falsy → falls through to existing behavior).
+    if verdict.get("partialSetupFailed"):
+        output = str(verdict.get("output") or "").strip()
+        return (
+            "fail",
+            output
+            or "Partial setup failure: one or more test runners could not run "
+            "their suite (environment/setup error); the suite is only partially "
+            "verified.",
+        )
     if verdict.get("detected") is False:
         if _probe_is_clear_failure(verdict.get("probe")):
             probe = verdict["probe"]

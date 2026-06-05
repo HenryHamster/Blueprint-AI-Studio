@@ -5433,9 +5433,21 @@ async def orchestrator_worker():
                                             ArtifactType.MERGE_TEST_RESULT,
                                         )
                                     )
+                                    # Either an all-runners setup failure
+                                    # (setupFailed) or a partial one
+                                    # (partialSetupFailed — some runners ran but a
+                                    # sibling's environment broke) means a suite
+                                    # could not run due to infra, distinct from a
+                                    # cold-clone crash. Both get the setup-failed
+                                    # operator reason on an exhausted-retry merge.
                                     _verify_setup_failed = bool(
                                         isinstance(_failed_artifact, dict)
-                                        and _failed_artifact.get("setupFailed")
+                                        and (
+                                            _failed_artifact.get("setupFailed")
+                                            or _failed_artifact.get(
+                                                "partialSetupFailed"
+                                            )
+                                        )
                                     )
                                 _outcome, _detail = (
                                     ci_resolution.classify_merge_test_verdict(

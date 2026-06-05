@@ -276,6 +276,39 @@ def test_classify_verdict_detected_false_is_undetected():
     assert detail == ""
 
 
+def test_classify_verdict_partial_setup_failed_blocks_not_falls_open():
+    # SOME-but-not-all runners failed setup: a suite never executed. The verdict
+    # arrives detected=false (the runners that ran may have passed) but it MUST
+    # NOT fall open to undetected — it blocks (fail) so the gate fails closed.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": False,
+            "passed": False,
+            "partialSetupFailed": True,
+            "output": "Partial setup failure — [npm test (ui)] npm ci failed",
+        }
+    )
+    assert outcome == "fail"
+    assert "npm ci failed" in detail
+
+
+def test_classify_verdict_partial_setup_failed_blank_output_gets_fallback():
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {"detected": False, "passed": False, "partialSetupFailed": True}
+    )
+    assert outcome == "fail"
+    assert detail  # non-empty fallback naming the partial setup failure
+
+
+def test_classify_verdict_partial_setup_failed_wins_over_sibling_pass():
+    # Even if a sibling runner's pass is reflected as passed=True, the
+    # partial-setup signal is checked first and still blocks.
+    outcome, _ = ci_resolution.classify_merge_test_verdict(
+        {"detected": True, "passed": True, "partialSetupFailed": True}
+    )
+    assert outcome == "fail"
+
+
 def test_classify_verdict_none_is_undetected():
     # Verify task crashed / produced no artifact → fall back, don't block.
     assert ci_resolution.classify_merge_test_verdict(None) == ("undetected", "")
