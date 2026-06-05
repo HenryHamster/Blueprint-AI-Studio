@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -137,6 +138,72 @@ def _usable_citations(obj: dict[str, Any]) -> list[str]:
     if not isinstance(raw, list):
         return []
     return [c.strip() for c in raw if _is_usable_citation(c)]
+
+
+# ---------------------------------------------------------------------------
+# Goal-level acceptance probe: is the document actually responsive to what was
+# asked? The structural/citation gates above only check shape — a well-formed
+# but off-topic document clears them. This cheap, no-dependency lexical probe
+# rejects a CLEAR topical miss (essentially no keyword overlap with the asked
+# topic/prompt) while erring toward acceptance whenever the signal is weak,
+# mirroring the conservative fall-open philosophy of the code merge gate.
+# ---------------------------------------------------------------------------
+
+# Common words carry no topical signal; drop them before measuring overlap.
+_PROBE_STOPWORDS = frozenset(
+    {
+        "about", "above", "across", "after", "against", "research", "current",
+        "state", "their", "these", "those", "which", "while", "would", "could",
+        "should", "there", "where", "what", "when", "with", "from", "that",
+        "this", "into", "over", "under", "between", "your", "have", "been",
+        "being", "does", "using", "used", "make", "made", "such", "than",
+        "then", "they", "them", "will", "shall", "topic", "prompt", "report",
+        "document", "summary",
+    }
+)
+
+# Probe only judges when the request carries enough signal; below this many
+# distinct content keywords there is too little to judge — accept.
+_MIN_REQUEST_KEYWORDS = 3
+# A clear miss is essentially-no overlap; require only a small fraction of the
+# request keywords to appear so borderline-but-genuine docs are not failed.
+_MIN_TOPIC_OVERLAP_RATIO = 0.1
+
+
+def _keywords(text: str) -> set[str]:
+    """Lowercase content keywords (alphanumeric, >=4 chars, non-stopword)."""
+    return {
+        w
+        for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+        if len(w) >= 4 and w not in _PROBE_STOPWORDS
+    }
+
+
+def _topic_responsiveness_miss(task: Task, document: dict[str, Any]) -> str | None:
+    """Return an operator-readable reason on a CLEAR topical miss, else ``None``.
+
+    Cheap deterministic keyword-overlap probe between the task's requested
+    topic/prompt and the document's title+summary+body. Returns ``None`` (accept)
+    whenever the request carries too little signal to judge — uncertainty errs
+    toward acceptance.
+    """
+    payload = task.first_payload or {}
+    requested = " ".join(str(payload.get(k) or "") for k in ("topic", "prompt"))
+    request_keywords = _keywords(requested)
+    if len(request_keywords) < _MIN_REQUEST_KEYWORDS:
+        return None  # too little signal in the request — accept.
+
+    doc_keywords = _keywords(
+        " ".join(str(document.get(k) or "") for k in ("title", "summary", "body"))
+    )
+    overlap = request_keywords & doc_keywords
+    if len(overlap) / len(request_keywords) >= _MIN_TOPIC_OVERLAP_RATIO:
+        return None
+    return (
+        "output is not responsive to the requested topic "
+        f"(only {len(overlap)}/{len(request_keywords)} topic keyword(s) appear "
+        "in the document title/summary/body)"
+    )
 
 
 def _parse_web_research_document(text: str | None) -> dict[str, Any] | None:
@@ -424,6 +491,19 @@ async def _handle_knowledge_document_completion(
         )
         return
 
+    # Goal-level acceptance probe: a cheap, deterministic check that the
+    # document is actually responsive to the asked topic/prompt before it is
+    # accepted as done. Err toward acceptance — only a CLEAR miss fails here.
+    miss_reason = _topic_responsiveness_miss(task, document)
+    if miss_reason is not None:
+        await _fail_gate(
+            task,
+            EvaluationVerdict(False, f"{kind} {miss_reason}", "forward-quality"),
+            session,
+            kind,
+        )
+        return
+
     # Optional blast-radius-proportional escalation: stand up an INDEPENDENT
     # grader and park EVALUATING. The verdict returns via the re-entrant
     # completion path, which re-invokes this handler (RESUME pass above).
@@ -440,8 +520,12 @@ async def _handle_knowledge_document_completion(
         session.add(task)
         await session.commit()
 
+        payload = task.first_payload or {}
+        question = " ".join(
+            str(payload.get(k) or "") for k in ("topic", "prompt")
+        ).strip()
         grader = await spawn_forward_quality_grader(
-            task, json.dumps(document), session
+            task, json.dumps(document), session, question=question or None
         )
         if grader is not None:
             logger.info(

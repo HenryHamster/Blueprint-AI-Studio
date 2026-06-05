@@ -108,11 +108,49 @@ describe('DetailsTab — Merge Test Gate', () => {
     expect(screen.getByText(/no runnable test command could be detected/)).toBeInTheDocument();
   });
 
-  it('renders the raw reason key when it is unmapped', () => {
+  it('humanizes an unmapped reason key instead of showing a raw token', () => {
     const task = makeTask({ unverified_merge_reason: 'some_future_reason' });
     render(<DetailsTab task={task} />);
     expect(screen.getByText('Merged unverified')).toBeInTheDocument();
-    expect(screen.getByText(/some_future_reason/)).toBeInTheDocument();
+    // Forward-compat: an unknown key is de-tokenized, never shown raw.
+    expect(screen.getByText(/some future reason/)).toBeInTheDocument();
+    expect(screen.queryByText(/some_future_reason/)).toBeNull();
+  });
+
+  it('renders the acceptance-probe outcome alongside the suite verdict', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({
+        detected: false,
+        passed: false,
+        tests: [],
+        output: 'No test runner detected',
+        probe: { ran: true, ecosystem: 'node', passed: true, could_not_run: false },
+      })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Acceptance probe')).toBeInTheDocument();
+    expect(screen.getByText('node: passed')).toBeInTheDocument();
+  });
+
+  it('renders a could-not-run acceptance probe on a fall-open', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({
+        detected: false,
+        passed: false,
+        tests: [],
+        output: '',
+        probe: { ran: true, ecosystem: 'python', passed: false, could_not_run: true },
+      })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('python: could not run')).toBeInTheDocument();
+  });
+
+  it('maps the probe_passed reason to an accurate, non-misleading label', () => {
+    const task = makeTask({ unverified_merge_reason: 'probe_passed' });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Merged unverified')).toBeInTheDocument();
+    expect(screen.getByText(/not real test verification/)).toBeInTheDocument();
   });
 
   it('reason label takes precedence when both an undetected artifact and a reason are present', () => {

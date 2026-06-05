@@ -8078,3 +8078,96 @@ class TestAgentTestRunnerParseHelpers:
         assert "missingCommand" in region
         assert ".some(line => missingCommand.test(line))" in region
         assert r"\bcommand\b" in region
+
+
+# ── No-CI UNVERIFIED-merge reason-label parity ────────────────────────────────
+# The orchestrator writes a stable reason KEY into
+# review_loop["unverified_merge_reason"] at each no-CI fall-open decision site.
+# Three operator-facing surfaces humanize that key: the backend unverified-merge
+# alert (alert_dispatch._UNVERIFIED_REASON_LABELS), the per-task Merge Test Gate
+# panel, and the project merge-verification banner (both frontend, sharing
+# admin-ui/src/utils/unverifiedReasonLabels.ts). These tests pin the label maps
+# to the full set of emitted keys so a new reason can never ship showing a raw
+# token (e.g. "suite_all_skipped") or a positive-sounding key ("probe_passed")
+# verbatim to an operator.
+
+# Canonical set of fall-open reason keys, with their emit sites:
+#   internal_staging_base / kill_switch_off / no_detectable_test_command /
+#   verify_setup_failed        -> app/orchestrator.py no-CI gate
+#   undetected_runtime / suite_all_skipped / probe_passed / probe_could_not_run
+#                              -> ci_resolution.classify_unverified_fall_open_reason
+_UNVERIFIED_REASON_KEYS = frozenset(
+    {
+        "no_detectable_test_command",
+        "kill_switch_off",
+        "internal_staging_base",
+        "undetected_runtime",
+        "suite_all_skipped",
+        "verify_setup_failed",
+        "probe_passed",
+        "probe_could_not_run",
+    }
+)
+
+
+def _frontend_unverified_reason_keys() -> "set[str] | None":
+    """Extract the key set of the frontend UNVERIFIED_REASON_LABELS map.
+
+    Returns ``None`` when admin-ui/src is not on disk (CI docker context is
+    ./backend) so the caller can skip, mirroring the frontend size guardrails.
+    """
+    if _ADMIN_UI_SRC_ROOT is None:
+        return None
+    path = _get_frontend_path(os.path.join("utils", "unverifiedReasonLabels.ts"))
+    source = Path(path).read_text(encoding="utf-8")
+    # Isolate the object literal body so we only read declared keys, not the
+    # JSDoc that names other keys in prose.
+    match = re.search(
+        r"UNVERIFIED_REASON_LABELS:\s*Record<string,\s*string>\s*=\s*\{(.*?)\n\};",
+        source,
+        re.DOTALL,
+    )
+    assert match, "UNVERIFIED_REASON_LABELS object literal not found in frontend util"
+    body = match.group(1)
+    return set(re.findall(r"^\s*([A-Za-z_][A-Za-z0-9_]*):", body, re.MULTILINE))
+
+
+def test_unverified_reason_labels_backend_covers_all_keys():
+    """The backend alert label map labels every emitted fall-open reason key."""
+    from app.alert_dispatch import _UNVERIFIED_REASON_LABELS
+
+    missing = _UNVERIFIED_REASON_KEYS - set(_UNVERIFIED_REASON_LABELS)
+    assert not missing, (
+        "backend _UNVERIFIED_REASON_LABELS (app/alert_dispatch.py) is missing "
+        f"labels for emitted reason keys: {sorted(missing)}"
+    )
+
+
+def test_unverified_reason_labels_frontend_backend_parity():
+    """Frontend and backend reason-label maps must cover the same key set.
+
+    Guards against the drift in this task: the frontend map had fallen behind
+    the backend (missing suite_all_skipped / verify_setup_failed / probe_*),
+    showing raw tokens to operators.
+    """
+    frontend_keys = _frontend_unverified_reason_keys()
+    if frontend_keys is None:
+        pytest.skip(
+            "admin-ui/src not available in this test environment "
+            "(CI docker context is ./backend; mount via test-backend.sh)"
+        )
+    from app.alert_dispatch import _UNVERIFIED_REASON_LABELS
+
+    backend_keys = set(_UNVERIFIED_REASON_LABELS)
+    assert frontend_keys == backend_keys, (
+        "no-CI UNVERIFIED reason-label maps drifted — frontend "
+        "(admin-ui/src/utils/unverifiedReasonLabels.ts) and backend "
+        "(app/alert_dispatch._UNVERIFIED_REASON_LABELS) must label the same keys. "
+        f"frontend-only={sorted(frontend_keys - backend_keys)} "
+        f"backend-only={sorted(backend_keys - frontend_keys)}"
+    )
+    # And both must cover the full canonical emitted set.
+    assert _UNVERIFIED_REASON_KEYS <= frontend_keys, (
+        "frontend reason-label map missing canonical keys: "
+        f"{sorted(_UNVERIFIED_REASON_KEYS - frontend_keys)}"
+    )

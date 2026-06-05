@@ -337,6 +337,14 @@ _UNVERIFIED_REASON_LABELS = {
         "the detected test suite exists but could not be run "
         "(setup/runner infrastructure failed after retries)"
     ),
+    "probe_passed": (
+        "no unit suite ran; only a cheap acceptance probe (compile/build) "
+        "passed — not real test verification"
+    ),
+    "probe_could_not_run": (
+        "no unit suite ran and the acceptance probe could not run "
+        "(missing deps/unprovisioned setup)"
+    ),
 }
 
 

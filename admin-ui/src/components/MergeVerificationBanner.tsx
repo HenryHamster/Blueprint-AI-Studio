@@ -1,6 +1,7 @@
 import { AlertTriangle, CheckCircle, ShieldCheck } from 'lucide-react';
 import type { MergeGateRuntime, MergeVerificationVerdict } from '../types/project';
 import { formatAbsolute, parseTimestamp } from '../utils/time';
+import { humanizeUnverifiedReason } from '../utils/unverifiedReasonLabels';
 
 interface MergeVerificationBannerProps {
   /** Backend-computed verdict. Renders nothing when null/undefined (older responses). */
@@ -25,7 +26,7 @@ export function MergeVerificationBanner({ verdict, runtime, className }: MergeVe
   const wrap = `rounded-lg border px-3 py-2.5 ${className ?? ''}`;
   const verifiedAt = runtime?.executed_real_tests && runtime.last_run_at ? parseTimestamp(runtime.last_run_at) : null;
   const unverifiedAt = runtime?.last_unverified_at ? parseTimestamp(runtime.last_unverified_at) : null;
-  const unverifiedReason = runtime?.last_unverified_reason ? runtime.last_unverified_reason.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim() : null;
+  const unverifiedReason = runtime?.last_unverified_reason ? humanizeUnverifiedReason(runtime.last_unverified_reason) : null;
   const mismatch = verdict.state === 'tests_gated' && Boolean(unverifiedAt && (!verifiedAt || unverifiedAt.getTime() > verifiedAt.getTime()));
   const runtimeState = runtime
     ? (mismatch

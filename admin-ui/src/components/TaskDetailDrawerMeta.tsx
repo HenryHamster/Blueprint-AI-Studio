@@ -11,18 +11,7 @@ import { SelfReviewPanel } from './TaskDetailDrawerSelfReview';
 import { TaskDiagnosticsPanel, TaskErrorLogsPanel, getLogEntryColor } from './TaskDetailDrawerDiagnostics';
 import { FailureDetailPanel } from './TaskDetailDrawerFailureDetail';
 import type { PanelReviewIssue, PanelReviewVerdict, Task, TaskEvaluationSummary } from '../types/task';
-
-// Human-readable labels for the no-CI UNVERIFIED-merge reason keys. Mirrors
-// backend _UNVERIFIED_REASON_LABELS (backend/app/alert_dispatch.py) — keep keys
-// in sync. The orchestrator writes the reason KEY into
-// review_loop["unverified_merge_reason"]; admin.py exposes it as
-// task.unverified_merge_reason.
-const UNVERIFIED_REASON_LABELS: Record<string, string> = {
-  no_detectable_test_command: 'no runnable test command could be detected',
-  kill_switch_off: 'the no-CI test-gate is disabled (kill-switch off)',
-  internal_staging_base: 'the PR targets an internal staging branch (CI is path-filtered there)',
-  undetected_runtime: 'the detected test suite produced no usable verdict',
-};
+import { humanizeUnverifiedReason } from '../utils/unverifiedReasonLabels';
 
 function CopyableId({ value }: { value: string }) {
   const [copied, setCopied] = useState(false);
@@ -526,17 +515,25 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
     // (classify_merge_test_verdict in ci_resolution.py): detected=false →
     // undetected; passed truthy → pass; otherwise → fail.
     const mergeTestArtifacts = artifacts.filter(a => a.artifact_type === 'MERGE_TEST_RESULT' && a.logs);
-    let mergeTestVerdict: { outcome: 'pass' | 'fail' | 'undetected'; output: string } | null = null;
+    // The cheap goal-level acceptance probe the agent attaches on a no-suite
+    // fall-open ("does the changed code still compile/build"). Surfaced next to
+    // the suite verdict, consistent with the Evaluation Summary section.
+    type ProbeBlock = { ran?: boolean; ecosystem?: string; passed?: boolean; could_not_run?: boolean };
+    let mergeTestVerdict: { outcome: 'pass' | 'fail' | 'undetected'; output: string; probe: ProbeBlock | null } | null = null;
     if (mergeTestArtifacts.length > 0) {
       const latest = mergeTestArtifacts.reduce((a, b) => ((b.iteration ?? 1) >= (a.iteration ?? 1) ? b : a));
       try {
-        const parsed = JSON.parse(latest.logs as string) as { detected?: boolean; passed?: boolean; output?: string };
+        const parsed = JSON.parse(latest.logs as string) as { detected?: boolean; passed?: boolean; output?: string; probe?: ProbeBlock };
         const outcome: 'pass' | 'fail' | 'undetected' = parsed.detected === false
           ? 'undetected'
           : parsed.passed
             ? 'pass'
             : 'fail';
-        mergeTestVerdict = { outcome, output: typeof parsed.output === 'string' ? parsed.output : '' };
+        mergeTestVerdict = {
+          outcome,
+          output: typeof parsed.output === 'string' ? parsed.output : '',
+          probe: parsed.probe && typeof parsed.probe === 'object' ? parsed.probe : null,
+        };
       } catch {
         mergeTestVerdict = null;
       }
@@ -1031,11 +1028,22 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
           unverifiedMergeReason || !mergeTestVerdict ? 'unverified' : mergeTestVerdict.outcome;
         const v = config[outcome];
         const reasonLabel = unverifiedMergeReason
-          ? (UNVERIFIED_REASON_LABELS[unverifiedMergeReason] ?? unverifiedMergeReason)
+          ? humanizeUnverifiedReason(unverifiedMergeReason)
           : null;
         const note = reasonLabel
           ? `The merge bypassed test verification — ${reasonLabel}.`
           : v.note;
+        // The acceptance probe runs only on a no-suite fall-open. Render its
+        // honest outcome (ecosystem + passed / could-not-run / failed) next to
+        // the suite verdict, mirroring the Evaluation Summary section.
+        const probe = mergeTestVerdict?.probe?.ran ? mergeTestVerdict.probe : null;
+        const probeState = probe
+          ? (probe.passed ? 'passed' : probe.could_not_run ? 'could not run' : 'failed')
+          : null;
+        const probeStateClass = probe
+          ? (probe.passed ? 'text-emerald-400' : probe.could_not_run ? 'text-neutral-400' : 'text-red-400')
+          : '';
+        const probeEcosystem = (probe?.ecosystem ?? '').trim();
         return (
           <>
             <SectionHeader>Merge Test Gate</SectionHeader>
@@ -1046,6 +1054,14 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
                   {v.label}
                 </span>
               </div>
+              {probeState && (
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-neutral-500 w-28 shrink-0">Acceptance probe</span>
+                  <span className={`text-xs font-semibold ${probeStateClass}`}>
+                    {probeEcosystem ? `${probeEcosystem}: ` : ''}{probeState}
+                  </span>
+                </div>
+              )}
               <p className="text-xs text-neutral-400 break-words">{note}</p>
               {mergeTestVerdict?.output && (
                 <div className="flex items-start gap-2">

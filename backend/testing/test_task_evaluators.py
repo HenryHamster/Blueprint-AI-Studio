@@ -401,3 +401,29 @@ def test_record_failed_gate_preserves_existing_context():
     record_failed_gate(task, EvaluationVerdict(False, "no measurement", "metric"))
     assert task.context["existing"] == "value"
     assert task.context["evaluation_gate"]["strategy"] == "metric"
+
+
+# ── grader rubric: optional relevance lens ──────────────────────────────────
+
+
+def test_grader_prompt_omits_relevance_lens_without_question():
+    """With no question the rubric carries only the 4 base lenses."""
+    from app.task_evaluators import build_forward_quality_grader_prompt
+
+    prompt = build_forward_quality_grader_prompt("web_research", "some artifact")
+    assert "RELEVANCE" not in prompt
+    assert "REQUEST START" not in prompt
+    assert "4. COHERENCE" in prompt
+
+
+def test_grader_prompt_adds_relevance_lens_with_question():
+    """A supplied question grows a RELEVANCE lens carrying the asked topic so
+    the grader can judge on-topic-ness."""
+    from app.task_evaluators import build_forward_quality_grader_prompt
+
+    prompt = build_forward_quality_grader_prompt(
+        "web_research", "some artifact", question="state of quantum computing"
+    )
+    assert "5. RELEVANCE" in prompt
+    assert "state of quantum computing" in prompt
+    assert "REQUEST START" in prompt

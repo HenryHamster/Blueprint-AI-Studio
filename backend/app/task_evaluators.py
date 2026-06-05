@@ -472,14 +472,31 @@ def _extract_verdict_object_any(text: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
-def build_forward_quality_grader_prompt(task_type: str, artifact_text: str) -> str:
+def build_forward_quality_grader_prompt(
+    task_type: str, artifact_text: str, *, question: str | None = None
+) -> str:
     """Build the rubric prompt for an independent grader of ``artifact_text``.
 
     The grader runs as a fresh, read-only agent with no stake in the artifact.
     It must end its output with a single JSON verdict object so the verdict
     parser can read it back deterministically.
+
+    When ``question`` is supplied (the task's declared topic/prompt) the rubric
+    grows a RELEVANCE lens — without the question the grader sees only the
+    artifact text and structurally cannot judge on-topic-ness.
     """
     label = task_type or "artifact"
+    asked = (question or "").strip()
+    relevance_block = "\n"
+    if asked:
+        relevance_block = (
+            "  5. RELEVANCE — does the artifact actually answer what was asked "
+            "below, rather than being well-formed but off-topic?\n\n"
+            "Requested topic / prompt:\n"
+            "-----8<----- REQUEST START -----8<-----\n"
+            f"{asked[:4000]}\n"
+            "-----8<----- REQUEST END -----8<-----\n\n"
+        )
     return (
         "You are an INDEPENDENT quality grader. A prior agent produced the "
         f"following {label} artifact, and its findings are about to SPAWN "
@@ -494,9 +511,10 @@ def build_forward_quality_grader_prompt(task_type: str, artifact_text: str) -> s
         "at HEAD? Spot-check the most load-bearing ones.\n"
         "  3. ACTIONABILITY — is each spawnable finding specific and scoped "
         "enough that an implementer could act on it without guessing?\n"
-        "  4. COHERENCE — is the artifact internally consistent and parseable?\n\n"
+        "  4. COHERENCE — is the artifact internally consistent and parseable?\n"
+        f"{relevance_block}"
         "Be skeptical. If the artifact is thin, ungrounded, internally "
-        "contradictory, or its load-bearing claims do not survive a "
+        "contradictory, off-topic, or its load-bearing claims do not survive a "
         "spot-check, FAIL it — a failing grade prevents unverified findings "
         "from spawning work, which is the safe default.\n\n"
         "Artifact under review:\n"
@@ -515,6 +533,7 @@ async def spawn_forward_quality_grader(
     session: AsyncSession,
     *,
     rubric: str | None = None,
+    question: str | None = None,
 ) -> Task | None:
     """Spawn an independent grader task for ``source_task`` and park the source.
 
@@ -535,7 +554,9 @@ async def spawn_forward_quality_grader(
         return None
 
     task_type = _task_type_of(source_task)
-    prompt = rubric or build_forward_quality_grader_prompt(task_type, artifact_text)
+    prompt = rubric or build_forward_quality_grader_prompt(
+        task_type, artifact_text, question=question
+    )
     base_branch = (source_task.first_payload or {}).get("base_branch", "main")
 
     grader = Task(

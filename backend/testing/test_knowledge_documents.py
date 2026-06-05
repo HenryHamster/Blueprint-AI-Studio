@@ -393,6 +393,115 @@ async def test_junk_citations_fail_gate(db_session, _quiet_broadcast):
     assert task.status == TaskStatus.FAILED
 
 
+# ── goal-level acceptance probe (topical responsiveness) ────────────────────
+
+
+async def _make_topic_task(db_session, topic, *, project_name="WRtopic"):
+    project = make_project(name=project_name)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(
+        project_id=project.id,
+        title="Web Research",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "web_research", "topic": topic, "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return project, task
+
+
+async def _docs_for(db_session, task_id):
+    return (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task_id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+@pytest.mark.asyncio
+async def test_off_topic_document_fails_acceptance_probe(db_session, _quiet_broadcast):
+    """A well-formed, cited document about an unrelated subject is a CLEAR topical
+    miss for the asked topic: the goal-level probe fails the gate, no doc persists."""
+    project, task = await _make_topic_task(
+        db_session,
+        "the current state of quantum error correction hardware",
+        project_name="WRofftopic",
+    )
+
+    document = {
+        "title": "A guide to organic vegetable gardening",
+        "summary": "How to grow tomatoes, lettuce and carrots in a backyard plot.",
+        "body": "# Gardening\n\nMulch, watering schedules, and companion planting.",
+        "citations": ["https://example.com/gardening"],
+        "tags": ["gardening"],
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    assert await _docs_for(db_session, task.id) == []
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert task.context["evaluation_gate"]["passed"] is False
+    assert "not responsive" in task.context["evaluation_gate"]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_on_topic_document_passes_acceptance_probe(db_session, _quiet_broadcast):
+    """A document genuinely responsive to the asked topic clears the probe and
+    persists exactly one KnowledgeDocument."""
+    project, task = await _make_topic_task(
+        db_session,
+        "the current state of quantum error correction hardware",
+        project_name="WRontopic",
+    )
+
+    document = {
+        "title": "State of quantum error correction hardware",
+        "summary": "Survey of surface-code error correction on superconducting qubits.",
+        "body": "# Quantum error correction\n\nHardware progress on logical qubits.",
+        "citations": ["https://example.com/qec"],
+        "tags": ["quantum"],
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    docs = await _docs_for(db_session, task.id)
+    assert len(docs) == 1
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_thin_topic_signal_errs_toward_acceptance(db_session, _quiet_broadcast):
+    """When the requested topic carries too little signal (few content keywords)
+    the probe cannot judge and accepts — uncertainty errs toward acceptance."""
+    project, task = await _make_topic_task(
+        db_session, "X", project_name="WRthin"
+    )
+
+    document = {
+        "title": "A guide to organic vegetable gardening",
+        "summary": "How to grow tomatoes in a backyard plot.",
+        "body": "# Gardening\n\nMulch and watering schedules.",
+        "citations": ["https://example.com/gardening"],
+        "tags": ["gardening"],
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    # Topic 'X' yields no content keywords → probe accepts despite mismatch.
+    assert len(await _docs_for(db_session, task.id)) == 1
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+
 @pytest.mark.asyncio
 async def test_file_reference_citation_is_usable(db_session, _quiet_broadcast):
     """A file reference (no http) is a usable citation: the gate passes and a
