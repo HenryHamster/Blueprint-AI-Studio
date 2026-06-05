@@ -938,6 +938,229 @@ def test_apply_agent_update_archived_only_current_not_treated_as_mature():
 
 
 # ---------------------------------------------------------------------------
+# apply_agent_update — floor-skeleton field preservation
+#
+# Under byte pressure the read-time floor delivers a SKELETON of an entry (gap
+# description/evidence stripped; capabilities/friction reduced to name+status).
+# Editing and resubmitting such an entry must NOT blank the durable fields the
+# agent never received. Preservation keys off the floor's own
+# ``_agent_view_floor_applied`` marker (echoed back) so a genuine clear of a
+# field the agent actually saw still applies.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_agent_update_floored_gap_skeleton_preserves_detail():
+    """Bumping a floored gap's priority and resubmitting it with blank
+    description/evidence preserves the durable detail the agent never saw."""
+    current = {
+        "revision": 3,
+        "gaps": [
+            {
+                "id": "g-1",
+                "name": "invoicing",
+                "status": "active",
+                "priority": "medium",
+                "description": "Durable description the agent never received.",
+                "evidence": "PR #42 establishes the gap.",
+                "active_moves": ["t-staffed-99"],
+            }
+        ],
+    }
+    proposed = {
+        "gaps": [
+            {
+                "id": "g-1",
+                "name": "invoicing",
+                "status": "active",
+                "priority": "high",
+                "description": "",
+                "evidence": "",
+                "active_moves": [],
+            }
+        ],
+        "_agent_view_floor_applied": {
+            "floor_bytes": 32768,
+            "stripped_gap_fields": [
+                "history",
+                "past_moves",
+                "active_moves",
+                "evidence",
+                "description",
+            ],
+            "dropped_gaps": 0,
+        },
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    gap = new_raw["gaps"][0]
+    assert gap["priority"] == "high"  # the real edit still applies
+    assert gap["description"] == "Durable description the agent never received."
+    assert gap["evidence"] == "PR #42 establishes the gap."
+    # Durable staffing state (read by reconciliation) survives the floored
+    # resubmit instead of being silently orphaned.
+    assert gap["active_moves"] == ["t-staffed-99"]
+
+
+def test_apply_agent_update_blank_gap_field_clears_without_floor_marker():
+    """No floor marker means the agent saw the full entry, so a blank field is a
+    deliberate clear and must apply — preservation is not blind."""
+    current = {
+        "revision": 3,
+        "gaps": [
+            {"id": "g-1", "name": "x", "status": "active", "description": "old"}
+        ],
+    }
+    proposed = {
+        "gaps": [{"id": "g-1", "name": "x", "status": "active", "description": ""}]
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["gaps"][0]["description"] == ""
+
+
+def test_apply_agent_update_floor_marker_only_preserves_stripped_gap_fields():
+    """A field NOT in ``stripped_gap_fields`` was seen by the agent, so blanking
+    it is a genuine clear even when the marker is present; only the stripped
+    field is preserved."""
+    current = {
+        "revision": 2,
+        "gaps": [
+            {
+                "id": "g-1",
+                "name": "x",
+                "status": "active",
+                "description": "seen",
+                "evidence": "durable",
+            }
+        ],
+    }
+    proposed = {
+        "gaps": [
+            {
+                "id": "g-1",
+                "name": "x",
+                "status": "active",
+                "description": "",
+                "evidence": "",
+            }
+        ],
+        "_agent_view_floor_applied": {
+            "stripped_gap_fields": ["history", "past_moves", "evidence"],
+            "dropped_gaps": 0,
+        },
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    gap = new_raw["gaps"][0]
+    assert gap["evidence"] == "durable"  # stripped → preserved
+    assert gap["description"] == ""  # seen by agent → genuine clear applies
+
+
+def test_apply_agent_update_floored_capability_skeleton_preserves_detail():
+    """Bumping a skeletonized capability's status preserves its durable notes,
+    backing_paths, and source provenance."""
+    current = {
+        "revision": 5,
+        "capabilities": [
+            {
+                "name": "Billing",
+                "status": "partial",
+                "notes": "durable notes",
+                "backing_paths": ["a.py", "b.py"],
+                "source": {"type": "shipped_change", "pr_number": 42},
+            }
+        ],
+    }
+    proposed = {
+        "capabilities": [{"name": "Billing", "status": "working"}],
+        "_agent_view_floor_applied": {
+            "summarized_capabilities": 1,
+            "summarized_friction": 0,
+        },
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    cap = new_raw["capabilities"][0]
+    assert cap["status"] == "working"  # edit applied
+    assert cap["notes"] == "durable notes"
+    assert cap["backing_paths"] == ["a.py", "b.py"]
+    assert cap["source"]["pr_number"] == 42
+
+
+def test_apply_agent_update_floored_capability_nonblank_value_overwrites():
+    """A skeletonized capability whose notes the agent actually rewrote (non-
+    blank) still takes the new value — preservation only fires on blanks."""
+    current = {
+        "revision": 5,
+        "capabilities": [
+            {"name": "Billing", "status": "partial", "notes": "old notes"}
+        ],
+    }
+    proposed = {
+        "capabilities": [
+            {"name": "Billing", "status": "working", "notes": "rewritten"}
+        ],
+        "_agent_view_floor_applied": {"summarized_capabilities": 1},
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["capabilities"][0]["notes"] == "rewritten"
+
+
+def test_apply_agent_update_floored_friction_skeleton_preserves_detail():
+    """Bumping a skeletonized friction's status preserves its durable
+    description, seen_in, mitigations_tried, source, and the promoted_to_gap_id
+    link (the skeleton keeps only id/name/status, so the link is stripped before
+    the agent sees it and a blank resubmit must NOT sever it)."""
+    current = {
+        "revision": 5,
+        "friction": [
+            {
+                "id": "f-1",
+                "name": "flaky CI",
+                "status": "active",
+                "description": "durable desc",
+                "seen_in": ["d-1"],
+                "mitigations_tried": ["retry"],
+                "source": {"type": "agent_observation"},
+                "promoted_to_gap_id": "g-flaky-ci",
+            }
+        ],
+    }
+    proposed = {
+        "friction": [{"id": "f-1", "name": "flaky CI", "status": "mitigated"}],
+        "_agent_view_floor_applied": {
+            "summarized_friction": 1,
+            "summarized_capabilities": 0,
+        },
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    fr = new_raw["friction"][0]
+    assert fr["status"] == "mitigated"  # edit applied
+    assert fr["description"] == "durable desc"
+    assert fr["seen_in"] == ["d-1"]
+    assert fr["mitigations_tried"] == ["retry"]
+    assert fr["source"]["type"] == "agent_observation"
+    assert fr["promoted_to_gap_id"] == "g-flaky-ci"
+
+
+def test_apply_agent_update_caps_friction_cleared_without_floor_marker():
+    """Without a floor marker (or with the section not skeletonized) a blank
+    capability/friction detail field is a genuine clear and applies."""
+    current = {
+        "revision": 5,
+        "capabilities": [
+            {"name": "Billing", "status": "partial", "notes": "old"}
+        ],
+        "friction": [
+            {"id": "f-1", "name": "flaky", "status": "active", "description": "d"}
+        ],
+    }
+    proposed = {
+        "capabilities": [{"name": "Billing", "status": "working", "notes": ""}],
+        "friction": [{"id": "f-1", "name": "flaky", "status": "mitigated"}],
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["capabilities"][0]["notes"] == ""
+    assert new_raw["friction"][0]["description"] == ""
+
+
+# ---------------------------------------------------------------------------
 # apply_agent_update — operator-seeded intent preservation
 # ---------------------------------------------------------------------------
 

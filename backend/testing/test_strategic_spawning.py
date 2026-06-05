@@ -8969,9 +8969,18 @@ def test_floor_no_pressure_path_is_byte_identical():
 
 def test_pathological_problem_model_is_delivered_not_dropped():
     """Regression: the strategist must never be silently deprived of its
-    problem_model. Even when the trimmed model exceeds the remaining budget,
-    the budget-aware summarize keeps it in the packed payload (it is NOT listed
-    among the packer's dropped keys)."""
+    problem_model — even in a REALISTICALLY CONTENDED mature-project payload.
+
+    The earlier version of this test packed the oversized model against only an
+    essentially-empty ``vision`` and tiny scalars, so the budget was never
+    contended and the model trivially fit — false confidence. This builds a
+    payload where the high-priority siblings (large vision, directions_summary,
+    cycle_start_reconciliation, running_update, open_messages) genuinely
+    compete for the budget; without the per-key reservation the floored
+    problem_model would be crowded out and dropped. The reservation makes its
+    delivery a guarantee: present, carrying its floor marker, NOT in the
+    dropped list — and the tiny model_health signal ships alongside it."""
+    big = "y" * 50_000
     pm = _pathological_problem_model()
     payload = {
         "type": "strategic_review",
@@ -8979,16 +8988,42 @@ def test_pathological_problem_model_is_delivered_not_dropped():
         "base_branch": "main",
         "model": "claude-opus-4-8",
         "effort": "medium",
-        "vision": {"purpose": "x"},
+        # Large critical + high-priority siblings that, together, would exhaust
+        # the 120KB budget before a last-sorted (largest-full-size) problem_model
+        # is ever reached.
+        "vision": {"purpose": big},
+        "cycle_start_reconciliation": {"summary": big},
+        "running_update": big,
+        "directions_summary": [
+            {"id": f"d-{i}", "text": "z" * 1000, "priority": "high"}
+            for i in range(40)
+        ],
+        "open_messages": [
+            {"id": f"m-{i}", "type": "NOTE", "content": "w" * 1000}
+            for i in range(40)
+        ],
         "problem_model": pm,
+        "model_health": {"model_size_status": "large", "gap_count": 400},
     }
     packed = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA)
 
-    assert "problem_model" in packed, (
-        "problem_model must be DELIVERED (budget-aware degradation), "
-        "never silently dropped"
+    meta = packed["_packer_meta"]
+    dropped_keys = {d["key"] for d in meta["dropped"]}
+    # The scenario must be genuinely contended: at least one high-priority
+    # sibling is squeezed out. Otherwise this is not exercising the guarantee.
+    assert dropped_keys, (
+        "expected real budget contention (some section dropped); "
+        f"meta={meta}"
     )
-    dropped_keys = {d["key"] for d in packed["_packer_meta"]["dropped"]}
-    assert "problem_model" not in dropped_keys
-    # And it was actually shrunk to the floor on the way in.
+
+    assert "problem_model" in packed, (
+        "problem_model must be DELIVERED under contention, never silently dropped"
+    )
+    assert "problem_model" not in dropped_keys, (
+        f"problem_model was dropped: {meta['dropped']}"
+    )
+    # Delivered as its guaranteed-small floor.
     assert "_agent_view_floor_applied" in packed["problem_model"]
+    # The tiny size/health signal ships alongside it in the same contended cycle.
+    assert "model_health" in packed
+    assert "model_health" not in dropped_keys

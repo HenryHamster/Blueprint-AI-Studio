@@ -80,7 +80,8 @@
     "failure_classification.py": 2400,
     "notification_dispatch.py": 2700,
     "ci_completion.py": 1850,
-    "routers/admin_debug.py": 1850
+    "routers/admin_debug.py": 1850,
+    "problem_model.py": 1800
   },
   "agent": {
     "index.ts": 4600,

@@ -1251,6 +1251,48 @@ def _upsert_by_key(
     return result
 
 
+# Floor-strippable detail that the read-time agent-view floor reduces away under
+# byte pressure (mirrors strategic_spawning's _FLOOR_SHRINK_LEVELS gap fields,
+# _CAP_SKELETON_KEEP, and _FRICTION_SKELETON_KEEP — these are the fields NOT kept
+# in each skeleton). When the agent edits and resubmits an entry it only ever saw
+# in floored/skeleton form, a blank value for one of these fields means "I never
+# received it", NOT "clear it" — so the merge restores the durable value instead
+# of letting the skeleton silently overwrite it. This is keyed off the floor's
+# own ``_agent_view_floor_applied`` marker (echoed back in the proposal) so a
+# genuine clear of a field the agent actually SAW (no floor, or this field not
+# stripped) still applies — empty is not blindly treated as keep.
+_GAP_FLOOR_FIELDS = ("description", "evidence", "active_moves")
+_CAP_FLOOR_FIELDS = ("notes", "backing_paths", "source")
+_FRICTION_FLOOR_FIELDS = (
+    "description",
+    "seen_in",
+    "mitigations_tried",
+    "source",
+    "promoted_to_gap_id",
+)
+
+
+def _is_blank_floor_field(value: Any) -> bool:
+    """A floor-strippable field value the agent may never have received: ``None``
+    or an empty string/list/dict. A populated ``Source`` model is non-blank."""
+    if value is None:
+        return True
+    return isinstance(value, (str, list, dict)) and len(value) == 0
+
+
+def _restore_floored_fields(
+    current: BaseModel, proposed: BaseModel, fields: tuple[str, ...]
+) -> None:
+    """Copy each of *fields* from *current* onto *proposed* when proposed's value
+    is blank but current's is not, so a resubmitted floor skeleton cannot wipe
+    durable detail the agent could not have seen. Mutates *proposed* in place."""
+    for name in fields:
+        if _is_blank_floor_field(getattr(proposed, name, None)) and not (
+            _is_blank_floor_field(getattr(current, name, None))
+        ):
+            setattr(proposed, name, getattr(current, name))
+
+
 def _merge_gap(current: Gap, proposed: Gap) -> Gap:
     """Upsert one gap: proposed wins for every field EXCEPT the append-only
     logs (``history``, ``past_moves``), which union current+proposed so a
@@ -1269,26 +1311,74 @@ def _merge_gap(current: Gap, proposed: Gap) -> Gap:
 
 
 def _merge_agent_owned_collections(
-    current: ProblemModel, proposed: ProblemModel, deletions: Any
+    current: ProblemModel,
+    proposed: ProblemModel,
+    deletions: Any,
+    floor: Any = None,
 ) -> None:
     """Replace ``proposed``'s agent-owned collections with a non-destructive
     merge over ``current`` (mutates ``proposed`` in place). Removal is explicit
     via ``deletions`` — a dict of ``{capabilities|gaps|friction|
     pending_user_confirmation: [key, ...]}``. ``constraints`` is NOT here: it is
-    operator-owned and handled by the 3-way merge / blank backstop."""
+    operator-owned and handled by the 3-way merge / blank backstop.
+
+    ``floor`` is the read-time ``_agent_view_floor_applied`` marker the agent
+    echoes back (or ``None``). When it records that a field/section was
+    floor-stripped before the agent saw it, a blank value for that field in a
+    resubmitted entry preserves the durable detail instead of wiping it (see
+    :func:`_restore_floored_fields`). Gap preservation is per-field-precise
+    (``stripped_gap_fields`` is uniform across gaps); capability/friction
+    preservation gates on whether that section was skeletonized this cycle
+    (``summarized_*`` > 0) — the floor records a count, not per-entry keys, and
+    over-preserving a field the agent meant to clear is the safe direction (no
+    durable loss, recoverable next cycle) versus silently wiping detail."""
     del_caps = set(_as_str_list(deletions, "capabilities"))
     del_gaps = set(_as_str_list(deletions, "gaps"))
     del_friction = set(_as_str_list(deletions, "friction"))
     del_pending = set(_as_str_list(deletions, "pending_user_confirmation"))
 
+    floor = floor if isinstance(floor, dict) else {}
+    stripped_gap = set(floor.get("stripped_gap_fields") or [])
+    gap_floor_fields = tuple(f for f in _GAP_FLOOR_FIELDS if f in stripped_gap)
+    caps_floored = bool(floor.get("summarized_capabilities"))
+    friction_floored = bool(floor.get("summarized_friction"))
+
+    def _merge_gap_preserving(c: Gap, p: Gap) -> Gap:
+        merged = _merge_gap(c, p)
+        if gap_floor_fields:
+            _restore_floored_fields(c, merged, gap_floor_fields)
+        return merged
+
+    def _merge_cap_preserving(c: Capability, p: Capability) -> Capability:
+        if caps_floored:
+            _restore_floored_fields(c, p, _CAP_FLOOR_FIELDS)
+        return p
+
+    def _merge_friction_preserving(c: Friction, p: Friction) -> Friction:
+        if friction_floored:
+            _restore_floored_fields(c, p, _FRICTION_FLOOR_FIELDS)
+        return p
+
     proposed.capabilities = _upsert_by_key(
-        current.capabilities, proposed.capabilities, lambda c: c.name, del_caps
+        current.capabilities,
+        proposed.capabilities,
+        lambda c: c.name,
+        del_caps,
+        merge_fn=_merge_cap_preserving,
     )
     proposed.gaps = _upsert_by_key(
-        current.gaps, proposed.gaps, lambda g: g.id, del_gaps, merge_fn=_merge_gap
+        current.gaps,
+        proposed.gaps,
+        lambda g: g.id,
+        del_gaps,
+        merge_fn=_merge_gap_preserving,
     )
     proposed.friction = _upsert_by_key(
-        current.friction, proposed.friction, lambda f: f.id, del_friction
+        current.friction,
+        proposed.friction,
+        lambda f: f.id,
+        del_friction,
+        merge_fn=_merge_friction_preserving,
     )
     proposed.pending_user_confirmation = _upsert_by_key(
         current.pending_user_confirmation,
@@ -1371,6 +1461,13 @@ def apply_agent_update(
     # part of the durable model (extra="forbid" would reject it).
     proposed_raw = dict(proposed_raw)
     deletions = proposed_raw.pop("_deletions", None)
+    # Read-time agent-view markers the packer injects into the floored model the
+    # agent sees. They are not part of the durable model (extra="forbid" would
+    # reject them), so lift them out before validation. ``_agent_view_floor_applied``
+    # drives floor-aware field preservation below; ``_gap_memory_trimmed`` is
+    # purely informational and discarded.
+    floor_applied = proposed_raw.pop("_agent_view_floor_applied", None)
+    proposed_raw.pop("_gap_memory_trimmed", None)
 
     proposed = ProblemModel.model_validate(proposed_raw)
     current = parse_problem_model(current_raw)
@@ -1401,7 +1498,7 @@ def apply_agent_update(
     # Non-destructive merge of agent-owned collections: an agent acting on a
     # trimmed/dropped payload view must not wipe entries it never saw. Runs
     # before the diff so the diff reflects the true merged state.
-    _merge_agent_owned_collections(current, proposed, deletions)
+    _merge_agent_owned_collections(current, proposed, deletions, floor_applied)
 
     # Compute diff before archival so closed gaps are still visible on
     # proposed.gaps — otherwise _compute_diff can't see what got closed
