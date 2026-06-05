@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { auth } from '../firebase';
-import { apiFetch, API_BASE_URL, authHeaders } from '../api';
-import { parseTimestamp } from '../utils/time';
+import { apiFetch, API_BASE_URL, authHeaders, type StrategicRefreshMarker } from '../api';
+import { parseTimestamp, timeAgo } from '../utils/time';
 import { type EventPref, loadEventPrefs, saveEventPrefs, effectiveSignal, getToastSeverity, countHighSignalMessages } from './eventPrefs';
 import { type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow } from './muteWindow';
 import { type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP } from './savedViews';
@@ -180,6 +180,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const [sortMode, setSortMode] = useState<'importance' | 'recent'>('importance');
   const [searchQuery, setSearchQuery] = useState('');
   const [webhookStats, setWebhookStats] = useState<WebhookStats | null>(null);
+  // Pending strategic-refresh marker (project.vision._strategic_refresh): set when
+  // operator steering arms a cycle, cleared backend-side once the autonomous loop
+  // consumes it. Drives the "strategic cycle pending" badge until then.
+  const [strategicRefresh, setStrategicRefresh] = useState<StrategicRefreshMarker | null>(null);
   const [muteWindow, setMuteWindow] = useState<MuteWindow | null>(() => loadMuteWindow(auth.currentUser?.email, selectedProjectId));
   const [tempMutes, setTempMutes] = useState<TemporaryMutes>(() =>
     loadTemporaryMutes(auth.currentUser?.email, selectedProjectId),
@@ -264,6 +268,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     setEventPrefs(localPrefs);
     setTempMutes(loadTemporaryMutes(auth.currentUser?.email, selectedProjectId));
     setWebhookStats(null);
+    setStrategicRefresh(null);
     setMuteWindow(loadMuteWindow(auth.currentUser?.email, selectedProjectId));
     const lastSeen = loadLastSeen(auth.currentUser?.email, selectedProjectId);
     setDividerTime(lastSeen);
@@ -350,6 +355,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // state, effects, and handlers.
   const {
     openMessages,
+    linkedMessages,
     resolvedMessages,
     openFeedbackMessages,
     newHighSignalCount,
@@ -647,6 +653,17 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       try {
         const statsRes = await apiFetch(`${API_BASE_URL}/api/admin/notification-dispatch/stats?project_id=${selectedProjectId}`);
         if (statsRes.ok) setWebhookStats(await statsRes.json());
+      } catch { /* ignore */ }
+      // Pending strategic-refresh marker — surfaced as a "strategic cycle pending"
+      // badge until the autonomous loop consumes it (when it clears backend-side).
+      // Non-critical: errors leave the prior marker state untouched.
+      try {
+        const visRes = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}`);
+        if (visRes.ok) {
+          const proj = await visRes.json() as { vision?: { _strategic_refresh?: StrategicRefreshMarker | null } };
+          const marker = proj.vision?._strategic_refresh;
+          setStrategicRefresh(marker && typeof marker === 'object' ? marker : null);
+        }
       } catch { /* ignore */ }
     } catch {
       addToastRef.current('Failed to load messages', 'error');
@@ -1010,6 +1027,20 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         onClose={onClose}
       />
 
+      {/* Pending strategic-refresh indicator — operator steering armed a cycle that
+          has not fired yet (project.vision._strategic_refresh present). Hidden once
+          the cycle starts (strategistActive), at which point the "Strategist working…"
+          indicator below takes over, so the badge transitions to "cycle running". */}
+      {strategicRefresh && !strategistActive && (
+        <div className="px-4 md:px-6 py-2 border-b border-neutral-800 bg-amber-950/40 flex items-center gap-2 shrink-0" role="status" aria-live="polite">
+          <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" aria-hidden="true" />
+          <span className="text-xs text-amber-300 font-medium">
+            Strategic cycle pending{strategicRefresh.origin ? ` · ${strategicRefresh.origin}` : ''}
+            {strategicRefresh.requested_at ? ` · armed ${timeAgo(strategicRefresh.requested_at)}` : ''}
+          </span>
+        </div>
+      )}
+
       {/* Live strategist activity indicator — driven by strategic_cycle_started/completed
           WS events, mirroring the DirectionsPanel affordance. Gives the operator
           at-a-glance context that a steer composed now will queue for the next cycle. */}
@@ -1050,6 +1081,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         newMessageCounts={newMessageCounts}
         highSignalOpen={highSignalOpen}
         routineOpen={routineOpen}
+        linkedMessages={linkedMessages}
         pinnedBlockers={pinnedBlockers}
         pinnedQuestions={pinnedQuestions}
         otherHighSignal={otherHighSignal}

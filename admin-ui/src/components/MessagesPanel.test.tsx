@@ -3572,3 +3572,90 @@ describe('MessagesPanel send arming receipt', () => {
   });
 });
 
+
+describe('MessagesPanel strategic-refresh pending badge', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  beforeEach(() => { localStorage.clear(); });
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  // Installs a mock where GET /api/admin/projects/{id} returns the supplied vision,
+  // and the messages list is empty. Mirrors _setupApiFetchMock's URL routing.
+  function _mockWithVision(vision: Record<string, unknown> | null): void {
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: Date.now() + 1e9 }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+      }
+      // Project detail GET carries the vision marker; tolerate trailing query.
+      if (/\/api\/admin\/projects\/[^/]+($|\?)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ vision: vision ?? {} }), { status: 200 });
+      }
+      if (method === 'GET' && (
+        urlStr.includes('/noise-prefs') || urlStr.includes('/saved-views') ||
+        urlStr.includes('/temp-mutes') || urlStr.includes('/mute-window')
+      )) {
+        return new Response('', { status: 404 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+  }
+
+  async function renderPanel(vision: Record<string, unknown> | null, strategistActive = false) {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _mockWithVision(vision);
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+          strategistActive={strategistActive}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    return host as HTMLDivElement;
+  }
+
+  test('shows pending badge with origin + age when marker is present', async () => {
+    const el = await renderPanel({
+      _strategic_refresh: { requested_at: new Date(Date.now() - 60_000).toISOString(), origin: 'steering', reason: 'op', count: 1 },
+    });
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).toContain('steering');
+  });
+
+  test('hides pending badge when no marker is present', async () => {
+    const el = await renderPanel({});
+    expect(el.textContent).not.toContain('Strategic cycle pending');
+  });
+
+  test('hides pending badge once the cycle is running (strategistActive)', async () => {
+    const el = await renderPanel(
+      { _strategic_refresh: { requested_at: new Date().toISOString(), origin: 'steering' } },
+      true,
+    );
+    expect(el.textContent).not.toContain('Strategic cycle pending');
+    expect(el.textContent).toContain('Strategist working');
+  });
+});

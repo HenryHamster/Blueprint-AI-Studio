@@ -51,6 +51,7 @@ function baseProps(overrides: Partial<MessagesListViewProps> = {}): MessagesList
     newMessageCounts: { blockers: 0, questions: 0, feedback: 0, bugReports: 0, routine: 0, highSignalNotes: 0 },
     highSignalOpen: [],
     routineOpen: [],
+    linkedMessages: [],
     pinnedBlockers: [],
     pinnedQuestions: [],
     otherHighSignal: [],

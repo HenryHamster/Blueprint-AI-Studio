@@ -1550,6 +1550,15 @@ export async function fetchWarmPoolTargets(): Promise<WarmPoolTargets> {
   };
 }
 
+export async function patchAdminSettings(settings: { promotion_enabled: boolean }): Promise<unknown> {
+  const res = await apiFetch('/api/admin/settings', {
+    method: 'PATCH',
+    body: JSON.stringify(settings),
+  });
+  if (!res.ok) throw new Error(`Failed to patch admin settings: ${res.status}`);
+  return res.json();
+}
+
 // Set (targetSize 0..50) or clear (null) a single project's explicit warm-pool
 // target. Backs POST /api/admin/projects/{id}/warm-pool/target with body
 // {target_size}. Clearing falls the project back to the global default.
@@ -1768,4 +1777,15 @@ export async function fetchKnowledgeDocument(
   );
   if (!res.ok) throw new Error(`Failed to fetch knowledge document: ${res.status}`);
   return res.json();
+}
+
+/** Operator-steering strategic-refresh marker persisted on `project.vision._strategic_refresh`.
+ *  Armed when operator steering wakes the strategist; cleared backend-side when the
+ *  autonomous loop consumes it. Returned (inside `vision`) by GET /api/admin/projects/{id}. */
+export interface StrategicRefreshMarker {
+  requested_at?: string;
+  reason?: string;
+  origin?: string;
+  count?: number;
+  excerpt?: string;
 }

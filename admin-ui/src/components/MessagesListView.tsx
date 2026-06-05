@@ -35,6 +35,7 @@ export interface MessagesListViewProps {
   newMessageCounts: MessageSummaryCounts;
   highSignalOpen: ProjectMessage[];
   routineOpen: ProjectMessage[];
+  linkedMessages: ProjectMessage[];
   pinnedBlockers: ProjectMessage[];
   pinnedQuestions: ProjectMessage[];
   otherHighSignal: ProjectMessage[];
@@ -94,6 +95,7 @@ export function MessagesListView({
   newMessageCounts,
   highSignalOpen,
   routineOpen,
+  linkedMessages,
   pinnedBlockers,
   pinnedQuestions,
   otherHighSignal,
@@ -181,13 +183,13 @@ export function MessagesListView({
           <p className="text-sm">No messages yet</p>
           <p className="text-xs mt-1 opacity-70">Send feedback, report bugs, or ask questions</p>
         </div>
-      ) : showOnlyNew && dividerTime && highSignalOpen.length === 0 && routineOpen.length === 0 && visibleResolved.length === 0 ? (
+      ) : showOnlyNew && dividerTime && highSignalOpen.length === 0 && routineOpen.length === 0 && linkedMessages.length === 0 && visibleResolved.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-16 text-neutral-500">
           <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
           <p className="text-sm">No new messages since {formatTimestamp(dividerTime)}</p>
           <p className="text-xs mt-1 opacity-70">You're all caught up!</p>
         </div>
-      ) : searchQuery.trim() && highSignalOpen.length === 0 && routineOpen.length === 0 && visibleResolved.length === 0 ? (
+      ) : searchQuery.trim() && highSignalOpen.length === 0 && routineOpen.length === 0 && linkedMessages.length === 0 && visibleResolved.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-16 text-neutral-500">
           <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
           <p className="text-sm">No matches for "{searchQuery}"</p>
@@ -495,6 +497,23 @@ export function MessagesListView({
                 </div>
               )}
             </div>
+          )}
+
+          {/* Linked messages (being addressed) */}
+          {linkedMessages.length > 0 && (
+            <>
+              <div className="flex items-center gap-1.5 text-[11px] text-indigo-400/70 font-semibold uppercase tracking-wide px-1">
+                <span>Being addressed · Linked</span>
+              </div>
+              {insertTimeDividers(linkedMessages).map((item, idx) =>
+                item.kind === 'divider' ? (
+                  <TimeDividerRow key={`divider-linked-${idx}`} label={item.label} />
+                ) : (
+                  <MessageBubble key={item.msg.id} msg={item.msg} readOnly allMessages={messages} {...bubbleProps} />
+                )
+              )}
+              {visibleResolved.length > 0 && <div className="border-t border-neutral-800/60" />}
+            </>
           )}
 
           {/* Resolved messages (faded) */}

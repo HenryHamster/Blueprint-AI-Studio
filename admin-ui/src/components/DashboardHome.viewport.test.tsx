@@ -263,6 +263,7 @@ vi.mock('../api', () => ({
     goal_editor_info: '[operator:test]',
   })),
   triggerQualify: vi.fn(async () => ({ status: 'dry_run' })),
+  patchAdminSettings: vi.fn(async () => ({ promotion_enabled: false })),
   fetchQualificationVerdicts: vi.fn(async () => ({
     verdicts: [
       { id: 'v1', release_version_id: 'rv1', candidate_sha: 'abc1234def56', confidence: 0.83, sub_scores: { audit: 0.90, test_erosion: 0.75, smoketest: 0.88 }, blocker: null, would_promote: true, promotion_enabled: false, terminal_status: 'dry_run', threshold: 0.80, started_at: '2026-05-20T10:00:00Z', finalized_at: '2026-05-20T11:00:00Z', created_at: '2026-05-20T11:00:00Z' },

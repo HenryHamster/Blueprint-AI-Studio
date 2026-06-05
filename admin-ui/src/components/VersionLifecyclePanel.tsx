@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import {
   fetchQualificationVerdicts,
+  patchAdminSettings,
   setVersionPhase,
   setVersionGoal,
   triggerQualify,
@@ -169,6 +170,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
   const [editingGoal, setEditingGoal] = useState<boolean>(false);
   const [goalInput, setGoalInput] = useState<string>('');
   const [optimisticOverrides, setOptimisticOverrides] = useState<Partial<CurrentVersion> | null>(null);
+  const [promotionEnabledOverride, setPromotionEnabledOverride] = useState<boolean | null>(null);
   useEffect(() => {
     if (!projectId) { setVerdicts([]); return; }
     fetchQualificationVerdicts(projectId, 10).then(r => setVerdicts(r.verdicts)).catch(() => {});
@@ -181,11 +183,15 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
   useEffect(() => {
     setOptimisticOverrides(null);
   }, [data?.current_version?.phase, data?.current_version?.goal]);
+  useEffect(() => {
+    setPromotionEnabledOverride(null);
+  }, [data?.promotion_enabled]);
 
   if (loading || !data || (!data.current_version && data.recent_versions.length === 0)) return null;
   const cv = data.current_version ? (optimisticOverrides ? { ...data.current_version, ...optimisticOverrides } : data.current_version) : null;
   const recent = data.recent_versions;
   const promotionEnabled = data.promotion_enabled ?? false;
+  const optimisticPromotionEnabled = promotionEnabledOverride ?? promotionEnabled;
   const readiness = data.promotion_readiness;
 
   const handleSetPhase = async (phase: 'build' | 'stabilize') => {
@@ -248,15 +254,45 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
     }
   };
 
+  const handleTogglePromotionEnabled = async () => {
+    const nextValue = !optimisticPromotionEnabled;
+    if (nextValue && !window.confirm('Enable live promotion? Passing qualify runs will push to main.')) return;
+    setActionLoading('promotion');
+    setActionMsg(null);
+    setPromotionEnabledOverride(nextValue);
+    try {
+      await patchAdminSettings({ promotion_enabled: nextValue });
+      setActionMsg(nextValue ? 'Live promotion enabled' : 'Live promotion disabled');
+      onRefresh();
+    } catch {
+      setActionMsg('Request failed');
+      setPromotionEnabledOverride(null);
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
   return (
     <section data-testid="version-lifecycle-panel">
       <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Version Lifecycle</h2>
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 space-y-2 text-xs">
         <div className="flex flex-wrap items-center gap-2">
           {data.promotion_enabled !== undefined && (
-            <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${promotionEnabled ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-neutral-500/10 border-neutral-500/30 text-neutral-400'}`}>
-              {promotionEnabled ? 'LIVE' : 'DRY-RUN'}
-            </span>
+            <>
+              <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${optimisticPromotionEnabled ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-neutral-500/10 border-neutral-500/30 text-neutral-400'}`}>
+                {optimisticPromotionEnabled ? 'LIVE' : 'DRY-RUN'}
+              </span>
+              {projectId && (
+                // eslint-disable-next-line viewport/min-touch-target
+                <button
+                  onClick={handleTogglePromotionEnabled}
+                  disabled={actionLoading !== null}
+                  className="text-[10px] px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  {actionLoading === 'promotion' ? '…' : optimisticPromotionEnabled ? 'Disable' : 'Enable'}
+                </button>
+              )}
+            </>
           )}
         </div>
         {cv && (

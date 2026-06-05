@@ -204,6 +204,31 @@ export function MessageBubble({
           <ContextBadges context={msg.context} fromType={msg.from_type} />
         </div>
 
+        {/* Linked indicator (for linked messages) */}
+        {msg.status === 'linked' && (
+          <div className={`mt-1 ${userMsg ? 'mr-3' : 'ml-3'} px-3 py-1.5 rounded-lg bg-indigo-800/30 border border-indigo-700/40`}>
+            <p className="text-[11px] text-neutral-400">
+              <span className="text-indigo-400 font-medium">Being addressed</span>
+              {typeof msg.context._convergence_link === 'object' && msg.context._convergence_link && (() => {
+                const link = msg.context._convergence_link as Record<string, unknown>;
+                const kind = link.kind as string | undefined;
+                const id = link.id as string | undefined;
+                const kindLabel = kind === 'direction' ? 'direction' : kind === 'task' ? 'task' : 'item';
+                return id ? (
+                  <>
+                    {' in '}
+                    <span className="text-indigo-300 font-medium">{kindLabel}</span>
+                    {' '}
+                    <code className="text-indigo-200 bg-indigo-950/50 px-1 py-0.5 rounded text-[10px]">
+                      {id.slice(0, 8)}
+                    </code>
+                  </>
+                ) : null;
+              })()}
+            </p>
+          </div>
+        )}
+
         {/* Resolution (for resolved messages) */}
         {msg.status === 'resolved' && msg.resolution && (
           <div className={`mt-1 ${userMsg ? 'mr-3' : 'ml-3'} px-3 py-1.5 rounded-lg bg-neutral-800/50 border border-neutral-700/30`}>
@@ -213,7 +238,7 @@ export function MessageBubble({
           </div>
         )}
 
-        {/* Action buttons (open messages only, not faded, not read-only grouped rows) */}
+        {/* Action buttons (open messages only, not faded, not read-only grouped rows, not linked) */}
         {!faded && !readOnly && msg.status === 'open' && (
           <div className={`flex items-center gap-1 mt-1 ${userMsg ? 'self-end mr-1' : 'self-start ml-1'}`}>
             {selectMode && msg.message_type === 'FEEDBACK' && (

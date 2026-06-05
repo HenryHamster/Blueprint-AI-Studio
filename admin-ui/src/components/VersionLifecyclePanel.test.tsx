@@ -40,6 +40,7 @@ describe('VersionLifecyclePanel', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockRefresh.mockClear();
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
   });
 
   describe('phase updates reflect immediately', () => {
@@ -258,6 +259,55 @@ describe('VersionLifecyclePanel', () => {
       await waitFor(() => {
         expect(screen.queryByText('Request failed')).not.toBeInTheDocument();
       });
+    });
+  });
+
+  describe('promotion enabled toggle', () => {
+    it('confirms before enabling live promotion and updates the badge immediately', async () => {
+      const patchAdminSettingsMock = vi.fn().mockResolvedValue({});
+      vi.mocked(api.patchAdminSettings).mockImplementation(patchAdminSettingsMock);
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ promotion_enabled: false })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /Enable/ }));
+
+      await waitFor(() => {
+        expect(window.confirm).toHaveBeenCalledWith('Enable live promotion? Passing qualify runs will push to main.');
+      });
+      await waitFor(() => {
+        expect(patchAdminSettingsMock).toHaveBeenCalledWith({ promotion_enabled: true });
+      });
+      expect(screen.getByText('LIVE')).toBeInTheDocument();
+    });
+
+    it('reverts the badge when patching promotion settings fails', async () => {
+      const patchAdminSettingsMock = vi.fn().mockRejectedValue(new Error('Network error'));
+      vi.mocked(api.patchAdminSettings).mockImplementation(patchAdminSettingsMock);
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ promotion_enabled: false })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /Enable/ }));
+
+      await waitFor(() => {
+        expect(screen.getByText('Request failed')).toBeInTheDocument();
+      });
+      expect(screen.getByText('DRY-RUN')).toBeInTheDocument();
     });
   });
 });
