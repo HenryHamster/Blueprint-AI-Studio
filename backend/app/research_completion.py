@@ -2741,6 +2741,55 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _prereq_candidates = list(existing_tasks) + list(child_tasks)
     for ci, ct in enumerate(child_tasks):
         fi = finding_indices[ci]
+        dep_indices = findings[fi].get("depends_on_indices", [])
+        missing_dep_indices = [j for j in dep_indices if j not in finding_to_child]
+        if missing_dep_indices:
+            missing_fi = missing_dep_indices[0]
+            missing_finding = findings[missing_fi] if missing_fi < len(findings) else {}
+            missing_title = missing_finding.get("title", f"#{missing_fi}")
+            missing_hash = _finding_hash(
+                str(missing_title),
+                str(
+                    missing_finding.get(
+                        "description", missing_finding.get("prompt", "")
+                    )
+                    or ""
+                ),
+            )
+            ctx = dict(ct.context or {})
+            unresolved = ctx.get("unresolved_prerequisite") or []
+            unresolved_list = unresolved if isinstance(unresolved, list) else [unresolved]
+            unresolved_list.append(
+                {
+                    "finding_index": missing_fi,
+                    "title": missing_title,
+                    "finding_hash": missing_hash,
+                }
+            )
+            ctx["unresolved_prerequisite"] = unresolved_list
+            ct.context = ctx
+            need = build_need("task", missing_hash, label=missing_title)
+            if need:
+                enter_blocked_state(
+                    ct,
+                    waiting_on=f"foundation task:{missing_hash}",
+                    reason=(
+                        f"Finding '{findings[fi].get('title', f'#{fi}')}' declared sibling "
+                        f"prerequisite '{missing_title}' but it was not spawned this cycle; "
+                        "blocked until the prerequisite appears or the blocked-resume sweep resolves it."
+                    ),
+                    source="research_prerequisite",
+                    blocker_kind="upstream_dependency",
+                    need=need,
+                )
+            session.add(ct)
+            logger.warning(
+                "[RESEARCH] Finding '%s' declared sibling prerequisite '%s' but it was not spawned; "
+                "dependent BLOCKED on the unresolved need",
+                findings[fi].get("title", f"#{fi}"),
+                missing_title,
+            )
+            continue
         prereq = findings[fi].get("_prerequisite")
         if not prereq:
             continue

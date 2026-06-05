@@ -399,3 +399,63 @@ async def test_non_eligible_subtask_type_is_skipped_not_rewritten(
     assert not any(
         c.first_payload.get("type") in {"research", "fix"} for c in children
     )
+
+
+@pytest.mark.asyncio
+async def test_dependent_on_skipped_producer_fails_plan(
+    db_session, mocker, _quiet_mocks
+):
+    """A dependent whose declared producer is skipped must not dispatch un-gated.
+
+    If subtask B depends on subtask A, and subtask A is non-eligible and skipped,
+    then the plan must FAIL rather than spawning B with an empty depends_on list.
+    This prevents silent de-gating of structural dependencies.
+    """
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Foundation (non-eligible)",
+                    "prompt": "research something",
+                    "type": "research",
+                },
+                {
+                    "title": "Dependent",
+                    "prompt": "implement based on foundation",
+                    "type": "create",
+                    "depends_on_indices": [0],
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    # Refresh to see the updated status and message.
+    await db_session.refresh(task)
+
+    # Plan must FAIL because a spawned dependent references a skipped producer.
+    assert task.status == TaskStatus.FAILED, (
+        f"Plan should FAIL when dependent references skipped producer, "
+        f"got status {task.status}"
+    )
+    assert "unsatisfiable dependency" in (task.latest_status_message or "").lower(), (
+        f"Expected 'unsatisfiable dependency' in error message, "
+        f"got {task.latest_status_message!r}"
+    )
+
+    # No children should have been spawned.
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 0, (
+        f"No children should spawn when plan fails due to unsatisfiable dependency, "
+        f"got {len(children)}"
+    )

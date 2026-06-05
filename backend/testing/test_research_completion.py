@@ -2573,6 +2573,7 @@ async def test_finding_prerequisite_wires_depends_on_to_inflight_foundation(
         .scalars()
         .all()
     )
+    children = [c for c in children if (c.first_payload or {}).get("type") != "memo"]
     assert len(children) == 1
     assert str(foundation.id) in (children[0].depends_on or []), (
         "the dependent finding must structurally depend on the in-flight foundation"
@@ -2709,6 +2710,64 @@ async def test_unresolved_prerequisite_blocks_dependent(db_session, mocker):
         u.get("kind") == "task" and u.get("ref") == "nonexistent-task-id"
         for u in (unresolved if isinstance(unresolved, list) else [unresolved])
     ), "unresolved prerequisite details must remain in context for visibility"
+
+
+@_pytest.mark.asyncio
+async def test_deferred_sibling_prerequisite_blocks_dependent(db_session, mocker):
+    """If a prerequisite sibling is deferred and not spawned, the dependent
+    must be held instead of spawning runnable with an empty depends_on list."""
+    from app.research_completion import _finding_hash
+    from app.task_blocked import get_blocker_metadata
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq05")
+    prereq = _make_finding(title="Define shared helper", direction_id=direction["id"])
+    prereq["actionability_grade"] = "LOW"
+    dependent = _make_finding(title="Use shared helper", direction_id=direction["id"])
+    dependent["depends_on_indices"] = [0]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[prereq, dependent],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    blocked_children = [
+        c
+        for c in children
+        if c.title == dependent["title"] and c.status == TaskStatus.BLOCKED
+    ]
+    assert len(blocked_children) == 1
+    assert not any(
+        c.title == dependent["title"] and c.status != TaskStatus.BLOCKED
+        for c in children
+    )
+    child = blocked_children[0]
+    assert child.status == TaskStatus.BLOCKED
+    assert not (child.depends_on or [])
+    blocker = get_blocker_metadata(child)
+    expected_hash = _finding_hash(prereq["title"], prereq["description"])
+    assert blocker.get("need") == {
+        "kind": "task",
+        "ref": expected_hash,
+        "label": prereq["title"],
+    }
+    unresolved = (child.context or {}).get("unresolved_prerequisite", [])
+    assert any(
+        u.get("finding_hash") == expected_hash and u.get("title") == prereq["title"]
+        for u in (unresolved if isinstance(unresolved, list) else [unresolved])
+    )
 
 
 @_pytest.mark.asyncio

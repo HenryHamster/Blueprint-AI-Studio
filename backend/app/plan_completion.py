@@ -343,8 +343,60 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     }
     parent_direction_id = (task.context or {}).get("direction_id")
     parent_research_task_id = (task.context or {}).get("research_task_id")
+
+    # Pre-validate: identify which subtasks will be skipped and check for unsatisfiable dependencies.
+    # Do this before creating any child tasks so we can fail cleanly if a spawned subtask
+    # depends on a skipped (non-eligible) producer.
+    skipped_indices = set()
+    for i, subtask_def in enumerate(subtasks):
+        raw_type = subtask_def.get("type", "create")
+        if raw_type not in PLAN_SUBTASK_TYPES:
+            skipped_indices.add(i)
+
+    for i, subtask_def in enumerate(subtasks):
+        if i in skipped_indices:
+            continue
+        dep_indices = subtask_def.get("depends_on_indices", [])
+        for dep_idx in dep_indices:
+            if 0 <= dep_idx < len(subtasks) and dep_idx in skipped_indices:
+                skipped_title = subtasks[dep_idx].get("title", f"#{dep_idx}")
+                skipped_type = subtasks[dep_idx].get("type", "create")
+                dependent_title = subtask_def.get("title", f"#{i}")
+                task.latest_status_message = (
+                    f"Plan has unsatisfiable dependency: {dependent_title!r} "
+                    f"depends on {skipped_title!r} (type {skipped_type!r}, "
+                    f"not a registered plan-spawnable task type)"
+                )[:500]
+                task.status = TaskStatus.FAILED
+                from app.failure_classification import (
+                    classify_failure,
+                    persist_failure_category,
+                )
+                from app.routers.agent_status import record_task_result
+
+                _fc = classify_failure(task)
+                persist_failure_category(task, _fc)
+                record_task_result(
+                    success=False,
+                    failure_class=_fc,
+                    task_id=str(task.id),
+                    task_type=task.first_payload.get("type", ""),
+                )
+                session.add(task)
+                await _maybe_create_failure_alert(
+                    task, session, task.latest_status_message
+                )
+                await session.commit()
+                logger.error(
+                    "[PLAN] Plan %s failed — dependent %r references skipped producer %r",
+                    task.id,
+                    dependent_title,
+                    skipped_title,
+                )
+                return
+
     child_tasks = []
-    for subtask_def in subtasks:
+    for i, subtask_def in enumerate(subtasks):
         # Gate the child type on the registry-derived plan-subtask allowlist
         # rather than a hardcoded literal. A requested type outside that set is
         # SKIPPED with an explicit log — never silently rewritten to "create" — so
@@ -352,8 +404,8 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         # instead of masquerading as a successfully-spawned create. A ``None``
         # placeholder keeps ``child_tasks`` index-aligned with ``subtasks`` for the
         # downstream dependency-injection pass.
-        raw_type = subtask_def.get("type", "create")
-        if raw_type not in PLAN_SUBTASK_TYPES:
+        if i in skipped_indices:
+            raw_type = subtask_def.get("type", "create")
             logger.warning(
                 "[PLAN] Skipping subtask %r with non-eligible type %r "
                 "(not a registered plan-spawnable write task type) in plan %s",
@@ -363,7 +415,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             )
             child_tasks.append(None)
             continue
-        subtask_type = raw_type
+        subtask_type = subtask_def.get("type", "create")
         related_files = subtask_def.get("related_files", [])
         prompt_text = subtask_def.get("prompt", "")
         full_prompt = (
