@@ -107,6 +107,14 @@ Object.defineProperty(globalThis, 'fetch', {
 const handlersModuleUrl = new URL('./index.ts', import.meta.url).href;
 const { handlers } = (await import(handlersModuleUrl)) as typeof import('./index.js');
 
+// This payload bypasses the dispatcher synth short-circuit (below), so
+// handleMemo reaches configureAgentPermissions — which requires the
+// task-capability contract the real agent loads at VM startup. Load the
+// bake-smoke stand-in first or classification throws (fail explicit).
+const contractModuleUrl = new URL('./bake-smoke-capability-contract.ts', import.meta.url).href;
+const contractMod = (await import(contractModuleUrl)) as typeof import('./bake-smoke-capability-contract.js');
+contractMod.loadBakeSmokeCapabilityContract();
+
 // Payload deliberately omits the dispatcher synth fields AND uses a non-
 // dispatcher reasoning_kind so the synth short-circuit in handlers/memo.ts
 // cannot fire and execution must reach the runClaudeCode call. See

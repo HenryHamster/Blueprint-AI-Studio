@@ -20,6 +20,8 @@ import { createServer } from 'http';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 
+import { buildBakeSmokeCapabilityContract } from './bake-smoke-capability-contract.js';
+
 const LIFECYCLE_SENTINEL = 'memo-lifecycle-bake-smoke-2026';
 
 // Dispatcher-path fixture: regression_false_positive with a verdict_reason
@@ -57,6 +59,13 @@ const server = createServer((req, res) => {
     } else if (req.method === 'GET' && url.includes('/api/agent/github/token')) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ data: { token: 'fake-gh-token', owner: 'smoke-owner', repo: 'smoke-repo' } }));
+    } else if (req.method === 'GET' && url.includes('/api/agent/task-capabilities')) {
+      // The real agent fetches + loads the capability contract at startup,
+      // before any handler dispatch (ensureTaskCapabilityContractLoaded in
+      // src/index.ts) — so this smoke exercises the production load path
+      // end-to-end against a complete stand-in contract.
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ task_capabilities: buildBakeSmokeCapabilityContract() }));
     } else if (req.method === 'POST' && url.includes('/api/agent/status')) {
       let parsed: { status?: string; logs?: string } = {};
       try { parsed = JSON.parse(body || '{}') as typeof parsed; } catch { /* ignore */ }

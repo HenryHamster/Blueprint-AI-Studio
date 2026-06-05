@@ -1410,6 +1410,101 @@ class TestPackerMemoLifecycleContract:
         )
 
 
+_BAKE_SMOKE_CONTRACT_HELPER = (
+    _AGENT_DIR / "src" / "handlers" / "bake-smoke-capability-contract.ts"
+)
+
+
+def _read_bake_smoke_contract_helper() -> str:
+    if not _BAKE_SMOKE_CONTRACT_HELPER.exists():
+        pytest.skip("agent/src/handlers/bake-smoke-capability-contract.ts not present")
+    return _BAKE_SMOKE_CONTRACT_HELPER.read_text(encoding="utf-8")
+
+
+class TestPackerSmokeCapabilityContract:
+    """Smokes that reach configureAgentPermissions must load the capability contract.
+
+    The real agent loads the published task-capability contract once per VM at
+    startup (ensureTaskCapabilityContractLoaded in src/index.ts) BEFORE any
+    handler dispatch; classifying permissions without it throws (fail explicit,
+    by design). The per-handler smokes whose payloads bypass the dispatcher
+    synth short-circuit reach configureAgentPermissions, so they must load the
+    bake-smoke stand-in contract first — and the lifecycle smoke's stub
+    orchestrator must serve the endpoint the real startup fetch hits. Dropping
+    either fails the bake at provision time, after merge, where it is most
+    expensive (incident: the V5 promotion bake, 2026-06-05).
+    """
+
+    @pytest.mark.parametrize(
+        ("smoke_name", "reader"),
+        [
+            ("memo-bake-smoke-codex.ts", _read_packer_codex_smoke),
+            ("memo-bake-smoke-primary.ts", _read_packer_primary_smoke),
+            ("memo-bake-smoke-reopen.ts", _read_packer_reopen_smoke),
+        ],
+    )
+    def test_runclaudecode_arm_smokes_load_contract_before_dispatch(
+        self, smoke_name, reader
+    ):
+        """Each runClaudeCode-arm smoke must load the stand-in contract BEFORE
+        calling handlers.memo — loading it after is too late, the handler has
+        already thrown."""
+        smoke = reader()
+        assert "loadBakeSmokeCapabilityContract" in smoke, (
+            f"{smoke_name} bypasses the dispatcher synth short-circuit and "
+            "reaches configureAgentPermissions, so it must call "
+            "loadBakeSmokeCapabilityContract() before handlers.memo()."
+        )
+        assert (
+            smoke.index("loadBakeSmokeCapabilityContract")
+            < smoke.index("await handlers.memo(")
+        ), (
+            f"{smoke_name} must load the bake-smoke capability contract "
+            "BEFORE invoking handlers.memo(), not after."
+        )
+
+    def test_lifecycle_stub_serves_capability_contract(self):
+        """The lifecycle smoke spawns the real agent entry point, whose startup
+        fetches GET /api/agent/task-capabilities — the stub server must serve it
+        or startup fails before dispatch."""
+        smoke = _read_packer_lifecycle_smoke()
+        assert "/api/agent/task-capabilities" in smoke, (
+            "memo-bake-smoke-lifecycle.ts stub server must route "
+            "GET /api/agent/task-capabilities — the real agent entry point "
+            "fetches it at startup before any handler dispatch."
+        )
+        assert "task_capabilities" in smoke, (
+            "memo-bake-smoke-lifecycle.ts must return the contract under the "
+            "task_capabilities response key, matching the real endpoint shape."
+        )
+        assert "buildBakeSmokeCapabilityContract" in smoke, (
+            "memo-bake-smoke-lifecycle.ts must serve the shared bake-smoke "
+            "stand-in contract so completeness validation is exercised."
+        )
+
+    def test_contract_helper_is_complete_and_typechecked(self):
+        """The shared stand-in must be generated from AGENT_TASK_TYPE_IDS (so a
+        newly added task type can never fail the loader's completeness check)
+        and live under agent/src for the tsc --noEmit surface."""
+        helper = _read_bake_smoke_contract_helper()
+        assert "AGENT_TASK_TYPE_IDS" in helper, (
+            "bake-smoke-capability-contract.ts must generate the contract from "
+            "AGENT_TASK_TYPE_IDS so it always satisfies the loader's "
+            "completeness check, including for task types added later."
+        )
+        assert "loadTaskCapabilityContract" in helper, (
+            "bake-smoke-capability-contract.ts must load via the real "
+            "loadTaskCapabilityContract so validation is exercised, not bypassed."
+        )
+        relative_helper_path = (
+            _BAKE_SMOKE_CONTRACT_HELPER.relative_to(_AGENT_DIR).as_posix()
+        )
+        assert relative_helper_path.startswith("src/"), (
+            "bake-smoke-capability-contract.ts must live under agent/src so the "
+            "agent typecheck covers it."
+        )
+
+
 class TestPackerFingerprintBakeContract:
     """agent.pkr.hcl must run the production readAgentRuntimeFingerprint()
     reader at bake time so a drift between the AGENT_RUNTIME_FINGERPRINT
