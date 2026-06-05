@@ -134,21 +134,30 @@ describe('deriveReviewerFindingCount', () => {
     expect(deriveReviewerFindingCount(undefined)).toBe(0);
   });
 
-  it('sums current_human_count across categories', () => {
+  it('sums current_reviewer_finding_count across categories', () => {
     const trends = {
       categories: {
-        correctness: { current_human_count: 4 },
-        security: { current_human_count: 3 },
+        correctness: { current_reviewer_finding_count: 4 },
+        security: { current_reviewer_finding_count: 3 },
       },
     } as unknown as SrTrendWithFixIterations;
     expect(deriveReviewerFindingCount(trends)).toBe(7);
   });
+
+  it('falls back to current_human_count for backward compatibility', () => {
+    const trends = {
+      categories: {
+        correctness: { current_human_count: 4 },
+      },
+    } as unknown as SrTrendWithFixIterations;
+    expect(deriveReviewerFindingCount(trends)).toBe(4);
+  });
 });
 
 describe('SrCatchRateCard', () => {
-  const trendsWithFindings = (humanCount: number, extra: Partial<SrTrendWithFixIterations> = {}) =>
+  const trendsWithFindings = (reviewerFindingCount: number, extra: Partial<SrTrendWithFixIterations> = {}) =>
     ({
-      categories: { correctness: { current_human_count: humanCount } },
+      categories: { correctness: { current_reviewer_finding_count: reviewerFindingCount } },
       ...extra,
     }) as unknown as SrTrendWithFixIterations;
 

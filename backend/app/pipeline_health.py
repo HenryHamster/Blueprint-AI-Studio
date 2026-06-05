@@ -34,6 +34,7 @@ from app.models import (
 )
 from app.time_utils import _coerce_naive_utc
 from app.routers.admin_analytics import _derive_completed_at
+from app.sr_blind_spots import has_reviewer_confirmed_categories
 from app.sr_review_quality_metrics import (
     _compute_edges_considered_metrics,
     _serialize_sr_catch_rate_trends,
@@ -1046,12 +1047,15 @@ async def compute_pipeline_health_summary(
             project.design_doc, hours=24
         )
 
-    # Self-review prediction accuracy: compare self-review check_results against human rejection categories
+    # Self-review prediction accuracy: compare self-review check_results
+    # against reviewer-confirmed rejection categories on ANY iteration (shared
+    # has_reviewer_confirmed_categories predicate — matches the scorer's ground
+    # truth so later-iteration-only confirmations are sampled, not dropped).
     tasks_with_both_24h = [
         t
         for t in terminal_tasks_24h
         if (t.context or {}).get("_self_review_outcome", {}).get("check_results")
-        and "_first_attempt_rejection_categories" in (t.context or {})
+        and has_reviewer_confirmed_categories(t.context or {})
     ]
     self_review_prediction_accuracy = compute_sr_prediction_accuracy(
         tasks_with_both_24h

@@ -202,8 +202,10 @@ def _stats_for_tasks(
     Catch/miss/precision/recall here therefore measure author-SR-agent vs.
     reviewer-LLM-agent AGREEMENT — an inter-agent agreement signal, not a
     catch rate against an external/human truth. Variables are named
-    ``reviewer_*`` accordingly. (The persisted ``*human_count`` aggregation
-    keys keep their legacy names for serialized/UI contract stability.)
+    ``reviewer_*`` accordingly. Internal ``*human_count`` aggregation keys are
+    a legacy implementation detail retained so the stats builder can keep its
+    existing shape while the serialized/UI contract exposes reviewer-grounded
+    names.
 
     Deliberately-skipped self-reviews (the ``./done`` fallback envelope,
     detected via :func:`is_skipped_sr_outcome`) are EXCLUDED so a skip is not

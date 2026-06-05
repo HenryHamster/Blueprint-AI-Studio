@@ -353,7 +353,10 @@ async def test_compute_sr_catch_rate_trends_exposes_finding_counts(
     assert result["current_finding_count"] == 5
     assert result["previous_finding_count"] == 5
     cat = result["categories"]["test-coverage"]
+    assert cat["current_reviewer_finding_count"] == 5
+    assert cat["previous_reviewer_finding_count"] == 5
     assert cat["current_human_count"] == 5
+    assert cat["previous_human_count"] == 5
     # 5 findings == _MIN_SR_FINDINGS, so not low-confidence
     assert cat["low_confidence_finding_count"] is False
 
@@ -5454,6 +5457,7 @@ def _make_fr_task(
     age_days: float,
     reviewer_findings=None,
     human_cats=None,
+    all_iteration_cats=None,
     sr_failed_cats=None,
     first_attempt_succeeded: bool = True,
     task_type: str = "create",
@@ -5471,6 +5475,8 @@ def _make_fr_task(
         ctx["_self_review_outcome"] = {"check_results": check_results}
     if human_cats is not None:
         ctx["_first_attempt_rejection_categories"] = human_cats
+    if all_iteration_cats is not None:
+        ctx["_all_iterations_rejection_categories"] = all_iteration_cats
     task = Task(
         project_id=project_id,
         title="FR task",
@@ -5741,6 +5747,39 @@ async def test_compute_fresh_reviewer_trend_added_value(db_session: AsyncSession
     av = result["added_value"]["correctness"]
     assert av["current"] == 3
     assert av["previous"] == 0
+
+
+@pytest.mark.asyncio
+async def test_compute_fresh_reviewer_trend_uses_any_iteration_confirmed_truth(
+    db_session: AsyncSession,
+):
+    """Later-iteration-only confirmations must count in hit rate and added value."""
+    from app.playbook_learning import compute_fresh_reviewer_trend
+
+    project = await _make_project(db_session)
+    tasks = []
+    for window_age in (2, 20):
+        for _ in range(5):
+            t = _make_fr_task(
+                project.id,
+                age_days=window_age,
+                reviewer_findings=[{"category": "correctness"}],
+                all_iteration_cats=["correctness"],
+                sr_failed_cats=[],
+            )
+            db_session.add(t)
+            tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["per_category_hit_rate"]["correctness"]
+    assert cat["current"] == 1.0
+    assert cat["previous"] == 1.0
+    av = result["added_value"]["correctness"]
+    assert av["current"] == 5
+    assert av["previous"] == 5
 
 
 @pytest.mark.asyncio

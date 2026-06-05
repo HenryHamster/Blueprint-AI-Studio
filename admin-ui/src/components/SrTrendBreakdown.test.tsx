@@ -2325,7 +2325,7 @@ describe('TargetHealthSummaryCard in SrTrendBreakdown', () => {
 });
 
 describe('SrTrendBreakdown finding-count gating (catch-rate true denominator)', () => {
-  it('shows too-small with finding count when current_finding_count < MIN_SAMPLE_SIZE even if current_human_count is large', () => {
+  it('shows too-small with reviewer finding count when current_reviewer_finding_count < MIN_SAMPLE_SIZE even if current_human_count is large', () => {
     const trends: SrTrendData = {
       categories: {
         correctness: {
@@ -2334,7 +2334,7 @@ describe('SrTrendBreakdown finding-count gating (catch-rate true denominator)', 
           miss_rate: 0.2,
           trend: 'stable',
           current_human_count: 50,  // many tasks
-          current_finding_count: 3,  // but very few reviewer findings
+          current_reviewer_finding_count: 3,  // but very few reviewer findings
         },
       },
     };
@@ -2352,8 +2352,8 @@ describe('SrTrendBreakdown finding-count gating (catch-rate true denominator)', 
           previous_hit_rate: 0.5,
           miss_rate: 0.1,
           trend: 'increasing',
-          current_finding_count: 20,  // enough in current window
-          previous_finding_count: 2,  // but too few in previous window
+          current_reviewer_finding_count: 20,  // enough in current window
+          previous_reviewer_finding_count: 2,  // but too few in previous window
         },
       },
     };
@@ -2370,8 +2370,8 @@ describe('SrTrendBreakdown finding-count gating (catch-rate true denominator)', 
           previous_hit_rate: 0.7,
           miss_rate: 0.1,
           trend: 'increasing',
-          current_finding_count: 15,
-          previous_finding_count: 10,
+          current_reviewer_finding_count: 15,
+          previous_reviewer_finding_count: 10,
         },
       },
     };
@@ -2386,6 +2386,21 @@ describe('SrTrendBreakdown finding-count gating (catch-rate true denominator)', 
           miss_rate: 0.3,
           trend: 'stable',
           current_human_count: 3,  // no finding_count — falls back to human_count
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.getByText(/too small/)).toBeInTheDocument();
+    expect(screen.getByText(/3 — too small/)).toBeInTheDocument();
+  });
+
+  it('falls back to current_finding_count when reviewer-grounded aliases are absent', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          miss_rate: 0.3,
+          trend: 'stable',
+          current_finding_count: 3,
         },
       },
     };

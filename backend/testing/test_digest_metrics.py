@@ -1519,6 +1519,70 @@ def test_compute_sr_prediction_accuracy_reviewer_origin_excluded():
     assert result["miss_rate"] == 1.0
 
 
+def test_compute_review_quality_metrics_includes_later_iteration_only_confirmations():
+    """A task whose reviewer-confirmed categories appear only on a LATER
+    iteration (``_all_iterations_rejection_categories`` set, no
+    ``_first_attempt_rejection_categories``) must be sampled by
+    compute_review_quality_metrics and its later-confirmed category scored as a
+    hit — not dropped from the sample, not counted as a false alarm."""
+    tasks = [
+        make_task(
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {
+                    "check_results": {"correctness": {"passed": False}}
+                },
+                # Confirmed on a later iteration only; first review approved.
+                "_all_iterations_rejection_categories": {"correctness": 1},
+            },
+        )
+        for _ in range(5)
+    ]
+    result = compute_review_quality_metrics(tasks)
+    pred = result["self_review_prediction_accuracy"]
+    assert pred is not None
+    # All five later-iteration-only tasks are in the sample.
+    assert pred["sample_size"] == 5
+    # SR flagged correctness AND reviewer confirmed it (later) => a hit, not a
+    # false alarm.
+    assert pred["prediction_hit_rate"] == 1.0
+    assert pred["false_alarm_rate"] == 0.0
+
+
+def test_compute_review_quality_metrics_fresh_reviewer_uses_any_iteration_truth():
+    """Fresh-reviewer effectiveness must sample and confirm against the same
+    later-iteration-aware reviewer truth as prediction accuracy."""
+    tasks = [
+        make_task(
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix"}],
+            context={
+                "_first_attempt_succeeded": False,
+                "_all_iterations_rejection_categories": {"correctness": 1},
+                "_self_review_outcome": {
+                    "check_results": {"correctness": {"passed": True}},
+                    "reviewer_findings": [
+                        {
+                            "category": "correctness",
+                            "severity": "HIGH",
+                            "description": "confirmed later",
+                        }
+                    ],
+                },
+            },
+        )
+        for _ in range(3)
+    ]
+
+    result = compute_review_quality_metrics(tasks)
+    fre = result["fresh_reviewer_effectiveness"]
+
+    assert fre["fresh_reviewer_sample_size"] == 3
+    assert fre["prediction_sample_size"] == 3
+    assert fre["per_category_hit_rate"]["correctness"] == 1.0
+    assert fre["reviewer_finding_added_value"]["correctness"] == 3
+
+
 def test_compute_review_quality_metrics_empty_returns_nones():
     """Empty input → every metric is None / empty-ish per sample-size guards."""
     result = compute_review_quality_metrics([])

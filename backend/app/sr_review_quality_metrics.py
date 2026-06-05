@@ -13,6 +13,7 @@ from app.models import Task
 from app.review_learning import _categorize_review_issues
 from app.sr_blind_spots import (
     _REVIEWER_ORIGINS,
+    has_reviewer_confirmed_categories,
     is_skipped_sr_outcome,
     reviewer_confirmed_categories,
 )
@@ -261,7 +262,7 @@ def _compute_fresh_reviewer_effectiveness(
     tasks_with_both = [
         t
         for t in tasks_with_reviewer
-        if "_first_attempt_rejection_categories" in (t.context or {})
+        if has_reviewer_confirmed_categories(t.context or {})
     ]
     cat_flagged: Dict[str, int] = {}
     cat_confirmed: Dict[str, int] = {}
@@ -269,7 +270,7 @@ def _compute_fresh_reviewer_effectiveness(
     for t in tasks_with_both:
         ctx = t.context or {}
         findings = ctx.get("_self_review_outcome", {}).get("reviewer_findings") or []
-        reviewer_confirmed_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
+        reviewer_confirmed_cats = reviewer_confirmed_categories(ctx)
         check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
         agent_failed = _author_sr_failed_categories(check_results)
         for finding in findings:
@@ -495,8 +496,16 @@ def _compute_edges_considered_metrics(
 def compute_sr_prediction_accuracy(
     tasks_with_both: List[Task],
 ) -> "Dict[str, Any] | None":
-    """Compute self-review prediction accuracy from tasks that have both
-    _self_review_outcome.check_results and _first_attempt_rejection_categories.
+    """Compute self-review prediction accuracy from the sampled task set.
+
+    The sample is tasks that have both ``_self_review_outcome.check_results``
+    AND reviewer-confirmed categories on *any* review iteration (the
+    :func:`has_reviewer_confirmed_categories` predicate — i.e.
+    ``_all_iterations_rejection_categories`` non-empty, falling back to
+    ``_first_attempt_rejection_categories``). Including later-iteration-only
+    confirmations keeps the sampled set aligned with the ground truth the scorer
+    reads via :func:`reviewer_confirmed_categories`; a task first approved then
+    rejected on a later iteration is in-sample, not dropped.
     Returns None when sample size < 5.
     """
     if len(tasks_with_both) < 5:
@@ -648,7 +657,7 @@ def compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any]
         t
         for t in terminal_tasks
         if (t.context or {}).get("_self_review_outcome", {}).get("check_results")
-        and "_first_attempt_rejection_categories" in (t.context or {})
+        and has_reviewer_confirmed_categories(t.context or {})
     ]
     self_review_prediction_accuracy = compute_sr_prediction_accuracy(tasks_with_both)
     fresh_reviewer_effectiveness = _compute_fresh_reviewer_effectiveness(terminal_tasks)

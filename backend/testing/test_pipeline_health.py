@@ -2189,6 +2189,41 @@ async def test_self_review_prediction_accuracy_partial_overlap():
 
 
 @pytest.mark.asyncio
+async def test_self_review_prediction_accuracy_includes_later_iteration_only():
+    """A task first APPROVED then rejected on a later iteration (only
+    ``_all_iterations_rejection_categories`` set, no
+    ``_first_attempt_rejection_categories``) is in the prediction-accuracy
+    sample — matching the scorer's any-iteration ground truth."""
+    project_id = uuid.uuid4()
+    now = _utcnow()
+    tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {
+                    "check_results": {"test-coverage": {"passed": False}}
+                },
+                # First review approved; rejected only on a later iteration.
+                "_all_iterations_rejection_categories": {"test-coverage": 1},
+            },
+            created_at=now - timedelta(hours=i),
+        )
+        for i in range(1, 7)
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+    result = await compute_pipeline_health_summary(session, project_id)
+    acc = result["self_review_prediction_accuracy"]
+    assert acc is not None
+    # All six later-iteration-only tasks are counted in the sample.
+    assert acc["sample_size"] == 6
+    # SR flagged test-coverage and the reviewer confirmed it (later) → hit, not
+    # a false alarm.
+    assert acc["prediction_hit_rate"] == 1.0
+    assert acc["false_alarm_rate"] == 0.0
+
+
+@pytest.mark.asyncio
 async def test_self_review_prediction_accuracy_snake_case_sr_does_not_match_kebab_human():
     """Snake_case SR keys (e.g. test_coverage) must NOT match kebab-case human cats (test-coverage)."""
     project_id = uuid.uuid4()

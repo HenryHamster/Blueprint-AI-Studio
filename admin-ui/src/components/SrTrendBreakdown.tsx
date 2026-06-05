@@ -541,9 +541,15 @@ function CategoryRow({
 
   const sparklineTitle = c.prompt_version_changed ? 'prompt version changed mid-window — attribution may differ' : undefined;
   // Gate confidence on reviewer finding count (true denominator of the catch rate).
-  // Fall back to current_human_count for backward compat with older backend payloads.
-  const findingCount = c.current_finding_count ?? c.current_human_count;
-  const prevFindingCount = c.previous_finding_count ?? c.previous_human_count;
+  // Fall back to older aliases for backward compatibility with stored payloads.
+  const findingCount =
+    c.current_reviewer_finding_count ??
+    c.current_finding_count ??
+    c.current_human_count;
+  const prevFindingCount =
+    c.previous_reviewer_finding_count ??
+    c.previous_finding_count ??
+    c.previous_human_count;
   const sampleTooSmall = isSampleTooSmall(findingCount);
   const deltaLowConfidence = sampleTooSmall || isSampleTooSmall(prevFindingCount);
 
@@ -558,7 +564,7 @@ function CategoryRow({
     if (!onSpawnSrInvestigation || spawning) return;
     setSpawning(true);
     try {
-      const id = await onSpawnSrInvestigation({ category: cat, current_hit_rate: c.current_hit_rate, previous_hit_rate: c.previous_hit_rate, sample_size: c.current_human_count, signals: activeSignals });
+      const id = await onSpawnSrInvestigation({ category: cat, current_hit_rate: c.current_hit_rate, previous_hit_rate: c.previous_hit_rate, sample_size: findingCount, signals: activeSignals });
       if (id) setSpawnedTaskId(id);
     } finally { setSpawning(false); }
   };

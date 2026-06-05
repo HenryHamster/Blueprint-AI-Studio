@@ -316,6 +316,30 @@ def reviewer_confirmed_categories(ctx: Dict[str, Any]) -> set:
     return confirmed
 
 
+def has_reviewer_confirmed_categories(ctx: Dict[str, Any]) -> bool:
+    """Sample-membership predicate for prediction-accuracy scoring.
+
+    Returns True when a task carries reviewer-confirmed categories on *any*
+    review iteration — i.e. :func:`reviewer_confirmed_categories` would return
+    a non-empty set. This is the single source of the "is this task part of the
+    self-review prediction-accuracy sample?" contract: a task belongs to the
+    sample iff its reviewer-confirmed truth set (the same set the scorer reads)
+    is non-empty.
+
+    Mirrors the prefer-all-iterations / fall-back-to-first-attempt logic of
+    :func:`reviewer_confirmed_categories` so the sample filter and the scorer's
+    ground truth cannot drift. In particular a task whose reviewer-confirmed
+    categories appear *only* on a later iteration
+    (``_all_iterations_rejection_categories`` set, no
+    ``_first_attempt_rejection_categories``) is in-sample — it must not be
+    dropped just because the first review approved.
+    """
+    return bool(
+        ctx.get("_all_iterations_rejection_categories")
+        or ctx.get("_first_attempt_rejection_categories")
+    )
+
+
 async def aggregate_sr_blind_spot_envelope(
     session: AsyncSession,
     project_id: uuid.UUID,
