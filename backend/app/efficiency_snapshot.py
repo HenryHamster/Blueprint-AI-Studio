@@ -42,6 +42,7 @@ from app.models import (
     Task,
     TaskStatus,
     _utcnow,
+    get_task_current_attempt_llm_totals,
     get_task_total_llm_totals,
     get_task_total_vm_cost_usd,
 )
@@ -817,12 +818,12 @@ def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
     total_cost = 0.0
     merged = 0
     for t in tasks:
-        input_tokens, output_tokens, _ = get_task_total_llm_totals(t)
-        if (input_tokens > 0 or output_tokens > 0) and t.provider and t.model:
-            pricing = LLM_TOKEN_PRICING.get((t.provider.lower(), t.model.lower()))
-            if pricing:
-                input_rate, output_rate = pricing
-                total_cost += input_tokens * input_rate + output_tokens * output_rate
+        for provider, model, input_tokens, output_tokens, _call_count in _task_llm_attempts(t):
+            if provider and model:
+                pricing = LLM_TOKEN_PRICING.get((provider.lower(), model.lower()))
+                if pricing:
+                    input_rate, output_rate = pricing
+                    total_cost += input_tokens * input_rate + output_tokens * output_rate
         if is_merged_completion(t):
             merged += 1
     if not merged:
@@ -831,6 +832,37 @@ def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
 
 
 _UNPRICED_COMBOS_CAP = 10
+
+
+def _llm_attempt_nonnegative_int(value: Any) -> int:
+    return int(value) if isinstance(value, (int, float)) and value >= 0 else 0
+
+
+def _task_llm_attempts(task: Task) -> list[tuple[str | None, str | None, int, int, int]]:
+    history = task.attempt_history or []
+    if not history:
+        input_tokens, output_tokens, call_count = get_task_total_llm_totals(task)
+        return (
+            [(task.provider, task.model, input_tokens, output_tokens, call_count)]
+            if input_tokens > 0 or output_tokens > 0
+            else []
+        )
+    attempts = [
+        (
+            attempt.get("provider") or task.provider,
+            attempt.get("model") or task.model,
+            _llm_attempt_nonnegative_int(attempt.get("llm_input_tokens")),
+            _llm_attempt_nonnegative_int(attempt.get("llm_output_tokens")),
+            _llm_attempt_nonnegative_int(attempt.get("llm_call_count")),
+        )
+        for attempt in history
+    ]
+    current_input, current_output, current_calls = get_task_current_attempt_llm_totals(
+        task
+    )
+    if current_input > 0 or current_output > 0:
+        attempts.append((task.provider, task.model, current_input, current_output, current_calls))
+    return attempts
 
 
 def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
@@ -843,10 +875,10 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
       - ``unpriced_combos``: capped list of ``provider:model`` strings that
         have non-zero tokens but no entry in :data:`LLM_TOKEN_PRICING`.
 
-    A task contributes to a bucket when it has a non-null provider, non-null
-    model, and non-zero aggregate tokens across the banked retry totals plus
-    the live ``api_call_summary`` snapshot. Unpriced (provider, model) combos
-    are still counted in ``task_count`` and feed
+    A task contributes one or more attempt rows to a bucket when it has a
+    non-null provider, non-null model, and non-zero aggregate tokens across
+    its banked retry history plus the live ``api_call_summary`` snapshot.
+    Unpriced (provider, model) combos are still counted in ``task_count`` and feed
     ``unpriced_coverage_fraction`` but contribute ``0.0`` cost. Cost values
     are rounded to 6 decimals and shares to 4 decimals, matching the rest of
     this module.
@@ -881,50 +913,50 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
     total_task_count = 0
 
     for t in tasks:
-        input_tokens, output_tokens, call_count = get_task_total_llm_totals(t)
-        if input_tokens <= 0 and output_tokens <= 0:
-            continue
-        if not t.provider or not t.model:
-            provider = "unattributed"
-            model = "unknown"
-        else:
-            provider = t.provider.lower()
-            model = t.model.lower()
-        key = (provider, model)
-        pricing = LLM_TOKEN_PRICING.get(key)
-        if pricing:
-            input_rate, output_rate = pricing
-            cost = input_tokens * input_rate + output_tokens * output_rate
-            priced_combos.add(key)
-            priced_task_count += 1
-        else:
-            cost = 0.0
-            unpriced_task_count += 1
-            combo = f"{provider}:{model}"
-            if (
-                combo not in unpriced_combos
-                and len(unpriced_combos) < _UNPRICED_COMBOS_CAP
-            ):
-                unpriced_combos.append(combo)
+        for provider, model, input_tokens, output_tokens, call_count in _task_llm_attempts(t):
+            if input_tokens <= 0 and output_tokens <= 0:
+                continue
+            if not provider or not model:
+                provider = "unattributed"
+                model = "unknown"
+            else:
+                provider = provider.lower()
+                model = model.lower()
+            key = (provider, model)
+            pricing = LLM_TOKEN_PRICING.get(key)
+            if pricing:
+                input_rate, output_rate = pricing
+                cost = input_tokens * input_rate + output_tokens * output_rate
+                priced_combos.add(key)
+                priced_task_count += 1
+            else:
+                cost = 0.0
+                unpriced_task_count += 1
+                combo = f"{provider}:{model}"
+                if (
+                    combo not in unpriced_combos
+                    and len(unpriced_combos) < _UNPRICED_COMBOS_CAP
+                ):
+                    unpriced_combos.append(combo)
 
-        mb = model_buckets[key]
-        mb["input_tokens"] += int(input_tokens)
-        mb["output_tokens"] += int(output_tokens)
-        mb["llm_call_count"] += call_count
-        mb["task_count"] += 1
-        mb["cost_usd"] += cost
+            mb = model_buckets[key]
+            mb["input_tokens"] += int(input_tokens)
+            mb["output_tokens"] += int(output_tokens)
+            mb["llm_call_count"] += call_count
+            mb["task_count"] += 1
+            mb["cost_usd"] += cost
 
-        pb = provider_buckets[provider]
-        pb["input_tokens"] += int(input_tokens)
-        pb["output_tokens"] += int(output_tokens)
-        pb["llm_call_count"] += call_count
-        pb["task_count"] += 1
-        pb["cost_usd"] += cost
+            pb = provider_buckets[provider]
+            pb["input_tokens"] += int(input_tokens)
+            pb["output_tokens"] += int(output_tokens)
+            pb["llm_call_count"] += call_count
+            pb["task_count"] += 1
+            pb["cost_usd"] += cost
 
-        total_input += int(input_tokens)
-        total_output += int(output_tokens)
-        total_cost += cost
-        total_task_count += 1
+            total_input += int(input_tokens)
+            total_output += int(output_tokens)
+            total_cost += cost
+            total_task_count += 1
 
     def _share(cost: float) -> Optional[float]:
         if total_cost <= 0:

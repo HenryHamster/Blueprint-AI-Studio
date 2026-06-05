@@ -1209,6 +1209,60 @@ async def test_retry_banked_vm_and_llm_costs_count_across_attempts(db_session):
 
 
 @pytest.mark.asyncio
+async def test_compute_llm_cost_breakdown_credits_each_attempt_model(db_session):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        api_call_summary={
+            "llm_call_count": 3,
+            "total_input_tokens": 1000,
+            "total_output_tokens": 400,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        vm_provisioned_at=now - timedelta(minutes=9),
+        vm_spot=True,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    bank_task_current_attempt(task, stopped_at=now - timedelta(minutes=5))
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    assert task.attempt_history[0]["provider"] == "anthropic"
+    assert task.attempt_history[0]["model"] == "claude-sonnet-4-6"
+
+    task.status = TaskStatus.COMPLETED
+    task.provider = "openai"
+    task.model = "gpt-5.4"
+    task.vm_provisioned_at = now - timedelta(minutes=3)
+    task.vm_stopped_at = now
+    task.vm_spot = False
+    task.api_call_summary = {
+        "llm_call_count": 2,
+        "total_input_tokens": 250,
+        "total_output_tokens": 150,
+    }
+    await db_session.commit()
+
+    refreshed = await db_session.get(type(task), task.id)
+    breakdown = compute_llm_cost_breakdown([refreshed])
+    by_model = {(e["provider"], e["model"]): e for e in breakdown["by_model"]}
+    assert by_model[("anthropic", "claude-sonnet-4-6")]["total_input_tokens"] == 1000
+    assert by_model[("anthropic", "claude-sonnet-4-6")]["total_output_tokens"] == 400
+    assert by_model[("openai", "gpt-5.4")]["total_input_tokens"] == 250
+    assert by_model[("openai", "gpt-5.4")]["total_output_tokens"] == 150
+
+
+@pytest.mark.asyncio
 async def test_schema_version_v3_migrates_llm_axis(db_session):
     """Existing baseline at schema_version=3 gets llm_cost_per_merged_pr cleared
     and re-seeded, then bumped to schema_version=5 (via v4 intermediate).

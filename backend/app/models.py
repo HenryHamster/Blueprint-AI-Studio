@@ -1521,6 +1521,8 @@ def bank_task_current_attempt(
         "vm_stopped_at": effective_stop.isoformat() if effective_stop else None,
         "vm_spot": bool(task.vm_spot),
         "vm_machine_type": task.vm_machine_type,
+        "provider": task.provider,
+        "model": task.model,
         "vm_runtime_cost_usd": round(vm_cost, 6),
         "llm_input_tokens": input_tokens,
         "llm_output_tokens": output_tokens,

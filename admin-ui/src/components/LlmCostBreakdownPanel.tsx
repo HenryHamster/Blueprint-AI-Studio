@@ -49,7 +49,7 @@ export function LlmCostBreakdownPanel({
     </h2>
   );
 
-  if (totals.total_cost_usd <= 0 || by_model.length === 0) {
+  if (by_model.length === 0) {
     return (
       <section>
         {Header}
@@ -60,10 +60,17 @@ export function LlmCostBreakdownPanel({
     );
   }
 
-  const coverageWarning = !fullCoverage && (
+  const allUnpriced = totals.total_cost_usd <= 0 && totals.unpriced_task_count > 0;
+  const coverageWarning = (allUnpriced || !fullCoverage) && (
     <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[10px] text-amber-300">
-      <span className="font-semibold">Pricing coverage {fmtShare(coverage)}</span>
-      {' — '}{totals.unpriced_task_count} of {totals.priced_task_count + totals.unpriced_task_count} priceable tasks have no pricing entry, so reported cost is understated.
+      <span className="font-semibold">
+        {allUnpriced ? 'Cost data unavailable' : `Pricing coverage ${fmtShare(coverage)}`}
+      </span>
+      {' — '}
+      {allUnpriced
+        ? `All ${totals.unpriced_task_count} token-bearing tasks have no pricing entry, so actual cost is unknown.`
+        : `${totals.unpriced_task_count} of ${totals.priced_task_count + totals.unpriced_task_count} priceable tasks have no pricing entry, so reported cost is understated.`
+      }
       {unpriced_combos.length > 0 && (
         <div className="mt-1 text-amber-400/80">
           Unpriced: <span className="font-mono">{unpriced_combos.join(', ')}</span>
