@@ -735,11 +735,12 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
     ? lastQualification.status
     : null;
   const qualificationPending = qualStatus === 'pending';
-  // A finalized dry-run already fully evaluated the candidate it scored. In the
+  // A finalized conclusive verdict (dry_run, not_promoted, or promoted) means
+  // the candidate has been fully evaluated and the outcome is settled. In the
   // shipped-dark default (promotion_enabled=False) a passing candidate records
   // status='dry_run' and the version stays open + stabilize. Re-emitting
   // `qualify_request` for the SAME candidate just re-spawns two agent VMs for
-  // an identical, already-scored commit — the orchestrator's already_dry_run
+  // an identical, already-scored commit — the orchestrator's cached_verdict
   // guard ignores it. Only a candidate change (new work merged onto the
   // integration branch) makes a fresh qualification meaningful.
   const qualificationDryRun = qualStatus === 'dry_run';

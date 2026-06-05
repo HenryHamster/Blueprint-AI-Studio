@@ -1398,8 +1398,8 @@ describe('buildVersionPhaseSection', () => {
   it('renders a dry_run last_qualification and instructs the agent NOT to re-emit qualify_request', () => {
     // A finalized dry-run already fully evaluated its candidate. Re-emitting
     // qualify_request for the SAME candidate re-spawns agent VMs for nothing
-    // (the orchestrator's already_dry_run guard ignores it) — the prompt must
-    // discourage it. H1: extends the pending-only guard to dry_run.
+    // (the orchestrator's cached_verdict guard ignores it) — the prompt must
+    // discourage it. H1: extends the pending-only guard to conclusive verdicts.
     const result = buildVersionPhaseSection({
       version_number: 6,
       phase: 'stabilize',

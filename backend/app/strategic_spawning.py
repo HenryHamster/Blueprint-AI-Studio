@@ -3169,6 +3169,54 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     return True
 
 
+async def _resolve_candidate_currency(
+    session: AsyncSession,
+    project: Project,
+    last_qual: dict,
+    integration_branch: str,
+) -> dict | None:
+    """Best-effort check: is a qualification's candidate commit still HEAD?
+
+    The qualifier scores its audit findings against a pinned ``candidate_sha``
+    snapshot, but the integration branch advances continuously and fixes for
+    those very findings often land afterward.  Resolve the live integration
+    branch HEAD and compare it to the qualification's candidate commit.
+
+    Returns ``{"current": bool, "candidate_sha": str, "head_sha": str}`` when
+    the comparison resolves, or ``None`` when it is indeterminate (no candidate
+    SHA on the record, GitHub unreachable, or the branch lookup failed).  Never
+    raises — a failure to resolve must never block the strategic payload build.
+    """
+    candidate_sha = last_qual.get("candidate_sha")
+    if not candidate_sha or not isinstance(candidate_sha, str):
+        return None
+    head_sha: str | None = None
+    try:
+        from app import github as _github
+        from app.release_qualifier import _resolve_github_with_session
+
+        _resolved = await _resolve_github_with_session(session, project)
+        if _resolved is None:
+            return None
+        _gh_token, _gh_owner, _gh_repo = _resolved
+        head_sha = await _github.get_branch_sha(
+            _gh_token, _gh_owner, _gh_repo, integration_branch
+        )
+    except Exception:
+        logger.exception(
+            "[STRATEGIC] could not resolve integration branch HEAD for "
+            "candidate-currency check"
+        )
+        return None
+    if not head_sha or not isinstance(head_sha, str):
+        return None
+    return {
+        "current": candidate_sha == head_sha,
+        "candidate_sha": candidate_sha,
+        "head_sha": head_sha,
+    }
+
+
 async def _spawn_strategic_review(
     project: Project,
     session: AsyncSession,
@@ -4106,46 +4154,95 @@ async def _spawn_strategic_review(
                             f"findings; address {_binding_key} alongside the "
                             f"audit findings"
                         )
-            _stabilize_hint += (
-                f" The last qualification's audit flagged {len(_carried_findings)} "
-                f"finding(s) — full list in "
-                f"version_phase.last_qualification.audit_findings — and "
-                f"{_binding_desc}. Top findings: {_top}."
+            # Establish whether the carried findings are still current before
+            # presenting them as live promotion blockers.  The findings were
+            # scored against a pinned candidate commit; if the integration
+            # branch has advanced past it, later commits may already have fixed
+            # them, so re-targeting research/plan/fix work directly at them
+            # churns at 0% conversion.  Best-effort — None means indeterminate.
+            _currency = await _resolve_candidate_currency(
+                session, project, _last_qual, _integration_branch
             )
-            # Only audit/fundamentals-mode directions do remediation work; a
-            # ship/pause direction that merely mentions the audit topic does
-            # not dispatch fixes.  When no remediation-mode direction is active,
-            # the agent must CREATE one — and we say so unambiguously.  The
-            # prior "create OR update a direction" phrasing let the agent
-            # satisfy the instruction by appending a status note to an
-            # unrelated ship-mode direction (observed 2026-05-27: v2 audit
-            # dropped to 0.47 with 10 real findings, the agent added a status
-            # note to a ship-mode direction and opened nothing, so the findings
-            # were never dispatched and the score stayed below the bar).
-            _remediation_modes = {"audit", "fundamentals"}
-            _has_remediation_direction = any(
-                d.get("status") == "active"
-                and d.get("recommended_mode") in _remediation_modes
-                for d in (project.directions or [])
-            )
-            if _has_remediation_direction:
+            _candidate_behind = _currency is not None and not _currency["current"]
+            if _version_phase_block is not None and _currency is not None:
+                _version_phase_block["last_qualification_candidate_currency"] = (
+                    _currency
+                )
+            if _candidate_behind:
+                _cand_short = _currency["candidate_sha"][:8]
+                _head_short = _currency["head_sha"][:8]
                 _stabilize_hint += (
-                    " You already have an active audit/fundamentals-mode "
-                    "direction; confirm it explicitly targets THESE findings "
-                    "(update its text/scope if not) so the remediation work is "
-                    "actually dispatched this cycle."
+                    f" The last qualification flagged {len(_carried_findings)} "
+                    f"audit finding(s), but it scored them against candidate "
+                    f"commit {_cand_short}, which is now BEHIND the live "
+                    f"{_integration_branch} HEAD ({_head_short}). These findings "
+                    f"are POSSIBLY-STALE: they were scored against a superseded "
+                    f"snapshot and may already be resolved by commits that landed "
+                    f"afterward — do NOT treat them as confirmed current promotion "
+                    f"blockers. Before scoping brand-new hardening work directly at "
+                    f"them, PREFER emitting a fresh qualify_request to re-qualify "
+                    f"the current HEAD; a new audit against the current snapshot "
+                    f"will report which finding(s), if any, genuinely remain. Prior "
+                    f"list (against {_cand_short}) in "
+                    f"version_phase.last_qualification.audit_findings. Top prior "
+                    f"findings: {_top}."
                 )
             else:
                 _stabilize_hint += (
-                    " There is currently NO active direction in audit or "
-                    "fundamentals mode, so nothing is set up to FIX these "
-                    "findings. You MUST create a new direction "
-                    "(recommended_mode='audit') whose stated work is resolving "
-                    "them — adding a status note to an existing ship/pause "
-                    "direction does NOT count and will not move the audit "
-                    "score. Creating this direction is the highest-leverage "
-                    "action available this cycle."
+                    f" The last qualification's audit flagged "
+                    f"{len(_carried_findings)} finding(s) — full list in "
+                    f"version_phase.last_qualification.audit_findings — and "
+                    f"{_binding_desc}. Top findings: {_top}."
                 )
+                if _currency is None:
+                    _stabilize_hint += (
+                        " (Could not confirm the candidate commit these findings "
+                        "were scored against is still the integration-branch HEAD, "
+                        "so treat their currency as provisional — if a fix may have "
+                        "already landed, a fresh qualify_request will confirm what "
+                        "genuinely remains.)"
+                    )
+            # When the carried findings are POSSIBLY-STALE, the highest-leverage
+            # action is a fresh re-qualification, NOT scoping new remediation
+            # directly at a superseded snapshot — so skip the create-a-direction
+            # escalation below (which would churn fix work at already-resolved
+            # findings).  The escalation only applies on the live/indeterminate
+            # path where the findings may genuinely still block promotion.
+            if not _candidate_behind:
+                # Only audit/fundamentals-mode directions do remediation work; a
+                # ship/pause direction that merely mentions the audit topic does
+                # not dispatch fixes.  When no remediation-mode direction is
+                # active, the agent must CREATE one — and we say so unambiguously.
+                # The prior "create OR update a direction" phrasing let the agent
+                # satisfy the instruction by appending a status note to an
+                # unrelated ship-mode direction (observed 2026-05-27: v2 audit
+                # dropped to 0.47 with 10 real findings, the agent added a status
+                # note to a ship-mode direction and opened nothing, so the
+                # findings were never dispatched and the score stayed below bar).
+                _remediation_modes = {"audit", "fundamentals"}
+                _has_remediation_direction = any(
+                    d.get("status") == "active"
+                    and d.get("recommended_mode") in _remediation_modes
+                    for d in (project.directions or [])
+                )
+                if _has_remediation_direction:
+                    _stabilize_hint += (
+                        " You already have an active audit/fundamentals-mode "
+                        "direction; confirm it explicitly targets THESE findings "
+                        "(update its text/scope if not) so the remediation work "
+                        "is actually dispatched this cycle."
+                    )
+                else:
+                    _stabilize_hint += (
+                        " There is currently NO active direction in audit or "
+                        "fundamentals mode, so nothing is set up to FIX these "
+                        "findings. You MUST create a new direction "
+                        "(recommended_mode='audit') whose stated work is resolving "
+                        "them — adding a status note to an existing ship/pause "
+                        "direction does NOT count and will not move the audit "
+                        "score. Creating this direction is the highest-leverage "
+                        "action available this cycle."
+                    )
         prompt_suffix = (
             f"{prompt_suffix}\n{_stabilize_hint}" if prompt_suffix else _stabilize_hint
         )

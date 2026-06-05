@@ -989,7 +989,7 @@ export interface VersionQualificationSubScores {
 export type QualificationStatus =
   | 'not_promoted'
   | 'dry_run'
-  | 'already_dry_run'
+  | 'cached_verdict'
   | 'promoted'
   | 'promotion_failed'
   | 'error'
@@ -1212,7 +1212,7 @@ export type QualifyTriggerStatus =
   | 'no_credentials'
   | 'sha_error'
   | 'version_not_found'
-  | 'already_dry_run'
+  | 'cached_verdict'
   | 'spawn_failed'
   | 'not_promoted'
   | 'dry_run'

@@ -4881,6 +4881,141 @@ async def test_stabilize_hint_names_lower_dimension_when_audit_not_binding(
     assert "the audit sub-score is the binding constraint on promotion" not in suffix
 
 
+def _patch_candidate_currency(mocker, *, resolved, head_sha):
+    """Mock the GitHub resolution path used by _resolve_candidate_currency.
+
+    ``resolved`` is the (token, owner, repo) tuple or None returned by
+    ``_resolve_github_with_session``; ``head_sha`` is the integration-branch
+    HEAD ``get_branch_sha`` reports.
+    """
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=resolved),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=head_sha),
+    )
+
+
+def _make_stabilize_version_with_candidate(candidate_sha):
+    from app.models import ReleaseVersion
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    return ReleaseVersion(
+        version_number=4,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={
+            "status": "not_promoted",
+            "confidence": 0.85,
+            "blocker": None,
+            "sub_scores": {"audit": 0.74, "test_erosion": 1.0},
+            "candidate_sha": candidate_sha,
+            "audit_findings": [
+                {"severity": "high", "summary": "Token baked into VM image."},
+                {"severity": "low", "summary": "Private cross-module import."},
+            ],
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_stabilize_carried_findings_marked_stale_when_candidate_behind_head(
+    db_session, mocker, _lts_split_active
+):
+    """When the qualification's candidate commit is BEHIND the live integration
+    HEAD, the carried findings are framed POSSIBLY-STALE, the agent is steered
+    toward a fresh qualify_request, and they are NOT asserted as a current
+    binding blocker nor escalated into a new audit direction."""
+    await _ensure_releaseversion_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "a" * 40
+    version = _make_stabilize_version_with_candidate(candidate)
+    version.project_id = project.id
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    _patch_candidate_currency(
+        mocker, resolved=("tok", "owner", "repo"), head_sha="b" * 40
+    )
+    suffix = await _spawn_and_get_stabilize_suffix(project, db_session)
+
+    assert "POSSIBLY-STALE" in suffix
+    assert "qualify_request" in suffix
+    assert candidate[:8] in suffix
+    # Must NOT assert the stale findings are a current binding blocker, and must
+    # NOT churn a fresh remediation direction at a superseded snapshot.
+    assert "the audit sub-score is the binding constraint on promotion" not in suffix
+    assert "MUST create a new direction" not in suffix
+
+
+@pytest.mark.asyncio
+async def test_stabilize_carried_findings_live_when_candidate_equals_head(
+    db_session, mocker, _lts_split_active
+):
+    """When the candidate commit equals the live HEAD, the findings are presented
+    live exactly as before — binding-constraint framing + create-a-direction
+    escalation — with no POSSIBLY-STALE wording."""
+    await _ensure_releaseversion_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "c" * 40
+    version = _make_stabilize_version_with_candidate(candidate)
+    version.project_id = project.id
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    _patch_candidate_currency(
+        mocker, resolved=("tok", "owner", "repo"), head_sha=candidate
+    )
+    suffix = await _spawn_and_get_stabilize_suffix(project, db_session)
+
+    assert "POSSIBLY-STALE" not in suffix
+    assert "the audit sub-score is the binding constraint on promotion" in suffix
+    assert "MUST create a new direction" in suffix
+    assert "Could not confirm" not in suffix
+
+
+@pytest.mark.asyncio
+async def test_stabilize_carried_findings_degrades_when_sha_unresolvable(
+    db_session, mocker, _lts_split_active
+):
+    """When the integration HEAD can't be resolved (GitHub unavailable), the loop
+    degrades to today's behavior but softens the currency assertion with a
+    provisional caveat — and never crashes."""
+    await _ensure_releaseversion_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "d" * 40
+    version = _make_stabilize_version_with_candidate(candidate)
+    version.project_id = project.id
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    _patch_candidate_currency(mocker, resolved=None, head_sha="e" * 40)
+    suffix = await _spawn_and_get_stabilize_suffix(project, db_session)
+
+    assert "POSSIBLY-STALE" not in suffix
+    assert "the audit sub-score is the binding constraint on promotion" in suffix
+    assert "Could not confirm" in suffix
+
+
 @pytest.mark.asyncio
 async def test_stabilize_hint_names_hard_blocker_as_binding_constraint(
     db_session, mocker, _lts_split_active

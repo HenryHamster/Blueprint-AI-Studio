@@ -210,6 +210,16 @@ from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
+# Conclusive qualification verdicts — when a candidate commit receives one of
+# these verdicts, the outcome is settled and idempotent (relying on lucky
+# re-rolls of a coin-flip margin is not sound). A re-run is only permitted
+# when the integration branch advances to a new commit. Infra/error outcomes
+# (infra_failure, error, etc.) are non-conclusive and always re-run, since they
+# produced no real quality verdict.
+_CONCLUSIVE_VERDICT_STATUSES: frozenset[str] = frozenset(
+    {"promoted", "not_promoted", "dry_run"}
+)
+
 # ---------------------------------------------------------------------------
 # Policy — the trusted core.  weights + threshold come from a human-owned file.
 # The hardcoded fallback rubric (_DEFAULT_POLICY) and the scoring math live in
@@ -902,14 +912,14 @@ async def run_qualification(
         terminated is *not* in flight — it is awaiting finalize — so a fresh
         run is still allowed; ``_finalize_qualification``/the reaper handle
         that stale record.)
-      * the prior qualification finalized as a ``dry_run`` and ``automain``
-        has not advanced since ⇒ ``{"status": "already_dry_run"}``.  In the
-        shipped-dark default (``promotion_enabled=False``) a passing candidate
-        records ``status="dry_run"`` and the version stays open + stabilize.
-        Without this guard the strategic agent re-emits ``qualify_request``
-        every cycle and re-spawns two agent VMs for an identical, already-
-        scored commit.  Once ``automain`` moves, the candidate is new and a
-        fresh qualification is allowed.
+      * a conclusive qualification verdict (promoted/not_promoted/dry_run) was
+        reached for this candidate commit and ``automain`` has not advanced
+        since ⇒ ``{"status": "cached_verdict", ...}``.  A conclusive verdict is
+        settled and idempotent — relying on lucky re-rolls of an LLM audit at
+        the margin is not sound. Once ``automain`` advances to a new commit,
+        that unscored candidate triggers a fresh qualification.  Non-conclusive
+        outcomes (infra_failure, error) always re-run when re-requested since
+        they produced no real quality verdict.
 
     Concurrency (audit C3): two callers can race here — the strategic
     ``qualify_request`` path and the admin ``POST /qualify`` endpoint.  Neither
@@ -933,7 +943,7 @@ async def run_qualification(
          side).  ``ci_green`` is recorded but not acted on here — the composite
          in ``_finalize_qualification`` applies it as a hard blocker.
       4. Lock the ``ReleaseVersion`` row, then re-check the in-flight /
-         already-dry-run guards under the lock.
+         cached-verdict guards under the lock.
       5. Spawn a ``release_audit`` task (clones ``main``, audits the
          ``main...<candidate_sha>`` diff against main's standards) and — only
          when ``smoketest_enabled`` is True — a qualify-time ``smoketest`` task.
@@ -947,7 +957,7 @@ async def run_qualification(
          bump ``version.qualification_attempts``.
 
     Returns a status dict.  ``status`` is ``"spawned"`` on success;
-    ``"wrong_phase"`` / ``"already_pending"`` / ``"already_dry_run"`` when a
+    ``"wrong_phase"`` / ``"already_pending"`` / ``"cached_verdict"`` when a
     guard fired (no side effects); or an error code (``"project_not_found"``,
     ``"no_credentials"``, ``"sha_error"``, ``"spawn_failed"``).  The caller
     commits the session.
@@ -1125,26 +1135,33 @@ async def run_qualification(
         )
         return {"status": "already_pending"}
 
-    # Guard 3 (under the lock — audit H1): the prior qualification finalized as
-    # a dry_run and automain has not advanced.  In the shipped-dark default
-    # (promotion_enabled=False) a passing candidate records status="dry_run"
-    # and the version stays open + stabilize; the strategic agent then re-emits
-    # qualify_request every cycle.  Re-qualifying the same already-scored
-    # commit just burns two more agent VMs, so short-circuit until automain
-    # actually moves.
+    # Guard 3 (under the lock): a conclusive qualification verdict
+    # (promoted/not_promoted/dry_run) for this candidate commit has been reached
+    # and automain has not advanced. A conclusive verdict is settled and
+    # idempotent — re-scoring identical code can yield a different (potentially
+    # lucky) result, so that verdict is not re-rolled on the same commit.
+    # Infra/error outcomes are non-conclusive; they must re-run when the
+    # qualification is re-requested.  Once automain moves to a new commit, that
+    # new candidate is unscored and a fresh qualification is always permitted.
     prior_qual = version.last_qualification or {}
+    prior_status = prior_qual.get("status")
     if (
-        prior_qual.get("status") == "dry_run"
+        prior_status in _CONCLUSIVE_VERDICT_STATUSES
         and prior_qual.get("candidate_sha") == candidate_sha
     ):
         logger.info(
             "[RELEASE_QUALIFIER] run_qualification: version v%d already has a "
-            "dry_run for candidate %s (automain unchanged) — skipping "
-            "(already_dry_run)",
+            "conclusive %s verdict for candidate %s (automain unchanged) — "
+            "skipping (cached verdict)",
             version.version_number,
+            prior_status,
             candidate_sha[:8],
         )
-        return {"status": "already_dry_run"}
+        return {
+            "status": "cached_verdict",
+            "cached_verdict_status": prior_status,
+            "candidate_sha": candidate_sha,
+        }
 
     # Carry forward the infra-failure streak so _finalize_qualification can
     # detect a persistently broken qualifier pipeline.  The streak is the count

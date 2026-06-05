@@ -2982,12 +2982,13 @@ async def test_run_qualification_version_vanished_before_lock(db_session, mocker
 
 
 @pytest.mark.asyncio
-async def test_run_qualification_already_dry_run_same_sha_is_noop(db_session, mocker):
-    """Audit H1: when the prior qualification finalized as a dry_run and
-    automain HEAD still equals the recorded candidate_sha, run_qualification
-    early-returns already_dry_run and spawns nothing — the strategic agent
+async def test_run_qualification_cached_dry_run_same_sha_is_noop(db_session, mocker):
+    """Idempotent qualification: when a conclusive dry_run verdict exists for
+    this candidate_sha and automain HEAD still equals it, run_qualification
+    early-returns cached_verdict and spawns nothing — the strategic agent
     re-emitting qualify_request every cycle must not re-spawn 2 agent VMs for
-    an identical, already-scored commit while promotion ships dark."""
+    an identical, already-scored commit. Relying on lucky re-rolls is not a
+    sound gate; the next automain advance will trigger a fresh qualification."""
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
     dry_run_sha = "drc0de00" * 5  # 40-char placeholder SHA
@@ -3021,7 +3022,8 @@ async def test_run_qualification_already_dry_run_same_sha_is_noop(db_session, mo
     result = await rq.run_qualification(db_session, project.id, version)
     await db_session.commit()
 
-    assert result["status"] == "already_dry_run"
+    assert result["status"] == "cached_verdict"
+    assert result["cached_verdict_status"] == "dry_run"
 
     await db_session.refresh(version)
     # The dry_run record is untouched, attempts NOT bumped.
@@ -3084,6 +3086,179 @@ async def test_run_qualification_dry_run_but_automain_moved_runs_fresh(
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "pending"
     assert version.last_qualification["candidate_sha"] == new_sha
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_cached_not_promoted_same_sha_is_noop(db_session, mocker):
+    """Idempotent qualification: when a conclusive not_promoted verdict exists
+    for this candidate_sha and automain HEAD still equals it, run_qualification
+    early-returns cached_verdict and spawns nothing — a candidate that scored
+    below the promotion bar is not re-audited on the same commit."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "notprom0" * 5  # 40-char placeholder SHA
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "ci_green": True,
+        "confidence": 0.82,
+        "threshold": 0.90,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    attempts_before = version.qualification_attempts
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    # automain HEAD still equals the not_promoted candidate.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate_sha),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "cached_verdict"
+    assert result["cached_verdict_status"] == "not_promoted"
+
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "not_promoted"
+    assert version.qualification_attempts == attempts_before
+
+    # No child tasks spawned.
+    from sqlmodel import select
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_cached_promoted_same_sha_is_noop(db_session, mocker):
+    """Idempotent qualification: when a conclusive promoted verdict exists
+    for this candidate_sha and automain HEAD still equals it, run_qualification
+    early-returns cached_verdict and spawns nothing — a successfully promoted
+    commit is not re-audited."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "promot00" * 5  # 40-char placeholder SHA
+    version.last_qualification = {
+        "status": "promoted",
+        "candidate_sha": candidate_sha,
+        "ci_green": True,
+        "confidence": 0.95,
+        "threshold": 0.90,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    attempts_before = version.qualification_attempts
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    # automain HEAD still equals the promoted candidate.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate_sha),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "cached_verdict"
+    assert result["cached_verdict_status"] == "promoted"
+
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "promoted"
+    assert version.qualification_attempts == attempts_before
+
+    # No child tasks spawned.
+    from sqlmodel import select
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_non_conclusive_error_always_retries(db_session, mocker):
+    """Non-idempotent infra/error verdicts: when a prior qualification
+    finalized with an error status (not a conclusive verdict) and the
+    candidate_sha is unchanged, run_qualification proceeds with a fresh run
+    (not cached) because the error produced no real quality verdict."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "errorsh0" * 5  # 40-char placeholder SHA
+    version.last_qualification = {
+        "status": "error",
+        "error": "spawn_failed",
+        "candidate_sha": candidate_sha,
+        "started_at": "2026-05-19T00:00:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Create a mock audit task to return from spawn.
+    audit_task = Task(
+        project_id=project.id,
+        title="audit-retry",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit-retry",
+        status=TaskStatus.QUEUED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    # automain HEAD still equals the error candidate.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate_sha),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+    mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(return_value=audit_task),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    # Not cached — a fresh qualification spawned despite unchanged sha.
+    assert result["status"] == "spawned"
 
 
 # ===========================================================================

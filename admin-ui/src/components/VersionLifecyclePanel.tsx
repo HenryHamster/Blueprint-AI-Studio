@@ -24,7 +24,7 @@ const QUAL_VERDICT_COLOR: Record<string, string> = {
   pending: 'text-blue-400',
   promoted: 'text-emerald-400',
   dry_run: 'text-blue-400',
-  already_dry_run: 'text-blue-400',
+  cached_verdict: 'text-blue-400',
   not_promoted: 'text-amber-400',
   promotion_failed: 'text-red-400',
   error: 'text-red-400',
