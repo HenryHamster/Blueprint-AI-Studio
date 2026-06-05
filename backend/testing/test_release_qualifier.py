@@ -2484,6 +2484,18 @@ def _qualifier_ci_resolves_green(mocker):
         "app.github.list_versions_at_ref",
         new=AsyncMock(return_value=["0001_init.py", "0002_feature.py"]),
     )
+    # Default the finalize-time scratch-DB migration-APPLY gate to CLEAN.
+    # _finalize_qualification calls run_migration_apply_gate, which in production
+    # reproduces the candidate's upgrade against production's recorded state on
+    # an isolated Postgres scratch DB. The test session is SQLite, so the real
+    # gate would 'defer' (non-Postgres bind) and HOLD every finalize as an infra
+    # failure. Defaulting it to ("ok", None) keeps migration-apply safety
+    # incidental for the majority of tests; tests exercising the gate re-patch
+    # this in their own body (block / defer); the later patch wins.
+    mocker.patch(
+        "app.release_qualifier.run_migration_apply_gate",
+        new=AsyncMock(return_value=("ok", None)),
+    )
 
 
 # ===========================================================================
@@ -3788,6 +3800,179 @@ async def test_finalize_holds_when_migration_listing_fetch_fails(db_session, moc
     assert version.status == "open"
     assert version.phase == "stabilize"
     assert version.last_qualification["status"] == "infra_failure"
+
+
+@pytest.mark.asyncio
+async def test_finalize_blocks_on_migration_apply_drift(db_session, mocker):
+    """The scratch-DB migration-apply gate is a SECOND deterministic dimension:
+    when it returns 'block' (the candidate's chain, replayed against production's
+    real recorded schema, leaves a required object uncreated — the v5 computejob
+    renumber-skip class) an otherwise-clean candidate is HARD-blocked. Confidence
+    forced to 0, promote False, blocker migration_apply_drift, and the verdict
+    record carries migration_apply_safety='block' with the specific detail.
+
+    The filename-identity gate stays CLEAN here (autouse default), isolating the
+    apply gate as the sole blocker — proving the two dimensions are distinct."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # The apply gate reports deploy-fatal drift: a required table is uncreated
+    # when the candidate's chain is applied against production's recorded state.
+    apply_detail = (
+        "candidate migrations applied against production's recorded revision "
+        "'0375' leave the schema missing required object(s) (deploy-fatal "
+        "drift): table 'computejob'"
+    )
+    mocker.patch(
+        "app.release_qualifier.run_migration_apply_gate",
+        new=AsyncMock(return_value=("block", apply_detail)),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "migration_apply_drift"
+    assert result["confidence"] == 0.0
+    promote_spy.assert_not_called()
+
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["status"] == "not_promoted"
+    assert lq["blocker"] == "migration_apply_drift"
+    assert lq["confidence"] == 0.0
+    assert version.phase == "stabilize"
+    # The new fields are recorded alongside (not replacing) the existing
+    # migration-identity fields — the identity gate stayed clean here.
+    assert lq["migration_safety"] == "ok"
+    assert lq["migration_apply_safety"] == "block"
+    assert lq["migration_apply_safety_detail"] == apply_detail
+    assert "computejob" in lq["migration_apply_safety_detail"]
+
+
+@pytest.mark.asyncio
+async def test_finalize_holds_when_migration_apply_gate_defers(db_session, mocker):
+    """Fail-safe: when the apply gate cannot determine safety (prod state
+    unreadable, candidate fetch failed, scratch DB unprovisionable) it returns
+    'defer'. Migration-apply safety is UNKNOWN, so the release is HELD as an
+    infra failure (no quality verdict, returned to stabilize) — never waved
+    through, mirroring the identity gate's defer path."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    mocker.patch(
+        "app.release_qualifier.run_migration_apply_gate",
+        new=AsyncMock(
+            return_value=("defer", "could not read production's recorded state")
+        ),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "infra_failure"
+    assert result["error"] == "migration_apply_check_unavailable"
+    promote_spy.assert_not_called()
+
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+    assert version.last_qualification["status"] == "infra_failure"
+
+
+@pytest.mark.asyncio
+async def test_finalize_apply_gate_ok_does_not_block_promotion(db_session, mocker):
+    """When the apply gate returns 'ok' (the autouse default) qualification
+    proceeds normally — the new dimension is inert on a clean candidate and the
+    verdict records migration_apply_safety='ok'. This is the complement of the
+    block/defer cases above: an 'ok' apply gate never perturbs the promotion
+    path."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Leave the autouse ("ok", None) apply-gate default in place. The candidate
+    # is otherwise pristine, so it clears every dimension and reaches promote();
+    # the apply gate never blocks it.
+    promote_spy = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Reaching promote() at all proves the apply gate did not block; the verdict
+    # record threaded into promote carries the clean apply-safety fields.
+    promote_spy.assert_called_once()
+    base_record = promote_spy.call_args.kwargs["base_record"]
+    assert base_record["migration_apply_safety"] == "ok"
+    assert base_record["migration_apply_safety_detail"] is None
+    assert base_record["blocker"] is None
 
 
 @pytest.mark.asyncio

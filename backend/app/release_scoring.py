@@ -52,6 +52,7 @@ def compute_composite(
     smoketest_enabled: bool = True,
     ci_state: str = "red",  # _CI_RED — defined later in module; use literal here
     migration_collision: bool = False,
+    migration_apply_blocked: bool = False,
 ) -> dict[str, Any]:
     """Compute the composite promotion confidence for a release candidate.
 
@@ -68,6 +69,18 @@ def compute_composite(
         (``release_qualifier._finalize_qualification``) precomputes this with
         ``find_content_divergent_revisions`` and the existing GitHub fetch
         helpers — this function stays pure and only consumes the boolean.
+      * ``migration_apply_blocked`` is True — the candidate's migration chain,
+        applied the deploy way against production's REAL recorded schema state
+        (live ``alembic_version`` stamp + present tables) on an isolated scratch
+        DB, leaves the schema missing a required object (the renumber-skip
+        class, v5 computejob incident) (``"migration_apply_drift"``).  This is a
+        SECOND, distinct deterministic dimension from ``migration_collision``:
+        the filename-identity check structurally cannot see a live DB stamped
+        ahead of its real schema.  Checked AFTER the identity collision so a
+        candidate failing both reports the identity collision first.  The
+        caller precomputes this via
+        ``migration_apply_gate.run_migration_apply_gate`` — this function stays
+        pure and only consumes the boolean.
       * ``smoketest_score`` is None — the smoketest never produced a usable
         score, treated as a startup-suite failure
         (``"smoketest_startup_failed"``).  ONLY checked when
@@ -147,6 +160,14 @@ def compute_composite(
         # audit-derived blockers so it is a clear, attributed gate rather than a
         # soft, score-eroding audit finding the spawned auditor might miss.
         blocker = "migration_identity_collision"
+    elif migration_apply_blocked:
+        # The candidate's migration chain, replayed the deploy way against
+        # production's REAL recorded schema state on an isolated scratch DB,
+        # leaves the schema missing a required object (the renumber-skip class,
+        # v5 computejob incident).  A SECOND deterministic dimension distinct
+        # from the filename-identity collision above — checked after it so a
+        # candidate failing both reports the identity collision first.
+        blocker = "migration_apply_drift"
     elif smoketest_enabled and smoketest_score is None:
         # Only a hard blocker when the smoketest subsystem was actually
         # enabled — a disabled subsystem legitimately produces no score.

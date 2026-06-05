@@ -312,6 +312,79 @@ def test_compute_composite_ci_red_outranks_migration_collision():
 
 
 # ===========================================================================
+# compute_composite — the migration_apply_drift hard blocker (scratch-DB
+# apply-vs-prod-schema gate; a SECOND, distinct dimension from the filename
+# identity collision above).
+# ===========================================================================
+
+
+def test_compute_composite_migration_apply_drift_forces_zero():
+    """An otherwise-perfect candidate (CI green, audit/erosion/smoke 1.0, no
+    identity collision) is forced to confidence 0 / promote False when
+    migration_apply_blocked is True, with blocker migration_apply_drift."""
+    result = compute_composite(
+        ci_green=True,
+        audit_score=1.0,
+        test_erosion=1.0,
+        smoketest_score=1.0,
+        policy=_POLICY,
+        ci_state="green",
+        migration_apply_blocked=True,
+    )
+    assert result["confidence"] == 0.0
+    assert result["promote"] is False
+    assert result["blocker"] == "migration_apply_drift"
+
+
+def test_compute_composite_apply_drift_default_is_inert():
+    """The same perfect candidate with migration_apply_blocked left at its
+    default False promotes — the new blocker is inert unless True is passed."""
+    result = compute_composite(
+        ci_green=True,
+        audit_score=1.0,
+        test_erosion=1.0,
+        smoketest_score=1.0,
+        policy=_POLICY,
+        ci_state="green",
+    )
+    assert result["blocker"] is None
+    assert result["promote"] is True
+
+
+def test_compute_composite_identity_collision_outranks_apply_drift():
+    """The filename-identity collision is evaluated before the apply-drift gate,
+    so a candidate failing BOTH deterministic migration dimensions reports
+    migration_identity_collision first (the identity check is cheaper/earlier)."""
+    result = compute_composite(
+        ci_green=True,
+        audit_score=1.0,
+        test_erosion=1.0,
+        smoketest_score=1.0,
+        policy=_POLICY,
+        ci_state="green",
+        migration_collision=True,
+        migration_apply_blocked=True,
+    )
+    assert result["blocker"] == "migration_identity_collision"
+
+
+def test_compute_composite_ci_red_outranks_apply_drift():
+    """CI-red is the most fundamental failure, checked before the apply-drift
+    gate, so a candidate that is both red and apply-blocked reports
+    ci_not_green first."""
+    result = compute_composite(
+        ci_green=False,
+        audit_score=1.0,
+        test_erosion=1.0,
+        smoketest_score=1.0,
+        policy=_POLICY,
+        ci_state="red",
+        migration_apply_blocked=True,
+    )
+    assert result["blocker"] == "ci_not_green"
+
+
+# ===========================================================================
 # Reconciliation of the revision-0143 incident: the INTEGRATION side moves, the
 # DEPLOYED promotion-target migration stays put (immutable).
 # ===========================================================================
