@@ -7877,6 +7877,60 @@ def test_summarize_open_messages_preserves_critical_and_oldest():
     assert len(bug["content"]) == _OPEN_MESSAGE_EXCERPT_MAX_CHARS
 
 
+def test_reproducing_bug_survives_over_older_stale_one():
+    """A reproducing bug report ranks higher than an older stale one.
+
+    When the inbox must be trimmed under budget pressure, reproducing bug
+    reports (citation_state != "absent") should rank higher in survival priority
+    than stale ones (citation_state == "absent"). This ensures fresh, actionable
+    bugs are preserved while stale ones (likely already fixed/refactored away)
+    are deprioritized.
+    """
+    from app.strategic_spawning import _open_message_survival_key, _bound_open_messages
+
+    messages = []
+    # Old STALE bug report (citation_state == "absent")
+    messages.append(
+        {
+            "id": "old_stale",
+            "type": "BUG_REPORT",
+            "content": "This bug is stale (cited code is absent)",
+            "created_at": "2026-05-01T00:00:00",
+            "citation_state": "absent",
+        }
+    )
+    # Newer REPRODUCING bug report (no citation_state = not stale)
+    messages.append(
+        {
+            "id": "new_reproducing",
+            "type": "BUG_REPORT",
+            "content": "This bug is fresh and reproducing",
+            "created_at": "2026-06-01T00:00:00",
+        }
+    )
+
+    # Verify the reproducing bug ranks higher (lower tuple value) than the stale one.
+    stale_key = _open_message_survival_key(messages[0])
+    reproducing_key = _open_message_survival_key(messages[1])
+
+    # Reproducing should have tier=0, stale should have tier=1.
+    assert reproducing_key[0] == 0  # tier 0: reproducing critical
+    assert stale_key[0] == 1  # tier 1: stale critical
+    # So reproducing_key < stale_key, meaning reproducing survives first.
+    assert reproducing_key < stale_key
+
+    # When both fit in the budget, both survive.
+    trimmed = _bound_open_messages(messages, keep=2)
+    ids = {m["id"] for m in trimmed}
+    assert "old_stale" in ids
+    assert "new_reproducing" in ids
+
+    # When we must trim to 1 item, the reproducing bug survives.
+    trimmed_strict = _bound_open_messages(messages, keep=1)
+    assert len(trimmed_strict) == 1
+    assert trimmed_strict[0]["id"] == "new_reproducing"
+
+
 class TestParallelismHint:
     """_build_parallelism_hint nudges toward enough INDEPENDENT direction lanes.
 

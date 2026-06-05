@@ -1768,13 +1768,27 @@ _CRITICAL_OPEN_MESSAGE_TYPES = (
 def _open_message_survival_key(msg: dict) -> tuple:
     """Sort key ranking an open message's survival priority HIGH→LOW.
 
-    Critical types (BUG_REPORT/BLOCKER) rank first; within a tier, oldest-open
-    items rank first (ascending created_at). The HEAD of the sorted list
-    survives when the feed must be bounded, so BUG_REPORT/BLOCKER and the
-    oldest-open items are the last to be dropped.
+    Critical types (BUG_REPORT/BLOCKER) rank first, with reproducing (non-stale)
+    ones ahead of stale (citation_state == "absent") ones; within each tier,
+    oldest-open items rank first (ascending created_at). The HEAD of the sorted
+    list survives when the feed must be bounded, so reproducing criticals are
+    last to be dropped, followed by stale criticals, then non-critical messages.
     """
     is_critical = msg.get("type") in _CRITICAL_OPEN_MESSAGE_TYPES
-    return (0 if is_critical else 1, msg.get("created_at") or "")
+    citation_state = msg.get("citation_state")
+    is_stale = citation_state == "absent"
+
+    # Tier 0: reproducing critical messages (highest priority)
+    # Tier 1: stale critical messages (lower than reproducing)
+    # Tier 2: non-critical messages
+    if is_critical and not is_stale:
+        tier = 0
+    elif is_critical and is_stale:
+        tier = 1
+    else:
+        tier = 2
+
+    return (tier, msg.get("created_at") or "")
 
 
 def _bound_open_messages(messages: list, keep: int) -> list:

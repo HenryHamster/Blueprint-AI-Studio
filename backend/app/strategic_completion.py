@@ -3007,6 +3007,21 @@ async def _handle_strategic_completion(
         except ValueError:
             msg_type = MessageType.NOTE
         _msg_ctx = msg_entry.get("context") or {}
+        # Reproduce-on-HEAD citation grounding for strategist-authored bug-class
+        # messages: a BUG_REPORT/BLOCKER parsed out of the strategic agent's
+        # output that cites code already fixed/refactored away would re-enter the
+        # strategist inbox fully trusted. Run the SAME conservative grounding the
+        # user/annotation paths use and stash an ``_provenance_warnings`` signal
+        # when a citation is unambiguously absent. Best-effort — indeterminate
+        # never flags, never fails message emission.
+        if msg_type in (MessageType.BUG_REPORT, MessageType.BLOCKER):
+            from app.source_ref_validation import compute_message_citation_warning
+
+            warning = await compute_message_citation_warning(
+                session, project, content
+            )
+            if warning:
+                _msg_ctx = {**_msg_ctx, "_provenance_warnings": warning}
         new_msg = ProjectMessage(
             project_id=project.id,
             message_type=msg_type,

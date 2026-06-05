@@ -1425,13 +1425,27 @@ async def strategic_operation(
             msg_type = MessageType(str(data.get("type", "NOTE")).upper())
         except ValueError:
             msg_type = MessageType.NOTE
+        msg_ctx = data.get("context") or {}
+        # Reproduce-on-HEAD citation grounding for strategist-authored bug-class
+        # messages: a strategist-emitted BUG_REPORT/BLOCKER citing code already
+        # fixed/refactored away would re-enter the strategist inbox fully
+        # trusted. Run the SAME conservative grounding the user/annotation paths
+        # use and stash an ``_provenance_warnings`` signal when a citation is
+        # unambiguously absent. Best-effort — indeterminate never flags, never
+        # fails message creation. (project is already locked above.)
+        if msg_type in (MessageType.BUG_REPORT, MessageType.BLOCKER):
+            warning = await _compute_message_citation_warning(
+                session, project, content
+            )
+            if warning:
+                msg_ctx = {**msg_ctx, "_provenance_warnings": warning}
         new_msg = ProjectMessage(
             project_id=project.id,
             message_type=msg_type,
             from_type="strategic",
             from_task_id=task.id,
             content=content,
-            context=data.get("context") or {},
+            context=msg_ctx,
         )
         session.add(new_msg)
         await session.commit()
