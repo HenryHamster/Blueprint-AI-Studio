@@ -8967,3 +8967,297 @@ async def test_converge_refuses_cycle(reaper_db, _no_broadcast):
     assert n == 0
     assert not later.depends_on
     assert earlier.depends_on == [str(later.id)]
+
+
+# ── Step 17: auto-resolve OPEN owned bug-class messages on owner success ───────
+
+from app.reaper_sweeps import sweep_resolve_open_owned_bug_messages  # noqa: E402
+
+
+async def _make_landed_task(db, project, *, status=TaskStatus.COMPLETED, landed=True):
+    """Create a task; when landed=True it is a merged completion (is_merged_completion)."""
+    ctx = {"pr_merged": True, "landed_on_integration": True} if landed else {}
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        status=status,
+        context=ctx,
+    )
+    db.add(task)
+    await db.commit()
+    await db.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_open_owned_resolves_when_direction_completed(reaper_db):
+    """An open owned BUG_REPORT resolves when its owning direction is 'completed'."""
+    project = await _make_project(reaper_db)
+    await _make_direction_row(
+        reaper_db, project, direction_key="d-done1", status="completed"
+    )
+    msg = await _make_bug_message(
+        reaper_db, project, context={"direction_id": "d-done1"}
+    )
+
+    resolved = await sweep_resolve_open_owned_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert "d-done1" in (msg.resolution or "")
+    assert "completed" in (msg.resolution or "")
+    assert msg.resolved_at is not None
+    assert msg.context.get("_owned_auto_resolved_at") is not None
+    assert msg.context.get("_owned_auto_resolution") == msg.resolution
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dir_status", ["retired", "rejected", "expired", "superseded"])
+async def test_open_owned_stays_open_when_direction_ended_without_landing(
+    reaper_db, dir_status
+):
+    """A direction that ended without landing the fix (retired/rejected/expired/
+    superseded) must NOT resolve the message — only genuine success resolves."""
+    project = await _make_project(reaper_db)
+    await _make_direction_row(
+        reaper_db, project, direction_key=f"d-{dir_status}", status=dir_status
+    )
+    msg = await _make_bug_message(
+        reaper_db, project, context={"direction_id": f"d-{dir_status}"}
+    )
+
+    resolved = await sweep_resolve_open_owned_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+    assert msg.resolution is None
+
+
+@pytest.mark.asyncio
+async def test_open_owned_resolves_when_owning_pr_merged(reaper_db):
+    """An open owned BLOCKER resolves when its owning PR's source task is a merged
+    completion (COMPLETED + landed signal)."""
+    project = await _make_project(reaper_db)
+    task = await _make_landed_task(reaper_db, project, landed=True)
+    msg = await _make_bug_message(
+        reaper_db,
+        project,
+        msg_type=MessageType.BLOCKER,
+        context={"pr_number": 4567, "source_task_id": str(task.id)},
+    )
+
+    resolved = await sweep_resolve_open_owned_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert "#4567" in (msg.resolution or "")
+    assert "merged" in (msg.resolution or "")
+
+
+@pytest.mark.asyncio
+async def test_open_owned_stays_open_when_owning_task_completed_but_unmerged(reaper_db):
+    """COMPLETED != merged: a COMPLETED owner with no landed signal has NOT landed
+    the fix, so the message stays open (the false-resolution this guards against)."""
+    project = await _make_project(reaper_db)
+    task = await _make_landed_task(reaper_db, project, landed=False)
+    msg = await _make_bug_message(
+        reaper_db,
+        project,
+        context={"pr_number": 99, "source_task_id": str(task.id)},
+    )
+
+    # verify_pr_merged stubbed to False so the secondary check can't merge it either.
+    async def _never_merged(_task, _session):
+        return False
+
+    resolved = await sweep_resolve_open_owned_bug_messages(
+        reaper_db, _utcnow(), verify_pr_merged=_never_merged
+    )
+
+    assert resolved == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_status", [TaskStatus.FAILED, TaskStatus.CANCELLED])
+async def test_open_owned_stays_open_when_owning_task_failed_or_cancelled(
+    reaper_db, task_status
+):
+    """An owner that failed/was cancelled never delivered the fix — stays open."""
+    project = await _make_project(reaper_db)
+    task = await _make_landed_task(
+        reaper_db, project, status=task_status, landed=False
+    )
+    msg = await _make_bug_message(
+        reaper_db,
+        project,
+        context={"pr_number": 7, "source_task_id": str(task.id)},
+    )
+
+    resolved = await sweep_resolve_open_owned_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_open_owned_stays_open_when_owner_missing(reaper_db):
+    """A source_task_id pointing at a non-existent task is fail-safe — stays open."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(
+        reaper_db,
+        project,
+        context={"pr_number": 3, "source_task_id": str(_uuid_mod.uuid4())},
+    )
+
+    resolved = await sweep_resolve_open_owned_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_open_owned_stays_open_when_owner_malformed(reaper_db):
+    """A malformed source_task_id (not a UUID) is fail-safe — stays open, no abort."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(
+        reaper_db,
+        project,
+        context={"pr_number": 3, "source_task_id": "not-a-uuid"},
+    )
+
+    resolved = await sweep_resolve_open_owned_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_open_owned_stays_open_when_no_ownership_context(reaper_db):
+    """A bug message with no direction_id / pr ownership context stays open."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(reaper_db, project, context={"source": "misc"})
+
+    resolved = await sweep_resolve_open_owned_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_open_owned_stays_open_when_direction_still_active(reaper_db):
+    """A still-active owning direction has not landed — message stays open."""
+    project = await _make_project(reaper_db)
+    await _make_direction_row(
+        reaper_db, project, direction_key="d-active1", status="active"
+    )
+    msg = await _make_bug_message(
+        reaper_db, project, context={"direction_id": "d-active1"}
+    )
+
+    resolved = await sweep_resolve_open_owned_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_open_owned_resolution_is_idempotent(reaper_db):
+    """Re-running the sweep on an already-resolved message is a no-op (status off 'open')."""
+    project = await _make_project(reaper_db)
+    await _make_direction_row(
+        reaper_db, project, direction_key="d-idem1", status="completed"
+    )
+    msg = await _make_bug_message(
+        reaper_db, project, context={"direction_id": "d-idem1"}
+    )
+
+    first = await sweep_resolve_open_owned_bug_messages(reaper_db, _utcnow())
+    assert first == 1
+    second = await sweep_resolve_open_owned_bug_messages(reaper_db, _utcnow())
+    assert second == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_open_owned_sweep_ignores_linked_status_messages(reaper_db):
+    """The Step-17 sweep is DISJOINT from the Step-15 linked sweep: a 'linked'
+    message with a completed owning direction is NOT touched here."""
+    project = await _make_project(reaper_db)
+    await _make_direction_row(
+        reaper_db, project, direction_key="d-linked1", status="completed"
+    )
+    # status='linked' (the linked sweep's domain), not 'open'.
+    msg = await _make_bug_message(
+        reaper_db,
+        project,
+        status="linked",
+        context={"direction_id": "d-linked1"},
+    )
+
+    resolved = await sweep_resolve_open_owned_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "linked"
+
+
+@pytest.mark.asyncio
+async def test_open_owned_sweep_ignores_user_authored_messages(reaper_db):
+    """Operator-authored (from_type='user') bug reports are never auto-resolved,
+    even with a completed owning direction."""
+    project = await _make_project(reaper_db)
+    await _make_direction_row(
+        reaper_db, project, direction_key="d-user1", status="completed"
+    )
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BUG_REPORT,
+        from_type="user",
+        content="operator bug",
+        status="open",
+        context={"direction_id": "d-user1"},
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+    await reaper_db.refresh(msg)
+
+    resolved = await sweep_resolve_open_owned_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_open_owned_one_bad_row_does_not_abort_batch(reaper_db):
+    """A malformed owner row is skipped (fail-safe) while a sibling resolvable
+    message in the same batch still resolves."""
+    project = await _make_project(reaper_db)
+    await _make_direction_row(
+        reaper_db, project, direction_key="d-good1", status="completed"
+    )
+    bad = await _make_bug_message(
+        reaper_db, project, context={"pr_number": 1, "source_task_id": "bad-uuid"}
+    )
+    good = await _make_bug_message(
+        reaper_db, project, context={"direction_id": "d-good1"}
+    )
+
+    resolved = await sweep_resolve_open_owned_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 1
+    await reaper_db.refresh(bad)
+    await reaper_db.refresh(good)
+    assert bad.status == "open"
+    assert good.status == "resolved"

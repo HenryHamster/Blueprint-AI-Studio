@@ -1877,3 +1877,220 @@ async def sweep_converge_linked_bug_messages(
         )
 
     return acted
+
+
+# ── Step 17: auto-resolve OPEN owned bug-class messages on owner success ──────
+#
+# A BUG_REPORT/BLOCKER created in the 'open' state carries machine-readable
+# ownership context stamped at CREATION time (NOT the strategist's
+# _convergence_link, which the Step-15 linked sweep owns):
+#   - Direction-owned: context['direction_id']  (pause/escalation posters in
+#     notification_dispatch.py; the dedup-deadlock BUG_REPORT in
+#     research_direction_state.py).
+#   - PR/task-owned:    context['pr_number'] + context['source_task_id']
+#     (the repeat-fingerprint halt BLOCKER in review_pipeline.py).
+#
+# Nothing on the integration branch ever resolves these open owned messages:
+# the routine-message retention sweep deliberately skips BUG_REPORT/BLOCKER, and
+# the Step-15 linked sweep only acts on messages the strategist has explicitly
+# moved to the 'linked' state. So once the owner genuinely LANDS — the owning
+# direction reaches 'completed', or the owning PR's source task is a merged
+# completion — the open message lingers forever in the strategist's inbox as
+# noise. This sweep closes only that loop, and ONLY on genuine SUCCESS.
+#
+# SUCCESS-ONLY, by construction: a message is resolved ONLY when the owning
+# direction's status == 'completed' OR the owning PR's source task satisfies the
+# canonical landed detector ``landed_signal.is_merged_completion`` (COMPLETED AND
+# carries the integration-branch landed signal). An owner that ended WITHOUT
+# delivering the fix — a retired/rejected/expired/superseded direction; a
+# failed/cancelled/missing task; a COMPLETED-but-unmerged task; an unknown,
+# malformed, or still-in-flight owner — leaves the message OPEN. Reaching some
+# terminal status is NOT enough; only landing resolves.
+#
+# Fail-safe: per-message owner resolution is wrapped so one bad row can never
+# abort the batch, and any error or ambiguity leaves the message open.
+#
+# Idempotent: resolution moves status off 'open', so the next pass (which filters
+# on status == 'open') skips already-resolved rows — re-running is a no-op.
+
+# Context audit keys stamped on an auto-resolution (traceability + idempotency).
+_OWNED_AUTO_RESOLVED_AT_KEY = "_owned_auto_resolved_at"
+_OWNED_AUTO_RESOLUTION_KEY = "_owned_auto_resolution"
+
+
+async def _owned_message_resolution(session, msg, *, verify_pr_merged) -> str | None:
+    """High-confidence audit string when ``msg``'s owner genuinely LANDED, else None.
+
+    Reads ownership context stamped at message creation (``direction_id`` first,
+    then ``pr_number`` + ``source_task_id``). Direction ownership wins when both
+    are present. Returns ``None`` — fail-safe, leaving the message open — for any
+    missing/unknown/malformed/still-in-flight owner or any owner that ended
+    without landing the fix.
+    """
+    from app.landed_signal import is_merged_completion
+    from app.models import Direction
+
+    ctx = msg.context if isinstance(msg.context, dict) else {}
+
+    # 1) Direction-owned: resolve ONLY on status == 'completed'. A direction that
+    #    was retired/rejected/expired/superseded ended WITHOUT landing the fix and
+    #    must leave the message open.
+    direction_id = ctx.get("direction_id")
+    if direction_id:
+        dir_row = (
+            (
+                await session.execute(
+                    select(Direction).where(
+                        Direction.project_id == msg.project_id,
+                        Direction.direction_key == str(direction_id),
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if dir_row is not None and (dir_row.status or "active") == "completed":
+            return f"Auto-resolved: owning direction '{direction_id}' completed"
+        # Direction owner present but not completed (or missing) — fail-safe open.
+        # Fall through only when there is NO direction owner at all.
+        if dir_row is not None:
+            return None
+
+    # 2) PR/task-owned: resolve ONLY when the source task is a merged completion.
+    #    Never infer 'merged' from a pr_url heuristic; never treat a
+    #    COMPLETED-but-unmerged task as success.
+    pr_number = ctx.get("pr_number")
+    source_task_id = ctx.get("source_task_id")
+    if pr_number is None or not source_task_id:
+        return None
+    try:
+        task_uuid = uuid.UUID(str(source_task_id))
+    except (ValueError, AttributeError, TypeError):
+        return None
+    task = await session.get(Task, task_uuid)
+    if task is None:
+        return None
+    # Primary detector: context-based, side-effect-free, identical to the Step-15
+    # linked sweep ("COMPLETED AND carries the landed signal"). A merged PR's
+    # source task is stamped landed at merge time.
+    if is_merged_completion(task):
+        return f"Auto-resolved: owning PR #{pr_number} merged"
+    # Secondary confirmation via the GitHub-backed verifier ONLY for a task that
+    # is already COMPLETED (so a still-active task is never probed and a
+    # COMPLETED-but-unmerged task is left open unless the verifier confirms the
+    # merge). Any verifier error is fail-safe (leaves the message open).
+    if task.status == TaskStatus.COMPLETED and verify_pr_merged is not None:
+        try:
+            if await verify_pr_merged(task, session):
+                return f"Auto-resolved: owning PR #{pr_number} merged"
+        except Exception:
+            return None
+    return None
+
+
+async def sweep_resolve_open_owned_bug_messages(
+    session,
+    now: datetime,
+    *,
+    batch_size: int = 200,
+    verify_pr_merged=None,
+) -> int:
+    """Step 17: auto-resolve OPEN owned BUG_REPORT/BLOCKER messages on owner success.
+
+    Selects up to ``batch_size`` OPEN, system/agent-authored bug-class messages
+    (DISJOINT from the Step-15 'linked' sweep) and resolves each one whose owning
+    outcome — read from creation-time context — has genuinely landed: the owning
+    direction reached 'completed', or the owning PR's source task is a merged
+    completion. Everything else (owner ended without landing, COMPLETED-but-
+    unmerged, missing/unknown/malformed/still-active, or any lookup error) leaves
+    the message OPEN.
+
+    Returns the number of messages auto-resolved.
+    """
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.models import ProjectMessage
+    from app.message_convergence import BUG_CLASS_TYPES, OPEN_STATUS, SYSTEM_AUTHORED_FROM_TYPES
+
+    if verify_pr_merged is None:
+        from app.rollup_pr_verification import _verify_pr_merged
+        verify_pr_merged = _verify_pr_merged
+
+    msgs = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.status == OPEN_STATUS,
+                    ProjectMessage.from_type.in_(list(SYSTEM_AUTHORED_FROM_TYPES)),
+                    ProjectMessage.message_type.in_(list(BUG_CLASS_TYPES)),
+                )
+                .order_by(ProjectMessage.created_at)
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(msgs) >= batch_size:
+        logger.warning(
+            "[REAPER] open-owned-message sweep hit cap=%d open bug-class messages — "
+            "result truncated; next cycle continues",
+            batch_size,
+        )
+
+    if not msgs:
+        return 0
+
+    resolved = 0
+    pending_broadcasts: list[tuple[str, dict]] = []
+    for msg in msgs:
+        # Fail-safe: one malformed/unreadable owner must never abort the batch.
+        try:
+            audit = await _owned_message_resolution(
+                session, msg, verify_pr_merged=verify_pr_merged
+            )
+        except Exception:
+            logger.warning(
+                "[REAPER] Step 17: owner resolution failed for message %s — "
+                "leaving open",
+                msg.id,
+                exc_info=True,
+            )
+            continue
+        if audit is None:
+            continue
+        msg.status = "resolved"
+        msg.resolution = audit
+        msg.resolved_at = now
+        ctx = dict(msg.context or {})
+        ctx[_OWNED_AUTO_RESOLVED_AT_KEY] = now.isoformat()
+        ctx[_OWNED_AUTO_RESOLUTION_KEY] = audit
+        msg.context = ctx
+        session.add(msg)
+        resolved += 1
+        pending_broadcasts.append(
+            (str(msg.project_id), {"message_id": str(msg.id)})
+        )
+        logger.info(
+            "[REAPER] Step 17: auto-resolved owned message %s — %s",
+            msg.id,
+            audit,
+        )
+
+    if resolved:
+        await session.commit()
+        for project_id, payload in pending_broadcasts:
+            try:
+                await _bcast(project_id, "message_updated", payload)
+            except Exception as _bcast_err:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] Step 17: broadcast failed for message %s: %s",
+                    payload.get("message_id"),
+                    _bcast_err,
+                )
+        logger.info(
+            "[REAPER] Step 17: auto-resolved %d open owned bug-class message(s)",
+            resolved,
+        )
+
+    return resolved

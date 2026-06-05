@@ -895,6 +895,7 @@ from app.reaper_sweeps import (  # noqa: E402
     sweep_stale_staged_directions,
     sweep_converge_linked_bug_messages,
     sweep_converge_duplicate_foundations,
+    sweep_resolve_open_owned_bug_messages,
 )
 
 # Zero-cycle starvation: a project that should be running the strategic loop but
@@ -3863,6 +3864,23 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Duplicate-foundation convergence sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 17: Auto-resolve OPEN owned bug-class messages — resolve an
+                # open system/agent BUG_REPORT/BLOCKER once the outcome that owns
+                # its fix (a direction or a PR, read from creation-time context)
+                # has genuinely LANDED: direction 'completed' or owning PR merged.
+                # Success-only + fail-safe; an owner that ended without landing
+                # leaves the message open. Disjoint from Step 15 (linked sweep).
+                _mark_reaper_progress()
+                try:
+                    await sweep_resolve_open_owned_bug_messages(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Open-owned-message resolve sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):
