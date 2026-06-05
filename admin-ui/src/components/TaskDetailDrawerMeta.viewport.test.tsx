@@ -18,6 +18,7 @@ vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response(JSON.stringify({ task_id: 'task-1', fix_loop_history: {}, summary: {} }), { status: 200 })),
   API_BASE_URL: 'http://localhost:8000',
   fetchComputeJobs: vi.fn(async () => []),
+  fetchKnowledgeDocument: vi.fn(async () => ({ id: 'doc-1', body: '# Full body\n\nDetailed markdown.' })),
   fetchTaskSerialConsole: vi.fn(async () => ({ serial_log: '', source: 'cached', vm_status: 'TERMINATED', vm_instance_id: 'test' })),
 }));
 

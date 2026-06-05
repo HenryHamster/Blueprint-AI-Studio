@@ -1,7 +1,8 @@
-import { afterEach, describe, test, vi } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { KnowledgeBrowser } from './KnowledgeBrowser';
+import { fetchKnowledgeDocuments } from '../api';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
 const sampleDocs = [
@@ -16,6 +17,7 @@ const sampleDocs = [
       { title: 'SQLAlchemy pool docs', url: 'https://docs.sqlalchemy.org/en/20/core/pooling.html', excerpt: 'max_overflow defaults to 10' },
     ],
     source_task_id: 'task-web-research-1',
+    source_kind: 'web_research',
     created_at: '2026-06-01T00:00:00Z',
     updated_at: '2026-06-01T00:00:00Z',
     forward_quality_verdict: { passed: true, reason: 'Well-cited, actionable, verified against current docs.', strategy: 'forward_quality' },
@@ -28,6 +30,7 @@ const sampleDocs = [
     tags: ['retry', 'backoff'],
     source_citations: [],
     source_task_id: null,
+    source_kind: 'design',
     created_at: '2026-05-30T00:00:00Z',
     updated_at: '2026-05-30T00:00:00Z',
     forward_quality_verdict: { passed: false, reason: 'Insufficient citations.', strategy: 'forward_quality' },
@@ -94,5 +97,30 @@ describe('KnowledgeBrowser — viewport regression', () => {
 
   test('interactive controls meet 44px touch target at 375px', async () => {
     await expectMinTouchTargetAt(375, async () => { await renderList(); }, { selector: 'button, a[href]' });
+  });
+
+  test('renders an origin badge for each document source kind', async () => {
+    await renderList();
+    const text = (host as HTMLDivElement).textContent ?? '';
+    // Badge labels mirror SOURCE_KIND_STYLES; both sample kinds should be visible.
+    expect(text).toContain('Web Research');
+    expect(text).toContain('Design');
+  });
+
+  test('selecting an origin filter forwards source_kind to fetchKnowledgeDocuments', async () => {
+    const mock = vi.mocked(fetchKnowledgeDocuments);
+    await renderList();
+    mock.mockClear();
+    const buttons = (host as HTMLDivElement).querySelectorAll('button');
+    const designFilter = Array.from(buttons).find(
+      b => b.textContent?.trim() === 'Design' && b.hasAttribute('data-viewport-allow-small-target'),
+    );
+    expect(designFilter).toBeTruthy();
+    await act(async () => { designFilter!.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    expect(mock).toHaveBeenCalledWith(
+      'project-test',
+      expect.objectContaining({ source_kind: 'design' }),
+    );
   });
 });

@@ -19,6 +19,7 @@ from sqlmodel import select
 
 from app.knowledge_completion import (
     _PENDING_DOCUMENT_KEY,
+    _handle_design_completion,
     _handle_web_research_completion,
     _is_usable_citation,
     _parse_web_research_document,
@@ -217,8 +218,13 @@ async def test_passing_grade_persists_one_document_and_completes(
     assert task.status == TaskStatus.COMPLETED
     # Compact mirror in plan_output (no body).
     assert isinstance(task.plan_output, dict)
-    assert task.plan_output["knowledge_document"]["title"] == document["title"]
-    assert "body" not in task.plan_output["knowledge_document"]
+    mirror = task.plan_output["knowledge_document"]
+    assert mirror["title"] == document["title"]
+    assert "body" not in mirror
+    # The document id + forward-quality verdict are carried forward so the task
+    # detail view can link to the produced document and show its gate verdict.
+    assert mirror["id"] == str(doc.id)
+    assert mirror["forward_quality_verdict"]["passed"] is True
 
 
 @pytest.mark.asyncio
@@ -416,6 +422,90 @@ async def test_file_reference_citation_is_usable(db_session, _quiet_broadcast):
     )
     assert len(docs) == 1
     assert docs[0].source_citations == ["file:docs/x.md"]
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+
+# ── source_kind discriminator on the producing completion handlers ──────────
+
+
+async def _make_design_task(db_session, *, project_name="DSGN"):
+    project = make_project(name=project_name)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="Design: X",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "design", "topic": "X", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return project, task
+
+
+@pytest.mark.asyncio
+async def test_web_research_completion_sets_source_kind(
+    db_session, _quiet_broadcast
+):
+    """A persisted web_research document records source_kind == 'web_research'."""
+    project, task = await _make_web_research_task(db_session, project_name="WRkind")
+
+    document = {
+        "title": "State of X on the web",
+        "summary": "A concise survey of X with citations.",
+        "body": "# X\n\nDetailed markdown body explaining X in depth.",
+        "citations": ["https://example.com/x"],
+        "tags": ["survey"],
+        "topic": "X",
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    doc = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert doc.source_kind == "web_research"
+
+
+@pytest.mark.asyncio
+async def test_design_completion_sets_source_kind(db_session, _quiet_broadcast):
+    """A persisted design document records source_kind == 'design'."""
+    project, task = await _make_design_task(db_session, project_name="DSGNkind")
+
+    document = {
+        "title": "Design for X subsystem",
+        "summary": "A codebase-internal design grounded in file references.",
+        "body": "# X\n\nDetailed design rationale referencing the code.",
+        "citations": ["backend/app/models.py", "docs/design/x.md"],
+        "tags": ["design"],
+        "topic": "X",
+    }
+    await _handle_design_completion(task, json.dumps(document), db_session)
+
+    doc = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert doc.source_kind == "design"
     await db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
 
@@ -681,6 +771,7 @@ async def _seed_doc(db_session, project_id, source_task_id, **kwargs):
         topic="alpha",
         tags=["t1"],
         source_citations=["https://example.com"],
+        source_kind="web_research",
         forward_quality_verdict={"passed": True, "strategy": "forward-quality"},
     )
     defaults.update(kwargs)
@@ -776,3 +867,65 @@ async def test_get_by_id_returns_body_and_scopes(client: AsyncClient, db_session
         f"/api/admin/projects/{proj_a.id}/knowledge-documents/{doc_b.id}"
     )
     assert cross.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_list_and_get_serialize_source_kind(
+    client: AsyncClient, db_session
+):
+    """Both the list and get-by-id endpoints return the source_kind field."""
+    proj = await _seed_project_with_membership(db_session, "KDkindserial")
+    task = make_task(project_id=proj.id, status=TaskStatus.COMPLETED)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    doc = await _seed_doc(
+        db_session, proj.id, task.id, title="Design doc", source_kind="design"
+    )
+
+    listed = await client.get(
+        f"/api/admin/projects/{proj.id}/knowledge-documents"
+    )
+    assert listed.status_code == 200
+    docs = listed.json()["documents"]
+    assert len(docs) == 1
+    assert docs[0]["source_kind"] == "design"
+
+    detail = await client.get(
+        f"/api/admin/projects/{proj.id}/knowledge-documents/{doc.id}"
+    )
+    assert detail.status_code == 200
+    assert detail.json()["source_kind"] == "design"
+
+
+@pytest.mark.asyncio
+async def test_list_filters_by_source_kind(client: AsyncClient, db_session):
+    """The source_kind list filter scopes results to a single producing kind."""
+    proj = await _seed_project_with_membership(db_session, "KDkindfilter")
+    task = make_task(project_id=proj.id, status=TaskStatus.COMPLETED)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _seed_doc(
+        db_session, proj.id, task.id, title="A design doc", source_kind="design"
+    )
+    await _seed_doc(
+        db_session,
+        proj.id,
+        task.id,
+        title="A research doc",
+        source_kind="web_research",
+    )
+
+    resp = await client.get(
+        f"/api/admin/projects/{proj.id}/knowledge-documents",
+        params={"source_kind": "design"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 1
+    assert len(body["documents"]) == 1
+    assert body["documents"][0]["title"] == "A design doc"
+    assert body["documents"][0]["source_kind"] == "design"

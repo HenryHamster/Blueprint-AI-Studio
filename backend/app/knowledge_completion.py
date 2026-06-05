@@ -44,7 +44,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.broadcast import broadcast_to_project
-from app.models import KnowledgeDocument, Task, TaskStatus
+from app.models import KnowledgeDocument, SourceKind, Task, TaskStatus
 from app.task_evaluators import (
     QUALITY_GRADER_VERDICT_KEY,
     EvaluationVerdict,
@@ -81,6 +81,18 @@ _KIND_META: dict[str, dict[str, str]] = {
 def _kind_tag(kind: str) -> str:
     meta = _KIND_META.get(kind)
     return meta["tag"] if meta else kind.upper()
+
+
+def _source_kind(kind: str) -> str:
+    """Coerce a producer ``kind`` to a stored :class:`SourceKind` value.
+
+    Unrecognized kinds fall back to ``unknown`` so an unexpected producer never
+    writes a junk discriminator into the durable store.
+    """
+    try:
+        return SourceKind(kind).value
+    except ValueError:
+        return SourceKind.UNKNOWN.value
 
 
 def _citation_hint(kind: str) -> str:
@@ -253,6 +265,7 @@ async def _persist_document(
     doc = KnowledgeDocument(
         project_id=task.project_id,
         source_task_id=task.id,
+        source_kind=_source_kind(kind),
         title=normalized["title"],
         summary=normalized["summary"],
         body=normalized["body"],
@@ -264,15 +277,20 @@ async def _persist_document(
     session.add(doc)
 
     # Mirror a compact copy into plan_output for debugging / admin visibility
-    # (the body is intentionally omitted to keep plan_output small).
+    # (the body is intentionally omitted to keep plan_output small). The
+    # document ``id`` and forward-quality ``verdict`` are carried forward so the
+    # task detail view can link straight to the produced document and render its
+    # gate verdict without a second lookup.
     plan_output = task.plan_output if isinstance(task.plan_output, dict) else {}
     plan_output = dict(plan_output)
     plan_output["knowledge_document"] = {
+        "id": str(doc.id),
         "title": normalized["title"],
         "summary": normalized["summary"],
         "topic": normalized["topic"],
         "tags": normalized["tags"],
         "citation_count": len(normalized["source_citations"]),
+        "forward_quality_verdict": verdict_record,
     }
     task.plan_output = plan_output
     flag_modified(task, "plan_output")

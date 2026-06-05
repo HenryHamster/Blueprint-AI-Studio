@@ -1,9 +1,10 @@
 import { useState, useEffect, useMemo, type ReactNode } from 'react';
-import { Copy, Check, ChevronDown, ChevronRight, ExternalLink, Hash } from 'lucide-react';
+import { Copy, Check, ChevronDown, ChevronRight, ExternalLink, Hash, BookOpen, CheckCircle, XCircle } from 'lucide-react';
 import { getHeartbeatStatus, isSafeUrl, useElapsedTime, linkifyStatusMessage, ResearchFindings, useDurationStats } from './TaskCard';
+import { MarkdownContent } from './MarkdownContent';
 import { formatAbsolute, parseTimestamp } from '../utils/time';
 import { hasTransitiveCycle } from '../utils/taskGraph';
-import { authGet, API_BASE_URL, fetchComputeJobs, type ComputeJob } from '../api';
+import { authGet, API_BASE_URL, fetchComputeJobs, fetchKnowledgeDocument, type ComputeJob } from '../api';
 import { isComputeJobActive, computeJobTerminalLabel } from './ComputeJobsPanel.utils';
 import { TaskFixLoopPanel } from './TaskFixLoopPanel';
 import { SelfReviewPanel } from './TaskDetailDrawerSelfReview';
@@ -232,6 +233,79 @@ function ResearchOriginSection({ task, tasks, onNavigateToTask }: { task: Task; 
         </DetailRow>
       )}
       {originFinding?.direction_id && <DetailRow label="Direction"><span className="font-mono text-xs text-neutral-400">{originFinding.direction_id}</span></DetailRow>}
+    </>
+  );
+}
+
+/** Surface the knowledge document a completed design / web_research task
+ *  produced. The completion handler mirrors the document's id, title, summary,
+ *  tags and forward-quality verdict into plan_output.knowledge_document, so the
+ *  drawer can link forward to the produced document without a second lookup —
+ *  and fetch its full markdown body inline on demand. */
+function KnowledgeDocumentSection({ task }: { task: Task }) {
+  const doc = (task.plan_output as Record<string, unknown> | undefined)?.knowledge_document as {
+    id?: string;
+    title?: string;
+    summary?: string;
+    citation_count?: number;
+    forward_quality_verdict?: { passed?: boolean; reason?: string } | null;
+  } | undefined;
+  const [expanded, setExpanded] = useState(false);
+  const [body, setBody] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const projectId = task.project_id;
+  const docId = doc?.id;
+
+  if (!doc?.title) return null;
+  const verdict = doc.forward_quality_verdict;
+
+  const toggle = () => {
+    const next = !expanded;
+    setExpanded(next);
+    if (next && body === null && projectId && docId) {
+      setLoading(true);
+      fetchKnowledgeDocument(projectId, docId)
+        .then(full => setBody(full.body ?? ''))
+        .catch(() => setBody(''))
+        .finally(() => setLoading(false));
+    }
+  };
+
+  return (
+    <>
+      <SectionHeader>Knowledge Document</SectionHeader>
+      <div className="space-y-2 bg-violet-950/10 rounded-lg p-3 border border-violet-900/30">
+        <div className="flex items-start gap-2">
+          <BookOpen className="w-4 h-4 text-violet-400 shrink-0 mt-0.5" />
+          <span className="text-sm font-medium text-neutral-100 min-w-0 break-words">{doc.title}</span>
+        </div>
+        {doc.summary && <p className="text-xs text-neutral-400 leading-relaxed break-words">{doc.summary}</p>}
+        <div className="flex items-center gap-2 flex-wrap">
+          {verdict && (
+            <span className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded border ${verdict.passed ? 'border-emerald-800/40 bg-emerald-950/30 text-emerald-300' : 'border-red-800/40 bg-red-950/30 text-red-300'}`}>
+              {verdict.passed ? <CheckCircle className="w-3 h-3" /> : <XCircle className="w-3 h-3" />}
+              Forward quality: {verdict.passed ? 'passed' : 'failed'}
+            </span>
+          )}
+          {typeof doc.citation_count === 'number' && (
+            <span className="text-[11px] text-neutral-500">{doc.citation_count} citation{doc.citation_count !== 1 ? 's' : ''}</span>
+          )}
+        </div>
+        {docId && projectId && (
+          <button
+            onClick={toggle}
+            className="inline-flex items-center gap-1.5 text-sm text-violet-300 hover:text-violet-200 transition-colors min-h-[44px]"
+          >
+            {expanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+            {expanded ? 'Hide document' : 'View document'}
+          </button>
+        )}
+        {expanded && (
+          loading
+            ? <p className="text-xs text-neutral-600">Loading document…</p>
+            : <div className="border-t border-violet-900/30 pt-2 text-sm text-neutral-200"><MarkdownContent content={body ?? ''} /></div>
+        )}
+      </div>
     </>
   );
 }
@@ -741,6 +815,8 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         );
       })()}
 
+      <KnowledgeDocumentSection task={task} />
+
       {task.evaluation_summary && <EvaluationSummarySection summary={task.evaluation_summary} />}
 
       {task.task_type === 'panel_review' && task.plan_output ? (() => {
@@ -841,7 +917,7 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         );
       })() : null}
 
-      {task.plan_output && task.task_type !== 'memo' && task.task_type !== 'panel_review' && <>
+      {task.plan_output && task.task_type !== 'memo' && task.task_type !== 'panel_review' && !(task.plan_output as Record<string, unknown>).knowledge_document && <>
         <SectionHeader>Plan Output</SectionHeader>
         <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-purple-950/20 rounded-lg p-3 max-h-64 overflow-y-auto custom-scrollbar border border-purple-900/30 font-mono">{JSON.stringify(task.plan_output, null, 2)}</pre>
       </>}

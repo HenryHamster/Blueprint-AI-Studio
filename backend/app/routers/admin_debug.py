@@ -1488,6 +1488,7 @@ def _knowledge_doc_to_dict(doc: KnowledgeDocument, *, include_body: bool) -> dic
         "id": str(doc.id),
         "title": doc.title,
         "summary": doc.summary,
+        "source_kind": doc.source_kind,
         "topic": doc.topic,
         "tags": doc.tags or [],
         "source_citations": doc.source_citations or [],
@@ -1507,6 +1508,9 @@ async def list_knowledge_documents(
     q: str | None = Query(default=None, description="Full-text search term"),
     topic: str | None = Query(default=None, description="Exact topic filter"),
     tag: str | None = Query(default=None, description="Exact tag filter"),
+    source_kind: str | None = Query(
+        default=None, description="Exact source-kind filter (design / web_research)"
+    ),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
@@ -1515,8 +1519,10 @@ async def list_knowledge_documents(
     """List / search a project's knowledge documents, newest-first, paginated.
 
     ``q`` matches title/summary/body/topic (ILIKE, trigram-backed on Postgres)
-    and the tag list. ``topic`` / ``tag`` apply exact filters. The list shape
-    omits the markdown body — use the get-by-id endpoint for the full document.
+    and the tag list. ``topic`` / ``tag`` / ``source_kind`` apply exact filters
+    (``source_kind`` scopes to a single producing task kind, e.g. ``design`` vs
+    ``web_research``). The list shape omits the markdown body — use the
+    get-by-id endpoint for the full document.
     """
     await _get_user_project(project_id, current_user["user_id"], session)
 
@@ -1525,6 +1531,8 @@ async def list_knowledge_documents(
     )
     if topic:
         stmt = stmt.where(KnowledgeDocument.topic == topic)
+    if source_kind:
+        stmt = stmt.where(KnowledgeDocument.source_kind == source_kind)
     if tag:
         # tags is a JSON list; match the exact element via a cast-to-text scan
         # so it works on both Postgres (JSONB) and the SQLite test backend.

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { X, Search, BookOpen, ArrowLeft, ExternalLink, Copy, Check, CheckCircle, XCircle } from 'lucide-react';
+import { X, Search, BookOpen, ArrowLeft, ExternalLink, Copy, Check, CheckCircle, XCircle, FileCode, Globe, HelpCircle } from 'lucide-react';
 import { isSafeUrl } from './TaskCard';
 import { MarkdownContent } from './MarkdownContent';
 import { fetchKnowledgeDocuments, fetchKnowledgeDocument, type KnowledgeDocument } from '../api';
@@ -30,6 +30,36 @@ function citationParts(c: unknown): { href: string | null; label: string; excerp
   const label = typeof o.title === 'string' ? o.title : href ?? JSON.stringify(o);
   const excerpt = typeof o.excerpt === 'string' ? o.excerpt : undefined;
   return { href: href && isSafeUrl(href) ? href : null, label, excerpt };
+}
+
+/**
+ * Origin badge for a knowledge document, mirroring TaskTypeBadge's static
+ * style-map language (slate for design, cyan for web research, neutral for
+ * unknown/legacy docs without a recorded source kind).
+ */
+const SOURCE_KIND_STYLES: Record<string, { bg: string; text: string; icon: typeof FileCode; label: string }> = {
+  design: { bg: 'bg-slate-500/10 border-slate-500/20', text: 'text-slate-300', icon: FileCode, label: 'Design' },
+  web_research: { bg: 'bg-cyan-500/10 border-cyan-500/20', text: 'text-cyan-300', icon: Globe, label: 'Web Research' },
+  unknown: { bg: 'bg-neutral-500/10 border-neutral-500/20', text: 'text-neutral-400', icon: HelpCircle, label: 'Unknown' },
+};
+
+/** Selectable origins for the filter control (order matters for the segmented control). */
+const SOURCE_KIND_OPTIONS = ['design', 'web_research', 'unknown'] as const;
+
+function SourceKindBadge({ kind }: { kind?: string }) {
+  if (!kind) return null;
+  const style = SOURCE_KIND_STYLES[kind] ?? SOURCE_KIND_STYLES.unknown;
+  const Icon = style.icon;
+  const label = SOURCE_KIND_STYLES[kind]?.label ?? kind;
+  return (
+    <span
+      className={`${style.bg} ${style.text} border text-[9px] uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-1 px-1.5 py-0.5`}
+      title={`Origin: ${label}`}
+    >
+      <Icon className="w-2.5 h-2.5 shrink-0" />
+      {label}
+    </span>
+  );
 }
 
 function VerdictBadge({ verdict }: { verdict: Record<string, unknown> | null }) {
@@ -79,6 +109,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask 
   const [error, setError] = useState<string | null>(null);
   const [topicFilter, setTopicFilter] = useState<string | null>(null);
   const [tagFilter, setTagFilter] = useState<string | null>(null);
+  const [sourceKindFilter, setSourceKindFilter] = useState<string | null>(null);
   const [selected, setSelected] = useState<KnowledgeDocument | null>(null);
 
   // Debounced list/search fetch driven by backend full-text/tag/topic search.
@@ -92,6 +123,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask 
         q: search.trim() || undefined,
         topic: topicFilter ?? undefined,
         tag: tagFilter ?? undefined,
+        source_kind: sourceKindFilter ?? undefined,
       })
         .then(data => {
           if (cancelled) return;
@@ -102,7 +134,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask 
         .finally(() => { if (!cancelled) setLoading(false); });
     }, 250);
     return () => { cancelled = true; clearTimeout(handle); };
-  }, [selectedProjectId, search, topicFilter, tagFilter]);
+  }, [selectedProjectId, search, topicFilter, tagFilter, sourceKindFilter]);
 
   const openDoc = useCallback((doc: KnowledgeDocument) => {
     if (!selectedProjectId) return;
@@ -148,6 +180,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask 
               <h2 className="text-base font-semibold text-neutral-100 leading-snug">{selected.title}</h2>
               <div className="flex items-center gap-3 flex-wrap text-[10px] text-neutral-500">
                 <CopyableId id={selected.id} />
+                <SourceKindBadge kind={selected.source_kind} />
                 {selected.topic && <span className="px-1.5 py-0.5 rounded bg-violet-950/40 text-violet-300">{selected.topic}</span>}
                 {selected.created_at && <span>{relativeDate(selected.created_at)}</span>}
                 {selected.source_task_id && onNavigateToTask && (() => {
@@ -238,6 +271,33 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask 
                   className="w-full bg-neutral-900 border border-neutral-800 rounded pl-8 pr-3 py-1.5 text-xs text-neutral-200 placeholder:text-neutral-600 focus:outline-none focus:ring-1 focus:ring-neutral-700"
                 />
               </div>
+              {/* Source-kind (origin) filter — scope the library to a single producing task type. */}
+              <div className="flex items-center gap-1 flex-wrap">
+                <span className="text-[9px] uppercase tracking-wide text-neutral-600 mr-0.5">origin</span>
+                {/* reason: origin filter segment; text-[9px] inline control matching card chip density */}
+                <button
+                  data-viewport-allow-small-target
+                  onClick={() => setSourceKindFilter(null)}
+                  className={`text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded border transition-colors ${sourceKindFilter === null ? 'bg-neutral-700 border-neutral-600 text-neutral-100' : 'bg-neutral-900 border-neutral-800 text-neutral-500 hover:text-neutral-300'}`}
+                >All</button>
+                {SOURCE_KIND_OPTIONS.map(kind => {
+                  const style = SOURCE_KIND_STYLES[kind];
+                  const active = sourceKindFilter === kind;
+                  const Icon = style.icon;
+                  return (
+                    // reason: origin filter segment; text-[9px] inline control matching card chip density
+                    <button
+                      data-viewport-allow-small-target
+                      key={kind}
+                      onClick={() => setSourceKindFilter(active ? null : kind)}
+                      className={`text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded border inline-flex items-center gap-1 transition-colors ${active ? `${style.bg} ${style.text} border-current` : 'bg-neutral-900 border-neutral-800 text-neutral-500 hover:text-neutral-300'}`}
+                    >
+                      <Icon className="w-2.5 h-2.5 shrink-0" />
+                      {style.label}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
 
             <div className="flex-1 overflow-y-auto p-4 space-y-2">
@@ -261,6 +321,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask 
                   </div>
                   {doc.summary && <p className="text-[11px] text-neutral-500 mt-1 line-clamp-2 leading-snug">{doc.summary}</p>}
                   <div className="flex items-center gap-1.5 flex-wrap mt-1.5">
+                    <SourceKindBadge kind={doc.source_kind} />
                     {doc.topic && (
                       // reason: topic filter chip in compact card footer; text-[9px] inline control
                       <button

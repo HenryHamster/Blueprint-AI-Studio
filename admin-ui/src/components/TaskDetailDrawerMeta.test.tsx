@@ -17,6 +17,7 @@ vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response(JSON.stringify({ task_id: 'task-1', fix_loop_history: {}, summary: {} }), { status: 200 })),
   API_BASE_URL: 'http://localhost:8000',
   fetchComputeJobs: vi.fn(async () => []),
+  fetchKnowledgeDocument: vi.fn(async () => ({ id: 'doc-1', body: '# Full body\n\nDetailed markdown.' })),
   fetchTaskSerialConsole: vi.fn(async () => ({ serial_log: '', source: 'cached', vm_status: 'TERMINATED', vm_instance_id: 'test' })),
 }));
 
@@ -265,5 +266,43 @@ describe('DetailsTab — Merge Test Gate', () => {
     expect(screen.getByText('Correctness')).toBeInTheDocument();
     expect(screen.getByText('agent/src/handlers/panel-review.ts:120')).toBeInTheDocument();
     expect(screen.queryByText('Plan Output')).toBeNull();
+  });
+});
+
+describe('DetailsTab — Knowledge Document', () => {
+  afterEach(() => cleanup());
+
+  function knowledgeTask(): Task {
+    return makeTask({
+      task_type: 'design',
+      project_id: 'proj-1' as unknown as Task['project_id'],
+      plan_output: {
+        knowledge_document: {
+          id: 'doc-1',
+          title: 'Auth subsystem design',
+          summary: 'A codebase-internal design of the auth subsystem.',
+          citation_count: 3,
+          forward_quality_verdict: { passed: true, reason: 'coherent and grounded' },
+        },
+      },
+    });
+  }
+
+  it('surfaces the produced document title, verdict and citation count', () => {
+    render(<DetailsTab task={knowledgeTask()} />);
+    expect(screen.getByText('Knowledge Document')).toBeInTheDocument();
+    expect(screen.getByText('Auth subsystem design')).toBeInTheDocument();
+    expect(screen.getByText(/Forward quality: passed/)).toBeInTheDocument();
+    expect(screen.getByText('3 citations')).toBeInTheDocument();
+    // The redundant raw Plan Output dump is suppressed when the mirror is present.
+    expect(screen.queryByText('Plan Output')).toBeNull();
+  });
+
+  it('fetches and renders the full document body on demand', async () => {
+    const { fetchKnowledgeDocument } = await import('../api');
+    render(<DetailsTab task={knowledgeTask()} />);
+    screen.getByText('View document').click();
+    expect(fetchKnowledgeDocument).toHaveBeenCalledWith('proj-1', 'doc-1');
+    expect(await screen.findByText(/Detailed markdown/)).toBeInTheDocument();
   });
 });

@@ -163,6 +163,21 @@ class ArtifactType(str, Enum):
     COMPUTE_RESULT = "COMPUTE_RESULT"
 
 
+class SourceKind(str, Enum):
+    """Which task type produced a :class:`KnowledgeDocument`.
+
+    A knowledge document is written by either a codebase-internal ``design``
+    task or a web-grounded ``web_research`` task; ``UNKNOWN`` is the durable
+    fallback so pre-existing rows (and any future producer that does not stamp
+    a kind) backfill cleanly. Stored as the enum *value* in a plain String
+    column, mirroring ``ArtifactType`` / ``TaskStatus``.
+    """
+
+    DESIGN = "design"
+    WEB_RESEARCH = "web_research"
+    UNKNOWN = "unknown"
+
+
 class LLMProviderName(str, Enum):
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
@@ -2729,6 +2744,20 @@ class KnowledgeDocument(SQLModel, table=True):
 
     # Provenance: the task whose terminal output produced this document.
     source_task_id: uuid.UUID = Field(foreign_key="task.id", index=True)
+
+    # Which task kind produced this document (``design`` vs ``web_research``).
+    # Stored as the enum value in a plain String column so it is index-friendly
+    # for origin filtering. Non-nullable with a Python default (so unseeded ORM
+    # instances carry a value pre-flush) and a server default (so pre-existing
+    # rows backfill to ``unknown``).
+    source_kind: str = Field(
+        default=SourceKind.UNKNOWN.value,
+        sa_column=Column(
+            String,
+            nullable=False,
+            server_default=text("'unknown'"),
+        ),
+    )
 
     title: str = Field(sa_column=Column(String, nullable=False))
     summary: str = Field(sa_column=Column(Text, nullable=False))

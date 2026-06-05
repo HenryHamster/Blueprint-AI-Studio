@@ -1660,6 +1660,8 @@ export interface KnowledgeDocument {
   tags: string[];
   source_citations: unknown[];
   source_task_id: string | null;
+  /** Which kind of task produced this document. `string` keeps it forward-compatible. */
+  source_kind?: 'design' | 'web_research' | 'unknown' | string;
   created_at: string | null;
   updated_at: string | null;
   forward_quality_verdict: Record<string, unknown> | null;
@@ -1677,12 +1679,13 @@ export interface KnowledgeDocumentsResponse {
 /** List / search a project's knowledge documents, newest-first. `q` drives full-text/tag/topic search. */
 export async function fetchKnowledgeDocuments(
   projectId: string,
-  params?: { q?: string; topic?: string; tag?: string; limit?: number; offset?: number },
+  params?: { q?: string; topic?: string; tag?: string; source_kind?: string; limit?: number; offset?: number },
 ): Promise<KnowledgeDocumentsResponse> {
   const sp = new URLSearchParams();
   if (params?.q) sp.set('q', params.q);
   if (params?.topic) sp.set('topic', params.topic);
   if (params?.tag) sp.set('tag', params.tag);
+  if (params?.source_kind) sp.set('source_kind', params.source_kind);
   if (params?.limit !== undefined) sp.set('limit', String(params.limit));
   if (params?.offset !== undefined) sp.set('offset', String(params.offset));
   const query = sp.toString();
