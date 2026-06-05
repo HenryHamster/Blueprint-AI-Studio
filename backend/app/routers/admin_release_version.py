@@ -151,12 +151,26 @@ async def get_version_lifecycle(
 
     current_version_out: Optional[Dict[str, Any]] = None
     if open_row is not None:
+        from app.models import Project  # noqa: PLC0415
+
         merged_count = await count_merged_since(session, project_id, open_row.opened_at)
         qual = open_row.last_qualification or {}
         # Surface the latest release_audit's actual findings/score so a verdict
         # is explainable (the verdict record only keeps the composite, and the
         # task API strips artifact logs — otherwise operators are blind to WHY).
         latest_audit = await get_latest_release_audit_report(session, project_id)
+
+        # Fetch live current_focus from the project's problem_model
+        project_row = (
+            await session.execute(
+                select(Project).where(Project.id == project_id)
+            )
+        ).scalar_one_or_none()
+        live_current_focus = None
+        if project_row and project_row.problem_model:
+            intent = project_row.problem_model.get("intent", {})
+            live_current_focus = intent.get("current_focus")
+
         current_version_out = {
             "version_number": open_row.version_number,
             "phase": open_row.phase,
@@ -169,6 +183,7 @@ async def get_version_lifecycle(
             if open_row.goal_updated_at
             else None,
             "goal_editor_info": open_row.goal_editor_info,
+            "live_current_focus": live_current_focus,
             "opened_at": open_row.opened_at.isoformat(),
             "qualification_attempts": open_row.qualification_attempts,
             "merged_task_count": merged_count,
@@ -309,6 +324,64 @@ async def set_version_goal(
         if open_ver.goal_updated_at
         else None,
         "goal_editor_info": open_ver.goal_editor_info,
+    }
+
+
+class _AbandonVersionBody(BaseModel):
+    reason: str | None = _Field(default=None, max_length=500)
+
+
+@router.post("/projects/{project_id}/version-cut")
+async def cut_version(
+    project_id: uuid.UUID,
+    payload: _AbandonVersionBody,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Operator-initiated version cut: abandon the open version, open the next.
+
+    Member+ role required.  Returns 404 when there is no open version to cut.
+    Abandons the current open ``ReleaseVersion`` (status ``abandoned``, recording
+    the operator reason + identity in ``last_qualification`` and
+    ``phase_reasoning``) and opens a fresh next-numbered version in the ``build``
+    phase with a current-focus goal snapshot.  Gives operators a lever to resolve
+    a genuinely-stuck version (wrong goal, pivoted work, un-passable candidate)
+    that the existing stall detection only alerts on.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+
+    operator_id = current_user.get("email") or current_user["user_id"]
+    abandoned, new_version = await _release_version.abandon_current_version(
+        session,
+        project_id,
+        reason=payload.reason,
+        operator_id=operator_id,
+    )
+    if abandoned is None or new_version is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No open release version found for this project.",
+        )
+
+    await session.commit()
+    await session.refresh(abandoned)
+    await session.refresh(new_version)
+    return {
+        "abandoned_version": {
+            "version_number": abandoned.version_number,
+            "status": abandoned.status,
+            "abandoned_at": (abandoned.last_qualification or {}).get("abandoned_at"),
+        },
+        "new_version": {
+            "version_number": new_version.version_number,
+            "phase": new_version.phase,
+            "goal": new_version.goal,
+            "opened_at": new_version.opened_at.isoformat()
+            if new_version.opened_at
+            else None,
+        },
     }
 
 

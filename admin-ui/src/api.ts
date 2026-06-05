@@ -1047,6 +1047,7 @@ export interface CurrentVersion {
   goal: string | null;
   goal_updated_at?: string | null;
   goal_editor_info?: string | null;
+  live_current_focus?: string | null;
   opened_at: string;
   qualification_attempts: number;
   merged_task_count: number;
@@ -1133,6 +1134,31 @@ export async function setVersionGoal(
     body: JSON.stringify({ goal: goal ?? null }),
   });
   if (!res.ok) throw new Error(`Failed to set version goal: ${res.status}`);
+  return res.json();
+}
+
+export interface CutVersionResponse {
+  abandoned_version: {
+    version_number: number;
+    status: string;
+  };
+  new_version: {
+    version_number: number;
+    phase: string;
+    goal: string | null;
+    opened_at: string;
+  };
+}
+
+export async function cutVersion(
+  projectId: string,
+  reason?: string,
+): Promise<CutVersionResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/version-cut`, {
+    method: 'POST',
+    body: JSON.stringify({ reason: reason ?? '' }),
+  });
+  if (!res.ok) throw new Error(`Failed to cut version: ${res.status}`);
   return res.json();
 }
 
@@ -1796,4 +1822,6 @@ export interface StrategicRefreshMarker {
   origin?: string;
   count?: number;
   excerpt?: string;
+  /** Timestamp when a prior marker was consumed by the strategic loop (receipt field). */
+  last_fired_at?: string;
 }

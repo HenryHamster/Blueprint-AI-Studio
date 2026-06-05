@@ -263,6 +263,10 @@ vi.mock('../api', () => ({
     goal_editor_info: '[operator:test]',
   })),
   triggerQualify: vi.fn(async () => ({ status: 'dry_run' })),
+  cutVersion: vi.fn(async () => ({
+    abandoned_version: { version_number: 42, status: 'abandoned' },
+    new_version: { version_number: 43, phase: 'build', goal: null, opened_at: '2026-05-20T12:00:00Z' },
+  })),
   patchAdminSettings: vi.fn(async () => ({ promotion_enabled: false })),
   fetchQualificationVerdicts: vi.fn(async () => ({
     verdicts: [

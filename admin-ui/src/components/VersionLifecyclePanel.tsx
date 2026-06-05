@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import {
+  cutVersion,
   fetchQualificationVerdicts,
   patchAdminSettings,
   setVersionPhase,
@@ -171,6 +172,8 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
   const [goalInput, setGoalInput] = useState<string>('');
   const [optimisticOverrides, setOptimisticOverrides] = useState<Partial<CurrentVersion> | null>(null);
   const [promotionEnabledOverride, setPromotionEnabledOverride] = useState<boolean | null>(null);
+  const [cuttingVersion, setCuttingVersion] = useState<boolean>(false);
+  const [cutReason, setCutReason] = useState<string>('');
   useEffect(() => {
     if (!projectId) { setVerdicts([]); return; }
     fetchQualificationVerdicts(projectId, 10).then(r => setVerdicts(r.verdicts)).catch(() => {});
@@ -272,6 +275,25 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
     }
   };
 
+  const handleCutVersion = async () => {
+    if (!projectId || !cv) return;
+    const msg = `Abandon v${cv.version_number} and open a fresh version?`;
+    if (!window.confirm(msg)) return;
+    setActionLoading('cut');
+    setActionMsg(null);
+    try {
+      const result = await cutVersion(projectId, cutReason || undefined);
+      setActionMsg(`Cut v${result.abandoned_version.version_number} → opened v${result.new_version.version_number}`);
+      setCuttingVersion(false);
+      setCutReason('');
+      onRefresh();
+    } catch {
+      setActionMsg('Request failed');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
   return (
     <section data-testid="version-lifecycle-panel">
       <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Version Lifecycle</h2>
@@ -347,6 +369,29 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
                     {cv.goal_editor_info && <span>{cv.goal_editor_info} </span>}
                     <span>{timeAgo(cv.goal_updated_at)}</span>
                   </p>
+                )}
+                {cv.live_current_focus && cv.live_current_focus !== cv.goal && (
+                  <div className="flex flex-col gap-1 pt-1 border-t border-amber-500/20">
+                    <p className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                      Goal has drifted from live focus
+                    </p>
+                    <p className="text-[10px] text-neutral-400" title={cv.live_current_focus}>
+                      <span className="text-neutral-600">Live focus: </span>{cv.live_current_focus}
+                    </p>
+                    {projectId && (
+                      // eslint-disable-next-line viewport/min-touch-target
+                      <button
+                        onClick={() => {
+                          setGoalInput(cv.live_current_focus || '');
+                          setEditingGoal(true);
+                        }}
+                        disabled={actionLoading !== null}
+                        className="text-[10px] px-1.5 py-0.5 w-fit rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        Resync to focus
+                      </button>
+                    )}
+                  </div>
                 )}
                 {projectId && (
                   // eslint-disable-next-line viewport/min-touch-target
@@ -447,6 +492,48 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
                     className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'qualify' ? '…' : 'Run Qualify'}
+                  </button>
+                )}
+                {cuttingVersion ? (
+                  <div className="flex flex-col gap-1 w-full">
+                    <div className="flex flex-wrap items-center gap-1">
+                      <input
+                        type="text"
+                        value={cutReason}
+                        onChange={(e) => setCutReason(e.target.value)}
+                        placeholder="Optional reason for cut..."
+                        disabled={actionLoading !== null}
+                        maxLength={200}
+                        className="text-[10px] flex-1 bg-neutral-800 border border-neutral-700 text-neutral-300 rounded px-2 py-0.5 focus:outline-none focus:border-neutral-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                      />
+                      {/* eslint-disable-next-line viewport/min-touch-target */}
+                      <button
+                        onClick={handleCutVersion}
+                        disabled={actionLoading !== null}
+                        className="text-[10px] px-2 py-0.5 rounded border border-red-500/40 text-red-400 hover:bg-red-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        {actionLoading === 'cut' ? '…' : 'Cut'}
+                      </button>
+                      {/* eslint-disable-next-line viewport/min-touch-target */}
+                      <button
+                        onClick={() => {
+                          setCuttingVersion(false);
+                          setCutReason('');
+                        }}
+                        disabled={actionLoading !== null}
+                        className="text-[10px] px-2 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => setCuttingVersion(true)}
+                    disabled={actionLoading !== null}
+                    className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-red-500/40 text-red-400 hover:bg-red-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    Cut/Abandon
                   </button>
                 )}
                 {actionMsg && (

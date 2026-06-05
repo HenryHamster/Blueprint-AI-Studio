@@ -6901,6 +6901,139 @@ class TestSetVersionGoal:
         assert resp.status_code == 422
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin_release_version.py — Cut/Abandon Version
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestCutVersion:
+    @pytest.mark.asyncio
+    async def test_version_cut_member_can_cut(
+        self, client: AsyncClient, db_session
+    ):
+        """Member can cut the open version; both versions are returned and the
+        old row flips to abandoned while a fresh build version opens."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="stabilize")
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json={"reason": "candidate can never pass"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["abandoned_version"]["version_number"] == 1
+        assert data["abandoned_version"]["status"] == "abandoned"
+        assert data["abandoned_version"]["abandoned_at"]
+        assert data["new_version"]["version_number"] == 2
+        assert data["new_version"]["phase"] == "build"
+        assert data["new_version"]["opened_at"]
+
+        # Persisted: the old row carries operator provenance.
+        old = (
+            (
+                await db_session.execute(
+                    select(ReleaseVersion).where(
+                        ReleaseVersion.project_id == project.id,
+                        ReleaseVersion.version_number == 1,
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        await db_session.refresh(old)
+        assert old.status == "abandoned"
+        assert old.last_qualification["operator"] == TEST_USER_EMAIL
+        assert old.last_qualification["reason"] == "candidate can never pass"
+
+    @pytest.mark.asyncio
+    async def test_version_cut_no_open_version_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns 404 when there is no open release version to cut."""
+        project = await _make_project(db_session)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json={"reason": "nothing here"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_version_cut_requires_member_role(
+        self, client: AsyncClient, db_session
+    ):
+        """A viewer (below member) cannot cut the version."""
+        other = Project(name="Viewer-Only", user_id="other-owner")
+        db_session.add(other)
+        await db_session.commit()
+        await db_session.refresh(other)
+        db_session.add(
+            ProjectMember(project_id=other.id, user_id="other-owner", role="owner")
+        )
+        db_session.add(
+            ProjectMember(project_id=other.id, user_id=TEST_USER_ID, role="viewer")
+        )
+        await db_session.commit()
+        await _make_open_version(db_session, other.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{other.id}/version-cut",
+            json={"reason": "not allowed"},
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_version_cut_rejects_cross_project(
+        self, client: AsyncClient, db_session
+    ):
+        """A non-member cannot cut another project's version (404)."""
+        other = Project(name="Other", user_id="other-owner")
+        db_session.add(other)
+        await db_session.commit()
+        await db_session.refresh(other)
+        db_session.add(
+            ProjectMember(project_id=other.id, user_id="other-owner", role="owner")
+        )
+        await _make_open_version(db_session, other.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{other.id}/version-cut",
+            json={"reason": "intrusion"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_version_cut_reason_optional(
+        self, client: AsyncClient, db_session
+    ):
+        """A cut with no reason still succeeds and records a null reason."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json={},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["new_version"]["version_number"] == 2
+
+    @pytest.mark.asyncio
+    async def test_version_cut_reason_too_long_returns_422(
+        self, client: AsyncClient, db_session
+    ):
+        """A reason exceeding the 500-char body limit is rejected by Pydantic."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json={"reason": "x" * 501},
+        )
+        assert resp.status_code == 422
+
+
 class TestVersionLifecycleInfraFailureFields:
     """GET /api/admin/projects/{id}/version-lifecycle exposes infra-failure fields."""
 

@@ -48,9 +48,10 @@ from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.landed_signal import landed_signal_predicate
-from app.models import ReleaseVersion, Task, TaskStatus
+from app.models import Project, ReleaseVersion, Task, TaskStatus
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -481,3 +482,234 @@ def set_version_goal(
         new_goal or "(none)",
         editor_id or "unknown",
     )
+
+
+async def _resolve_integration_head_sha(
+    session: AsyncSession,
+    project: Project | None,
+) -> str | None:
+    """Best-effort: resolve the integration branch HEAD SHA for a new version.
+
+    Used to set the ``base_sha`` of the version opened by an operator-initiated
+    abandon.  ALL failure modes (no project, no GitHub credentials, branch
+    unreachable, any GitHub I/O error) degrade to ``None`` — a SHA-resolution
+    failure must NEVER abort the cut, exactly mirroring the best-effort
+    promoted-SHA re-resolve in ``release_promotion.promote``.
+    """
+    if project is None:
+        return None
+    try:
+        from app.github import get_branch_sha
+        from app.release_promotion import _resolve_github_with_session
+        from app.shared_state import get_project_integration_branch
+
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved is None:
+            return None
+        token, owner, repo = resolved
+        branch = get_project_integration_branch(project)
+        return await get_branch_sha(token, owner, repo, branch)
+    except Exception as exc:  # noqa: BLE001 — SHA resolution is best-effort
+        logger.warning(
+            "[RELEASE_VERSION] abandon: could not resolve integration HEAD for "
+            "project=%s (non-fatal, falling back): %s",
+            getattr(project, "id", "?"),
+            exc,
+        )
+        return None
+
+
+async def abandon_current_version(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    reason: str | None = None,
+    operator_id: str,
+) -> tuple[ReleaseVersion | None, ReleaseVersion | None]:
+    """Operator-initiated version cut: abandon the open version, open the next.
+
+    The operator template is ``release_promotion._record_promotion_success`` — a
+    cut is "the awaited version resolved", just by operator fiat rather than a
+    passing qualification.  Returns ``(abandoned_version, next_version)`` on a
+    successful cut, or ``(None, None)`` when there is no open version to cut
+    (the double-cut race guard).
+
+    Discipline mirrored from ``_record_promotion_success``:
+
+    * **Re-lock + re-check** — the open row is re-read under ``SELECT ... FOR
+      UPDATE`` and only mutated while ``status == "open"``.  A concurrent
+      promotion / abandon that already closed the row makes this a NO-OP
+      returning ``(None, None)`` — so two operators racing the same cut never
+      open a duplicate vN+1.
+    * **No schema change** — the operator REASON + IDENTITY + abandoned-at
+      timestamp are stored in the existing ``last_qualification`` JSONB
+      (``{status: "abandoned", reason, operator, abandoned_at}``) and the human
+      reason is mirrored into ``phase_reasoning`` with the ``[operator:<id>]``
+      convention.  No new columns.
+    * **Open N+1 in build** — base_sha is the integration-branch HEAD resolved
+      best-effort (falling back to the abandoned row's ``base_sha``); the goal
+      snapshots ``ProblemModel.intent.current_focus`` exactly like the promotion
+      path.
+
+    The staged-direction activation, strategic refresh, and operator
+    notification are all best-effort and isolated so a failure there can NEVER
+    abort the abandon (mirroring the promotion path).
+
+    Caller is responsible for committing the session.
+    """
+    # Re-read + re-lock the open row.  with_for_update serializes concurrent
+    # cuts; the status re-check below is the double-cut guard.
+    locked = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "open",
+                )
+                .order_by(ReleaseVersion.opened_at.desc())
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if locked is None or locked.status != "open":
+        # No open version (or a concurrent cut already closed it) — NO-OP.
+        logger.info(
+            "[RELEASE_VERSION] abandon: no open version to cut for project=%s "
+            "(operator=%s) — no-op",
+            project_id,
+            operator_id,
+        )
+        return None, None
+
+    project = await session.get(Project, project_id)
+
+    now = _utcnow()
+    truncated_reason = reason[:_PHASE_REASONING_MAX] if reason else None
+
+    # Provenance into the existing last_qualification JSONB (no schema change).
+    record = dict(locked.last_qualification or {})
+    record["status"] = "abandoned"
+    record["reason"] = truncated_reason
+    record["operator"] = operator_id
+    record["abandoned_at"] = now.isoformat()
+    locked.last_qualification = record
+    flag_modified(locked, "last_qualification")
+
+    # Mirror the human reason into phase_reasoning with the operator convention.
+    human = (
+        f"[operator:{operator_id}] abandoned: {truncated_reason}"
+        if truncated_reason
+        else f"[operator:{operator_id}] abandoned"
+    )
+    locked.phase_reasoning = human[:_PHASE_REASONING_MAX]
+
+    locked.status = "abandoned"
+    session.add(locked)
+
+    # Open the successor in build over the integration-branch HEAD (best-effort),
+    # falling back to the abandoned row's base_sha so a SHA-resolution failure
+    # never aborts the cut.
+    resolved_head = await _resolve_integration_head_sha(session, project)
+    next_base_sha = resolved_head or locked.base_sha
+
+    next_goal: str | None = None
+    try:
+        from app.problem_model import parse_problem_model
+
+        if project is not None:
+            next_goal = (
+                parse_problem_model(project.problem_model).intent.current_focus or None
+            )
+    except Exception:
+        logger.exception(
+            "[RELEASE_VERSION] abandon: could not read current_focus for the "
+            "next version goal (non-fatal)"
+        )
+
+    next_version = await open_version(
+        session,
+        project_id,
+        version_number=locked.version_number + 1,
+        base_sha=next_base_sha,
+        phase="build",
+        goal=next_goal,
+    )
+    logger.info(
+        "[RELEASE_VERSION] abandon: v%d abandoned by operator=%s; opened v%d "
+        "(base_sha=%s) for project=%s",
+        locked.version_number,
+        operator_id,
+        next_version.version_number,
+        (next_base_sha or "(none)")[:8] if next_base_sha else "(none)",
+        project_id,
+    )
+
+    # Best-effort: activate staged directions awaiting the abandoned version and
+    # arm a strategic refresh.  An abandon counts as the awaited version
+    # resolving — directions staged behind it must not be orphaned.  Fully
+    # isolated in its OWN session + try/except so a sweep failure can NEVER abort
+    # the abandon, exactly mirroring the promotion path.
+    try:
+        from app.database import AsyncSessionLocal
+        from app.directions_repo import activate_eligible_staged_directions
+        from app.strategic_trigger import request_strategic_refresh
+
+        _abandoned_n = locked.version_number
+        async with AsyncSessionLocal() as _staged_session:
+            _activated = await activate_eligible_staged_directions(
+                _staged_session, project_id, _abandoned_n
+            )
+            await request_strategic_refresh(
+                _staged_session,
+                project_id,
+                f"version_abandoned:v{_abandoned_n}",
+            )
+            await _staged_session.commit()
+            if _activated:
+                logger.info(
+                    "[RELEASE_VERSION] abandon: v%d cut activated %d staged "
+                    "direction(s) for project=%s",
+                    _abandoned_n,
+                    len(_activated),
+                    project_id,
+                )
+    except Exception as exc:  # noqa: BLE001 — staged activation must not abort the cut
+        logger.warning(
+            "[RELEASE_VERSION] abandon: staged-direction activation / refresh "
+            "failed after v%d cut (non-fatal; reaper backstop retries): %s",
+            locked.version_number,
+            exc,
+        )
+
+    # Best-effort operator notification — rides the caller's commit.
+    try:
+        from app.release_promotion import _notify_operator
+
+        await _notify_operator(
+            session,
+            locked,
+            "release_version_abandoned",
+            (
+                f"v{locked.version_number} was abandoned by operator "
+                f"{operator_id}"
+                + (f" ({truncated_reason})" if truncated_reason else "")
+                + f". v{next_version.version_number} is now open for build."
+            ),
+            extra={
+                "reason": truncated_reason,
+                "operator": operator_id,
+                "next_version_number": next_version.version_number,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — notification must not abort the cut
+        logger.warning(
+            "[RELEASE_VERSION] abandon: operator notification failed after v%d "
+            "cut (non-fatal): %s",
+            locked.version_number,
+            exc,
+        )
+
+    return locked, next_version

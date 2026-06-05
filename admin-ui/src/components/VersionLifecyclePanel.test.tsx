@@ -6,6 +6,9 @@ import type { VersionLifecycleResponse } from '../api';
 
 vi.mock('../api');
 
+// Mock window.confirm for cut version tests
+const mockConfirm = vi.spyOn(window, 'confirm');
+
 function makeCurrentVersion(overrides: Partial<api.CurrentVersion> = {}): api.CurrentVersion {
   return {
     version_number: 1,
@@ -308,6 +311,141 @@ describe('VersionLifecyclePanel', () => {
         expect(screen.getByText('Request failed')).toBeInTheDocument();
       });
       expect(screen.getByText('DRY-RUN')).toBeInTheDocument();
+    });
+  });
+
+  describe('cut/abandon version', () => {
+    it('renders cut/abandon button when there is an open version', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ version_number: 1 }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.getByRole('button', { name: /Cut\/Abandon/ })).toBeInTheDocument();
+    });
+
+    it('shows confirm guard and calls API on cut version', async () => {
+      const cutVersionMock = vi.fn().mockResolvedValue({
+        abandoned_version: { version_number: 1, status: 'abandoned' },
+        new_version: { version_number: 2, phase: 'build', goal: null, opened_at: '2026-01-02T00:00:00Z' },
+      });
+      vi.mocked(api.cutVersion).mockImplementation(cutVersionMock);
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+      mockConfirm.mockReturnValue(true);
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ version_number: 1 }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const cutButton = screen.getByRole('button', { name: /Cut\/Abandon/ });
+      fireEvent.click(cutButton);
+
+      // Should show the input and buttons
+      const reasonInput = screen.getByPlaceholderText('Optional reason for cut...');
+      expect(reasonInput).toBeInTheDocument();
+
+      const cutButtonInForm = screen.getByRole('button', { name: /^Cut$/ });
+      fireEvent.click(cutButtonInForm);
+
+      await waitFor(() => {
+        expect(window.confirm).toHaveBeenCalledWith('Abandon v1 and open a fresh version?');
+      });
+
+      await waitFor(() => {
+        expect(cutVersionMock).toHaveBeenCalledWith('proj-1', undefined);
+      });
+
+      expect(mockRefresh).toHaveBeenCalled();
+    });
+
+    it('calls cutVersion with reason when provided', async () => {
+      const cutVersionMock = vi.fn().mockResolvedValue({
+        abandoned_version: { version_number: 1, status: 'abandoned' },
+        new_version: { version_number: 2, phase: 'build', goal: null, opened_at: '2026-01-02T00:00:00Z' },
+      });
+      vi.mocked(api.cutVersion).mockImplementation(cutVersionMock);
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+      mockConfirm.mockReturnValue(true);
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ version_number: 1 }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
+
+      const reasonInput = screen.getByPlaceholderText('Optional reason for cut...') as HTMLInputElement;
+      fireEvent.change(reasonInput, { target: { value: 'stalled in build' } });
+
+      fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
+
+      await waitFor(() => {
+        expect(cutVersionMock).toHaveBeenCalledWith('proj-1', 'stalled in build');
+      });
+    });
+
+    it('cancels cut version action when confirm is rejected', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+      mockConfirm.mockReturnValue(false);
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ version_number: 1 }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
+      fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
+
+      await waitFor(() => {
+        expect(window.confirm).toHaveBeenCalledWith('Abandon v1 and open a fresh version?');
+      });
+
+      expect(vi.mocked(api.cutVersion)).not.toHaveBeenCalled();
+    });
+
+    it('shows action message on successful cut version', async () => {
+      const cutVersionMock = vi.fn().mockResolvedValue({
+        abandoned_version: { version_number: 5, status: 'abandoned' },
+        new_version: { version_number: 6, phase: 'build', goal: null, opened_at: '2026-01-02T00:00:00Z' },
+      });
+      vi.mocked(api.cutVersion).mockImplementation(cutVersionMock);
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+      mockConfirm.mockReturnValue(true);
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ version_number: 5 }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
+      fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
+
+      await waitFor(() => {
+        expect(screen.getByText('Cut v5 → opened v6')).toBeInTheDocument();
+      });
     });
   });
 });

@@ -656,13 +656,23 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       } catch { /* ignore */ }
       // Pending strategic-refresh marker — surfaced as a "strategic cycle pending"
       // badge until the autonomous loop consumes it (when it clears backend-side).
+      // After consumption, shows a receipt via last_fired_at.
       // Non-critical: errors leave the prior marker state untouched.
       try {
         const visRes = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}`);
         if (visRes.ok) {
-          const proj = await visRes.json() as { vision?: { _strategic_refresh?: StrategicRefreshMarker | null } };
+          const proj = await visRes.json() as { vision?: { _strategic_refresh?: StrategicRefreshMarker | null; _strategic_refresh_last_fired_at?: string } };
           const marker = proj.vision?._strategic_refresh;
-          setStrategicRefresh(marker && typeof marker === 'object' ? marker : null);
+          const lastFiredAt = proj.vision?._strategic_refresh_last_fired_at;
+          // Build marker state: include pending marker if present, or add last_fired_at receipt
+          if (marker && typeof marker === 'object') {
+            setStrategicRefresh(marker);
+          } else if (lastFiredAt && typeof lastFiredAt === 'string') {
+            // No pending marker, but show receipt of prior consumption
+            setStrategicRefresh({ last_fired_at: lastFiredAt });
+          } else {
+            setStrategicRefresh(null);
+          }
         }
       } catch { /* ignore */ }
     } catch {
@@ -1027,16 +1037,24 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         onClose={onClose}
       />
 
-      {/* Pending strategic-refresh indicator — operator steering armed a cycle that
-          has not fired yet (project.vision._strategic_refresh present). Hidden once
-          the cycle starts (strategistActive), at which point the "Strategist working…"
-          indicator below takes over, so the badge transitions to "cycle running". */}
+      {/* Strategic-refresh indicator: either pending (armed but not yet fired) or
+          a receipt showing when a prior steer was picked up and acted upon. Hidden
+          once the cycle starts (strategistActive), at which point "Strategist working…"
+          takes over. */}
       {strategicRefresh && !strategistActive && (
-        <div className="px-4 md:px-6 py-2 border-b border-neutral-800 bg-amber-950/40 flex items-center gap-2 shrink-0" role="status" aria-live="polite">
-          <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" aria-hidden="true" />
-          <span className="text-xs text-amber-300 font-medium">
-            Strategic cycle pending{strategicRefresh.origin ? ` · ${strategicRefresh.origin}` : ''}
-            {strategicRefresh.requested_at ? ` · armed ${timeAgo(strategicRefresh.requested_at)}` : ''}
+        <div className={`px-4 md:px-6 py-2 border-b ${strategicRefresh.requested_at ? 'border-neutral-800 bg-amber-950/40' : 'border-green-800 bg-emerald-950/40'} flex items-center gap-2 shrink-0`} role="status" aria-live="polite">
+          <span className={`w-2 h-2 rounded-full ${strategicRefresh.requested_at ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400'}`} aria-hidden="true" />
+          <span className={`text-xs font-medium ${strategicRefresh.requested_at ? 'text-amber-300' : 'text-emerald-300'}`}>
+            {strategicRefresh.requested_at ? (
+              <>
+                Strategic cycle pending{strategicRefresh.origin ? ` · ${strategicRefresh.origin}` : ''}
+                {` · armed ${timeAgo(strategicRefresh.requested_at)}`}
+              </>
+            ) : (
+              <>
+                Steer picked up{strategicRefresh.last_fired_at ? ` · strategic cycle ran ${timeAgo(strategicRefresh.last_fired_at)}` : ''}
+              </>
+            )}
           </span>
         </div>
       )}
