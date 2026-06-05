@@ -1,6 +1,28 @@
-import { X, Check, AlertTriangle, HelpCircle, Bug, StickyNote, MessageSquare, PlusCircle, Trash2, CheckSquare, Reply } from 'lucide-react';
+import { X, Check, AlertTriangle, HelpCircle, Bug, StickyNote, MessageSquare, PlusCircle, Trash2, CheckSquare, Reply, Copy } from 'lucide-react';
+import { useState, useCallback } from 'react';
 import { parseTimestamp } from '../utils/time';
 import { ESCALATION_BADGE_LABELS, HIGH_SIGNAL_NOTE_BADGE_LABELS } from './eventPrefs';
+
+function CopyableMessageRef({ msgId }: { msgId: string }) {
+  const [copied, setCopied] = useState(false);
+  const shortRef = msgId.slice(0, 8);
+  const copy = useCallback(() => {
+    navigator.clipboard?.writeText(shortRef).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    }).catch(() => {/* clipboard unavailable */});
+  }, [shortRef]);
+  return (
+    <button
+      onClick={copy}
+      title="Copy message short ref"
+      className="inline-flex items-center gap-1 font-mono text-[10px] text-neutral-600 hover:text-neutral-400 transition-colors"
+    >
+      {copied ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+      {shortRef}
+    </button>
+  );
+}
 
 export interface ProjectMessage {
   id: string;
@@ -184,6 +206,8 @@ export function MessageBubble({
               )}
               <span> · {formatAge(msg.created_at)}</span>
             </span>
+            <span className="flex-1" />
+            <CopyableMessageRef msgId={msg.id} />
           </div>
           {/* Reply context for feedback acknowledgment */}
           {replyContextMsg && (

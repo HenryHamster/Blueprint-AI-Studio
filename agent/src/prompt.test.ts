@@ -63,6 +63,7 @@ import {
   formatProjectBlindSpotSummary,
   formatFixIterationHistory,
   formatSelfReviewCalibrationSection,
+  writeMessagesHelper,
   writeDesignDocHelper,
   CODE_CHANGE_HELPER_GUIDANCE,
   buildCodeChangeHelperGuidance,
@@ -4432,5 +4433,41 @@ describe('writeDesignDocHelper', () => {
         try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
       }
     });
+  });
+});
+
+// ── writeMessagesHelper ──────────────────────────────────────────────────────
+describe('writeMessagesHelper', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  it('preserves non-2xx response bodies so ambiguous short refs show backend candidates', async () => {
+    writeMessagesHelper('task-xyz');
+    const script = capturedScripts['/tmp/workspace/messages'];
+    expect(script).toBeDefined();
+    expect(script).toContain('_post_strategic()');
+    expect(script).toContain('if ! response=$(curl $CURL_OPTS -X POST "$API/api/agent/strategic"');
+    expect(script).toContain("-w '\\n%{http_code}'");
+    expect(script).toContain('printf \'%s\\\\n\' "$body" >&2');
+    expect(script).toContain('[ERROR] messages $OP failed (HTTP $http_code)');
+    expect(script).not.toContain('curl -f -sS');
+
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const tmp = `${realOs.tmpdir().replace(/\\/g, '/')}/messages_smoke_${process.pid}_${Date.now()}.sh`;
+    realFs.writeFileSync(tmp, script);
+    try {
+      realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });
+    } finally {
+      try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
   });
 });

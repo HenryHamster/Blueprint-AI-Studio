@@ -1431,14 +1431,13 @@ async def strategic_operation(
         msg_id = data.get("message_id")
         if not msg_id:
             raise HTTPException(status_code=400, detail="message_id required")
-        try:
-            msg = await session.get(ProjectMessage, uuid.UUID(str(msg_id)))
-        except (ValueError, TypeError):
-            raise HTTPException(
-                status_code=400, detail="Invalid message_id"
-            ) from None
-        if not msg or msg.project_id != project.id:
-            raise HTTPException(status_code=404, detail="Message not found")
+        # Accept a full UUID (unchanged behavior) OR a short hex prefix (the
+        # first 8+ hex chars the admin UI surfaces). Resolution is strictly
+        # project-scoped, spans all statuses, and fails loudly on
+        # ambiguous (409) / missing (404) / too-short (400) refs.
+        from app.message_convergence import resolve_message_ref as _resolve_message_ref
+
+        msg = await _resolve_message_ref(session, project.id, str(msg_id))
         if msg.status == "resolved":
             return _resp({"status": "already_resolved"})
         owned_by_direction = data.get("owned_by_direction")

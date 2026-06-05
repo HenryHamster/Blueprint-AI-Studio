@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
+from app.message_convergence import get_message_link, resolve_message_ref
 from app.models import Project, Task
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
@@ -136,6 +137,42 @@ async def agent_fetch_problem_model(
     image-rollover window."""
     project = await _resolve_agent_project(project_id, token, session)
     return {"status": "success", "data": project.problem_model or {}}
+
+
+@router.get("/projects/{project_id}/messages/{ref}")
+@limiter.limit("60/minute")
+async def agent_fetch_message(
+    request: Request,
+    project_id: uuid.UUID,
+    ref: str,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Resolve a project message by short ref (first 8+ hex chars of its UUID)
+    or full UUID and return its content. Used when a message has aged out of
+    the live strategic thread (only status=open messages are loaded into the
+    spawn context) and the agent needs to inspect it before acting on it.
+
+    Project-scoped via ``_resolve_agent_project`` (cross-project → 404). The
+    shared resolver fails loudly on ambiguous (409), missing (404), and
+    too-short (400) refs, and matches across all statuses."""
+    project = await _resolve_agent_project(project_id, token, session)
+    msg = await resolve_message_ref(session, project.id, ref)
+    message_type = msg.message_type
+    type_value = message_type.value if hasattr(message_type, "value") else str(message_type)
+    return {
+        "status": "success",
+        "data": {
+            "id": str(msg.id),
+            "content": msg.content,
+            "type": type_value,
+            "from_type": msg.from_type,
+            "status": msg.status,
+            "resolution": msg.resolution,
+            "convergence_link": get_message_link(msg),
+            "created_at": msg.created_at.isoformat() if msg.created_at else None,
+        },
+    }
 
 
 @router.get("/projects/{project_id}/gaps/{gap_id}")

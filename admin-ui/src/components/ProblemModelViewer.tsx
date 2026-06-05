@@ -52,14 +52,27 @@ const pendingTypeLabels: Record<string, string> = {
 };
 
 function SourceBadge({ source }: { source: Source }) {
-  const parts: string[] = [source.type.replace(/_/g, ' ')];
-  if (source.message_id) parts.push(`msg ${source.message_id.slice(0, 8)}`);
-  if (source.pr_number) parts.push(`PR #${source.pr_number}`);
-  if (source.direction_id) parts.push(`dir ${source.direction_id.slice(0, 8)}`);
-  if (source.friction_id) parts.push(`friction ${source.friction_id.slice(0, 8)}`);
+  // The message short ref is exactly the first 8 hex chars of the message UUID —
+  // the canonical, resolvable reference the backend short-ref resolver matches
+  // (MIN_MESSAGE_REF_HEXLEN = 8). Keep this slice length in lockstep with the
+  // backend resolver so the displayed ref is always usable as-is via
+  // `./fetch message <ref>` / `./messages resolve <ref>` — do NOT shorten it.
+  const messageRef = source.message_id ? source.message_id.slice(0, 8) : null;
+  const tail: string[] = [];
+  if (source.pr_number) tail.push(`PR #${source.pr_number}`);
+  if (source.direction_id) tail.push(`dir ${source.direction_id.slice(0, 8)}`);
+  if (source.friction_id) tail.push(`friction ${source.friction_id.slice(0, 8)}`);
   return (
     <span className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-800/70 text-neutral-400 border border-neutral-800">
-      {parts.join(' · ')}
+      {source.type.replace(/_/g, ' ')}
+      {messageRef && (
+        <span
+          title={`Message ref ${messageRef} — resolvable short ref (fetch message ${messageRef} / messages resolve ${messageRef}); matches the backend short-ref resolver, no full UUID needed`}
+        >
+          {' · '}msg {messageRef}
+        </span>
+      )}
+      {tail.length > 0 && ` · ${tail.join(' · ')}`}
     </span>
   );
 }

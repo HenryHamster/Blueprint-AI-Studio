@@ -16,15 +16,25 @@ No new DB columns or migrations are required.
 
 from __future__ import annotations
 
+import uuid
 from typing import TYPE_CHECKING
 
-from app.models import MessageType
+from fastapi import HTTPException
+from sqlmodel import select
+
+from app.models import MessageType, ProjectMessage
 from app.time_utils import _utcnow
 
 if TYPE_CHECKING:
     from datetime import datetime
 
-    from app.models import ProjectMessage
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+# Minimum hex characters required for a short message reference. The admin UI
+# surfaces the first 8 hex chars (``id.slice(0, 8)``); anything shorter is too
+# collision-prone to resolve unambiguously, so we reject it loudly rather than
+# match an arbitrary row.
+MIN_MESSAGE_REF_HEXLEN = 8
 
 # Status string for a message that has a durable forward link but is not yet resolved.
 LINKED_STATUS = "linked"
@@ -171,3 +181,96 @@ def get_message_link(msg: "ProjectMessage") -> dict | None:
     if not isinstance(link, dict):
         return None
     return link
+
+
+def _normalize_message_ref(ref: str) -> str:
+    """Normalize a short ref or full UUID to a lowercase, dash-free hex prefix."""
+    return str(ref or "").strip().lower().replace("-", "")
+
+
+def _message_ref_candidates(matches: list["ProjectMessage"]) -> list[dict[str, str | None]]:
+    """Return deterministic disambiguators for ambiguous message refs.
+
+    Each candidate includes a collision-free hex prefix (at least
+    ``MIN_MESSAGE_REF_HEXLEN`` chars, extended only as far as needed) plus the
+    full UUID so callers can retry resolution without recovering ids out of
+    band.
+    """
+    ordered = sorted(matches, key=lambda msg: msg.id.hex)
+    prefix_len = MIN_MESSAGE_REF_HEXLEN
+    while prefix_len < 32:
+        prefixes = {msg.id.hex[:prefix_len] for msg in ordered}
+        if len(prefixes) == len(ordered):
+            break
+        prefix_len += 1
+
+    candidates: list[dict[str, str | None]] = []
+    for msg in ordered:
+        msg_type = getattr(msg, "message_type", None)
+        type_value = msg_type.value if hasattr(msg_type, "value") else str(msg_type or "")
+        candidates.append(
+            {
+                "id": str(msg.id),
+                "ref": msg.id.hex[:prefix_len],
+                "type": type_value,
+                "from_type": str(getattr(msg, "from_type", "") or ""),
+                "status": str(getattr(msg, "status", "") or ""),
+                "created_at": msg.created_at.isoformat() if msg.created_at else None,
+            }
+        )
+    return candidates
+
+
+async def resolve_message_ref(
+    session: "AsyncSession",
+    project_id: uuid.UUID,
+    ref: str,
+) -> "ProjectMessage":
+    """Resolve a short ref or full UUID to the one matching ProjectMessage.
+
+    The reference may be a full UUID or a short hex prefix (case-insensitive,
+    dashes ignored). Resolution is strictly project-scoped: the query filters
+    on ``project_id`` FIRST so a ref from another project can never match (the
+    caller surfaces that as a 404, never a 403, to avoid project enumeration).
+    Matching spans ALL statuses (open, resolved, linked) — not just open.
+
+    Raises:
+        HTTPException(400): the normalized ref is empty or shorter than
+            ``MIN_MESSAGE_REF_HEXLEN`` (too collision-prone to resolve).
+        HTTPException(404): no message in the project starts with the prefix.
+        HTTPException(409): more than one message matches (ambiguous prefix);
+            the detail includes retryable candidate refs/full ids and NO row is
+            touched.
+    """
+    prefix = _normalize_message_ref(ref)
+    if not prefix:
+        raise HTTPException(status_code=400, detail="message reference required")
+    if len(prefix) < MIN_MESSAGE_REF_HEXLEN:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"message reference too short: need at least "
+                f"{MIN_MESSAGE_REF_HEXLEN} hex characters"
+            ),
+        )
+    # Scope to the project FIRST so cross-project rows are never candidates,
+    # then match id-hex prefix in Python (sqlite-safe, status-agnostic).
+    result = await session.execute(
+        select(ProjectMessage).where(ProjectMessage.project_id == project_id)
+    )
+    matches = [m for m in result.scalars().all() if m.id.hex.startswith(prefix)]
+    if not matches:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    f"Ambiguous message reference {prefix!r} matches multiple messages"
+                ),
+                "prefix": prefix,
+                "min_hex_chars": MIN_MESSAGE_REF_HEXLEN,
+                "candidates": _message_ref_candidates(matches),
+            },
+        )
+    return matches[0]

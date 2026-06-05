@@ -350,6 +350,7 @@ export async function handleStrategic(
         '  - `./fetch direction <id>` — full direction record (research_history capped at 20 cycles)',
         '  - `./fetch playbook <key>` — single playbook entry (e.g. `./fetch playbook frontend-build`)',
         '  - `./fetch gap <id>` — single gap with full history/past_moves/evidence',
+        '  - `./fetch message <ref>` — inspect a message by short ref (8+ hex chars) or UUID, including one aged out of the live thread; then `./messages resolve <ref>` accepts the same ref',
         '  - `./fetch problem-model` — the FULL untrimmed problem_model (all gaps, friction, archived) if it was trimmed/dropped above',
       );
       return lines.join('\n');
@@ -604,9 +605,13 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 ./fetch direction <direction_id>   # full direction record
 ./fetch playbook <key>             # single playbook entry
 ./fetch gap <gap_id>               # single problem_model gap
+./fetch message <ref>              # inspect a message by short ref (8+ hex chars) or UUID,
+                                   # even one that has aged out of the live thread
 
-# Respond to or resolve user messages
-./messages resolve <message-id> 'How it was addressed'
+# Respond to or resolve user messages. <ref> may be a short ref (the first 8+ hex
+# chars shown in the admin UI) or a full UUID — the backend resolves it, so you do
+# NOT need to recover the full UUID out-of-band.
+./messages resolve <ref> 'How it was addressed'
 ./messages send 'Observation or note to the user'
 \`\`\`
 

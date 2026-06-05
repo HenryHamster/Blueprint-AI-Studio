@@ -10,8 +10,54 @@ into its own router seam; behavior and contracts are unchanged.
 import pytest
 from httpx import AsyncClient
 
-from app.models import Project, Task, TaskStatus
+from app.models import MessageType, Project, ProjectMessage, Task, TaskStatus
 from app.auth import create_agent_token
+
+
+async def _make_project_task(db_session, *, vm="agent-vm-msg"):
+    project = Project(name="Msg Test", user_id="test-user-msg")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id=vm)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return project, task
+
+
+async def _add_message(db_session, project, **kwargs):
+    msg = ProjectMessage(project_id=project.id, **kwargs)
+    db_session.add(msg)
+    await db_session.commit()
+    await db_session.refresh(msg)
+    return msg
+
+
+async def _add_ambiguous_messages(db_session, project, *, shared_prefix: str = "abcdef12"):
+    """Create two messages whose UUIDs share the same 8-hex prefix."""
+    import uuid as _uuid
+
+    ids = (
+        _uuid.UUID(shared_prefix + "0000" + "4000" + "8000" + "000000000001"),
+        _uuid.UUID(shared_prefix + "0000" + "4000" + "8000" + "000000000002"),
+    )
+    messages: list[ProjectMessage] = []
+    for mid in ids:
+        msg = ProjectMessage(
+            id=mid,
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            content="dup",
+            status="open",
+        )
+        db_session.add(msg)
+        messages.append(msg)
+    await db_session.commit()
+    for msg in messages:
+        await db_session.refresh(msg)
+    return shared_prefix, messages
 
 
 @pytest.mark.asyncio
@@ -532,3 +578,273 @@ async def test_agent_fetch_problem_model_both_spellings_return_same_body(
     assert body_underscore == body_hyphen
     assert body_underscore["data"]["revision"] == 5
     assert body_underscore["data"]["intent"]["purpose"] == "Image rollover compatibility"
+
+
+# ---------------------------------------------------------------------------
+# Message short-ref lookup + resolution
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["open", "resolved", "linked"])
+async def test_agent_fetch_message_lookup_across_statuses(
+    client: AsyncClient, db_session, status
+):
+    """The agent can resolve a message by short ref regardless of status."""
+    project, task = await _make_project_task(db_session)
+    msg = await _add_message(
+        db_session,
+        project,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content=f"a {status} message",
+        status=status,
+    )
+    short_ref = msg.id.hex[:8].upper()  # case-insensitive
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/messages/{short_ref}",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert data["id"] == str(msg.id)
+    assert data["content"] == f"a {status} message"
+    assert data["status"] == status
+    assert data["from_type"] == "user"
+    assert data["type"] == "NOTE"
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_message_by_full_uuid_with_dashes(
+    client: AsyncClient, db_session
+):
+    """A full UUID (with dashes) resolves to exactly that message."""
+    project, task = await _make_project_task(db_session)
+    msg = await _add_message(
+        db_session,
+        project,
+        message_type=MessageType.BUG_REPORT,
+        from_type="agent",
+        content="full uuid lookup",
+        status="open",
+    )
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/messages/{msg.id}",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["data"]["id"] == str(msg.id)
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_message_ambiguous_prefix_fails_loudly(
+    client: AsyncClient, db_session
+):
+    """An ambiguous prefix returns retryable refs/full ids; no row touched."""
+    project, task = await _make_project_task(db_session)
+    shared, messages = await _add_ambiguous_messages(db_session, project)
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/messages/{shared}",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 409, res.text
+    detail = res.json()["error"]["message"]
+    assert detail["prefix"] == shared
+    assert detail["min_hex_chars"] == 8
+    assert detail["message"].startswith("Ambiguous message reference")
+    candidates = detail["candidates"]
+    assert len(candidates) == 2
+    expected_ids = {str(msg.id) for msg in messages}
+    assert {candidate["id"] for candidate in candidates} == expected_ids
+    assert all(len(candidate["ref"]) > len(shared) for candidate in candidates)
+    assert all(candidate["status"] == "open" for candidate in candidates)
+    retry_res = await client.get(
+        f"/api/agent/projects/{project.id}/messages/{candidates[0]['ref']}",
+        headers={"x-agent-token": token},
+    )
+    assert retry_res.status_code == 200, retry_res.text
+    assert retry_res.json()["data"]["id"] == candidates[0]["id"]
+
+
+@pytest.mark.asyncio
+async def test_strategic_resolve_message_ambiguous_prefix_returns_candidates(
+    client: AsyncClient, db_session
+):
+    """resolve_message surfaces retryable candidates when an 8-char ref collides."""
+    project, task = await _make_project_task(db_session)
+    shared, messages = await _add_ambiguous_messages(db_session, project)
+    token = create_agent_token(
+        str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    res = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "resolve_message",
+            "data": {"message_id": shared, "resolution": "done"},
+        },
+    )
+    assert res.status_code == 409, res.text
+    detail = res.json()["error"]["message"]
+    assert detail["prefix"] == shared
+    candidates = detail["candidates"]
+    assert len(candidates) == 2
+    expected_ids = {str(msg.id) for msg in messages}
+    assert {candidate["id"] for candidate in candidates} == expected_ids
+    assert all(len(candidate["ref"]) > len(shared) for candidate in candidates)
+    retry_res = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "resolve_message",
+            "data": {"message_id": candidates[0]["ref"], "resolution": "done"},
+        },
+    )
+    assert retry_res.status_code == 200, retry_res.text
+    assert retry_res.json()["message_id"] == candidates[0]["id"]
+    for msg in messages:
+        await db_session.refresh(msg)
+    resolved = next(msg for msg in messages if str(msg.id) == candidates[0]["id"])
+    untouched = next(msg for msg in messages if str(msg.id) != candidates[0]["id"])
+    assert resolved.status == "resolved"
+    assert resolved.resolution == "done"
+    assert untouched.status == "open"
+    assert untouched.resolution is None
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_message_missing_prefix_returns_404(
+    client: AsyncClient, db_session
+):
+    """A prefix matching no message returns 404."""
+    project, task = await _make_project_task(db_session)
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/messages/deadbeef",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404, res.text
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_message_too_short_ref_fails_loudly(
+    client: AsyncClient, db_session
+):
+    """A too-short prefix is rejected (400) rather than matching arbitrarily."""
+    project, task = await _make_project_task(db_session)
+    await _add_message(
+        db_session,
+        project,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content="short",
+        status="open",
+    )
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/messages/abc",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 400, res.text
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_message_cross_project_not_found(
+    client: AsyncClient, db_session
+):
+    """A short ref from another project is not found (cross-project stays closed)."""
+    project_a, task_a = await _make_project_task(db_session, vm="agent-vm-a")
+    project_b, _ = await _make_project_task(db_session, vm="agent-vm-b")
+    msg_b = await _add_message(
+        db_session,
+        project_b,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content="belongs to B",
+        status="open",
+    )
+    # Agent token scoped to A asks A for a ref that exists only in B.
+    token = create_agent_token(str(task_a.id), task_a.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project_a.id}/messages/{msg_b.id.hex[:8]}",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404, res.text
+
+
+@pytest.mark.asyncio
+async def test_strategic_resolve_message_by_short_ref_plain(
+    client: AsyncClient, db_session
+):
+    """resolve_message op accepts a short ref and resolves a plain message."""
+    project, task = await _make_project_task(db_session)
+    msg = await _add_message(
+        db_session,
+        project,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content="please resolve",
+        status="open",
+    )
+    token = create_agent_token(
+        str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    res = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "resolve_message",
+            "data": {"message_id": msg.id.hex[:8], "resolution": "done"},
+        },
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "ok"
+    assert body["message_id"] == str(msg.id)
+    await db_session.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "done"
+    assert msg.resolved_at is not None
+
+
+@pytest.mark.asyncio
+async def test_strategic_resolve_message_by_short_ref_links_bug(
+    client: AsyncClient, db_session
+):
+    """resolve_message op by short ref links a bug-class message to an outcome."""
+    project, task = await _make_project_task(db_session)
+    msg = await _add_message(
+        db_session,
+        project,
+        message_type=MessageType.BUG_REPORT,
+        from_type="agent",
+        content="a bug",
+        status="open",
+    )
+    token = create_agent_token(
+        str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    res = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "resolve_message",
+            "data": {
+                "message_id": msg.id.hex[:8],
+                "owned_by_direction": "dir-99",
+            },
+        },
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["linked_to"] == {"kind": "direction", "id": "dir-99"}
+    await db_session.refresh(msg)
+    assert msg.status == "linked"

@@ -615,28 +615,51 @@ export function writeMessagesHelper(taskIdRaw: string, workspace: string = WORKS
 # Usage:
 #   ./messages send '<content>'                    # send a NOTE message
 #   ./messages send '<content>' QUESTION           # send with specific type (NOTE|QUESTION|FEEDBACK|BUG_REPORT|BLOCKER)
-#   ./messages resolve <message-id> '<resolution>' # resolve an open message
+#   ./messages resolve <ref> '<resolution>'        # resolve an open message; <ref> may be a
+#                                                  #   short ref (first 8+ hex chars of the
+#                                                  #   message UUID, as shown in the admin UI)
+#                                                  #   or a full UUID — the backend resolves it,
+#                                                  #   so no need to recover the full UUID.
 
 OP="\${1:?Usage: messages send|resolve ...}"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 TASK="${taskId}"
-CURL_OPTS="-f -sS --max-time 30 --connect-timeout 10"
+CURL_OPTS="-sS --max-time 30 --connect-timeout 10"
+
+_post_strategic() {
+  local response http_code body
+  if ! response=$(curl $CURL_OPTS -X POST "$API/api/agent/strategic" \\
+    -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" \\
+    --data-binary @- \\
+    -w '\\n%{http_code}'); then
+    return 1
+  fi
+  http_code=$(printf '%s' "$response" | tail -n1)
+  body=$(printf '%s' "$response" | head -n -1)
+  if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+    printf '%s' "$body"
+    return 0
+  fi
+  if [ -n "$body" ]; then
+    printf '%s\\n' "$body" >&2
+  fi
+  echo "[ERROR] messages $OP failed (HTTP $http_code)" >&2
+  return 1
+}
 
 if [ "$OP" = "send" ]; then
   CONTENT="\${2:?send requires '<content>'}"
   MSG_TYPE="\${3:-NOTE}"
   jq -n --arg tid "$TASK" --arg t "$MSG_TYPE" --arg c "$CONTENT" \\
     '{task_id: $tid, op: "create_message", data: {type: $t, content: $c}}' | \\
-    curl $CURL_OPTS -X POST "$API/api/agent/strategic" \\
-      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+    _post_strategic
 elif [ "$OP" = "resolve" ]; then
   MSG_ID="\${2:?resolve requires <message-id>}"
   RESOLUTION="\${3:-Addressed}"
   jq -n --arg tid "$TASK" --arg mid "$MSG_ID" --arg r "$RESOLUTION" \\
     '{task_id: $tid, op: "resolve_message", data: {message_id: $mid, resolution: $r}}' | \\
-    curl $CURL_OPTS -X POST "$API/api/agent/strategic" \\
-      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+    _post_strategic
 else
   echo "Unknown op: $OP. Use send or resolve." >&2; exit 1
 fi

@@ -72,6 +72,23 @@ describe('writeStrategicHelpers', () => {
     expect(content).toContain('direction');
     expect(content).toContain('playbook');
     expect(content).toContain('gap');
+    expect(content).toContain('message');
+  });
+
+  it('supports fetching a message by short ref via the messages endpoint', () => {
+    const taskId = 'test-task-123';
+    const projectId = 'test-project-456';
+    writeStrategicHelpers(taskId, projectId, testWorkspace);
+
+    const content = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
+    // The new subcommand maps `fetch message <ref>` to the read-only lookup
+    // endpoint that resolves a short ref or full UUID backend-side.
+    expect(content).toContain('message)    PATH_SUFFIX="messages/$ID"');
+    expect(content).toContain('fetch problem-model|direction|playbook|gap|message [id]');
+    // Reuses the existing X-Agent-Token GET path — no new auth/curl block.
+    expect(content).toContain('-H "X-Agent-Token: $TOKEN"');
+    // The shared id-required guard covers `message` (only problem-model is id-less).
+    expect(content).toContain('fetch $KIND requires an id argument');
   });
 
   it('allows fetching the full problem model without an id', () => {
@@ -80,7 +97,7 @@ describe('writeStrategicHelpers', () => {
     writeStrategicHelpers(taskId, projectId, testWorkspace);
 
     const content = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
-    expect(content).toContain('Usage: fetch problem-model|direction|playbook|gap [id]');
+    expect(content).toContain('Usage: fetch problem-model|direction|playbook|gap|message [id]');
     expect(content).toContain('problem-model) PATH_SUFFIX="problem-model"');
     expect(content).toContain('fetch $KIND requires an id argument');
   });

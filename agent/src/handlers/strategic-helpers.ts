@@ -83,20 +83,24 @@ function generateFetchScript(projectIdRaw: string): string {
   return `#!/bin/bash
 # Strategic-context fetch tool — pull detail for items the packer trimmed.
 # Reads ORCHESTRATOR_URL, AGENT_API_TOKEN from env. project_id is baked in.
-KIND="\${1:?Usage: fetch problem-model|direction|playbook|gap [id]}"
+KIND="\${1:?Usage: fetch problem-model|direction|playbook|gap|message [id]}"
 ID="\${2:-}"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 PROJECT="${projectId}"
 [ -n "$PROJECT" ] || { echo "[ERROR] no project_id available; fetch is only usable in strategic-mode tasks" >&2; exit 1; }
 
-# problem-model takes no id; everything else requires one.
+# problem-model takes no id; everything else requires one. For "message" the
+# id may be a short ref (first 8+ hex chars of the message UUID — the same ref
+# operators see in the admin UI) or a full UUID; the backend resolves it and
+# fails loudly on ambiguous/missing refs.
 case "$KIND" in
   problem-model) PATH_SUFFIX="problem-model" ;;
   direction)  PATH_SUFFIX="directions/$ID" ;;
   playbook)   PATH_SUFFIX="playbook/$ID" ;;
   gap)        PATH_SUFFIX="gaps/$ID" ;;
-  *) echo "Unknown kind: $KIND (use problem-model|direction|playbook|gap)" >&2; exit 1 ;;
+  message)    PATH_SUFFIX="messages/$ID" ;;
+  *) echo "Unknown kind: $KIND (use problem-model|direction|playbook|gap|message)" >&2; exit 1 ;;
 esac
 
 if [ "$KIND" != "problem-model" ] && [ -z "$ID" ]; then
