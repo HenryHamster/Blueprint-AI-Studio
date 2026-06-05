@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -1261,6 +1262,72 @@ async def _maybe_release_safeguard_gate(
             )
 
 
+# ---------------------------------------------------------------------------
+# Cheap always-on acceptance probes for findings-producing task types
+# (security_audit, perf). Mirrors the topic-responsiveness and grounding
+# probes in knowledge_completion.py: deterministic, no external calls, errs
+# toward acceptance — only a CLEAR objective miss or complete lack of file
+# references fails here.
+# ---------------------------------------------------------------------------
+
+_FINDINGS_STOPWORDS = frozenset({
+    "about", "code", "does", "from", "function", "have", "into", "make",
+    "made", "method", "over", "prompt", "report", "should", "state", "such",
+    "than", "that", "their", "them", "then", "there", "these", "they", "this",
+    "those", "topic", "under", "used", "using", "what", "when", "where",
+    "which", "while", "will", "with", "would", "your",
+})
+_FINDINGS_MIN_KWS = 3
+_FINDINGS_MIN_OVERLAP = 0.1
+
+
+def _findings_kws(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(w) >= 4 and w not in _FINDINGS_STOPWORDS}
+
+
+def _findings_responsiveness_miss(task: Task, findings: list) -> str | None:
+    """Return a reason when findings clearly don't match the requested target, else None."""
+    payload = task.first_payload or {}
+    req = _findings_kws(" ".join(str(payload.get(k) or "") for k in ("prompt", "topic", "target")))
+    if len(req) < _FINDINGS_MIN_KWS:
+        return None
+    doc = _findings_kws(" ".join(
+        " ".join(str(f.get(k) or "") for k in ("title", "description", "area")) for f in findings
+    ))
+    overlap = req & doc
+    if len(overlap) / len(req) >= _FINDINGS_MIN_OVERLAP:
+        return None
+    return f"findings not responsive to target ({len(overlap)}/{len(req)} keyword(s) matched in titles/descriptions)"
+
+
+def _findings_grounding_miss(findings: list) -> str | None:
+    """Return a reason when NO finding references a file path (completely ungrounded)."""
+    if not findings or any(str(f.get("file_path") or "").strip() for f in findings):
+        return None
+    return f"findings not grounded in repository: none of {len(findings)} finding(s) cite a file path"
+
+
+def _findings_probe_detail(task: Task, findings: list) -> dict:
+    """Structured probe detail persisted in plan_output for operator visibility."""
+    payload = task.first_payload or {}
+    req = _findings_kws(" ".join(str(payload.get(k) or "") for k in ("prompt", "topic", "target")))
+    doc = _findings_kws(" ".join(
+        " ".join(str(f.get(k) or "") for k in ("title", "description", "area")) for f in findings
+    ))
+    grounded = sum(1 for f in findings if str(f.get("file_path") or "").strip())
+    return {
+        "topic_responsiveness": {
+            "passed": _findings_responsiveness_miss(task, findings) is None,
+            "overlap": len(req & doc), "total": len(req),
+        },
+        "grounding": {
+            "passed": _findings_grounding_miss(findings) is None,
+            "grounded": grounded, "total": len(findings),
+        },
+    }
+
+
 async def _handle_security_audit_completion(
     task: Task, logs: str, session: AsyncSession
 ):
@@ -1336,12 +1403,27 @@ async def _handle_security_audit_completion(
         await _maybe_release_safeguard_gate(task, findings, session)
         return
 
-    # Store all findings for display — wrapped in a dict so query_findings_index
-    # (which only processes list plan_output) does not treat security audit
-    # findings as research findings.
-    task.plan_output = {"findings": findings}
+    # Store all findings + acceptance-probe detail for operator visibility.
+    # Wrapped in a dict so query_findings_index (which only processes list
+    # plan_output) does not treat security audit findings as research findings.
+    task.plan_output = {"findings": findings, "acceptance_probe": _findings_probe_detail(task, findings)}
     session.add(task)
     await session.commit()
+
+    # Goal-level acceptance probe: cheap deterministic check that findings are
+    # responsive to the audited target and grounded in the repository. Runs
+    # always, regardless of whether the optional quality grader is enabled.
+    # Errs toward acceptance — only a CLEAR miss fails here, preventing an
+    # obviously off-objective or ungrounded audit from spawning fix PRs.
+    _probe_miss = _findings_responsiveness_miss(task, findings) or _findings_grounding_miss(findings)
+    if _probe_miss is not None:
+        record_failed_gate(task, EvaluationVerdict(False, f"security_audit {_probe_miss}", "forward-quality"))
+        session.add(task)
+        await session.commit()
+        await _maybe_release_safeguard_gate(task, None, session)
+        await broadcast_to_project(str(task.project_id), "task_updated", {"task_id": str(task.id), "status": TaskStatus.FAILED})
+        logger.info("[SECURITY AUDIT] Task %s failed acceptance probe: %s", task.id, _probe_miss)
+        return
 
     project = await session.get(Project, task.project_id)
     base_branch = (task.first_payload).get(
@@ -1555,12 +1637,26 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
         await session.commit()
         return
 
-    # Store all findings for display — wrapped in a dict so query_findings_index
-    # (which only processes list plan_output) does not treat perf audit findings
-    # as research findings.
-    task.plan_output = {"findings": findings}
+    # Store all findings + acceptance-probe detail for operator visibility.
+    # Wrapped in a dict so query_findings_index (which only processes list
+    # plan_output) does not treat perf audit findings as research findings.
+    task.plan_output = {"findings": findings, "acceptance_probe": _findings_probe_detail(task, findings)}
     session.add(task)
     await session.commit()
+
+    # Goal-level acceptance probe: cheap deterministic check that findings are
+    # responsive to the audited target. Runs always (after the metric structural
+    # gate), regardless of the optional quality grader. Errs toward acceptance —
+    # only a CLEAR miss fails here. Grounding (file_path presence) is NOT
+    # applied here: perf findings are legitimately area-based without file refs.
+    _probe_miss = _findings_responsiveness_miss(task, findings)
+    if _probe_miss is not None:
+        record_failed_gate(task, EvaluationVerdict(False, f"perf {_probe_miss}", "forward-quality"))
+        session.add(task)
+        await session.commit()
+        await broadcast_to_project(str(task.project_id), "task_updated", {"task_id": str(task.id), "status": TaskStatus.FAILED})
+        logger.info("[PERF] Task %s failed acceptance probe: %s", task.id, _probe_miss)
+        return
 
     project = await session.get(Project, task.project_id)
     base_branch = (task.first_payload).get(

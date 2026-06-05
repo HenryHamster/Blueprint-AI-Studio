@@ -5449,6 +5449,21 @@ async def orchestrator_worker():
                                             )
                                         )
                                     )
+                                    # The suite could not run, but the cheap
+                                    # acceptance probe DID run on the setup-failure
+                                    # fall-open and the changed code CLEARLY failed
+                                    # to compile/build (not a could-not-run degrade
+                                    # from the same environment problem). Feed the
+                                    # FAILED artifact as the verdict so it maps to a
+                                    # merge BLOCK + fix instead of the
+                                    # crash-retry-then-fall-open path — a genuine
+                                    # build break must not merge UNVERIFIED.
+                                    if isinstance(
+                                        _failed_artifact, dict
+                                    ) and ci_resolution.probe_is_clear_failure(
+                                        _failed_artifact.get("probe")
+                                    ):
+                                        _verdict = _failed_artifact
                                 _outcome, _detail = (
                                     ci_resolution.classify_merge_test_verdict(
                                         _verdict

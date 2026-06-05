@@ -51,6 +51,7 @@ from app.ci_resolution import (
     classify_unverified_fall_open_reason,
     has_detectable_tests,
     merge_gate_runtime_block,
+    probe_is_clear_failure,
     proceed_on_no_checks,
     record_no_ci_gate_runtime,
     should_run_no_ci_test_gate,
@@ -741,6 +742,114 @@ async def test_no_ci_setup_failed_verify_task_exhausted_retry_merges_unverified_
     assert runtime is not None
     assert runtime["executed_real_tests"] is False
     assert runtime["last_unverified_reason"] == "verify_setup_failed"
+
+
+@pytest.mark.asyncio
+async def test_no_ci_setup_failed_with_clear_probe_failure_blocks_merge(
+    db_session, mocker
+):
+    """A FAILED verify task whose suite could not run (setupFailed) but whose
+    cheap acceptance probe DID run and caught a clear build break must BLOCK the
+    merge — the orchestrator redirects the setup-failure artifact into the verdict
+    so it maps to ``fail`` + fix, instead of the crash-retry-then-fall-open path
+    that would merge a genuine build break UNVERIFIED."""
+    _patch_github(mocker)
+    merge_mock = mocker.patch("app.github.merge_pull_request", return_value=None)
+
+    project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    verify_task, was_created = await _spawn_pipeline_task(
+        parent, "verify_tests", db_session, PR_NUMBER, BRANCH, BASE,
+        original_task_id=str(parent.id), suppress_warm_handoff=True,
+        attempt=_VERIFY_TESTS_MAX_RETRIES,
+    )
+    assert was_created is True and verify_task is not None
+
+    probe_output = (
+        '  File "widget/core.py", line 12\n    def broken(\nSyntaxError: invalid syntax'
+    )
+    setup_artifact = {
+        "detected": False,
+        "passed": False,
+        "setupFailed": True,
+        "tests": [],
+        "output": "Test runner setup failed; acceptance probe caught a build break.",
+        "probe": {
+            "ran": True,
+            "passed": False,
+            "could_not_run": False,
+            "ecosystem": "python",
+            "output": probe_output,
+            "label": "python3 -m compileall (root)",
+        },
+    }
+    db_session.add(
+        Artifact(
+            task_id=verify_task.id,
+            artifact_type=ArtifactType.MERGE_TEST_RESULT,
+            logs=json.dumps(setup_artifact),
+        )
+    )
+    verify_task.status = TaskStatus.FAILED
+    db_session.add(verify_task)
+    await db_session.commit()
+
+    failed_artifact = await _latest_artifact_logs(
+        db_session, verify_task.id, ArtifactType.MERGE_TEST_RESULT
+    )
+    # Mirror the orchestrator: a FAILED verify task feeds no verdict UNLESS its
+    # setup-failure artifact carries a clear-failure probe, in which case it is
+    # redirected into the verdict so the build break blocks the merge.
+    verdict = None
+    if probe_is_clear_failure(failed_artifact.get("probe")):
+        verdict = failed_artifact
+
+    outcome, detail = classify_merge_test_verdict(verdict)
+    assert outcome == "fail"
+    assert "SyntaxError" in detail
+    # A clear probe failure is NOT a crash → no retry, block immediately.
+    assert _is_verify_crash(outcome, verdict) is False
+
+    ci_result = build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "failure"
+
+    parent = await db_session.get(Task, parent.id)
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    merge_mock.assert_not_called()
+
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars().all()
+    )
+    fix_tasks = [t for t in all_tasks if t.first_payload.get("type") == "fix"]
+    assert len(fix_tasks) == 1, "a clear probe failure must spawn exactly one fix task"
+
+
+def test_setup_failed_with_could_not_run_probe_keeps_crash_retry():
+    """A setupFailed artifact whose probe could NOT run (same environment
+    problem) must NOT be redirected into the verdict: ``probe_is_clear_failure``
+    is False, so the orchestrator keeps ``verdict=None`` and the existing
+    crash-retry-then-fall-open path is preserved — distinguishing an
+    unprovisioned environment from a genuine build break."""
+    could_not_run = {
+        "detected": False,
+        "setupFailed": True,
+        "probe": {"ran": True, "passed": False, "could_not_run": True, "ecosystem": "node"},
+    }
+    assert probe_is_clear_failure(could_not_run["probe"]) is False
+    # No probe at all (older agent) likewise never redirects.
+    assert probe_is_clear_failure(None) is False
+    # The crash-retry path stays intact: verdict stays None → undetected crash.
+    verdict = None
+    outcome, _ = classify_merge_test_verdict(verdict)
+    assert outcome == "undetected"
+    assert _is_verify_crash(outcome, verdict) is True
 
 
 # ---------------------------------------------------------------------------

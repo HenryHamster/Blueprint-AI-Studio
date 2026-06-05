@@ -97,6 +97,7 @@ function matchesTransientSetupFailure(message: string): boolean {
     'network is unreachable',
     'could not resolve host',
     'registry timeout',
+    'unreachable',
     'timed out',
     'timeout',
     'eai_again',

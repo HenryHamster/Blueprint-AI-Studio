@@ -487,17 +487,32 @@ async function provisionDependencies(
   return null;
 }
 
-// Emit the canonical setup-failure verdict (FAILED + setupFailed marker). Shared
-// shape with the suite/replacement setup-failure paths so a provisioning failure
-// flows through the SAME merge-gate retry-before-fall-open semantics.
+// Emit the canonical setup-failure verdict (FAILED + setupFailed/partialSetupFailed
+// marker). Shared shape across the provisioning, suite, and replacement
+// setup-failure paths so they all flow through the SAME merge-gate
+// retry-before-fall-open semantics.
+//
+// Even though the detected suite could NOT run, we still run the cheap
+// acceptance probe and carry its verdict on the artifact: a setup-failure
+// fall-open otherwise merges UNVERIFIED with ZERO execution signal — the one
+// situation the probe exists for. A clear compile/build FAILURE still blocks the
+// merge (the backend redirects on a clear-failure probe); a probe that itself
+// could not run (the same environment problem) stays distinguishable as
+// could_not_run and keeps the fall-open.
 async function postVerifySetupFailure(
   taskId: string, owner: string, repo: string,
   ws: WebSocket | null, summary: string,
+  buildConfig: BuildConfig | undefined,
+  markers: { setupFailed?: boolean; partialSetupFailed?: boolean } = { setupFailed: true },
 ): Promise<void> {
-  const setupResult: VerifyTestsResult = {
-    detected: false, passed: false, setupFailed: true, tests: [],
+  const setupResult = await attachAcceptanceProbe(ws, buildConfig, {
+    detected: false,
+    passed: false,
+    setupFailed: markers.setupFailed || undefined,
+    partialSetupFailed: markers.partialSetupFailed || undefined,
+    tests: [],
     output: summary.slice(-VERIFY_TESTS_OUTPUT_LIMIT),
-  };
+  });
   const setupResultPath = `/tmp/verify_tests_result_${taskId}.json`;
   try {
     fs.writeFileSync(setupResultPath, JSON.stringify(setupResult, null, 2));
@@ -553,7 +568,8 @@ export async function handleVerifyTests(
   const provisionFailure = await provisionDependencies(ws, statusRef, buildConfig);
   if (provisionFailure) {
     sendLog(ws, `\nDependency provisioning failed after bounded retries — reporting FAILED so the merge gate retries the gate before falling open.\n`);
-    await postVerifySetupFailure(taskId, owner, repo, ws, provisionFailure);
+    statusRef.value = 'Running cheap acceptance probe (dependency provisioning failed)...';
+    await postVerifySetupFailure(taskId, owner, repo, ws, provisionFailure, buildConfig);
     return;
   }
 
@@ -594,28 +610,14 @@ export async function handleVerifyTests(
       // failing open immediately. The partial case stays distinguishable in the
       // artifact via partialSetupFailed so the backend never reads it as a clean
       // pass.
-      const setupResult: VerifyTestsResult = {
-        detected: false,
-        passed: false,
-        setupFailed: loop.setupFailed || undefined,
-        partialSetupFailed: loop.partialSetupFailed || undefined,
-        tests: [],
-        output: (loop.failureSummary ?? 'Test runner setup failed.').slice(-VERIFY_TESTS_OUTPUT_LIMIT),
-      };
-      const setupResultPath = `/tmp/verify_tests_result_${taskId}.json`;
-      try {
-        fs.writeFileSync(setupResultPath, JSON.stringify(setupResult, null, 2));
-      } catch (e) {
-        sendLog(ws, `[WARNING] Could not write ${setupResultPath}: ${e instanceof Error ? e.message : String(e)}\n`);
-      }
       sendLog(ws, `\nTest verification could not run the suite (setup failed after ${MAX_VERIFY_SETUP_RETRIES} retries) — reporting FAILED so the merge gate retries the gate before falling open.\n`);
-      await persistAndPostStatus(taskId, {
-        task_id: taskId,
-        status: 'FAILED',
-        artifact_type: 'MERGE_TEST_RESULT',
-        logs: sanitize(JSON.stringify(setupResult)),
-        repo_url: `https://github.com/${owner}/${repo}`,
-      });
+      statusRef.value = 'Running cheap acceptance probe (suite setup failed)...';
+      await postVerifySetupFailure(
+        taskId, owner, repo, ws,
+        loop.failureSummary ?? 'Test runner setup failed.',
+        buildConfig,
+        { setupFailed: loop.setupFailed || undefined, partialSetupFailed: loop.partialSetupFailed || undefined },
+      );
       return;
     } else if (loop.noTestsExecuted) {
       // A runner ran but no real tests executed — the stored command was a
@@ -630,28 +632,14 @@ export async function handleVerifyTests(
       if (recovered?.kind === 'recovered') {
         result = recovered.result;
       } else if (recovered?.kind === 'setupFailed') {
-        const setupResult: VerifyTestsResult = {
-          detected: false,
-          passed: false,
-          setupFailed: recovered.loop.setupFailed || undefined,
-          partialSetupFailed: recovered.loop.partialSetupFailed || undefined,
-          tests: [],
-          output: (recovered.loop.failureSummary ?? 'Test runner setup failed.').slice(-VERIFY_TESTS_OUTPUT_LIMIT),
-        };
-        const setupResultPath = `/tmp/verify_tests_result_${taskId}.json`;
-        try {
-          fs.writeFileSync(setupResultPath, JSON.stringify(setupResult, null, 2));
-        } catch (e) {
-          sendLog(ws, `[WARNING] Could not write ${setupResultPath}: ${e instanceof Error ? e.message : String(e)}\n`);
-        }
         sendLog(ws, `\nStale-command recovery found a replacement suite, but it still failed setup after ${MAX_VERIFY_SETUP_RETRIES} retries — reporting FAILED so the merge gate retries instead of falling open.\n`);
-        await persistAndPostStatus(taskId, {
-          task_id: taskId,
-          status: 'FAILED',
-          artifact_type: 'MERGE_TEST_RESULT',
-          logs: sanitize(JSON.stringify(setupResult)),
-          repo_url: `https://github.com/${owner}/${repo}`,
-        });
+        statusRef.value = 'Running cheap acceptance probe (replacement suite setup failed)...';
+        await postVerifySetupFailure(
+          taskId, owner, repo, ws,
+          recovered.loop.failureSummary ?? 'Test runner setup failed.',
+          buildConfig,
+          { setupFailed: recovered.loop.setupFailed || undefined, partialSetupFailed: recovered.loop.partialSetupFailed || undefined },
+        );
         return;
       } else {
         // No real replacement suite — this is effectively a no-detectable-tests

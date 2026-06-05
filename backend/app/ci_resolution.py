@@ -379,7 +379,7 @@ def classify_merge_test_verdict(
             "verified.",
         )
     if verdict.get("detected") is False:
-        if _probe_is_clear_failure(verdict.get("probe")):
+        if probe_is_clear_failure(verdict.get("probe")):
             probe = verdict["probe"]
             output = str(probe.get("output") or "").strip()
             if probe.get("declared"):
@@ -410,13 +410,17 @@ def classify_merge_test_verdict(
     return ("fail", output or "Detected test suite failed (no output captured).")
 
 
-def _probe_is_clear_failure(probe: Any) -> bool:
+def probe_is_clear_failure(probe: Any) -> bool:
     """Whether an acceptance ``probe`` block represents a CLEAR, blocking failure.
 
     True only when the probe ran, was not a could-not-run degrade, and did not
     pass — i.e. the changed code genuinely failed to compile/build. Defensive
     about a missing / non-dict / old-shape probe (returns False), so a verdict
     from an older agent that emits no probe keeps the undetected fall-open.
+
+    Public so the orchestrator can redirect a setup-failure (FAILED) verify task
+    that nonetheless ran the probe and caught a clear build break into a merge
+    BLOCK, rather than the crash-retry-then-fall-open path.
     """
     if not isinstance(probe, dict):
         return False
