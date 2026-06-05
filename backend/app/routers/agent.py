@@ -26,6 +26,7 @@ from app.auth import (
     VM_SCOPED_TOKEN_SCOPE,
 )
 from app.database import get_session, AsyncSessionLocal, resolve_dialect_name
+from app.landed_signal import is_merged_completion
 from app.models import (
     Project,
     Task,
@@ -1808,16 +1809,16 @@ async def claim_task(
                         f"{file_overlap_count} overlapping file(s)"
                     )
                 # Provenance: the branch/HEAD this entry was authored against.
-                # Flag as diverged when its origin branch differs from the
-                # reader's integration branch — the entry may describe code that
-                # only exists on an unmerged branch. Drives the stale caveat.
+                # The diverged signal is NOT a raw branch-name comparison —
+                # every task runs on its own short-lived feature branch, so a
+                # name mismatch is the norm, not a divergence. Whether the
+                # referenced work is actually absent from the reader's branch is
+                # derived AFTER capping from the source task's landed/merge state
+                # (see _landed_source_ids batch lookup below). Here we only
+                # capture the raw provenance fields + source id the lookup needs.
                 entry_branch = str(v.get("branch") or "")
                 entry_head_sha = str(v.get("head_sha") or "")
-                provenance_diverged = bool(
-                    entry_branch
-                    and project_integration_branch
-                    and entry_branch != project_integration_branch
-                )
+                entry_source_id = str(v.get("source_task_id") or "")
                 # Age in days for metadata (0 if updated_at unavailable)
                 age_days = 0
                 if updated_at_str:
@@ -1849,7 +1850,7 @@ async def claim_task(
                         relevance_reasons,
                         entry_branch,
                         entry_head_sha,
-                        provenance_diverged,
+                        entry_source_id,
                     )
                 )
         _playbook_candidates.sort()
@@ -1871,6 +1872,53 @@ async def claim_task(
         _default_caps = {"fix": 8, "qa": 8, "review": 8, "create": 12, "refactor": 12}
         _cap = int(_playbook_caps.get(task_type, _default_caps.get(task_type, 10)))
         _capped_candidates = _playbook_candidates[: max(_cap, 0)]
+        # Derive landed-vs-not-landed for the SMALL capped set with a single
+        # batched query (diverged is not a sort key, so doing this after the cap
+        # is safe and keeps it off the per-entry hot loop). An entry is diverged
+        # only when it carries branch provenance AND its source task did NOT land
+        # on the integration branch — i.e. the referenced work is genuinely still
+        # unmerged / completed-but-non-merge. Squash-merges rewrite commit
+        # identity, so we key on the source task's merge state, never head_sha.
+        _candidate_source_ids: set[str] = set()
+        for _c in _capped_candidates:
+            _branch_v, _src_v = _c[15], _c[17]
+            if _branch_v and _src_v and _src_v != _my_task_id:
+                _candidate_source_ids.add(_src_v)
+        _landed_source_ids: set[str] = set()
+        # When the lookup itself fails we cannot tell landed from unlanded, so
+        # we suppress the diverged signal entirely (favour low false positives
+        # over distrusting healthy entries on a transient DB hiccup).
+        _landed_lookup_failed = False
+        if _candidate_source_ids:
+            _parsed_ids = []
+            for _sid in _candidate_source_ids:
+                try:
+                    _parsed_ids.append(uuid.UUID(_sid))
+                except (ValueError, TypeError):
+                    # Malformed/unresolvable id — skip; the entry will fall
+                    # through to NOT diverged (favouring low false positives).
+                    continue
+            if _parsed_ids:
+                try:
+                    _src_rows = (
+                        await session.execute(
+                            select(Task)
+                            .where(Task.id.in_(_parsed_ids))
+                            .options(load_only(Task.id, Task.status, Task.context))
+                        )
+                    ).scalars()
+                    for _src_task in _src_rows:
+                        if is_merged_completion(_src_task):
+                            _landed_source_ids.add(str(_src_task.id))
+                except Exception:
+                    # A degraded session must not 500 the already-committed
+                    # claim. Mark the lookup failed so provenance-bearing
+                    # entries fall through to NOT diverged (low false positives).
+                    _landed_lookup_failed = True
+                    logger.exception(
+                        "[AGENT] playbook landed-state lookup failed — "
+                        "treating provenance-bearing entries as non-diverged"
+                    )
         for (
             _,
             _,
@@ -1889,8 +1937,18 @@ async def claim_task(
             relevance_reasons,
             entry_branch_v,
             entry_head_sha_v,
-            prov_diverged,
+            entry_source_id_v,
         ) in _capped_candidates:
+            # Diverged ⇔ branch-bearing entry whose source task is neither the
+            # reader's own task nor a task that landed on the integration
+            # branch. A failed landed-state lookup suppresses the signal.
+            prov_diverged = bool(
+                entry_branch_v
+                and entry_source_id_v
+                and entry_source_id_v != _my_task_id
+                and not _landed_lookup_failed
+                and entry_source_id_v not in _landed_source_ids
+            )
             playbook_entries[short_key] = {
                 "content": content,
                 "effectiveness_score": round(eff_score, 3),

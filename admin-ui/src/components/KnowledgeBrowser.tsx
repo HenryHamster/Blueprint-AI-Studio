@@ -189,6 +189,11 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
               <div className="flex items-center gap-3 flex-wrap text-[10px] text-neutral-500">
                 <CopyableId id={selected.id} />
                 <SourceKindBadge kind={selected.source_kind} />
+                {selected.authoring_branch && selected.head_sha && (
+                  <span className="px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 font-mono">
+                    {selected.authoring_branch}@{selected.head_sha}
+                  </span>
+                )}
                 {selected.direction_id && <span className="px-1.5 py-0.5 rounded bg-blue-950/40 text-blue-300">{selected.direction_id}</span>}
                 {selected.topic && <span className="px-1.5 py-0.5 rounded bg-violet-950/40 text-violet-300">{selected.topic}</span>}
                 {selected.created_at && <span>{relativeDate(selected.created_at)}</span>}

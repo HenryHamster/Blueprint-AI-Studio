@@ -41,6 +41,13 @@ vi.mock('fs', () => ({
   },
 }));
 
+// Deterministic git provenance: captureGitProvenance shells out via execSync.
+vi.mock('child_process', () => ({
+  execSync: vi.fn((cmd: string) =>
+    Buffer.from(cmd.includes('--short') ? 'def5678\n' : 'design/reaper-branch\n'),
+  ),
+}));
+
 // ── Imports under test ────────────────────────────────────────────────────────
 import fs from 'fs';
 import { handleDesign, groundDesignCitations } from './design.js';
@@ -148,6 +155,25 @@ describe('handleDesign', () => {
     expect(payload.status).toBe('FAILED');
     expect(payload.failure_category).toBe('claude_code_failed');
     expect(payload.artifact_type).toBe('ERROR_LOG');
+  });
+
+  it('embeds branch/HEAD provenance INSIDE the emitted document (not as a sibling field)', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue({ ...VALID_DOCUMENT });
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design how X should work' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    const payload = lastPostedPayload();
+    // Provenance must live INSIDE the parsed document — the backend extracts it
+    // from the parsed `logs` document, not from a top-level status payload field.
+    const parsed = JSON.parse(payload.logs as string) as Record<string, unknown>;
+    expect(parsed.authoring_branch).toBe('design/reaper-branch');
+    expect(parsed.head_sha).toBe('def5678');
+    // And NOT as a sibling of logs (where the backend never reads it).
+    expect(payload.authoring_branch).toBeUndefined();
+    expect(payload.head_sha).toBeUndefined();
   });
 
   it('stamps _citation_grounding on the emitted document for the backend gate', async () => {

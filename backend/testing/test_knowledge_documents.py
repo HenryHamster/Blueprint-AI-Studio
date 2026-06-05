@@ -1231,3 +1231,108 @@ async def test_list_filters_by_source_kind(client: AsyncClient, db_session):
     assert len(body["documents"]) == 1
     assert body["documents"][0]["title"] == "A design doc"
     assert body["documents"][0]["source_kind"] == "design"
+
+
+# ── provenance (authoring_branch / head_sha) ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_normalize_document_extracts_provenance(db_session):
+    """_normalize_document extracts authoring_branch and head_sha from the doc."""
+    from app.knowledge_completion import _normalize_document
+
+    project, task = await _make_web_research_task(db_session)
+    obj = {
+        "title": "T",
+        "summary": "S",
+        "body": "B",
+        "citations": ["https://example.com"],
+        "authoring_branch": "feat/my-branch",
+        "head_sha": "abc1234",
+    }
+    normalized = _normalize_document(obj, task)
+    assert normalized["authoring_branch"] == "feat/my-branch"
+    assert normalized["head_sha"] == "abc1234"
+
+
+@pytest.mark.asyncio
+async def test_normalize_document_provenance_absent_stores_none(db_session):
+    """When authoring_branch/head_sha are absent, _normalize_document stores None."""
+    from app.knowledge_completion import _normalize_document
+
+    project, task = await _make_web_research_task(db_session)
+    obj = {
+        "title": "T",
+        "summary": "S",
+        "body": "B",
+        "citations": ["https://example.com"],
+    }
+    normalized = _normalize_document(obj, task)
+    assert normalized["authoring_branch"] is None
+    assert normalized["head_sha"] is None
+
+
+@pytest.mark.asyncio
+async def test_persist_document_captures_provenance(db_session, _quiet_broadcast):
+    """A document with authoring_branch/head_sha persists them on the KnowledgeDocument row."""
+    project, task = await _make_web_research_task(db_session)
+    document = {
+        "title": "Provenance test doc",
+        "summary": "Testing provenance capture.",
+        "body": "# Body\n\nSome content.",
+        "citations": ["https://example.com/provenance"],
+        "tags": [],
+        "topic": "provenance",
+        "authoring_branch": "feat/provenance",
+        "head_sha": "deadbeef",
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    docs = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(docs) == 1
+    doc = docs[0]
+    assert doc.authoring_branch == "feat/provenance"
+    assert doc.head_sha == "deadbeef"
+
+
+@pytest.mark.asyncio
+async def test_persist_document_provenance_absent_stores_null(
+    db_session, _quiet_broadcast
+):
+    """A document without authoring_branch/head_sha stores NULL on the row."""
+    project, task = await _make_web_research_task(db_session)
+    document = {
+        "title": "No provenance doc",
+        "summary": "No provenance fields.",
+        "body": "# Body\n\nContent without provenance.",
+        "citations": ["https://example.com/no-prov"],
+        "tags": [],
+        "topic": "no-provenance",
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    docs = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(docs) == 1
+    doc = docs[0]
+    assert doc.authoring_branch is None
+    assert doc.head_sha is None

@@ -19,6 +19,8 @@ const sampleDocs = [
       { title: 'SQLAlchemy pool docs', url: 'https://docs.sqlalchemy.org/en/20/core/pooling.html', excerpt: 'max_overflow defaults to 10' },
     ],
     source_task_id: 'task-web-research-1',
+    authoring_branch: 'feature/knowledge-provenance',
+    head_sha: 'abc1234',
     source_kind: 'web_research',
     created_at: '2026-06-01T00:00:00Z',
     updated_at: '2026-06-01T00:00:00Z',
@@ -33,6 +35,8 @@ const sampleDocs = [
     tags: ['retry', 'backoff'],
     source_citations: [],
     source_task_id: null,
+    authoring_branch: null,
+    head_sha: null,
     source_kind: 'design',
     created_at: '2026-05-30T00:00:00Z',
     updated_at: '2026-05-30T00:00:00Z',
@@ -171,5 +175,15 @@ describe('KnowledgeBrowser — viewport regression', () => {
       'project-test',
       expect.objectContaining({ source_kind: 'design' }),
     );
+  });
+
+  test('detail view renders provenance branch and sha when present', async () => {
+    await renderList();
+    const buttons = (host as HTMLDivElement).querySelectorAll('button');
+    const docButton = Array.from(buttons).find(b => b.textContent?.includes('Resilient connection pooling'));
+    expect(docButton).toBeTruthy();
+    await act(async () => { docButton!.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    expect((host as HTMLDivElement).textContent).toContain('feature/knowledge-provenance@abc1234');
   });
 });

@@ -2811,6 +2811,15 @@ class KnowledgeDocument(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=True),
     )
 
+    # Git provenance captured at write time (mirrors playbook entry stamping).
+    # Nullable so legacy rows and older agents that don't supply them remain valid.
+    authoring_branch: str | None = Field(
+        default=None, sa_column=Column(String, nullable=True)
+    )
+    head_sha: str | None = Field(
+        default=None, sa_column=Column(String, nullable=True)
+    )
+
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),

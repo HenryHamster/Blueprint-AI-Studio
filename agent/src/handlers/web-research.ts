@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { execSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   strVal, sanitize, sendLog, readHandlerOutput,
@@ -27,6 +28,22 @@ export function readWebResearchProgress(taskId: string): string | undefined {
     }
   } catch { /* ignore */ }
   return undefined;
+}
+
+// Capture the git branch and short HEAD commit from the current working directory.
+// Web research does not clone a repo, so this returns an empty object. Tolerates
+// non-git or missing workspace by returning an empty object on error.
+function captureGitProvenance(): Record<string, string> {
+  try {
+    const branch = execSync('git rev-parse --abbrev-ref HEAD').toString().trim();
+    const sha = execSync('git rev-parse --short HEAD').toString().trim();
+    const result: Record<string, string> = {};
+    if (branch) result.authoring_branch = branch;
+    if (sha) result.head_sha = sha;
+    return result;
+  } catch {
+    return {};
+  }
 }
 
 // A single knowledge-document summary as returned by the agent-facing list
@@ -185,18 +202,31 @@ ${DEFAULT_TOOL_GUIDANCE}`;
   // fall back to parsing a JSON object with the required document keys from the
   // final result text or the full transcript.
   let logs = '';
+  let document: Record<string, unknown> | null = null;
   const documentFromFile = readHandlerOutput(taskId, 'web_research_document', ws);
   if (documentFromFile !== null && typeof documentFromFile === 'object' && !Array.isArray(documentFromFile)) {
-    logs = sanitize(JSON.stringify(documentFromFile));
+    document = documentFromFile as Record<string, unknown>;
     sendLog(ws, `Read web research document from ${documentPath}\n`);
   }
-  if (!logs) {
+  if (!document) {
     const source = (lastResultText && lastResultText.includes('"title"')) ? lastResultText : allOutput;
     const docObj = extractJsonObjectDetailed(source, 'title', 'summary', 'body');
     if (!docObj.ok) {
       sendLog(ws, `[WARNING] Could not extract knowledge document JSON: ${describeJsonExtractionResult(docObj)}\n`);
+    } else {
+      document = docObj.value;
     }
-    logs = sanitize(docObj.ok ? JSON.stringify(docObj.value) : (lastResultText || allOutput.slice(-50_000)));
+  }
+
+  // Embed branch/HEAD provenance INTO the document before serializing — the
+  // backend completion handler parses authoring_branch/head_sha out of the
+  // parsed `logs` document (knowledge_completion._normalize_document), so
+  // provenance must travel inside the document, not as a sibling status field.
+  const provenance = captureGitProvenance();
+  if (document) {
+    logs = sanitize(JSON.stringify({ ...document, ...provenance }));
+  } else {
+    logs = sanitize(lastResultText || allOutput.slice(-50_000));
   }
 
   const finalStatus = exitCode === 0 ? 'COMPLETED' : 'FAILED';

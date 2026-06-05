@@ -322,6 +322,9 @@ def _normalize_document(obj: dict[str, Any], task: Task) -> dict[str, Any]:
     if topic is None:
         topic = payload.get("topic")
 
+    authoring_branch = obj.get("authoring_branch")
+    head_sha = obj.get("head_sha")
+
     return {
         "title": (str(obj.get("title")) if obj.get("title") is not None else "")[:500],
         "summary": str(obj.get("summary")) if obj.get("summary") is not None else "",
@@ -329,6 +332,8 @@ def _normalize_document(obj: dict[str, Any], task: Task) -> dict[str, Any]:
         "topic": str(topic)[:200] if topic is not None else None,
         "tags": tags,
         "source_citations": citations[:100],
+        "authoring_branch": str(authoring_branch)[:255] if authoring_branch is not None else None,
+        "head_sha": str(head_sha)[:40] if head_sha is not None else None,
     }
 
 
@@ -381,6 +386,8 @@ async def _persist_document(
         tags=normalized["tags"],
         source_citations=normalized["source_citations"],
         forward_quality_verdict=verdict_record,
+        authoring_branch=normalized.get("authoring_branch"),
+        head_sha=normalized.get("head_sha"),
     )
     session.add(doc)
 

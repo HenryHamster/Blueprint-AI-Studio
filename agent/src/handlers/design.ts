@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { execSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, readHandlerOutput,
@@ -67,6 +68,22 @@ export function groundDesignCitations(
     file_citations: fileCitations, grounded, checked: true,
   };
   return document;
+}
+
+// Capture the git branch and short HEAD commit from the workspace. Returns an
+// object with authoring_branch and head_sha fields, or an empty object if
+// the workspace is not a git repository or git commands fail.
+function captureGitProvenance(workspace: string = WORKSPACE): Record<string, string> {
+  try {
+    const branch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: workspace }).toString().trim();
+    const sha = execSync('git rev-parse --short HEAD', { cwd: workspace }).toString().trim();
+    const result: Record<string, string> = {};
+    if (branch) result.authoring_branch = branch;
+    if (sha) result.head_sha = sha;
+    return result;
+  } catch {
+    return {};
+  }
 }
 
 // ── Handler: Design (codebase-internal design, terminal knowledge doc) ────────
@@ -186,11 +203,16 @@ ${DEFAULT_TOOL_GUIDANCE}`;
       document = docObj.value;
     }
   }
+  // Embed branch/HEAD provenance INTO the document before serializing — the
+  // backend completion handler parses authoring_branch/head_sha out of the
+  // parsed `logs` document (knowledge_completion._normalize_document), so
+  // provenance must travel inside the document, not as a sibling status field.
+  const provenance = captureGitProvenance();
   if (document) {
     // Ground file-reference citations against the cloned working tree before
     // emitting so the backend gate can reject an ungrounded design.
     groundDesignCitations(document);
-    logs = sanitize(JSON.stringify(document));
+    logs = sanitize(JSON.stringify({ ...document, ...provenance }));
   } else {
     logs = sanitize(lastResultText || allOutput.slice(-50_000));
   }

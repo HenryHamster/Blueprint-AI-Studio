@@ -43,6 +43,8 @@ def serialize_knowledge_document(doc: KnowledgeDocument, *, include_body: bool) 
         "created_at": doc.created_at.isoformat() if doc.created_at else None,
         "updated_at": doc.updated_at.isoformat() if doc.updated_at else None,
         "forward_quality_verdict": doc.forward_quality_verdict,
+        "authoring_branch": doc.authoring_branch,
+        "head_sha": doc.head_sha,
     }
     if include_body:
         out["body"] = doc.body

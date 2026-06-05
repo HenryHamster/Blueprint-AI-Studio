@@ -34,6 +34,13 @@ vi.mock('fs', () => ({
   },
 }));
 
+// Deterministic git provenance: captureGitProvenance shells out via execSync.
+vi.mock('child_process', () => ({
+  execSync: vi.fn((cmd: string) =>
+    Buffer.from(cmd.includes('--short') ? 'abc1234\n' : 'feat/wasm-branch\n'),
+  ),
+}));
+
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleWebResearch } from './web-research.js';
 import { runClaudeCode, persistAndPostStatus, readHandlerOutput, apiGet } from '../index.js';
@@ -124,6 +131,25 @@ describe('handleWebResearch', () => {
     expect(payload.status).toBe('COMPLETED');
     const parsed = JSON.parse(payload.logs as string) as typeof VALID_DOCUMENT;
     expect(parsed.title).toBe(VALID_DOCUMENT.title);
+  });
+
+  it('embeds branch/HEAD provenance INSIDE the emitted document (not as a sibling field)', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_DOCUMENT);
+
+    await handleWebResearch(
+      TASK_ID, { prompt: 'Research the state of WebAssembly' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    const payload = lastPostedPayload();
+    // Provenance must live INSIDE the parsed document — the backend extracts it
+    // from the parsed `logs` document, not from a top-level status payload field.
+    const parsed = JSON.parse(payload.logs as string) as Record<string, unknown>;
+    expect(parsed.authoring_branch).toBe('feat/wasm-branch');
+    expect(parsed.head_sha).toBe('abc1234');
+    // And NOT as a sibling of logs (where the backend never reads it).
+    expect(payload.authoring_branch).toBeUndefined();
+    expect(payload.head_sha).toBeUndefined();
   });
 
   it('installs the read-only permission posture for the web_research type', async () => {

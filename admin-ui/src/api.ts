@@ -1683,6 +1683,8 @@ export interface KnowledgeDocument {
   tags: string[];
   source_citations: unknown[];
   source_task_id: string | null;
+  authoring_branch?: string | null;
+  head_sha?: string | null;
   /** Which kind of task produced this document. `string` keeps it forward-compatible. */
   source_kind?: 'design' | 'web_research' | 'unknown' | string;
   created_at: string | null;
