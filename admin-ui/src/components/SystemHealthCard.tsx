@@ -88,6 +88,11 @@ export function SystemHealthCard({
       </div>
       {loading ? (
         <div className="space-y-2"><Skeleton className="h-10 w-full" /><Skeleton className="h-14 w-full" /></div>
+      ) : !data ? (
+        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 flex items-center gap-2 text-neutral-400 text-xs">
+          <AlertTriangle className="w-4 h-4" />
+          Health data unavailable
+        </div>
       ) : (
         <div className={stale ? STALE_CLASSES : undefined}>
           {data && (sr?.current != null || qd) && (

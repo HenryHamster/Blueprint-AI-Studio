@@ -203,6 +203,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
     deployState.status === 'MONITORING' ||
     deployState.status === 'ROLLED_BACK' ||
     deployState.status === 'HALTED' ||
+    deployState.status === 'PAUSED' ||
     (deployState.rollback_count > 0)
   );
 
@@ -285,12 +286,14 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
                   <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                     deployState?.status === 'HALTED' ? 'bg-red-500 animate-pulse' :
                     deployState?.status === 'ROLLED_BACK' ? 'bg-amber-400' :
+                    deployState?.status === 'PAUSED' ? 'bg-amber-400' :
                     deployState?.status === 'MONITORING' ? 'bg-blue-400 animate-pulse' :
                     'bg-neutral-500'
                   }`} />
                   <span className={`${
                     deployState?.status === 'HALTED' ? 'text-red-400' :
                     deployState?.status === 'ROLLED_BACK' ? 'text-amber-400' :
+                    deployState?.status === 'PAUSED' ? 'text-amber-400' :
                     deployState?.status === 'MONITORING' ? 'text-blue-400' :
                     'text-neutral-400'
                   }`}>
@@ -298,6 +301,8 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
                       ? `Monitoring ${monitoringDuration(deployState?.monitoring_since)}`
                       : deployState?.status === 'ROLLED_BACK'
                       ? 'Rolled back'
+                      : deployState?.status === 'PAUSED'
+                      ? 'Paused'
                       : deployState?.status === 'HALTED'
                       ? 'Halted'
                       : deployState?.status}

@@ -1042,6 +1042,15 @@ export interface VersionQualification {
   audit_findings?: AuditFinding[] | null;
 }
 
+export interface QualificationState {
+  state: string;
+  summary: string;
+  promotion_pr_number?: number | null;
+  promotion_pr_url?: string | null;
+  error?: string | null;
+  blocker?: string | null;
+}
+
 export interface CurrentVersion {
   version_number: number;
   phase: string;
@@ -1057,6 +1066,7 @@ export interface CurrentVersion {
   /** Non-terminal tasks still in flight against this version. A version cut does
    *  not stop them — they continue and land against the freshly-opened version. */
   in_flight_task_count?: number;
+  qualification_state?: QualificationState | null;
   last_qualification: VersionQualification | null;
   latest_audit?: LatestAudit | null;
 }
@@ -1204,8 +1214,12 @@ export async function cutVersion(
     method: 'POST',
     body: JSON.stringify({ reason: reason ?? '' }),
   });
-  if (!res.ok) throw new Error(`Failed to cut version: ${res.status}`);
-  return res.json();
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = data?.detail || data?.error?.message || `Failed to cut version: ${res.status}`;
+    throw new Error(detail);
+  }
+  return data;
 }
 
 export type QualifyTriggerStatus =

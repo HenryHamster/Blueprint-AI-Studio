@@ -163,4 +163,49 @@ describe('OrchestratorHealthBar — viewport regression', () => {
       });
     });
   });
+
+  test('PAUSED deploy state renders without overflow at 375px', async () => {
+    apiFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ daily_cost_usd: 0, daily_cost_ceiling_usd: 0 }),
+    } as Response);
+
+    const pausedProps = {
+      ...baseProps,
+      health: {
+        last_cycle_seconds_ago: 5,
+        orchestrator_alive: true,
+        orchestrator_hung: false,
+        orchestrator_progress_age_seconds: 3,
+        orchestrator_cycle_age_seconds: 5,
+        queued_tasks: 2,
+        active_tasks: 1,
+        pool_info: {},
+        deploy_state: {
+          status: 'PAUSED',
+          rollback_count: 0,
+          pause_reason: 'External dependency temporarily unavailable',
+          monitoring_since: '2026-05-06T20:00:00Z',
+          recent_outcomes: [],
+        },
+        deploy_monitoring: {
+          external_health: {},
+        },
+      },
+    };
+
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<OrchestratorHealthBar {...pausedProps} />);
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 75));
+      });
+    });
+  });
 });

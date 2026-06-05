@@ -17,6 +17,7 @@ import {
   type VersionLifecycleResponse,
   type VersionQualification,
   type PromotionReadiness,
+  type QualificationState,
 } from '../api';
 import { timeAgo } from '../utils/time';
 
@@ -73,6 +74,15 @@ const FINDING_SEVERITY_STYLE: Record<string, string> = {
   low: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
 };
 const FINDING_SEVERITY_ORDER = ['critical', 'high', 'medium', 'low'];
+const QUAL_STATE_STYLE: Record<string, string> = {
+  qualifying: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
+  promotion_in_flight: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400',
+  promotion_failed: 'bg-red-500/10 border-red-500/30 text-red-400',
+  dry_run: 'bg-blue-500/10 border-blue-500/30 text-blue-400',
+  promoted: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400',
+  not_promoted: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
+  deferred_unsynced: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
+};
 
 // Provenance + staleness header for the audit findings. Shows which commit the
 // audit ran against and how long ago, and flags when that commit differs from the
@@ -257,6 +267,7 @@ function stagedActivatedByCut(staged: StagedDirection[], versionNumber: number):
 function CutConsequences({ cv, staged }: { cv: CurrentVersion; staged: StagedDirection[] }) {
   const activating = stagedActivatedByCut(staged, cv.version_number);
   const inFlight = cv.in_flight_task_count ?? 0;
+  const qualState: QualificationState | null = cv.qualification_state ?? null;
   return (
     <div
       data-testid="cut-consequences"
@@ -285,6 +296,11 @@ function CutConsequences({ cv, staged }: { cv: CurrentVersion; staged: StagedDir
           ? `${inFlight} in-flight task${inFlight !== 1 ? 's' : ''} will NOT be stopped — they keep running and land against the new version.`
           : 'No tasks are currently in flight.'}
       </p>
+      {qualState?.state === 'promotion_in_flight' && (
+        <p className="text-emerald-300">
+          Promotion PR{qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open and auto-merging — this cut will be rejected until it lands or is canceled.
+        </p>
+      )}
     </div>
   );
 }
@@ -420,12 +436,16 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
     if (!projectId || !cv) return;
     const activating = stagedActivatedByCut(data?.staged_directions ?? [], cv.version_number);
     const inFlight = cv.in_flight_task_count ?? 0;
+    const qualState: QualificationState | null = cv.qualification_state ?? null;
     const consequences = [
       activating.length > 0
         ? `${activating.length} staged direction${activating.length !== 1 ? 's' : ''} will start now`
         : null,
       inFlight > 0
         ? `${inFlight} in-flight task${inFlight !== 1 ? 's' : ''} will keep running against the new version`
+        : null,
+      qualState?.state === 'promotion_in_flight'
+        ? `promotion PR${qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open and auto-merging`
         : null,
     ].filter(Boolean);
     const msg = consequences.length
@@ -440,8 +460,8 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
       setCuttingVersion(false);
       setCutReason('');
       onRefresh();
-    } catch {
-      setActionMsg('Request failed');
+    } catch (error) {
+      setActionMsg(error instanceof Error ? error.message : 'Request failed');
     } finally {
       setActionLoading(null);
     }
@@ -620,6 +640,16 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
             ) : null}
             {cv.phase_reasoning && (
               <p className="text-[10px] text-neutral-400 italic truncate" title={cv.phase_reasoning}>{cv.phase_reasoning}</p>
+            )}
+            {cv.qualification_state && (
+              <div className="pl-2 border-l border-neutral-700/50 space-y-0.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${QUAL_STATE_STYLE[cv.qualification_state.state] ?? 'bg-neutral-800 text-neutral-400 border-neutral-700'}`}>
+                    {cv.qualification_state.state.replace(/_/g, ' ')}
+                  </span>
+                </div>
+                <p className="text-[10px] text-neutral-400">{cv.qualification_state.summary}</p>
+              </div>
             )}
             {cv.last_qualification && (
               <div className="pl-2 border-l border-neutral-700/50 space-y-0.5">

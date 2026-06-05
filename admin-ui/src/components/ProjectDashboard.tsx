@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { ChevronDown, ChevronUp, FolderKanban, GitBranch, Compass, UserPlus, Plus, Settings, MoreVertical, Trash2, AlertTriangle, RotateCcw, Pause, Play, Archive, ArchiveRestore } from 'lucide-react';
 import type { Task } from './TaskCard';
 import { formatAbsolute, parseTimestamp } from '../utils/time';
-import { projectStatusBadge } from '../utils/projectStatus';
+import { projectStatusBadge, isProjectActive } from '../utils/projectStatus';
 import { humanizeUnverifiedReason } from '../utils/unverifiedReasonLabels';
 import { formatMergeGateSummary } from '../utils/mergeGateSummary';
 import { ProjectApprovalGateSection } from './ProjectApprovalGateSection';
@@ -362,7 +362,7 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
         <div className="flex gap-4 px-1 pb-2">
           <span className="bg-neutral-800 rounded px-2 py-0.5 text-xs text-neutral-400 flex items-center gap-1.5">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" />
-            {projects.filter(p => p.status === 'active').length} active
+            {projects.filter(p => isProjectActive({ status: p.status, paused: p.paused, archived: p.archived })).length} active
           </span>
           <span className="bg-neutral-800 rounded px-2 py-0.5 text-xs text-neutral-400 flex items-center gap-1.5">
             <span className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0" />

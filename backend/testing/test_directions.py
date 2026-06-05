@@ -8670,6 +8670,64 @@ async def test_operator_message_arms_strategic_refresh(
 
 
 @pytest.mark.asyncio
+async def test_operator_message_idempotency_key_dedupes(
+    client: AsyncClient, db_session, mocker
+):
+    """Mirrors the live-chat idempotency test: a double-send of the same
+    steering instruction with one idempotency key collapses to a single
+    message row and a single strategist arming, instead of duplicating the
+    operator message and re-quoting it as the priority directive."""
+    from sqlalchemy import func as sa_func
+    from app.models import ProjectMessage
+
+    project_id = await _deploy_project(client, mocker)
+    body = {
+        "content": "Please refocus on the auth bug",
+        "message_type": "FEEDBACK",
+        "idempotency_key": "key-double-submit-1",
+    }
+
+    first = await client.post(
+        f"/api/admin/projects/{project_id}/messages", json=body
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["status"] == "created"
+    assert first.json()["arming"] == "steering"
+    first_id = first.json()["id"]
+
+    # Identical retry with the same key — idempotent success, same row, and the
+    # duplicate does NOT re-arm the strategist.
+    second = await client.post(
+        f"/api/admin/projects/{project_id}/messages", json=body
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["status"] == "duplicate"
+    assert second.json()["id"] == first_id
+    assert second.json()["arming"] == "duplicate"
+
+    # Exactly one row landed for this project.
+    count = await db_session.scalar(
+        select(sa_func.count())
+        .select_from(ProjectMessage)
+        .where(ProjectMessage.project_id == uuid.UUID(project_id))
+    )
+    assert count == 1
+
+    # Exactly one arming: the marker coalesced count stays at 1.
+    vision = await _reload_vision(db_session, project_id)
+    assert vision["_strategic_refresh"]["count"] == 1
+
+    # A different key on the same content does create a second message.
+    third = await client.post(
+        f"/api/admin/projects/{project_id}/messages",
+        json={**body, "idempotency_key": "key-double-submit-2"},
+    )
+    assert third.status_code == 200, third.text
+    assert third.json()["status"] == "created"
+    assert third.json()["id"] != first_id
+
+
+@pytest.mark.asyncio
 async def test_passive_note_does_not_arm_strategic_refresh(
     client: AsyncClient, db_session, mocker
 ):

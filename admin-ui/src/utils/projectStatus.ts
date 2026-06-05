@@ -33,6 +33,23 @@ export interface ProjectStatusInput {
 const STALE_CLASSES = 'opacity-60 saturate-50';
 
 /**
+ * Determine if a project is actively running (not paused, not archived, with a
+ * DEPLOYING/ACTIVE status). Used to count "active" projects in the dashboard summary.
+ * Reuses the canonical badge logic so the count and badge can never drift apart.
+ */
+export function isProjectActive(input: ProjectStatusInput | null | undefined): boolean {
+  if (!input || typeof input === 'string') return false;
+
+  const status = (input.status ?? '').toUpperCase();
+  const paused = input.paused ?? false;
+  const archived = input.archived ?? false;
+
+  // A project is active if it's deploying/active, not paused, and not archived
+  const isDeploying = status === 'DEPLOYING' || status === 'ACTIVE';
+  return isDeploying && !paused && !archived;
+}
+
+/**
  * Resolve a per-project status badge that reflects its real operating state.
  * Accepts either a project-like object with status/paused/archived/created_at
  * or a plain status string (for backward compatibility).

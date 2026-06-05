@@ -220,3 +220,39 @@ describe('OrchestratorHealthBar cycle liveness verdict', () => {
     expect(cycle.textContent).toContain('⚠');
   });
 });
+
+describe('OrchestratorHealthBar deploy state', () => {
+  beforeEach(() => {
+    apiFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ daily_cost_usd: 0, daily_cost_ceiling_usd: 0 }),
+    } as Response);
+  });
+
+  it('shows amber PAUSED indicator with pause reason', async () => {
+    const health = {
+      last_cycle_seconds_ago: 0,
+      queued_tasks: 0,
+      active_tasks: 0,
+      pool_info: {},
+      deploy_state: {
+        status: 'PAUSED',
+        rollback_count: 0,
+        pause_reason: 'External dependency down: payment service unavailable',
+        monitoring_since: '2026-05-06T20:00:00Z',
+        recent_outcomes: [],
+      },
+      deploy_monitoring: {
+        external_health: {},
+      },
+    };
+
+    await act(async () => { render(<OrchestratorHealthBar {...baseProps} health={health} />); });
+
+    const deployIndicator = screen.getByTitle(/Paused: External dependency down/);
+    expect(deployIndicator).toBeTruthy();
+    expect(deployIndicator.innerHTML).toContain('bg-amber-400');
+    expect(deployIndicator.textContent).toContain('Paused');
+    expect(deployIndicator.textContent).toContain('External dependency down');
+  });
+});

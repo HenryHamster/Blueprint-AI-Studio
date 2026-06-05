@@ -21,6 +21,7 @@ function makeCurrentVersion(overrides: Partial<api.CurrentVersion> = {}): api.Cu
     opened_at: '2026-01-01T00:00:00Z',
     qualification_attempts: 0,
     merged_task_count: 0,
+    qualification_state: null,
     last_qualification: null,
     latest_audit: null,
     ...overrides,
@@ -695,6 +696,49 @@ describe('VersionLifecyclePanel', () => {
         expect(window.confirm).toHaveBeenCalledWith(
           'Abandon v6 and open a fresh version?\n\nThis will: 1 staged direction will start now; 2 in-flight tasks will keep running against the new version.'
         );
+      });
+    });
+
+    it('surfaces promotion-in-flight context before confirming a cut', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+      vi.mocked(api.cutVersion).mockRejectedValue(
+        new Error('a promotion PR is open and auto-merging — wait for it to land or cancel it before cutting (PR #7357 https://example/pr/7357)'),
+      );
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              version_number: 6,
+              qualification_state: {
+                state: 'promotion_in_flight',
+                summary: 'Audit PASSED; a promotion PR is open and auto-merging.',
+                promotion_pr_number: 7357,
+                promotion_pr_url: 'https://example/pr/7357',
+              },
+            }),
+            staged_directions: [],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
+
+      const consequences = screen.getByTestId('cut-consequences');
+      expect(consequences).toHaveTextContent('Promotion PR #7357 is open and auto-merging');
+
+      fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
+
+      await waitFor(() => {
+        expect(window.confirm).toHaveBeenCalledWith(
+          expect.stringContaining('promotion PR #7357 is open and auto-merging')
+        );
+      });
+      await waitFor(() => {
+        expect(screen.getByText(/wait for it to land or cancel it before cutting/)).toBeInTheDocument();
       });
     });
   });

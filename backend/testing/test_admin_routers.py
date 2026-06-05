@@ -17,6 +17,7 @@ from httpx import AsyncClient, ASGITransport
 from sqlmodel import select
 
 from app.main import app
+from app import release_version as rv
 from app.models import (
     AllowedUser,
     Artifact,
@@ -7038,6 +7039,36 @@ class TestCutVersion:
         )
         assert resp.status_code == 422
 
+    @pytest.mark.asyncio
+    async def test_version_cut_rejects_promotion_in_flight(
+        self, client: AsyncClient, db_session
+    ):
+        """A version with an open promotion PR is rejected before any state
+        mutation and returns a clear 409 explanation."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        version.last_qualification = {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 7357,
+                "pr_url": "https://example/pr/7357",
+                "auto_merge_enabled": True,
+            },
+        }
+        db_session.add(version)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json={"reason": "too early"},
+        )
+        assert resp.status_code == 409
+        assert "promotion PR is open and auto-merging" in resp.text
+
+        await db_session.refresh(version)
+        assert version.status == "open"
+        assert await rv.current_open_version(db_session, project.id) is not None
+
 
 class TestVersionLifecycleInfraFailureFields:
     """GET /api/admin/projects/{id}/version-lifecycle exposes infra-failure fields."""
@@ -7139,6 +7170,54 @@ class TestVersionLifecycleInfraFailureFields:
         assert lq["error"] is None
         assert lq["consecutive_infra_errors"] is None
         assert lq["audit_missing_reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_promotion_pending_state_exposed_in_current_version(
+        self, client: AsyncClient, db_session
+    ):
+        """The lifecycle payload surfaces promotion-in-flight as a distinct
+        qualification_state, not a generic pending status."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=3,
+            phase="stabilize",
+            status="open",
+            last_qualification={
+                "status": "pending",
+                "promotion_pending": {
+                    "pr_number": 7357,
+                    "pr_url": "https://example/pr/7357",
+                    "auto_merge_enabled": True,
+                },
+            },
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.get_latest_release_audit_report",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["qualification_state"]["state"] == "promotion_in_flight"
+        assert current["qualification_state"]["promotion_pr_number"] == 7357
+        assert "auto-merge is armed" in current["qualification_state"]["summary"].lower()
 
 
 class TestVersionLifecycleStagedDirections:

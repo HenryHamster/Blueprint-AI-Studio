@@ -64,6 +64,19 @@ _PHASE_REASONING_MAX = 500
 _GOAL_MAX = 500
 
 
+class VersionCutBlockedByPromotion(RuntimeError):
+    """Raised when an operator tries to cut a version that is auto-merging."""
+
+    def __init__(
+        self,
+        promotion_pr_number: int | None = None,
+        promotion_pr_url: str | None = None,
+    ) -> None:
+        super().__init__("promotion PR is open and auto-merging")
+        self.promotion_pr_number = promotion_pr_number
+        self.promotion_pr_url = promotion_pr_url
+
+
 async def open_version(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -624,6 +637,13 @@ async def abandon_current_version(
             operator_id,
         )
         return None, None
+
+    qual_state = summarize_qualification_state(locked.last_qualification)
+    if qual_state and qual_state.get("state") == "promotion_in_flight":
+        raise VersionCutBlockedByPromotion(
+            qual_state.get("promotion_pr_number"),
+            qual_state.get("promotion_pr_url"),
+        )
 
     project = await session.get(Project, project_id)
 

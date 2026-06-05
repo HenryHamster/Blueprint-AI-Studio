@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { projectStatusBadge } from './projectStatus';
+import { projectStatusBadge, isProjectActive } from './projectStatus';
 
 describe('projectStatusBadge', () => {
   describe('backward compatibility: string input', () => {
@@ -139,4 +139,39 @@ describe('projectStatusBadge', () => {
       expect(badge.classes).not.toContain('opacity-60');
     });
   });
+});
+
+describe('isProjectActive', () => {
+  it('returns true for DEPLOYING projects that are not paused or archived', () => {
+    expect(isProjectActive({ status: 'DEPLOYING' })).toBe(true);
+    expect(isProjectActive({ status: 'DEPLOYING', paused: false, archived: false })).toBe(true);
+  });
+
+  it('returns true for legacy active status', () => {
+    expect(isProjectActive({ status: 'active' })).toBe(true);
+  });
+
+  it('returns false for paused projects', () => {
+    expect(isProjectActive({ status: 'DEPLOYING', paused: true })).toBe(false);
+  });
+
+  it('returns false for archived projects', () => {
+    expect(isProjectActive({ status: 'DEPLOYING', archived: true })).toBe(false);
+  });
+
+  it('returns false for terminal states', () => {
+    expect(isProjectActive({ status: 'COMPLETED' })).toBe(false);
+    expect(isProjectActive({ status: 'FAILED' })).toBe(false);
+    expect(isProjectActive({ status: 'CANCELLED' })).toBe(false);
+  });
+
+  it('returns false for DRAFT projects', () => {
+    expect(isProjectActive({ status: 'DRAFT' })).toBe(false);
+  });
+
+  it('returns false for null or undefined input', () => {
+    expect(isProjectActive(null)).toBe(false);
+    expect(isProjectActive(undefined)).toBe(false);
+  });
+
 });

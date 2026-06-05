@@ -173,6 +173,7 @@ async def get_version_lifecycle(
         merged_count = await count_merged_since(session, project_id, open_row.opened_at)
         in_flight_count = await count_in_flight_tasks(session, project_id)
         qual = open_row.last_qualification or {}
+        qual_state = _release_version.summarize_qualification_state(qual)
         # Surface the latest release_audit's actual findings/score so a verdict
         # is explainable (the verdict record only keeps the composite, and the
         # task API strips artifact logs — otherwise operators are blind to WHY).
@@ -204,6 +205,7 @@ async def get_version_lifecycle(
             # they keep running and land against the freshly-opened next version.
             # Surfaced so the cut confirmation can disclose this consequence.
             "in_flight_task_count": in_flight_count,
+            "qualification_state": qual_state,
             "last_qualification": _format_qualification(qual) if qual else None,
             "latest_audit": latest_audit,
         }
@@ -406,12 +408,24 @@ async def cut_version(
     )
 
     operator_id = current_user.get("email") or current_user["user_id"]
-    abandoned, new_version = await _release_version.abandon_current_version(
-        session,
-        project_id,
-        reason=payload.reason,
-        operator_id=operator_id,
-    )
+    try:
+        abandoned, new_version = await _release_version.abandon_current_version(
+            session,
+            project_id,
+            reason=payload.reason,
+            operator_id=operator_id,
+        )
+    except _release_version.VersionCutBlockedByPromotion as exc:
+        detail = (
+            "a promotion PR is open and auto-merging — wait for it to land or "
+            "cancel it before cutting"
+        )
+        if exc.promotion_pr_number is not None:
+            detail += f" (PR #{exc.promotion_pr_number}"
+            if exc.promotion_pr_url:
+                detail += f" {exc.promotion_pr_url}"
+            detail += ")"
+        raise HTTPException(status_code=409, detail=detail) from exc
     if abandoned is None or new_version is None:
         raise HTTPException(
             status_code=404,

@@ -7,6 +7,7 @@ from typing import Optional, Dict, Any, List
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -1175,6 +1176,11 @@ async def trigger_strategic_cycle(
 class CreateMessage(BaseModel):
     content: str
     message_type: str = "NOTE"  # NOTE, FEEDBACK, BUG_REPORT, QUESTION, BLOCKER
+    # Client-generated idempotency key. When supplied, a repeat send (double
+    # submit / network retry of the same steering instruction) converges to the
+    # single already-stored message and a single arming, mirroring the live-chat
+    # endpoint (admin_notifications.create_message).
+    idempotency_key: Optional[str] = None
 
 
 @router.post("/projects/{project_id}/messages")
@@ -1201,14 +1207,60 @@ async def create_message(
             status_code=400, detail=f"Invalid message type: {payload.message_type}"
         )
 
+    # Idempotency: if this send carries a client key and a message with that
+    # key already exists for the project, return the existing row instead of
+    # inserting a duplicate. This collapses an accidental double-submit /
+    # network retry to a single logical message (and a single arming),
+    # identically to the live-chat endpoint (admin_notifications.create_message).
+    idem_key = (payload.idempotency_key or "").strip() or None
+    if idem_key:
+        if len(idem_key) > 255:
+            raise HTTPException(
+                status_code=400, detail="idempotency_key exceeds 255 characters"
+            )
+        existing = (
+            await session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.idempotency_key == idem_key,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return {"id": str(existing.id), "status": "duplicate", "arming": "duplicate"}
+
     msg = ProjectMessage(
         project_id=project.id,
         message_type=msg_type,
         from_type="user",
         content=payload.content.strip(),
+        idempotency_key=idem_key,
     )
     session.add(msg)
-    await session.commit()
+    # Concurrency backstop: two simultaneous sends sharing the same key both
+    # passed the pre-insert query, but the partial unique index lets only one
+    # row land. Roll back and return the winner so the loser is still an
+    # idempotent success rather than a 500.
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        if idem_key:
+            existing = (
+                await session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id,
+                        ProjectMessage.idempotency_key == idem_key,
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                return {
+                    "id": str(existing.id),
+                    "status": "duplicate",
+                    "arming": "duplicate",
+                }
+        raise
     await session.refresh(msg)
     # Snapshot the id before arming: maybe_arm_operator_refresh's bounded lock
     # acquire can OperationalError + roll back under project-row contention,
