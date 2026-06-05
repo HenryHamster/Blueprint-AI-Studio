@@ -122,4 +122,67 @@ describe('detectProvisioningSteps', () => {
     expect(steps[0].cmd).toBe('composer');
     expect(steps[0].cwd).toBe(`${WORKSPACE}/api`);
   });
+
+  // Node/JS auto-provision: install node_modules ONCE up front so the suite (any
+  // test command, not just literal `npm`) AND the cheap probes run provisioned.
+  // The committed lockfile selects the package manager.
+  it.each([
+    ['yarn.lock', 'yarn', ['install', '--frozen-lockfile']],
+    ['pnpm-lock.yaml', 'pnpm', ['install', '--frozen-lockfile']],
+    ['package-lock.json', 'npm', ['ci']],
+  ])('selects the package manager from the committed lockfile %s', (lockfile, cmd, args) => {
+    mockFs.existsSync.mockImplementation((p: string) =>
+      p === `${WORKSPACE}/package.json` || p === `${WORKSPACE}/${lockfile}`,
+    );
+    const steps = detectProvisioningSteps(undefined);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].cmd).toBe(cmd);
+    expect(steps[0].args).toEqual(args);
+    expect(steps[0].cwd).toBe(WORKSPACE);
+    expect(steps[0].declared).toBeUndefined();
+  });
+
+  it('falls back to npm install for a bare package.json with no lockfile', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/package.json`);
+    const steps = detectProvisioningSteps(undefined);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].cmd).toBe('npm');
+    expect(steps[0].args).toEqual(['install']);
+    expect(steps[0].cwd).toBe(WORKSPACE);
+  });
+
+  it('prefers yarn.lock over pnpm-lock.yaml and package-lock.json (lockfile precedence)', () => {
+    mockFs.existsSync.mockImplementation((p: string) =>
+      p === `${WORKSPACE}/package.json` ||
+      p === `${WORKSPACE}/yarn.lock` ||
+      p === `${WORKSPACE}/pnpm-lock.yaml` ||
+      p === `${WORKSPACE}/package-lock.json`,
+    );
+    const steps = detectProvisioningSteps(undefined);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].cmd).toBe('yarn');
+  });
+
+  it('declared install_cmd suppresses the Node fallback for the same dir', () => {
+    mockFs.existsSync.mockImplementation((p: string) =>
+      p === `${WORKSPACE}/package.json` || p === `${WORKSPACE}/package-lock.json`,
+    );
+    const buildConfig: BuildConfig = {
+      directories: [{ path: '', type: 'node', install_cmd: 'npm ci --legacy-peer-deps' }],
+    };
+    const steps = detectProvisioningSteps(buildConfig);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].declared).toBe(true);
+    expect(steps[0].args).toEqual(['ci', '--legacy-peer-deps']);
+  });
+
+  it('detects a Node manifest under a build_config directory', () => {
+    mockFs.existsSync.mockImplementation((p: string) =>
+      p === `${WORKSPACE}/web/package.json` || p === `${WORKSPACE}/web/pnpm-lock.yaml`,
+    );
+    const steps = detectProvisioningSteps({ directories: [{ path: 'web', type: 'node' }] });
+    expect(steps).toHaveLength(1);
+    expect(steps[0].cmd).toBe('pnpm');
+    expect(steps[0].cwd).toBe(`${WORKSPACE}/web`);
+  });
 });

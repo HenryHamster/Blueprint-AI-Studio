@@ -611,6 +611,14 @@ export interface ProvisioningStep {
  *     Elixir (mix.exs → ``mix deps.get``), PHP (composer.json → ``composer
  *     install``). Detected from the SAME signals the suite detector uses, skipped
  *     when the operator declared an install_cmd for that directory.
+ *  4) Node/JS projects (package.json) — node_modules install previously fired
+ *     ONLY in the per-runner suite loop and ONLY for a literal ``npm`` command,
+ *     so a ``yarn``/``pnpm``/direct-``vitest`` suite and the cheap goal-level
+ *     probes ran unprovisioned. Provisioned ONCE here per Node directory, with
+ *     the committed lockfile selecting the package manager (package-lock.json →
+ *     ``npm ci``, yarn.lock → ``yarn install --frozen-lockfile``, pnpm-lock.yaml
+ *     → ``pnpm install --frozen-lockfile``; bare package.json → ``npm install``).
+ *     Skipped when the operator declared an install_cmd for that directory.
  *
  * Deduped by ``cwd``; inspects ONLY the local filesystem (zero GitHub-API cost).
  */
@@ -709,6 +717,51 @@ export function detectProvisioningSteps(buildConfig?: BuildConfig): Provisioning
   }
   // Repo root covers the auto-detected (no build_config) case.
   addExtraFamilyAuto(WORKSPACE, 'root');
+
+  // 4) Node/JS auto-provision. Node is the most common external-repo ecosystem,
+  //    yet node_modules install previously lived ONLY in the per-runner suite
+  //    loop and fired ONLY when the resolved test command was literally `npm`.
+  //    So a suite invoked as `yarn test` / `pnpm test` / a direct `vitest`/`jest`
+  //    never got deps, and the cheap goal-level probes (acceptance type-check +
+  //    documented/PR-introduced command) ran with no node_modules and silently
+  //    degraded to "could not run". Provision node_modules ONCE here so BOTH the
+  //    suite (regardless of which test command was detected) AND the probes run
+  //    against a provisioned environment. The committed lockfile selects the
+  //    package manager exactly like the per-runner backstop in test-fix-loop.ts:
+  //    yarn.lock → `yarn install --frozen-lockfile`, pnpm-lock.yaml →
+  //    `pnpm install --frozen-lockfile`, package-lock.json → `npm ci`; a bare
+  //    package.json with no lockfile falls back to `npm install` (npm ci REQUIRES
+  //    a lockfile and would hard-fail). Skips any dir that declared its own
+  //    install_cmd (operator's command wins) and any cwd already provisioned
+  //    above (deduped by `add`). A provisioning FAILURE flows through the existing
+  //    setup-failure path — never a blocking test failure. The per-runner npm
+  //    fallback stays as a harmless idempotent backstop (it no-ops once
+  //    node_modules is present).
+  const addNodeAuto = (absDir: string, label: string): void => {
+    if (declaredCwds.has(absDir)) return;
+    if (!exists(`${absDir}/package.json`)) return;
+    if (exists(`${absDir}/yarn.lock`)) {
+      add({ cmd: 'yarn', args: ['install', '--frozen-lockfile'], cwd: absDir, label: `yarn install --frozen-lockfile (${label})` });
+      return;
+    }
+    if (exists(`${absDir}/pnpm-lock.yaml`)) {
+      add({ cmd: 'pnpm', args: ['install', '--frozen-lockfile'], cwd: absDir, label: `pnpm install --frozen-lockfile (${label})` });
+      return;
+    }
+    if (exists(`${absDir}/package-lock.json`)) {
+      add({ cmd: 'npm', args: ['ci'], cwd: absDir, label: `npm ci (${label})` });
+      return;
+    }
+    // Bare package.json, no committed lockfile: npm ci would fail, so npm install.
+    add({ cmd: 'npm', args: ['install'], cwd: absDir, label: `npm install (${label})` });
+  };
+  if (buildConfig?.directories) {
+    for (const dir of buildConfig.directories) {
+      addNodeAuto(dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE, dir.path || 'root');
+    }
+  }
+  // Repo root covers the auto-detected (no build_config) case.
+  addNodeAuto(WORKSPACE, 'root');
 
   return steps;
 }

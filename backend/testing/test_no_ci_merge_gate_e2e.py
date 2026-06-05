@@ -1350,6 +1350,7 @@ async def test_unverified_merge_raises_single_alert_naming_pr_and_reason(
     assert ci_result["conclusion"] == "success"
 
     # The orchestrator records WHY the merge is unverified on the parent context.
+    # undetected_runtime is a degraded reason that escalates to ERROR.
     parent = await _set_unverified_reason(db_session, parent, "undetected_runtime")
 
     acted = await handle_ci_completion(
@@ -1362,7 +1363,7 @@ async def test_unverified_merge_raises_single_alert_naming_pr_and_reason(
     assert len(alerts) == 1, "exactly one UNVERIFIED-merge alert per merged PR"
     from app.models import AlertSeverity
 
-    assert alerts[0].severity == AlertSeverity.WARNING
+    assert alerts[0].severity == AlertSeverity.ERROR  # undetected_runtime is degraded
     assert alerts[0].task_id == parent.id
     assert f"PR #{PR_NUMBER}" in alerts[0].title
     assert "UNVERIFIED" in alerts[0].message
@@ -1402,6 +1403,73 @@ async def test_unverified_merge_alert_not_duplicated_on_second_sweep(
 
     alerts = await _unverified_merge_alerts(db_session, project.id)
     assert len(alerts) == 1, "second merge sweep must not duplicate the alert"
+
+
+@pytest.mark.asyncio
+async def test_unverified_merge_alert_severity_degraded_vs_benign(db_session, mocker):
+    """Degraded env/setup-failure reasons escalate to ERROR; benign reasons stay WARNING.
+
+    This pins the severity split: a real test suite that couldn't run is more urgent
+    (ERROR) than a repo that legitimately has no tests (WARNING).
+    """
+    from app.models import AlertSeverity
+
+    _patch_github(mocker)
+    mocker.patch("app.github.merge_pull_request", return_value={"merged": True})
+
+    ci_result = build_no_ci_gate_ci_result("undetected", "")
+
+    # --- Test ERROR reasons (degraded: environment/setup failed) ---
+    for degraded_reason in [
+        "verify_setup_failed",
+        "undetected_runtime",
+        "suite_all_skipped",
+        "probe_could_not_run",
+        "documented_command_could_not_run",
+    ]:
+        project = await _make_no_ci_project(db_session, with_test_cmd=False)
+        parent = _make_parent_task(db_session, project)
+        await db_session.commit()
+        await db_session.refresh(parent)
+
+        parent = await _set_unverified_reason(db_session, parent, degraded_reason)
+        await handle_ci_completion(
+            parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+        )
+
+        alerts = await _unverified_merge_alerts(db_session, project.id)
+        assert (
+            len(alerts) == 1
+        ), f"degraded reason {degraded_reason} must raise exactly one alert"
+        assert (
+            alerts[0].severity == AlertSeverity.ERROR
+        ), f"degraded reason {degraded_reason} must escalate to ERROR severity"
+
+    # --- Test WARNING reasons (benign: no verification expected or positive-only signals) ---
+    for benign_reason in [
+        "no_detectable_test_command",
+        "kill_switch_off",
+        "internal_staging_base",
+        "probe_passed",
+        "documented_command_passed",
+    ]:
+        project = await _make_no_ci_project(db_session, with_test_cmd=False)
+        parent = _make_parent_task(db_session, project)
+        await db_session.commit()
+        await db_session.refresh(parent)
+
+        parent = await _set_unverified_reason(db_session, parent, benign_reason)
+        await handle_ci_completion(
+            parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+        )
+
+        alerts = await _unverified_merge_alerts(db_session, project.id)
+        assert (
+            len(alerts) == 1
+        ), f"benign reason {benign_reason} must raise exactly one alert"
+        assert (
+            alerts[0].severity == AlertSeverity.WARNING
+        ), f"benign reason {benign_reason} must stay at WARNING severity"
 
 
 # ---------------------------------------------------------------------------

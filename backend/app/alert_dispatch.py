@@ -355,6 +355,33 @@ _UNVERIFIED_REASON_LABELS = {
     ),
 }
 
+# Severity escalation for no-CI UNVERIFIED-merge reasons: degraded environment/setup
+# failures escalate to ERROR, benign fall-open reasons stay WARNING.
+_UNVERIFIED_REASON_SEVERITY = {
+    # ERROR (degraded): environment/setup failure prevented verification that was expected
+    "verify_setup_failed": AlertSeverity.ERROR,
+    "undetected_runtime": AlertSeverity.ERROR,
+    "suite_all_skipped": AlertSeverity.ERROR,
+    "probe_could_not_run": AlertSeverity.ERROR,
+    "documented_command_could_not_run": AlertSeverity.ERROR,
+    # WARNING (benign): no verification expected or only positive signals obtained
+    "no_detectable_test_command": AlertSeverity.WARNING,
+    "kill_switch_off": AlertSeverity.WARNING,
+    "internal_staging_base": AlertSeverity.WARNING,
+    "probe_passed": AlertSeverity.WARNING,
+    "documented_command_passed": AlertSeverity.WARNING,
+}
+
+
+def _severity_for_unverified_reason(reason: str) -> AlertSeverity:
+    """Map an unverified-merge reason to its alert severity.
+
+    Degraded reasons (environment/setup failure blocked verification) escalate
+    to ERROR; benign reasons (no verification expected) stay WARNING. Defaults
+    to WARNING for unknown reasons to preserve backward compatibility.
+    """
+    return _UNVERIFIED_REASON_SEVERITY.get(reason, AlertSeverity.WARNING)
+
 
 async def _maybe_create_unverified_merge_alert(
     task: "Task",
