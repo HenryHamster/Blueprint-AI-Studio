@@ -6734,6 +6734,37 @@ class TestSetVersionPhase:
         assert resp.json()["phase"] == "build"
 
     @pytest.mark.asyncio
+    async def test_set_phase_rejects_promotion_in_flight(
+        self, client: AsyncClient, db_session
+    ):
+        """A phase flip while a promotion PR is open and auto-merging is rejected
+        with a 409 — flipping back to build would clear the in-flight indication
+        without cancelling anything, leaving the operator levers disagreeing."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        version.last_qualification = {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 8642,
+                "pr_url": "https://example/pr/8642",
+                "auto_merge_enabled": True,
+            },
+        }
+        db_session.add(version)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-phase",
+            json={"phase": "build"},
+        )
+        assert resp.status_code == 409
+        assert "promotion PR is open and auto-merging" in resp.text
+
+        # Phase unchanged — the flip was refused before any mutation.
+        await db_session.refresh(version)
+        assert version.phase == "stabilize"
+
+    @pytest.mark.asyncio
     async def test_set_phase_no_open_version_returns_404(
         self, client: AsyncClient, db_session
     ):
@@ -8936,6 +8967,62 @@ class TestModifyTaskApplySeam:
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_operator_triggers.py — Manual Operator Triggers
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestTriggerQualify:
+    @pytest.mark.asyncio
+    async def test_qualify_rejects_promotion_in_flight(
+        self, client: AsyncClient, db_session
+    ):
+        """Re-running qualification while a promotion PR is open and auto-merging
+        is rejected with a 409 — run_qualification no-ops (promotion_in_flight)
+        and the endpoint surfaces it, mirroring the version-cut lever, instead of
+        spawning a fresh audit/smoketest pair that clobbers the pending record."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        # A terminal audit child — by the child-task definition this is NOT "in
+        # flight", so only the promotion-in-flight guard catches it.
+        audit_task = Task(
+            project_id=project.id,
+            title="audit-done",
+            payloads=[{"type": "release_audit", "base_branch": "main"}],
+            vm_instance_id="vm-audit-promo",
+            status=TaskStatus.COMPLETED,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "abc123",
+            "audit_task_id": str(audit_task.id),
+            "smoketest_enabled": False,
+            "promotion_pending": {
+                "pr_number": 9753,
+                "pr_url": "https://example/pr/9753",
+                "auto_merge_enabled": True,
+            },
+        }
+        db_session.add(version)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/qualify")
+        assert resp.status_code == 409
+        assert "promotion PR is open and auto-merging" in resp.text
+
+        # The promotion-pending record survives untouched.
+        await db_session.refresh(version)
+        assert version.last_qualification["promotion_pending"]["pr_number"] == 9753
+
+    @pytest.mark.asyncio
+    async def test_qualify_no_open_version_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns 404 when there is no open release version to qualify."""
+        project = await _make_project(db_session)
+        resp = await client.post(f"/api/admin/projects/{project.id}/qualify")
+        assert resp.status_code == 404
 
 
 class TestClearWaveDeps:

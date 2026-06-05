@@ -315,6 +315,31 @@ async def set_version_phase(
             detail="No open release version found for this project.",
         )
 
+    # Refuse a phase flip while a promotion is in flight (audit passed, promotion
+    # PR open and auto-merging).  Flipping back to build here clears the
+    # "promotion in flight" indication in the panel even though nothing was
+    # cancelled — leaving the operator levers disagreeing about the version's
+    # real state.  Mirrors the version-cut lever's 409 refusal on the same
+    # predicate. (Only the operator endpoint guards this — the internal
+    # set_version_phase helper stays open for finalize/sweep/promotion flows that
+    # legitimately flip phase mid-promotion.)
+    _qual_state = _release_version.summarize_qualification_state(
+        open_ver.last_qualification
+    )
+    if _qual_state and _qual_state.get("state") == "promotion_in_flight":
+        detail = (
+            "a promotion PR is open and auto-merging — wait for it to land or "
+            "cancel it before changing the phase"
+        )
+        pr_number = _qual_state.get("promotion_pr_number")
+        if pr_number is not None:
+            detail += f" (PR #{pr_number}"
+            pr_url = _qual_state.get("promotion_pr_url")
+            if pr_url:
+                detail += f" {pr_url}"
+            detail += ")"
+        raise HTTPException(status_code=409, detail=detail)
+
     operator_id = current_user.get("email") or current_user["user_id"]
     full_reasoning = (
         f"[operator:{operator_id}] {payload.reasoning}".strip()

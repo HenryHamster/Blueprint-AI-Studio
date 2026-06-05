@@ -426,6 +426,33 @@ async def _qualification_in_flight(
     return False
 
 
+def _promotion_in_flight_result(
+    version: release_version.ReleaseVersion,
+) -> dict[str, Any] | None:
+    """Return a ``promotion_in_flight`` status dict, or None when not in flight.
+
+    A version whose audit PASSED and now has an open promotion PR auto-merging
+    (``last_qualification.status == "pending"`` + a ``promotion_pending``
+    sub-key) is mid-promotion. Re-qualifying in this state would spawn a fresh
+    audit/smoketest pair and clobber the promotion-pending record other parts of
+    the system rely on as provenance that the promotion is still legitimately
+    merging — so ``run_qualification`` refuses (no-op) just like the version-cut
+    lever does (``abandon_current_version`` raises ``VersionCutBlockedByPromotion``
+    on the same predicate). Reuses ``summarize_qualification_state`` so all the
+    operator levers agree by construction.
+    """
+    qual_state = release_version.summarize_qualification_state(
+        version.last_qualification
+    )
+    if qual_state and qual_state.get("state") == "promotion_in_flight":
+        return {
+            "status": "promotion_in_flight",
+            "promotion_pr_number": qual_state.get("promotion_pr_number"),
+            "promotion_pr_url": qual_state.get("promotion_pr_url"),
+        }
+    return None
+
+
 async def _increment_qualification_attempts(
     session: AsyncSession,
     version_id: uuid.UUID,
@@ -993,6 +1020,21 @@ async def run_qualification(
         )
         return {"status": "already_pending"}
 
+    # Cheap pre-lock promotion-in-flight check (no I/O — pure DB read).  A
+    # version whose audit passed and now has an open promotion PR auto-merging
+    # must not be re-qualified: doing so spawns a fresh heavy audit/smoketest
+    # pair and clobbers the promotion-pending record.  Consistent with the
+    # version-cut lever, which refuses in the same state.  Best-effort fast path
+    # — the authoritative re-check happens under the row lock below.
+    _promo = _promotion_in_flight_result(version)
+    if _promo is not None:
+        logger.info(
+            "[RELEASE_QUALIFIER] run_qualification: version v%d has a promotion "
+            "in flight — skipping (promotion_in_flight, pre-lock)",
+            version.version_number,
+        )
+        return _promo
+
     project = await session.get(Project, project_id)
     if project is None:
         logger.warning(
@@ -1138,6 +1180,24 @@ async def run_qualification(
             version.version_number,
         )
         return {"status": "already_pending"}
+
+    # Guard 2b (under the lock): a promotion is in flight — the audit PASSED and
+    # a promotion PR is open and auto-merging (last_qualification.status ==
+    # "pending" + a promotion_pending sub-key, children already terminal).  This
+    # is NOT "in flight" by the child-task definition above, and "pending" is not
+    # a conclusive verdict, so neither Guard 2 nor Guard 3 catches it.  Spawning
+    # a fresh audit/smoketest pair here and overwriting the promotion-pending
+    # record would discard the provenance the rest of the system relies on to
+    # know the promotion is still legitimately merging — so refuse (no-op),
+    # consistent with the version-cut lever.
+    _promo = _promotion_in_flight_result(version)
+    if _promo is not None:
+        logger.info(
+            "[RELEASE_QUALIFIER] run_qualification: version v%d has a promotion "
+            "in flight — skipping (promotion_in_flight)",
+            version.version_number,
+        )
+        return _promo
 
     # Guard 3 (under the lock): a conclusive qualification verdict
     # (promoted/not_promoted/dry_run) for this candidate commit has been reached

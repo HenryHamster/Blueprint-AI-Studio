@@ -242,6 +242,24 @@ async def trigger_qualify(
         session, project_id, open_version
     )
     await session.commit()
+    # Promotion-in-flight: the audit passed and a promotion PR is open and
+    # auto-merging.  Re-qualifying would spawn a fresh heavy audit/smoketest pair
+    # and clobber the promotion-pending provenance, so run_qualification refuses
+    # (no-op).  Surface that to the operator as a 409, mirroring the version-cut
+    # lever, so all the levers over an in-flight promotion agree.
+    if result.get("status") == "promotion_in_flight":
+        detail = (
+            "a promotion PR is open and auto-merging — wait for it to land or "
+            "cancel it before re-qualifying"
+        )
+        pr_number = result.get("promotion_pr_number")
+        if pr_number is not None:
+            detail += f" (PR #{pr_number}"
+            pr_url = result.get("promotion_pr_url")
+            if pr_url:
+                detail += f" {pr_url}"
+            detail += ")"
+        raise HTTPException(status_code=409, detail=detail)
     return result
 
 

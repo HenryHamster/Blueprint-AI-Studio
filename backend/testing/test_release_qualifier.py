@@ -2921,6 +2921,81 @@ async def test_run_qualification_already_pending_is_noop(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_run_qualification_promotion_in_flight_is_noop(db_session, mocker):
+    """A version whose audit PASSED and now has an open promotion PR
+    auto-merging (status='pending' + a promotion_pending sub-key, children
+    terminal) must NOT be re-qualified: doing so would spawn a fresh heavy
+    audit/smoketest pair and clobber the promotion-pending provenance.
+    run_qualification refuses with promotion_in_flight, spawns nothing, and
+    leaves the record untouched — consistent with the version-cut lever."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    # Both children already terminal — by the child-task definition this is NOT
+    # "in flight", and 'pending' is not a conclusive verdict, so only the
+    # promotion-in-flight guard catches it.
+    audit_task = Task(
+        project_id=project.id,
+        title="audit-done",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit-promo",
+        status=TaskStatus.COMPLETED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "feed" * 10,
+        "ci_green": True,
+        "started_at": "2026-05-20T00:00:00",
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": None,
+        "smoketest_enabled": False,
+        "promotion_pending": {
+            "pr_number": 4242,
+            "pr_url": "https://github.com/o/r/pull/4242",
+            "auto_merge_enabled": True,
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    attempts_before = version.qualification_attempts
+
+    sha_mock = mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="cafe" * 10),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "promotion_in_flight"
+    assert result["promotion_pr_number"] == 4242
+    assert result["promotion_pr_url"] == "https://github.com/o/r/pull/4242"
+    # The pre-lock guard fired before any GitHub I/O (no SHA snapshot).
+    sha_mock.assert_not_called()
+
+    await db_session.refresh(version)
+    # The promotion-pending record is untouched; attempts NOT bumped.
+    assert version.last_qualification["promotion_pending"]["pr_number"] == 4242
+    assert version.last_qualification["candidate_sha"] == "feed" * 10
+    assert version.qualification_attempts == attempts_before
+
+    # Still exactly the one original child — no fresh audit/smoketest pair.
+    from sqlmodel import select
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(tasks) == 1
+
+
+@pytest.mark.asyncio
 async def test_run_qualification_pending_but_children_terminal_runs_fresh(
     db_session, mocker
 ):
