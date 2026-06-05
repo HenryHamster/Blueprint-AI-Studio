@@ -4342,4 +4342,49 @@ describe('writeDesignDocHelper', () => {
       try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
     }
   });
+
+  // ── Read-only mode (research / plan workspaces) ──────────────────────────────
+  // The research/plan prompt advertises `./design-doc get <key>` (and lists
+  // section keys to read), so those workspaces must provision a working get/list
+  // helper. They must NOT be handed a write path to durable strategic state.
+  describe('readOnly mode', () => {
+    it('provisions the get/list read surface the research/plan prompt advertises', () => {
+      writeDesignDocHelper('task-xyz', '/tmp/workspace', { readOnly: true });
+      const script = capturedScripts['/tmp/workspace/design-doc'];
+      expect(script.startsWith('#!/bin/bash')).toBe(true);
+      expect(script).toContain('design-doc get|list');
+      expect(script).toContain('TASK="task-xyz"');
+      // get and list still route through the fail-fast single-shot helper.
+      expect(script).toContain('_post_once()');
+      expect(script).toMatch(/"op":"list"\}' "\$TASK" \| _post_once/);
+      expect(script).toMatch(/"op":"get","key":"%s"\}' "\$TASK" "\$KEY" \| _post_once/);
+    });
+
+    it('rejects set/delete (no write path, no retry loop) in read-only workspaces', () => {
+      writeDesignDocHelper('task-xyz', '/tmp/workspace', { readOnly: true });
+      const script = capturedScripts['/tmp/workspace/design-doc'];
+      expect(script).toContain('read-only in this workspace');
+      // No durable write path is emitted at all.
+      expect(script).not.toContain('_post_retry');
+      expect(script).not.toContain('"op":"set"');
+      expect(script).not.toContain('"op":"delete"');
+    });
+
+    it('read-only script passes `bash -n` syntax check', async () => {
+      writeDesignDocHelper('task-xyz', '/tmp/workspace', { readOnly: true });
+      const script = capturedScripts['/tmp/workspace/design-doc'];
+      expect(script).toBeDefined();
+
+      const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+      const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+      const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+      const tmp = `${realOs.tmpdir().replace(/\\/g, '/')}/design_doc_ro_smoke_${process.pid}_${Date.now()}.sh`;
+      realFs.writeFileSync(tmp, script);
+      try {
+        realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });
+      } finally {
+        try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
+      }
+    });
+  });
 });

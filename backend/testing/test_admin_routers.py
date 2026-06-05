@@ -2712,6 +2712,50 @@ class TestMessages:
         assert "id" in data
 
     @pytest.mark.asyncio
+    async def test_create_message_idempotency_key_dedupes(
+        self, client: AsyncClient, db_session
+    ):
+        """Two sends sharing one idempotency key collapse to a single row."""
+        from sqlalchemy import func as sa_func
+        from app.models import ProjectMessage
+
+        project = await _make_project(db_session)
+        body = {
+            "project_id": str(project.id),
+            "message_type": "FEEDBACK",
+            "content": "Steer toward X.",
+            "idempotency_key": "key-double-submit-1",
+        }
+
+        first = await client.post("/api/admin/messages", json=body)
+        assert first.status_code == 200
+        assert first.json()["status"] == "created"
+        first_id = first.json()["id"]
+
+        # Identical retry with the same key — idempotent success, same row.
+        second = await client.post("/api/admin/messages", json=body)
+        assert second.status_code == 200
+        assert second.json()["status"] == "duplicate"
+        assert second.json()["id"] == first_id
+
+        # Exactly one row landed for this project.
+        count = await db_session.scalar(
+            select(sa_func.count())
+            .select_from(ProjectMessage)
+            .where(ProjectMessage.project_id == project.id)
+        )
+        assert count == 1
+
+        # A different key on the same content does create a second message.
+        third = await client.post(
+            "/api/admin/messages",
+            json={**body, "idempotency_key": "key-double-submit-2"},
+        )
+        assert third.status_code == 200
+        assert third.json()["status"] == "created"
+        assert third.json()["id"] != first_id
+
+    @pytest.mark.asyncio
     async def test_create_message_no_access_returns_404(
         self, client: AsyncClient, db_session
     ):

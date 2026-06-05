@@ -21,6 +21,15 @@ import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 
 const DEFAULT_VIEW_ID = '__default__';
 
+// Generate a client idempotency key for a message send. Prefers the native
+// UUID generator and falls back to a timestamp+random token for older runtimes
+// (and JSDOM, where crypto.randomUUID may be absent).
+function generateIdempotencyKey(): string {
+  const c = typeof globalThis !== 'undefined' ? globalThis.crypto : undefined;
+  if (c && typeof c.randomUUID === 'function') return c.randomUUID();
+  return `idem-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 function viewSummaryLine(query: string, prefs: Record<string, EventPref>, sort: 'importance' | 'recent', showResolved: boolean, showOnlyNew?: boolean): string {
   const parts: string[] = [];
   parts.push(query.trim() ? `Search: ${query.trim().slice(0, 40)}` : 'No search');
@@ -124,6 +133,11 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // to a fresh type-based prediction).
   const [lastArming, setLastArming] = useState<ArmingOutcome | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Idempotency key for the in-flight draft. Generated once per draft and
+  // reused across retries / a rapid double-submit so the backend collapses
+  // them to one logical message; cleared after a successful send so the next
+  // distinct message gets a fresh key.
+  const idempotencyKeyRef = useRef<string | null>(null);
 
   // Per-message action state
   const [resolvingId, setResolvingId] = useState<string | null>(null);
@@ -709,6 +723,11 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         context.reply_to = replyTo.id;
         context.reply_preview = replyTo.content.slice(0, 120);
       }
+      // Reuse the draft's key across a double-submit / retry so the backend
+      // dedups; only mint a new one when the previous send fully succeeded.
+      if (!idempotencyKeyRef.current) {
+        idempotencyKeyRef.current = generateIdempotencyKey();
+      }
       const res = await apiFetch(`${API_BASE_URL}/api/admin/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -716,6 +735,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
           project_id: selectedProjectId,
           message_type: newType,
           content: newContent.trim(),
+          idempotency_key: idempotencyKeyRef.current,
           ...(Object.keys(context).length > 0 ? { context } : {}),
         }),
       });
@@ -730,6 +750,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       } catch {
         // No/invalid JSON body — fall back to generic confirmation copy.
       }
+      // Sent cleanly — the next distinct message gets a fresh key.
+      idempotencyKeyRef.current = null;
       setNewContent('');
       setReplyTo(null);
       setLastArming(arming);

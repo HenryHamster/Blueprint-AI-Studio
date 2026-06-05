@@ -1211,7 +1211,9 @@ export async function handlePlan(
   verifyCloneDelivered(task, baseBranch);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
-  writeDesignDocHelper(taskId);
+  // The plan prompt advertises `./design-doc get <key>` for architectural
+  // grounding; provision the read-only helper so that contract is honest.
+  writeDesignDocHelper(taskId, WORKSPACE, { readOnly: true });
   const disallowedTools = configureAgentPermissions('plan');
   const promptFingerprint = computeResearchPlanPromptFingerprint('plan');
   const setPromptFingerprint = (indexMod as { setCurrentPromptFingerprint?: (fp: string) => void }).setCurrentPromptFingerprint;
@@ -1395,7 +1397,9 @@ export async function handleResearch(
   verifyCloneDelivered(task, baseBranch);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
-  writeDesignDocHelper(taskId);
+  // The research prompt advertises `./design-doc get <key>` for architectural
+  // grounding; provision the read-only helper so that contract is honest.
+  writeDesignDocHelper(taskId, WORKSPACE, { readOnly: true });
   const researchMode = strVal(payload.research_mode as string, 'research');
   const disallowedTools = configureAgentPermissions(researchMode);
   const promptFingerprint = computeResearchPlanPromptFingerprint('research');

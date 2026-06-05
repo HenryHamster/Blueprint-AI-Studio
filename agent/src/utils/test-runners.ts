@@ -825,6 +825,62 @@ function runnerKindFromCmd(cmd: string): string {
 }
 
 /**
+ * Detect environment/infrastructure failure signatures in test runner output.
+ *
+ * Returns true when the output shows a setup or infrastructure failure —
+ * missing shared library, Python module not installed, spawn ENOENT — rather
+ * than a genuine test failure. CONSERVATIVE: returns false whenever real test
+ * failure evidence is present (FAILED/error-count lines), so a test that
+ * quotes an env phrase as assertion data stays a real run. Patterns are
+ * checked per-line so a phrase mid-line in an assertion diff never triggers
+ * a misroute.
+ *
+ * Mirrors backend/app/failure_layer_classifier.py _AGENT_VM_PATTERNS — keep
+ * the two in sync. The cross-language contract is pinned by the CI source-scan
+ * in backend/testing/test_invariants.py.
+ */
+export function matchesEnvironmentFailureSignature(output: string): boolean {
+  if (!output) return false;
+  const trimmedLines = output.split(/\r?\n/).map(line => line.trim());
+  // Real-failure evidence guard — same logic as classifyTestExecution's
+  // hasRealFailureEvidence. When a FAILED/error-count line is present the env
+  // phrase was quoted inside assertion data, not an infrastructure error.
+  const hasRealFailureEvidence = trimmedLines.some(line => (
+    /^FAILED\s+\S+/.test(line) ||
+    /^FAIL\s{2,}\S+/.test(line) ||
+    /^[✕✗×⨯]\s+\S+/.test(line) ||
+    /\b[1-9]\d*\s+failed\b/i.test(line) ||
+    /\b[1-9]\d*\s+failures?\b/i.test(line) ||
+    /^--- FAIL:/.test(line) ||
+    /^FAIL\t\S/.test(line) ||
+    /\bFailed:\s+[1-9]\d*\b/i.test(line) ||
+    /\bFailures:\s+[1-9]\d*\b/i.test(line) ||
+    /\bErrors:\s+[1-9]\d*\b/i.test(line) ||
+    /\b[1-9]\d*\s+errors?\b/i.test(line)
+  ));
+  if (hasRealFailureEvidence) return false;
+  // Environment failure patterns — checked per-line.
+  // Mirrors _AGENT_VM_PATTERNS in backend/app/failure_layer_classifier.py.
+  return trimmedLines.some(line => (
+    // Shared-library load errors (.so not installed on the gate VM)
+    /error while loading shared librar/i.test(line) ||
+    /cannot open shared object file/i.test(line) ||
+    /no such file or directory.*\.so\b/i.test(line) ||
+    /libatk[-\w]*\.so/i.test(line) ||
+    /missing.*system.*librar/i.test(line) ||
+    // Python module/dep not installed in the gate environment
+    /^ModuleNotFoundError:\s+No module named/i.test(line) ||
+    /^No module named\b/i.test(line) ||
+    /^ImportError:\s+No module named/i.test(line) ||
+    // Spawn failure: binary not found (OS could not exec the process)
+    /\bspawn\b.+\bENOENT\b/i.test(line) ||
+    // System runtimes not on PATH (VM-level, not test-runner-level)
+    /\bnode:\s+command not found/i.test(line) ||
+    /\bpython3?:\s+command not found/i.test(line)
+  ));
+}
+
+/**
  * Classify whether a test runner's output indicates that real tests actually
  * executed, or that the command was a placeholder / collected zero tests.
  *

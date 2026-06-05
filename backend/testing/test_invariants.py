@@ -7361,6 +7361,135 @@ def _extract_classifier_region(source: str) -> str:
     return source[start:end]
 
 
+def _extract_env_failure_region(source: str) -> str:
+    """Extract the matchesEnvironmentFailureSignature function from test-runners.ts.
+
+    The function must be defined immediately before classifyTestExecution so the
+    region boundary is [matchesEnvironmentFailureSignature .. classifyTestExecution).
+    Raises ValueError with a clear message on parse miss.
+    """
+    start = source.find("export function matchesEnvironmentFailureSignature")
+    if start == -1:
+        raise ValueError(
+            "Could not find `export function matchesEnvironmentFailureSignature` anchor "
+            "in agent/src/utils/test-runners.ts — the function was renamed or removed. "
+            "Update _extract_env_failure_region in backend/testing/test_invariants.py."
+        )
+    end = source.find("\nexport function classifyTestExecution", start)
+    if end == -1:
+        raise ValueError(
+            "Could not find `export function classifyTestExecution` terminator after "
+            "matchesEnvironmentFailureSignature in agent/src/utils/test-runners.ts. "
+            "Ensure matchesEnvironmentFailureSignature is defined immediately before "
+            "classifyTestExecution in the file."
+        )
+    return source[start:end]
+
+
+class TestAgentEnvFailureSignatureParity:
+    """SOURCE-SCAN: when agent/src is mounted, the agent-side env-failure
+    signature list stays in sync with the backend's _AGENT_VM_PATTERNS in
+    backend/app/failure_layer_classifier.py.
+
+    A pattern in the backend that is absent from the agent means a VM-level
+    failure (missing .so, ModuleNotFoundError) is misrouted to the code-fix
+    loop instead of the setup-escalation path, burning agent budget on an
+    unfixable problem.
+
+    Skips in CI Docker contexts where agent/src is absent, exactly like the
+    sibling ``TestAgentTestRunnerSourceParity`` class.
+    """
+
+    @staticmethod
+    def _read_agent_source() -> str:
+        path = _resolve_agent_test_runners_ts_path()
+        if path is None:
+            pytest.skip(
+                "agent/src/utils/test-runners.ts not available in this test "
+                "environment (CI docker context is ./backend; run locally or via "
+                "scripts/test-backend.sh from a checkout for enforcement)"
+            )
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_env_failure_function_exists_and_is_exported(self):
+        """matchesEnvironmentFailureSignature must be defined and exported."""
+        source = self._read_agent_source()
+        region = _extract_env_failure_region(source)  # raises (loud) on parse miss
+        assert "export function matchesEnvironmentFailureSignature" in region, (
+            "agent/src/utils/test-runners.ts no longer exports "
+            "matchesEnvironmentFailureSignature. Restore the export so the "
+            "no-CI gate can route env failures to setupErrors."
+        )
+
+    def test_env_failure_real_failure_guard_present(self):
+        """The function must gate on a hasRealFailureEvidence check so a test
+        that quotes an env phrase as assertion data stays a real test failure."""
+        source = self._read_agent_source()
+        region = _extract_env_failure_region(source)
+        assert "hasRealFailureEvidence" in region, (
+            "agent/src/utils/test-runners.ts matchesEnvironmentFailureSignature "
+            "no longer defines a real-failure evidence guard. Without this guard "
+            "a genuine failing suite whose output quotes an env phrase would be "
+            "misrouted to the setup-failure escalation path."
+        )
+        assert "if (hasRealFailureEvidence) return false;" in region, (
+            "agent/src/utils/test-runners.ts matchesEnvironmentFailureSignature "
+            "no longer short-circuits on real failure evidence. Restore the "
+            "`if (hasRealFailureEvidence) return false;` guard."
+        )
+
+    def test_env_failure_patterns_mirror_agent_vm_patterns(self):
+        """Key patterns from _AGENT_VM_PATTERNS must appear in the agent function.
+
+        The backend is the source of truth for what counts as a VM-level failure.
+        A pattern present in the backend but absent from the agent means that
+        failure class silently falls through to the code-fix loop.
+        """
+        source = self._read_agent_source()
+        region = _extract_env_failure_region(source)
+
+        # Each entry: (human label, canonical substring that must appear in region).
+        # Substrings are key phrases from _AGENT_VM_PATTERNS (failure_layer_classifier.py).
+        # Use raw strings to match backslash-escaped regex literals in the TS source.
+        required_patterns = [
+            ("shared-library load error", "error while loading shared librar"),
+            ("shared-object open failure", "cannot open shared object file"),
+            ("no-such-file .so", r"\.so"),
+            ("Python ModuleNotFoundError", "ModuleNotFoundError"),
+            ("Python No module named", "No module named"),
+            ("Python ImportError", "ImportError"),
+            ("spawn ENOENT", "ENOENT"),
+            # TS source uses regex literals: \bnode:\s+command not found
+            ("node runtime missing", r"\bnode:"),
+            ("python3 runtime missing", "python3"),
+        ]
+        missing = [
+            label
+            for label, phrase in required_patterns
+            if phrase not in region
+        ]
+        assert not missing, (
+            "agent/src/utils/test-runners.ts matchesEnvironmentFailureSignature "
+            "is missing pattern(s) that mirror backend _AGENT_VM_PATTERNS: "
+            f"{missing}. Add the missing patterns to keep the two banks in sync."
+        )
+
+    def test_extract_env_failure_region_raises_on_missing_anchor(self):
+        """Parser raises loudly when the function anchor is absent."""
+        with pytest.raises(ValueError, match="matchesEnvironmentFailureSignature"):
+            _extract_env_failure_region(
+                "export function classifyTestExecution(output: string) {}"
+            )
+
+    def test_extract_env_failure_region_raises_on_missing_terminator(self):
+        """Parser raises loudly when classifyTestExecution is absent after anchor."""
+        with pytest.raises(ValueError, match="classifyTestExecution"):
+            _extract_env_failure_region(
+                "export function matchesEnvironmentFailureSignature(output: string) {}"
+            )
+
+
 class TestAgentTestRunnerTableParity:
     """ALWAYS-ON: the backend-resident agent runner table is pinned to the shared
     fixture. Runs in plain GitHub CI (no agent/src required).

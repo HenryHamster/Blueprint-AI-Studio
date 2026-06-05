@@ -2840,6 +2840,82 @@ async def test_playbook_set_and_get(client: AsyncClient, db_session):
     assert "playbook/build-commands" in project.design_doc
 
 
+@pytest.mark.asyncio
+async def test_playbook_set_records_branch_head_provenance(
+    client: AsyncClient, db_session
+):
+    """A set with branch/head_sha stamps provenance; get surfaces it; absent
+    provenance stays backward-compatible (empty strings, no error)."""
+    project = Project(name="Provenance Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do something"}],
+        vm_instance_id="agent-vm-prov",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-prov")
+    headers = {"x-agent-token": token}
+
+    # Set WITH provenance.
+    resp = await client.post(
+        "/api/agent/playbook",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "with-prov",
+            "value": "module X defines Y",
+            "branch": "automain",
+            "head_sha": "abc1234",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+    # Set WITHOUT provenance (legacy callers / non-git workspaces).
+    resp_legacy = await client.post(
+        "/api/agent/playbook",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "no-prov",
+            "value": "run tests with Z",
+        },
+        headers=headers,
+    )
+    assert resp_legacy.status_code == 200
+
+    # Provenance is persisted on the entry.
+    await db_session.refresh(project)
+    stored = project.design_doc["playbook/with-prov"]
+    assert stored["branch"] == "automain"
+    assert stored["head_sha"] == "abc1234"
+    # Legacy entry carries no provenance keys.
+    legacy = project.design_doc["playbook/no-prov"]
+    assert "branch" not in legacy
+    assert "head_sha" not in legacy
+
+    # get surfaces provenance; absent provenance reads back as "".
+    resp_get = await client.post(
+        "/api/agent/playbook",
+        json={"task_id": str(task.id), "op": "get"},
+        headers=headers,
+    )
+    assert resp_get.status_code == 200
+    entries = resp_get.json()["entries"]
+    assert entries["with-prov"]["branch"] == "automain"
+    assert entries["with-prov"]["head_sha"] == "abc1234"
+    assert entries["no-prov"]["branch"] == ""
+    assert entries["no-prov"]["head_sha"] == ""
+
+
 @pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_playbook_set_stamps_branch_head_provenance(

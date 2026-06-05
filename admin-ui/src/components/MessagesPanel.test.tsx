@@ -3520,5 +3520,55 @@ describe('MessagesPanel send arming receipt', () => {
     // Hint falls back to the type-based prediction (FEEDBACK → steering).
     expect(hintText(el)).toBe(armingHintCopy('steering'));
   });
+
+  test('a failed send and its retry reuse one idempotency key, so a double-submit is one logical message', async () => {
+    const postKeys: unknown[] = [];
+    let postCount = 0;
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'POST') {
+        const body = JSON.parse(String((init as RequestInit).body));
+        postKeys.push(body.idempotency_key);
+        postCount += 1;
+        // First attempt fails server-side → the draft's key must be retained so
+        // the retry carries the SAME key and the backend dedups it.
+        if (postCount === 1) return new Response('boom', { status: 500 });
+        return new Response(
+          JSON.stringify({ id: 'm1', status: 'created', arming: 'steering' }),
+          { status: 200 },
+        );
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+      }
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      return new Response('', { status: 404 });
+    });
+    const addToast = vi.fn();
+    const el = await renderPanel(addToast);
+
+    // First send fails — content is retained (only cleared on success).
+    await typeAndSend(el, 'please prioritize the migration work');
+    await waitFor(() => expect(addToast).toHaveBeenCalled());
+
+    // Retry the SAME draft: the key must match so it collapses to one message.
+    const sendBtn = el.querySelector('button[class*="bg-blue-600"]') as HTMLButtonElement;
+    expect(sendBtn.disabled).toBe(false);
+    await act(async () => { sendBtn.click(); });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+
+    expect(postKeys.length).toBe(2);
+    expect(postKeys[0]).toBeTruthy();
+    expect(postKeys[0]).toBe(postKeys[1]);
+
+    // A subsequent distinct message mints a FRESH key (no false dedup).
+    await typeAndSend(el, 'a different steering message');
+    expect(postKeys.length).toBe(3);
+    expect(postKeys[2]).toBeTruthy();
+    expect(postKeys[2]).not.toBe(postKeys[0]);
+  });
 });
 

@@ -631,37 +631,31 @@ echo ""
 // expecting the client to retry (see backend/app/task_locking.py). A single
 // fail-fast curl would drop the page write silently, so set/delete retry a
 // bounded number of times, honoring Retry-After, before surfacing a real error.
-export function writeDesignDocHelper(taskIdRaw: string, workspace: string = WORKSPACE): void {
+export function writeDesignDocHelper(
+  taskIdRaw: string,
+  workspace: string = WORKSPACE,
+  opts: { readOnly?: boolean } = {},
+): void {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
-  const helperScript = `#!/bin/bash
-# Design doc wiki tool — updates pages incrementally via API
-# Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env (no secrets on disk)
-# Usage:
-#   ./design-doc get <key>                — read a section
+  // Read-only mode (research / plan workspaces): the prompt only promises
+  // `./design-doc get|list`, and these agents must never mutate durable
+  // strategic state. We provision the read subset and reject set/delete with a
+  // clear message instead of silently shipping a write path they shouldn't use.
+  const readOnly = opts.readOnly === true;
+  const usageComment = readOnly
+    ? `#   ./design-doc get <key>                — read a section
+#   ./design-doc list                     — list all section keys`
+    : `#   ./design-doc get <key>                — read a section
 #   ./design-doc set <key> '<json-value>' — write a section (durable: retries on 429/5xx)
 #   ./design-doc delete <key>             — remove a section (durable: retries on 429/5xx)
-#   ./design-doc list                     — list all section keys
+#   ./design-doc list                     — list all section keys`;
+  const usageLine = readOnly ? 'get|list' : 'get|set|delete|list';
 
-OP="\${1:?Usage: design-doc get|set|delete|list <key> [json-value]}"
-KEY="$2"
-VALUE="$3"
-API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
-TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
-TASK="${taskId}"
-
-# Fail-fast POST for read operations (list/get): single curl, no retry.
-_post_once() {
-  curl -f -sS --max-time 30 --connect-timeout 10 \\
-    -X POST "$API/api/agent/design-doc" \\
-    -H "Content-Type: application/json" \\
-    -H "X-Agent-Token: $TOKEN" \\
-    --data-binary @-
-}
-
-# Durable POST for write operations (set/delete). Retries up to 3 times on
-# 429 (lock contention / rate limit) and 5xx (transient), honoring the
-# Retry-After header when present and falling back to linear backoff.
-# Non-retryable responses (other 4xx) surface immediately.
+  // Durable POST for write operations (set/delete). Retries up to 3 times on
+  // 429 (lock contention / rate limit) and 5xx (transient), honoring the
+  // Retry-After header when present and falling back to linear backoff.
+  // Non-retryable responses (other 4xx) surface immediately.
+  const retryFn = readOnly ? '' : `
 _post_retry() {
   local body="$1"
   local attempt=0 max=3 delay http_code response dump
@@ -697,15 +691,9 @@ _post_retry() {
   echo "[ERROR] design-doc $OP failed after $max attempts" >&2
   return 1
 }
-
-if [ "$OP" = "list" ]; then
-  printf '{"task_id":"%s","op":"list"}' "$TASK" | _post_once
-elif [ "$OP" = "get" ]; then
-  if [ -z "$KEY" ]; then
-    echo "Error: get requires <key>" >&2; exit 1
-  fi
-  printf '{"task_id":"%s","op":"get","key":"%s"}' "$TASK" "$KEY" | _post_once
-elif [ "$OP" = "set" ]; then
+`;
+  const writeBranches = readOnly ? `elif [ "$OP" = "set" ] || [ "$OP" = "delete" ]; then
+  echo "Error: ./design-doc is read-only in this workspace ($OP not permitted)." >&2; exit 1` : `elif [ "$OP" = "set" ]; then
   if [ -z "$KEY" ] || [ -z "$VALUE" ]; then
     echo "Error: set requires <key> and <json-value>" >&2; exit 1
   fi
@@ -714,9 +702,40 @@ elif [ "$OP" = "delete" ]; then
   if [ -z "$KEY" ]; then
     echo "Error: delete requires <key>" >&2; exit 1
   fi
-  _post_retry "$(printf '{"task_id":"%s","op":"delete","key":"%s"}' "$TASK" "$KEY")"
+  _post_retry "$(printf '{"task_id":"%s","op":"delete","key":"%s"}' "$TASK" "$KEY")"`;
+  const unknownUsage = readOnly ? 'Use get or list.' : 'Use get, set, delete, or list.';
+  const helperScript = `#!/bin/bash
+# Design doc wiki tool — updates pages incrementally via API
+# Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env (no secrets on disk)
+# Usage:
+${usageComment}
+
+OP="\${1:?Usage: design-doc ${usageLine} <key> [json-value]}"
+KEY="$2"
+VALUE="$3"
+API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
+TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+TASK="${taskId}"
+
+# Fail-fast POST for read operations (list/get): single curl, no retry.
+_post_once() {
+  curl -f -sS --max-time 30 --connect-timeout 10 \\
+    -X POST "$API/api/agent/design-doc" \\
+    -H "Content-Type: application/json" \\
+    -H "X-Agent-Token: $TOKEN" \\
+    --data-binary @-
+}
+${retryFn}
+if [ "$OP" = "list" ]; then
+  printf '{"task_id":"%s","op":"list"}' "$TASK" | _post_once
+elif [ "$OP" = "get" ]; then
+  if [ -z "$KEY" ]; then
+    echo "Error: get requires <key>" >&2; exit 1
+  fi
+  printf '{"task_id":"%s","op":"get","key":"%s"}' "$TASK" "$KEY" | _post_once
+${writeBranches}
 else
-  echo "Unknown op: $OP. Use get, set, delete, or list." >&2; exit 1
+  echo "Unknown op: $OP. ${unknownUsage}" >&2; exit 1
 fi
 # Propagate the helper's exit status so the model sees a real failure after
 # retries are exhausted (the trailing newline must not mask a non-zero rc).

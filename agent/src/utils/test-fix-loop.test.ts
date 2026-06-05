@@ -37,15 +37,27 @@ vi.mock('child_process', () => ({
 
 vi.mock('fs', () => ({
   default: {
-    existsSync: vi.fn(() => true), // node_modules present → skip npm ci
+    // node_modules present → skip npm ci; no pre-install marker files present
+    // so Python/Go/Rust pre-install steps are not triggered in these tests.
+    existsSync: vi.fn((p: unknown) =>
+      typeof p === 'string' && (p.endsWith('/node_modules') || p.includes('/node_modules/')),
+    ),
     readFileSync: vi.fn(() => ''),
     unlinkSync: vi.fn(),
   },
 }));
 
+import fs from 'fs';
 import { testFixLoop, matchesSizeBreachSignature } from './test-fix-loop.js';
 import { runClaudeCode } from '../providers/runners.js';
 import type { TestRunner } from './test-runners.js';
+
+// Default fs.existsSync behavior matching the module-level mock factory:
+// only node_modules paths "exist" (so npm ci is skipped and no non-npm
+// pre-install marker files are present). Tests that exercise a specific
+// ecosystem's pre-install path override this per-test.
+const defaultExistsSync = (p: unknown): boolean =>
+  typeof p === 'string' && (p.endsWith('/node_modules') || p.includes('/node_modules/'));
 
 const NPM_RUNNER: TestRunner = { cmd: 'npm', args: ['test'], cwd: '/tmp/workspace', label: 'npm test (root)' };
 const PLACEHOLDER_RUNNER: TestRunner = { cmd: 'npm', args: ['test'], cwd: '/tmp/workspace/packages/a', label: 'npm test (packages/a)' };
@@ -367,5 +379,185 @@ describe('testFixLoop — deterministic size-breach remediation', () => {
       ([cmd]) => cmd === 'python3',
     );
     expect(bumpCall).toBeUndefined();
+  });
+});
+
+describe('testFixLoop — non-npm pre-test dependency install (maxFixAttempts: 0)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // clearAllMocks does not reset implementations; restore the default so a
+    // prior test's per-ecosystem override never leaks into this one.
+    vi.mocked(fs.existsSync).mockImplementation(defaultExistsSync);
+  });
+
+  it('Python runner + poetry.lock → `poetry install --no-root` runs, then the suite runs and passes', async () => {
+    vi.mocked(fs.existsSync).mockImplementation(
+      (p: unknown) => typeof p === 'string' && p.endsWith('/poetry.lock'),
+    );
+    execFileAsync.mockImplementation((cmd: string) =>
+      cmd === 'poetry'
+        ? Promise.resolve('Installing dependencies from lock file')
+        : Promise.resolve('Tests  3 passed (3)'),
+    );
+
+    const pyRunner: TestRunner = { cmd: 'pytest', args: ['-q'], cwd: '/tmp/workspace', label: 'pytest (root)' };
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [pyRunner] },
+    );
+
+    const poetryCall = execFileAsync.mock.calls.find(([cmd]) => cmd === 'poetry');
+    expect(poetryCall?.[1]).toEqual(['install', '--no-root']);
+    // The suite itself ran after a successful install.
+    expect(execFileAsync.mock.calls.some(([cmd]) => cmd === 'pytest')).toBe(true);
+    expect(result.passed).toBe(true);
+    expect(result.setupFailed).toBeFalsy();
+  });
+
+  it('Python runner + requirements.txt and a failing pip install → setupErrors → setupFailed (not a code-fix failure)', async () => {
+    vi.mocked(fs.existsSync).mockImplementation(
+      (p: unknown) => typeof p === 'string' && p.endsWith('/requirements.txt'),
+    );
+    execFileAsync.mockImplementation((cmd: string) =>
+      cmd === 'pip'
+        ? Promise.reject(new Error('Command failed: pip install -r requirements.txt\nERROR: Could not find a version that satisfies the requirement foo'))
+        : Promise.resolve('Tests  3 passed (3)'),
+    );
+
+    const pyRunner: TestRunner = { cmd: 'python3', args: ['-m', 'pytest'], cwd: '/tmp/workspace', label: 'pytest (root)' };
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [pyRunner] },
+    );
+
+    const pipCall = execFileAsync.mock.calls.find(([cmd]) => cmd === 'pip');
+    expect(pipCall?.[1]).toEqual(['install', '-r', 'requirements.txt']);
+    // The suite was skipped after the install failure — the runner never ran.
+    expect(execFileAsync.mock.calls.some(([cmd]) => cmd === 'python3')).toBe(false);
+    // Routed to setupErrors → setupFailed, NOT to the code-fix/failures path.
+    expect(result.setupFailed).toBe(true);
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(false);
+  });
+
+  it('Go runner + go.mod and a failing `go mod download` → setupErrors → setupFailed', async () => {
+    vi.mocked(fs.existsSync).mockImplementation(
+      (p: unknown) => typeof p === 'string' && p.endsWith('/go.mod'),
+    );
+    execFileAsync.mockImplementation((cmd: string, args: string[]) =>
+      cmd === 'go' && Array.isArray(args) && args[0] === 'mod'
+        ? Promise.reject(new Error('go: example.com/foo@v1.2.3: reading module: connection refused'))
+        : Promise.resolve('ok'),
+    );
+
+    const goRunner: TestRunner = { cmd: 'go', args: ['test', './...'], cwd: '/tmp/workspace', label: 'go test (root)' };
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [goRunner] },
+    );
+
+    const dlCall = execFileAsync.mock.calls.find(
+      ([cmd, args]) => cmd === 'go' && Array.isArray(args) && args[0] === 'mod',
+    );
+    expect(dlCall?.[1]).toEqual(['mod', 'download']);
+    // `go test` never ran — the runner was skipped after the download failure.
+    expect(execFileAsync.mock.calls.some(
+      ([cmd, args]) => cmd === 'go' && Array.isArray(args) && args[0] === 'test',
+    )).toBe(false);
+    expect(result.setupFailed).toBe(true);
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(false);
+  });
+
+  it('Rust runner + Cargo.toml and a failing `cargo fetch` → setupErrors → setupFailed', async () => {
+    vi.mocked(fs.existsSync).mockImplementation(
+      (p: unknown) => typeof p === 'string' && p.endsWith('/Cargo.toml'),
+    );
+    execFileAsync.mockImplementation((cmd: string, args: string[]) =>
+      cmd === 'cargo' && Array.isArray(args) && args[0] === 'fetch'
+        ? Promise.reject(new Error('error: failed to fetch `https://github.com/rust-lang/crates.io-index`'))
+        : Promise.resolve('ok'),
+    );
+
+    const cargoRunner: TestRunner = { cmd: 'cargo', args: ['test'], cwd: '/tmp/workspace', label: 'cargo test (root)' };
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [cargoRunner] },
+    );
+
+    const fetchCall = execFileAsync.mock.calls.find(
+      ([cmd, args]) => cmd === 'cargo' && Array.isArray(args) && args[0] === 'fetch',
+    );
+    expect(fetchCall?.[1]).toEqual(['fetch', '--manifest-path', '/tmp/workspace/Cargo.toml']);
+    // `cargo test` never ran — skipped after the fetch failure.
+    expect(execFileAsync.mock.calls.some(
+      ([cmd, args]) => cmd === 'cargo' && Array.isArray(args) && args[0] === 'test',
+    )).toBe(false);
+    expect(result.setupFailed).toBe(true);
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(false);
+  });
+});
+
+describe('testFixLoop — in-loop environment-failure routing (maxFixAttempts: 0)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(fs.existsSync).mockImplementation(defaultExistsSync);
+  });
+
+  it('runner exits non-zero with a ModuleNotFoundError → setupErrors → setupFailed (not a FAILED/code-fix verdict)', async () => {
+    execFileAsync.mockRejectedValue(
+      new Error("Command failed: python3 -m pytest -x -q\nModuleNotFoundError: No module named 'pytest'"),
+    );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [REAL_RUNNER] },
+    );
+
+    // Env signature → skipped to setupErrors, surfaced as setupFailed. The
+    // code-fix path (testFailuresDetected) must NOT fire.
+    expect(result.setupFailed).toBe(true);
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(false);
+  });
+
+  it('runner exits non-zero with a missing shared library (.so) → setupErrors → setupFailed', async () => {
+    execFileAsync.mockRejectedValue(
+      new Error('Command failed: npm test\nerror while loading shared libraries: libatk-1.0.so.0: cannot open shared object file: No such file or directory'),
+    );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [NPM_RUNNER] },
+    );
+
+    expect(result.setupFailed).toBe(true);
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(false);
+  });
+
+  it('a real test failure that QUOTES an env phrase stays a code failure (precedence preserved, no fall-open)', async () => {
+    execFileAsync.mockRejectedValue(
+      new Error("Command failed: python3 -m pytest -x -q\nFAILED test_imports.py::test_optional_dep - AssertionError: expected 'No module named foo' in message\n1 failed in 0.12s"),
+    );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [REAL_RUNNER] },
+    );
+
+    // Real-failure evidence (FAILED line + "1 failed") guards against the env
+    // misroute — this stays a genuine test failure, not a setup fall-open.
+    expect(result.setupFailed).toBeFalsy();
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(true);
   });
 });

@@ -39,7 +39,7 @@ import {
   type BuildConfig, type TestRunner,
   detectTestRunners, isDockerRunner,
   parseFailingTests, buildTargetedPytestRunners,
-  classifyTestExecution,
+  classifyTestExecution, matchesEnvironmentFailureSignature,
 } from './test-runners.js';
 
 // Build + buffer a FixLoopEvent from one wrapper-loop iteration. Centralized
@@ -519,6 +519,66 @@ export async function testFixLoop(
           continue;
         }
       }
+      // Python pre-install: install declared deps before running the suite.
+      // poetry.lock → poetry install --no-root; requirements.txt → pip install.
+      // Treat install failure as a setup error so it routes to setupFailed
+      // rather than the code-fix loop.
+      if (
+        (runner.cmd === 'python3' || runner.cmd === 'python' || runner.cmd === 'pytest' || runner.cmd === 'tox' || runner.cmd === 'nox') &&
+        (fs.existsSync(`${runner.cwd}/poetry.lock`) || fs.existsSync(`${runner.cwd}/requirements.txt`))
+      ) {
+        const usePoetry = fs.existsSync(`${runner.cwd}/poetry.lock`);
+        const installCmd = usePoetry ? 'poetry' : 'pip';
+        const installArgs = usePoetry
+          ? ['install', '--no-root']
+          : ['install', '-r', 'requirements.txt'];
+        sendLog(ws, `Installing Python dependencies for ${runner.label}...\n`);
+        try {
+          await execFileAsync(installCmd, installArgs, { cwd: runner.cwd, timeoutMs: TEST_RUNNER_TIMEOUT });
+        } catch (installErr) {
+          const msg = installErr instanceof Error ? installErr.message : String(installErr);
+          sendLog(
+            ws,
+            `WARNING: Python dependency install failed for [${runner.label}] — ` +
+            `setup error, not a fixable test failure. Skipping runner.\n` +
+            `${msg.slice(0, 500)}\n`,
+          );
+          setupErrors.push({ label: runner.label, message: `${installCmd} install failed: ${msg}` });
+          continue;
+        }
+      }
+      // Go pre-install: download module graph before running tests.
+      if (runner.cmd === 'go' && fs.existsSync(`${runner.cwd}/go.mod`)) {
+        sendLog(ws, `Downloading Go modules for ${runner.label}...\n`);
+        try {
+          await execFileAsync('go', ['mod', 'download'], { cwd: runner.cwd, timeoutMs: TEST_RUNNER_TIMEOUT });
+        } catch (installErr) {
+          const msg = installErr instanceof Error ? installErr.message : String(installErr);
+          sendLog(
+            ws,
+            `WARNING: Go module download failed for [${runner.label}] — ` +
+            `setup error. Skipping runner.\n${msg.slice(0, 500)}\n`,
+          );
+          setupErrors.push({ label: runner.label, message: `go mod download failed: ${msg}` });
+          continue;
+        }
+      }
+      // Rust pre-install: fetch dependencies before running tests.
+      if (runner.cmd === 'cargo' && fs.existsSync(`${runner.cwd}/Cargo.toml`)) {
+        sendLog(ws, `Fetching Rust dependencies for ${runner.label}...\n`);
+        try {
+          await execFileAsync('cargo', ['fetch', '--manifest-path', `${runner.cwd}/Cargo.toml`], { cwd: runner.cwd, timeoutMs: TEST_RUNNER_TIMEOUT });
+        } catch (installErr) {
+          const msg = installErr instanceof Error ? installErr.message : String(installErr);
+          sendLog(
+            ws,
+            `WARNING: Rust dependency fetch failed for [${runner.label}] — ` +
+            `setup error. Skipping runner.\n${msg.slice(0, 500)}\n`,
+          );
+          setupErrors.push({ label: runner.label, message: `cargo fetch failed: ${msg}` });
+          continue;
+        }
+      }
       // For vitest runners, request the JSON reporter alongside default
       // (human-readable) output — the JSON file is the authoritative source
       // of failed-test IDs, stdout is kept for operator diagnosis.
@@ -558,10 +618,23 @@ export async function testFixLoop(
           setupErrors.push({ label: runner.label, message: `runner timeout: ${msg}` });
           continue;
         }
-        // Non-timeout non-zero exit = the runner actually ran the suite
-        // and at least one test failed. Record the failure.
-        ranAnyRunner = true;
         const msg = testErr instanceof Error ? testErr.message : String(testErr);
+        // Route env/infrastructure failures to setupErrors, not the code-fix
+        // loop. A missing shared library, Python dep, or spawn ENOENT cannot
+        // be fixed by editing code — escalate as a setup failure.
+        if (matchesEnvironmentFailureSignature(msg)) {
+          sendLog(
+            ws,
+            `WARNING: Test runner [${runner.label}] hit an environment failure ` +
+            `(missing dep / library / spawn ENOENT) — not a fixable code failure. ` +
+            `Skipping runner.\n${msg.slice(0, 500)}\n`,
+          );
+          setupErrors.push({ label: runner.label, message: `environment failure: ${msg}` });
+          continue;
+        }
+        // Non-timeout, non-env-failure, non-zero exit = the runner ran the
+        // suite and at least one test failed. Record the failure.
+        ranAnyRunner = true;
         // A non-zero exit from a placeholder command (e.g. the default `npm`
         // "no test specified" script) is NOT a real test failure. Only count
         // this as a real test executing when the output isn't a no-tests

@@ -2302,6 +2302,14 @@ class ProjectMessage(SQLModel, table=True):
     )
     status: str = Field(default="open")  # "open" | "resolved"
     resolution: str | None = None
+    # Client-supplied idempotency key. A double-click / network retry of a
+    # send that already succeeded server-side carries the same key, so the
+    # create endpoint returns the existing row instead of inserting a
+    # duplicate. NULL for legacy / keyless sends (backward-compatible); the
+    # partial unique index below only constrains non-NULL keys per project.
+    idempotency_key: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
     resolved_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
@@ -2315,6 +2323,17 @@ class ProjectMessage(SQLModel, table=True):
 
     __table_args__ = (
         Index("ix_projectmessage_project_status", "project_id", "status"),
+        # One logical message per (project, client key). Partial so keyless
+        # legacy sends are unconstrained; the create endpoint queries this
+        # before insert and the index is the concurrency-safe backstop.
+        Index(
+            "ux_projectmessage_project_idempotency_key",
+            "project_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+            sqlite_where=text("idempotency_key IS NOT NULL"),
+        ),
     )
 
 

@@ -12,6 +12,7 @@ import fs from 'fs';
 import { readFile } from 'node:fs/promises';
 import {
   detectTestRunners, detectAutoTestRunners, describeRunnerDirectory, classifyTestExecution,
+  matchesEnvironmentFailureSignature,
   detectAcceptanceProbes, classifyProbeOutcome,
 } from './test-runners.js';
 import type { BuildConfig, TestRunner } from './test-runners.js';
@@ -1767,6 +1768,112 @@ describe('classifyTestExecution — extra-family real-failure guard', () => {
     expect(classifyTestExecution(
       'bash: mix: command not found\n0 tests, 0 failures',
     )).toBe('no_tests');
+  });
+});
+
+describe('matchesEnvironmentFailureSignature — env/setup failure detection', () => {
+  // ── True cases: env signals without real test failure evidence ──────────────
+
+  it('ModuleNotFoundError (no module named pytest) → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      "ModuleNotFoundError: No module named 'pytest'",
+    )).toBe(true);
+  });
+
+  it('No module named (bare) → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      "No module named 'requests'",
+    )).toBe(true);
+  });
+
+  it('ImportError: No module named → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      "ImportError: No module named 'yaml'",
+    )).toBe(true);
+  });
+
+  it('cannot open shared object file (.so) → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'error while loading shared libraries: libssl.so.1.1: cannot open shared object file: No such file or directory',
+    )).toBe(true);
+  });
+
+  it('error while loading shared libraries → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'error while loading shared librar: libfoo.so: no such file',
+    )).toBe(true);
+  });
+
+  it('no such file or directory for .so → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'No such file or directory: libpq.so.5',
+    )).toBe(true);
+  });
+
+  it('spawn ENOENT → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'Error: spawn /usr/bin/pytest ENOENT',
+    )).toBe(true);
+  });
+
+  it('node: command not found (VM-level) → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'node: command not found',
+    )).toBe(true);
+  });
+
+  it('python3: command not found (VM-level) → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'python3: command not found',
+    )).toBe(true);
+  });
+
+  // ── False cases: real test failure evidence guards against misrouting ───────
+
+  it('FAILED line + ModuleNotFoundError → false (real test failure, not env)', () => {
+    expect(matchesEnvironmentFailureSignature(
+      "FAILED test_api.py::test_get - ModuleNotFoundError: No module named 'requests'\n1 failed in 0.01s",
+    )).toBe(false);
+  });
+
+  it('1 failed count + .so error → false (real test failure quotes env phrase)', () => {
+    expect(matchesEnvironmentFailureSignature(
+      "test_loader.py::test_lib - AssertionError: expected 'cannot open shared object file'\n1 failed in 0.03s",
+    )).toBe(false);
+  });
+
+  it('Go --- FAIL: line + env phrase → false', () => {
+    expect(matchesEnvironmentFailureSignature(
+      '--- FAIL: TestLoadLib (0.01s)\n    lib_test.go:12: error while loading shared librar: libfoo.so\nFAIL',
+    )).toBe(false);
+  });
+
+  it('.NET Failed: 1 + env phrase → false', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'ModuleNotFoundError: No module named foo\nFailed!  - Failed:     1, Passed:     0',
+    )).toBe(false);
+  });
+
+  // ── Edge cases ──────────────────────────────────────────────────────────────
+
+  it('empty string → false', () => {
+    expect(matchesEnvironmentFailureSignature('')).toBe(false);
+  });
+
+  it('plain test failure with no env phrase → false', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'FAILED test_foo.py::test_bar - AssertionError: 1 != 2\n1 failed in 0.05s',
+    )).toBe(false);
+  });
+
+  it('passing output → false', () => {
+    expect(matchesEnvironmentFailureSignature('2 passed in 0.50s')).toBe(false);
+  });
+
+  it('missing-system-librar phrase → true', () => {
+    expect(matchesEnvironmentFailureSignature(
+      'missing required system library: libgomp.so',
+    )).toBe(true);
   });
 });
 
