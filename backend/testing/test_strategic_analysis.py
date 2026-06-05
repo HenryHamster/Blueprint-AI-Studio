@@ -11,7 +11,10 @@ from app.strategic_analysis import (
     _RETIRED_MAX_COUNT,
     _RETIRED_PER_ENTRY_CHAR_CAP,
 )
-from app.direction_metrics import _compute_difficulty_index
+from app.direction_metrics import (
+    _compute_difficulty_index,
+    _compute_lifetime_generalized_outcome_state,
+)
 
 
 def _make_project(directions=None, vision=None):
@@ -2981,6 +2984,7 @@ def test_overall_generalized_success_rate_for_mixed_portfolio():
                 {
                     "timestamp": "2026-01-01T00:00:00",
                     "prs_merged": 2,
+                    "tasks_completed": 2,  # the 2 merges are completed terminal outcomes
                     "tasks_failed": 1,
                     "generalized_successes": 2,  # same as prs_merged for code-only
                 },
@@ -3009,6 +3013,46 @@ def test_overall_generalized_success_rate_for_mixed_portfolio():
     assert "generalized_successes" in overall
     assert overall["generalized_successes"] == 5
     assert overall["generalized_success_rate"] == round(5 / (5 + 1), 2)
+
+
+def test_generalized_health_rate_matches_dashboard_with_neutral_outcomes():
+    """Strategic generalized_health_rate equals the canonical dashboard value.
+
+    Regression guard for the divergent-denominator bug: the strategic path used
+    to divide by (successes + failed), omitting neutral terminal outcomes, so it
+    reported an optimistically higher 'health' than the operator dashboard for
+    the same direction. With the reconciliation, both paths divide successes by
+    ALL terminal outcomes (success + neutral + failure), so the two agree.
+    """
+    direction = {
+        "id": "dir-mixed",
+        "status": "active",
+        "research_history": [
+            {
+                "timestamp": "2026-01-01T00:00:00",
+                "prs_merged": 2,
+                "generalized_successes": 3,  # 2 code merges + 1 non-code success
+                "outcome_kind_breakdown": {
+                    "code_merge": {"success": 2, "neutral": 0, "failure": 0},
+                    "research": {"success": 1, "neutral": 2, "failure": 1},
+                },
+            },
+        ],
+    }
+    project = _make_project(directions=[direction])
+    result = _build_outcome_evaluation(project, [])
+    d = result["directions"][0]
+
+    # Denominator is ALL 6 terminal outcomes (3 success + 2 neutral + 1 failure),
+    # not the old 3 (successes) + 1 (failed) = 4 that dropped the neutrals.
+    assert d["generalized_terminal_outcomes"] == 6
+    assert d["generalized_health_rate"] == round(3 / 6, 3)
+
+    # The strategic value equals the canonical dashboard helper for the same data.
+    dashboard = _compute_lifetime_generalized_outcome_state(direction)
+    assert d["generalized_health_rate"] == dashboard["generalized_health_rate"]
+    # And it is strictly lower than the old neutral-dropping denominator would give.
+    assert d["generalized_health_rate"] < round(3 / (3 + 1), 3)
 
 
 def test_generalized_success_rate_absent_for_code_only_portfolio():

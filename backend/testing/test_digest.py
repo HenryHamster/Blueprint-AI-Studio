@@ -207,60 +207,6 @@ async def test_digest_with_failed_tasks(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
-async def test_digest_migration_health(client: AsyncClient, db_session):
-    """migration_health surfaces migrate-task counts, MIGRATION_ERROR failures, and auto-generated migrations."""
-    from app.main import EXPECTED_SCHEMA_REVISION
-
-    project = make_project()
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    db_session.add_all(
-        [
-            make_task(
-                project_id=project.id,
-                status=TaskStatus.COMPLETED,
-                payloads=[{"type": "migrate"}],
-            ),
-            make_task(
-                project_id=project.id,
-                status=TaskStatus.FAILED,
-                payloads=[{"type": "migrate"}],
-                context={"failure_class": "MIGRATION_ERROR"},
-            ),
-            make_task(
-                project_id=project.id,
-                status=TaskStatus.COMPLETED,
-                payloads=[{"type": "create"}],
-                context={
-                    "related_files": [
-                        "backend/alembic/versions/0099_x.py",
-                        "backend/app/models.py",
-                    ]
-                },
-            ),
-            make_task(
-                project_id=project.id,
-                status=TaskStatus.COMPLETED,
-                payloads=[{"type": "create"}],
-            ),
-        ]
-    )
-    await db_session.commit()
-
-    response = await client.get("/api/admin/digest")
-    assert response.status_code == 200
-    mh = response.json()["migration_health"]
-    assert mh["current_schema_revision"] == EXPECTED_SCHEMA_REVISION
-    assert mh["migration_tasks_in_window"] == 2
-    assert mh["migration_tasks_succeeded"] == 1
-    assert mh["migration_tasks_failed"] == 1
-    assert mh["migration_errors_in_window"] == 1
-    assert mh["auto_generated_migrations"] == 1
-
-
-@pytest.mark.asyncio
 async def test_digest_merge_gate_fleet_health_verified(client: AsyncClient, db_session):
     """Fleet with verified merges: verified_count matches, verification_rate is
     correct, degraded_project_count is 0 (no fall-opens)."""
@@ -8135,3 +8081,52 @@ async def test_narrative_suppresses_convergence_verdict_on_thin_window(
 
     assert "Review/fix churn" not in narrative
     assert "non-converged PR chains" not in narrative
+
+
+@pytest.mark.asyncio
+async def test_digest_includes_sr_false_attestation_trends_from_design_doc(
+    client: AsyncClient, db_session
+):
+    """When sr_false_attestation_trends is in project.design_doc, it appears in digest."""
+    project = make_project()
+    project.design_doc = {
+        "sr_false_attestation_trends": {
+            "computed_at": "2026-06-05T10:00:00",
+            "bucket_mode": "by_cycle",
+            "per_category": {
+                "tests_executed_cleanly": {
+                    "false_attestation_rate": 0.05,
+                    "previous_false_attestation_rate": 0.08,
+                    "delta": -0.03,
+                    "trend": "improving",
+                    "ci_confirmed": 10,
+                    "false_attested": 1,
+                    "ci_data_missing": 0,
+                }
+            },
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert "sr_false_attestation_trends" in data
+    assert data["sr_false_attestation_trends"] is not None
+    assert (
+        data["sr_false_attestation_trends"]["computed_at"]
+        == "2026-06-05T10:00:00"
+    )
+    assert (
+        "tests_executed_cleanly"
+        in data["sr_false_attestation_trends"]["per_category"]
+    )
+    assert (
+        data["sr_false_attestation_trends"]["per_category"][
+            "tests_executed_cleanly"
+        ]["false_attestation_rate"]
+        == 0.05
+    )

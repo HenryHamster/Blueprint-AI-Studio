@@ -69,7 +69,6 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "_compute_cat_fp_stats",
         "_compute_cat_severity_calibration",
         "_task_prompt_fingerprint",
-        "_score_reasoning_quality",
         "_compute_reasoning_engagement",
         "_collect_prompt_versions",
         "_percentile",

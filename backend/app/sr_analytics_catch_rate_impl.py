@@ -479,7 +479,6 @@ async def _compute_sr_catch_rate_trends_impl(
     eng = _compute_reasoning_engagement(current_window_tasks, all_cats)
     for cat, cat_eng in eng.items():
         categories[cat]["reasoning_engagement_rate"] = cat_eng["engagement_rate"]
-        categories[cat]["reasoning_quality_rate"] = cat_eng["reasoning_quality_rate"]
         categories[cat]["reasoning_engagement_with"] = cat_eng["with_reasoning"]
         categories[cat]["reasoning_engagement_total"] = cat_eng["total_passes"]
 

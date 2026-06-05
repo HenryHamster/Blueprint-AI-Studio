@@ -42,8 +42,8 @@ COMPLETION_CRITERIA_MAX = 500
 DIRECTION_CONTEXT_FIELD_MAX = 500
 
 
-def _compute_direction_merge_rate(d: dict) -> Any:
-    """Return merged-PRs-per-cycle for a direction. Returns 0.5 (neutral) if never researched."""
+def _compute_direction_merges_per_cycle(d: dict) -> Any:
+    """Return merged-PRs-per-cycle for a direction. Returns None if never researched."""
     history: list[dict[str, Any]] = list(d.get("research_history") or [])
     agg: dict[str, Any] = dict(d.get("history_aggregate") or {})
     total_cycles = float(len(history) + int(agg.get("total_cycles") or 0))
@@ -52,7 +52,7 @@ def _compute_direction_merge_rate(d: dict) -> Any:
         + float(agg.get("total_prs_merged") or 0)
     )
     if total_cycles == 0:
-        return 0.5
+        return None
     return total_merged / total_cycles
 
 
@@ -203,7 +203,7 @@ async def get_directions(
         enriched.append(
             {
                 **d,
-                "merge_rate": _compute_direction_merge_rate(d),
+                "merges_per_cycle": _compute_direction_merges_per_cycle(d),
                 "quality_score": round(_compute_direction_quality_score(d), 3),
                 "generalized_successes": generalized_state["generalized_successes"],
                 "generalized_health_rate": generalized_state[

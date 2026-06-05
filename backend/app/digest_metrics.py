@@ -1799,7 +1799,7 @@ def compute_migration_health(
     _migrate_failed = [t for t in failed_tasks if _task_type(t) == "migrate"]
     _migration_errors = sum(
         1
-        for t in failed_tasks
+        for t in _migrate_failed
         if (t.context or {}).get("failure_class") == "MIGRATION_ERROR"
         or _mig_classify(t, error_log_map.get(str(t.id))) == "MIGRATION_ERROR"
     )

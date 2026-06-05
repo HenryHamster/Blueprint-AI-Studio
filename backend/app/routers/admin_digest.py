@@ -1067,6 +1067,7 @@ async def _compute_digest(
     edges_trend: Optional[Dict[str, Any]] = None
     self_review_prediction_accuracy_trends: Optional[Dict[str, Any]] = None
     sr_regression_risk_test_signal_trends: Optional[Dict[str, Any]] = None
+    sr_false_attestation_trends: Optional[Dict[str, Any]] = None
     memo_pathway_exits: int = 0
     recent_cycle_memo_stats: list[dict[str, Any]] = []
     memo_ever_cited: dict[str, Any] | None = None
@@ -1087,6 +1088,9 @@ async def _compute_digest(
             )
             if _sr_rrts:
                 sr_regression_risk_test_signal_trends = _sr_rrts
+            _sft = (_proj.design_doc or {}).get("sr_false_attestation_trends")
+            if _sft:
+                sr_false_attestation_trends = _sft
             cycle_history = (_proj.vision or {}).get("_strategic_cycle_history", [])
             completed_cycles = [
                 c
@@ -1265,6 +1269,7 @@ async def _compute_digest(
         ],
         "self_review_prediction_accuracy_trends": self_review_prediction_accuracy_trends,
         "sr_regression_risk_test_signal_trends": sr_regression_risk_test_signal_trends,
+        "sr_false_attestation_trends": sr_false_attestation_trends,
         "self_review_skip_rate": _self_review_skip_rate,
         "sr_disallowed_blind_spot_rate": _sr_disallowed_blind_spot_rate,
         "review_accuracy": _review_quality["review_accuracy"],

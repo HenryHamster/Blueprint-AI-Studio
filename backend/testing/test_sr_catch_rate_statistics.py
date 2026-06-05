@@ -53,23 +53,6 @@ def test_trend_significance_threshold_boundaries(p1, n1, p2, n2, expected):
     assert _is_trend_significant(p1, n1, p2, n2) is expected
 
 
-@pytest.mark.parametrize(
-    "reasoning,expected",
-    [
-        ("", 0.0),
-        ("checked backend/app/foo.py and verified the empty path", 0.67),
-        (
-            "verified backend/app/foo.py and test_foo.py::test_empty works today",
-            1.0,
-        ),
-    ],
-)
-def test_reasoning_quality_scoring(reasoning, expected):
-    from app.sr_catch_rate_statistics import _score_reasoning_quality
-
-    assert _score_reasoning_quality(reasoning) == pytest.approx(expected)
-
-
 def test_precision_equals_one_minus_fpr_from_cat_fp_stats():
     """precision and false_positive_rate from _compute_cat_fp_stats share one fp/tp basis."""
     from app.sr_analytics_common import _compute_cat_fp_stats
@@ -133,6 +116,38 @@ def test_stats_for_tasks_excludes_skipped_self_reviews():
     assert cat_stats["correctness"]["hit_count"] == 1
 
 
+def test_prediction_accuracy_later_iteration_confirmation_not_false_alarm():
+    """A category the author SR flagged that the reviewer confirmed only on a
+    LATER iteration (present in _all_iterations_rejection_categories but not in
+    _first_attempt_rejection_categories) must score as a hit, not a false alarm.
+
+    Under the old first-attempt-only ground-truth window this scored 1.0 false
+    alarm; the all-iterations truth set (shared with the blind-spot FP scan)
+    makes it a hit, so the SR 'false alarm' figures reconcile by construction.
+    """
+    from app.sr_review_quality_metrics import compute_sr_prediction_accuracy
+
+    tasks = [
+        _make_task(
+            context={
+                "_self_review_outcome": {
+                    "check_results": {"correctness": {"passed": False}},
+                },
+                # Reviewer did NOT reject 'correctness' on the first iteration...
+                "_first_attempt_rejection_categories": {},
+                # ...but confirmed it across all iterations.
+                "_all_iterations_rejection_categories": {"correctness": 1},
+            }
+        )
+        for _ in range(5)
+    ]
+    result = compute_sr_prediction_accuracy(tasks)
+    assert result is not None
+    assert result["false_alarm_rate"] == 0.0
+    assert result["prediction_hit_rate"] == 1.0
+    assert result["miss_rate"] == 0.0
+
+
 def test_sr_catch_rate_statistics_import_seam():
     backend_root = Path(__file__).resolve().parents[1]
     env = os.environ.copy()
@@ -150,7 +165,6 @@ analytics = importlib.import_module("app.sr_analytics")
 for name in (
     "_TREND_DELTA_THRESHOLD",
     "_TREND_Z_MIN",
-    "_score_reasoning_quality",
     "_compute_reasoning_engagement",
     "_collect_prompt_versions",
     "_percentile",

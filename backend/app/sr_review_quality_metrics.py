@@ -14,6 +14,7 @@ from app.review_learning import _categorize_review_issues
 from app.sr_blind_spots import (
     _REVIEWER_ORIGINS,
     is_skipped_sr_outcome,
+    reviewer_confirmed_categories,
 )
 from app.time_utils import _to_naive_utc
 
@@ -507,7 +508,11 @@ def compute_sr_prediction_accuracy(
     for t in tasks_with_both:
         ctx = t.context or {}
         check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
-        human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
+        # All-iterations reviewer-confirmed truth set (falls back to the
+        # first-attempt set only when absent) — shared with the sibling FP
+        # surfaces so a later-iteration confirmation is not scored as a false
+        # alarm and all "false alarm" figures reconcile.
+        human_cats = reviewer_confirmed_categories(ctx)
         sr_failed = _author_sr_failed_categories(check_results)
         total_human += len(human_cats)
         total_overlap += len(human_cats & sr_failed)

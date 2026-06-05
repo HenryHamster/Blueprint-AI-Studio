@@ -75,7 +75,6 @@ from app.playbook_sr_metrics import (  # noqa: F401
     _partition_edges_by_origin,
     _percentile,
     _reviewer_caught_author_miss,
-    _score_reasoning_quality,
     _sr_skip_stats,
     _stats_for_tasks,
     _task_prompt_fingerprint,

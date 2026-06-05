@@ -45,7 +45,6 @@ from app.sr_analytics_common import (  # noqa: F401
     _is_sensitive_desc,
     _is_trend_significant,
     _percentile,
-    _score_reasoning_quality,
     _sr_skip_stats,
     _task_prompt_fingerprint,
 )

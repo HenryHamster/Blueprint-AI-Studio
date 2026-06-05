@@ -2342,7 +2342,7 @@ class TestComputeAutonomyThresholdState:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. Direction Cap, completion_criteria, and merge_rate in list
+# 8. Direction Cap, completion_criteria, and merges_per_cycle in list
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -2477,7 +2477,7 @@ async def test_reactivation_clears_manual_intervention_state(
 
 @pytest.mark.asyncio
 async def test_merge_rate_in_list(client: AsyncClient, db_session, mocker):
-    """GET directions returns merge_rate for each direction based on research_history."""
+    """GET directions returns merges_per_cycle for each direction based on research_history."""
     project_id = await _deploy_project(client, mocker)
     direction = await _add_direction(client, project_id, text="Direction with history")
     direction_id = direction["id"]
@@ -2505,8 +2505,25 @@ async def test_merge_rate_in_list(client: AsyncClient, db_session, mocker):
     assert resp.status_code == 200
     dirs = resp.json()["directions"]
     target = next(d for d in dirs if d["id"] == direction_id)
-    assert "merge_rate" in target
-    assert abs(target["merge_rate"] - 0.5) < 0.001  # 1 merged / 2 cycles = 0.5
+    assert "merges_per_cycle" in target
+    assert abs(target["merges_per_cycle"] - 0.5) < 0.001  # 1 merged / 2 cycles = 0.5
+
+
+@pytest.mark.asyncio
+async def test_merges_per_cycle_null_when_never_researched(
+    client: AsyncClient, mocker
+):
+    """GET directions returns null merges_per_cycle when direction has never been researched."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Never researched direction")
+    direction_id = direction["id"]
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp.status_code == 200
+    dirs = resp.json()["directions"]
+    target = next(d for d in dirs if d["id"] == direction_id)
+    assert "merges_per_cycle" in target
+    assert target["merges_per_cycle"] is None
 
 
 @pytest.mark.asyncio

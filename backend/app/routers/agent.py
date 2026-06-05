@@ -3056,8 +3056,8 @@ async def claim_task(
                     Task.status == TaskStatus.COMPLETED,
                     # Task has no `completed_at` column — that name is a property
                     # on the strategic-cycle model, not Task. For a COMPLETED
-                    # task, created_at bounds the recent-window scan (mirrors
-                    # sr_blind_spots._scan_fp_stats, the sibling 14-day SR scan).
+                    # task, created_at bounds the recent-window scan (the standard
+                    # bounded recent-task SR scan pattern).
                     Task.created_at > _utcnow() - timedelta(days=14),
                 )
                 .options(

@@ -1106,6 +1106,12 @@ export interface PromotionReadiness {
   // is a self-approval rate, not a validated qualifier precision. See `caveat`.
   ground_truth_validated?: boolean;
   caveat?: string;
+  // The readiness window only measures DRY-RUN-regime verdicts, so it reflects
+  // *current* readiness only pre-go-live. Once promotion is effectively enabled
+  // the window is frozen pre-go-live history: regime='live', is_current_readiness=false.
+  regime?: 'pre_go_live_calibration' | 'live';
+  is_current_readiness?: boolean;
+  promotion_enabled?: boolean;
 }
 
 export interface StagedDirection {

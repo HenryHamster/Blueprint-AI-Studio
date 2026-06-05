@@ -18,6 +18,7 @@ from app.digest_metrics import (
     compute_digest_cost_economics,
     compute_digest_trend_history,
     compute_failure_grouping,
+    compute_migration_health,
     compute_narrative_summary,
     compute_dependency_health_signals,
     compute_recurring_error_clusters,
@@ -227,6 +228,36 @@ def test_compute_narrative_summary_direction_taxonomy_hint():
 
 def test_compute_narrative_summary_empty_window_fallback():
     assert _build_narrative_summary() == "All quiet — no activity in the last 24h."
+
+
+def test_compute_migration_health_counts_migration_errors_only_for_migrate_tasks():
+    migrate_completed = make_task(status=TaskStatus.COMPLETED, payloads=[{"type": "migrate"}])
+    migrate_failed = make_task(
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "migrate"}],
+        context={"failure_class": "MIGRATION_ERROR"},
+    )
+    non_migrate_completed = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"failure_class": "MIGRATION_ERROR"},
+    )
+    non_migrate_failed = make_task(
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        context={"failure_class": "MIGRATION_ERROR"},
+    )
+
+    result = compute_migration_health(
+        [migrate_completed, non_migrate_completed],
+        [migrate_failed, non_migrate_failed],
+        error_log_map={},
+    )
+
+    assert result["migration_tasks_in_window"] == 2
+    assert result["migration_tasks_succeeded"] == 1
+    assert result["migration_tasks_failed"] == 1
+    assert result["migration_errors_in_window"] == 1
 
 
 def test_compute_narrative_summary_convergence_verdict_appears():
