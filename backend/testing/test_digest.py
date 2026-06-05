@@ -402,6 +402,47 @@ async def test_digest_merge_gate_fleet_health_window_filters_stale(
 
 
 @pytest.mark.asyncio
+async def test_digest_merge_gate_fleet_health_reason_respects_window(
+    client: AsyncClient, db_session
+):
+    """The most_common_reason reflects only in-window fall-opens, not stale
+    all-time tallies. A project with an old fall-open for reason A and a new
+    fall-open for reason B should report B as most_common when the old one is
+    outside the window."""
+    now_iso = _utcnow().isoformat()
+    stale_iso = (_utcnow() - timedelta(days=30)).isoformat()
+    project = make_project(
+        merge_gate_runtime={
+            "last_run_at": now_iso,
+            "executed_real_tests": True,
+            "recent_outcomes": [
+                # Stale fall-open with reason A (outside window)
+                {"at": stale_iso, "verified": False, "reason": "probe_passed"},
+                # In-window fall-open with reason B (inside window)
+                {"at": now_iso, "verified": False, "reason": "suite_all_skipped"},
+            ],
+            # All-time tally shows probe_passed dominates historically
+            "unverified_reason_counts": {"probe_passed": 5, "suite_all_skipped": 1},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    mg = response.json()["merge_gate_fleet_health"]
+    # The in-window entry shows 1 fall-open with suite_all_skipped reason.
+    assert mg["verified_count"] == 0
+    assert mg["fell_open_count"] == 1
+    # most_common_reason must reflect the in-window reason (suite_all_skipped),
+    # not the all-time dominant (probe_passed). This is the fix: the windowed
+    # reason should not be masked by historical counts.
+    assert mg["most_common_reason"] == "suite_all_skipped"
+    assert mg["project_count"] == 1
+    assert mg["degraded_project_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_digest_aggregates_merge_retries_saved(client: AsyncClient, db_session):
     """total_merge_retries_saved sums _merge_retries_saved across completed+failed tasks;
     merge_early_exit_count counts tasks with a positive saved value."""

@@ -710,6 +710,54 @@ export function detectProvisioningSteps(buildConfig?: BuildConfig): Provisioning
   // Repo root covers the auto-detected (no build_config) case.
   addRequirementsTxtAuto(WORKSPACE, 'root');
 
+  // 2c) Poetry Python auto-provision. A project with a committed poetry.lock
+  //     must run `poetry install` before tests/probes to install dependencies
+  //     AND the project's own package (with console-script entrypoints). Without
+  //     this, the documented-command probe runs unprovisioned, hits missing-dependency
+  //     or command-not-found, and classifies as "could not run" — silently falling open.
+  //     Skipped when a declared install_cmd is present (operator's command wins);
+  //     deduped by cwd like the other auto steps.
+  const addPoetryAuto = (absDir: string, label: string): void => {
+    if (declaredCwds.has(absDir)) return;
+    if (!exists(`${absDir}/pyproject.toml`) || !exists(`${absDir}/poetry.lock`)) return;
+    add({ cmd: 'poetry', args: ['install'], cwd: absDir, label: `poetry install (${label})` });
+  };
+  if (buildConfig?.directories) {
+    for (const dir of buildConfig.directories) {
+      if (dir.type !== 'python') continue;
+      addPoetryAuto(dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE, dir.path || 'root');
+    }
+  }
+  // Repo root covers the auto-detected (no build_config) case.
+  addPoetryAuto(WORKSPACE, 'root');
+
+  // 2d) Bare setup.py/setup.cfg Python auto-provision. A project with setup.py or
+  //     setup.cfg but NO pyproject.toml must run `pip install .` before tests/probes to
+  //     install dependencies AND the project's own package (with console-script entrypoints).
+  //     Without this, the documented-command probe runs unprovisioned, hits missing-dependency
+  //     or command-not-found, and classifies as "could not run" — silently falling open.
+  //     Skipped when a declared install_cmd or any OTHER provisioning step already fired
+  //     (operator's command wins, deduped by cwd).
+  const bareSetupPy = (absDir: string): boolean =>
+    !exists(`${absDir}/pyproject.toml`) &&
+    !exists(`${absDir}/requirements.txt`) &&
+    !exists(`${absDir}/requirements-dev.txt`) &&
+    !exists(`${absDir}/requirements/base.txt`) &&
+    !exists(`${absDir}/poetry.lock`) &&
+    (exists(`${absDir}/setup.py`) || exists(`${absDir}/setup.cfg`));
+  const addBareSetupAuto = (absDir: string, label: string): void => {
+    if (declaredCwds.has(absDir) || !bareSetupPy(absDir)) return;
+    add({ cmd: 'pip', args: ['install', '.'], cwd: absDir, label: `pip install . (${label})` });
+  };
+  if (buildConfig?.directories) {
+    for (const dir of buildConfig.directories) {
+      if (dir.type !== 'python') continue;
+      addBareSetupAuto(dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE, dir.path || 'root');
+    }
+  }
+  // Repo root covers the auto-detected (no build_config) case.
+  addBareSetupAuto(WORKSPACE, 'root');
+
   // 3) Extra-ecosystem auto-provision (Ruby/Gradle/Maven/Elixir/PHP). The suite
   //    detector LAUNCHES these runners (detectExtraFamilyRunner) but their test
   //    commands (`bundle exec rake test`, `./gradlew test`, `mvn test`,

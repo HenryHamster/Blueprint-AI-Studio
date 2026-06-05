@@ -1562,6 +1562,7 @@ async def compute_merge_gate_fleet_health(
     degraded_project_count = 0
     project_count = 0
     reason_histogram: Dict[str, int] = {}
+    windowed_reason_histogram: Dict[str, int] = {}
 
     for project in projects:
         raw = getattr(project, "merge_gate_runtime", None)
@@ -1600,14 +1601,31 @@ async def compute_merge_gate_fleet_health(
         if proj_fell_open > 0:
             degraded_project_count += 1
 
+        # Tally windowed fall-open reasons for the dominant reason when a
+        # window is provided. Each outcome carries its own reason, so we
+        # can derive the windowed dominant reason directly without using
+        # the all-time tally.
+        if window_start is not None:
+            for outcome in outcomes:
+                if not outcome.get("verified"):
+                    reason = outcome.get("reason")
+                    if reason is not None:
+                        reason_key = str(reason)
+                        windowed_reason_histogram[reason_key] = (
+                            windowed_reason_histogram.get(reason_key, 0) + 1
+                        )
+
     total = verified_count + fell_open_count
     verification_rate = (verified_count / total) if total > 0 else None
     most_common_reason = None
-    if reason_histogram:
+    # When a window is provided, use the windowed tally; otherwise use the
+    # all-time tally for completeness.
+    histogram_to_use = windowed_reason_histogram if window_start is not None else reason_histogram
+    if histogram_to_use:
         # Deterministic tie-break: highest count, then reason key (mirrors
         # ci_resolution.merge_gate_runtime_block's per-project tie-break).
         most_common_reason = sorted(
-            reason_histogram.items(), key=lambda kv: (-kv[1], kv[0])
+            histogram_to_use.items(), key=lambda kv: (-kv[1], kv[0])
         )[0][0]
 
     return {
