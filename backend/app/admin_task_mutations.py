@@ -322,6 +322,16 @@ async def _apply_status_mutation(
         )
 
     if new_status == TaskStatus.QUEUED:
+        # Manual requeue must reopen a CLEAN attempt: drop any durable blocker
+        # metadata and the BLOCKED_PRECONDITION failure tags from the prior run,
+        # mirroring the automatic out-transition (unblock_to_queued). Otherwise a
+        # task moved from BLOCKED/failed-retry back to QUEUED would still look and
+        # classify as blocked work (stale context['blocker'], budget-exempt
+        # failure_class) on its next dispatch. Safe no-op on never-blocked tasks.
+        from app.task_blocked import clear_blocker_metadata
+
+        clear_blocker_metadata(task)
+
         task_type = (task.first_payload).get("type", "")
         is_parent_type = task_type in ("research", "plan")
         from app.task_lifecycle import _requeue_parent_task

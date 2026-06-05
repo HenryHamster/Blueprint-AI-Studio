@@ -12,6 +12,7 @@ from typing import Any, Dict, List
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.broadcast import broadcast_to_project
+from app.depends_on_provenance import remember_structural_depends_on
 from app.models import Project, Task, TaskHistory, TaskStatus
 from app.payload_schemas import validate_internal_payload
 from app.task_capabilities import PLAN_SUBTASK_TYPES
@@ -427,11 +428,14 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         if child_tasks[i] is None:
             continue
         dep_indices = subtask_def.get("depends_on_indices", [])
-        child_tasks[i].depends_on = [
+        dep_ids = [
             str(child_tasks[j].id)
             for j in dep_indices
             if 0 <= j < len(child_tasks) and child_tasks[j] is not None
         ]
+        child_tasks[i].depends_on = dep_ids
+        if dep_ids:
+            remember_structural_depends_on(child_tasks[i], dep_ids)
         session.add(child_tasks[i])
 
     _log_file_overlaps(subtasks, "PLAN")

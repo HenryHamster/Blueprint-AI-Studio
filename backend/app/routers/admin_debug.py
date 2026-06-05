@@ -585,12 +585,18 @@ async def get_autonomy_debug(
                     TaskStatus.PROVISIONING,
                     TaskStatus.IN_PROGRESS,
                     TaskStatus.EVALUATING,
+                    # BLOCKED research parents still hold their direction (see
+                    # _spawn_research_task_inner): a lane parked on an unresolved
+                    # upstream prerequisite is wanted-but-not-runnable, so the
+                    # direction is structurally occupied and not eligible.
+                    TaskStatus.BLOCKED,
                 ]
             ),
         )
         .limit(1000)
     )
     busy_direction_ids: list[str] = []
+    blocked_direction_ids: set[str] = set()
     active_research_count = 0
     for t in busy_tasks_result.scalars().all():
         payload = t.first_payload
@@ -599,7 +605,10 @@ async def get_autonomy_debug(
         did = payload.get("current_direction_id")
         if did:
             busy_direction_ids.append(did)
-        # Only the VM-consuming statuses count against the parallel cap
+            if t.status == TaskStatus.BLOCKED:
+                blocked_direction_ids.add(did)
+        # Only the VM-consuming statuses count against the parallel cap.
+        # BLOCKED (like EVALUATING) does not consume a VM slot.
         if t.status in (
             TaskStatus.QUEUED,
             TaskStatus.PROVISIONING,
@@ -637,9 +646,15 @@ async def get_autonomy_debug(
             "seconds_until_eligible": seconds_until_eligible,
         }
         if is_busy:
-            entry["busy_reason"] = (
-                "direction has active research task (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING)"
-            )
+            if d.get("id") in blocked_direction_ids:
+                entry["busy_reason"] = (
+                    "direction held by a BLOCKED research task parked on an "
+                    "unresolved upstream prerequisite"
+                )
+            else:
+                entry["busy_reason"] = (
+                    "direction has active research task (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING)"
+                )
         directions_info.append(entry)
 
     eligible_directions = [d for d in directions_info if d["is_eligible"]]

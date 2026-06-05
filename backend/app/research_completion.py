@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.depends_on_provenance import remember_structural_depends_on
 from app.findings_index import (  # noqa: F401 — re-exported for callers/tests
     lookup_findings_by_source_ref,
     query_findings_index,
@@ -2719,6 +2720,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         ]
         if explicit_deps:
             ct.depends_on = explicit_deps
+            remember_structural_depends_on(ct, explicit_deps)
             session.add(ct)
 
     # Foundation-aware cross-task wiring: when a finding declares an EXPLICIT
@@ -2816,6 +2818,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if foundation_id not in existing_dep:
             existing_dep.append(foundation_id)
             ct.depends_on = existing_dep
+            remember_structural_depends_on(ct, foundation_id)
             session.add(ct)
             logger.info(
                 "[RESEARCH] Wired finding '%s' depends_on foundation %s "
@@ -2843,6 +2846,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if prev_id not in existing:
             existing.append(prev_id)
             child_tasks[ci].depends_on = existing
+            remember_structural_depends_on(child_tasks[ci], prev_id)
             session.add(child_tasks[ci])
 
     # Log file overlap warnings for observability and surface them to agents

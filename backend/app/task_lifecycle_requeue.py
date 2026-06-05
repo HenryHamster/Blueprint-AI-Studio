@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.depends_on_provenance import remap_structural_depends_on
 from app.models import Task, TaskHistory, TaskStatus
 from app.shared_state import DEFAULT_TASK_SCOPE
 import app.shared_state as _shared_state
@@ -725,6 +726,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             else:
                 remapped.append(dep_id)  # Keep (COMPLETED sibling or still-active task)
         clone.depends_on = remapped
+        remap_structural_depends_on(clone, old_to_new)
 
     # Pass 3: In-memory cycle check on cloned subgraph
     if cloned_pairs:

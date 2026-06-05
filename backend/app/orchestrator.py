@@ -56,6 +56,7 @@ from app.compute import (
     zone_recovery_wait_seconds,
 )
 from app.database import AsyncSessionLocal, resolve_dialect_name
+from app.depends_on_provenance import remap_structural_depends_on
 from app.models import (
     DeploymentState,
     Project,
@@ -1202,6 +1203,31 @@ async def _mark_unblocked_dependents(completed_task: Task, verify_pr_merged) -> 
     return len(eligible_ids)
 
 
+async def _persist_requeue_dep_remap(task: Task, deps_remapped: dict[str, str]) -> bool:
+    """Rewrite a candidate's requeue-cancelled dep edges to their replacements.
+
+    Updates BOTH ``depends_on`` and the per-edge ``_structural_depends_on_ids``
+    provenance so a surviving structural prerequisite still resolves through
+    ``_has_edge_prerequisite_provenance`` after the remap — otherwise
+    clear-wave-deps would mistake the live edge for legacy sequencing and strip
+    it. Persists via its own session and mirrors the change onto the in-memory
+    ``task``. Returns True when an edge was actually rewritten.
+    """
+    new_deps = [deps_remapped.get(d, d) for d in (task.depends_on or [])]
+    if new_deps == list(task.depends_on or []):
+        return False
+    async with AsyncSessionLocal() as remap_session:
+        remap_task = await remap_session.get(Task, task.id)
+        if remap_task:
+            remap_task.depends_on = new_deps
+            remap_structural_depends_on(remap_task, deps_remapped)
+            remap_session.add(remap_task)
+            await remap_session.commit()
+    task.depends_on = new_deps
+    remap_structural_depends_on(task, deps_remapped)
+    return True
+
+
 async def orchestrator_worker():
     """
     Background worker that polls for QUEUED tasks and provisions VMs.
@@ -2099,17 +2125,7 @@ async def orchestrator_worker():
                     # Persist remap of requeue-cancelled dep IDs → replacement clone IDs
                     # so future orchestrator cycles skip the _replaced_by_task_id lookup.
                     if deps_remapped and not any_failed:
-                        new_deps = [
-                            deps_remapped.get(d, d) for d in (task.depends_on or [])
-                        ]
-                        if new_deps != list(task.depends_on or []):
-                            async with AsyncSessionLocal() as remap_session:
-                                remap_task = await remap_session.get(Task, task.id)
-                                if remap_task:
-                                    remap_task.depends_on = new_deps
-                                    remap_session.add(remap_task)
-                                    await remap_session.commit()
-                            task.depends_on = new_deps
+                        if await _persist_requeue_dep_remap(task, deps_remapped):
                             logger.info(
                                 f"[ORCHESTRATOR] Remapped {len(deps_remapped)} requeue-cancelled "
                                 f"dep(s) for task {task.id}"

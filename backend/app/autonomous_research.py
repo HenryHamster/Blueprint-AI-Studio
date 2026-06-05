@@ -459,6 +459,16 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                                 TaskStatus.PROVISIONING,
                                 TaskStatus.IN_PROGRESS,
                                 TaskStatus.EVALUATING,
+                                # BLOCKED research parents still structurally
+                                # occupy their direction: a lane parked on an
+                                # unresolved upstream prerequisite is wanted-but-
+                                # not-runnable, not done. Treating it as busy
+                                # keeps the prerequisite-gating model consistent
+                                # — the direction stays held until the lane
+                                # resumes (foundation lands / recheck) or is
+                                # explicitly resolved, instead of drifting back
+                                # into autonomous selection after the cooldown.
+                                TaskStatus.BLOCKED,
                             ]
                         ),
                         and_(

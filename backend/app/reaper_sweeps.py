@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 
 from sqlmodel import select
 
+from app.depends_on_provenance import remember_structural_depends_on
 from app.models import Task, TaskStatus
 from app.time_utils import _utcnow
 
@@ -739,6 +740,7 @@ async def _resolve_need_into_dep_edge(
     existing = [str(d) for d in (task.depends_on or [])]
     if match_id not in existing:
         task.depends_on = existing + [match_id]
+    remember_structural_depends_on(task, match_id)
     return True
 
 
@@ -805,6 +807,7 @@ async def sweep_converge_duplicate_foundations(session, now=None) -> int:
                 )
                 continue
             dependent.depends_on = existing + [found_id]
+            remember_structural_depends_on(dependent, found_id)
             ctx = dependent.context or {}
             ctx["_foundation_converged"] = {
                 "foundation_id": found_id,

@@ -16,6 +16,7 @@ import uuid
 import logging
 
 from app.database import get_session
+from app.depends_on_provenance import has_structural_depends_on
 from app.branch_resolution import classify_rollup_merge_outcome
 from app.landed_signal import apply_merged_landed_signal
 from app.shared_state import (
@@ -172,13 +173,100 @@ async def trigger_qualify(
     return result
 
 
+# Blocker provenance sources that mark a depends_on edge as a real, structural
+# prerequisite rather than legacy queue-wave serialization.
+_PREREQUISITE_BLOCKER_SOURCES = {"research_prerequisite", "parent"}
+
+
+def _has_edge_prerequisite_provenance(dependent: Task, dep_id: str) -> bool:
+    """True if *dep_id* is durably marked as a structural prerequisite edge."""
+    dep_text = str(dep_id).strip()
+    if not dep_text:
+        return False
+    if has_structural_depends_on(dependent, dep_text):
+        return True
+
+    ctx = dependent.context or {}
+    converged = ctx.get("_foundation_converged")
+    if isinstance(converged, dict) and str(converged.get("foundation_id")) == dep_text:
+        return True
+
+    unresolved = ctx.get("unresolved_prerequisite") or []
+    if isinstance(unresolved, dict):
+        unresolved = [unresolved]
+    if isinstance(unresolved, list):
+        for item in unresolved:
+            if isinstance(item, dict) and str(item.get("ref")) == dep_text:
+                return True
+
+    blocker = ctx.get("blocker")
+    if (
+        isinstance(blocker, dict)
+        and blocker.get("source") in _PREREQUISITE_BLOCKER_SOURCES
+    ):
+        need = blocker.get("need")
+        if isinstance(need, dict) and str(need.get("ref")) == dep_text:
+            return True
+    return False
+
+
+async def _is_clearable_wave_edge(
+    dependent: Task,
+    dep_id: str,
+    foundation: Task | None,
+    session: AsyncSession,
+) -> bool:
+    """True when a single edge is legacy sequencing and safe to clear.
+
+    The route must share the dispatcher's dependency semantics instead of using
+    foundation status as a proxy. We therefore ask the canonical dependency gate
+    whether THIS edge is already non-blocking for dispatch:
+
+    * ``waiting``       → preserve (still a live prerequisite)
+    * ``cascade_cancel`` → preserve (real failed/deleted prerequisite)
+    * ``eligible``      → only clear if the edge is ordering-only and carries no
+      structural provenance
+    """
+    from app.orchestrator_health import (
+        _check_candidate_task_deps,
+        is_ordering_only_dependency,
+    )
+    from app.rollup_pr_verification import _verify_pr_merged
+
+    if _has_edge_prerequisite_provenance(dependent, dep_id):
+        return False
+
+    dep_tasks = [foundation] if foundation is not None else []
+    result, _ = await _check_candidate_task_deps(
+        dependent,
+        dep_tasks,
+        [dep_id],
+        session,
+        _verify_pr_merged,
+    )
+    if result != "eligible" or foundation is None:
+        return False
+    return is_ordering_only_dependency(dependent, foundation)
+
+
 @router.post("/projects/{project_id}/clear-wave-deps")
 async def clear_wave_deps(
     project_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Clear depends_on on all QUEUED tasks in a project to unblock wave-gated tasks."""
+    """Clear only STALE/legacy wave depends_on edges on QUEUED tasks.
+
+    Recovers stale queue-wave serialization without destroying the prerequisite
+    graph: each ``depends_on`` edge on a QUEUED task is classified by the SAME
+    dependency gate the dispatcher uses plus per-edge structural provenance.
+    Only edges that are already dispatch-eligible AND ordering-only are removed,
+    so a task mixing legacy sequencing and a real prerequisite keeps the latter.
+
+    Response: ``cleared`` (tasks whose stale edges were removed — kept for
+    backward compat), ``preserved`` (tasks that retained ≥1 prerequisite edge),
+    and ``total_queued``.
+    """
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
@@ -188,14 +276,43 @@ async def clear_wave_deps(
         )
     )
     tasks = result.scalars().all()
-    cleared = 0
+
+    # Batch-load every referenced foundation task in one query so the per-edge
+    # classifier can check landed status without N round-trips.
+    foundation_ids: set[uuid.UUID] = set()
     for task in tasks:
-        if task.depends_on:
-            task.depends_on = []
+        for dep in task.depends_on or []:
+            try:
+                foundation_ids.add(uuid.UUID(str(dep)))
+            except (ValueError, TypeError):
+                continue
+    foundation_map: dict[str, Task] = {}
+    if foundation_ids:
+        frows = (
+            await session.execute(select(Task).where(Task.id.in_(foundation_ids)))
+        ).scalars().all()
+        foundation_map = {str(f.id): f for f in frows}
+
+    cleared = 0
+    preserved = 0
+    for task in tasks:
+        deps = task.depends_on or []
+        if not deps:
+            continue
+        kept: list[str] = []
+        for dep in deps:
+            dep_text = str(dep)
+            foundation = foundation_map.get(dep_text)
+            if not await _is_clearable_wave_edge(task, dep_text, foundation, session):
+                kept.append(dep)
+        if len(kept) != len(deps):
+            task.depends_on = kept
             session.add(task)
             cleared += 1
+        if kept:
+            preserved += 1
     await session.commit()
-    return {"cleared": cleared, "total_queued": len(tasks)}
+    return {"cleared": cleared, "preserved": preserved, "total_queued": len(tasks)}
 
 
 @router.post("/tasks/{task_id}/rollup")

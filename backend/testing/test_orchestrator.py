@@ -4165,6 +4165,62 @@ class TestClassifyStuckTasksSharedPolicy:
         assert out == [(stuck.id, "dead_deps")]
 
     @pytest.mark.asyncio
+    async def test_requeue_dep_remap_follows_structural_provenance(self, db_session):
+        """Remapping a requeue-cancelled edge moves its structural provenance too.
+
+        Regression: the dispatcher rewrites an existing dependent's ``depends_on``
+        from a cancelled dep ID to its replacement clone, but used to leave
+        ``_structural_depends_on_ids`` pointing at the dead ID. That made the
+        surviving prerequisite edge invisible to ``_has_edge_prerequisite_provenance``
+        so clear-wave-deps would later strip it as legacy sequencing.
+        """
+        from app.orchestrator import _persist_requeue_dep_remap
+        from app.depends_on_provenance import get_structural_depends_on_ids
+        from app.routers.admin_operator_triggers import (
+            _has_edge_prerequisite_provenance,
+        )
+
+        project = make_project(name="RemapProvenance", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        old_dep_id = str(uuid.uuid4())
+        new_dep_id = str(uuid.uuid4())
+
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "dependent"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[old_dep_id],
+            context={"_structural_depends_on_ids": [old_dep_id]},
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+        await db_session.refresh(dependent)
+
+        # Edge is a recognized structural prerequisite before the remap.
+        assert _has_edge_prerequisite_provenance(dependent, old_dep_id)
+
+        remapped = await _persist_requeue_dep_remap(
+            dependent, {old_dep_id: new_dep_id}
+        )
+        assert remapped is True
+
+        # In-memory task updated on BOTH axes.
+        assert dependent.depends_on == [new_dep_id]
+        assert get_structural_depends_on_ids(dependent) == [new_dep_id]
+        # The live edge still resolves as a prerequisite (so clear-wave-deps keeps it),
+        # and the dead edge no longer does.
+        assert _has_edge_prerequisite_provenance(dependent, new_dep_id)
+        assert not _has_edge_prerequisite_provenance(dependent, old_dep_id)
+
+        # Persisted copy carries the same remap.
+        await db_session.refresh(dependent)
+        assert dependent.depends_on == [new_dep_id]
+        assert get_structural_depends_on_ids(dependent) == [new_dep_id]
+
+    @pytest.mark.asyncio
     async def test_requeue_cancelled_dep_with_active_clone_waits(self, db_session):
         from app.orchestrator_health import _classify_stuck_tasks
 

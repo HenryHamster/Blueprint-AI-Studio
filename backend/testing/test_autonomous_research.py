@@ -317,6 +317,59 @@ async def test_spawn_skipped_when_all_directions_non_active(db_session):
 
 
 @pytest.mark.asyncio
+async def test_blocked_research_lane_keeps_direction_out_of_respawn(db_session):
+    """A direction whose prior research task is BLOCKED on an upstream
+    prerequisite stays structurally occupied — even past cooldown — so the
+    autonomous loop does not open a fresh research cycle on it."""
+    direction = {
+        **_active_direction("d-blocked1", "Parked on prerequisite"),
+        # 5h ago — well past the 4h direction cooldown, so the ONLY thing that
+        # can hold this direction is the BLOCKED lane itself.
+        "last_researched_at": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+    }
+    project = Project(
+        name="Blocked Lane Hold",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},  # Non-empty vision so force_strategic doesn't fire
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    blocked = Task(
+        project_id=project.id,
+        title="Research: parked",
+        payloads=[
+            {
+                "type": "research",
+                "current_direction_id": "d-blocked1",
+                "directions": [direction],
+                "base_branch": "main",
+            }
+        ],
+        status=TaskStatus.BLOCKED,
+        blocker_kind="upstream_dependency",
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(blocked)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research_tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research_tasks) == 1, (
+        "No fresh research cycle should spawn while the direction's prior lane is "
+        "BLOCKED on an upstream prerequisite — only the pre-existing blocked task remains"
+    )
+    assert research_tasks[0].id == blocked.id
+
+
+@pytest.mark.asyncio
 async def test_all_paused_directions_still_get_strategic_via_backstop(db_session, mocker):
     """Regression: when every active direction is recommended_mode=pause, the
     wall-clock strategic backstop must still fire a strategic cycle.

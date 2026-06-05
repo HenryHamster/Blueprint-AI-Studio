@@ -8660,10 +8660,10 @@ class TestModifyTaskApplySeam:
 
 class TestClearWaveDeps:
     @pytest.mark.asyncio
-    async def test_clears_depends_on_for_queued_tasks(
+    async def test_preserves_missing_depends_on_for_queued_tasks(
         self, client: AsyncClient, db_session
     ):
-        """Queued tasks with depends_on are unblocked; returns cleared count."""
+        """A missing dependency row is preserved for cascade-cancel handling."""
         project = await _make_project(db_session)
         dep_id = uuid.uuid4()
         blocked = Task(
@@ -8678,11 +8678,12 @@ class TestClearWaveDeps:
         resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["cleared"] == 1
+        assert data["cleared"] == 0
+        assert data["preserved"] == 1
         assert data["total_queued"] == 1
 
         await db_session.refresh(blocked)
-        assert blocked.depends_on == []
+        assert blocked.depends_on == [str(dep_id)]
 
     @pytest.mark.asyncio
     async def test_returns_zero_when_no_queued_tasks(
@@ -8693,6 +8694,276 @@ class TestClearWaveDeps:
         assert resp.status_code == 200
         assert resp.json()["cleared"] == 0
         assert resp.json()["total_queued"] == 0
+
+    @pytest.mark.asyncio
+    async def test_clears_ordering_only_edge_when_dispatch_gate_says_eligible(
+        self, client: AsyncClient, db_session
+    ):
+        """An ordering-only edge is cleared even if the foundation is still in flight."""
+        project = await _make_project(db_session)
+        foundation = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foundation.py"]},
+            status=TaskStatus.IN_PROGRESS,
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        dependent = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/bbb"}],
+            status=TaskStatus.QUEUED,
+            context={"related_files": ["backend/app/dependent.py"]},
+            depends_on=[str(foundation.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cleared"] == 1
+        assert data["preserved"] == 0
+        assert data["total_queued"] == 1
+
+        await db_session.refresh(dependent)
+        assert dependent.depends_on == []
+
+    @pytest.mark.asyncio
+    async def test_preserves_prerequisite_edge_with_provenance(
+        self, client: AsyncClient, db_session
+    ):
+        """A QUEUED task with foundation-converged provenance keeps its edge."""
+        project = await _make_project(db_session)
+        foundation = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        dependent = Task(
+            project_id=project.id,
+            payloads=[{"type": "smoketest"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(foundation.id)],
+            context={"_foundation_converged": {"foundation_id": str(foundation.id)}},
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cleared"] == 0
+        assert data["preserved"] == 1
+        assert data["total_queued"] == 1
+
+        await db_session.refresh(dependent)
+        assert dependent.depends_on == [str(foundation.id)]
+
+    @pytest.mark.asyncio
+    async def test_preserves_edge_when_foundation_in_flight(
+        self, client: AsyncClient, db_session
+    ):
+        """An in-flight (not-yet-landed) foundation gates its dependent — preserve."""
+        project = await _make_project(db_session)
+        foundation = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.IN_PROGRESS,
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        dependent = Task(
+            project_id=project.id,
+            payloads=[{"type": "smoketest"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(foundation.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cleared"] == 0
+        assert data["preserved"] == 1
+        assert data["total_queued"] == 1
+
+        await db_session.refresh(dependent)
+        assert dependent.depends_on == [str(foundation.id)]
+
+    @pytest.mark.asyncio
+    async def test_preserves_completed_same_base_edge_until_pr_merged(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A COMPLETED same-base code dependency still waits until PR merge/landing."""
+        project = await _make_project(db_session)
+        foundation = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/shared"}],
+            status=TaskStatus.COMPLETED,
+            context={"related_files": ["backend/app/shared.py"]},
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+        mocker.patch(
+            "app.rollup_pr_verification._verify_pr_merged",
+            new_callable=AsyncMock,
+            return_value=False,
+        )
+
+        dependent = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/shared"}],
+            status=TaskStatus.QUEUED,
+            context={"related_files": ["backend/app/shared.py"]},
+            depends_on=[str(foundation.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cleared"] == 0
+        assert data["preserved"] == 1
+        assert data["total_queued"] == 1
+
+        await db_session.refresh(dependent)
+        assert dependent.depends_on == [str(foundation.id)]
+
+    @pytest.mark.asyncio
+    async def test_preserves_failed_prerequisite_edge(
+        self, client: AsyncClient, db_session
+    ):
+        """A genuinely failed prerequisite is preserved for cascade-cancel handling."""
+        project = await _make_project(db_session)
+        foundation = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/shared"}],
+            status=TaskStatus.FAILED,
+            context={"related_files": ["backend/app/shared.py"]},
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        dependent = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/shared"}],
+            status=TaskStatus.QUEUED,
+            context={"related_files": ["backend/app/shared.py"]},
+            depends_on=[str(foundation.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cleared"] == 0
+        assert data["preserved"] == 1
+        assert data["total_queued"] == 1
+
+        await db_session.refresh(dependent)
+        assert dependent.depends_on == [str(foundation.id)]
+
+    @pytest.mark.asyncio
+    async def test_preserves_resolved_need_edge_without_blocker_metadata(
+        self, client: AsyncClient, db_session
+    ):
+        """A real edge resolved from blocked_need survives after blocker metadata clears."""
+        project = await _make_project(db_session)
+        foundation = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            status=TaskStatus.COMPLETED,
+            context={"related_files": ["backend/app/foundation.py"]},
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        dependent = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/bbb"}],
+            status=TaskStatus.QUEUED,
+            context={
+                "related_files": ["backend/app/dependent.py"],
+                "_structural_depends_on_ids": [str(foundation.id)],
+            },
+            depends_on=[str(foundation.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cleared"] == 0
+        assert data["preserved"] == 1
+        assert data["total_queued"] == 1
+
+        await db_session.refresh(dependent)
+        assert dependent.depends_on == [str(foundation.id)]
+
+    @pytest.mark.asyncio
+    async def test_mixed_edges_keeps_only_the_live_prerequisite(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A task mixing ordering-only and real deps clears only the ordering-only edge."""
+        project = await _make_project(db_session)
+        stale_foundation = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            status=TaskStatus.IN_PROGRESS,
+            context={"related_files": ["backend/app/stale.py"]},
+        )
+        live_foundation = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/shared"}],
+            status=TaskStatus.COMPLETED,
+            context={"related_files": ["backend/app/live.py"]},
+        )
+        db_session.add(stale_foundation)
+        db_session.add(live_foundation)
+        await db_session.commit()
+        await db_session.refresh(stale_foundation)
+        await db_session.refresh(live_foundation)
+        mocker.patch(
+            "app.rollup_pr_verification._verify_pr_merged",
+            new_callable=AsyncMock,
+            return_value=False,
+        )
+
+        dependent = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/shared"}],
+            status=TaskStatus.QUEUED,
+            context={"related_files": ["backend/app/live.py"]},
+            depends_on=[str(stale_foundation.id), str(live_foundation.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cleared"] == 1
+        assert data["preserved"] == 1
+        assert data["total_queued"] == 1
+
+        await db_session.refresh(dependent)
+        assert dependent.depends_on == [str(live_foundation.id)]
 
 
 class TestBulkApprove:
@@ -8900,6 +9171,70 @@ class TestBulkRetrySessionFactory:
         assert task.status == TaskStatus.QUEUED
         assert task.attempt_count == 0
         assert task.vm_instance_id != "agent-vm-old"
+
+
+class TestRequeueClearsBlockerMetadata:
+    @pytest.mark.asyncio
+    async def test_manual_requeue_clears_blocked_state(self, db_session):
+        """A BLOCKED task manually requeued to QUEUED must shed all prior-attempt
+        blocker metadata and the budget-exempt BLOCKED_PRECONDITION tags, mirroring
+        the automatic unblock out-transition."""
+        from fastapi import BackgroundTasks
+
+        from app.admin_task_mutations import modify_task_apply
+        from app.task_blocked import (
+            BLOCKED_PRECONDITION,
+            BLOCKER_CONTEXT_KEY,
+            enter_blocked_state,
+        )
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="Blocked then requeued",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.IN_PROGRESS,
+            vm_instance_id="agent-vm-old",
+            attempt_count=2,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        enter_blocked_state(
+            task,
+            waiting_on="upstream rollup PR #123",
+            reason="dependency not yet merged",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        # Precondition: the blocked-state markers are present before requeue.
+        assert task.status == TaskStatus.BLOCKED
+        assert BLOCKER_CONTEXT_KEY in (task.context or {})
+        assert (task.context or {}).get("failure_class") == BLOCKED_PRECONDITION
+        assert task.blocker_kind is not None
+
+        await modify_task_apply(
+            task,
+            {"status": TaskStatus.QUEUED.value},
+            BackgroundTasks(),
+            db_session,
+        )
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        # Structured blocker metadata and the budget-exempt failure tags are gone.
+        assert BLOCKER_CONTEXT_KEY not in (task.context or {})
+        assert (task.context or {}).get("failure_class") != BLOCKED_PRECONDITION
+        assert (task.context or {}).get("failure_category") != BLOCKED_PRECONDITION
+        # Column-shaped blocker markers cleared too.
+        assert task.blocker_kind is None
+        assert task.blocked_reason is None
+        assert task.blocked_at is None
+        assert task.recheck_after is None
+        # Clean attempt: counter reset like any leaf requeue.
+        assert task.attempt_count == 0
 
 
 class TestTriggerRollup:

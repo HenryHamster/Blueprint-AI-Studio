@@ -65,7 +65,12 @@ export function useProjectsState(
         body: '{}',
       });
       const data = await res.json();
-      addToast(`Cleared dependencies on ${data.cleared} tasks`, 'success');
+      const cleared = data.cleared ?? 0;
+      const preserved = data.preserved ?? 0;
+      addToast(
+        `Cleared stale deps on ${cleared} tasks; kept prerequisites on ${preserved}`,
+        'success',
+      );
       fetchTasksRef.current();
     } catch (error) {
       console.error('Failed to clear wave deps:', error);
