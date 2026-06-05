@@ -287,5 +287,5 @@ For questions or issues:
 
 ---
 
-**Last updated:** 2026-06-02  
-**Current schema revision:** 0134 (see [../backend/app/main.py](../backend/app/main.py))
+**Last updated:** 2026-06-05  
+**Current schema revision:** 0150 (see [../backend/app/main.py](../backend/app/main.py))

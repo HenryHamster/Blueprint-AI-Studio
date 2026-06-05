@@ -1,3 +1,20 @@
+/**
+ * Task handler registry and dispatcher.
+ *
+ * Maps task types to their corresponding handler functions. Each handler processes
+ * a specific task type (create, refactor, docs, review, fix, research, plan, etc.)
+ * and manages the task lifecycle: cloning the repo, setting up the workspace,
+ * running Claude Code, capturing output, and reporting status back to the orchestrator.
+ *
+ * The handlers module is the central dispatch point for all task execution logic.
+ * New task types must be added to both the import statements and the `handlers` map
+ * to be discoverable by the agent runtime.
+ *
+ * Research tasks are special: they dispatch to either the tactical research handler
+ * or the strategic handler based on the task's `research_mode` field (set via the
+ * dispatchResearch function).
+ */
+
 import type WebSocket from 'ws';
 import type { AgentTaskType } from '../taskCapabilities.js';
 import { handleCreate, handleRefactor, handleDocs, handleDeps, handleQA } from './standard.js';
