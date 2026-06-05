@@ -8,6 +8,7 @@ from typing import List, Dict, Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models import ArtifactType, ComputeJobOutcome, ComputeJobStatus, TaskStatus
+from app.task_blocked import NEED_KINDS, NEED_LABEL_MAX_LEN, NEED_REF_MAX_LEN
 
 
 class DeployPayload(BaseModel):
@@ -27,6 +28,29 @@ class TaskEvaluationSummary(BaseModel):
     verdict: str
     evidence: List[TaskEvaluationSummaryItem] = Field(default_factory=list)
     highlights: List[TaskEvaluationSummaryItem] = Field(default_factory=list)
+
+
+class BlockedNeed(BaseModel):
+    """Normalized, machine-resolvable prerequisite a blocked task waits on.
+
+    The canonical NEED primitive: ``kind`` names the reference category (a
+    sibling task, a PR, or a capability/foundation), ``ref`` is the concrete
+    identifier, and ``label`` is an optional human description. Kept in sync
+    with ``app.task_blocked`` (single source of truth for the kinds and bounds)
+    so agent blockers and research findings share one shape.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    kind: str = Field(..., max_length=20)
+    ref: str = Field(..., min_length=1, max_length=NEED_REF_MAX_LEN)
+    label: str | None = Field(None, max_length=NEED_LABEL_MAX_LEN)
+
+    @field_validator("kind")
+    @classmethod
+    def _validate_kind(cls, v: str) -> str:
+        if v not in NEED_KINDS:
+            raise ValueError(f"kind must be one of {NEED_KINDS}")
+        return v
 
 
 class AgentStatusPayload(BaseModel):
@@ -94,6 +118,11 @@ class AgentStatusPayload(BaseModel):
     # operators see WHY there is no PR. A no-diff finish WITHOUT this reason is
     # not a no-op completion; the agent wrapper fails it as `incomplete`.
     no_op_reason: str | None = Field(None, max_length=2000)
+    # Optional normalized machine-resolvable prerequisite for a BLOCKED status.
+    # Set by `./blocked --needs-task|--needs-pr|--needs-capability`. Persisted
+    # into context['blocker']['need'] on the BLOCKED-entry path. Absent payloads
+    # behave identically to today (free-text waiting_on/reason only).
+    blocked_need: BlockedNeed | None = None
 
 
 class UploadUrlRequest(BaseModel):

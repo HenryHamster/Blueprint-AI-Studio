@@ -7364,6 +7364,97 @@ async def test_blocker_lands_blocked_no_retry_no_alert(
     assert task.recheck_after is not None and task.recheck_after > task.blocked_at
     # No failure alert for a non-failure outcome.
     alert_mock.assert_not_called()
+    # Absent-need path: no structured need persisted when none was sent.
+    assert "need" not in blocker
+
+
+def test_blocked_need_schema_parses_valid_and_rejects_malformed():
+    """AgentStatusPayload.blocked_need accepts a well-formed {kind, ref[, label]}
+    need and rejects malformed kinds / empty refs. Backward compat: an absent
+    blocked_need leaves the payload valid with the field None."""
+    from pydantic import ValidationError
+
+    from app.schemas import AgentStatusPayload
+
+    tid = str(uuid.uuid4())
+    base = {"task_id": tid, "status": "FAILED"}
+
+    # Absent need is fine — backward compatible.
+    assert AgentStatusPayload(**base).blocked_need is None
+
+    # Valid need with each recognized kind.
+    for kind, ref in (("task", "t-abc"), ("pr", "7910"), ("capability", "auth")):
+        parsed = AgentStatusPayload(**base, blocked_need={"kind": kind, "ref": ref})
+        assert parsed.blocked_need is not None
+        assert parsed.blocked_need.kind == kind
+        assert parsed.blocked_need.ref == ref
+
+    # Optional human label is accepted.
+    with_label = AgentStatusPayload(
+        **base, blocked_need={"kind": "task", "ref": "t-x", "label": "the foundation"}
+    )
+    assert with_label.blocked_need.label == "the foundation"
+
+    # Malformed: unrecognized kind.
+    with pytest.raises(ValidationError):
+        AgentStatusPayload(**base, blocked_need={"kind": "branch", "ref": "main"})
+    # Malformed: empty ref.
+    with pytest.raises(ValidationError):
+        AgentStatusPayload(**base, blocked_need={"kind": "task", "ref": ""})
+    # Malformed: missing ref.
+    with pytest.raises(ValidationError):
+        AgentStatusPayload(**base, blocked_need={"kind": "task"})
+
+
+@pytest.mark.asyncio
+async def test_blocker_persists_structured_need_into_context(
+    client: AsyncClient, db_session, mocker
+):
+    """A BLOCKER: outcome that carries a structured blocked_need persists the
+    normalized {kind, ref} need into context['blocker']['need'] without changing
+    any BLOCKED-entry behavior."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    project = Project(name="Blocked Need Test", user_id="test-user-blocked-need")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build x"}],
+        vm_instance_id="agent-vm-blocked-need",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-blocked-need")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "failure_category": "BLOCKED_PRECONDITION",
+        "logs": "BLOCKER: waiting on the shared auth foundation",
+        "blocked_need": {"kind": "task", "ref": "t-foundation-1", "label": "auth"},
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+    assert resp.json().get("status") == "blocked"
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.BLOCKED
+    need = ((task.context or {}).get("blocker") or {}).get("need")
+    assert need == {"kind": "task", "ref": "t-foundation-1", "label": "auth"}
 
 
 @pytest.mark.asyncio

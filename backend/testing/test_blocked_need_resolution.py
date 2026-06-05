@@ -1,0 +1,153 @@
+"""Unit tests for the pure cross-task NEED resolver.
+
+These exercise ``blocked_need_resolution.resolve_blocked_need`` as a pure matcher
+over in-memory ``Task`` objects (no DB / no session) — the sweep integration is
+covered separately in ``test_reaper.py``.
+"""
+
+import uuid
+
+from app.blocked_need_resolution import resolve_blocked_need
+from app.models import Task, TaskStatus
+
+
+def _task(*, status=TaskStatus.IN_PROGRESS, title="cand", payloads=None,
+          context=None, depends_on=None, tid=None) -> Task:
+    return Task(
+        id=tid or uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        title=title,
+        description="x",
+        status=status,
+        created_by="u",
+        requires_approval=False,
+        payloads=payloads if payloads is not None else [{"type": "create"}],
+        context=context or {},
+        depends_on=depends_on or [],
+        status_log=[],
+    )
+
+
+# ── kind='task' ──────────────────────────────────────────────────────────────
+
+def test_task_need_resolves_by_id():
+    foundation = _task()
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": str(foundation.id)}
+    assert resolve_blocked_need(blocked, need, [foundation]) is foundation
+
+
+def test_task_need_no_matching_id_returns_none():
+    foundation = _task()
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": str(uuid.uuid4())}
+    assert resolve_blocked_need(blocked, need, [foundation]) is None
+
+
+def test_task_need_malformed_ref_returns_none():
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": "not-a-uuid"}
+    assert resolve_blocked_need(blocked, need, [_task()]) is None
+
+
+# ── kind='pr' ────────────────────────────────────────────────────────────────
+
+def test_pr_need_resolves_to_owning_task():
+    foundation = _task(payloads=[{"type": "fix", "pr_number": 7919}])
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "pr", "ref": "7919"}
+    assert resolve_blocked_need(blocked, need, [foundation]) is foundation
+
+
+def test_pr_need_handles_hash_prefix():
+    foundation = _task(payloads=[{"type": "fix", "pr_number": 42}])
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "pr", "ref": "#42"}
+    assert resolve_blocked_need(blocked, need, [foundation]) is foundation
+
+
+def test_pr_need_no_match_returns_none():
+    foundation = _task(payloads=[{"type": "fix", "pr_number": 1}])
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "pr", "ref": "999"}
+    assert resolve_blocked_need(blocked, need, [foundation]) is None
+
+
+def test_pr_need_ambiguous_returns_none():
+    a = _task(payloads=[{"type": "fix", "pr_number": 7}])
+    b = _task(payloads=[{"type": "create", "pr_number": 7}])
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "pr", "ref": "7"}
+    assert resolve_blocked_need(blocked, need, [a, b]) is None
+
+
+# ── kind='capability' ────────────────────────────────────────────────────────
+
+def test_capability_resolves_on_exact_payload_type():
+    foundation = _task(payloads=[{"type": "design"}])
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "capability", "ref": "design"}
+    assert resolve_blocked_need(blocked, need, [foundation]) is foundation
+
+
+def test_capability_resolves_on_exact_title():
+    foundation = _task(title="Build the auth foundation")
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "capability", "ref": "build the auth foundation"}
+    assert resolve_blocked_need(blocked, need, [foundation]) is foundation
+
+
+def test_capability_resolves_on_exact_related_file():
+    foundation = _task(context={"related_files": ["backend/app/auth.py"]})
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "capability", "ref": "backend/app/auth.py"}
+    assert resolve_blocked_need(blocked, need, [foundation]) is foundation
+
+
+def test_capability_no_conservative_match_returns_none():
+    # A fuzzy/partial description must NOT match — only exact signals do.
+    foundation = _task(title="Build the auth foundation",
+                       context={"related_files": ["backend/app/auth.py"]})
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "capability", "ref": "auth"}
+    assert resolve_blocked_need(blocked, need, [foundation]) is None
+
+
+def test_capability_ambiguous_returns_none():
+    a = _task(payloads=[{"type": "design"}])
+    b = _task(title="design")
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "capability", "ref": "design"}
+    assert resolve_blocked_need(blocked, need, [a, b]) is None
+
+
+# ── guards ───────────────────────────────────────────────────────────────────
+
+def test_self_edge_refused():
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": str(blocked.id)}
+    # Even if the blocked task appears in its own candidate set, no self-edge.
+    assert resolve_blocked_need(blocked, need, [blocked]) is None
+
+
+def test_cycle_refused():
+    blocked = _task(status=TaskStatus.BLOCKED)
+    # foundation already depends_on the blocked task -> adding blocked->foundation
+    # would close a cycle.
+    foundation = _task(depends_on=[str(blocked.id)])
+    need = {"kind": "task", "ref": str(foundation.id)}
+    assert resolve_blocked_need(blocked, need, [foundation]) is None
+
+
+def test_malformed_need_returns_none():
+    blocked = _task(status=TaskStatus.BLOCKED)
+    assert resolve_blocked_need(blocked, {}, [_task()]) is None
+    assert resolve_blocked_need(blocked, {"kind": "task"}, [_task()]) is None
+    assert resolve_blocked_need(blocked, {"ref": "x"}, [_task()]) is None
+    assert resolve_blocked_need(blocked, {"kind": "bogus", "ref": "x"}, [_task()]) is None
+
+
+def test_unknown_kind_returns_none():
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "branch", "ref": "main"}
+    assert resolve_blocked_need(blocked, need, [_task()]) is None

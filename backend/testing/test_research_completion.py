@@ -2530,3 +2530,129 @@ async def test_non_spawning_findings_skip_grader_even_when_enabled(db_session, m
     ), "observation-only findings must not escalate to an independent grader"
     await db_session.refresh(task)
     assert task.status != TaskStatus.EVALUATING, "must not park when nothing would spawn"
+
+
+@_pytest.mark.asyncio
+async def test_finding_prerequisite_wires_depends_on_to_inflight_foundation(
+    db_session, mocker
+):
+    """A finding declaring an explicit {kind:task} prerequisite that matches an
+    in-flight task gets a depends_on edge to it instead of rebuilding it."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq01")
+
+    # An unrelated in-flight foundation already building shared scaffolding.
+    foundation = _Task(
+        project_id=_project.id,
+        title="Provision shared database schema",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(foundation)
+    await db_session.commit()
+    await db_session.refresh(foundation)
+
+    finding = _make_finding(title="Add login endpoint", direction_id=direction["id"])
+    finding["prerequisite"] = {"kind": "task", "ref": str(foundation.id)}
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    assert str(foundation.id) in (children[0].depends_on or []), (
+        "the dependent finding must structurally depend on the in-flight foundation"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_batch_findings_share_single_foundation_via_capability(
+    db_session, mocker
+):
+    """Two findings declaring the same capability prerequisite both wire onto the
+    single sibling foundation that advertises that capability — exactly one
+    foundation, two dependents."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq02")
+
+    foundation_finding = _make_finding(
+        title="Establish payment gateway core", direction_id=direction["id"]
+    )
+    foundation_finding["provides_capability"] = "payment-core"
+    dep_a = _make_finding(title="Add refund flow", direction_id=direction["id"])
+    dep_a["prerequisite"] = {"kind": "capability", "ref": "payment-core"}
+    dep_b = _make_finding(title="Wire chargeback handler", direction_id=direction["id"])
+    dep_b["prerequisite"] = {"kind": "capability", "ref": "payment-core"}
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[foundation_finding, dep_a, dep_b],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_title = {c.title: c for c in children}
+    assert len(children) == 3, "exactly one foundation + two dependents must spawn"
+    foundation_child = by_title["Establish payment gateway core"]
+    assert (foundation_child.context or {}).get("provides_capability") == "payment-core"
+    for dep_title in ("Add refund flow", "Wire chargeback handler"):
+        assert str(foundation_child.id) in (by_title[dep_title].depends_on or []), (
+            f"{dep_title} must depend on the single shared foundation"
+        )
+
+
+@_pytest.mark.asyncio
+async def test_finding_without_prerequisite_spawns_with_no_extra_deps(
+    db_session, mocker
+):
+    """A finding with no declared prerequisite spawns unchanged (no depends_on)."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq03")
+    finding = _make_finding(title="Tidy logging output", direction_id=direction["id"])
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    assert not (children[0].depends_on or []), (
+        "a finding with no prerequisite must not gain a dependency edge"
+    )

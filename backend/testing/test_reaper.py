@@ -7116,6 +7116,7 @@ class TestMarkLandedParentDependents:
 from app.reaper_sweeps import (  # noqa: E402
     sweep_unblock_blocked_tasks,
     _BLOCKED_ESCALATE_AFTER,
+    _BLOCKED_ESCALATED_PARK,
     _BLOCKED_OPTIMISTIC_RETRY_CAP,
 )
 from app.time_utils import _utcnow  # noqa: E402
@@ -7330,6 +7331,182 @@ async def test_unblock_sweep_parks_agent_precondition_after_retry_budget_spent(
     assert t.status == TaskStatus.BLOCKED
     assert t.recheck_after is not None and t.recheck_after > now
     assert t.context.get("_blocked_recheck_attempts") == 1
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_resolves_task_need_into_dep_edge_and_requeues(
+    reaper_db, mocker
+):
+    """An agent BLOCKER carrying a machine-resolvable {kind:'task'} need is
+    resolved into a real depends_on edge onto the in-flight foundation and
+    requeued — SHORT-CIRCUITING the optimistic-retry path (no wasted re-dispatch
+    loop; the dispatch-time dependency gate now holds it)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    foundation = Task(
+        project_id=project.id, title="foundation", description="x",
+        status=TaskStatus.IN_PROGRESS, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}], context={}, status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: needs the foundation task first",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "foundation",
+                "reason": "BLOCKER: needs the foundation task first",
+                "need": {"kind": "task", "ref": str(foundation.id)},
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    # The need became a real dependency edge onto the foundation.
+    assert str(foundation.id) in (t.depends_on or [])
+    # Resolution short-circuited the optimistic retry: no retry budget consumed.
+    assert t.context.get("_blocked_optimistic_retries") is None
+    # Blocker metadata cleared on requeue.
+    assert "blocker" not in (t.context or {})
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_resolves_pr_need_to_owning_task(reaper_db, mocker):
+    """A {kind:'pr'} need resolves onto the in-flight task that owns that PR."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    owner = Task(
+        project_id=project.id, title="pr-owner", description="x",
+        status=TaskStatus.IN_PROGRESS, created_by="u", requires_approval=False,
+        payloads=[{"type": "fix", "pr_number": 7919}], context={}, status_log=[],
+    )
+    reaper_db.add(owner)
+    await reaper_db.commit()
+    await reaper_db.refresh(owner)
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="precondition",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "PR 7919",
+                "need": {"kind": "pr", "ref": "7919"},
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    assert str(owner.id) in (t.depends_on or [])
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_unresolvable_capability_need_falls_through_to_retry(
+    reaper_db, mocker
+):
+    """A {kind:'capability'} need with NO conservative candidate match does NOT
+    wire an edge — it falls through to the existing optimistic-retry path
+    unchanged (the edge-resolution must never invent a false dependency)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    # An in-flight task that does NOT match the capability ref by any exact signal.
+    other = Task(
+        project_id=project.id, title="unrelated work", description="x",
+        status=TaskStatus.IN_PROGRESS, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}], context={}, status_log=[],
+    )
+    reaper_db.add(other)
+    await reaper_db.commit()
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: needs an auth subsystem",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "auth",
+                "reason": "BLOCKER: needs an auth subsystem",
+                "need": {"kind": "capability", "ref": "auth"},
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    # No edge wired; the optimistic-retry path handled it instead.
+    assert not (t.depends_on or [])
+    assert t.context.get("_blocked_optimistic_retries") == 1
+    assert "optimistic" in (t.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_does_not_resolve_when_dep_edge_already_present(
+    reaper_db, mocker
+):
+    """A task that already carries a depends_on edge is left to the structural-
+    wait path — resolution only fills the MISSING-edge gap."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    dep = Task(
+        project_id=project.id, title="existing-dep", description="x",
+        status=TaskStatus.IN_PROGRESS, created_by="u", requires_approval=False,
+        payloads=[{"type": "fix"}], context={}, status_log=[],
+    )
+    foundation = Task(
+        project_id=project.id, title="foundation", description="x",
+        status=TaskStatus.IN_PROGRESS, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}], context={}, status_log=[],
+    )
+    reaper_db.add_all([dep, foundation])
+    await reaper_db.commit()
+    await reaper_db.refresh(dep)
+    await reaper_db.refresh(foundation)
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        depends_on=[str(dep.id)],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "foundation",
+                "need": {"kind": "task", "ref": str(foundation.id)},
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+    verify = AsyncMock(return_value=False)
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now, verify_pr_merged=verify)
+
+    # The in-flight existing dep keeps it BLOCKED; no new edge appended.
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    assert t.depends_on == [str(dep.id)]
 
 
 @pytest.mark.asyncio
@@ -7630,6 +7807,82 @@ async def test_unblock_sweep_deadline_escalation(reaper_db, mocker):
         )
     ).scalars().all()
     assert len(alerts2) == 1
+
+
+@pytest.mark.asyncio
+async def test_park_horizon_is_never_silent_invariant(reaper_db, mocker):
+    """INVARIANT: a BLOCKED task only reaches the far-future parked horizon AFTER a
+    tracked operator escalation alert has been emitted — a park is never silent.
+
+    Runs the unblock sweep over a mixed population (one past-deadline blocker that
+    must escalate+park, one under-budget agent blocker that must requeue and never
+    park) and asserts that EVERY task left parked at the horizon carries the
+    ``_blocked_escalated`` flag AND has a matching ERROR escalation alert. This
+    guards the observability of parked blockers (compute_parked_blocker_summary
+    keys off the same flag): a park without an alert would be an uncounted,
+    invisible permanently-stuck task.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    # (a) Past-deadline conflict blocker → escalates terminally and parks.
+    escalated = await _blocked_task(
+        reaper_db, project, depends_on=[],
+        blocked_at=now - _BLOCKED_ESCALATE_AFTER - timedelta(minutes=5),
+        recheck_after=now - timedelta(minutes=1),
+    )
+    # (b) Fresh, under-budget agent blocker → optimistically requeued, never parked.
+    requeuable = await _blocked_task(
+        reaper_db, project, depends_on=[],
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: orchestrator ./pr open returned HTTP 500",
+        blocked_at=now,
+        context={"blocker": {"source": "agent"}},
+    )
+
+    await sweep_unblock_blocked_tasks(
+        reaper_db, now, verify_pr_merged=AsyncMock(return_value=False)
+    )
+
+    # Park horizon = recheck_after pushed (close to) _BLOCKED_ESCALATED_PARK ahead.
+    park_floor = now + _BLOCKED_ESCALATED_PARK - timedelta(days=1)
+    parked_rows = (
+        await reaper_db.execute(
+            _select(Task).where(
+                Task.project_id == project.id,
+                Task.status == TaskStatus.BLOCKED,
+                Task.recheck_after >= park_floor,
+            )
+        )
+    ).scalars().all()
+
+    # Exactly the escalated task is parked, and the requeued one is not.
+    assert {str(r.id) for r in parked_rows} == {str(escalated.id)}
+
+    # The core invariant: every parked task is escalation-flagged AND alerted.
+    for row in parked_rows:
+        assert row.context.get("_blocked_escalated") is True
+        alerts = (
+            await reaper_db.execute(
+                _select(Alert).where(
+                    Alert.task_id == row.id,
+                    Alert.severity == AlertSeverity.ERROR,
+                )
+            )
+        ).scalars().all()
+        assert len(alerts) == 1, "a park must be preceded by an escalation alert"
+        assert "permanently blocked" in alerts[0].title
+
+    # The under-budget blocker requeued instead of parking — no silent park, no alert.
+    await reaper_db.refresh(requeuable)
+    assert requeuable.status == TaskStatus.QUEUED
+    no_alerts = (
+        await reaper_db.execute(
+            _select(Alert).where(Alert.task_id == requeuable.id)
+        )
+    ).scalars().all()
+    assert no_alerts == []
 
 
 @pytest.mark.asyncio

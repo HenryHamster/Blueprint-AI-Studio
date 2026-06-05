@@ -660,6 +660,70 @@ def _clear_blocked_fields(task, *, preserve_first_blocked: bool = False) -> None
     task.context = ctx
 
 
+async def _fetch_active_candidates(session, project_id) -> list:
+    """Active/in-flight tasks in a project — the foundations a need can resolve to.
+
+    Statuses mirror ``blocked_need_resolution.ACTIVE_CANDIDATE_STATUSES``: a need
+    can only resolve onto work that is still going to land (QUEUED/PROVISIONING/
+    IN_PROGRESS/EVALUATING), never onto already-terminal rows.
+    """
+    from app.blocked_need_resolution import ACTIVE_CANDIDATE_STATUSES
+
+    active = [TaskStatus(s) for s in ACTIVE_CANDIDATE_STATUSES]
+    return (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.status.in_(active),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def _resolve_need_into_dep_edge(
+    task, ctx, session, *, candidate_cache: dict
+) -> bool:
+    """Turn a blocked task's machine-resolvable need into a real depends_on edge.
+
+    Returns ``True`` when a foundation was matched and an edge wired (the caller
+    then requeues the task to QUEUED and SHORT-CIRCUITS the optimistic-retry /
+    escalate-and-park path). Returns ``False`` (no mutation) when the task has no
+    need, already carries a dependency edge, or no conservative match exists — so
+    the existing precondition machinery runs unchanged.
+    """
+    from app.task_blocked import get_blocker_metadata
+    from app.blocked_need_resolution import resolve_blocked_need
+
+    # Only attempt resolution for a need with NO existing edge: a task that
+    # already depends on something is carried by the structural-wait path.
+    if task.depends_on:
+        return False
+    need = get_blocker_metadata(task).get("need")
+    if not isinstance(need, dict):
+        return False
+
+    candidates = candidate_cache.get(task.project_id)
+    if candidates is None:
+        candidates = await _fetch_active_candidates(session, task.project_id)
+        candidate_cache[task.project_id] = candidates
+
+    match = resolve_blocked_need(task, need, candidates)
+    if match is None:
+        return False
+
+    # Idempotently add the foundation as a dependency. Full-list reassignment so
+    # SQLAlchemy observes the JSONB change (flag_modified is applied by callers).
+    match_id = str(match.id)
+    existing = [str(d) for d in (task.depends_on or [])]
+    if match_id not in existing:
+        task.depends_on = existing + [match_id]
+    return True
+
+
 async def sweep_unblock_blocked_tasks(
     session,
     now: datetime,
@@ -703,6 +767,9 @@ async def sweep_unblock_blocked_tasks(
     # admin UI (which refetches task/digest data on these events) never observes
     # a stale BLOCKED row — or, on rollback, a transition that never persisted.
     pending_broadcasts: list[tuple[str, dict]] = []
+    # Active-candidate lists are fetched at most once per project across the batch
+    # (only when a task actually has a resolvable need with no edge).
+    candidate_cache: dict = {}
 
     async def _escalate_blocked_task(
         task,
@@ -741,6 +808,37 @@ async def sweep_unblock_blocked_tasks(
                 task.recheck_after = now + _BLOCKED_ESCALATED_PARK
                 session.add(task)
                 changed = True
+            continue
+
+        # Cross-task RESOLUTION (runs BEFORE the optimistic-retry / escalate path):
+        # if this task's machine-resolvable need names an in-flight foundation,
+        # wire a real depends_on edge onto it and requeue. The dispatch-time
+        # dependency gate then holds the task until the foundation lands and the
+        # blocked-resume machinery carries it — no wasted re-dispatch. A successful
+        # resolution SHORT-CIRCUITS the bounded optimistic retry below.
+        if await _resolve_need_into_dep_edge(
+            task, ctx, session, candidate_cache=candidate_cache
+        ):
+            _clear_blocked_fields(task, preserve_first_blocked=False)
+            task.status = TaskStatus.QUEUED
+            task.latest_status_message = (
+                "Unblocked — need resolved into dependency edge, requeued"
+            )
+            flag_modified(task, "context")
+            flag_modified(task, "depends_on")
+            session.add(task)
+            requeued += 1
+            changed = True
+            pending_broadcasts.append(
+                (
+                    str(task.project_id),
+                    {
+                        "task_id": str(task.id),
+                        "status": "QUEUED",
+                        "message": task.latest_status_message,
+                    },
+                )
+            )
             continue
 
         state = await _blocked_precondition_state(task, session, verify_pr_merged)

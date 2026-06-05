@@ -39,6 +39,41 @@ BLOCKED_PRECONDITION = "BLOCKED_PRECONDITION"
 # JSONB key under Task.context that holds the structured blocker metadata.
 BLOCKER_CONTEXT_KEY = "blocker"
 
+# ── Canonical machine-resolvable NEED primitive ──────────────────────────────
+# A "need" names the specific precondition a piece of blocked work depends on,
+# in a normalized, machine-resolvable shape: ``{kind, ref}`` (plus an optional
+# human ``label``). ``kind`` is one of NEED_KINDS — a sibling task, a PR, or a
+# capability/foundation description. This is the single canonical shape reused
+# by BOTH agent blockers (via the status endpoint) and research findings that
+# declare a prerequisite. Capturing it changes NO resolution behavior yet — it
+# is persisted alongside the existing free-text waiting_on/reason so a later
+# resolver can match against it.
+NEED_KINDS: tuple[str, ...] = ("task", "pr", "capability")
+NEED_REF_MAX_LEN = 200
+NEED_LABEL_MAX_LEN = 200
+
+
+def build_need(
+    kind: str, ref: str, label: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Return a normalized need dict ``{kind, ref[, label]}`` or ``None``.
+
+    Returns ``None`` when ``kind`` is not a recognized NEED kind or ``ref`` is
+    empty after trimming, so callers can pass through unvalidated input and only
+    persist a well-formed need. Length-bounds ``ref`` and ``label``.
+    """
+    if kind not in NEED_KINDS:
+        return None
+    ref_text = (ref or "").strip()
+    if not ref_text:
+        return None
+    need: Dict[str, Any] = {"kind": kind, "ref": ref_text[:NEED_REF_MAX_LEN]}
+    if label:
+        label_text = str(label).strip()
+        if label_text:
+            need["label"] = label_text[:NEED_LABEL_MAX_LEN]
+    return need
+
 # Default interval before a blocked task is rechecked by the auto-unblock sweep.
 DEFAULT_BLOCKER_RECHECK_SECONDS = 600
 _UPSTREAM_REASON_MARKERS = (
@@ -93,6 +128,7 @@ def enter_blocked_state(
     recheck_in_seconds: Optional[int] = DEFAULT_BLOCKER_RECHECK_SECONDS,
     deadline_at: Optional[datetime] = None,
     escalated: bool = False,
+    need: Optional[Dict[str, Any]] = None,
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Transition ``task`` into the BLOCKED state and persist blocker metadata.
@@ -126,6 +162,15 @@ def enter_blocked_state(
         "deadline_at": _iso(deadline_at),
         "escalated": bool(escalated),
     }
+    # Normalized machine-resolvable prerequisite, if the caller supplied one.
+    # Re-validated through build_need so a malformed dict is never persisted;
+    # absent/invalid need leaves the metadata shape exactly as before.
+    if isinstance(need, dict):
+        normalized_need = build_need(
+            need.get("kind"), need.get("ref"), need.get("label")
+        )
+        if normalized_need:
+            meta["need"] = normalized_need
     ctx = dict(task.context or {})
     ctx[BLOCKER_CONTEXT_KEY] = meta
     # Preserve BLOCKED_PRECONDITION classification compatibility so historical

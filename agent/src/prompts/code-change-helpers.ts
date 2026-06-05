@@ -302,7 +302,25 @@ function writeBlockedHelper(cfg: CodeChangeHelperConfig): void {
 # to spawn a precondition-fix direction.
 
 set -uo pipefail
-REASON="\${1:?Usage: ./blocked \\"<reason>\\"}"
+
+# Optional structured prerequisite flags. When given, the blocker carries a
+# normalized machine-resolvable need ({kind, ref}) alongside the free-text
+# reason. Without any flag the payload is byte-for-byte the legacy shape.
+REASON=""
+NEED_KIND=""
+NEED_REF=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --needs-task) NEED_KIND="task"; NEED_REF="\${2:-}"; shift 2;;
+    --needs-pr) NEED_KIND="pr"; NEED_REF="\${2:-}"; shift 2;;
+    --needs-capability) NEED_KIND="capability"; NEED_REF="\${2:-}"; shift 2;;
+    *) if [ -z "$REASON" ]; then REASON="$1"; fi; shift;;
+  esac
+done
+if [ -z "$REASON" ]; then
+  echo "Usage: ./blocked \\"<reason>\\" [--needs-task <id>|--needs-pr <n>|--needs-capability \\"<desc>\\"]" >&2
+  exit 1
+fi
 
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
@@ -319,8 +337,14 @@ fi
 # the routing is unambiguous regardless of which path the orchestrator
 # takes (normalize_agent_failure_category vs the BLOCKER:-prefix
 # fast-path in _classify_failure_class).
-PAYLOAD=$(jq -n --arg tid "$TASK" --arg r "BLOCKER: $REASON" \\
-  '{task_id: $tid, status: "FAILED", artifact_type: "ERROR_LOG", logs: $r, failure_category: "BLOCKED_PRECONDITION"}')
+if [ -n "$NEED_KIND" ] && [ -n "$NEED_REF" ]; then
+  PAYLOAD=$(jq -n --arg tid "$TASK" --arg r "BLOCKER: $REASON" \\
+    --arg nk "$NEED_KIND" --arg nr "$NEED_REF" \\
+    '{task_id: $tid, status: "FAILED", artifact_type: "ERROR_LOG", logs: $r, failure_category: "BLOCKED_PRECONDITION", blocked_need: {kind: $nk, ref: $nr}}')
+else
+  PAYLOAD=$(jq -n --arg tid "$TASK" --arg r "BLOCKER: $REASON" \\
+    '{task_id: $tid, status: "FAILED", artifact_type: "ERROR_LOG", logs: $r, failure_category: "BLOCKED_PRECONDITION"}')
+fi
 POSTED=0
 for attempt in 1 2 3 4 5; do
   HTTP=$(printf '%s' "$PAYLOAD" | curl -sS -o /tmp/blocked_resp_${cfg.taskId} -w '%{http_code}' --max-time 30 \\

@@ -1211,6 +1211,177 @@ def compute_anomaly_adjustment_summary() -> Dict[str, Any]:
     }
 
 
+# ── Dependency-health observability (read-only) ────────────────────────────
+#
+# Two failure modes the foundation-resolution work exists to prevent are
+# otherwise invisible to operators and to the pipeline's own metrics:
+#   1. PARKED BLOCKERS — a BLOCKED task that outlived its escalation deadline is
+#      escalated once (ERROR alert) and then parked by pushing recheck_after far
+#      into the future (``reaper_sweeps._BLOCKED_ESCALATED_PARK``), dropping it
+#      off the recovery sweep's due-queue until a manual operator requeue. Nothing
+#      counts how many tasks sit in this parked state.
+#   2. DUPLICATED FOUNDATIONS — the file-conflict filter deliberately lets two
+#      write-tasks under DIFFERENT parents touch the same files in parallel and
+#      reconcile at merge, so two tasks independently building the same foundation
+#      are never flagged.
+# Both helpers below are READ-ONLY and observational: they make the patterns
+# measurable without changing resume or conflict-resolution behavior.
+
+# Code-change ("write") task types — the ones that produce a PR and can build a
+# foundation. Mirrors ``sr_review_quality_metrics._SR_CODE_CHANGE_TYPES``.
+_WRITE_TASK_TYPES = frozenset({"create", "fix", "refactor", "migrate"})
+# Two active write-tasks under DIFFERENT parents whose related-file sets overlap
+# by at least this Jaccard ratio are surfaced as a candidate duplicated
+# foundation. Deliberately conservative (strong overlap only) so the signal
+# flags genuine duplication rather than incidental shared-file edits.
+_FOUNDATION_OVERLAP_THRESHOLD = 0.5
+# Defensive caps on the surfaced lists so a large backlog never bloats the digest.
+_PARKED_BLOCKER_LIST_LIMIT = 100
+_DUPLICATE_FOUNDATION_LIST_LIMIT = 50
+
+
+def _task_related_files(t: "Task") -> set:
+    """Best-effort related-file set for a task (context first, then payload)."""
+    files = (t.context or {}).get("related_files")
+    if not isinstance(files, list):
+        files = (t.first_payload or {}).get("related_files")
+    if not isinstance(files, list):
+        return set()
+    return {f for f in files if isinstance(f, str) and f}
+
+
+def compute_parked_blocker_summary(blocked_tasks: List[Task]) -> Dict[str, Any]:
+    """Count and list BLOCKED tasks that were escalated and parked awaiting requeue.
+
+    Pure function — no database calls. A *parked* blocker is a BLOCKED task whose
+    context carries ``_blocked_escalated`` (set by
+    ``reaper_sweeps._escalate_blocked_task`` ONLY after a tracked operator
+    escalation alert was emitted). The recovery sweep stops rechecking these and
+    pushes ``recheck_after`` far into the future, so they need a manual operator
+    requeue. Returns the total count plus a capped list with enough context to
+    find and requeue each one. Newest-parked first.
+    """
+    parked: List[Dict[str, Any]] = []
+    for t in blocked_tasks:
+        ctx = t.context or {}
+        if not ctx.get("_blocked_escalated"):
+            continue
+        blocked_at = getattr(t, "blocked_at", None)
+        recheck_after = getattr(t, "recheck_after", None)
+        parked.append(
+            {
+                "task_id": str(t.id),
+                "title": t.title or str(t.id)[:8],
+                "project_id": str(t.project_id)
+                if getattr(t, "project_id", None) is not None
+                else None,
+                "blocker_kind": getattr(t, "blocker_kind", None),
+                "blocked_reason": getattr(t, "blocked_reason", None)
+                or t.latest_status_message,
+                "blocked_at": blocked_at.isoformat() if blocked_at else None,
+                "recheck_after": recheck_after.isoformat() if recheck_after else None,
+                "direction_id": ctx.get("direction_id"),
+            }
+        )
+    parked.sort(key=lambda r: r["blocked_at"] or "", reverse=True)
+    return {"total": len(parked), "tasks": parked[:_PARKED_BLOCKER_LIST_LIMIT]}
+
+
+def compute_duplicate_foundation_signal(
+    active_write_tasks: List[Task],
+) -> Dict[str, Any]:
+    """Count candidate duplicated foundations among concurrently-active write-tasks.
+
+    Pure function — no database calls. A *candidate* is a pair of active
+    code-change tasks under DIFFERENT parents whose related-file sets overlap by at
+    least ``_FOUNDATION_OVERLAP_THRESHOLD`` (Jaccard). Same-parent siblings are
+    skipped — those are intra-decomposition work gated by explicit ``depends_on``
+    edges, not the silent cross-parent duplication this signal surfaces. Returns
+    the candidate-pair count plus a capped list (the two task ids, the overlap
+    ratio, and the shared files). Observational only — the pipeline still lets the
+    tasks proceed and reconcile at merge.
+    """
+    enriched = [
+        (t, _task_related_files(t))
+        for t in active_write_tasks
+        if (t.first_payload or {}).get("type") in _WRITE_TASK_TYPES
+    ]
+    enriched = [(t, files) for t, files in enriched if files]
+
+    candidates: List[Dict[str, Any]] = []
+    for i in range(len(enriched)):
+        ti, fi = enriched[i]
+        pi = getattr(ti, "parent_task_id", None)
+        for j in range(i + 1, len(enriched)):
+            tj, fj = enriched[j]
+            pj = getattr(tj, "parent_task_id", None)
+            # Different parents only — same non-None parent reconciles by design.
+            if pi is not None and pi == pj:
+                continue
+            inter = fi & fj
+            if not inter:
+                continue
+            union = fi | fj
+            overlap = len(inter) / len(union)
+            if overlap < _FOUNDATION_OVERLAP_THRESHOLD:
+                continue
+            candidates.append(
+                {
+                    "task_ids": [str(ti.id), str(tj.id)],
+                    "overlap_ratio": round(overlap, 3),
+                    "shared_files": sorted(inter),
+                }
+            )
+    candidates.sort(key=lambda c: c["overlap_ratio"], reverse=True)
+    return {
+        "total": len(candidates),
+        "candidates": candidates[:_DUPLICATE_FOUNDATION_LIST_LIMIT],
+    }
+
+
+async def compute_dependency_health_signals(
+    session: AsyncSession,
+    project_id: "uuid.UUID | None" = None,
+) -> Dict[str, Any]:
+    """Surface the parked-blocker and duplicate-foundation observability signals.
+
+    Read-only: runs two small self-contained queries (escalated/parked BLOCKED
+    tasks; active IN_PROGRESS tasks) and delegates to the pure summarizers above.
+    Never mutates state. Scoped to ``project_id`` when provided, else fleet-wide.
+    """
+    blocked_filters = [
+        Task.status == TaskStatus.BLOCKED,
+        Task.context["_blocked_escalated"].astext == "true",
+    ]
+    if project_id is not None:
+        blocked_filters.append(Task.project_id == project_id)
+    blocked = (
+        (
+            await session.execute(
+                select(Task).where(*blocked_filters).limit(_PARKED_BLOCKER_LIST_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    active_filters = [Task.status == TaskStatus.IN_PROGRESS]
+    if project_id is not None:
+        active_filters.append(Task.project_id == project_id)
+    active = (
+        (await session.execute(select(Task).where(*active_filters).limit(1000)))
+        .scalars()
+        .all()
+    )
+
+    return {
+        "parked_blockers": compute_parked_blocker_summary(list(blocked)),
+        "duplicate_foundation_candidates": compute_duplicate_foundation_signal(
+            list(active)
+        ),
+    }
+
+
 def compute_migration_health(
     completed_tasks: List[Task],
     failed_tasks: List[Task],

@@ -66,6 +66,11 @@ _STOPWORDS = frozenset(
 
 _PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
+# Whitelisted prerequisite kinds for the machine-resolvable {kind, ref} need
+# representation a finding may declare. Conservative by design: only these two
+# kinds are ever resolved into a dependency edge — anything else is dropped.
+VALID_PREREQUISITE_KINDS = frozenset({"task", "capability"})
+
 
 def _task_context(task: Task) -> dict:
     ctx = task.context or {}
@@ -120,6 +125,89 @@ def is_duplicate(
         if len(overlap) >= threshold:
             return True
     return False
+
+
+def normalize_prerequisite(raw: object) -> Optional[dict]:
+    """Coerce a finding's declared prerequisite into a validated ``{kind, ref}``.
+
+    The need representation is intentionally tiny and machine-resolvable: a
+    ``kind`` drawn from :data:`VALID_PREREQUISITE_KINDS` and a non-empty ``ref``
+    string. Returns ``None`` for any malformed input (non-dict, missing/blank
+    ref, non-string fields) or an unknown kind, so callers can treat "declared a
+    prerequisite" as a hard, explicit signal rather than a fuzzy guess.
+
+    ``kind`` is lowercased; ``ref`` is whitespace-stripped but case-preserved
+    (task ids / finding hashes are case-sensitive; capability matching lowercases
+    at compare time).
+    """
+    if not isinstance(raw, dict):
+        return None
+    kind = raw.get("kind")
+    ref = raw.get("ref")
+    if not isinstance(kind, str) or not isinstance(ref, str):
+        return None
+    kind = kind.strip().lower()
+    ref = ref.strip()
+    if kind not in VALID_PREREQUISITE_KINDS or not ref:
+        return None
+    return {"kind": kind, "ref": ref}
+
+
+def _task_capability_markers(task: Task) -> set[str]:
+    """Return the explicit capability markers a task advertises in its context.
+
+    Looks only at the explicit ``provides_capability`` / ``capability`` context
+    keys (string or list-of-strings). No inference from title/files — a task
+    only "provides" a capability if it says so.
+    """
+    ctx = _task_context(task)
+    markers: set[str] = set()
+    for key in ("provides_capability", "capability"):
+        val = ctx.get(key)
+        if isinstance(val, str) and val.strip():
+            markers.add(val.strip().lower())
+        elif isinstance(val, (list, tuple, set)):
+            for v in val:
+                if isinstance(v, str) and v.strip():
+                    markers.add(v.strip().lower())
+    return markers
+
+
+def resolve_prerequisite_task(
+    prereq: object,
+    candidate_tasks: Iterable[Task],
+) -> Optional[Task]:
+    """Conservatively resolve a declared prerequisite to one candidate task.
+
+    EXPLICIT references only — never fuzzy title overlap — so genuinely
+    independent work is never falsely serialized:
+
+      * ``kind == "task"``: ``ref`` must equal ``str(task.id)`` or the task's
+        ``context["finding_hash"]``.
+      * ``kind == "capability"``: ``ref`` (case-insensitive) must match an
+        explicit capability marker on the task (see
+        :func:`_task_capability_markers`).
+
+    ``prereq`` is normalized internally, so a raw finding field can be passed
+    directly. Returns the first matching :class:`Task`, or ``None`` when the
+    prereq is malformed or nothing matches. The candidate enumeration (e.g.
+    active/queued/in-flight statuses) is entirely the caller's responsibility.
+    """
+    normalized = normalize_prerequisite(prereq)
+    if normalized is None:
+        return None
+    kind = normalized["kind"]
+    ref = normalized["ref"]
+    for task in candidate_tasks:
+        if task is None:
+            continue
+        if kind == "task":
+            if ref == str(task.id) or ref == _task_finding_hash(task):
+                return task
+        elif kind == "capability":
+            if ref.lower() in _task_capability_markers(task):
+                return task
+    return None
 
 
 def build_dedup_state(

@@ -51,6 +51,8 @@ from app.finding_deduplication import (
     extract_archived_diagnoses,
     finding_hash as _finding_hash,  # noqa: F401 — re-exported for callers/tests
     is_duplicate as _is_duplicate,  # noqa: F401 — re-exported for callers/tests
+    normalize_prerequisite,
+    resolve_prerequisite_task,
 )
 from app.payload_schemas import validate_internal_payload
 from app.playbook_learning import (
@@ -1075,6 +1077,26 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # tier while its own citations are absent at HEAD. Reuses the broken-ref
         # and ungrounded-claim signals already in hand (no new I/O).
         _reconcile_verification_basis(_f, _broken_provenance, _ungrounded)
+
+    # Normalize an optional declared prerequisite (machine-resolvable {kind, ref}
+    # need) onto each finding. A finding may name an in-flight foundation task or
+    # a named capability it depends on; malformed/unknown-kind declarations are
+    # dropped so only explicit references ever drive a dependency edge later.
+    for _f in findings:
+        _prereq_raw = _f.get("prerequisite") or _f.get("requires")
+        _prereq = normalize_prerequisite(_prereq_raw)
+        if _prereq is not None:
+            _f["_prerequisite"] = _prereq
+        else:
+            _f.pop("_prerequisite", None)
+        # An explicit capability a finding's task advertises, so a sibling
+        # finding declaring {kind:capability, ref:<name>} can structurally
+        # depend on it (intra-batch foundation sharing). Explicit string only.
+        _cap = _f.get("provides_capability") or _f.get("capability")
+        if isinstance(_cap, str) and _cap.strip():
+            _f["_provides_capability"] = _cap.strip()
+        else:
+            _f.pop("_provides_capability", None)
 
     _structural_downgrades = _apply_structural_actionability_downgrade(findings)
 
@@ -2457,6 +2479,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "related_files": related_files,
                 "finding_hash": fhash,
                 **(
+                    {"provides_capability": finding["_provides_capability"]}
+                    if finding.get("_provides_capability")
+                    else {}
+                ),
+                **(
                     {"direction_id": direction_id}
                     if direction_id
                     else (
@@ -2693,6 +2720,38 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if explicit_deps:
             ct.depends_on = explicit_deps
             session.add(ct)
+
+    # Foundation-aware cross-task wiring: when a finding declares an EXPLICIT
+    # {kind, ref} prerequisite, resolve it against (a) tasks already active /
+    # queued / in-flight in this project and (b) the sibling tasks just spawned
+    # in this batch, then append the matched foundation's id to depends_on. This
+    # lets a finding that requires a shared foundation depend on the single task
+    # already building it — in-flight or a sibling — instead of each dependent
+    # rebuilding the foundation. Conservative: explicit references only (see
+    # resolve_prerequisite_task); never overwrites the explicit_deps above.
+    _prereq_candidates = list(existing_tasks) + list(child_tasks)
+    for ci, ct in enumerate(child_tasks):
+        fi = finding_indices[ci]
+        prereq = findings[fi].get("_prerequisite")
+        if not prereq:
+            continue
+        foundation = resolve_prerequisite_task(prereq, _prereq_candidates)
+        if foundation is None or foundation.id == ct.id:
+            continue
+        foundation_id = str(foundation.id)
+        existing_dep = list(ct.depends_on or [])
+        if foundation_id not in existing_dep:
+            existing_dep.append(foundation_id)
+            ct.depends_on = existing_dep
+            session.add(ct)
+            logger.info(
+                "[RESEARCH] Wired finding '%s' depends_on foundation %s "
+                "(prerequisite %s:%s)",
+                findings[fi].get("title", f"#{fi}"),
+                foundation_id,
+                prereq.get("kind"),
+                prereq.get("ref"),
+            )
 
     # Chain auto-decomposed siblings: when a finding is split into N sub-tasks
     # by cochange/path clustering, run them serially rather than in parallel.

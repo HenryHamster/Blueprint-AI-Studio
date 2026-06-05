@@ -837,3 +837,130 @@ describe('writeCheckHelper — config-driven scoped lint', () => {
     expect(checkScript).not.toContain('if [ "$FULL_SCOPE" = "1" ]; then');
   });
 });
+
+// ── writeCodeChangeHelpers — ./blocked structured NEED flags ──────────────────
+describe('writeCodeChangeHelpers — ./blocked structured need', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  let nextTaskSeq = 0;
+  const cfg = {
+    taskId: 'test-task-123',
+    workBranch: 'blueprint/test-task-123',
+    baseBranch: 'main',
+    owner: 'test-owner',
+    repo: 'test-repo',
+    testsOnMainBranch: true,
+  };
+
+  // Run the generated ./blocked script against a stubbed `curl` that captures
+  // the POSTed payload, then return the parsed JSON body. The stub lives in a
+  // temp bin dir prepended to PATH so the real network is never touched. Each
+  // run uses a UNIQUE taskId so the /tmp/blocked_<taskId> idempotency marker
+  // (written after a successful POST) never short-circuits a sibling run.
+  const runBlocked = async (
+    args: string[],
+  ): Promise<{ exit: number; payload: Record<string, unknown> | null }> => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+
+    const taskId = `blocked-need-${process.pid}-${nextTaskSeq++}`;
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers({ ...cfg, taskId });
+    try { realFs.unlinkSync(`/tmp/blocked_${taskId}`); } catch { /* ignore */ }
+
+    const dir = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), 'blocked-need-'));
+    try {
+      const scriptPath = realPath.join(dir, 'blocked');
+      realFs.writeFileSync(scriptPath, capturedScripts['/tmp/workspace/blocked'], { mode: 0o755 });
+      const bin = realPath.join(dir, 'bin');
+      realFs.mkdirSync(bin);
+      const payloadFile = realPath.join(dir, 'payload.json');
+      // curl stub: drain --data-binary @- from stdin into payloadFile, emit 200.
+      realFs.writeFileSync(
+        realPath.join(bin, 'curl'),
+        `#!/bin/bash\ncat > "${payloadFile}"\nprintf '200'\n`,
+        { mode: 0o755 },
+      );
+      const env = {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        ORCHESTRATOR_URL: 'http://orchestrator.test',
+        AGENT_API_TOKEN: 'tok',
+      };
+      let exit = 0;
+      try {
+        realCp.execFileSync('bash', [scriptPath, ...args], { stdio: 'pipe', env });
+      } catch (err: unknown) {
+        exit = (err as { status?: number }).status ?? -1;
+      }
+      const payload: Record<string, unknown> | null = realFs.existsSync(payloadFile)
+        ? (JSON.parse(realFs.readFileSync(payloadFile, 'utf8')) as Record<string, unknown>)
+        : null;
+      return { exit, payload };
+    } finally {
+      realFs.rmSync(dir, { recursive: true, force: true });
+      try { realFs.unlinkSync(`/tmp/blocked_${taskId}`); } catch { /* ignore */ }
+    }
+  };
+
+  it('generated ./blocked script passes `bash -n` syntax check', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers(cfg);
+    const blocked = capturedScripts['/tmp/workspace/blocked'];
+    expect(blocked).toBeDefined();
+    expect(blocked).toContain('--needs-task');
+    expect(blocked).toContain('--needs-pr');
+    expect(blocked).toContain('--needs-capability');
+
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const tmp = `${realOs.tmpdir().replace(/\\/g, '/')}/blocked_smoke_${process.pid}_${Date.now()}.sh`;
+    realFs.writeFileSync(tmp, blocked);
+    try {
+      realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });
+    } finally {
+      try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  });
+
+  it('emits a normalized need in the payload when --needs-task is given', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers(cfg);
+    const { exit, payload } = await runBlocked(['waiting on foundation', '--needs-task', 't-abc123']);
+    expect(exit).toBe(0);
+    expect(payload?.failure_category).toBe('BLOCKED_PRECONDITION');
+    expect(payload?.logs).toBe('BLOCKER: waiting on foundation');
+    expect(payload?.blocked_need).toEqual({ kind: 'task', ref: 't-abc123' });
+  });
+
+  it('maps --needs-pr and --needs-capability to the right kind', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers(cfg);
+    const pr = await runBlocked(['need pr', '--needs-pr', '7910']);
+    expect(pr.payload?.blocked_need).toEqual({ kind: 'pr', ref: '7910' });
+    const cap = await runBlocked(['need cap', '--needs-capability', 'shared auth layer']);
+    expect(cap.payload?.blocked_need).toEqual({ kind: 'capability', ref: 'shared auth layer' });
+  });
+
+  it('absent-need path is byte-for-byte the legacy payload (no blocked_need key)', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers(cfg);
+    const { exit, payload } = await runBlocked(['just a reason']);
+    expect(exit).toBe(0);
+    expect(payload).not.toBeNull();
+    expect(payload).not.toHaveProperty('blocked_need');
+    expect(payload?.logs).toBe('BLOCKER: just a reason');
+    expect(payload?.failure_category).toBe('BLOCKED_PRECONDITION');
+  });
+});

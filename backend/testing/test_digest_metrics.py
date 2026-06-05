@@ -1968,3 +1968,119 @@ class TestDigestMetricsModuleSeams:
                         "load time — this risks a circular import. Use a "
                         "function-local import instead."
                     )
+
+
+# ── Dependency-health observability signals ────────────────────────────────
+
+
+def test_parked_blocker_summary_counts_only_escalated_blocked():
+    """Only BLOCKED tasks carrying ``_blocked_escalated`` are counted as parked;
+    a still-rechecking blocker (no escalation flag) is excluded."""
+    from app.digest_metrics import compute_parked_blocker_summary
+
+    now = _utcnow()
+    parked = make_task(
+        status=TaskStatus.BLOCKED,
+        title="parked-foundation",
+        blocker_kind="upstream_dependency",
+        blocked_reason="Waiting: foundation never landed",
+        blocked_at=now - timedelta(hours=8),
+        recheck_after=now + timedelta(days=3650),
+        context={"_blocked_escalated": True, "direction_id": "d-1"},
+    )
+    still_rechecking = make_task(
+        status=TaskStatus.BLOCKED,
+        title="still-waiting",
+        context={"_blocked_recheck_attempts": 2},
+    )
+
+    result = compute_parked_blocker_summary([parked, still_rechecking])
+
+    assert result["total"] == 1
+    assert len(result["tasks"]) == 1
+    row = result["tasks"][0]
+    assert row["task_id"] == str(parked.id)
+    assert row["blocker_kind"] == "upstream_dependency"
+    assert row["direction_id"] == "d-1"
+    assert row["blocked_at"] is not None
+
+
+def test_duplicate_foundation_signal_flags_cross_parent_overlap():
+    """Two active write-tasks under DIFFERENT parents whose related-file sets
+    strongly overlap are surfaced; a disjoint task is not."""
+    from app.digest_metrics import compute_duplicate_foundation_signal
+
+    p_a, p_b = uuid4(), uuid4()
+    files = ["app/foundation.py", "app/db.py"]
+    # Cross-parent, identical files → flagged.
+    t1 = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=p_a,
+        payloads=[{"type": "create", "related_files": files}],
+    )
+    t2 = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=p_b,
+        payloads=[{"type": "create", "related_files": files}],
+    )
+    # Disjoint files → NOT flagged.
+    t3 = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create", "related_files": ["app/unrelated.py"]}],
+    )
+
+    result = compute_duplicate_foundation_signal([t1, t2, t3])
+
+    assert result["total"] == 1
+    cand = result["candidates"][0]
+    assert set(cand["task_ids"]) == {str(t1.id), str(t2.id)}
+    assert cand["overlap_ratio"] == 1.0
+    assert cand["shared_files"] == ["app/db.py", "app/foundation.py"]
+
+
+def test_duplicate_foundation_signal_skips_same_parent_siblings():
+    """Same-parent siblings are intra-decomposition work gated by depends_on
+    edges, not the silent cross-parent duplication this signal surfaces — so an
+    overlapping same-parent pair is NOT flagged."""
+    from app.digest_metrics import compute_duplicate_foundation_signal
+
+    parent = uuid4()
+    files = ["app/foundation.py", "app/db.py"]
+    t1 = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=parent,
+        payloads=[{"type": "create", "related_files": files}],
+    )
+    t2 = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=parent,
+        payloads=[{"type": "fix", "related_files": files}],
+    )
+
+    result = compute_duplicate_foundation_signal([t1, t2])
+
+    assert result["total"] == 0
+    assert result["candidates"] == []
+
+
+def test_duplicate_foundation_signal_ignores_non_write_tasks():
+    """Research/plan (non code-change) active tasks never contribute to the
+    duplicate-foundation signal even with overlapping declared files."""
+    from app.digest_metrics import compute_duplicate_foundation_signal
+
+    t1 = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "research", "related_files": ["app/x.py"]}],
+    )
+    t2 = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "plan", "related_files": ["app/x.py"]}],
+    )
+
+    result = compute_duplicate_foundation_signal([t1, t2])
+
+    assert result["total"] == 0
+    assert result["candidates"] == []

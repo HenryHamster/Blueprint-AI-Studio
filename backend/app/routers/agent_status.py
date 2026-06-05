@@ -1438,6 +1438,11 @@ async def update_agent_status(
                         or "precondition",
                         reason=task.latest_status_message or "Precondition not met",
                         source="agent",
+                        need=(
+                            payload.blocked_need.model_dump(exclude_none=True)
+                            if payload.blocked_need
+                            else None
+                        ),
                     )
                     task.vm_stopped_at = _utcnow()
                     session.add(task)
