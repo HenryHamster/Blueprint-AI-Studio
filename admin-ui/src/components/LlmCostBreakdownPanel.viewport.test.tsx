@@ -26,7 +26,10 @@ vi.mock('../api', () => ({
         llm_call_count: 1820,
         merged_count: 186,
         merge_rate: 0.75,
+        verified_merged_count: 182,
+        verified_merge_rate: 0.734,
         priced: true,
+        approximate_priced: false,
         cost_per_merge: 0.99,
       },
       {
@@ -41,7 +44,10 @@ vi.mock('../api', () => ({
         llm_call_count: 640,
         merged_count: 120,
         merge_rate: 0.61,
+        verified_merged_count: 106,
+        verified_merge_rate: 0.535,
         priced: false,
+        approximate_priced: false,
         cost_per_merge: null,
       },
     ],
@@ -52,6 +58,8 @@ vi.mock('../api', () => ({
       task_count: 446,
       merged_count: 306,
       merge_rate: 0.686,
+      verified_merged_count: 288,
+      verified_merge_rate: 0.646,
       priced_task_count: 248,
       unpriced_task_count: 198,
       unpriced_coverage_fraction: 0.556,
@@ -59,6 +67,7 @@ vi.mock('../api', () => ({
       fallback_cost_usd: 18.4,
     },
     unpriced_combos: ['openai:gpt-5-codex', 'gemini:gemini-2.5-pro'],
+    approximate_priced_combos: [],
   })),
 }));
 
@@ -111,6 +120,7 @@ describe('LlmCostBreakdownPanel — viewport regression', () => {
           task_count: 84,
           llm_call_count: 320,
           priced: false,
+          approximate_priced: false,
         },
       ],
       totals: {
@@ -118,11 +128,16 @@ describe('LlmCostBreakdownPanel — viewport regression', () => {
         total_output_tokens: 1_200_000,
         total_cost_usd: 0,
         task_count: 84,
+        merged_count: 0,
+        verified_merged_count: 0,
+        merge_rate: 0,
+        verified_merge_rate: 0,
         priced_task_count: 0,
         unpriced_task_count: 84,
         unpriced_coverage_fraction: 1.0,
       },
       unpriced_combos: ['custom-provider:custom-model'],
+      approximate_priced_combos: [],
     };
     vi.mocked(api.fetchLlmCostBreakdown).mockResolvedValueOnce(unpriced);
 
@@ -145,6 +160,7 @@ describe('LlmCostBreakdownPanel — viewport regression', () => {
     expect(caveatText).toContain('Cost data unavailable');
     expect(caveatText).toContain('custom-model');
     expect(caveatText).toContain('unpriced');
+    expect(caveatText).toContain('Verified');
     expect(caveatText).not.toContain('No priced LLM token spend');
   });
 });

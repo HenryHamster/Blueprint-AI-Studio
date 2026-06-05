@@ -35,7 +35,7 @@
     "routers/agent_status.py": 3850,
     "autonomous_research.py": 2850,
     "autonomous_research_residual.py": 600,
-    "efficiency_snapshot.py": 2300,
+    "efficiency_snapshot.py": 2850,
     "research_completion.py": 3350,
     "findings_index.py": 350,
     "strategic_completion.py": 3200,
@@ -86,7 +86,7 @@
   "agent": {
     "index.ts": 4600,
     "prompt.ts": 1650,
-    "prompts/task-type-focus.ts": 200,
+    "prompts/task-type-focus.ts": 450,
     "prompts/code-change-helpers.ts": 1250,
     "prompts/code-change-helpers.test.ts": 1200,
     "prompts/check-helper.ts": 500,

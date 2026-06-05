@@ -768,6 +768,81 @@ async def _maybe_create_pool_payoff_alert(
     )
 
 
+# Stable per-project title for the unpriced-LLM-models coverage alert. The
+# drifting numbers (unpriced share, affected combos) live in the MESSAGE so a
+# degradation that persists across snapshot ticks dedups to exactly ONE alert
+# per project. Keep the prefix stable.
+_UNPRICED_MODELS_ALERT_TITLE_PREFIX = "LLM spend on unpriced models"
+
+
+async def _maybe_create_unpriced_models_alert(
+    project_id: "uuid.UUID",
+    session: AsyncSession,
+    *,
+    unpriced_combos: list,
+    unpriced_task_count: int,
+    attributed_task_count: int,
+    unpriced_share: float,
+    severity: AlertSeverity = AlertSeverity.WARNING,
+) -> None:
+    """Create a deduplicated operator Alert when a meaningful share of a
+    project's recent LLM-bearing tasks ran on (provider, model) combinations
+    that have NO entry in the cost-analytics pricing table.
+
+    Unpriced tasks contribute ``0.0`` to the headline cost economics
+    (cost-per-merge, total spend), so spend silently leaks into a zero-cost
+    bucket until someone adds a price entry. The only place an operator could
+    previously notice this was the LLM cost-breakdown panel's pricing-coverage
+    caveat — there was no proactive signal. This mirrors the warm-pool payoff
+    alert: it names the unpriced combinations and the affected coverage so the
+    operator learns a price entry is missing without polling the panel.
+
+    Deduplicated by ``(project_id, title, dismissed_at IS NULL)`` on a STABLE
+    title — so a coverage gap that persists across many snapshot ticks raises
+    exactly ONE alert per project. The drifting numbers (share, combos) live in
+    the message so a moving metric never defeats dedup. Caller owns the
+    transition-edge gating; this helper only enforces title-level dedup and
+    commits its own ``Alert`` row.
+    """
+    title = f"{_UNPRICED_MODELS_ALERT_TITLE_PREFIX} on project {str(project_id)[:8]}"
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    combos_label = ", ".join(unpriced_combos) if unpriced_combos else "(none recorded)"
+    message = (
+        f"{unpriced_task_count} of {attributed_task_count} recently attributed "
+        f"LLM-bearing tasks ({unpriced_share * 100:.0f}%) ran on (provider, "
+        f"model) combinations with no entry in the cost pricing table, so their "
+        f"spend is counted as $0 and understates cost-per-merge and total spend. "
+        f"Unpriced combinations: {combos_label}. Add a price entry for these "
+        f"models to LLM_TOKEN_PRICING to restore accurate cost analytics."
+    )[:1000]
+    alert = Alert(
+        project_id=project_id,
+        severity=severity,
+        title=title,
+        message=message,
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": severity.value,
+            "title": alert.title,
+        },
+    )
+
+
 async def _maybe_create_precondition_blocker_alert(
     task: "Task",
     session: AsyncSession,

@@ -295,8 +295,13 @@ vi.mock('../api', () => ({
       priced_task_count: 0,
       unpriced_task_count: 0,
       unpriced_coverage_fraction: null,
+      merged_count: 0,
+      verified_merged_count: 0,
+      merge_rate: null,
+      verified_merge_rate: null,
     },
     unpriced_combos: [],
+    approximate_priced_combos: [],
   })),
   // DashboardHome renders OuterReviewLoopConvergenceWidget, which imports these
   // from '../api'. The complete mock must provide them or the browser-mode test

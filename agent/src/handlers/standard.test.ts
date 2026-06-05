@@ -425,7 +425,7 @@ describe('mid-run ./fetch provisioning for create/refactor', () => {
     // problem-model/gap/message are NOT provisioned for code-change agents.
     expect(prompt).not.toContain('./fetch problem-model');
     expect(prompt).not.toContain('./fetch gap <id>');
-    expect(vi.mocked(writeFetchHelper)).toHaveBeenCalledWith(
+    expectCalledWith(writeFetchHelper,
       TASK_ID, 'p-xyz', expect.anything(), { verbs: PLAN_FETCH_VERBS },
     );
   });
@@ -443,7 +443,7 @@ describe('mid-run ./fetch provisioning for create/refactor', () => {
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const prompt = capturedPrompt();
     expect(prompt).toContain('MID-RUN FETCH (./fetch)');
-    expect(vi.mocked(writeFetchHelper)).toHaveBeenCalledWith(
+    expectCalledWith(writeFetchHelper,
       TASK_ID, 'p-abc', expect.anything(), { verbs: PLAN_FETCH_VERBS },
     );
   });

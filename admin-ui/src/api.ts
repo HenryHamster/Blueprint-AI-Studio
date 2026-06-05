@@ -946,11 +946,18 @@ export interface LlmCostModelRow {
   merged_count: number;
   /** merged_count / task_count, or null when the bucket has no tasks. */
   merge_rate: number | null;
+  /** Count of tasks in this bucket that landed and were verified (not fall-open degraded). */
+  verified_merged_count: number;
+  /** verified_merged_count / task_count, or null when the bucket has no tasks. */
+  verified_merge_rate: number | null;
   priced: boolean;
+  /** True when this (provider, model) is priced at a proxy rate (closest GA equivalent) rather than exact published pricing. */
+  approximate_priced: boolean;
   /**
-   * cost_usd / merged_count, present only when the bucket is fully priced AND
-   * has at least one merge. Null for unpriced (understated cost) or zero-merge
-   * buckets so the panel never shows a misleading/divide-by-zero figure.
+   * cost_usd / verified_merged_count, present only when the bucket is fully
+   * priced AND has at least one verified merge. Null for unpriced (understated
+   * cost) or zero-verified-merge buckets so the panel never shows a
+   * misleading/divide-by-zero figure.
    */
   cost_per_merge: number | null;
 }
@@ -967,6 +974,8 @@ export interface LlmCostBreakdownResponse {
     task_count: number;
     merged_count: number;
     merge_rate: number | null;
+    verified_merged_count: number;
+    verified_merge_rate: number | null;
     priced_task_count: number;
     unpriced_task_count: number;
     unpriced_coverage_fraction: number | null;
@@ -978,6 +987,8 @@ export interface LlmCostBreakdownResponse {
     fallback_cost_usd: number;
   };
   unpriced_combos: string[];
+  /** (provider, model) combos priced at a proxy rate (no separately published API rate). */
+  approximate_priced_combos: string[];
 }
 
 export async function fetchLlmCostBreakdown(

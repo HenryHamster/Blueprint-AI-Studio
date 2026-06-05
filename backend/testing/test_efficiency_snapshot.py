@@ -49,6 +49,24 @@ def _make_efficient_task(project_id, **overrides):
     return make_task(**defaults)
 
 
+def _make_merged_task(project_id, *, reason: str | None = None):
+    context = {"pr_merged": True}
+    if reason is not None:
+        context["review_loop"] = {"unverified_merge_reason": reason}
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context=context,
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+            "llm_call_count": 5,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+
 @pytest.mark.asyncio
 async def test_compute_current_axes_returns_all_keys(db_session):
     project = make_project()
@@ -1680,6 +1698,57 @@ def test_compute_llm_cost_breakdown_priced_and_unpriced():
     assert totals["merge_rate"] == 0.0
 
 
+def test_compute_llm_cost_breakdown_approximate_priced():
+    """Approximate-priced combos (proxy rate, not exact published pricing) are marked distinctly from unpriced."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    # gpt-5.3-codex-spark: priced at 3e-6 / 12e-6 (closest GA equivalent) — NO exact published rate.
+    # 1000 in @ 3e-6, 500 out @ 12e-6 = 0.003 + 0.006 = 0.009
+    approximate_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+            "llm_call_count": 5,
+        },
+        provider="openai",
+        model="gpt-5.3-codex-spark",
+    )
+
+    # Exact-priced for comparison (gpt-5.4 has published rate).
+    exact_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 3,
+        },
+        provider="openai",
+        model="gpt-5.4",
+    )
+
+    result = compute_llm_cost_breakdown([approximate_task, exact_task])
+
+    by_model = {(e["provider"], e["model"]): e for e in result["by_model"]}
+    # Approximate-priced combo is marked as both priced AND approximate.
+    approx_row = by_model[("openai", "gpt-5.3-codex-spark")]
+    assert approx_row["priced"] is True
+    assert approx_row["approximate_priced"] is True
+    # Exact-priced combo is priced but NOT approximate.
+    exact_row = by_model[("openai", "gpt-5.4")]
+    assert exact_row["priced"] is True
+    assert exact_row["approximate_priced"] is False
+
+    # Approximate combo appears in the caveated list, NOT in unpriced_combos.
+    assert "openai:gpt-5.3-codex-spark" in result["approximate_priced_combos"]
+    assert "openai:gpt-5.3-codex-spark" not in result["unpriced_combos"]
+    assert result["unpriced_combos"] == []
+
+
 def test_compute_llm_cost_breakdown_merge_rate_and_cost_per_merge():
     """Priced bucket with merges yields cost-per-merge; unpriced bucket suppresses it."""
     import uuid
@@ -1729,7 +1798,9 @@ def test_compute_llm_cost_breakdown_merge_rate_and_cost_per_merge():
 
     sonnet = by_model[("anthropic", "claude-sonnet-4-6")]
     assert sonnet["merged_count"] == 1
+    assert sonnet["verified_merged_count"] == 1
     assert sonnet["merge_rate"] == round(1 / 2, 4)
+    assert sonnet["verified_merge_rate"] == round(1 / 2, 4)
     # priced bucket: cost_per_merge = total_cost / merged = 0.021 / 1
     assert sonnet["cost_per_merge"] == round(sonnet["total_cost_usd"] / 1, 6)
 
@@ -1750,7 +1821,50 @@ def test_compute_llm_cost_breakdown_merge_rate_and_cost_per_merge():
 
     totals = result["totals"]
     assert totals["merged_count"] == 2
+    assert totals["verified_merged_count"] == 2
     assert totals["merge_rate"] == round(2 / 3, 4)
+    assert totals["verified_merge_rate"] == round(2 / 3, 4)
+
+
+def test_compute_llm_cost_breakdown_verified_excludes_degraded_merges():
+    """Degraded fall-open merges still count as landed, but not verified."""
+    import uuid
+
+    from app.ci_resolution import DEGRADED_UNVERIFIED_REASONS
+
+    project_id = uuid.uuid4()
+    degraded_reason = next(iter(DEGRADED_UNVERIFIED_REASONS))
+
+    verified = _make_merged_task(project_id)
+    degraded = _make_merged_task(project_id, reason=degraded_reason)
+
+    result = compute_llm_cost_breakdown([verified, degraded])
+    by_model = {(e["provider"], e["model"]): e for e in result["by_model"]}
+    by_provider = {e["provider"]: e for e in result["by_provider"]}
+
+    model_row = by_model[("anthropic", "claude-sonnet-4-6")]
+    provider_row = by_provider["anthropic"]
+
+    assert model_row["merged_count"] == 2
+    assert model_row["verified_merged_count"] == 1
+    assert model_row["merge_rate"] == 1.0
+    assert model_row["verified_merge_rate"] == 0.5
+    assert model_row["cost_per_merge"] == round(model_row["total_cost_usd"] / 1, 6)
+
+    assert provider_row["merged_count"] == 2
+    assert provider_row["verified_merged_count"] == 1
+    assert provider_row["merge_rate"] == 1.0
+    assert provider_row["verified_merge_rate"] == 0.5
+    assert provider_row["cost_per_merge"] == round(
+        provider_row["total_cost_usd"] / 1, 6
+    )
+
+    totals = result["totals"]
+    assert totals["merged_count"] == 2
+    assert totals["verified_merged_count"] == 1
+    assert totals["merge_rate"] == 1.0
+    assert totals["verified_merge_rate"] == 0.5
+    assert totals["total_cost_usd"] == model_row["total_cost_usd"]
 
 
 def test_compute_llm_cost_breakdown_empty():
@@ -1927,6 +2041,10 @@ async def test_llm_cost_breakdown_endpoint_returns_rollup(
     assert data["totals"]["task_count"] == 2
     assert data["totals"]["priced_task_count"] == 1
     assert data["totals"]["unpriced_task_count"] == 1
+    assert data["totals"]["merged_count"] == 0
+    assert data["totals"]["verified_merged_count"] == 0
+    assert data["totals"]["merge_rate"] == 0.0
+    assert data["totals"]["verified_merge_rate"] == 0.0
     assert "fakeprovider:mystery-model" in data["unpriced_combos"]
 
 
@@ -2814,3 +2932,159 @@ async def test_pool_hit_rate_estimate_endpoint_validates_target_size(
         f"/api/admin/projects/{project.id}/pool-hit-rate-estimate?target_size=101"
     )
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# maybe_alert_unpriced_models_coverage — unpriced-models operator alert
+# ---------------------------------------------------------------------------
+
+from app.efficiency_snapshot import (  # noqa: E402
+    LAST_ALERTED_UNPRICED_KEY,
+    UNPRICED_ALERT_MIN_TASKS,
+    maybe_alert_unpriced_models_coverage,
+)
+
+
+def _priced_task(project_id):
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={"total_input_tokens": 1000, "total_output_tokens": 500},
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+
+def _unpriced_task(project_id, model="fake-model-x"):
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={"total_input_tokens": 500, "total_output_tokens": 200},
+        provider="fakeprovider",
+        model=model,
+    )
+
+
+async def _unpriced_alerts(db_session, project_id):
+    stmt = _sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.title.contains("unpriced models"),
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_unpriced_alert_fires_when_coverage_degrades(db_session, mocker):
+    """Crossing the unpriced-share threshold fires one WARNING naming the combos."""
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 2 priced + 4 unpriced -> unpriced share = 4/6 = 0.67, well over threshold.
+    for _ in range(2):
+        db_session.add(_priced_task(project.id))
+    for _ in range(4):
+        db_session.add(_unpriced_task(project.id))
+    await db_session.commit()
+
+    fired = await maybe_alert_unpriced_models_coverage(db_session, project.id)
+    assert fired is True
+
+    alerts = await _unpriced_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert "fakeprovider:fake-model-x" in alerts[0].message
+    assert "67%" in alerts[0].message
+    bcast.assert_awaited()
+
+    await db_session.refresh(project)
+    assert project.design_doc[DESIGN_DOC_KEY][LAST_ALERTED_UNPRICED_KEY] == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_unpriced_alert_no_fire_when_coverage_full(db_session, mocker):
+    """Full pricing coverage (no unpriced tasks) never alerts."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for _ in range(5):
+        db_session.add(_priced_task(project.id))
+    await db_session.commit()
+
+    fired = await maybe_alert_unpriced_models_coverage(db_session, project.id)
+    assert fired is None
+    assert await _unpriced_alerts(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_unpriced_alert_dedups_on_stable_degraded_state(db_session, mocker):
+    """A second tick at the same degraded state does not fire a second alert."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_priced_task(project.id))
+    for _ in range(4):
+        db_session.add(_unpriced_task(project.id))
+    await db_session.commit()
+
+    first = await maybe_alert_unpriced_models_coverage(db_session, project.id)
+    second = await maybe_alert_unpriced_models_coverage(db_session, project.id)
+    assert first is True
+    assert second is None  # deduped on the persisted marker
+    assert len(await _unpriced_alerts(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_unpriced_alert_ignores_tokenless_and_unattributed(db_session, mocker):
+    """Token-less and unattributed (no provider/model) tasks never trip the alert.
+
+    Many unpriced-LOOKING tasks here are excluded from the attributed
+    denominator, so the unpriced share stays below threshold and nothing fires.
+    """
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # One real unpriced task — below UNPRICED_ALERT_MIN_TASKS on its own.
+    db_session.add(_unpriced_task(project.id))
+    # Token-less tasks (no usage) — not priceable, must be ignored.
+    for _ in range(5):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                api_call_summary={"llm_call_count": 2},
+                provider="fakeprovider",
+                model="fake-model-x",
+            )
+        )
+    # Token-bearing but unattributed (no provider/model) — must be ignored.
+    for _ in range(5):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                api_call_summary={
+                    "total_input_tokens": 300,
+                    "total_output_tokens": 100,
+                },
+            )
+        )
+    await db_session.commit()
+
+    assert UNPRICED_ALERT_MIN_TASKS > 1  # guards the single-unpriced premise
+    fired = await maybe_alert_unpriced_models_coverage(db_session, project.id)
+    assert fired is None
+    assert await _unpriced_alerts(db_session, project.id) == []
