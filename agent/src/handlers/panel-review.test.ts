@@ -17,6 +17,9 @@ vi.mock('../index.js', () => ({
     return '';
   }),
   runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
+  // Defaults to the native-subagent (parallel) path; serial-fallback tests
+  // override this to false.
+  providerSupportsNativeSubagents: vi.fn(() => true),
   sendHeartbeatSync: vi.fn(),
   setCurrentPromptFingerprint: vi.fn(),
   snapshotToolTrace: vi.fn().mockReturnValue([]),
@@ -96,7 +99,12 @@ vi.mock('child_process', () => ({
 }));
 
 import { execFileSync } from 'child_process';
-import { persistAndPostStatus, readHandlerOutput, runClaudeCode } from '../index.js';
+import {
+  persistAndPostStatus,
+  providerSupportsNativeSubagents,
+  readHandlerOutput,
+  runClaudeCode,
+} from '../index.js';
 import { handlePanelReview, PANEL_REVIEW_LENSES } from './panel-review.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 
@@ -126,6 +134,11 @@ describe('handlePanelReview', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(execFileSync).mockReturnValue('abc123\trefs/heads/feature/panel-review\n' as never);
+    // clearAllMocks clears call records but NOT implementations, so explicitly
+    // restore the two mocks that individual tests mutate, keeping the default
+    // path (native sub-agent / parallel) and a clean exit between tests.
+    vi.mocked(providerSupportsNativeSubagents).mockReturnValue(true);
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
     global.fetch = vi.fn().mockResolvedValue({
       ok: true,
       json: () => Promise.resolve({ title: 'Panel review PR', body: 'Review this carefully.' }),
@@ -141,10 +154,40 @@ describe('handlePanelReview', () => {
     ]);
   });
 
-  it('runs one independent agent pass per lens (genuine fan-out)', async () => {
+  it('parallel path: fans the four lenses out from ONE orchestrating pass', async () => {
     await runHandler();
 
-    // Four lenses → four independent runClaudeCode passes.
+    // Native sub-agent fan-out → a SINGLE orchestrating runClaudeCode pass.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+
+    // The single orchestrating prompt instructs parallel fan-out and embeds
+    // EVERY lens's focus and its lens-specific output path, bounded to exactly
+    // the four declared lenses.
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0] ?? '';
+    expect(prompt).toContain('Task tool');
+    expect(prompt).toContain('SINGLE message');
+    for (const lens of PANEL_REVIEW_LENSES) {
+      expect(prompt).toContain(lens.focus);
+      expect(prompt).toContain(`/tmp/panel_review_lens_${lens.id}_task-panel-1.json`);
+    }
+
+    // The handler still reads each lens's own output file back deterministically.
+    for (const lens of PANEL_REVIEW_LENSES) {
+      expectCalledWith(
+        readHandlerOutput,
+        'task-panel-1',
+        `panel_review_lens_${lens.id}`,
+        null,
+      );
+    }
+  });
+
+  it('serial fallback (no native sub-agents): one independent pass per lens', async () => {
+    vi.mocked(providerSupportsNativeSubagents).mockReturnValue(false);
+
+    await runHandler();
+
+    // Four lenses → four independent runClaudeCode passes, in sequence.
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(PANEL_REVIEW_LENSES.length);
 
     // Each launched prompt is scoped to exactly ONE lens: it contains that
@@ -207,8 +250,10 @@ describe('handlePanelReview', () => {
     ]);
   });
 
-  it('fails closed when a lens produces no usable verdict', async () => {
-    // security lens returns null → fail closed, no silent APPROVE.
+  it('parallel path: fails closed when any lens produces no usable verdict', async () => {
+    // security lens returns null → fail closed, no silent APPROVE. Under the
+    // parallel path all lenses launch from ONE pass; synthesis still fails
+    // closed because one lens verdict is unusable.
     vi.mocked(readHandlerOutput).mockImplementation((_taskId: string, outputType: string) => {
       if (outputType === 'panel_review_lens_correctness') {
         return { verdict: 'APPROVE', summary: 'Correctness is fine.', issues: [] };
@@ -222,11 +267,48 @@ describe('handlePanelReview', () => {
     expect(call.status).toBe('FAILED');
     expect(call.artifact_type).toBe('ERROR_LOG');
     expect(call.failure_category).toBe('panel_review_lens_failed');
-    // Fan-out stops at the first unusable lens (correctness ok, security null).
+    // Single orchestrating pass (no serial short-circuit in the parallel path).
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+  });
+
+  it('serial fallback: stops at the first unusable lens', async () => {
+    vi.mocked(providerSupportsNativeSubagents).mockReturnValue(false);
+    vi.mocked(readHandlerOutput).mockImplementation((_taskId: string, outputType: string) => {
+      if (outputType === 'panel_review_lens_correctness') {
+        return { verdict: 'APPROVE', summary: 'Correctness is fine.', issues: [] };
+      }
+      return null;
+    });
+
+    await runHandler();
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.artifact_type).toBe('ERROR_LOG');
+    expect(call.failure_category).toBe('panel_review_lens_failed');
+    // Serial fan-out short-circuits at the first unusable lens (correctness ok,
+    // security null) — only two passes ran.
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
   });
 
-  it('fails closed when a lens agent pass exits non-zero', async () => {
+  it('parallel path: fails closed when the orchestrating pass exits non-zero', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 1,
+      allOutput: 'crash',
+      lastResultText: '',
+    });
+
+    await runHandler();
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('panel_review_lens_failed');
+    // Fails before reading any lens file — one pass, no synthesis.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+  });
+
+  it('serial fallback: fails closed when a lens pass exits non-zero', async () => {
+    vi.mocked(providerSupportsNativeSubagents).mockReturnValue(false);
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 1,
       allOutput: 'crash',

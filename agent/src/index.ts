@@ -56,7 +56,7 @@ import {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
   parseLLMCliTranslation, matchesRateLimit, RateLimitError, NoProgressTimeoutError,
   refreshRuntimeState,
-  getProviderRunner,
+  getProviderRunner, providerSupportsNativeSubagents,
   __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
   runClaudeCode, runProviderAgent,
   type LLMCliTranslation, type ClaudeOutput, type RunnerCommand,
@@ -67,7 +67,7 @@ export {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
   parseLLMCliTranslation, matchesRateLimit, RateLimitError, NoProgressTimeoutError,
   refreshRuntimeState,
-  getProviderRunner,
+  getProviderRunner, providerSupportsNativeSubagents,
   __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
   runClaudeCode, runProviderAgent,
 };

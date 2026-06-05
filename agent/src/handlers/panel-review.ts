@@ -9,6 +9,7 @@ import {
   persistAndPostStatus,
   git,
   runClaudeCode,
+  providerSupportsNativeSubagents,
   sendHeartbeatSync,
   setCurrentPromptFingerprint,
   snapshotToolTrace,
@@ -184,7 +185,7 @@ function synthesizePanelReviewVerdict(
   };
 }
 
-function buildPanelReviewLensPrompt(args: {
+type PanelReviewLensBodyArgs = {
   lens: (typeof PANEL_REVIEW_LENSES)[number];
   taskId: string;
   prNumber: number;
@@ -195,11 +196,18 @@ function buildPanelReviewLensPrompt(args: {
   originalPrompt: string;
   prTitle: string;
   prBody: string;
-  projectContext: string;
-  playbookSection: string;
   buildConfig?: BuildConfig;
-  claudeMdPrefix: string;
-}): string {
+};
+
+/**
+ * The per-lens review instructions, independent of any prompt prefix. Shared by
+ * BOTH execution paths so a lens reviewer receives byte-for-byte the same brief
+ * whether it runs as its own top-level pass (serial fallback) or as a native
+ * sub-agent under one orchestrating pass (parallel path). The lens still records
+ * its structured verdict through the existing non-Write output channel
+ * (a Bash-written /tmp file read back via readHandlerOutput).
+ */
+function buildPanelReviewLensBody(args: PanelReviewLensBodyArgs): string {
   const {
     lens,
     taskId,
@@ -211,13 +219,10 @@ function buildPanelReviewLensPrompt(args: {
     originalPrompt,
     prTitle,
     prBody,
-    projectContext,
-    playbookSection,
     buildConfig,
-    claudeMdPrefix,
   } = args;
   const outputPath = `/tmp/${panelReviewLensOutputType(lens.id)}_${taskId}.json`;
-  return `${claudeMdPrefix}${playbookSection}${projectContext}${buildReviewMasterPreamble(prNumber, branch, baseBranch)}
+  return `${buildReviewMasterPreamble(prNumber, branch, baseBranch)}
 
 This is ONE independent pass of the fixed \`panel_review\` multi-agent workflow.
 You are the **${lens.label}** reviewer (lens id: \`${lens.id}\`). Other lenses run as
@@ -262,6 +267,69 @@ IMPORTANT:
 - Write the JSON object to ${outputPath} (NOT in the repository).
 - The file must contain ONLY the JSON object, with no markdown fence or commentary.
 - Do not write to /tmp/review_verdict_${taskId}.json; this task has its own structured verdict channel.
+
+${DEFAULT_TOOL_GUIDANCE}`;
+}
+
+function buildPanelReviewLensPrompt(args: PanelReviewLensBodyArgs & {
+  projectContext: string;
+  playbookSection: string;
+  claudeMdPrefix: string;
+}): string {
+  const { projectContext, playbookSection, claudeMdPrefix } = args;
+  return `${claudeMdPrefix}${playbookSection}${projectContext}${buildPanelReviewLensBody(args)}`;
+}
+
+/**
+ * Single orchestrating prompt for the native-subagent (parallel) path. It tells
+ * the parent to fan the four declared lenses out as parallel sub-agents via the
+ * Task tool in ONE message, then wait for all of them. Fan-out is bounded to
+ * exactly the four declared lenses (no per-lens sub-fan-out, no extra agents).
+ * Each embedded block is the COMPLETE, unmodified per-lens brief, so a sub-agent
+ * receives the same instructions a serial pass would, and each writes its own
+ * /tmp verdict file that the handler reads back deterministically.
+ */
+function buildPanelReviewParentPrompt(args: {
+  lensArgs: PanelReviewLensBodyArgs[];
+  taskId: string;
+  prNumber: number;
+  branch: string;
+  baseBranch: string;
+  projectContext: string;
+  playbookSection: string;
+  claudeMdPrefix: string;
+}): string {
+  const {
+    lensArgs,
+    taskId,
+    prNumber,
+    branch,
+    baseBranch,
+    projectContext,
+    playbookSection,
+    claudeMdPrefix,
+  } = args;
+  const lensBlocks = lensArgs
+    .map((lensArg, index) => {
+      const outputPath = `/tmp/${panelReviewLensOutputType(lensArg.lens.id)}_${taskId}.json`;
+      return `═══════════ SUB-AGENT ${index + 1} of ${lensArgs.length}: ${lensArg.lens.label} (lens id: \`${lensArg.lens.id}\`) ═══════════
+Spawn ONE Task sub-agent whose verdict file is ${outputPath}. Pass the block below as that sub-agent's COMPLETE prompt, verbatim:
+
+${buildPanelReviewLensBody(lensArg)}`;
+    })
+    .join('\n\n');
+
+  return `${claudeMdPrefix}${playbookSection}${projectContext}You are the ORCHESTRATOR of the fixed \`panel_review\` multi-agent workflow on PR #${prNumber} (${branch} -> ${baseBranch}).
+
+This workflow has EXACTLY ${lensArgs.length} review lenses. Run them IN PARALLEL:
+- Spawn all ${lensArgs.length} lenses as independent sub-agents using the Task tool, issuing ALL ${lensArgs.length} Task calls in a SINGLE message so they execute concurrently.
+- Do NOT perform any review yourself. Do NOT spawn fewer or more than ${lensArgs.length} sub-agents. Do NOT let any sub-agent spawn further sub-agents.
+- Do NOT write, edit, or modify any repository or verdict file yourself — each sub-agent writes its OWN verdict file.
+- Wait for ALL ${lensArgs.length} sub-agents to finish before you finish.
+
+${lensBlocks}
+
+When every sub-agent has completed, confirm that all ${lensArgs.length} \`/tmp/panel_review_lens_*_${taskId}.json\` verdict files exist (the deterministic code-side synthesis fails the whole panel closed if any is missing). You are done once all ${lensArgs.length} verdict files are written; do not modify any repository files.
 
 ${DEFAULT_TOOL_GUIDANCE}`;
 }
@@ -378,39 +446,66 @@ export async function handlePanelReview(
   const promptFingerprint = computePromptFingerprint('panel_review', buildConfig);
   setCurrentPromptFingerprint(promptFingerprint);
 
-  // Genuine multi-agent fan-out: each declared lens runs as its OWN independent
-  // runClaudeCode pass from a clean single-lens perspective over the same PR
-  // diff. A code-side synthesis then aggregates the per-lens verdicts into the
-  // single structured object the backend gate consumes. Fan-out is bounded to
-  // the four declared lenses (no unbounded recursion). Fail closed: if any lens
-  // pass crashes (exitCode!==0) or yields no normalizable verdict, the whole
-  // panel FAILS — overall_verdict must never claim success when a lens never
-  // produced a real verdict.
+  // Per-lens review brief, shared by both execution paths. Bounded to exactly
+  // the four declared lenses (no unbounded recursion, no per-lens sub-fan-out).
+  const lensArgs: PanelReviewLensBodyArgs[] = PANEL_REVIEW_LENSES.map(lens => ({
+    lens,
+    taskId,
+    prNumber,
+    branch,
+    baseBranch,
+    changedFiles,
+    diffShortstat,
+    originalPrompt,
+    prTitle,
+    prBody,
+    buildConfig,
+  }));
+  const projectContextSection = projectContext ? `${projectContext}\n\n` : '';
+
+  // Fail-closed terminal status, shared by both paths. The aggregated panel must
+  // never claim success when a lens crashed or never produced a real verdict.
+  const failPanelClosed = async (reason: string, detail: string) => {
+    sendLog(ws, `Panel review failing closed: ${reason}\n`);
+    const failLogs = sanitize(`Panel review fan-out failed: ${reason}.\n${detail}`);
+    await persistAndPostStatus(taskId, {
+      task_id: taskId,
+      status: 'FAILED',
+      artifact_type: 'ERROR_LOG',
+      logs: failLogs,
+      failure_category: 'panel_review_lens_failed',
+      ...(changedFileList.length > 0 ? { changed_files: changedFileList.slice(0, 50) } : {}),
+    });
+  };
+
   const lensVerdicts = {} as Record<PanelReviewLensId, PanelReviewLensVerdict>;
-  for (const [index, lens] of PANEL_REVIEW_LENSES.entries()) {
-    statusRef.value = `Panel review lens ${index + 1}/${PANEL_REVIEW_LENSES.length}: ${lens.label}...`;
-    sendLog(ws, `Running panel review lens '${lens.id}' (${index + 1}/${PANEL_REVIEW_LENSES.length})\n`);
+
+  if (providerSupportsNativeSubagents()) {
+    // Parallel path: ONE orchestrating runClaudeCode pass fans the four lenses
+    // out as native Task sub-agents that run concurrently, so wall-clock
+    // approaches the slowest single lens instead of the sum of four. A single
+    // pass also avoids the per-task prompt-scratch race that concurrent
+    // same-task OS passes would hit. The background heartbeat keeps the task
+    // live through the parallel window; each sub-agent still writes its own
+    // verdict file, and synthesis below fails closed on any missing/unusable
+    // verdict or non-zero parent exit.
+    statusRef.value = `Panel review: fanning out ${PANEL_REVIEW_LENSES.length} lenses in parallel...`;
+    sendLog(ws, `Running panel review lenses in parallel via native sub-agent fan-out (${PANEL_REVIEW_LENSES.length} lenses)\n`);
     sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
 
-    const lensPrompt = buildPanelReviewLensPrompt({
-      lens,
+    const parentPrompt = buildPanelReviewParentPrompt({
+      lensArgs,
       taskId,
       prNumber,
       branch,
       baseBranch,
-      changedFiles,
-      diffShortstat,
-      originalPrompt,
-      prTitle,
-      prBody,
-      projectContext: projectContext ? `${projectContext}\n\n` : '',
+      projectContext: projectContextSection,
       playbookSection,
-      buildConfig,
       claudeMdPrefix,
     });
 
     const { exitCode, allOutput, lastResultText } = await runClaudeCode(
-      lensPrompt,
+      parentPrompt,
       ws,
       statusRef,
       model,
@@ -418,28 +513,65 @@ export async function handlePanelReview(
       disallowedTools,
     );
 
-    const rawLensVerdict = readHandlerOutput(taskId, panelReviewLensOutputType(lens.id), ws);
-    const normalizedLens = normalizeLensVerdict(rawLensVerdict, lens.id);
-    if (exitCode !== 0 || !normalizedLens) {
-      const reason = exitCode !== 0
-        ? `lens '${lens.id}' agent pass exited ${exitCode}`
-        : `lens '${lens.id}' produced no usable verdict`;
-      sendLog(ws, `Panel review failing closed: ${reason}\n`);
-      const failLogs = sanitize(
-        `Panel review fan-out failed: ${reason}.\n` +
-        (lastResultText || allOutput.slice(-20_000)),
+    if (exitCode !== 0) {
+      await failPanelClosed(
+        `orchestrating panel pass exited ${exitCode}`,
+        lastResultText || allOutput.slice(-20_000),
       );
-      await persistAndPostStatus(taskId, {
-        task_id: taskId,
-        status: 'FAILED',
-        artifact_type: 'ERROR_LOG',
-        logs: failLogs,
-        failure_category: 'panel_review_lens_failed',
-        ...(changedFileList.length > 0 ? { changed_files: changedFileList.slice(0, 50) } : {}),
-      });
       return;
     }
-    lensVerdicts[lens.id] = normalizedLens;
+
+    // Read every lens verdict file; fail closed if ANY lens is missing or
+    // unusable. All four launched together, so unlike the serial path there is
+    // no short-circuit — we still must require all four to be usable.
+    for (const lens of PANEL_REVIEW_LENSES) {
+      const rawLensVerdict = readHandlerOutput(taskId, panelReviewLensOutputType(lens.id), ws);
+      const normalizedLens = normalizeLensVerdict(rawLensVerdict, lens.id);
+      if (!normalizedLens) {
+        await failPanelClosed(
+          `lens '${lens.id}' produced no usable verdict`,
+          lastResultText || allOutput.slice(-20_000),
+        );
+        return;
+      }
+      lensVerdicts[lens.id] = normalizedLens;
+    }
+  } else {
+    // Serial fallback: providers without a native sub-agent primitive (codex,
+    // gemini) can't fan out, so each declared lens runs as its OWN independent
+    // runClaudeCode pass in sequence. Same fail-closed guarantees; just slower.
+    for (const [index, lens] of PANEL_REVIEW_LENSES.entries()) {
+      statusRef.value = `Panel review lens ${index + 1}/${PANEL_REVIEW_LENSES.length}: ${lens.label}...`;
+      sendLog(ws, `Running panel review lens '${lens.id}' (${index + 1}/${PANEL_REVIEW_LENSES.length})\n`);
+      sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
+
+      const lensPrompt = buildPanelReviewLensPrompt({
+        ...lensArgs[index],
+        projectContext: projectContextSection,
+        playbookSection,
+        claudeMdPrefix,
+      });
+
+      const { exitCode, allOutput, lastResultText } = await runClaudeCode(
+        lensPrompt,
+        ws,
+        statusRef,
+        model,
+        effort,
+        disallowedTools,
+      );
+
+      const rawLensVerdict = readHandlerOutput(taskId, panelReviewLensOutputType(lens.id), ws);
+      const normalizedLens = normalizeLensVerdict(rawLensVerdict, lens.id);
+      if (exitCode !== 0 || !normalizedLens) {
+        const reason = exitCode !== 0
+          ? `lens '${lens.id}' agent pass exited ${exitCode}`
+          : `lens '${lens.id}' produced no usable verdict`;
+        await failPanelClosed(reason, lastResultText || allOutput.slice(-20_000));
+        return;
+      }
+      lensVerdicts[lens.id] = normalizedLens;
+    }
   }
 
   const investigatedFiles = extractInvestigatedFiles(snapshotToolTrace());

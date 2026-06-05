@@ -141,6 +141,19 @@ export function refreshRuntimeState(): void {
   LLM_CLI_TRANSLATION = parseLLMCliTranslation();
 }
 
+/**
+ * Whether the active provider exposes a native sub-agent / Task fan-out
+ * primitive that lets a single orchestrating pass run several independent
+ * review passes in parallel. Only Claude Code (anthropic) ships the
+ * Task/Agent tool; codex and gemini have no equivalent, so callers that
+ * depend on native fan-out (e.g. the panel_review handler) must fall back to a
+ * serial path for those providers. This is the single source of truth for "is
+ * the native fan-out primitive available" — detect availability, never assume.
+ */
+export function providerSupportsNativeSubagents(provider: ProviderName = PROVIDER): boolean {
+  return provider === 'anthropic';
+}
+
 function getRateLimitPatterns(provider: ProviderName, authMode: AuthMode): readonly string[] {
   return RATE_LIMIT_PATTERNS[provider][authMode] ?? RATE_LIMIT_PATTERNS[provider].oauth ?? [];
 }
