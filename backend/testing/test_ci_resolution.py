@@ -1735,3 +1735,64 @@ def test_runtime_block_malformed_history_is_defensive():
     assert "recent_outcomes" not in block
     assert "unverified_reason_counts" not in block
     assert "summary" not in block
+
+
+# --- benign-vs-degraded UNVERIFIED-merge reason partition -------------------
+
+
+def test_unverified_reason_sets_are_disjoint():
+    """The benign and degraded reason sets must not overlap — a key is one or
+    the other, never both."""
+    overlap = (
+        ci_resolution.BENIGN_UNVERIFIED_REASONS
+        & ci_resolution.DEGRADED_UNVERIFIED_REASONS
+    )
+    assert not overlap, f"reason keys classified as BOTH benign and degraded: {sorted(overlap)}"
+
+
+def test_unverified_reason_sets_union_is_canonical():
+    """Their union must equal the canonical 12-key emitted reason set."""
+    canonical = {
+        "no_detectable_test_command",
+        "kill_switch_off",
+        "internal_staging_base",
+        "undetected_runtime",
+        "suite_all_skipped",
+        "verify_setup_failed",
+        "probe_passed",
+        "probe_could_not_run",
+        "probe_no_artifact",
+        "documented_command_could_not_run",
+        "documented_command_passed",
+        "documented_command_no_artifact",
+    }
+    union = (
+        ci_resolution.BENIGN_UNVERIFIED_REASONS
+        | ci_resolution.DEGRADED_UNVERIFIED_REASONS
+    )
+    assert union == canonical
+
+
+def test_is_degraded_unverified_reason_true_for_degraded():
+    for reason in ci_resolution.DEGRADED_UNVERIFIED_REASONS:
+        assert ci_resolution.is_degraded_unverified_reason(reason) is True, reason
+
+
+def test_is_degraded_unverified_reason_false_for_benign_and_unknown():
+    for reason in ci_resolution.BENIGN_UNVERIFIED_REASONS:
+        assert ci_resolution.is_degraded_unverified_reason(reason) is False, reason
+    assert ci_resolution.is_degraded_unverified_reason("totally_unknown") is False
+    assert ci_resolution.is_degraded_unverified_reason(None) is False
+
+
+def test_alert_severity_map_derives_from_shared_sets():
+    """The alert-layer severity map must agree with the shared partition byte-for-
+    byte: every degraded reason -> ERROR, every benign reason -> WARNING, and the
+    map covers exactly the canonical union (single-source-of-truth wiring)."""
+    from app.alert_dispatch import _UNVERIFIED_REASON_SEVERITY, AlertSeverity
+
+    expected = {
+        **{r: AlertSeverity.ERROR for r in ci_resolution.DEGRADED_UNVERIFIED_REASONS},
+        **{r: AlertSeverity.WARNING for r in ci_resolution.BENIGN_UNVERIFIED_REASONS},
+    }
+    assert _UNVERIFIED_REASON_SEVERITY == expected

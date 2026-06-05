@@ -77,6 +77,7 @@ from app.task_lifecycle import (
 from app.rollup_management import _check_and_trigger_rollup
 from app.payload_schemas import validate_internal_payload as _validate_internal_payload
 from app.task_completion import _compute_first_attempt_succeeded
+from app.landed_signal import merge_verification_status as _merge_verification_status
 from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 from app.time_utils import _utcnow, set_retry_after
 from app.agent_status_spawn import (
@@ -2608,7 +2609,9 @@ async def update_agent_status(
             try:
                 _ctx = dict(task.context or {})
                 _ctx["_first_attempt_succeeded"] = _compute_first_attempt_succeeded(
-                    task.attempt_count, payload.status
+                    task.attempt_count,
+                    payload.status,
+                    merge_verification=_merge_verification_status(task),
                 )
                 _proj = None
                 try:

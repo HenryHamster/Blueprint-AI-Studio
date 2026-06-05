@@ -21,7 +21,7 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.landed_signal import is_merged_completion
+from app.landed_signal import is_merged_completion, merge_verification_status
 from app.models import (
     Task,
     TaskStatus,
@@ -476,17 +476,31 @@ async def compute_pipeline_health_summary(
     def _first_attempt_rate(tasks):
         if not tasks:
             return None
-        first_success = sum(
-            1
-            for t in tasks
-            if (t.context or {}).get("_first_attempt_succeeded") is True
-        )
         # Only count tasks that have the metric recorded
         measured = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
         if not measured:
             return None
         first_success = sum(
             1 for t in measured if t.context["_first_attempt_succeeded"]
+        )
+        return round(first_success / len(measured), 2)
+
+    def _verified_first_attempt_rate(tasks):
+        """Like _first_attempt_rate but excludes degraded-unverified merges.
+
+        A task with _first_attempt_succeeded=True whose PR fell open for a
+        degraded reason (environment/setup failure blocked verification) is NOT
+        a proven fix — exclude it from the verified count.  Benign fall-opens
+        (no suite, kill-switch off) still count as successes.
+        """
+        measured = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
+        if not measured:
+            return None
+        first_success = sum(
+            1
+            for t in measured
+            if t.context["_first_attempt_succeeded"]
+            and merge_verification_status(t) != "unverified_degraded"
         )
         return round(first_success / len(measured), 2)
 
@@ -753,6 +767,11 @@ async def compute_pipeline_health_summary(
         "without_measurements": _first_attempt_rate(tasks_without_measurements)
         if tasks_without_measurements
         else None,
+        # verified_overall: excludes degraded-unverified merges (environment/setup
+        # failures that blocked real test verification). Aligned with the
+        # merge-gate-health verified-vs-fell-open split so strategic scoring is
+        # not misled by unproven fixes. Additive — does not replace "overall".
+        "verified_overall": _verified_first_attempt_rate(terminal_tasks_24h),
     }
 
     # First-review approval rate: of create/refactor tasks that merged, what fraction

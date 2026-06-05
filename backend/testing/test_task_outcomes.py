@@ -142,6 +142,40 @@ def test_research_failed_is_failure():
     assert evaluate_task_outcome(task) == TaskOutcome("failure", KIND_RESEARCH_QUALITY)
 
 
+def test_research_surviving_findings_recorded_is_success():
+    # When the completion handler recorded surviving findings, the cycle is a
+    # success regardless of how many raw titled findings sit in plan_output.
+    task = _make_task(
+        "research",
+        plan_output=[{"title": "fix: do the thing"}],
+        context={"research_surviving_findings": 2},
+    )
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_RESEARCH_QUALITY)
+    assert is_successful_outcome(task) is True
+
+
+def test_research_zero_survivors_is_neutral_despite_titled_findings():
+    # Core fix: every titled finding was rejected at ingestion (stale dup /
+    # citation absent on HEAD / low actionability). plan_output still holds the
+    # raw findings for admin visibility, but the cycle produced no work — neutral.
+    task = _make_task(
+        "research",
+        plan_output=[
+            {"title": "fix: stale", "actionability_grade": "HIGH"},
+            {"title": "fix: dup", "actionability_grade": "MEDIUM"},
+        ],
+        context={"research_surviving_findings": 0},
+    )
+    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_RESEARCH_QUALITY)
+    assert is_successful_outcome(task) is False
+
+
+def test_research_missing_survivor_count_falls_back_to_titled_findings():
+    # Legacy tasks (dispatch predates the survivor signal) keep the old heuristic.
+    task = _make_task("research", plan_output=[{"title": "fix: legacy"}], context={})
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_RESEARCH_QUALITY)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Audit family (security_audit / perf / self_audit / release_audit)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -826,6 +860,171 @@ def test_summary_panel_review_counts_lens_issues_without_top_level():
 def test_summary_panel_review_no_verdict_is_none():
     task = _make_task("panel_review", plan_output={})
     assert build_task_evaluation_summary(task) is None
+
+
+# --- merge_verification_status / is_verified_merge --------------------------
+
+
+def _merged_with_reason(reason: str | None) -> Task:
+    """A merged code-merge completion carrying an optional fall-open reason."""
+    context = _merged_context()
+    if reason is not None:
+        context["review_loop"] = {"unverified_merge_reason": reason}
+    return _make_task(KIND_CODE_MERGE, context=context)
+
+
+def test_merge_verification_status_verified_when_no_reason():
+    from app.landed_signal import is_verified_merge, merge_verification_status
+
+    task = _merged_with_reason(None)
+    assert merge_verification_status(task) == "verified"
+    assert is_verified_merge(task) is True
+
+
+def test_merge_verification_status_benign_reasons():
+    from app.ci_resolution import BENIGN_UNVERIFIED_REASONS
+    from app.landed_signal import is_verified_merge, merge_verification_status
+
+    for reason in BENIGN_UNVERIFIED_REASONS:
+        task = _merged_with_reason(reason)
+        assert merge_verification_status(task) == "unverified_benign", reason
+        assert is_verified_merge(task) is False, reason
+
+
+def test_merge_verification_status_degraded_reasons():
+    from app.ci_resolution import DEGRADED_UNVERIFIED_REASONS
+    from app.landed_signal import is_verified_merge, merge_verification_status
+
+    for reason in DEGRADED_UNVERIFIED_REASONS:
+        task = _merged_with_reason(reason)
+        assert merge_verification_status(task) == "unverified_degraded", reason
+        assert is_verified_merge(task) is False, reason
+
+
+def test_merge_verification_status_unknown_reason_defaults_benign():
+    from app.landed_signal import merge_verification_status
+
+    task = _merged_with_reason("some_future_unclassified_reason")
+    assert merge_verification_status(task) == "unverified_benign"
+
+
+def test_merge_verification_status_non_merged_is_none():
+    from app.landed_signal import is_verified_merge, merge_verification_status
+
+    # COMPLETED but never landed.
+    completed_unmerged = _make_task(KIND_CODE_MERGE, context={})
+    assert merge_verification_status(completed_unmerged) is None
+    assert is_verified_merge(completed_unmerged) is False
+
+    # Not COMPLETED even though the (stale) landed flag is present.
+    in_progress = _make_task(
+        KIND_CODE_MERGE, status=TaskStatus.IN_PROGRESS, context=_merged_context()
+    )
+    assert merge_verification_status(in_progress) is None
+    assert is_verified_merge(in_progress) is False
+
+
+def test_merge_verification_status_ignores_malformed_review_loop():
+    from app.landed_signal import merge_verification_status
+
+    context = _merged_context()
+    context["review_loop"] = "not-a-dict"
+    task = _make_task(KIND_CODE_MERGE, context=context)
+    assert merge_verification_status(task) == "verified"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _evaluate_write: degraded-unverified merge downgrade
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _write_merged_with_reason(reason: str | None) -> Task:
+    """A merged write-type task carrying an optional fall-open reason."""
+    context = _merged_context()
+    if reason is not None:
+        context["review_loop"] = {"unverified_merge_reason": reason}
+    return _make_task("create", context=context)
+
+
+def test_write_degraded_unverified_merge_is_neutral():
+    """A merged PR that fell open for a degraded reason must NOT score as success."""
+    from app.ci_resolution import DEGRADED_UNVERIFIED_REASONS
+
+    for reason in DEGRADED_UNVERIFIED_REASONS:
+        task = _write_merged_with_reason(reason)
+        result = evaluate_task_outcome(task)
+        assert result == TaskOutcome("neutral", KIND_CODE_MERGE), (
+            f"reason={reason!r} should be neutral, got {result}"
+        )
+        assert is_successful_outcome(task) is False, reason
+
+
+def test_write_benign_unverified_merge_is_success():
+    """A benign fall-open (no suite, kill-switch) must still score as success."""
+    from app.ci_resolution import BENIGN_UNVERIFIED_REASONS
+
+    for reason in BENIGN_UNVERIFIED_REASONS:
+        task = _write_merged_with_reason(reason)
+        result = evaluate_task_outcome(task)
+        assert result == TaskOutcome("success", KIND_CODE_MERGE), (
+            f"reason={reason!r} should be success, got {result}"
+        )
+        assert is_successful_outcome(task) is True, reason
+
+
+def test_write_verified_merge_is_success():
+    """A verified merge (no fall-open reason) must score as success."""
+    task = _write_merged_with_reason(None)
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_CODE_MERGE)
+    assert is_successful_outcome(task) is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _compute_first_attempt_succeeded: merge-verification awareness
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_first_attempt_succeeded_degraded_returns_false():
+    """A degraded-unverified merge_verification makes first_attempt False."""
+    from app.task_completion import _compute_first_attempt_succeeded
+
+    assert _compute_first_attempt_succeeded(
+        0, TaskStatus.COMPLETED, merge_verification="unverified_degraded"
+    ) is False
+    assert _compute_first_attempt_succeeded(
+        1, TaskStatus.COMPLETED, merge_verification="unverified_degraded"
+    ) is False
+
+
+def test_first_attempt_succeeded_benign_unverified_is_unaffected():
+    """Benign-unverified merge does not suppress the flag."""
+    from app.task_completion import _compute_first_attempt_succeeded
+
+    assert _compute_first_attempt_succeeded(
+        0, TaskStatus.COMPLETED, merge_verification="unverified_benign"
+    ) is True
+
+
+def test_first_attempt_succeeded_verified_is_unaffected():
+    """A verified merge keeps the normal first-attempt semantics."""
+    from app.task_completion import _compute_first_attempt_succeeded
+
+    assert _compute_first_attempt_succeeded(
+        0, TaskStatus.COMPLETED, merge_verification="verified"
+    ) is True
+    assert _compute_first_attempt_succeeded(
+        2, TaskStatus.COMPLETED, merge_verification="verified"
+    ) is False
+
+
+def test_first_attempt_succeeded_none_verification_backward_compat():
+    """Passing None merge_verification preserves pre-change semantics."""
+    from app.task_completion import _compute_first_attempt_succeeded
+
+    assert _compute_first_attempt_succeeded(0, TaskStatus.COMPLETED, merge_verification=None) is True
+    assert _compute_first_attempt_succeeded(1, TaskStatus.COMPLETED, merge_verification=None) is True
+    assert _compute_first_attempt_succeeded(2, TaskStatus.COMPLETED, merge_verification=None) is False
+    assert _compute_first_attempt_succeeded(0, TaskStatus.FAILED, merge_verification=None) is False
 
 
 if __name__ == "__main__":

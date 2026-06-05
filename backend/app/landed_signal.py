@@ -20,12 +20,14 @@ integration branch" signal used by analytics.
 """
 
 import logging
+from typing import Literal
 
 from sqlalchemy import and_, cast, func, or_
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import ColumnElement
 
+from app.ci_resolution import is_degraded_unverified_reason
 from app.database import resolve_dialect_name
 from app.models import Task, TaskStatus
 
@@ -36,6 +38,19 @@ logger = logging.getLogger(__name__)
 LANDED_SIGNAL_KEY = "pr_merged"
 LANDED_ON_INTEGRATION_KEY = "landed_on_integration"
 NON_MERGE_UNBLOCK_REASON_KEY = "_non_merge_unblock_reason"
+
+# Where the no-CI merge gate stamps WHY a PR merged without real test
+# verification. Lives under ``task.context["review_loop"]``; absent on a
+# verified/normal merge. The reason KEYS are minted in ``ci_resolution`` and
+# classified benign-vs-degraded there (the single source of truth).
+REVIEW_LOOP_KEY = "review_loop"
+UNVERIFIED_MERGE_REASON_KEY = "unverified_merge_reason"
+
+# Task-level verified-merge classification consumed by success-scoring analytics
+# (task_outcomes / direction_outcomes / pipeline_health).
+MergeVerificationStatus = Literal[
+    "verified", "unverified_benign", "unverified_degraded"
+]
 
 
 def has_merge_unblock_signal(task: Task) -> bool:
@@ -76,6 +91,63 @@ def is_merged_completion(task: Task) -> bool:
 def is_unblocked_completion(task: Task) -> bool:
     """True when a completed task should no longer block rollup convergence."""
     return task.status == TaskStatus.COMPLETED and has_merge_unblock_signal(task)
+
+
+def _unverified_merge_reason(task: Task) -> str | None:
+    """Read ``review_loop["unverified_merge_reason"]`` defensively.
+
+    Returns the stable reason KEY a no-CI fall-open stamped, or ``None`` when the
+    merge was verified (no reason) or the context shape is missing/malformed.
+    """
+    review_loop = (task.context or {}).get(REVIEW_LOOP_KEY)
+    if not isinstance(review_loop, dict):
+        return None
+    reason = review_loop.get(UNVERIFIED_MERGE_REASON_KEY)
+    return reason if isinstance(reason, str) and reason else None
+
+
+def merge_verification_status(task: Task) -> "MergeVerificationStatus | None":
+    """Classify HOW a merged completion's PR was verified, for success scoring.
+
+    A PR merging onto the integration branch is necessary but NOT sufficient to
+    call a done/fixed claim *proven*: the no-CI merge gate legitimately "falls
+    open" and merges some PRs WITHOUT running real tests, recording why in
+    ``review_loop["unverified_merge_reason"]``. This predicate reads that reason
+    and returns one of:
+
+      - ``"verified"`` — merged completion with NO fall-open reason: a real CI /
+        test verdict gated the merge.
+      - ``"unverified_benign"`` — merged via a fall-open whose reason is benign
+        (the project has no runnable suite, or only positive execution signals
+        were obtained). A benign project must NOT be penalized for having no tests.
+      - ``"unverified_degraded"`` — merged via a fall-open whose reason is
+        *degraded* (verification was expected but an environment/setup failure
+        blocked it) per :func:`ci_resolution.is_degraded_unverified_reason`.
+
+    Returns ``None`` for any task that is not a merged completion (the question
+    does not apply), so callers can cheaply skip non-shipped tasks. Reuses
+    :func:`is_merged_completion` so the "shipped" definition stays identical to
+    the rest of analytics; an unknown / unclassified reason key defaults to
+    ``"unverified_benign"`` (mirroring the WARNING severity default).
+    """
+    if not is_merged_completion(task):
+        return None
+    reason = _unverified_merge_reason(task)
+    if reason is None:
+        return "verified"
+    if is_degraded_unverified_reason(reason):
+        return "unverified_degraded"
+    return "unverified_benign"
+
+
+def is_verified_merge(task: Task) -> bool:
+    """True iff *task* is a merged completion whose PR was really verified.
+
+    Convenience wrapper over :func:`merge_verification_status`: only the
+    ``"verified"`` status counts. Both unverified buckets and non-merged tasks
+    return False, so success-scoring can gate a "proven fix" credit on this.
+    """
+    return merge_verification_status(task) == "verified"
 
 
 def landed_signal_predicate(session: AsyncSession) -> ColumnElement[bool]:

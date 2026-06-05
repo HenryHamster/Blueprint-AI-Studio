@@ -27,7 +27,7 @@ from app.failure_classification import (
     classify_failure as _classify_failure,
     classify_failure_taxonomy as _classify_taxonomy,
 )
-from app.landed_signal import is_merged_completion
+from app.landed_signal import is_merged_completion, merge_verification_status
 from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
 from app.review_pipeline import _is_test_file
 from app.task_capabilities import PRODUCT_TASK_TYPES
@@ -410,6 +410,15 @@ async def _update_direction_research_outcomes(
     )
     entry["assisted_prs_merged"] = sum(
         1 for ct in _merged_rows if not is_autonomous_merge(ct)
+    )
+    # verified_prs_merged: merged completions whose PR was actually verified by
+    # a real test suite (not a fall-open for a degraded environment/setup reason).
+    # Additive alongside prs_merged for back-compat; consumers that need "proven
+    # fix" counts should prefer this field over the raw prs_merged.
+    entry["verified_prs_merged"] = sum(
+        1
+        for ct in _merged_rows
+        if merge_verification_status(ct) != "unverified_degraded"
     )
     # operator_action_count: tasks in this cycle with any detectable operator intervention
     entry["operator_action_count"] = sum(

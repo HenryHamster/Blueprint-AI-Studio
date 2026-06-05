@@ -217,8 +217,22 @@ async def patch_pr_body_with_blueprint_meta(
         )
 
 
-def _compute_first_attempt_succeeded(attempt_count: int, status: "TaskStatus") -> bool:
-    """Return True if the task completed successfully on its first attempt (attempt_count <= 1)."""
+def _compute_first_attempt_succeeded(
+    attempt_count: int,
+    status: "TaskStatus",
+    merge_verification: "str | None" = None,
+) -> bool:
+    """Return True if the task completed successfully on its first attempt.
+
+    A degraded-unverified merge (environment/setup failure blocked real
+    verification) does NOT count as a first-attempt success even if
+    attempt_count <= 1 and status == COMPLETED — the claim was never proven on
+    HEAD.  Pass ``merge_verification`` as the
+    :func:`~app.landed_signal.merge_verification_status` result at write time
+    so the flag is accurate when the merge context is already available.
+    """
+    if merge_verification == "unverified_degraded":
+        return False
     return attempt_count <= 1 and status == TaskStatus.COMPLETED
 
 

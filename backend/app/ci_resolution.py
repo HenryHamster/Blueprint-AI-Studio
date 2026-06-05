@@ -828,6 +828,59 @@ _ALL_SKIPPED_NO_TESTS_REASONS = frozenset(
 )
 
 
+# --- Single source of truth: benign-vs-degraded UNVERIFIED-merge reasons -----
+#
+# The no-CI merge gate records WHY a PR merged without real test verification in
+# ``review_loop["unverified_merge_reason"]`` (the reason KEYS are minted by
+# :func:`classify_unverified_fall_open_reason` here and at the orchestrator's
+# two other fall-open decision sites). Two downstream layers must agree on
+# whether a given reason is *benign* (the project legitimately has no runnable
+# suite, or only positive execution signals were obtained — do NOT penalize) or
+# *degraded* (verification was expected but an environment/setup failure
+# prevented it — escalate loudly):
+#   - :mod:`app.alert_dispatch` maps these onto ``AlertSeverity`` (WARNING vs
+#     ERROR), and
+#   - success-scoring analytics distinguish a *verified* merge from one the gate
+#     merged UNVERIFIED.
+# Keep that partition HERE, in one dependency-light leaf (this module imports
+# only ``app.github``), so the two layers cannot drift. ``alert_dispatch``
+# DERIVES ``_UNVERIFIED_REASON_SEVERITY`` from these sets rather than re-listing
+# the keys. Their union is the canonical emitted reason set (pinned by
+# ``test_invariants._UNVERIFIED_REASON_KEYS``); they are disjoint by contract.
+DEGRADED_UNVERIFIED_REASONS = frozenset(
+    {
+        "verify_setup_failed",
+        "undetected_runtime",
+        "suite_all_skipped",
+        "probe_could_not_run",
+        "probe_no_artifact",
+        "documented_command_could_not_run",
+        "documented_command_no_artifact",
+    }
+)
+BENIGN_UNVERIFIED_REASONS = frozenset(
+    {
+        "no_detectable_test_command",
+        "kill_switch_off",
+        "internal_staging_base",
+        "probe_passed",
+        "documented_command_passed",
+    }
+)
+
+
+def is_degraded_unverified_reason(reason: str | None) -> bool:
+    """Whether a no-CI UNVERIFIED-merge reason key marks a *degraded* fall-open.
+
+    Degraded reasons mean verification was expected but an environment/setup
+    failure prevented it (escalate). Benign reasons mean no verification was
+    expected, or only positive execution signals were obtained. Unknown / None
+    keys are treated as NOT degraded, mirroring ``alert_dispatch``'s WARNING
+    default — a key with no explicit classification never silently escalates.
+    """
+    return reason in DEGRADED_UNVERIFIED_REASONS
+
+
 def classify_unverified_fall_open_reason(
     verdict: dict[str, Any] | None,
 ) -> tuple[str, str]:

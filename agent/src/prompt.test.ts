@@ -2242,6 +2242,13 @@ describe('getTaskTypeHints', () => {
     expect(result).toBeUndefined();
   });
 
+  it('fix hint requires reproduce-on-HEAD first with a non-reproducible no-op off-ramp', () => {
+    const hint = TASK_TYPE_HINTS['fix'];
+    expect(hint).toContain('REPRODUCE FIRST');
+    expect(hint).toContain('reproduces on current HEAD');
+    expect(hint).toContain('./done --already-done');
+  });
+
   it('returns static hint when buildConfig has empty directories array', () => {
     const result = getTaskTypeHints({ directories: [] })['create'];
     expect(result).toBe(TASK_TYPE_HINTS['create']);

@@ -8485,6 +8485,36 @@ def test_unverified_reason_severity_degraded_are_error():
         )
 
 
+def test_unverified_reason_severity_derives_from_shared_sets():
+    """The alert severity map is the SINGLE-SOURCE-OF-TRUTH wiring: it must be
+    derived exactly from ``ci_resolution.{DEGRADED,BENIGN}_UNVERIFIED_REASONS``.
+
+    The benign-vs-degraded partition lives in ``app.ci_resolution`` so the alert
+    layer and success-scoring analytics cannot drift. This pins the wiring: if a
+    future edit re-hand-lists the severity map or the shared sets diverge from
+    the canonical key set, this fails loudly rather than silently mis-scoring a
+    merge as verified.
+    """
+    from app.alert_dispatch import _UNVERIFIED_REASON_SEVERITY, AlertSeverity
+    from app.ci_resolution import (
+        BENIGN_UNVERIFIED_REASONS,
+        DEGRADED_UNVERIFIED_REASONS,
+    )
+
+    # The shared sets partition the canonical emitted reason key set exactly.
+    assert not (BENIGN_UNVERIFIED_REASONS & DEGRADED_UNVERIFIED_REASONS)
+    assert (BENIGN_UNVERIFIED_REASONS | DEGRADED_UNVERIFIED_REASONS) == set(
+        _UNVERIFIED_REASON_KEYS
+    )
+    assert DEGRADED_UNVERIFIED_REASONS == _DEGRADED_REASON_KEYS
+
+    expected = {
+        **{r: AlertSeverity.ERROR for r in DEGRADED_UNVERIFIED_REASONS},
+        **{r: AlertSeverity.WARNING for r in BENIGN_UNVERIFIED_REASONS},
+    }
+    assert _UNVERIFIED_REASON_SEVERITY == expected
+
+
 class TestSpawnResumeNeedSignalParity:
     """The spawn-time prerequisite resolver and the resume-time blocked-need
     matcher MUST agree on the shared EXPLICIT ``{kind, ref}`` signals.

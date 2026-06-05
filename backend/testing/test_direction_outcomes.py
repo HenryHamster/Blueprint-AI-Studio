@@ -4129,3 +4129,73 @@ async def test_product_vs_structural_classification_registry_driven(
     # 3 product / 6 total = 0.5, 3 structural.
     assert entry["product_ratio"] == 0.5
     assert entry["structural_count"] == 3
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# verified_prs_merged
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_verified_prs_merged_excludes_degraded(db_session: AsyncSession):
+    """verified_prs_merged counts only merges NOT falling open for a degraded reason."""
+    direction_id = "d-verified-prs"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
+    await db_session.flush()
+
+    # 1. Verified merge (no unverified_merge_reason).
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": True},
+        title="verified-merge",
+    )
+    # 2. Benign unverified merge (project has no test suite — not penalised).
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "review_loop": {"unverified_merge_reason": "no_detectable_test_command"},
+        },
+        title="benign-unverified",
+    )
+    # 3. Degraded unverified merge (env/setup failure blocked verification).
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "review_loop": {"unverified_merge_reason": "verify_setup_failed"},
+        },
+        title="degraded-unverified",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    # All three PR merges count in the raw metric (back-compat).
+    assert entry["prs_merged"] == 3
+    # Only verified + benign count as verified merges (degraded excluded).
+    assert entry["verified_prs_merged"] == 2

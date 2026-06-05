@@ -11,6 +11,7 @@ from app.models import (
 )
 from app.digest_metrics import (
     _FAILURE_CLASS_LABELS,
+    _compute_first_attempt_breakdowns,
     _compute_first_review_approval_breakdowns,
     _compute_non_code_outcomes,
     compute_churn_direction,
@@ -2660,3 +2661,79 @@ def test_compute_foundation_convergence_actions_multiple_pairs():
     pair_ids = {(a["foundation_id"], a["dependent_id"]) for a in actions}
     assert (str(t1a.id), str(t1b.id)) in pair_ids
     assert (str(t2a.id), str(t2b.id)) in pair_ids
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _compute_first_attempt_breakdowns: verified_overall
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _fa_task(*, succeeded: bool, reason: str | None = None) -> object:
+    """Create a minimal in-memory task-like object for first-attempt breakdown tests."""
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    ctx: dict = {"_first_attempt_succeeded": succeeded}
+    if reason is not None:
+        ctx[LANDED_SIGNAL_KEY] = True
+        ctx[LANDED_ON_INTEGRATION_KEY] = True
+        ctx["review_loop"] = {"unverified_merge_reason": reason}
+    return make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context=ctx,
+    )
+
+
+def test_first_attempt_breakdowns_verified_overall_excludes_degraded():
+    """verified_overall must not count degraded-unverified merges as successes."""
+    from app.ci_resolution import DEGRADED_UNVERIFIED_REASONS
+
+    # One verified success, one degraded-unverified "success" (should be excluded).
+    degraded_reason = next(iter(DEGRADED_UNVERIFIED_REASONS))
+    tasks = [
+        _fa_task(succeeded=True, reason=None),        # verified success
+        _fa_task(succeeded=True, reason=degraded_reason),  # degraded — exclude
+    ]
+    result = _compute_first_attempt_breakdowns(tasks)
+    # overall counts both True flags → 2/2 = 1.0
+    assert result["overall"] == 1.0
+    # verified_overall counts only the verified success → 1/2 = 0.5
+    assert result["verified_overall"] == 0.5
+
+
+def test_first_attempt_breakdowns_verified_overall_benign_counts():
+    """Benign fall-opens must still count in verified_overall."""
+    from app.ci_resolution import BENIGN_UNVERIFIED_REASONS
+
+    benign_reason = next(iter(BENIGN_UNVERIFIED_REASONS))
+    tasks = [
+        _fa_task(succeeded=True, reason=None),         # verified
+        _fa_task(succeeded=True, reason=benign_reason),  # benign — should count
+        _fa_task(succeeded=False, reason=None),         # plain failure
+    ]
+    result = _compute_first_attempt_breakdowns(tasks)
+    # overall: 2 successes / 3 measured = 0.67
+    assert result["overall"] == round(2 / 3, 2)
+    # verified_overall: both successes count (benign is fine) → 2/3 = 0.67
+    assert result["verified_overall"] == round(2 / 3, 2)
+
+
+def test_first_attempt_breakdowns_verified_overall_all_degraded():
+    """verified_overall is 0.0 when all successes are degraded-unverified."""
+    from app.ci_resolution import DEGRADED_UNVERIFIED_REASONS
+
+    degraded_reason = next(iter(DEGRADED_UNVERIFIED_REASONS))
+    tasks = [
+        _fa_task(succeeded=True, reason=degraded_reason),
+        _fa_task(succeeded=True, reason=degraded_reason),
+    ]
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["overall"] == 1.0
+    assert result["verified_overall"] == 0.0
+
+
+def test_first_attempt_breakdowns_verified_overall_no_measured_is_none():
+    """verified_overall returns None when no task has the metric recorded."""
+    tasks = [make_task(status=TaskStatus.COMPLETED, payloads=[{"type": "create"}], context={})]
+    result = _compute_first_attempt_breakdowns(tasks)
+    assert result["verified_overall"] is None

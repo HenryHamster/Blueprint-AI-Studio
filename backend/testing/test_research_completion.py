@@ -30,6 +30,7 @@ from app.research_completion import (
     _apply_structural_actionability_downgrade,
     _handle_research_completion,
     _reconcile_verification_basis,
+    _record_research_survival_signal,
     _research_findings_would_spawn,
     _summarize_ungrounded_claims_grounded,
 )
@@ -40,6 +41,43 @@ from app.task_evaluators import (
     spawn_forward_quality_grader,
 )
 from app.time_utils import _utcnow
+
+
+class TestRecordResearchSurvivalSignal:
+    """_record_research_survival_signal: honest research success signal on the task."""
+
+    def _task(self, context=None):
+        return _Task(
+            project_id=uuid.uuid4(),
+            title="research",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context=context or {},
+        )
+
+    def test_records_surviving_count(self):
+        t = self._task()
+        _record_research_survival_signal(t, surviving=3)
+        assert t.context["research_surviving_findings"] == 3
+
+    def test_zero_survivors_downgrades_first_attempt_success(self):
+        t = self._task({"_first_attempt_succeeded": True})
+        _record_research_survival_signal(t, surviving=0)
+        assert t.context["research_surviving_findings"] == 0
+        assert t.context["_first_attempt_succeeded"] is False
+
+    def test_positive_survivors_preserve_first_attempt_success(self):
+        t = self._task({"_first_attempt_succeeded": True})
+        _record_research_survival_signal(t, surviving=1)
+        assert t.context["_first_attempt_succeeded"] is True
+
+    def test_zero_survivors_never_upgrades_first_attempt_success(self):
+        # A later attempt already recorded False — a no-survivor cycle must not
+        # flip it to True.
+        t = self._task({"_first_attempt_succeeded": False})
+        _record_research_survival_signal(t, surviving=0)
+        assert t.context["_first_attempt_succeeded"] is False
 
 
 class TestScopeBudgetGate:
@@ -2934,3 +2972,134 @@ async def test_cyclic_prerequisite_refused_at_spawn(db_session, mocker):
             assert other is None or str(c.id) not in (other.depends_on or []), (
                 "a mutual depends_on cycle must never be persisted"
             )
+
+
+class TestFindingHeadProvenance:
+    """Stale-targeting helpers: HEAD-commit provenance + cited-file diff."""
+
+    def test_finding_cited_paths_extracts_file_refs(self):
+        from app.source_ref_validation import finding_cited_paths
+
+        finding = {
+            "sources": [
+                {"type": "file", "ref": "backend/app/foo.py:42"},
+                {"type": "file", "ref": "agent/src/bar.ts#L10-L20"},
+                {"type": "pr", "ref": "https://github.com/o/r/pull/1"},
+                {"type": "message", "ref": "msg-abc"},
+                {"ref": "not a path"},
+                "garbage",
+            ]
+        }
+        paths = finding_cited_paths(finding)
+        assert paths == ["backend/app/foo.py", "agent/src/bar.ts"]
+
+    def test_finding_cited_paths_handles_missing_sources(self):
+        from app.source_ref_validation import finding_cited_paths
+
+        assert finding_cited_paths({}) == []
+        assert finding_cited_paths({"sources": None}) == []
+        assert finding_cited_paths("nope") == []
+
+    async def test_resolve_head_commit_uses_github_when_creds(self, monkeypatch):
+        from app import source_ref_validation as srv
+
+        async def _fake_branch_sha(token, owner, repo, branch):
+            assert (token, owner, repo, branch) == ("t", "o", "r", "main")
+            return "deadbeefcafe"
+
+        import app.github_refs as gh
+
+        monkeypatch.setattr(gh, "get_branch_sha", _fake_branch_sha)
+        sha = await srv.resolve_head_commit(
+            token="t", owner="o", repo="r", branch="main"
+        )
+        assert sha == "deadbeefcafe"
+
+    async def test_resolve_head_commit_github_error_degrades_to_none(
+        self, monkeypatch
+    ):
+        from app import source_ref_validation as srv
+        import app.github_refs as gh
+
+        async def _boom(*a, **k):
+            raise RuntimeError("api down")
+
+        monkeypatch.setattr(gh, "get_branch_sha", _boom)
+        # No local checkout dir -> _git_output returns None -> overall None.
+        monkeypatch.setattr(srv.os.path, "isdir", lambda p: False)
+        sha = await srv.resolve_head_commit(
+            token="t", owner="o", repo="r", branch="main"
+        )
+        assert sha is None
+
+    async def test_cited_paths_changed_since_true_when_file_in_diff(
+        self, monkeypatch
+    ):
+        from app import source_ref_validation as srv
+        import app.github_refs as gh
+
+        async def _changed(token, owner, repo, base, head, project_id=None):
+            return ["backend/app/foo.py", "unrelated.py"]
+
+        monkeypatch.setattr(gh, "get_files_changed_between_refs", _changed)
+        result = await srv.cited_paths_changed_since(
+            "oldsha",
+            ["backend/app/foo.py:42"],
+            token="t",
+            owner="o",
+            repo="r",
+            branch="main",
+        )
+        assert result is True
+
+    async def test_cited_paths_changed_since_false_when_not_in_diff(
+        self, monkeypatch
+    ):
+        from app import source_ref_validation as srv
+        import app.github_refs as gh
+
+        async def _changed(*a, **k):
+            return ["something/else.py"]
+
+        monkeypatch.setattr(gh, "get_files_changed_between_refs", _changed)
+        result = await srv.cited_paths_changed_since(
+            "oldsha",
+            ["backend/app/foo.py"],
+            token="t",
+            owner="o",
+            repo="r",
+            branch="main",
+        )
+        assert result is False
+
+    async def test_cited_paths_changed_since_none_when_diff_indeterminate(
+        self, monkeypatch
+    ):
+        from app import source_ref_validation as srv
+        import app.github_refs as gh
+
+        async def _indeterminate(*a, **k):
+            return None  # API error sentinel
+
+        monkeypatch.setattr(gh, "get_files_changed_between_refs", _indeterminate)
+        result = await srv.cited_paths_changed_since(
+            "oldsha",
+            ["backend/app/foo.py"],
+            token="t",
+            owner="o",
+            repo="r",
+            branch="main",
+        )
+        assert result is None
+
+    async def test_cited_paths_changed_since_none_for_unknown_sha(self):
+        from app.source_ref_validation import cited_paths_changed_since
+
+        assert await cited_paths_changed_since(None, ["backend/app/foo.py"]) is None
+        assert await cited_paths_changed_since("", ["backend/app/foo.py"]) is None
+
+    async def test_cited_paths_changed_since_none_when_no_cited_paths(self):
+        from app.source_ref_validation import cited_paths_changed_since
+
+        assert await cited_paths_changed_since("sha", []) is None
+        assert await cited_paths_changed_since("sha", ["not a path"]) is None

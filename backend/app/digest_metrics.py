@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.database import resolve_dialect_name
-from app.landed_signal import has_landed_signal
+from app.landed_signal import has_landed_signal, merge_verification_status
 from app.models import (
     Alert,
     Project,
@@ -181,8 +181,27 @@ def _compute_first_attempt_breakdowns(
             for cat, count in sorted(cat_counts.items(), key=lambda x: -x[1])
         }
 
+    # verified_overall: excludes degraded-unverified merges from the success
+    # count.  A task with _first_attempt_succeeded=True whose PR merged via a
+    # degraded fall-open (environment/setup failure blocked verification) is not
+    # a proven fix on HEAD and should not inflate the success rate.  Benign
+    # fall-opens (no detectable suite, kill-switch off) still count.  Additive
+    # — does not replace "overall".
+    def _fa_verified_rate(tasks):
+        measured = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
+        if not measured:
+            return None
+        succ = sum(
+            1
+            for t in measured
+            if t.context["_first_attempt_succeeded"]
+            and merge_verification_status(t) != "unverified_degraded"
+        )
+        return round(succ / len(measured), 2)
+
     return {
         "overall": overall,
+        "verified_overall": _fa_verified_rate(terminal_tasks),
         "with_playbook": _fa_rate(with_pb),
         "without_playbook": _fa_rate(without_pb),
         "with_arch_context": _fa_rate(with_arch),

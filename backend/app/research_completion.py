@@ -79,6 +79,9 @@ from app.source_ref_validation import (
     summarize_broken_refs,
     summarize_ungrounded_claims,  # noqa: F401 — re-exported for callers/tests
     detect_absent_symbols,
+    resolve_head_commit,
+    cited_paths_changed_since,
+    finding_cited_paths,
 )
 from app.scope_complexity import _composite_complexity_score
 from app.shared_state import (
@@ -740,6 +743,30 @@ def _apply_structural_actionability_downgrade(findings: list) -> int:
     return downgrades
 
 
+def _record_research_survival_signal(task: Task, *, surviving: int) -> None:
+    """Record the honest research success signal on the task at dispatch time.
+
+    ``surviving`` is the count of findings that survived ingestion validation +
+    dedup + actionability gating and were routed to work (spawned, or deferred
+    only for capacity/health reasons). Stored on ``task.context`` so the outcome
+    evaluator (``task_outcomes._evaluate_research``) scores the cycle on real
+    surviving work rather than the raw parsed-findings list.
+
+    A cycle whose findings were ALL rejected (stale duplicates, citations absent
+    on HEAD, low actionability) yields ``surviving == 0``; in that case any
+    first-attempt-success flag that bare-COMPLETED status set upstream is
+    downgraded to honest ``False`` — a no-surviving cycle is a neutral terminal
+    outcome, not a first-attempt win. The flag is never upgraded to ``True``
+    here (a later attempt keeps its existing ``False``).
+    """
+    ctx = dict(task.context or {})
+    ctx["research_surviving_findings"] = int(surviving)
+    if surviving <= 0 and ctx.get("_first_attempt_succeeded"):
+        ctx["_first_attempt_succeeded"] = False
+    task.context = ctx
+    flag_modified(task, "context")
+
+
 def _summarize_dispatch_outcome(
     spawned: int,
     total_findings: int,
@@ -975,6 +1002,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     if not findings:
         task.latest_status_message = "Research completed with no actionable findings"
         task.plan_output = []
+        _record_research_survival_signal(task, surviving=0)
         session.add(task)
         await session.commit()
         return
@@ -1032,8 +1060,32 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             )
             _src_ref_ctx = {}
 
+    # Record the integration HEAD these findings were generated against, so a
+    # later re-dispatch can answer the one cheap question that gates trust: have
+    # the cited files changed since? Resolved once against the same verification
+    # context the citation checks use. Degrades to None (no stamp) when the SHA
+    # is unknown (no creds + no checkout) — a missing SHA never marks a finding
+    # stale downstream.
+    _generated_head_sha: Optional[str] = None
+    if project_obj is not None:
+        try:
+            _generated_head_sha = await resolve_head_commit(**_src_ref_ctx)
+        except Exception:  # noqa: BLE001 — provenance must never crash ingestion
+            logger.debug(
+                "[RESEARCH] head-commit provenance resolution failed", exc_info=True
+            )
+            _generated_head_sha = None
+
     # Validate optional structured fields: claims and sources.
+    # Count findings whose cited code is absent on the integration HEAD (broken
+    # file citation or ungrounded path:symbol claim). A finding that cites code
+    # not present on HEAD definitionally does not reproduce on HEAD, so this
+    # count is recorded on the task as the honest "rejected for does-not-exist-
+    # on-HEAD" signal — separate from the surviving-finding success signal below.
+    _broken_citation_findings = 0
     for _f in findings:
+        if _generated_head_sha and not _f.get("generated_head_sha"):
+            _f["generated_head_sha"] = _generated_head_sha
         if "claims" in _f and not isinstance(_f.get("claims"), list):
             _f["claims"] = []
         _broken_provenance: Optional[Dict[str, Any]] = None
@@ -1073,6 +1125,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _f["_provenance_warnings"] = {**_broken_provenance, **_ungrounded}
         elif _broken_provenance or _ungrounded:
             _f["_provenance_warnings"] = _broken_provenance or _ungrounded
+        if _broken_provenance or _ungrounded:
+            _broken_citation_findings += 1
         # Reconcile the self-reported verification_basis against the validation
         # just computed: a finding cannot honestly claim a verified-against-code
         # tier while its own citations are absent at HEAD. Reuses the broken-ref
@@ -1106,6 +1160,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     task.context = {
         **(task.context or {}),
         "_actionability_structural_downgrades": _structural_downgrades,
+        "research_broken_citation_rejected": _broken_citation_findings,
     }
     session.add(task)
     await session.commit()
@@ -1208,6 +1263,25 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 f"titles={[f.get('title') or f.get('description', '')[:60] for f in _decayed]}"
             )
         prior_actionable = _kept
+        # Stale-targeting: a deferred finding carries the integration HEAD it was
+        # generated against. On re-dispatch, ask whether any cited file changed
+        # between that commit and the current branch tip; if so, the finding may
+        # no longer reproduce — flag it for the reproduce-on-HEAD gate rather than
+        # trusting it as fresh. Conservative: an unknown SHA or an uncomputable
+        # diff (no creds + no checkout, API error) never raises the flag.
+        for f in prior_actionable:
+            _gen_sha = f.get("generated_head_sha")
+            if not _gen_sha:
+                continue
+            try:
+                _changed = await cited_paths_changed_since(
+                    _gen_sha, finding_cited_paths(f), **_src_ref_ctx
+                )
+            except Exception:  # noqa: BLE001 — re-validation must never crash recovery
+                _changed = None
+            if _changed is True:
+                f["needs_revalidation"] = True
+                f["needs_revalidation_reason"] = "cited_files_changed_since_generation"
         if prior_actionable:
             logger.info(
                 f"[RESEARCH] Prepending {len(prior_actionable)} deferred finding(s) from previous cycle "
@@ -2702,6 +2776,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         dedup_outcome=_dedup_outcome,
         deferred_reason_parts=_deferral_reasons,
     )
+    # Honest success signal: count findings that SURVIVED ingestion validation +
+    # dedup + actionability and were routed to work — spawned, or deferred only
+    # for capacity/health reasons (batch cap, pipeline degradation). Findings
+    # dropped as low-actionability / stale-duplicate / broken-citation did NOT
+    # survive and are excluded, so a cycle whose findings were all rejected
+    # scores neutral instead of a spurious success.
+    _surviving_findings = (
+        _impl_spawned + len(_batch_cap_deferred) + len(_degradation_gate_deferred)
+    )
+    _record_research_survival_signal(task, surviving=_surviving_findings)
     session.add(task)
 
     await session.commit()

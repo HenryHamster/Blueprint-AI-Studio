@@ -106,6 +106,20 @@ export const FIX_TASK_FOCUS = `
 Fix tasks most commonly introduce regression risk on the surface that was already
 failing, and scope creep into unrelated files. Apply these additional checks:
 
+0. **Reproduced-on-HEAD gate (do this FIRST, before editing)** — a bug-fix task is
+   spawned from a finding that asserts a defect at a cited location, but that finding
+   can be stale: the bug was already fixed by an intervening merge, the cited code was
+   refactored away, or the report was simply wrong. Before changing code, confirm the
+   reported defect still reproduces on current HEAD via at least one of: a failing test,
+   an observable symptom, or the cited buggy pattern still present at the cited
+   code/symbol. If it does NOT reproduce — the cited code/symbol is absent, or a
+   reproduction attempt you wrote down demonstrably no longer fails — take the
+   already-resolved off-ramp \`./done --already-done "<reason naming the cited location
+   and what you checked>"\` INSTEAD of producing a speculative change, so the outcome is
+   recorded as a no-op rather than a false fix. Keep the not-reproducible bar HIGH:
+   ambiguity, or a still-present cited pattern, falls through to the normal fix path
+   below. Record this under \`correctness\` with the reproduction evidence
+   (e.g. \`"issue": "reproduced: cited pattern foo() still present at bar.py:42"\`).
 1. **Regression surface** — identify the specific code path that was failing before
    your fix. Confirm the fix targets ONLY that path and does not silently change
    adjacent behavior. Record in \`regression_risk\` even when passing:
