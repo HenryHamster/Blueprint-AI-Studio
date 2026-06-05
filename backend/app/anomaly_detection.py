@@ -233,7 +233,10 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     """
     # Deferred import to avoid circular dependency (main.py imports this module)
     from app.failure_classification import classify_failure  # noqa: PLC0415
-    from app.direction_outcomes import _is_cascade_cancelled  # noqa: PLC0415
+    from app.direction_outcomes import (  # noqa: PLC0415
+        _is_cascade_cancelled,
+        verified_merged_count,
+    )
 
     now = _utcnow()
     window_48h = now - timedelta(hours=48)
@@ -535,7 +538,7 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
                 rates = []
                 for entry in last3:
                     created = entry.get("tasks_created", 0)
-                    merged = entry.get("prs_merged", 0)
+                    merged = verified_merged_count(entry)
                     rates.append(merged / created if created > 0 else 0.0)
                 if rates[0] > rates[1] > rates[2] and rates[0] > 0.1:
                     anomalies.append(

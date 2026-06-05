@@ -442,6 +442,12 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         description="Open-ended read-only investigation.",
         run_shape="single_agent",
         output_kind="knowledge",
+        # Operator-launchable so a bug report can be turned into a targeted
+        # read-only investigation directly (the citation gate in
+        # admin.create_task_manually re-validates the originating message's
+        # citations against HEAD). Read-only + prompt-only contract — no launch
+        # metadata beyond the prompt the manual creation path already supplies.
+        user_launchable=True,
         evaluation_strategy="review_only",
         cost_ceiling_usd=4.0,
         evaluation="forward-quality",

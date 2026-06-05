@@ -1816,6 +1816,35 @@ def _summarize_open_messages(messages: list) -> list:
     return _bound_open_messages(messages, _OPEN_MESSAGES_KEEP_WHEN_TRIMMED)
 
 
+def _open_message_citation_summary(context: Any) -> dict:
+    """Promote a message's stored citation-grounding signal to a compact summary.
+
+    BUG_REPORT/BLOCKER ingestion stores a reproduce-on-HEAD citation signal under
+    ``context['_provenance_warnings']`` (the same key research findings use). This
+    surfaces it at the top level of the packed open-message dict so the strategist
+    sees a stale/broken-citation report as discounted instead of trusting it. The
+    signal is only stored when a citation is unambiguously absent, so a present
+    summary always means "cited code is missing on HEAD". Returns an empty dict
+    (no key added) when there is no recorded warning.
+    """
+    if not isinstance(context, dict):
+        return {}
+    warnings = context.get("_provenance_warnings")
+    if not isinstance(warnings, dict):
+        return {}
+    state = warnings.get("citation_state")
+    if state != "absent":
+        return {}
+    summary: dict = {"citation_state": state}
+    broken = warnings.get("broken_refs")
+    if isinstance(broken, list) and broken:
+        summary["broken_refs"] = broken
+    ungrounded = warnings.get("ungrounded_refs")
+    if isinstance(ungrounded, list) and ungrounded:
+        summary["ungrounded_refs"] = ungrounded
+    return summary
+
+
 async def _fetch_open_messages(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -1862,6 +1891,11 @@ async def _fetch_open_messages(
             "resolution": m.resolution,
             "created_at": m.created_at.isoformat() if m.created_at else None,
             "resolved_at": m.resolved_at.isoformat() if m.resolved_at else None,
+            # Promote the reproduce-on-HEAD citation signal (stored on the
+            # message context at ingestion) to the top level so a stale or
+            # broken-citation bug report is VISIBLY discounted to the strategist
+            # rather than silently trusted. Absent when no warning was recorded.
+            **_open_message_citation_summary(m.context),
         }
         for m in result.scalars().all()
     ]

@@ -480,10 +480,11 @@ async def create_message(
         project_id = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid project_id format")
-    # Verify user has access. The returned instance is only used for the
-    # access check; the routine-digest branch below re-reads the project under
-    # a row lock so its read-append-write on running_update is concurrency-safe.
-    await _get_user_project(project_id, current_user["user_id"], session)
+    # Verify user has access. The returned instance is used for the access
+    # check and for resolving the citation-grounding branch context below; the
+    # routine-digest branch further down re-reads the project under a row lock
+    # so its read-append-write on running_update is concurrency-safe.
+    project = await _get_user_project(project_id, current_user["user_id"], session)
 
     valid_types = {t.value for t in MessageType}
     msg_type = payload.message_type.upper()
@@ -525,6 +526,21 @@ async def create_message(
         ).scalar_one_or_none()
         if existing is not None:
             return {"id": str(existing.id), "status": "duplicate", "arming": "duplicate"}
+
+    # Reproduce-on-HEAD citation grounding: a free-text BUG_REPORT/BLOCKER can
+    # cite code that was already refactored away or fixed. Validate its cited
+    # files/symbols against the project's real integration branch and stash an
+    # ``_provenance_warnings`` signal on the message context when a citation is
+    # unambiguously absent, so the strategist (and any spawned investigation)
+    # discounts a stale report rather than trusting it. Best-effort and
+    # conservative: indeterminate never flags, and it never fails message create.
+    # Computed after the idempotency early-return so a retried send does no work.
+    if MessageType(msg_type) in (MessageType.BUG_REPORT, MessageType.BLOCKER):
+        from app.source_ref_validation import compute_message_citation_warning
+
+        warning = await compute_message_citation_warning(session, project, content)
+        if warning:
+            ctx = {**ctx, "_provenance_warnings": warning}
 
     msg = ProjectMessage(
         project_id=project_id,

@@ -1226,6 +1226,83 @@ def test_compute_digest_cost_economics_pipeline_aggregates():
     assert "pipeline_outcome_kind_breakdown" not in result
 
 
+def test_compute_digest_cost_economics_pipeline_uses_verified_merged():
+    """Pipeline acceptance/conversion rates sum the verified merge count, so a
+    direction whose only merges are unverified-degraded does not inflate the
+    headline rate, while a direction with genuine verified merges contributes
+    normally — matching the verified per-direction rates the pipeline aggregates."""
+    now = _utcnow()
+    dirs = [
+        {
+            # Genuine direction: every merge is verified.
+            "estimated_cost_usd": 0.0,
+            "prs_merged": 3,
+            "verified_prs_merged": 3,
+            "prs_rejected": 1,
+            "tasks_created": 10,
+            "pr_eligible_tasks_created": 10,
+        },
+        {
+            # Degraded direction: 2 merges, none verified (no-CI fall-open).
+            "estimated_cost_usd": 0.0,
+            "prs_merged": 2,
+            "verified_prs_merged": 0,
+            "prs_rejected": 1,
+            "tasks_created": 5,
+            "pr_eligible_tasks_created": 5,
+        },
+    ]
+    result = compute_digest_cost_economics(
+        all_tasks=[],
+        direction_progress_list=dirs,
+        window_start=now - timedelta(hours=24),
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+    )
+    # Verified merged = 3 + 0 = 3 (NOT raw 3 + 2 = 5).
+    # acceptance = 3 / (3 + 2 rejected) = 0.6; conversion = 3 / 15 created = 0.2.
+    assert result["pipeline_acceptance_rate"] == 0.6
+    assert result["pipeline_conversion_rate"] == 0.2
+    # The degraded merges lower BOTH rates versus the raw-count rollup, which
+    # would have produced acceptance 5/7 ≈ 0.714 and conversion 5/15 ≈ 0.333.
+    assert result["pipeline_acceptance_rate"] < round(5 / 7, 3)
+    assert result["pipeline_conversion_rate"] < round(5 / 15, 3)
+
+
+def test_compute_digest_cost_economics_pipeline_verified_fallback():
+    """A direction dict lacking verified_prs_merged falls back to raw prs_merged
+    so legacy/partial entries degrade to prior behavior rather than to zero."""
+    now = _utcnow()
+    dirs = [
+        {
+            # Legacy dict: no verified_prs_merged key → falls back to prs_merged.
+            "estimated_cost_usd": 0.0,
+            "prs_merged": 4,
+            "prs_rejected": 1,
+            "tasks_created": 8,
+            "pr_eligible_tasks_created": 8,
+        },
+        {
+            "estimated_cost_usd": 0.0,
+            "prs_merged": 3,
+            "verified_prs_merged": 1,
+            "prs_rejected": 0,
+            "tasks_created": 4,
+            "pr_eligible_tasks_created": 4,
+        },
+    ]
+    result = compute_digest_cost_economics(
+        all_tasks=[],
+        direction_progress_list=dirs,
+        window_start=now - timedelta(hours=24),
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+    )
+    # merged = 4 (fallback) + 1 (verified) = 5; rejected = 1; created = 12.
+    assert result["pipeline_acceptance_rate"] == round(5 / 6, 3)
+    assert result["pipeline_conversion_rate"] == round(5 / 12, 3)
+
+
 def test_compute_scope_mismatch_summary_no_calibrated_tasks():
     """Returns None when no terminal task carries scope_calibrated_from."""
     completed = [make_task(status=TaskStatus.COMPLETED, context={})]

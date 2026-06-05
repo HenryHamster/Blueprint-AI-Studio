@@ -210,6 +210,57 @@ async def test_digest_direction_progress_prs_merged(client: AsyncClient, db_sess
 
 
 @pytest.mark.asyncio
+async def test_digest_direction_progress_verified_prs_merged(
+    client: AsyncClient, db_session
+):
+    """The per-direction output dict exposes verified_prs_merged (summed via
+    verified_merged_count), which excludes unverified-degraded merges while the
+    raw prs_merged key still counts them."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-1",
+                "text": "Direction with degraded merge",
+                "status": "active",
+                "research_history": [
+                    # 3 merged this window, but only 2 verified (1 degraded).
+                    {
+                        "timestamp": recent_ts,
+                        "prs_merged": 3,
+                        "verified_prs_merged": 2,
+                    },
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-1"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert len(data["direction_progress"]) == 1
+    dp = data["direction_progress"][0]
+    assert dp["prs_merged"] == 3  # raw count still includes the degraded merge
+    assert dp["verified_prs_merged"] == 2  # verified count excludes it
+
+
+@pytest.mark.asyncio
 async def test_digest_direction_progress_generalized_success_metrics(
     client: AsyncClient, db_session
 ):

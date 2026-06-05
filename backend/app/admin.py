@@ -40,6 +40,7 @@ from app.models import (
     TaskHistory,
     Project,
     ProjectMember,
+    ProjectMessage,
     Artifact,
     ArtifactType,
     DeploymentState,
@@ -1242,6 +1243,13 @@ class CreateTaskPayload(BaseModel):
     # The agent handler branches hotfix/* off main and the orchestrator
     # back-merges main → automain after the hotfix lands.
     hotfix: bool = False
+    # Optional originating ProjectMessage (e.g. a BUG_REPORT) this task is being
+    # spawned from. Additive and backward compatible — omitted by existing
+    # callers. When provided for an ``investigate`` task, the message's citations
+    # are RE-VALIDATED against current HEAD and any "cited code is absent" signal
+    # is injected into the spawned task's context + prompt so the investigating
+    # agent discounts a stale report. Ignored for all other task types.
+    source_message_id: uuid.UUID | None = None
 
     @field_validator("base_branch", "branch")
     @classmethod
@@ -1422,6 +1430,52 @@ async def create_task_manually(
             trimmed_directions.append(entry)
         task_payload["directions"] = trimmed_directions
 
+    # Reproduce-on-HEAD citation gate for investigation tasks spawned from a
+    # bug-report message. The decision-critical moment: a full agent run is
+    # about to chase a defect. Re-validate the originating message's citations
+    # against CURRENT HEAD (which may have moved since ingestion) and, when the
+    # cited code is unambiguously absent, inject the signal into the spawned
+    # task's context (mirroring how research_completion injects
+    # finding["_provenance_warnings"]) and append a short provenance note to the
+    # prompt so the investigating agent discounts a stale report. Best-effort:
+    # a missing message or no extractable refs degrades silently (no injection).
+    citation_task_context: dict | None = None
+    if payload.source_message_id is not None and payload.task_type == TaskType.investigate:
+        from app.source_ref_validation import (
+            resolve_branch_verification_context,
+            summarize_bug_report_citations,
+        )
+
+        src_msg = await session.get(ProjectMessage, payload.source_message_id)
+        if src_msg is not None and src_msg.project_id == project.id:
+            try:
+                _ctx = await resolve_branch_verification_context(session, project)
+                signal = await summarize_bug_report_citations(
+                    src_msg.content,
+                    structured_context=src_msg.context,
+                    **_ctx,
+                )
+            except Exception:  # noqa: BLE001 — grounding must never block task create
+                logger.debug(
+                    "[ADMIN] source-message citation re-validation failed",
+                    exc_info=True,
+                )
+                signal = None
+            if signal and signal.get("citation_state") == "absent":
+                citation_task_context = {"_provenance_warnings": signal}
+                refs = list(signal.get("broken_refs") or []) + list(
+                    signal.get("ungrounded_refs") or []
+                )
+                ref_note = f" ({', '.join(refs[:5])})" if refs else ""
+                task_payload["prompt"] = (
+                    task_payload["prompt"]
+                    + "\n\n[Provenance warning] The originating bug report cites "
+                    "code that is ABSENT on the current integration branch"
+                    f"{ref_note}. The defect may already be fixed or refactored "
+                    "away — verify it still reproduces on HEAD before investing, "
+                    "and discount its actionability accordingly."
+                )
+
     try:
         task_payload = validate_task_payload(task_payload)
     except ValueError as exc:
@@ -1499,6 +1553,7 @@ async def create_task_manually(
         launched_by_user_id=current_user["user_id"],
         requires_approval=False,
         idempotency_key=scoped_idempotency_key,
+        **({"context": citation_task_context} if citation_task_context else {}),
     )
     session.add(new_task)
     try:

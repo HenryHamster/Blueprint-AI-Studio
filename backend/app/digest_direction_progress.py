@@ -618,6 +618,7 @@ async def compute_direction_progress(
                 "cycles_in_window": cycles_in_window,
                 "tasks_created": tasks_created_in_window,
                 "prs_merged": prs_merged,
+                "verified_prs_merged": verified_prs_merged,
                 "autonomous_prs_merged": autonomous_prs_merged,
                 "assisted_prs_merged": assisted_prs_merged,
                 "operator_action_count": operator_action_count,

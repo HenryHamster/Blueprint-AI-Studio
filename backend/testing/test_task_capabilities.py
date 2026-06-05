@@ -61,6 +61,7 @@ def test_task_capability_ui_subsets_only_reference_known_types():
         "research",
         "migrate",
         "refactor",
+        "investigate",
         "web_research",
         "design",
     )

@@ -14,6 +14,7 @@ import { armingToastCopy, armingHintCopy, parseArmingOutcome, type ArmingOutcome
 // preserve here, and the only export this suite reads is `auth.currentUser`.
 vi.mock('../firebase', () => ({
   auth: { currentUser: { email: 'test-user@example.com' } },
+  getIdToken: vi.fn(async () => 'test-token'),
 }));
 
 // Partial mock — `MessagesPanel.tsx` imports `authHeaders` (and `API_BASE_URL`)
@@ -2391,6 +2392,42 @@ describe('MessagesPanel Investigate action', () => {
     const cancelBtn = [...el.querySelectorAll('button')].find(b => b.title === 'Cancel' && el.textContent?.includes('Spawn investigation'));
     expect(confirmBtn).toBeTruthy();
     expect(cancelBtn).toBeTruthy();
+  });
+
+  test('investigation task POST includes source_message_id', async () => {
+    const blocker = makeMsg({
+      id: 'msg-origin',
+      message_type: 'BLOCKER',
+      content: 'Critical issue with stale refs',
+      status: 'open',
+    });
+    const el = await renderWithMessages([blocker]);
+    const investigateBtn = el.querySelector('button[title="Investigate"]') as HTMLButtonElement;
+    expect(investigateBtn).toBeTruthy();
+
+    await act(async () => { investigateBtn.click(); });
+    const confirmBtn = [...el.querySelectorAll('button')].find(b => b.title === 'Confirm investigation') as HTMLButtonElement | undefined;
+    expect(confirmBtn).toBeTruthy();
+
+    await act(async () => { confirmBtn?.click(); });
+
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(global.fetch).toHaveBeenCalledWith(
+      expect.stringContaining('/api/admin/tasks'),
+      expect.objectContaining({
+        method: 'POST',
+        body: expect.any(String),
+      }),
+    );
+
+    const body = JSON.parse(((global.fetch as ReturnType<typeof vi.fn>).mock.calls[0]?.[1] as RequestInit).body as string);
+    expect(body).toMatchObject({
+      github_repo: 'owner/repo',
+      title: 'Critical issue with stale refs',
+      prompt: expect.stringContaining('Original message: msg-origin'),
+      source_message_id: 'msg-origin',
+      task_type: 'investigate',
+    });
   });
 });
 

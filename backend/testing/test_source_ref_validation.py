@@ -932,3 +932,115 @@ async def test_symbol_defined_in_repo_branch_api_error_indeterminate(mocker):
         branch="main",
     )
     assert result is None
+
+
+# ── summarize_bug_report_citations (free-text bug-report grounding) ────────────
+
+_CITE_CREDS = dict(token="t", owner="o", repo="r", branch="main", project_id="p")
+
+
+@pytest.mark.asyncio
+async def test_bug_report_citations_flags_absent_file(mocker):
+    """A cited file absent on the branch yields citation_state == 'absent'."""
+    from app.source_ref_validation import summarize_bug_report_citations
+
+    mocker.patch(
+        "app.source_ref_validation._file_content_in_repo_branch",
+        new=AsyncMock(return_value=(False, None)),
+    )
+    signal = await summarize_bug_report_citations(
+        "Crash originates in backend/app/gone.py during startup.", **_CITE_CREDS
+    )
+    assert signal["citation_state"] == "absent"
+    assert "backend/app/gone.py" in signal["broken_refs"]
+    assert signal["ungrounded_refs"] == []
+
+
+@pytest.mark.asyncio
+async def test_bug_report_citations_present_file_not_flagged(mocker):
+    """A cited file present on the branch is not flagged (state == 'present')."""
+    from app.source_ref_validation import summarize_bug_report_citations
+
+    mocker.patch(
+        "app.source_ref_validation._file_content_in_repo_branch",
+        new=AsyncMock(return_value=(True, 500)),
+    )
+    signal = await summarize_bug_report_citations(
+        "Issue reproduces in backend/app/real.py reliably.", **_CITE_CREDS
+    )
+    assert signal["citation_state"] == "present"
+    assert signal["broken_refs"] == []
+
+
+@pytest.mark.asyncio
+async def test_bug_report_citations_no_refs_is_indeterminate(mocker):
+    """Prose with no extractable references degrades to 'indeterminate'."""
+    from app.source_ref_validation import summarize_bug_report_citations
+
+    spy = mocker.patch(
+        "app.source_ref_validation._file_content_in_repo_branch",
+        new=AsyncMock(return_value=(False, None)),
+    )
+    signal = await summarize_bug_report_citations(
+        "Something feels slow when many users hit the dashboard.", **_CITE_CREDS
+    )
+    assert signal["citation_state"] == "indeterminate"
+    assert signal["broken_refs"] == []
+    assert signal["ungrounded_refs"] == []
+    spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_bug_report_citations_indeterminate_validation_not_flagged(mocker):
+    """No creds and no checkout → indeterminate even with an extractable path."""
+    from app.source_ref_validation import summarize_bug_report_citations
+
+    mocker.patch(
+        "app.source_ref_validation._file_exists_at_head",
+        new=AsyncMock(return_value=None),
+    )
+    signal = await summarize_bug_report_citations(
+        "Look at backend/app/maybe.py for the regression.",
+        cwd="/nonexistent-checkout-xyz",
+    )
+    assert signal["citation_state"] == "indeterminate"
+    assert signal["broken_refs"] == []
+
+
+@pytest.mark.asyncio
+async def test_bug_report_citations_flags_absent_symbol(mocker):
+    """A present file whose cited symbol is gone is flagged as ungrounded/absent."""
+    from app.source_ref_validation import summarize_bug_report_citations
+
+    mocker.patch(
+        "app.source_ref_validation._file_content_in_repo_branch",
+        new=AsyncMock(return_value=(True, 500)),
+    )
+    mocker.patch(
+        "app.source_ref_validation._symbol_defined_at_head",
+        new=AsyncMock(return_value=False),
+    )
+    signal = await summarize_bug_report_citations(
+        "The guard backend/app/real.py:deleted_fn no longer validates input.",
+        **_CITE_CREDS,
+    )
+    assert signal["citation_state"] == "absent"
+    assert "backend/app/real.py:deleted_fn" in signal["ungrounded_refs"]
+
+
+@pytest.mark.asyncio
+async def test_bug_report_citations_uses_structured_file_path(mocker):
+    """A structured file_path (e.g. annotation) is grounded even if prose omits it."""
+    from app.source_ref_validation import summarize_bug_report_citations
+
+    mocker.patch(
+        "app.source_ref_validation._file_content_in_repo_branch",
+        new=AsyncMock(return_value=(False, None)),
+    )
+    signal = await summarize_bug_report_citations(
+        "This whole flow is broken.",
+        structured_context={"file_path": "backend/app/annotated.py"},
+        **_CITE_CREDS,
+    )
+    assert signal["citation_state"] == "absent"
+    assert "backend/app/annotated.py" in signal["broken_refs"]

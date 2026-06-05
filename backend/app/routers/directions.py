@@ -1229,12 +1229,28 @@ async def create_message(
         if existing is not None:
             return {"id": str(existing.id), "status": "duplicate", "arming": "duplicate"}
 
+    # Reproduce-on-HEAD citation grounding for free-text bug reports: validate
+    # any file/symbol the report cites against the project's real integration
+    # branch and stash an ``_provenance_warnings`` signal when a citation is
+    # unambiguously absent, so a stale report is discounted rather than trusted.
+    # Best-effort and conservative — indeterminate never flags, never fails create.
+    msg_context: Optional[Dict[str, Any]] = None
+    if msg_type in (MessageType.BUG_REPORT, MessageType.BLOCKER):
+        from app.source_ref_validation import compute_message_citation_warning
+
+        warning = await compute_message_citation_warning(
+            session, project, payload.content.strip()
+        )
+        if warning:
+            msg_context = {"_provenance_warnings": warning}
+
     msg = ProjectMessage(
         project_id=project.id,
         message_type=msg_type,
         from_type="user",
         content=payload.content.strip(),
         idempotency_key=idem_key,
+        **({"context": msg_context} if msg_context else {}),
     )
     session.add(msg)
     # Concurrency backstop: two simultaneous sends sharing the same key both

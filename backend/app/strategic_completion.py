@@ -972,7 +972,7 @@ def _already_built_signature(direction: dict) -> dict | None:
     window = history[-window_cycles:]
     no_pr = sum(e.get("tasks_completed_no_pr", 0) for e in window)
     completed = sum(e.get("tasks_completed", 0) for e in window)
-    merged = sum(e.get("prs_merged", 0) for e in window)
+    merged = sum(verified_merged_count(e) for e in window)
     code_failed = sum(
         max(0, e.get("tasks_failed", 0) - e.get("tasks_failed_infra", 0))
         for e in window
@@ -1039,7 +1039,7 @@ def _check_direction_health(direction: dict) -> str | None:
         # the lifetime non-merge volume — if nothing real finished unmerged, 0 PRs merged
         # is "nothing to merge", not unproductiveness.
         if len(history) >= 5 and not still_productive:
-            total_merged = sum(entry.get("prs_merged", 0) for entry in history)
+            total_merged = sum(verified_merged_count(entry) for entry in history)
             if total_merged == 0:
                 non_merge_real = sum(
                     max(0, entry.get("tasks_completed", 0))
@@ -1086,7 +1086,7 @@ def _check_direction_health(direction: dict) -> str | None:
             total_failed = e.get("tasks_failed", 0)
             infra_failed = e.get("tasks_failed_infra", 0)
             code_failed = max(0, total_failed - infra_failed)
-            return code_failed > 0 and e.get("prs_merged", 0) == 0
+            return code_failed > 0 and verified_merged_count(e) == 0
 
         if all(_cycle_failed(e) for e in recent3):
             return (
@@ -1200,12 +1200,12 @@ def _check_direction_completion(direction: dict) -> str | None:
     history = direction.get("research_history") or []
     if len(history) < 4:
         return None
-    total_merged = sum(entry.get("prs_merged", 0) for entry in history)
+    total_merged = sum(verified_merged_count(entry) for entry in history)
     if total_merged < 3:
         return None
     recent2 = history[-2:]
     recent_created = sum(e.get("tasks_created", 0) for e in recent2)
-    recent_merged = sum(e.get("prs_merged", 0) for e in recent2)
+    recent_merged = sum(verified_merged_count(e) for e in recent2)
     if recent_created <= 2 and recent_merged <= 1:
         return (
             f"Direction appears complete: {total_merged} PRs merged across "

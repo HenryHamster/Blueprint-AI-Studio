@@ -10037,3 +10037,196 @@ class TestGetProjectFindings:
 
         resp = await client.get(f"/api/admin/projects/{other_project.id}/findings")
         assert resp.status_code == 404
+
+
+class TestBugReportCitationGate:
+    """Reproduce-on-HEAD citation grounding for free-text bug reports.
+
+    A BUG_REPORT/BLOCKER whose cited code is absent on the integration branch is
+    flagged at ingestion (``_provenance_warnings`` stored on the message context)
+    and re-validated when turned into an investigation task. Conservative: a
+    report whose code exists, or that cites nothing, is never flagged.
+    """
+
+    async def _project_with_repo(self, session):
+        project = Project(
+            name="acme/citegate",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="citegate",
+            integration_branch="main",
+            promotion_target="main",
+        )
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+        session.add(
+            ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner")
+        )
+        await session.commit()
+        return project
+
+    @pytest.mark.asyncio
+    async def test_bug_report_absent_citation_is_flagged(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A BUG_REPORT citing code absent on HEAD stores an absent-state signal."""
+        project = await self._project_with_repo(db_session)
+        # No GitHub creds → local-HEAD fallback; the cited file is reported absent.
+        mocker.patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        mocker.patch(
+            "app.source_ref_validation._file_exists_at_head",
+            new=AsyncMock(return_value=False),
+        )
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "BUG_REPORT",
+                "content": "The crash originates in backend/app/gone.py during init.",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        msg = (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        ).scalar_one()
+        warnings = (msg.context or {}).get("_provenance_warnings")
+        assert warnings is not None
+        assert warnings["citation_state"] == "absent"
+        assert "backend/app/gone.py" in warnings["broken_refs"]
+
+    @pytest.mark.asyncio
+    async def test_bug_report_present_citation_not_flagged(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A BUG_REPORT whose cited file exists on HEAD is NOT flagged."""
+        project = await self._project_with_repo(db_session)
+        mocker.patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        mocker.patch(
+            "app.source_ref_validation._file_exists_at_head",
+            new=AsyncMock(return_value=True),
+        )
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "BUG_REPORT",
+                "content": "Reproduces reliably in backend/app/real.py on load.",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        msg = (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        ).scalar_one()
+        assert "_provenance_warnings" not in (msg.context or {})
+
+    @pytest.mark.asyncio
+    async def test_bug_report_no_refs_not_flagged(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A BUG_REPORT with no extractable references degrades to indeterminate."""
+        project = await self._project_with_repo(db_session)
+        mocker.patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        spy = mocker.patch(
+            "app.source_ref_validation._file_exists_at_head",
+            new=AsyncMock(return_value=False),
+        )
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "BUG_REPORT",
+                "content": "Everything feels slow when many users hit the dashboard.",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        msg = (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        ).scalar_one()
+        assert "_provenance_warnings" not in (msg.context or {})
+        spy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_investigate_task_revalidates_source_message(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """An investigate task from a stale bug report gets the warning + prompt note."""
+        project = await self._project_with_repo(db_session)
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            from_type="user",
+            content="The handler in backend/app/gone.py drops the guard.",
+        )
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+
+        mocker.patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        mocker.patch(
+            "app.source_ref_validation._file_exists_at_head",
+            new=AsyncMock(return_value=False),
+        )
+        resp = await client.post(
+            "/api/admin/tasks",
+            json={
+                "github_repo": "acme/citegate",
+                "title": "Investigate dropped guard",
+                "prompt": "Investigate the reported dropped guard.",
+                "task_type": "investigate",
+                "source_message_id": str(msg.id),
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project.id)
+            )
+        ).scalar_one()
+        warnings = (task.context or {}).get("_provenance_warnings")
+        assert warnings is not None
+        assert warnings["citation_state"] == "absent"
+        assert "backend/app/gone.py" in warnings["broken_refs"]
+        assert "Provenance warning" in task.payloads[0]["prompt"]
+
+    @pytest.mark.asyncio
+    async def test_investigate_task_no_source_message_is_unaffected(
+        self, client: AsyncClient, db_session
+    ):
+        """Omitting source_message_id keeps investigate task creation unchanged."""
+        project = await self._project_with_repo(db_session)
+        resp = await client.post(
+            "/api/admin/tasks",
+            json={
+                "github_repo": "acme/citegate",
+                "title": "Plain investigation",
+                "prompt": "Investigate something.",
+                "task_type": "investigate",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project.id)
+            )
+        ).scalar_one()
+        assert "_provenance_warnings" not in (task.context or {})
+        assert task.payloads[0]["prompt"] == "Investigate something."

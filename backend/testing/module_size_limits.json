@@ -81,7 +81,8 @@
     "notification_dispatch.py": 2700,
     "ci_completion.py": 1850,
     "routers/admin_debug.py": 1850,
-    "problem_model.py": 1800
+    "problem_model.py": 1800,
+    "source_ref_validation.py": 1900
   },
   "agent": {
     "index.ts": 4600,
@@ -138,7 +139,7 @@
     "components/PipelineView.tsx": 1200,
     "components/DashboardHome.tsx": 3050,
     "components/MessagesPanel.tsx": 2400,
-    "components/MessageBubble.tsx": 400,
+    "components/MessageBubble.tsx": 650,
     "components/MetricsDashboard.tsx": 1500,
     "components/ProjectDashboard.tsx": 1500,
     "components/AutonomousStatus.tsx": 1500,

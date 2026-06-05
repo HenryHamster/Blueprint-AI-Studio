@@ -2161,9 +2161,13 @@ def compute_digest_cost_economics(
         for ttype in _type_cost
     }
 
-    # Pipeline-level acceptance rate: total merged / (total merged + total rejected) across directions in window
+    # Pipeline-level acceptance rate: total merged / (total merged + total rejected) across directions in window.
+    # Sum the VERIFIED merge count (excludes unverified-degraded fall-open merges) so the headline pipeline
+    # rate stays consistent with the per-direction acceptance/conversion rates, which already use the verified
+    # count. Fall back to raw prs_merged when the verified key is absent (legacy/partial direction dicts).
     _pipeline_total_merged_d = sum(
-        d.get("prs_merged") or 0 for d in direction_progress_list
+        (d.get("verified_prs_merged", d.get("prs_merged")) or 0)
+        for d in direction_progress_list
     )
     _pipeline_total_rejected_d = sum(
         d.get("prs_rejected") or 0 for d in direction_progress_list

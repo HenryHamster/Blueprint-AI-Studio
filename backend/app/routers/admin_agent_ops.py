@@ -41,6 +41,7 @@ from app.playbook_storage import (
 )
 from app.routers.agent import verify_agent_token
 from app.source_ref_validation import (
+    compute_message_citation_warning as _compute_message_citation_warning,
     ground_design_doc_value,
     resolve_branch_verification_context as _resolve_branch_verification_context,
 )
@@ -550,9 +551,30 @@ async def agent_annotate(
             **({"severity": payload.severity} if payload.severity else {}),
         }
 
+    # Reproduce-on-HEAD citation grounding: an ``issue`` annotation maps to a
+    # BUG_REPORT. Validate the file/symbol citations in its free-text content
+    # (and any structured ``file_path``) against the project's real integration
+    # branch and stash an ``_provenance_warnings`` signal when a citation is
+    # unambiguously absent, so a stale issue is discounted rather than trusted.
+    # Best-effort and conservative — indeterminate never flags, never fails.
+    msg_type = _ANNOTATION_TYPE_MAP[payload.annotation_type]
+    if msg_type in (MessageType.BUG_REPORT, MessageType.BLOCKER):
+        project = await session.get(Project, task.project_id)
+        if project is not None:
+            structured = (
+                {"file_path": payload.file_path.strip()}
+                if payload.file_path and payload.file_path.strip()
+                else None
+            )
+            warning = await _compute_message_citation_warning(
+                session, project, content, structured_context=structured
+            )
+            if warning:
+                ctx = {**ctx, "_provenance_warnings": warning}
+
     msg = ProjectMessage(
         project_id=task.project_id,
-        message_type=_ANNOTATION_TYPE_MAP[payload.annotation_type],
+        message_type=msg_type,
         from_type="agent",
         from_task_id=task.id,
         content=content,

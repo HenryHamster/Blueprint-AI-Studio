@@ -6314,6 +6314,38 @@ def _no_pr_history(
     ]
 
 
+def _verified_history(
+    n,
+    tasks_created=2,
+    tasks_completed=1,
+    tasks_completed_no_pr=0,
+    tasks_failed=0,
+    tasks_failed_infra=0,
+    prs_merged=1,
+    verified_prs_merged=0,
+):
+    """research_history entries carrying BOTH prs_merged and verified_prs_merged.
+
+    Lets a test model an unverified-degraded merge cycle: prs_merged > 0 (the PR
+    landed) while verified_prs_merged == 0 (the merge went green via a no-CI
+    fall-open where verification was blocked). verified_merged_count() returns 0
+    for such an entry, so direction-level control decisions must treat it as no
+    merge.
+    """
+    return [
+        {
+            "tasks_created": tasks_created,
+            "tasks_completed": tasks_completed,
+            "tasks_completed_no_pr": tasks_completed_no_pr,
+            "tasks_failed": tasks_failed,
+            "tasks_failed_infra": tasks_failed_infra,
+            "prs_merged": prs_merged,
+            "verified_prs_merged": verified_prs_merged,
+        }
+        for _ in range(n)
+    ]
+
+
 class TestDirectionStillProductive:
     def test_false_when_flag_absent(self):
         # Legacy directions never set last_cycle_productive → not gated (rules fire)
@@ -6599,6 +6631,148 @@ class TestAlreadyBuiltSignature:
             )
         )
         assert already_built_completion_suggestion(d) is None
+
+
+class TestVerifiedMergePredicateDrivesDecisions:
+    """Direction-level control decisions count only verified merges.
+
+    A merge that landed in an unverified-degraded state (prs_merged > 0 but
+    verified_prs_merged == 0) must NOT mask a stall or suppress an auto-pause /
+    completion gate. Each case pairs a degraded-only direction (which now trips
+    the rule) with a genuinely-verified direction (which is unaffected), proving
+    the predicate — not the raw count — drives the decision.
+    """
+
+    # --- Rule 2: zero-merge auto-pause ---
+
+    def test_rule2_fires_when_only_merges_are_degraded(self):
+        # 5 cycles, each landed a PR (prs_merged=1) but none verified. Last cycle
+        # fully finished; 2 real (non-no-op) completions per cycle. Raw count would
+        # suppress the pause; verified count is 0 → Unproductive fires.
+        d = _direction(
+            research_history=_verified_history(
+                5,
+                tasks_created=2,
+                tasks_completed=2,
+                tasks_failed=0,
+                prs_merged=1,
+                verified_prs_merged=0,
+            )
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Unproductive" in result
+
+    def test_rule2_silent_when_merges_are_verified(self):
+        # Same shape, but the merges are genuinely verified → not unproductive.
+        d = _direction(
+            research_history=_verified_history(
+                5,
+                tasks_created=2,
+                tasks_completed=2,
+                tasks_failed=0,
+                prs_merged=1,
+                verified_prs_merged=1,
+            )
+        )
+        assert _check_direction_health(d) is None
+
+    # --- Rule 4: recent-stall auto-pause ---
+
+    def test_rule4_stall_fires_with_degraded_merges_and_code_failure(self):
+        # 3 cycles each: 1 code failure AND a degraded merge. The degraded merge
+        # must not count as a merge, so the stall rule fires.
+        d = _direction(
+            research_history=_verified_history(
+                3,
+                tasks_created=2,
+                tasks_completed=1,
+                tasks_failed=1,
+                tasks_failed_infra=0,
+                prs_merged=1,
+                verified_prs_merged=0,
+            )
+        )
+        reason = _check_direction_health(d)
+        assert reason is not None
+        assert _is_code_failure_pause_reason(reason) is True
+
+    def test_rule4_stall_silent_when_merges_verified(self):
+        # Identical except the merges are verified → cycle is not "failed", no stall.
+        d = _direction(
+            research_history=_verified_history(
+                3,
+                tasks_created=2,
+                tasks_completed=1,
+                tasks_failed=1,
+                tasks_failed_infra=0,
+                prs_merged=1,
+                verified_prs_merged=1,
+            )
+        )
+        assert _check_direction_health(d) is None
+
+    # --- _check_direction_completion ---
+
+    def test_completion_not_declared_when_merges_all_degraded(self):
+        # 4 cycles each landing 2 unverified-degraded merges + 2 low-yield cycles.
+        # Raw total = 8 (>=3) would declare complete; verified total = 0 → None.
+        history = _verified_history(
+            4, tasks_created=2, tasks_completed=2, prs_merged=2, verified_prs_merged=0
+        ) + _verified_history(
+            2, tasks_created=1, tasks_completed=1, prs_merged=0, verified_prs_merged=0
+        )
+        d = _direction(research_history=history)
+        assert _check_direction_completion(d) is None
+
+    def test_completion_declared_when_merges_verified(self):
+        # Same shape but the early merges are verified → direction reads complete.
+        history = _verified_history(
+            4, tasks_created=2, tasks_completed=2, prs_merged=2, verified_prs_merged=2
+        ) + _verified_history(
+            2, tasks_created=1, tasks_completed=1, prs_merged=0, verified_prs_merged=0
+        )
+        d = _direction(research_history=history)
+        result = _check_direction_completion(d)
+        assert result is not None
+        assert "complete" in result.lower()
+
+    # --- already-built signature ---
+
+    def test_already_built_fires_despite_degraded_merges_above_max(self):
+        # No-op-dominated cycles, no code failures, but 2 (degraded) merges/cycle —
+        # raw merged=10 would exceed max_merged=1 and suppress the signal. Verified
+        # merged=0, so the already-built suggestion still surfaces.
+        d = _direction(
+            research_history=_verified_history(
+                5,
+                tasks_created=4,
+                tasks_completed=4,
+                tasks_completed_no_pr=4,
+                tasks_failed=0,
+                prs_merged=2,
+                verified_prs_merged=0,
+            )
+        )
+        sig = _already_built_signature(d)
+        assert sig is not None
+        assert sig["merged"] == 0
+        assert already_built_completion_suggestion(d) is not None
+
+    def test_already_built_suppressed_when_merges_verified(self):
+        # Identical except merges are verified → actively shipping, not already-built.
+        d = _direction(
+            research_history=_verified_history(
+                5,
+                tasks_created=4,
+                tasks_completed=4,
+                tasks_completed_no_pr=4,
+                tasks_failed=0,
+                prs_merged=2,
+                verified_prs_merged=2,
+            )
+        )
+        assert _already_built_signature(d) is None
 
 
 # ── Outcome-progress (scaffolding) detector ───────────────────────────────────

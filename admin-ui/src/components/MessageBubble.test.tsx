@@ -143,6 +143,68 @@ describe('MessageBubble', () => {
     expect(screen.getByText('Blocker')).toBeTruthy();
   });
 
+  test('renders stale citation badge for BUG_REPORT when cited code is absent on HEAD', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        message_type: 'BUG_REPORT',
+        context: {
+          _provenance_warnings: {
+            citation_state: 'absent',
+            broken_refs: ['backend/app/models.py:Task'],
+          },
+        },
+      }),
+    })} />);
+    expect(screen.getByText('cited code missing on HEAD')).toBeTruthy();
+    expect(screen.getByText('backend/app/models.py:Task')).toBeTruthy();
+  });
+
+  test('renders stale citation badge details for BLOCKER when broken and ungrounded refs are present', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        message_type: 'BLOCKER',
+        context: {
+          _provenance_warnings: {
+            citation_state: 'absent',
+            broken_refs: ['backend/app/reaper.py:cancel_need'],
+            ungrounded_refs: ['backend/app/orchestrator.py#spawn'],
+          },
+        },
+      }),
+    })} />);
+    expect(screen.getByText('cited code missing on HEAD')).toBeTruthy();
+    expect(screen.getByText(/backend\/app\/reaper\.py:cancel_need/)).toBeTruthy();
+    expect(screen.getByText(/backend\/app\/orchestrator\.py#spawn/)).toBeTruthy();
+  });
+
+  test('does not render stale citation badge for present or indeterminate citation states', () => {
+    const { rerender } = render(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        message_type: 'BUG_REPORT',
+        context: {
+          _provenance_warnings: {
+            citation_state: 'present',
+            broken_refs: ['backend/app/models.py:Task'],
+          },
+        },
+      }),
+    })} />);
+    expect(screen.queryByText('cited code missing on HEAD')).toBeNull();
+
+    rerender(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        message_type: 'BLOCKER',
+        context: {
+          _provenance_warnings: {
+            citation_state: 'indeterminate',
+            broken_refs: ['backend/app/models.py:Task'],
+          },
+        },
+      }),
+    })} />);
+    expect(screen.queryByText('cited code missing on HEAD')).toBeNull();
+  });
+
   test('data-testid message-bubble is set', () => {
     render(<MessageBubble {...makeProps()} />);
     expect(screen.getByTestId('message-bubble')).toBeTruthy();

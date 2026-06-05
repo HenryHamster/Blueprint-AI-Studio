@@ -915,6 +915,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
           github_repo: githubRepo,
           title,
           prompt,
+          source_message_id: msg.id,
           ...(defaultBranch ? { base_branch: defaultBranch } : {}),
           task_type: 'investigate',
         }),

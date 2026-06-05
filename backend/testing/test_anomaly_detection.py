@@ -10,12 +10,11 @@ from datetime import timedelta
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-import app.shared_state as _shared_state
 from app.anomaly_detection import (
     _compute_research_anomalies,
 )
 from app.failure_classification import classify_failure
-from app.models import Task as _TaskModel, TaskStatus, Project
+from app.models import TaskStatus, Project
 from testing.factories import make_task, make_project, _utcnow
 
 
@@ -409,6 +408,91 @@ async def test_fewer_than_3_history_cycles_no_merge_rate_anomaly():
     result = await _compute_research_anomalies(project_id, session)
 
     assert not any("merge rate declining" in a["signal"] for a in result)
+
+
+@pytest.mark.asyncio
+async def test_declining_merge_rate_uses_verified_not_raw_count():
+    """Verified merges drive the trend: raw prs_merged is flat at 1.0 every cycle,
+    but the verified merges decline 0.80 → 0.40 → 0.00, so the anomaly must fire."""
+    project_id = uuid.uuid4()
+    direction = {
+        "id": "d-verok01",
+        "text": "Direction whose merges decay into unverified-degraded",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "research_history": [
+            # raw rate 1.0 each cycle; verified rate 0.80 → 0.40 → 0.00
+            {"tasks_created": 5, "prs_merged": 5, "verified_prs_merged": 4, "tasks_failed": 0},
+            {"tasks_created": 5, "prs_merged": 5, "verified_prs_merged": 2, "tasks_failed": 0},
+            {"tasks_created": 5, "prs_merged": 5, "verified_prs_merged": 0, "tasks_failed": 0},
+        ],
+    }
+    project = make_project(directions=[direction])
+    session = _make_session(tasks=[], project=project)
+
+    result = await _compute_research_anomalies(project_id, session)
+
+    medium = [
+        a for a in result if a["severity"] == "medium" and "d-verok01" in a["signal"]
+    ]
+    assert len(medium) >= 1
+    assert "merge rate declining" in medium[0]["signal"]
+
+
+@pytest.mark.asyncio
+async def test_degraded_merges_do_not_fabricate_declining_trend():
+    """Degraded merges cannot fabricate a decline: raw prs_merged falls 1.0 → 0.6 →
+    0.2 (would trip the old raw-count alert), but the VERIFIED rate is flat at 0.40,
+    so no merge-decline anomaly is emitted."""
+    project_id = uuid.uuid4()
+    direction = {
+        "id": "d-nofab01",
+        "text": "Direction with declining raw but flat verified merges",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "research_history": [
+            {"tasks_created": 5, "prs_merged": 5, "verified_prs_merged": 2, "tasks_failed": 0},
+            {"tasks_created": 5, "prs_merged": 3, "verified_prs_merged": 2, "tasks_failed": 0},
+            {"tasks_created": 5, "prs_merged": 1, "verified_prs_merged": 2, "tasks_failed": 0},
+        ],
+    }
+    project = make_project(directions=[direction])
+    session = _make_session(tasks=[], project=project)
+
+    result = await _compute_research_anomalies(project_id, session)
+
+    assert not any("merge rate declining" in a["signal"] for a in result)
+
+
+@pytest.mark.asyncio
+async def test_declining_merge_rate_legacy_fixture_unchanged():
+    """Legacy entries lacking verified_prs_merged fall back to raw prs_merged, so a
+    declining-merge-rate direction still produces the anomaly exactly as before."""
+    project_id = uuid.uuid4()
+    direction = {
+        "id": "d-legacy01",
+        "text": "Legacy direction without verified_prs_merged",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "research_history": [
+            {"tasks_created": 5, "prs_merged": 4, "tasks_failed": 0},  # rate 0.80
+            {"tasks_created": 5, "prs_merged": 2, "tasks_failed": 0},  # rate 0.40
+            {"tasks_created": 5, "prs_merged": 0, "tasks_failed": 0},  # rate 0.00
+        ],
+    }
+    project = make_project(directions=[direction])
+    session = _make_session(tasks=[], project=project)
+
+    result = await _compute_research_anomalies(project_id, session)
+
+    medium = [
+        a for a in result if a["severity"] == "medium" and "d-legacy01" in a["signal"]
+    ]
+    assert len(medium) >= 1
+    assert "merge rate declining" in medium[0]["signal"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
