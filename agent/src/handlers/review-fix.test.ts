@@ -329,6 +329,52 @@ describe('handleFix — operator steering (strategic_intent)', () => {
   });
 });
 
+// ── handleFix: stale-premise / provenance notice ───────────────────────────
+describe('handleFix — provenance / stale-premise notice', () => {
+  const hist = [{
+    iteration: 1,
+    feedback: 'address the issues',
+    issues: [{ severity: 'major', description: 'real problem', file: 'a.ts', line: 10 }],
+  }];
+
+  it('renders the stale-premise notice when _provenance_warnings is present', async () => {
+    await handleFix(
+      'task-provenance-fix',
+      { branch: 'feat/s', base_branch: 'main', pr_number: 9, prompt: 'address review' },
+      {
+        context: {
+          scope: 'small',
+          review_loop: { iteration: 2, review_history: hist },
+          _provenance_warnings: {
+            cited_files_changed_since_generation: true,
+            broken_source_ref_count: 2,
+            broken_refs: ['app/foo.py:5', 'app/bar.ts'],
+          },
+        },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('## Stale-premise notice');
+    expect(prompt).toContain('Cited files changed since the finding was generated');
+    expect(prompt).toContain('2 broken/missing citation(s)');
+    expect(prompt).toContain('app/foo.py:5');
+    expect(prompt).toContain('REPRODUCE-FIRST');
+    // Additive — existing review context still present.
+    expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
+  });
+
+  it('omits the stale-premise notice when _provenance_warnings is absent', async () => {
+    await handleFix(
+      'task-no-provenance-fix',
+      { branch: 'feat/s', base_branch: 'main', pr_number: 10, prompt: 'address review' },
+      { context: { scope: 'small', review_loop: { iteration: 2, review_history: hist } } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(capturedFixPrompt()).not.toContain('## Stale-premise notice');
+  });
+});
+
 // ── handleReview: scope-overflow replaces (not augments) scope preamble ─────
 describe('handleReview — scope overflow replaces scope-narrowed preamble', () => {
   const basePayload = {

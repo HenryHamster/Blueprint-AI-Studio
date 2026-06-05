@@ -14,6 +14,9 @@ import {
   computePromptFingerprint,
 } from '../prompt.js';
 import { parseBackendTimestamp } from '../utils/time.js';
+import {
+  writeFetchHelper, buildFetchGuidance, DESIGN_DOC_FETCH_VERBS,
+} from './strategic-helpers.js';
 
 // ── Handler: Design Doc Update (Phase 1 of strategic cycle) ──
 // Analyzes codebase architecture and incrementally updates the design doc
@@ -44,6 +47,8 @@ export async function handleDesignDocUpdate(
     : '';
   const fileTreeSection = buildFileTree(ws);
   const projectName = strVal(payload.project_name, 'Unknown Project');
+  const projectMetadata = task.project_metadata as Record<string, unknown> | undefined;
+  const projectId = strVal(projectMetadata?.project_id as string | undefined);
   const designDocRetryContext = buildRetryContext(task);
   const designDocFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
 
@@ -146,6 +151,8 @@ export async function handleDesignDocUpdate(
   // 429/5xx contention; see writeDesignDocHelper in prompt.ts.
   writeDesignDocHelper(taskId);
   writeMessagesHelper(taskId);
+  if (projectId) writeFetchHelper(taskId, projectId, WORKSPACE, { verbs: DESIGN_DOC_FETCH_VERBS });
+  const designDocFetchGuidance = projectId ? buildFetchGuidance(DESIGN_DOC_FETCH_VERBS) : '';
 
   // CLAUDE.md as persistent reminder
   fs.writeFileSync(`${WORKSPACE}/CLAUDE.md`,
@@ -217,15 +224,16 @@ Skip full re-analysis of systems with no files in the manifest.
   const promptFingerprint = computePromptFingerprint('design_doc_update');
   setCurrentPromptFingerprint(promptFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
-  let { exitCode } = await runClaudeCode(prompt + designDocFirstTaskSection + `\n\n${PLAYBOOK_GUIDANCE}\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  let { exitCode } = await runClaudeCode(
+    prompt + designDocFirstTaskSection + `\n\n${PLAYBOOK_GUIDANCE}\n\n${designDocFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`,
+    ws, statusRef, model, effort, disallowedTools,
+  );
 
   // Post-check: verify the agent actually called ./design-doc.
   // design_doc lives only on the project detail endpoint — the /api/admin/projects
   // list payload no longer carries JSONB columns. Skip the check entirely when no
   // project_id is available, otherwise pageCount would be a false 0 and trigger a
   // spurious retry of an already-successful task.
-  const projectMetadata = task.project_metadata as Record<string, unknown> | undefined;
-  const projectId = strVal(projectMetadata?.project_id as string | undefined);
   if (projectId) {
     try {
       const detail = await apiGet(`/api/admin/projects/${projectId}`) as Record<string, unknown>;

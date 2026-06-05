@@ -60,6 +60,7 @@ import {
   synthesizeSuccessPatterns,
   synthesizeFailureHotspots,
   formatSelfReviewBlindSpots,
+  formatProvenanceWarnings,
   formatProjectBlindSpotSummary,
   formatFixIterationHistory,
   formatSelfReviewCalibrationSection,
@@ -2945,6 +2946,110 @@ describe('buildRetryContext', () => {
     expect(result).toContain('## Previous Attempt (attempt #4 failed)');
     expect(result).not.toContain('Retry budget:');
     expect(result).not.toContain('Final attempt');
+  });
+});
+
+// ── formatProvenanceWarnings ──────────────────────────────────────────────────
+describe('formatProvenanceWarnings', () => {
+  it('returns empty string when context is undefined', () => {
+    expect(formatProvenanceWarnings(undefined)).toBe('');
+  });
+
+  it('returns empty string when _provenance_warnings is absent', () => {
+    expect(formatProvenanceWarnings({ scope: 'medium' })).toBe('');
+  });
+
+  it('returns empty string when _provenance_warnings is an empty object', () => {
+    expect(formatProvenanceWarnings({ _provenance_warnings: {} })).toBe('');
+  });
+
+  it('returns empty string when _provenance_warnings is not a dict (defensive)', () => {
+    expect(formatProvenanceWarnings({ _provenance_warnings: 'oops' })).toBe('');
+    expect(formatProvenanceWarnings({ _provenance_warnings: ['a'] })).toBe('');
+    expect(formatProvenanceWarnings({ _provenance_warnings: null })).toBe('');
+  });
+
+  it('renders the cited-files-changed signal', () => {
+    const result = formatProvenanceWarnings({
+      _provenance_warnings: { cited_files_changed_since_generation: true },
+    });
+    expect(result).toContain('## Stale-premise notice');
+    expect(result).toContain('Cited files changed since the finding was generated');
+    expect(result).toContain('REPRODUCE-FIRST');
+  });
+
+  it('does not render the cited-files signal when the flag is false', () => {
+    expect(
+      formatProvenanceWarnings({
+        _provenance_warnings: { cited_files_changed_since_generation: false },
+      }),
+    ).toBe('');
+  });
+
+  it('renders the broken-citation count and the offending refs', () => {
+    const result = formatProvenanceWarnings({
+      _provenance_warnings: {
+        broken_source_ref_count: 2,
+        broken_refs: ['app/foo.py:42', 'app/bar.ts'],
+      },
+    });
+    expect(result).toContain('2 broken/missing citation(s)');
+    expect(result).toContain('app/foo.py:42');
+    expect(result).toContain('app/bar.ts');
+  });
+
+  it('renders the broken-citation signal from refs alone when count is missing', () => {
+    const result = formatProvenanceWarnings({
+      _provenance_warnings: { broken_refs: ['app/only.py'] },
+    });
+    expect(result).toContain('1 broken/missing citation(s)');
+    expect(result).toContain('app/only.py');
+  });
+
+  it('renders the ungrounded-claim count and the offending refs', () => {
+    const result = formatProvenanceWarnings({
+      _provenance_warnings: {
+        ungrounded_claim_count: 3,
+        ungrounded_refs: ['claim about retries', 'claim about caching'],
+      },
+    });
+    expect(result).toContain('3 ungrounded claim(s)');
+    expect(result).toContain('claim about retries');
+    expect(result).toContain('claim about caching');
+  });
+
+  it('renders all three signals combined and the no-op/pivot instruction', () => {
+    const result = formatProvenanceWarnings({
+      _provenance_warnings: {
+        cited_files_changed_since_generation: true,
+        broken_source_ref_count: 1,
+        broken_refs: ['x.py'],
+        ungrounded_claim_count: 1,
+        ungrounded_refs: ['some claim'],
+      },
+    });
+    expect(result).toContain('Cited files changed since the finding was generated');
+    expect(result).toContain('1 broken/missing citation(s)');
+    expect(result).toContain('1 ungrounded claim(s)');
+    expect(result).toContain('./done --already-done');
+    expect(result).toContain('do NOT fabricate');
+  });
+
+  it('does not throw on malformed nested fields and renders nothing useful', () => {
+    expect(() =>
+      formatProvenanceWarnings({
+        _provenance_warnings: {
+          broken_source_ref_count: 'two',
+          broken_refs: 'notalist',
+          ungrounded_refs: [123, null, 'real ref'],
+        },
+      }),
+    ).not.toThrow();
+    // ungrounded_refs has one stringifiable real ref, so the signal fires for it.
+    const result = formatProvenanceWarnings({
+      _provenance_warnings: { ungrounded_refs: [123, null, 'real ref'] },
+    });
+    expect(result).toContain('real ref');
   });
 });
 

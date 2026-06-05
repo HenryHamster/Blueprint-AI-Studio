@@ -8,6 +8,7 @@ import {
   buildFetchGuidance,
   RESEARCH_FETCH_VERBS,
   PLAN_FETCH_VERBS,
+  DESIGN_DOC_FETCH_VERBS,
   STRATEGIC_FETCH_VERBS,
 } from './strategic-helpers.js';
 
@@ -325,6 +326,19 @@ describe('writeFetchHelper (verb-subset read-only fetch)', () => {
     expect(content).toContain('problem-model|gap|message) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: direction|playbook|section)."');
   });
 
+  it('different subsets bake different verb vocabularies (design-doc subset)', () => {
+    writeFetchHelper('t', 'proj-3', testWorkspace, { verbs: DESIGN_DOC_FETCH_VERBS });
+    const content = readFetch();
+    expect(content).toContain('direction)  PATH_SUFFIX="directions/$ID"');
+    expect(content).toContain('section)    PATH_SUFFIX="design-doc/$ID"');
+    expect(content).toContain('playbook)   PATH_SUFFIX="playbook/$ID"');
+    expect(content).toContain('gap)        PATH_SUFFIX="gaps/$ID"');
+    expect(content).toContain('message)    PATH_SUFFIX="messages/$ID"');
+    expect(content).toContain('Usage: fetch direction|playbook|gap|message|section [id]');
+    // problem-model is rejected here because it is not part of the design-doc subset.
+    expect(content).toContain('problem-model) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: direction|playbook|gap|message|section)."');
+  });
+
   it('bakes the project id and escapes shell-injection attempts', () => {
     writeFetchHelper('t', 'proj$(echo hacked)id', testWorkspace, { verbs: RESEARCH_FETCH_VERBS });
     const content = readFetch();
@@ -357,6 +371,16 @@ describe('buildFetchGuidance', () => {
     // Verbs not granted to research are absent from the guidance.
     expect(block).not.toContain('`./fetch section');
     expect(block).not.toContain('`./fetch message');
+  });
+
+  it('lists the architecture-focused design-doc verbs', () => {
+    const block = buildFetchGuidance(DESIGN_DOC_FETCH_VERBS);
+    expect(block).toContain('`./fetch direction <id>`');
+    expect(block).toContain('`./fetch section <key>`');
+    expect(block).toContain('`./fetch playbook <key>`');
+    expect(block).toContain('`./fetch gap <id>`');
+    expect(block).toContain('`./fetch message <ref>`');
+    expect(block).not.toContain('`./fetch problem-model`');
   });
 
   it('returns empty string when no verbs are granted', () => {

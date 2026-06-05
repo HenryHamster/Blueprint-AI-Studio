@@ -248,6 +248,60 @@ def _merge_provenance_warnings(
         finding.pop("_provenance_warnings", None)
 
 
+async def recompute_launch_staleness(session: Any, task: Any) -> bool:
+    """Re-check cited-file freshness against the CURRENT integration HEAD at launch.
+
+    A finding-derived task carries the ``generated_head_sha`` it was generated
+    against and the file paths it cites (``_finding_cited_paths``), both stamped
+    onto its context at spawn. But the integration branch advances while the task
+    sits QUEUED, so the ingestion-time staleness warning is structurally inert
+    (generated HEAD == ingestion HEAD). This recomputes the diff against the branch
+    TIP at dispatch and, ONLY on an affirmative change verdict, merges
+    ``{'cited_files_changed_since_generation': True}`` into the context's
+    ``_provenance_warnings`` — reusing the exact shape the ingestion path emits.
+
+    Returns True iff it mutated ``task.context`` (the caller must persist + mark the
+    column modified). Conservative and best-effort by construction: a missing
+    ``generated_head_sha``, no cited paths, no research parent, an unresolvable
+    project, a None/False verdict, or ANY exception all leave the context untouched
+    and return False. It never raises and never flags on an indeterminate result,
+    so it can never block or delay dispatch nor false-positive a stale finding.
+    """
+    try:
+        context = task.context or {}
+        gen_sha = context.get("generated_head_sha")
+        cited_paths = context.get("_finding_cited_paths")
+        if not gen_sha or not isinstance(cited_paths, list) or not cited_paths:
+            return False
+        # Only annotate findings derived from a research parent.
+        if not (
+            context.get("research_task_id")
+            or context.get("parent_research_task_id")
+        ):
+            return False
+        project = (
+            await session.get(Project, task.project_id) if task.project_id else None
+        )
+        if project is None:
+            return False
+        src_ref_ctx = await resolve_branch_verification_context(session, project)
+        changed = await cited_paths_changed_since(gen_sha, cited_paths, **src_ref_ctx)
+        if changed is not True:
+            return False
+        new_context = dict(context)
+        _merge_provenance_warnings(
+            new_context, {"cited_files_changed_since_generation": True}
+        )
+        task.context = new_context
+        return True
+    except Exception:  # noqa: BLE001 — launch recompute must never block dispatch
+        logger.debug(
+            "[RESEARCH] launch-time cited-file staleness recompute failed",
+            exc_info=True,
+        )
+        return False
+
+
 def _trim_finding_for_memo(finding: Dict[str, Any]) -> Dict[str, Any]:
     """Trim a dropped finding to a bounded dict for embedding in a MemoPayload.
 
@@ -2643,6 +2697,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # Audit W1: previous_error_fingerprint is a column. Pull it out of
         # prior_retry_ctx so it lands on the column, not in JSONB context.
         _prev_fp_col = prior_retry_ctx.pop("_previous_error_fingerprint", None)
+        # Cited paths the finding references — propagated so the launch-time
+        # staleness recompute can diff them against the current integration HEAD.
+        _child_cited_paths = finding_cited_paths(finding)
         new_task = Task(
             project_id=task.project_id,
             title=title,
@@ -2706,6 +2763,22 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 **(
                     {"_provenance_warnings": finding["_provenance_warnings"]}
                     if finding.get("_provenance_warnings")
+                    else {}
+                ),
+                # Provenance the launch-time staleness recompute needs: the
+                # integration HEAD the finding was generated against and the file
+                # paths it cites. With these the orchestrator can re-check, at
+                # dispatch, whether any cited file changed since generation against
+                # the CURRENT branch tip (the ingestion-time warning is inert
+                # because generated HEAD == ingestion HEAD). Only set when present.
+                **(
+                    {"generated_head_sha": finding["generated_head_sha"]}
+                    if finding.get("generated_head_sha")
+                    else {}
+                ),
+                **(
+                    {"_finding_cited_paths": _child_cited_paths}
+                    if _child_cited_paths
                     else {}
                 ),
                 **(

@@ -1620,6 +1620,183 @@ class TestProvenanceWarningsAttachment:
             "cited_files_changed_since_generation": True,
         }
 
+    @_pytest.mark.asyncio
+    async def test_spawned_child_carries_generated_head_sha_and_cited_paths(
+        self, db_session, mocker
+    ):
+        """The child context propagates the provenance the launch recompute needs."""
+        from test_autonomous_research import _make_finding
+
+        deferred = _make_finding(
+            title="Deferred carries provenance", direction_id="d-prov-prop01"
+        )
+        deferred["generated_head_sha"] = "cafef00d"
+        deferred["sources"] = [
+            {"type": "file", "ref": "backend/app/foo.py:42"},
+            {"type": "pr", "ref": "https://github.com/o/r/pull/1"},
+        ]
+        child = await self._spawn_deferred_child(
+            db_session, mocker, direction_id="d-prov-prop01", deferred=deferred
+        )
+        ctx = child.context or {}
+        assert ctx.get("generated_head_sha") == "cafef00d"
+        # Line suffix stripped; PR source skipped.
+        assert ctx.get("_finding_cited_paths") == ["backend/app/foo.py"]
+
+    @_pytest.mark.asyncio
+    async def test_spawned_child_omits_provenance_keys_when_absent(
+        self, db_session, mocker
+    ):
+        """No generated_head_sha and no file sources → neither key is set."""
+        from test_autonomous_research import _make_finding
+
+        deferred = _make_finding(
+            title="Deferred no provenance", direction_id="d-prov-prop02"
+        )
+        deferred.pop("generated_head_sha", None)
+        deferred["sources"] = []
+        child = await self._spawn_deferred_child(
+            db_session, mocker, direction_id="d-prov-prop02", deferred=deferred
+        )
+        ctx = child.context or {}
+        assert "generated_head_sha" not in ctx
+        assert "_finding_cited_paths" not in ctx
+
+
+class TestRecomputeLaunchStaleness:
+    """Launch-time cited-file staleness recompute (orchestrator dispatch hook)."""
+
+    def _task(self, context):
+        t = MagicMock()
+        t.context = context
+        t.project_id = uuid.uuid4()
+        return t
+
+    def _session(self, project=None):
+        s = MagicMock()
+        s.get = AsyncMock(return_value=project if project is not None else object())
+        return s
+
+    def _patch_ctx(self, mocker, *, verdict):
+        mocker.patch(
+            "app.research_completion.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        m = AsyncMock(return_value=verdict)
+        mocker.patch("app.research_completion.cited_paths_changed_since", new=m)
+        return m
+
+    @_pytest.mark.asyncio
+    async def test_true_verdict_sets_stale_flag(self, mocker):
+        from app.research_completion import recompute_launch_staleness
+
+        self._patch_ctx(mocker, verdict=True)
+        task = self._task(
+            {
+                "research_task_id": "r1",
+                "generated_head_sha": "deadbeef",
+                "_finding_cited_paths": ["backend/app/foo.py"],
+            }
+        )
+        assert await recompute_launch_staleness(self._session(), task) is True
+        assert task.context["_provenance_warnings"] == {
+            "cited_files_changed_since_generation": True
+        }
+
+    @_pytest.mark.asyncio
+    async def test_true_verdict_preserves_existing_warnings(self, mocker):
+        from app.research_completion import recompute_launch_staleness
+
+        self._patch_ctx(mocker, verdict=True)
+        task = self._task(
+            {
+                "parent_research_task_id": "r1",
+                "generated_head_sha": "deadbeef",
+                "_finding_cited_paths": ["backend/app/foo.py"],
+                "_provenance_warnings": {
+                    "broken_source_ref_count": 2,
+                    "broken_refs": ["backend/app/x.py"],
+                },
+            }
+        )
+        assert await recompute_launch_staleness(self._session(), task) is True
+        assert task.context["_provenance_warnings"] == {
+            "broken_source_ref_count": 2,
+            "broken_refs": ["backend/app/x.py"],
+            "cited_files_changed_since_generation": True,
+        }
+
+    @_pytest.mark.asyncio
+    @_pytest.mark.parametrize("verdict", [None, False])
+    async def test_indeterminate_or_unchanged_verdict_no_flag(self, mocker, verdict):
+        from app.research_completion import recompute_launch_staleness
+
+        self._patch_ctx(mocker, verdict=verdict)
+        task = self._task(
+            {
+                "research_task_id": "r1",
+                "generated_head_sha": "deadbeef",
+                "_finding_cited_paths": ["backend/app/foo.py"],
+            }
+        )
+        assert await recompute_launch_staleness(self._session(), task) is False
+        assert "_provenance_warnings" not in (task.context or {})
+
+    @_pytest.mark.asyncio
+    async def test_missing_generated_head_sha_is_noop(self, mocker):
+        from app.research_completion import recompute_launch_staleness
+
+        m = self._patch_ctx(mocker, verdict=True)
+        task = self._task(
+            {"research_task_id": "r1", "_finding_cited_paths": ["backend/app/foo.py"]}
+        )
+        assert await recompute_launch_staleness(self._session(), task) is False
+        assert "_provenance_warnings" not in (task.context or {})
+        m.assert_not_called()
+
+    @_pytest.mark.asyncio
+    async def test_missing_cited_paths_is_noop(self, mocker):
+        from app.research_completion import recompute_launch_staleness
+
+        m = self._patch_ctx(mocker, verdict=True)
+        task = self._task(
+            {"research_task_id": "r1", "generated_head_sha": "deadbeef"}
+        )
+        assert await recompute_launch_staleness(self._session(), task) is False
+        m.assert_not_called()
+
+    @_pytest.mark.asyncio
+    async def test_no_research_parent_is_noop(self, mocker):
+        from app.research_completion import recompute_launch_staleness
+
+        m = self._patch_ctx(mocker, verdict=True)
+        task = self._task(
+            {
+                "generated_head_sha": "deadbeef",
+                "_finding_cited_paths": ["backend/app/foo.py"],
+            }
+        )
+        assert await recompute_launch_staleness(self._session(), task) is False
+        m.assert_not_called()
+
+    @_pytest.mark.asyncio
+    async def test_exception_is_swallowed(self, mocker):
+        from app.research_completion import recompute_launch_staleness
+
+        mocker.patch(
+            "app.research_completion.resolve_branch_verification_context",
+            new=AsyncMock(side_effect=RuntimeError("boom")),
+        )
+        task = self._task(
+            {
+                "research_task_id": "r1",
+                "generated_head_sha": "deadbeef",
+                "_finding_cited_paths": ["backend/app/foo.py"],
+            }
+        )
+        assert await recompute_launch_staleness(self._session(), task) is False
+        assert "_provenance_warnings" not in (task.context or {})
+
 
 class TestQueryFindingsIndex:
     """query_findings_index: structured findings view for strategic cycle and admin."""

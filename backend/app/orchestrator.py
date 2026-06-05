@@ -3252,6 +3252,21 @@ async def orchestrator_worker():
                         execution_mode=runtime_execution_mode,
                     )
 
+                    # Launch-time staleness recompute: for finding-derived tasks
+                    # that have been QUEUED while the integration branch advanced,
+                    # re-check whether any cited file changed since the finding was
+                    # generated — against the CURRENT branch tip, not the inert
+                    # ingestion HEAD. Best-effort: the helper never raises and only
+                    # an affirmative change verdict annotates the context, so it can
+                    # never block or delay dispatch. The mutation is persisted by
+                    # the PROVISIONING commit below.
+                    from app.research_completion import recompute_launch_staleness
+
+                    if await recompute_launch_staleness(session, task):
+                        from sqlalchemy.orm.attributes import flag_modified
+
+                        flag_modified(task, "context")
+
                     # Mark as PROVISIONING to prevent other workers from picking it up.
                     # last_heartbeat is intentionally NOT set here — it must reflect real
                     # agent activity only. The reaper uses vm_provisioned_at as the clock

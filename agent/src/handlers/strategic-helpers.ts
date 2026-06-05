@@ -94,9 +94,12 @@ export const STRATEGIC_FETCH_VERBS: FetchVerb[] = [
 // Read-only verb subsets for non-strategic agents. Research resolves directions,
 // the problem-model, and gaps it was handed by reference; plan resolves
 // directions, design-doc sections, and playbook entries for architectural
-// grounding. Both are strictly read-only (every verb is a GET).
+// grounding; design-doc curation resolves directions, design-doc sections,
+// playbook entries, gaps, and operator messages for architecture review.
+// All subsets are strictly read-only (every verb is a GET).
 export const RESEARCH_FETCH_VERBS: FetchVerb[] = ['direction', 'problem-model', 'gap'];
 export const PLAN_FETCH_VERBS: FetchVerb[] = ['direction', 'section', 'playbook'];
+export const DESIGN_DOC_FETCH_VERBS: FetchVerb[] = ['direction', 'section', 'playbook', 'gap', 'message'];
 
 // Exact case-statement body for each verb. The spacing is preserved verbatim so
 // the full-set (strategic) script remains byte-identical to the original.

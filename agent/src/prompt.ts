@@ -1545,3 +1545,77 @@ export function buildRetryContext(task: Record<string, unknown>): string {
   lines.push('');
   return lines.join('\n');
 }
+
+/**
+ * Render a "## Stale-premise notice" provenance block from a finding-derived
+ * task's `_provenance_warnings`. Research findings spawn implementing tasks
+ * (create/fix/refactor/docs/qa/deps and review→fix) that often run long after
+ * the finding was generated — by which time the cited code may have moved, the
+ * citations may have been broken/ungrounded at ingestion, or the integration
+ * branch may have advanced. This block names which signals fired and instructs
+ * the agent to REPRODUCE-FIRST against the current checkout before implementing.
+ *
+ * Returns '' when `_provenance_warnings` is absent or empty, so the prompt (and
+ * its fingerprint) is byte-unchanged for tasks that carry no warnings. Reads
+ * every field defensively — the dict is optional and duck-typed, and every key
+ * inside it is optional.
+ */
+export function formatProvenanceWarnings(
+  context: Record<string, unknown> | undefined,
+): string {
+  const warnings = context?._provenance_warnings;
+  if (!warnings || typeof warnings !== 'object' || Array.isArray(warnings)) return '';
+  const w = warnings as Record<string, unknown>;
+
+  const signals: string[] = [];
+
+  if (w.cited_files_changed_since_generation === true) {
+    signals.push(
+      '- **Cited files changed since the finding was generated.** The integration branch ' +
+      'has advanced — the code this finding points at may have moved, been refactored, or ' +
+      'already been fixed.',
+    );
+  }
+
+  const brokenCount = typeof w.broken_source_ref_count === 'number' ? w.broken_source_ref_count : 0;
+  const brokenRefs = Array.isArray(w.broken_refs)
+    ? (w.broken_refs as unknown[]).map(r => strVal(r)).filter(Boolean)
+    : [];
+  if (brokenCount > 0 || brokenRefs.length > 0) {
+    const n = brokenCount || brokenRefs.length;
+    const refList = brokenRefs.length > 0 ? `: ${brokenRefs.slice(0, 20).join(', ')}` : '';
+    signals.push(
+      `- **${n} broken/missing citation(s)${refList}.** ` +
+      'These references did not resolve to real code when the research was ingested.',
+    );
+  }
+
+  const ungroundedCount = typeof w.ungrounded_claim_count === 'number' ? w.ungrounded_claim_count : 0;
+  const ungroundedRefs = Array.isArray(w.ungrounded_refs)
+    ? (w.ungrounded_refs as unknown[]).map(r => strVal(r)).filter(Boolean)
+    : [];
+  if (ungroundedCount > 0 || ungroundedRefs.length > 0) {
+    const n = ungroundedCount || ungroundedRefs.length;
+    const refList = ungroundedRefs.length > 0 ? `: ${ungroundedRefs.slice(0, 20).join(', ')}` : '';
+    signals.push(
+      `- **${n} ungrounded claim(s)${refList}.** ` +
+      'These assertions were not tied to verifiable source when the research was ingested.',
+    );
+  }
+
+  if (signals.length === 0) return '';
+
+  return (
+    `## Stale-premise notice\n` +
+    `This task was derived from a research finding whose provenance was flagged. ` +
+    `The finding's premise may no longer hold against the current checkout:\n\n` +
+    `${signals.join('\n')}\n\n` +
+    `**REPRODUCE-FIRST against the current HEAD before implementing.** Verify the cited code ` +
+    `still exists and that the finding's problem actually reproduces now. If it does, implement ` +
+    `the fix as described. If the premise no longer holds — the cited code is gone, already ` +
+    `fixed, or the problem cannot be reproduced — do NOT fabricate a change to match the finding: ` +
+    `cleanly no-op with \`./done --already-done "<what you verified>"\`, or pivot to the real ` +
+    `current issue if one is evident. A stale finding is a signal to investigate, not a mandate ` +
+    `to invent a diff.\n\n`
+  );
+}

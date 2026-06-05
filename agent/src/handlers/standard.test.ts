@@ -275,6 +275,56 @@ describe('sibling task note generation', () => {
   });
 });
 
+// ── Stale-premise / provenance notice injection ───────────────────────────────
+describe('provenance notice injection', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('omits the stale-premise notice when _provenance_warnings is absent', async () => {
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(capturedPrompt()).not.toContain('## Stale-premise notice');
+  });
+
+  it('renders the stale-premise notice when _provenance_warnings is populated', async () => {
+    const task = {
+      title: 'Task',
+      description: '',
+      context: {
+        _provenance_warnings: {
+          cited_files_changed_since_generation: true,
+          broken_source_ref_count: 1,
+          broken_refs: ['app/foo.py:10'],
+          ungrounded_claim_count: 1,
+          ungrounded_refs: ['some claim'],
+        },
+      },
+      project_context: {},
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('## Stale-premise notice');
+    expect(prompt).toContain('Cited files changed since the finding was generated');
+    expect(prompt).toContain('1 broken/missing citation(s)');
+    expect(prompt).toContain('app/foo.py:10');
+    expect(prompt).toContain('1 ungrounded claim(s)');
+    expect(prompt).toContain('REPRODUCE-FIRST');
+  });
+
+  it('renders the notice for refactor tasks too', async () => {
+    const task = {
+      title: 'Refactor',
+      description: '',
+      context: {
+        _provenance_warnings: { cited_files_changed_since_generation: true },
+      },
+    };
+    await handleRefactor(TASK_ID, { prompt: 'Refactor it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(capturedPrompt()).toContain('## Stale-premise notice');
+  });
+});
+
 // ── Handler configuration: branchPrefix and runCodeChangeTask wiring ─────────
 describe('handleCreate configuration', () => {
   beforeEach(() => {

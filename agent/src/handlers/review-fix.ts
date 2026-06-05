@@ -22,7 +22,7 @@ import {
   FIX_TASK_FOCUS, getTaskTypeFocusBlock, PARALLEL_REVIEW_GUIDANCE, PARALLEL_FIX_GUIDANCE,
   assembleFailureGuidanceBlocks,
   readClaudeMd, formatProjectContext, configureAgentPermissions, computePromptFingerprint,
-  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, type PlaybookEntry,
+  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, formatProvenanceWarnings, type PlaybookEntry,
 } from '../prompt.js';
 import { formatProjectVision, formatStrategicIntent } from '../prompts/context-prefix.js';
 import { resolveBuildConfig } from '../build-config.js';
@@ -771,6 +771,17 @@ export async function handleFix(
   const fixSelfReviewSection = formatSelfReviewBlindSpots(fixSelfReviewOutcome, fixChangedFilePathList);
   if (fixSelfReviewSection) {
     basePrompt = `${fixSelfReviewSection}${basePrompt}`;
+  }
+
+  // Stale-premise/provenance notice for finding-derived fix tasks. Renders the
+  // SAME provenance block as the standard handler — complementary to (not a
+  // replacement for) the merge-conflict-vs-CI stale-premise notice computed
+  // later; if both apply, both render. Prepended early so the agent
+  // reproduces-first before trusting a possibly-stale finding. Empty when no
+  // provenance warnings fired.
+  const fixProvenanceNotice = formatProvenanceWarnings(taskContext);
+  if (fixProvenanceNotice) {
+    basePrompt = `${fixProvenanceNotice}${basePrompt}`;
   }
 
   // Parallel fix fan-out gating: per-project flag AND helper-threshold both
