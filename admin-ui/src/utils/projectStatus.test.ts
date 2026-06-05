@@ -68,6 +68,21 @@ describe('projectStatusBadge', () => {
       expect(projectStatusBadge({ status: 'DEPLOYING', created_at: twoHoursAgo }).classes).toContain('text-emerald-400');
     });
 
+    it('interprets naive UTC timestamps correctly (no trailing Z)', () => {
+      // Backend sends timestamps as naive UTC strings without 'Z'.
+      // parseTimestamp appends 'Z' to ensure they're parsed as UTC, not local time.
+      // This test verifies that a timestamp string 10 minutes ago (without 'Z')
+      // is correctly interpreted as Bootstrapping regardless of operator timezone.
+      const tenMinutesAgoUtc = new Date(Date.now() - 10 * 60 * 1000).toISOString().slice(0, -1);
+      expect(projectStatusBadge({ status: 'DEPLOYING', created_at: tenMinutesAgoUtc }).label).toBe('Bootstrapping');
+    });
+
+    it('distinguishes Bootstrapping from Running with naive UTC timestamps', () => {
+      // A project created 2 hours ago (naive UTC string, no 'Z') should show Running.
+      const twoHoursAgoUtc = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString().slice(0, -1);
+      expect(projectStatusBadge({ status: 'DEPLOYING', created_at: twoHoursAgoUtc }).label).toBe('Running');
+    });
+
     it('shows Running by default for active projects without created_at', () => {
       expect(projectStatusBadge({ status: 'DEPLOYING' }).label).toBe('Running');
     });

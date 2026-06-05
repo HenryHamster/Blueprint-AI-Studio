@@ -85,6 +85,26 @@ export function formatTimeOnly(v: string | number): string {
   });
 }
 
+/**
+ * Freshness affordance for a precomputed snapshot served from a cache.
+ *
+ * Returns a relative "as of" label (via {@link timeAgo}, or null when no
+ * timestamp is supplied) and whether the snapshot is stale — its age in
+ * seconds exceeds `staleAfterSeconds`. Callers degrade the surface (dim /
+ * desaturate / mark) when `stale` so a cached reading is never presented as a
+ * live, authoritative one.
+ */
+export function snapshotFreshness(
+  computedAt: string | null | undefined,
+  ageSeconds: number | null | undefined,
+  staleAfterSeconds: number,
+): { asOfLabel: string | null; stale: boolean } {
+  return {
+    asOfLabel: computedAt ? timeAgo(computedAt) : null,
+    stale: ageSeconds != null && ageSeconds > staleAfterSeconds,
+  };
+}
+
 /** Seconds remaining until a future timestamp (0 if past). */
 export function secondsUntil(v: string | number): number {
   return Math.max(0, Math.floor((parseTimestamp(v).getTime() - Date.now()) / 1000));

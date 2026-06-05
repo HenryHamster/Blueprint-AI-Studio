@@ -5,6 +5,8 @@
 // and Tailwind color classes. Isolated here so it can be unit tested without
 // rendering the dashboard (mirrors utils/convergenceVerdict.ts).
 
+import { parseTimestamp } from './time';
+
 export interface ProjectStatusBadge {
   label: string;
   classes: string;
@@ -114,7 +116,7 @@ function resolveBaseBadge(
     // Check if recently created (less than 1 hour ago)
     if (createdAt) {
       try {
-        const createdMs = new Date(createdAt).getTime();
+        const createdMs = parseTimestamp(createdAt).getTime();
         const oneHourAgo = Date.now() - 60 * 60 * 1000;
         if (createdMs > oneHourAgo) {
           return { label: 'Bootstrapping', classes: 'bg-blue-500/15 text-blue-400 border border-blue-500/20' };

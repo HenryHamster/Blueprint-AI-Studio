@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef, type ReactElement } from 'rea
 import { apiFetch } from '../api';
 import type { FixLoopAttempt } from '../types/task';
 import { FIX_LOOP_LAYERS, LOOP_LABELS } from '../utils/fixLoopLayers';
+import { parseTimestamp } from '../utils/time';
 
 interface LoopSummary {
   attempts: number;
@@ -25,8 +26,8 @@ const EXIT_REASON_STYLE: Record<string, string> = {
 
 function formatDuration(startedAt: string | null | undefined, endedAt: string | null | undefined): string | null {
   if (!startedAt || !endedAt) return null;
-  const start = new Date(startedAt).getTime();
-  const end = new Date(endedAt).getTime();
+  const start = parseTimestamp(startedAt).getTime();
+  const end = parseTimestamp(endedAt).getTime();
   if (!start || !end || start >= end) return null;
   const seconds = Math.round((end - start) / 1000);
   if (seconds < 60) return `${seconds}s`;
@@ -37,7 +38,7 @@ function formatDuration(startedAt: string | null | undefined, endedAt: string | 
 
 function formatAbsoluteTime(isoString: string | null | undefined): string | null {
   if (!isoString) return null;
-  const date = new Date(isoString);
+  const date = parseTimestamp(isoString);
   if (isNaN(date.getTime())) return null;
   return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
 }
