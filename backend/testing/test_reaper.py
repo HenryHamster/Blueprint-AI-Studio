@@ -7383,6 +7383,50 @@ async def test_unblock_sweep_resolves_task_need_into_dep_edge_and_requeues(
 
 
 @pytest.mark.asyncio
+async def test_unblock_sweep_resolves_finding_hash_need_into_dep_edge(
+    reaper_db, mocker
+):
+    """A {kind:'task'} need whose ref is the foundation's non-UUID finding-hash
+    resolves into a real depends_on edge — the resume matcher now sees the same
+    finding-hash signal the producer recorded (previously this parked forever)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    foundation = Task(
+        project_id=project.id, title="foundation", description="x",
+        status=TaskStatus.IN_PROGRESS, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}], context={"finding_hash": "abc123def4560789"},
+        status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: needs the foundation finding first",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "foundation",
+                "reason": "BLOCKER: needs the foundation finding first",
+                "need": {"kind": "task", "ref": "abc123def4560789"},
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    assert str(foundation.id) in (t.depends_on or [])
+    assert t.context.get("_blocked_optimistic_retries") is None
+
+
+@pytest.mark.asyncio
 async def test_unblock_sweep_resolves_pr_need_to_owning_task(reaper_db, mocker):
     """A {kind:'pr'} need resolves onto the in-flight task that owns that PR."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)

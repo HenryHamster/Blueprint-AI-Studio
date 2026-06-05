@@ -26,9 +26,9 @@ keeps it cheap to call inside the sweep loop and trivial to unit-test.
 
 from __future__ import annotations
 
-import uuid
 from typing import Any, Dict, List, Optional
 
+from app.finding_deduplication import prerequisite_matches_task
 from app.models import Task
 
 # Candidate statuses an in-flight foundation can be in. Kept here (not imported
@@ -67,15 +67,18 @@ def _candidate_pr_number(candidate: Task) -> Optional[int]:
 
 
 def _match_task(ref: str, candidates: List[Task]) -> Optional[Task]:
-    """kind='task': the candidate whose id equals ``ref`` (exact id match)."""
-    try:
-        ref_id = uuid.UUID(str(ref).strip())
-    except (ValueError, AttributeError, TypeError):
-        return None
-    for c in candidates:
-        if c.id == ref_id:
-            return c
-    return None
+    """kind='task': the single candidate whose id OR finding-hash equals ``ref``.
+
+    Reuses the spawn-time resolver's explicit task-signal predicate
+    (:func:`finding_deduplication.prerequisite_matches_task`) so a need that
+    names its foundation by a non-UUID ``finding_hash`` — exactly how the
+    producer records sibling/prerequisite needs — resolves here too, not only a
+    raw task id. Ambiguity (more than one candidate sharing the signal) returns
+    ``None`` so independent work is never falsely serialized.
+    """
+    normalized = {"kind": "task", "ref": str(ref).strip()}
+    matches = [c for c in candidates if prerequisite_matches_task(normalized, c)]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _match_pr(ref: str, candidates: List[Task]) -> Optional[Task]:
@@ -101,6 +104,9 @@ def _match_capability(
     refuse anything fuzzy. A candidate qualifies only when one of these EXACT
     signals holds:
 
+      - it advertises the ref as an explicit capability marker
+        (``provides_capability`` / ``capability`` — the producer-stamped signal,
+        matched via the spawn-time resolver predicate), OR
       - its leading-payload ``type`` equals the capability ref, OR
       - its title exactly equals the ref (case-insensitive, trimmed), OR
       - the ref appears as an exact entry in its ``related_files``.
@@ -112,9 +118,13 @@ def _match_capability(
     if not ref_text:
         return None
     ref_lower = ref_text.lower()
+    normalized = {"kind": "capability", "ref": ref_text}
 
     matches: List[Task] = []
     for c in candidates:
+        if prerequisite_matches_task(normalized, c):
+            matches.append(c)
+            continue
         payload_type = (c.first_payload or {}).get("type")
         if isinstance(payload_type, str) and payload_type.strip().lower() == ref_lower:
             matches.append(c)

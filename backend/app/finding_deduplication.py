@@ -173,6 +173,35 @@ def _task_capability_markers(task: Task) -> set[str]:
     return markers
 
 
+def prerequisite_matches_task(normalized: dict, task: Optional[Task]) -> bool:
+    """True if ``task`` satisfies a normalized ``{kind, ref}`` prereq by explicit signal.
+
+    The single-candidate predicate underneath :func:`resolve_prerequisite_task`,
+    exposed so the resume-time matcher (``blocked_need_resolution``) can reuse the
+    exact same task-id / finding-hash / capability-marker signals rather than
+    re-deriving them — keeping the spawn-time and resume-time resolvers in
+    lockstep. EXPLICIT signals only:
+
+      * ``kind == "task"``: ``ref`` equals ``str(task.id)`` or the task's
+        ``context["finding_hash"]``.
+      * ``kind == "capability"``: ``ref`` (case-insensitive) matches an explicit
+        capability marker (see :func:`_task_capability_markers`).
+
+    Any other kind, a ``None`` task, or a malformed ``normalized`` is ``False``.
+    """
+    if task is None or not isinstance(normalized, dict):
+        return False
+    kind = normalized.get("kind")
+    ref = normalized.get("ref")
+    if not isinstance(ref, str):
+        return False
+    if kind == "task":
+        return ref == str(task.id) or ref == _task_finding_hash(task)
+    if kind == "capability":
+        return ref.lower() in _task_capability_markers(task)
+    return False
+
+
 def resolve_prerequisite_task(
     prereq: object,
     candidate_tasks: Iterable[Task],
@@ -196,17 +225,9 @@ def resolve_prerequisite_task(
     normalized = normalize_prerequisite(prereq)
     if normalized is None:
         return None
-    kind = normalized["kind"]
-    ref = normalized["ref"]
     for task in candidate_tasks:
-        if task is None:
-            continue
-        if kind == "task":
-            if ref == str(task.id) or ref == _task_finding_hash(task):
-                return task
-        elif kind == "capability":
-            if ref.lower() in _task_capability_markers(task):
-                return task
+        if prerequisite_matches_task(normalized, task):
+            return task
     return None
 
 

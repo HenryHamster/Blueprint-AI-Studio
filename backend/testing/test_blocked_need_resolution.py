@@ -48,9 +48,20 @@ def test_task_need_no_matching_id_returns_none():
     assert resolve_blocked_need(blocked, need, [foundation]) is None
 
 
-def test_task_need_malformed_ref_returns_none():
+def test_task_need_resolves_by_finding_hash():
+    # A non-UUID finding-hash ref resolves onto the candidate that stamps it —
+    # this is the canonical signal the producer records for sibling prereqs.
+    foundation = _task(context={"finding_hash": "deadbeefcafe0001"})
     blocked = _task(status=TaskStatus.BLOCKED)
-    need = {"kind": "task", "ref": "not-a-uuid"}
+    need = {"kind": "task", "ref": "deadbeefcafe0001"}
+    assert resolve_blocked_need(blocked, need, [foundation]) is foundation
+
+
+def test_task_need_unmatched_ref_returns_none():
+    # A ref that is neither any candidate's id nor its finding-hash matches
+    # nothing (no longer rejected as "malformed" — it is simply unmatched).
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": "not-a-known-ref"}
     assert resolve_blocked_need(blocked, need, [_task()]) is None
 
 
@@ -117,12 +128,55 @@ def test_capability_no_conservative_match_returns_none():
     assert resolve_blocked_need(blocked, need, [foundation]) is None
 
 
+def test_capability_resolves_on_advertised_marker():
+    # The producer-stamped explicit capability marker resolves, even when no
+    # payload-type / title / related-file signal would.
+    foundation = _task(
+        title="unrelated title",
+        context={"provides_capability": "auth-tokens"},
+    )
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "capability", "ref": "auth-tokens"}
+    assert resolve_blocked_need(blocked, need, [foundation]) is foundation
+
+
+def test_capability_resolves_on_marker_in_list():
+    foundation = _task(context={"capability": ["billing", "Auth-Tokens"]})
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "capability", "ref": "auth-tokens"}  # case-insensitive
+    assert resolve_blocked_need(blocked, need, [foundation]) is foundation
+
+
 def test_capability_ambiguous_returns_none():
     a = _task(payloads=[{"type": "design"}])
     b = _task(title="design")
     blocked = _task(status=TaskStatus.BLOCKED)
     need = {"kind": "capability", "ref": "design"}
     assert resolve_blocked_need(blocked, need, [a, b]) is None
+
+
+# ── parity guard: resume matcher must not miss what spawn resolves ────────────
+
+def test_resume_matcher_parity_with_spawn_resolver():
+    """Whatever the spawn-time resolver matches by an explicit task/capability
+    signal, the resume-time matcher must resolve to the SAME candidate — they
+    share ``prerequisite_matches_task`` so they cannot silently diverge again."""
+    from app.finding_deduplication import resolve_prerequisite_task
+
+    blocked = _task(status=TaskStatus.BLOCKED)
+    foundation = _task(context={"finding_hash": "deadbeefcafe0002"})
+    cap = _task(context={"provides_capability": "search-index"})
+
+    cases = [
+        ({"kind": "task", "ref": str(foundation.id)}, foundation),
+        ({"kind": "task", "ref": "deadbeefcafe0002"}, foundation),
+        ({"kind": "capability", "ref": "search-index"}, cap),
+    ]
+    for need, expected in cases:
+        # Spawn-time resolver (producer side) matches the foundation...
+        assert resolve_prerequisite_task(need, [expected]) is expected
+        # ...and the resume-time matcher resolves to the same candidate.
+        assert resolve_blocked_need(blocked, need, [expected]) is expected
 
 
 # ── guards ───────────────────────────────────────────────────────────────────
@@ -166,6 +220,20 @@ def test_completed_task_need_satisfied_by_merged_foundation():
     assert need_satisfied_by_completed(blocked, need, [done]) is True
 
 
+def test_completed_finding_hash_need_satisfied_by_merged_foundation():
+    done = _task(status=TaskStatus.COMPLETED, context={"finding_hash": "f00dcafe00001234"})
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": "f00dcafe00001234"}
+    assert need_satisfied_by_completed(blocked, need, [done]) is True
+
+
+def test_completed_capability_need_satisfied_by_advertised_marker():
+    done = _task(status=TaskStatus.COMPLETED, context={"provides_capability": "auth-tokens"})
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "capability", "ref": "auth-tokens"}
+    assert need_satisfied_by_completed(blocked, need, [done]) is True
+
+
 def test_completed_pr_need_satisfied_by_owning_completed_task():
     done = _task(status=TaskStatus.COMPLETED, payloads=[{"type": "fix", "pr_number": 8123}])
     blocked = _task(status=TaskStatus.BLOCKED)
@@ -196,6 +264,20 @@ def test_dead_task_need_matches_failed_foundation():
     dead = _task(status=TaskStatus.FAILED)
     blocked = _task(status=TaskStatus.BLOCKED)
     need = {"kind": "task", "ref": str(dead.id)}
+    assert need_matched_dead_foundation(blocked, need, [dead]) is True
+
+
+def test_dead_finding_hash_need_matches_failed_foundation():
+    dead = _task(status=TaskStatus.FAILED, context={"finding_hash": "f00dcafe0000dead"})
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": "f00dcafe0000dead"}
+    assert need_matched_dead_foundation(blocked, need, [dead]) is True
+
+
+def test_dead_capability_need_matches_advertised_marker():
+    dead = _task(status=TaskStatus.CANCELLED, context={"provides_capability": "auth-tokens"})
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "capability", "ref": "auth-tokens"}
     assert need_matched_dead_foundation(blocked, need, [dead]) is True
 
 
