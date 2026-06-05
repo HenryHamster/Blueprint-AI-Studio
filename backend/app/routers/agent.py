@@ -185,6 +185,17 @@ _AGENT_INACTIVE_TASK_STATUSES = (
     TaskStatus.BLOCKED,
 )
 
+# Peer code-change and analysis task types that do real code/analysis work and
+# therefore benefit from the same baseline launch context (concurrent/sibling/
+# queued task awareness, recent completions, lessons, and direction
+# goal/contract/narrative) that create/fix/refactor/research/plan/review get.
+# Single source of truth for the two claim-path context gates below. These reuse
+# the existing per-project queries — no new heavy computation on the hot claim
+# path; the expensive review-only analytics stay gated to their narrower sets.
+_PEER_CODE_ANALYSIS_TYPES = frozenset(
+    {"qa", "migrate", "debug", "perf", "investigate"}
+)
+
 # Issue M3 (warm-VM continuity audit): JWTs for terminated tasks remain valid
 # for the JWT's full TTL (1h). The is_idempotent_path branch accepts these
 # terminal-task tokens on /next-role and /vm-heartbeat so a legitimate warm
@@ -853,7 +864,10 @@ async def claim_task(
     task_capability = agent_capability_slice(task_type)
     if task_capability is not None:
         response["task_capability"] = task_capability
-    if task_type in ("research", "plan", "create", "fix", "refactor", "review"):
+    if (
+        task_type in ("research", "plan", "create", "fix", "refactor", "review")
+        or task_type in _PEER_CODE_ANALYSIS_TYPES
+    ):
         # Active tasks (IN_PROGRESS or EVALUATING) in the same project.
         # Phase B4 (H-P6): load_only drops status_log/plan_output JSONB.
         # Reads below: id, title, first_payload (payloads), status, context.
@@ -3256,13 +3270,16 @@ async def claim_task(
     if (
         direction_id
         and project_for_playbook
-        and task_type
-        in (
-            "create",
-            "fix",
-            "refactor",
-            "research",
-            "plan",
+        and (
+            task_type
+            in (
+                "create",
+                "fix",
+                "refactor",
+                "research",
+                "plan",
+            )
+            or task_type in _PEER_CODE_ANALYSIS_TYPES
         )
     ):
         _narrative_direction = next(
@@ -3287,6 +3304,13 @@ async def claim_task(
                 if "direction_context" not in response:
                     response["direction_context"] = {}
                 response["direction_context"]["contract"] = contract
+            # Surface the direction goal/title so peer code-change and analysis
+            # agents (qa/migrate/debug/perf/investigate) launch knowing which
+            # direction they serve, not just its narrative/contract bodies.
+            if narrative or contract:
+                response["direction_context"].setdefault(
+                    "title", _narrative_direction.get("title", "")
+                )
 
     # Inject build_config so the agent knows how to lint/test/build
     if project_for_playbook and project_for_playbook.build_config:

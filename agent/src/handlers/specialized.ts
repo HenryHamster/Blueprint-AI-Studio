@@ -197,6 +197,11 @@ CRITICAL RULES:
   const migrateClaudeMd = readClaudeMd();
   const migrateClaudeMdSection = migrateClaudeMd ? `## Codebase Instructions\n${migrateClaudeMd}\n\n` : '';
   const migratePlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
+  // Shared launch-context block (sibling/queued tasks, the served direction,
+  // quality signals). Degrades to '' when absent, so it is safe even when the
+  // migrate payload carries only partial context. See buildContextPrefix.
+  const migrateContextPrefix = buildContextPrefix(task);
+  const migrateContextSection = migrateContextPrefix ? `${migrateContextPrefix}\n` : '';
   const migrateRetryContext = buildRetryContext(task);
   const migrateFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const migratePromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
@@ -206,7 +211,7 @@ CRITICAL RULES:
     schemaRevisionFile: migrateLayout.schemaRevisionFile,
     schemaRevisionConst: migrateLayout.schemaRevisionConst,
   });
-  const finalMigratePrompt = migrateClaudeMdSection + migratePlaybookSection + migrateRetryContext
+  const finalMigratePrompt = migrateClaudeMdSection + migrateContextSection + migratePlaybookSection + migrateRetryContext
     + migratePrompt + migrateFirstTaskSection
     + buildCodeChangeHelperGuidance({ buildConfig: migrateBuildConfig, owner, repo }) + migrateFocusBlock + PLAYBOOK_GUIDANCE
     + READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + PRIOR_ATTEMPT_DIVERGENCE + BEYOND_SCOPE_REPORTING
@@ -318,7 +323,10 @@ export async function handleSmoketest(
 
   const smoketestRetryContext = buildRetryContext(task);
   const smoketestFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
-  const smoketestPrompt = `${smoketestRetryContext}You are a smoke test agent. Your job is to run structured health checks on this codebase using the smoketest configuration.
+  // Shared launch-context block; degrades to '' when absent (graceful).
+  const smoketestContextPrefix = buildContextPrefix(task);
+  const smoketestContextSection = smoketestContextPrefix ? `${smoketestContextPrefix}\n` : '';
+  const smoketestPrompt = `${smoketestContextSection}${smoketestRetryContext}You are a smoke test agent. Your job is to run structured health checks on this codebase using the smoketest configuration.
 
 Follow these steps:
 
@@ -577,8 +585,11 @@ export async function handlePerf(
   const perfNodeDir = perfNodeDirs.length > 0 ? perfNodeDirs[0].path.replace(/\/$/, '') : 'admin-ui';
   const perfRetryContext = buildRetryContext(task);
   const perfFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
+  // Shared launch-context block; degrades to '' when absent (graceful).
+  const perfContextPrefix = buildContextPrefix(task);
+  const perfContextSection = perfContextPrefix ? `${perfContextPrefix}\n` : '';
 
-  const perfPrompt = `${perfRetryContext}You are a performance analysis agent. You have full access to this repository. Your job is to analyze the codebase for demonstrable performance bottlenecks and produce structured, evidence-based findings.
+  const perfPrompt = `${perfContextSection}${perfRetryContext}You are a performance analysis agent. You have full access to this repository. Your job is to analyze the codebase for demonstrable performance bottlenecks and produce structured, evidence-based findings.
 
 Analyze the codebase for the following performance anti-patterns. Only flag issues you can directly observe in the code — do NOT speculate about theoretical problems.
 
@@ -687,8 +698,12 @@ export async function handleInvestigate(
   const investigateRetryContext = buildRetryContext(task);
   const investigateFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const recentChangesSection = formatRecentChanges(payload.recent_changes);
+  // Shared launch-context block; degrades to '' when absent (graceful). This is
+  // the equipping gap vs. the near-twin debug handler, which already includes it.
+  const investigateContextPrefix = buildContextPrefix(task);
+  const investigateContextSection = investigateContextPrefix ? `${investigateContextPrefix}\n` : '';
 
-  const investigatePrompt = `${investigateRetryContext}You are an investigation agent. You have full read access to this repository. Your job is to analyze the issue described below and produce a structured diagnosis report.
+  const investigatePrompt = `${investigateContextSection}${investigateRetryContext}You are an investigation agent. You have full read access to this repository. Your job is to analyze the issue described below and produce a structured diagnosis report.
 Use the Recent changes section first to correlate the issue with the latest deploy window and recently merged changes.
 
 Issue to investigate:

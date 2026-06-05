@@ -5181,6 +5181,174 @@ async def test_claim_does_not_inject_direction_context_for_review_task(
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
+async def test_claim_includes_full_project_context_for_qa_task(
+    client: AsyncClient, db_session
+):
+    """A qa task receives the same baseline project_context as create/fix/refactor
+    — active_tasks, lessons, and recently_completed_tasks — not just the
+    lightweight pipeline_health summary handed to other peripheral types."""
+    project = Project(name="QA Launch Context", user_id="test-user-qa")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A sibling task already in flight (should show up under active_tasks).
+    active_task = Task(
+        project_id=project.id,
+        title="Active sibling create",
+        payloads=[{"type": "create", "prompt": "Build the validator"}],
+        vm_instance_id="agent-vm-qa-active",
+        status=TaskStatus.IN_PROGRESS,
+        context={"related_files": ["backend/app/main.py"]},
+    )
+    db_session.add(active_task)
+    # A recently completed task (should show up under recently_completed_tasks).
+    completed_task = Task(
+        project_id=project.id,
+        title="Completed groundwork",
+        payloads=[{"type": "create", "prompt": "Lay groundwork"}],
+        vm_instance_id="agent-vm-qa-done",
+        status=TaskStatus.COMPLETED,
+        context={"related_files": ["backend/app/foo.py"]},
+    )
+    db_session.add(completed_task)
+    await db_session.commit()
+
+    claim_task = Task(
+        project_id=project.id,
+        title="QA the validator",
+        payloads=[{"type": "qa", "prompt": "Write tests for the validator"}],
+        vm_instance_id="agent-vm-qa-claimer",
+    )
+    db_session.add(claim_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+
+    token = create_agent_token(str(claim_task.id), "agent-vm-qa-claimer")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    pc = resp.json().get("project_context", {})
+    # Baseline keys (not just pipeline_health) must be present for qa.
+    assert "active_tasks" in pc, list(pc.keys())
+    assert "lessons" in pc, list(pc.keys())
+    assert "recently_completed_tasks" in pc, list(pc.keys())
+    assert any(t["title"] == "Active sibling create" for t in pc["active_tasks"])
+    assert any(
+        t["title"] == "Completed groundwork" for t in pc["recently_completed_tasks"]
+    )
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_includes_project_context_for_migrate_task(
+    client: AsyncClient, db_session
+):
+    """A migrate task sees sibling/active migrate tasks already in flight — the
+    concrete revision-collision / duplicate-schema risk the baseline context
+    is meant to surface."""
+    project = Project(name="Migrate Launch Context", user_id="test-user-migrate")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    active_migrate = Task(
+        project_id=project.id,
+        title="Active sibling migration",
+        payloads=[{"type": "migrate", "prompt": "Add column to models"}],
+        vm_instance_id="agent-vm-mig-active",
+        status=TaskStatus.IN_PROGRESS,
+        context={"related_files": ["backend/app/models.py"]},
+    )
+    db_session.add(active_migrate)
+    await db_session.commit()
+
+    claim_task = Task(
+        project_id=project.id,
+        title="Add another migration",
+        payloads=[{"type": "migrate", "prompt": "Add index to models"}],
+        vm_instance_id="agent-vm-mig-claimer",
+    )
+    db_session.add(claim_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+
+    token = create_agent_token(str(claim_task.id), "agent-vm-mig-claimer")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    pc = resp.json().get("project_context", {})
+    active_tasks = pc.get("active_tasks", [])
+    assert any(t["title"] == "Active sibling migration" for t in active_tasks), (
+        f"migrate task should see sibling migrations, got: {active_tasks}"
+    )
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_injects_direction_context_narrative_contract_for_investigate_task(
+    client: AsyncClient, db_session
+):
+    """An investigate task working inside a direction receives the direction's
+    narrative, contract, and title — the same trajectory/goal context that
+    create/fix/refactor get — so it does not re-diagnose resolved work blind."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Investigate Direction Context", user_id="test-user-inv")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Harden the claim path",
+            "priority": "high",
+            "completion_criteria": "Claim latency stays bounded under load.",
+            "research_context": (
+                "## Established Findings\n"
+                "- The hot claim path reuses per-project queries.\n"
+                "## Open Questions\n"
+                "- Does adding peer types regress latency?\n"
+            ),
+            "context": {
+                "success_evidence": "A before/after delta on claim latency.",
+                "retirement_condition": "All peer types launch well-equipped.",
+            },
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "investigate", "prompt": "Diagnose the claim latency"}],
+        vm_instance_id="agent-vm-inv",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-inv")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    dc = resp.json().get("direction_context") or {}
+    assert "narrative" in dc, dc
+    assert "contract" in dc, dc
+    assert dc.get("title") == "Harden the claim path", dc
+    assert (
+        "The hot claim path reuses per-project queries."
+        in dc["narrative"]["established_findings"]
+    )
+    assert (
+        dc["contract"]["completion_criteria"]
+        == "Claim latency stays bounded under load."
+    )
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
 async def test_claim_injects_saturation_signals_for_research_task(
     client: AsyncClient, db_session
 ):
