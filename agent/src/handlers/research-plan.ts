@@ -17,7 +17,7 @@ import {
 } from '../json-extract.js';
 import {
   PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, isGreenfieldRepo, verifyCloneDelivered, configureAgentPermissions,
-  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, type PlaybookEntry,
+  writePlaybookHelper, writeMessagesHelper, writeDesignDocHelper, formatPlaybook, buildRetryContext, type PlaybookEntry,
 } from '../prompt.js';
 import { parseBackendTimestamp } from '../utils/time.js';
 import { reconcileSystemEntry, reconcileMissingCapabilities } from '../utils/design-doc-presence.js';
@@ -1211,6 +1211,7 @@ export async function handlePlan(
   verifyCloneDelivered(task, baseBranch);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  writeDesignDocHelper(taskId);
   const disallowedTools = configureAgentPermissions('plan');
   const promptFingerprint = computeResearchPlanPromptFingerprint('plan');
   const setPromptFingerprint = (indexMod as { setCurrentPromptFingerprint?: (fp: string) => void }).setCurrentPromptFingerprint;
@@ -1394,6 +1395,7 @@ export async function handleResearch(
   verifyCloneDelivered(task, baseBranch);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  writeDesignDocHelper(taskId);
   const researchMode = strVal(payload.research_mode as string, 'research');
   const disallowedTools = configureAgentPermissions(researchMode);
   const promptFingerprint = computeResearchPlanPromptFingerprint('research');

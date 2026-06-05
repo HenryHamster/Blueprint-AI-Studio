@@ -418,6 +418,21 @@ meaningful state (active gaps, capabilities, pending confirmations) is never
 evicted here — only history/archive."""
 
 
+PROBLEM_MODEL_BYTE_BUDGET = 90_000
+"""Serialized-byte budget for the durable problem model, set safely under the
+strategic write cap.
+
+The strategic op endpoint enforces a 100KB limit on the INCOMING agent payload
+(``admin_agent_ops`` ``set_problem_model``), but the persisted post-merge model
+— after ``archived_gaps`` are unioned forward — is never byte-checked, so the
+durable model can silently exceed the size that could ever be written back
+through the cap. :func:`gc_problem_model` measures the serialized model after
+the count caps run and, while it exceeds this budget, evicts oldest archived
+gaps and trims the rejected-agent-edits ledger (both history/reference-only) so
+the durable model stays round-trippable. Set ~10KB under the 100KB cap to leave
+headroom for the revision-log entry appended in the same write."""
+
+
 class SelfReflectionEntry(BaseModel):
     """Agent-written reflection about what was hard this cycle.
 
@@ -486,6 +501,38 @@ def _archived_gap_recency_key(gap: Gap) -> str:
     return gap.closed or gap.opened or ""
 
 
+def _serialized_model_bytes(model: ProblemModel) -> int:
+    """Serialized byte length of the durable model, matching how the strategic
+    op endpoint measures an incoming payload (``json.dumps(..., default=str)``)."""
+    return len(json.dumps(model.model_dump(), default=str))
+
+
+def _byte_evictable(model: ProblemModel) -> bool:
+    """Whether the byte pass can actually bring ``model`` under the budget.
+
+    The byte pass only touches reference-only history — ``archived_gaps`` and the
+    ``rejected_agent_edits`` ledger. If the live/active state alone (everything
+    that survives once BOTH of those are emptied) already exceeds the budget,
+    evicting that history cannot get the model under the cap; doing so would be
+    futile destruction of re-fetchable reference state on every mature project
+    (a healthy within-caps model carries enough active gaps/history to exceed the
+    budget on its own). So gate eviction on it actually being achievable: measure
+    the floor with both evictable collections cleared, restore them, and only let
+    the caller evict when that floor fits. The legitimate target — a model whose
+    individual archived/ledger entries are large enough to blow the cap despite a
+    small active core — still has a sub-budget floor and is GC'd normally."""
+    saved_archived = model.archived_gaps
+    saved_ledger = model.rejected_agent_edits
+    model.archived_gaps = []
+    model.rejected_agent_edits = []
+    try:
+        floor_bytes = _serialized_model_bytes(model)
+    finally:
+        model.archived_gaps = saved_archived
+        model.rejected_agent_edits = saved_ledger
+    return floor_bytes <= PROBLEM_MODEL_BYTE_BUDGET
+
+
 def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
     """Structurally bound the durable model so it round-trips in a single pass.
 
@@ -493,19 +540,39 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
     summary of what was evicted (empty dict when nothing was dropped, so the
     caller can keep the diff/output byte-identical on the no-op path).
 
-    Today this caps ``archived_gaps`` (the only durable collection that grows
-    without limit) at :data:`ARCHIVED_GAPS_DURABLE_MAX`, evicting the oldest
-    entries by ``closed``/``opened`` timestamp. It deliberately does NOT touch
-    active gaps, capabilities, friction, or pending confirmations — those are
-    live, semantically meaningful state that the agent owns and merges
-    non-destructively; a structural cap there could drop entries the agent never
-    saw. ``archived_gaps`` is pure history (closed/abandoned, reference-only,
-    re-fetchable by id) so oldest-first eviction is safe.
+    Two passes, both touching ONLY history/reference-only state:
 
-    Returns a dict like ``{"archived_gaps_evicted": ["g-x", "g-y"]}`` listing
-    the ids rolled off, suitable for folding into the revision-log diff.
+    1. **Count cap** — bounds ``archived_gaps`` (the only durable collection
+       that grows without limit) at :data:`ARCHIVED_GAPS_DURABLE_MAX`, evicting
+       the oldest entries by ``closed``/``opened`` timestamp.
+    2. **Byte cap** — after the count cap, measures the serialized model and,
+       while it exceeds :data:`PROBLEM_MODEL_BYTE_BUDGET` (set safely under the
+       100KB write cap), evicts the oldest archived gaps and then trims the
+       oldest rejected-agent-edits ledger entries until the model fits. This
+       guards models whose individual entries are large enough to blow the cap
+       despite being under the count caps, so the durable model stays writable
+       back through the strategic op endpoint. The byte pass is gated on
+       :func:`_byte_evictable`: it runs ONLY when emptying the evictable
+       reference-only collections could actually bring the model under budget. A
+       healthy within-caps model can carry enough active gaps/history to exceed
+       the budget on its own, and the byte pass cannot touch that live state — so
+       evicting archived history there is futile destruction and is skipped,
+       leaving such a model bounded by the count cap alone.
+
+    It deliberately does NOT touch active gaps, capabilities, friction, or
+    pending confirmations — those are live, semantically meaningful state that
+    the agent owns and merges non-destructively; a structural cap there could
+    drop entries the agent never saw. ``archived_gaps`` is pure history
+    (closed/abandoned, reference-only, re-fetchable by id) and
+    ``rejected_agent_edits`` is agent-readable bookkeeping, so oldest-first
+    eviction of either is safe.
+
+    Returns a dict like ``{"archived_gaps_evicted": ["g-x"],
+    "rejected_agent_edits_trimmed": 2}`` recording what rolled off, suitable for
+    folding into the revision-log diff.
     """
     summary: dict[str, Any] = {}
+    evicted_ids: list[str] = []
 
     if len(model.archived_gaps) > ARCHIVED_GAPS_DURABLE_MAX:
         # Stable sort newest-last by recency, then keep the most-recent N.
@@ -513,7 +580,31 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
         evicted = ordered[:-ARCHIVED_GAPS_DURABLE_MAX]
         kept = ordered[-ARCHIVED_GAPS_DURABLE_MAX:]
         model.archived_gaps = kept
-        summary["archived_gaps_evicted"] = [g.id for g in evicted]
+        evicted_ids.extend(g.id for g in evicted)
+
+    # Byte cap: only re-order/evict when we are genuinely over budget so the
+    # no-op path leaves the model byte-identical (no spurious archived re-sort).
+    ledger_trimmed = 0
+    if _serialized_model_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET and _byte_evictable(
+        model
+    ):
+        # Oldest-first so list.pop(0) drops the oldest archived gap.
+        model.archived_gaps = sorted(
+            model.archived_gaps, key=_archived_gap_recency_key
+        )
+        while _serialized_model_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET and (
+            model.archived_gaps or model.rejected_agent_edits
+        ):
+            if model.archived_gaps:
+                evicted_ids.append(model.archived_gaps.pop(0).id)
+            else:
+                model.rejected_agent_edits.pop(0)
+                ledger_trimmed += 1
+
+    if evicted_ids:
+        summary["archived_gaps_evicted"] = evicted_ids
+    if ledger_trimmed:
+        summary["rejected_agent_edits_trimmed"] = ledger_trimmed
 
     return summary
 
@@ -758,6 +849,8 @@ def _diff_summary(diff: dict[str, Any]) -> str:
         parts.append(f"{len(caps)} capability status changes")
     if evicted := diff.get("archived_gaps_evicted"):
         parts.append(f"GC evicted {len(evicted)} archived gap(s)")
+    if trimmed := diff.get("rejected_agent_edits_trimmed"):
+        parts.append(f"GC trimmed {trimmed} rejected-edit ledger entry(ies)")
     return "; ".join(parts) if parts else "no structural changes"
 
 
@@ -1279,24 +1372,26 @@ def apply_agent_update(
 
     archive_closed_gaps(proposed)
 
+    # Carry the durable rejected-agent-edits ledger forward and append any new
+    # overrides, capped — mirrors archived_gaps/revision_log preservation. The
+    # agent's own submission of this field is ignored (agent-readable, not
+    # agent-writable bookkeeping). Set BEFORE the GC so the byte-aware pass can
+    # see the full durable model (the ledger stores sizable operator+agent
+    # blobs) and trim this reference-only state if the model is over budget.
+    ledger = list(current.rejected_agent_edits) + rejected_edits
+    proposed.rejected_agent_edits = ledger[-REJECTED_AGENT_EDITS_MAX:]
+
     # Structural GC backstop: bound the durable history/archive collections so
     # the model round-trips in a single pass regardless of whether the agent
     # voluntarily pruned. Runs AFTER archival (so this cycle's just-closed gaps
     # are eligible) and BEFORE the revision-log append so the eviction is
-    # recorded in the same revision that performed it. Folds the evicted ids
+    # recorded in the same revision that performed it. Folds what was dropped
     # into the diff so the GC is observable in the revision log.
     gc_summary = gc_problem_model(proposed)
     if gc_summary:
         diff.update(gc_summary)
 
     append_revision_log(proposed, summary=_diff_summary(diff), changes=diff)
-
-    # Carry the durable rejected-agent-edits ledger forward and append any new
-    # overrides, capped — mirrors archived_gaps/revision_log preservation. The
-    # agent's own submission of this field is ignored (agent-readable, not
-    # agent-writable bookkeeping).
-    ledger = list(current.rejected_agent_edits) + rejected_edits
-    proposed.rejected_agent_edits = ledger[-REJECTED_AGENT_EDITS_MAX:]
 
     result = proposed.model_dump()
     # Keep output byte-identical to the pre-merge behavior on the no-conflict /

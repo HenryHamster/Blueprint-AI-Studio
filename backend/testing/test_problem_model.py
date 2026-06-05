@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from app.problem_model import (
     ARCHIVED_GAPS_DURABLE_MAX,
+    PROBLEM_MODEL_BYTE_BUDGET,
     GAP_HISTORY_DURABLE_MAX,
     GAP_PAST_MOVES_DURABLE_MAX,
     MODEL_SIZE_HEALTHY_CAPABILITIES,
@@ -560,6 +561,166 @@ def test_apply_agent_update_gc_never_drops_active_state():
     assert {g["id"] for g in new_raw["gaps"]} == {"g-live"}
     assert {c["name"] for c in new_raw["capabilities"]} == {"cap-x"}
     assert {p["id"] for p in new_raw["pending_user_confirmation"]} == {"p-1"}
+
+
+# ---------------------------------------------------------------------------
+# Byte-aware GC — bound the serialized model under the write cap even when
+# individual entries are large (count caps alone don't catch this).
+# ---------------------------------------------------------------------------
+
+
+def _serialized_bytes(model: ProblemModel) -> int:
+    import json
+
+    return len(json.dumps(model.model_dump(), default=str))
+
+
+def test_gc_problem_model_byte_aware_evicts_large_archived_gaps():
+    """A model UNDER the archived-gap count cap but whose large entries push the
+    serialized size past the byte budget is GC'd down to fit, evicting the
+    oldest archived gaps first."""
+    big = "x" * 5_000
+    # ~20 archived gaps * ~5KB each ≈ 100KB > 90KB budget, but well under the
+    # 200-entry count cap so only the byte pass can catch it.
+    archived = [
+        Gap(
+            id=f"g-{i:04d}",
+            name=f"archived {i}",
+            status="closed",
+            closed=f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}",
+            description=big,
+        )
+        for i in range(20)
+    ]
+    model = ProblemModel(archived_gaps=archived)
+    assert len(model.archived_gaps) < ARCHIVED_GAPS_DURABLE_MAX  # count cap inert
+    assert _serialized_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET
+
+    summary = gc_problem_model(model)
+
+    assert _serialized_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET
+    # Oldest evicted first; the most-recent gaps survive.
+    evicted = summary["archived_gaps_evicted"]
+    assert evicted == [f"g-{i:04d}" for i in range(len(evicted))]
+    kept_ids = {g.id for g in model.archived_gaps}
+    assert f"g-{19:04d}" in kept_ids
+    assert "g-0000" not in kept_ids
+
+
+def test_gc_problem_model_byte_aware_trims_ledger_when_archive_exhausted():
+    """When archived gaps are exhausted (or absent) and the model is still over
+    budget, the byte pass trims the oldest rejected-agent-edits ledger entries —
+    pure reference-only bookkeeping — until it fits."""
+    big = "x" * 6_000
+    ledger = [
+        {
+            "at": f"2026-01-0{i}",
+            "field": "context",
+            "kind": "value_conflict",
+            "operator_value": big,
+            "agent_value": big,
+        }
+        for i in range(10)
+    ]
+    model = ProblemModel(rejected_agent_edits=ledger)
+    assert _serialized_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET
+
+    summary = gc_problem_model(model)
+
+    assert _serialized_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET
+    assert summary["rejected_agent_edits_trimmed"] > 0
+    # Oldest entries dropped; the newest survive (trim is from the front).
+    assert model.rejected_agent_edits[-1]["at"] == "2026-01-09"
+    assert "archived_gaps_evicted" not in summary
+
+
+def test_gc_problem_model_byte_aware_noop_under_budget():
+    """A model already under the byte budget is left byte-identical — the byte
+    pass never re-orders archived gaps or trims the ledger on the no-op path."""
+    model = ProblemModel(
+        archived_gaps=[
+            Gap(id="g-b", name="b", status="closed", closed="2026-01-02"),
+            Gap(id="g-a", name="a", status="closed", closed="2026-01-01"),
+        ],
+        rejected_agent_edits=[{"at": "t", "field": "context"}],
+    )
+    before = model.model_dump()
+    assert _serialized_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET
+
+    summary = gc_problem_model(model)
+
+    assert summary == {}
+    # Archived-gap order is preserved (no spurious recency re-sort).
+    assert model.model_dump() == before
+
+
+def test_apply_agent_update_byte_gc_keeps_model_roundtrippable():
+    """On write-back, a durable model stuffed with large archived gaps AND a
+    large rejected-edits ledger is GC'd under the byte budget — and the eviction
+    is observable in the diff + revision log — while live state is untouched."""
+    big = "y" * 5_000
+    current = {
+        "revision": 3,
+        "archived_gaps": [
+            {
+                "id": f"g-arch-{i:04d}",
+                "name": f"old {i}",
+                "status": "closed",
+                "closed": f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}",
+                "description": big,
+            }
+            for i in range(20)
+        ],
+        "rejected_agent_edits": [
+            {
+                "at": f"2026-02-0{i}",
+                "field": "constraints",
+                "kind": "value_conflict",
+                "operator_value": big,
+                "agent_value": big,
+            }
+            for i in range(5)
+        ],
+        "gaps": [{"id": "g-live", "name": "live", "status": "active"}],
+        "capabilities": [{"name": "cap-x", "status": "working"}],
+        "pending_user_confirmation": [
+            {"id": "p-1", "type": "access_needed", "proposal": "grant access"}
+        ],
+    }
+    proposed = {"gaps": [{"id": "g-live", "name": "live", "status": "active"}]}
+
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+
+    persisted = ProblemModel.model_validate(new_raw)
+    assert _serialized_bytes(persisted) <= PROBLEM_MODEL_BYTE_BUDGET
+    # GC dropped reference-only state and recorded it in the diff + revision log.
+    assert diff.get("archived_gaps_evicted")
+    last_entry = new_raw["revision_log"][-1]
+    assert "archived_gaps_evicted" in last_entry["changes"]
+    assert "GC evicted" in last_entry["summary"]
+    # Live, semantically meaningful state survives untouched.
+    assert {g["id"] for g in new_raw["gaps"]} == {"g-live"}
+    assert {c["name"] for c in new_raw["capabilities"]} == {"cap-x"}
+    assert {p["id"] for p in new_raw["pending_user_confirmation"]} == {"p-1"}
+
+
+def test_apply_agent_update_under_budget_no_byte_gc():
+    """A normally-sized model write-back is not touched by the byte pass — no
+    archived_gaps_evicted / rejected_agent_edits_trimmed keys appear."""
+    current = {
+        "revision": 1,
+        "archived_gaps": [
+            {"id": "g-a", "name": "a", "status": "closed", "closed": "2026-01-01"},
+        ],
+        "gaps": [{"id": "g-live", "name": "live", "status": "active"}],
+    }
+    proposed = {"gaps": [{"id": "g-live", "name": "live", "status": "active"}]}
+
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+
+    assert "archived_gaps_evicted" not in diff
+    assert "rejected_agent_edits_trimmed" not in diff
+    assert {g["id"] for g in new_raw["archived_gaps"]} == {"g-a"}
 
 
 def test_apply_agent_update_detects_new_gaps():
