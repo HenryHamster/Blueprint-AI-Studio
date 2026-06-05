@@ -2656,3 +2656,44 @@ async def test_finding_without_prerequisite_spawns_with_no_extra_deps(
     assert not (children[0].depends_on or []), (
         "a finding with no prerequisite must not gain a dependency edge"
     )
+
+
+@_pytest.mark.asyncio
+async def test_unresolved_prerequisite_recorded_on_task(db_session, mocker):
+    """When a finding declares a prerequisite that does not resolve to any
+    candidate, it is recorded on the spawned task's context so duplication
+    risk is detectable rather than silent."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq04")
+    finding = _make_finding(title="Add login endpoint", direction_id=direction["id"])
+    # Declare a prerequisite that does not exist in the project
+    finding["prerequisite"] = {"kind": "task", "ref": "nonexistent-task-id"}
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    child = children[0]
+    assert not (child.depends_on or []), (
+        "unresolved prerequisite must not create a depends_on edge"
+    )
+    unresolved = (child.context or {}).get("unresolved_prerequisite", [])
+    assert unresolved, "unresolved prerequisite must be recorded on task context"
+    assert any(
+        u.get("kind") == "task" and u.get("ref") == "nonexistent-task-id"
+        for u in (unresolved if isinstance(unresolved, list) else [unresolved])
+    ), "unresolved prerequisite details must be in context"

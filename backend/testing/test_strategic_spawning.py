@@ -11,6 +11,7 @@ Covers:
     in directions_summary for the strategic agent
 """
 
+import json
 import uuid
 from datetime import datetime, timezone, timedelta
 
@@ -36,7 +37,12 @@ from app.strategic_spawning import (
     _build_operator_steering_directive,
     _build_shipped_changes_manifest,
     _build_recent_interventions,
+    _agent_view_problem_model_packed,
+    _AGENT_VIEW_FLOOR_BYTES,
+    _FLOOR_MIN_GAPS,
+    _STRATEGIC_REVIEW_SCHEMA,
 )
+from app.payload_schemas import pack_under_budget
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 
@@ -8673,3 +8679,71 @@ async def test_open_bug_report_older_than_thread_cap_appears_in_open_messages(
     assert old_bug_content not in thread_contents, (
         "Old bug aged out of 15-message thread cap as expected"
     )
+
+
+def _pathological_problem_model(n_gaps: int = 400) -> dict:
+    """A problem_model whose ACTIVE gap list (no count cap by design) has grown
+    so large that the count-based agent-view trim alone cannot fit it under the
+    payload byte budget."""
+    big = "x" * 2000  # bulky free-text body per gap
+    gaps = []
+    for i in range(n_gaps):
+        gaps.append(
+            {
+                "id": f"g-{i}",
+                "name": f"gap {i}",
+                "description": big,
+                "evidence": big,
+                "priority": "high" if i % 3 == 0 else "low",
+                "status": "active",
+                "opened": f"2026-01-{(i % 28) + 1:02d}T00:00:00Z",
+                "history": [{"ts": "2026-01-01T00:00:00Z", "event": big}],
+                "past_moves": [f"d-{i}-{j}" for j in range(20)],
+            }
+        )
+    return {"gaps": gaps, "capabilities": [], "constraints": []}
+
+
+def test_agent_view_problem_model_packed_shrinks_under_floor():
+    """A pathologically large model is shrunk under the guaranteed-small floor
+    and carries a marker of what was shortened — never returned oversized."""
+    pm = _pathological_problem_model()
+    packed = _agent_view_problem_model_packed(pm)
+
+    serialized = len(json.dumps(packed, default=str).encode())
+    assert serialized <= _AGENT_VIEW_FLOOR_BYTES, (
+        f"floor shrink must bring the model under {_AGENT_VIEW_FLOOR_BYTES} "
+        f"bytes, got {serialized}"
+    )
+    marker = packed.get("_agent_view_floor_applied")
+    assert marker is not None, "shrink must leave a loud, visible marker"
+    assert marker["floor_bytes"] == _AGENT_VIEW_FLOOR_BYTES
+    # At least the highest-value gaps survive so the strategist can still reason.
+    assert len(packed["gaps"]) >= _FLOOR_MIN_GAPS
+
+
+def test_pathological_problem_model_is_delivered_not_dropped():
+    """Regression: the strategist must never be silently deprived of its
+    problem_model. Even when the trimmed model exceeds the remaining budget,
+    the budget-aware summarize keeps it in the packed payload (it is NOT listed
+    among the packer's dropped keys)."""
+    pm = _pathological_problem_model()
+    payload = {
+        "type": "strategic_review",
+        "project_name": "p",
+        "base_branch": "main",
+        "model": "claude-opus-4-8",
+        "effort": "medium",
+        "vision": {"purpose": "x"},
+        "problem_model": pm,
+    }
+    packed = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA)
+
+    assert "problem_model" in packed, (
+        "problem_model must be DELIVERED (budget-aware degradation), "
+        "never silently dropped"
+    )
+    dropped_keys = {d["key"] for d in packed["_packer_meta"]["dropped"]}
+    assert "problem_model" not in dropped_keys
+    # And it was actually shrunk to the floor on the way in.
+    assert "_agent_view_floor_applied" in packed["problem_model"]

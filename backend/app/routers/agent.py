@@ -1802,6 +1802,17 @@ async def claim_task(
                     relevance_reasons.append(
                         f"{file_overlap_count} overlapping file(s)"
                     )
+                # Provenance: the branch/HEAD this entry was authored against.
+                # Flag as diverged when its origin branch differs from the
+                # reader's integration branch — the entry may describe code that
+                # only exists on an unmerged branch. Drives the stale caveat.
+                entry_branch = str(v.get("branch") or "")
+                entry_head_sha = str(v.get("head_sha") or "")
+                provenance_diverged = bool(
+                    entry_branch
+                    and project_integration_branch
+                    and entry_branch != project_integration_branch
+                )
                 # Age in days for metadata (0 if updated_at unavailable)
                 age_days = 0
                 if updated_at_str:
@@ -1831,6 +1842,9 @@ async def claim_task(
                         age_days,
                         bool(age_penalty or stale_penalty),
                         relevance_reasons,
+                        entry_branch,
+                        entry_head_sha,
+                        provenance_diverged,
                     )
                 )
         _playbook_candidates.sort()
@@ -1868,16 +1882,26 @@ async def claim_task(
             age_days_val,
             is_stale,
             relevance_reasons,
+            entry_branch_v,
+            entry_head_sha_v,
+            prov_diverged,
         ) in _capped_candidates:
             playbook_entries[short_key] = {
                 "content": content,
                 "effectiveness_score": round(eff_score, 3),
                 "confirmed_count": conf_count,
                 "age_days": age_days_val,
-                "stale": is_stale,
+                # Divergent-provenance entries self-mark as stale so the prompt
+                # renderer surfaces the possibly-outdated caveat automatically.
+                "stale": is_stale or prov_diverged,
                 "relevance": {
                     "reasons": relevance_reasons,
                     "local_match": bool(relevance_reasons),
+                },
+                "provenance": {
+                    "branch": entry_branch_v,
+                    "head_sha": entry_head_sha_v,
+                    "diverged": prov_diverged,
                 },
             }
         if len(_playbook_candidates) > len(_capped_candidates):

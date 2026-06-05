@@ -5,6 +5,7 @@ strategic review cycle. Extracted from autonomous_research.py to free up
 function slots in that module.
 """
 
+import json
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -218,6 +219,129 @@ def _agent_view_problem_model(pm: dict | None) -> dict:
         if gap_memory_trimmed:
             trimmed["_gap_memory_trimmed"] = gap_memory_trimmed
     return trimmed
+
+
+# Guaranteed-small floor for the agent-view problem_model when it is packed
+# under genuine byte-budget pressure. The byte-budget packer registers
+# ``_agent_view_problem_model_packed`` as problem_model's summarize_fn at
+# "high" priority — NOT "critical" — so a count-trimmed-but-still-oversized
+# model would otherwise be DROPPED entirely and the strategist would run a
+# cycle with NO problem_model at all (recorded only in packer metadata).
+# Active gaps have no count cap (they are live state), so the count-based
+# trims above cannot guarantee the result fits. The floor makes the summarize
+# path budget-aware: it progressively strips the lowest-value per-gap detail,
+# then drops the lowest-value gaps, until the serialized model is under a small
+# floor that comfortably fits the remaining budget — so the model is ALWAYS
+# delivered. What was shortened is marked in ``_agent_view_floor_applied`` so
+# the agent can ``./fetch`` fuller detail (and so an unfittable model is a
+# LOUD, visible signal rather than a quiet drop).
+_AGENT_VIEW_FLOOR_BYTES = 32 * 1024
+# Headroom reserved below the floor for the ``_agent_view_floor_applied`` marker
+# (added AFTER the size checks), so the final serialized model — marker included
+# — still lands under the floor.
+_FLOOR_MARKER_RESERVE = 1024
+# Never shrink below this many gaps — the strategist needs at least the
+# highest-value live gaps to reason at all.
+_FLOOR_MIN_GAPS = 12
+# Per-gap detail stripped at each escalating floor level, lowest-value first
+# (append-only memory and free-text evidence before the human-readable body).
+_FLOOR_SHRINK_LEVELS: tuple[tuple[str, ...], ...] = (
+    ("history", "past_moves", "active_moves", "evidence"),
+    ("description",),
+)
+_GAP_PRIORITY_RANK = {"critical": 3, "high": 2, "medium": 1, "low": 0}
+
+
+def _serialized_bytes(value: Any) -> int:
+    """Serialized JSON byte length using the project-standard ``default=str``
+    (matches the packer's own ``_serialized_size`` measurement)."""
+    return len(json.dumps(value, default=str).encode())
+
+
+def _gap_floor_keep_rank(g: dict) -> tuple:
+    """Sort key for floor eviction — HIGHER sorts first (kept). Active beats
+    closed/abandoned, higher priority beats lower, newer-opened beats older."""
+    closed = bool(g.get("closed")) or g.get("status") in ("closed", "abandoned")
+    return (
+        0 if closed else 1,
+        _GAP_PRIORITY_RANK.get(g.get("priority"), 1),
+        g.get("opened") or "",
+    )
+
+
+def _shrink_pm_to_floor(trimmed: dict) -> dict:
+    """Progressively shrink *trimmed* (an already ``_agent_view_problem_model``-
+    trimmed model) until it serializes under :data:`_AGENT_VIEW_FLOOR_BYTES`,
+    so it always fits the packer's remaining budget and is never silently
+    dropped. Mutates and returns *trimmed* (caller passes a fresh copy)."""
+    if _serialized_bytes(trimmed) <= _AGENT_VIEW_FLOOR_BYTES:
+        return trimmed
+    target = _AGENT_VIEW_FLOOR_BYTES - _FLOOR_MARKER_RESERVE
+    gaps = trimmed.get("gaps")
+    if not isinstance(gaps, list) or not gaps:
+        return trimmed
+    stripped: list[str] = []
+    for level in _FLOOR_SHRINK_LEVELS:
+        gaps = [
+            {k: v for k, v in g.items() if k not in level}
+            if isinstance(g, dict)
+            else g
+            for g in gaps
+        ]
+        trimmed["gaps"] = gaps
+        stripped.extend(level)
+        if _serialized_bytes(trimmed) <= target:
+            trimmed["_agent_view_floor_applied"] = {
+                "floor_bytes": _AGENT_VIEW_FLOOR_BYTES,
+                "stripped_gap_fields": stripped,
+                "dropped_gaps": 0,
+            }
+            return trimmed
+    # Every gap is now a skeleton and the model is STILL over floor (a
+    # pathological active-gap count). Keep the highest-value gaps that fit,
+    # summarizing the rest as a count, so the model is delivered not dropped.
+    base = dict(trimmed)
+    base["gaps"] = []
+    running = _serialized_bytes(base)
+    kept: list = []
+    dropped = 0
+    for g in sorted(
+        (g for g in gaps if isinstance(g, dict)),
+        key=_gap_floor_keep_rank,
+        reverse=True,
+    ):
+        gsize = _serialized_bytes(g) + 1  # +1 ~ list separator
+        if running + gsize <= target or len(kept) < _FLOOR_MIN_GAPS:
+            kept.append(g)
+            running += gsize
+        else:
+            dropped += 1
+    trimmed["gaps"] = kept
+    still_over = _serialized_bytes(trimmed) > _AGENT_VIEW_FLOOR_BYTES
+    if still_over:
+        logger.warning(
+            "[STRATEGIC] agent-view problem_model still exceeds the %d-byte floor "
+            "after shrinking to %d gaps — shipping anyway with a loud marker so "
+            "the strategist is never silently deprived of its model",
+            _AGENT_VIEW_FLOOR_BYTES,
+            len(kept),
+        )
+    trimmed["_agent_view_floor_applied"] = {
+        "floor_bytes": _AGENT_VIEW_FLOOR_BYTES,
+        "stripped_gap_fields": stripped,
+        "dropped_gaps": dropped,
+        "still_over_floor": still_over,
+    }
+    return trimmed
+
+
+def _agent_view_problem_model_packed(pm: dict | None) -> dict:
+    """Budget-pressure ``summarize`` callback for the ``problem_model`` payload
+    key. Runs ONLY when the (already agent-view-trimmed) model still exceeds the
+    packer's remaining byte budget: it re-applies the agent-view trim, then
+    shrinks to a guaranteed-small floor so the model ALWAYS fits and is never
+    silently dropped from the strategist's cycle payload."""
+    return _shrink_pm_to_floor(_agent_view_problem_model(pm))
 
 
 # Maximum operator-override entries surfaced to the next strategic cycle, and
@@ -1458,7 +1582,10 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # packer drops it whole under budget rather than trimming. Surfaced so the
     # strategist knows what is already staged and does NOT re-propose it.
     "staged_directions": {"priority": "medium"},
-    "problem_model": {"priority": "high", "summarize": _agent_view_problem_model},
+    "problem_model": {
+        "priority": "high",
+        "summarize": _agent_view_problem_model_packed,
+    },
     # Tiny, load-bearing soft size/health signal computed from the DURABLE
     # problem_model (honest counts, not the trimmed agent view). High priority,
     # no summarize_fn — it should only drop under genuine budget exhaustion.
@@ -1531,7 +1658,10 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     "vision": {"priority": "critical"},
     "open_messages": {"priority": "high"},
     "design_doc": {"priority": "high", "summarize": _agent_view_design_doc},
-    "problem_model": {"priority": "high", "summarize": _agent_view_problem_model},
+    "problem_model": {
+        "priority": "high",
+        "summarize": _agent_view_problem_model_packed,
+    },
     # See _STRATEGIC_REVIEW_SCHEMA: tiny, load-bearing soft size/health signal.
     "model_health": {"priority": "high"},
     "proposed_changes": {"priority": "high"},

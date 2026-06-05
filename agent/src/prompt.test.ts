@@ -158,6 +158,37 @@ describe('formatPlaybook', () => {
     expect(result).toContain('Relevance: same direction; 2 overlapping file(s)');
     expect(result).toContain('use this when touching router code');
   });
+
+  it('renders branch/HEAD provenance for object entries', () => {
+    const result = formatPlaybook({
+      'prov-tip': {
+        content: 'advice with provenance',
+        effectiveness_score: 0.8,
+        confirmed_count: 5,
+        age_days: 1,
+        stale: false,
+        provenance: { branch: 'automain', head_sha: 'abc1234', diverged: false },
+      },
+    });
+    expect(result).toContain('Recorded on automain @ abc1234');
+    expect(result).not.toContain('Possibly outdated');
+  });
+
+  it('flags divergent-provenance entries as possibly outdated', () => {
+    const result = formatPlaybook({
+      'diverged-tip': {
+        content: 'written on a feature branch',
+        effectiveness_score: 0.9,
+        confirmed_count: 8,
+        age_days: 1,
+        stale: false,
+        provenance: { branch: 'blueprint/feature-x', head_sha: 'def5678', diverged: true },
+      },
+    });
+    expect(result).toContain('Recorded on blueprint/feature-x @ def5678');
+    expect(result).toContain('different branch than yours');
+    expect(result).toContain('Possibly outdated or low confidence');
+  });
 });
 
 // ── formatFixIterationHistory ─────────────────────────────────────────────────

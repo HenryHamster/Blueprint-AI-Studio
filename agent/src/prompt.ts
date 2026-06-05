@@ -541,7 +541,7 @@ export function shellEscapeDoubleQuoted(value: string): string {
   return value.replace(/[\\"`$]/g, '\\$&');
 }
 
-export function writePlaybookHelper(taskIdRaw: string): void {
+export function writePlaybookHelper(taskIdRaw: string, workspace: string = WORKSPACE): void {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
   const helperScript = `#!/bin/bash
 OP="\${1:?Usage: playbook get|set|list [key] [content]}"
@@ -557,8 +557,14 @@ if [ "$OP" = "get" ]; then
       -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
 elif [ "$OP" = "set" ]; then
   [ -z "$KEY" ] || [ -z "$VALUE" ] && { echo "Error: set requires <key> and <content>" >&2; exit 1; }
-  jq -n --arg tid "$TASK" --arg k "$KEY" --arg v "$VALUE" \\
-    '{task_id: $tid, op: "set", key: $k, value: $v}' | \\
+  # Capture branch/HEAD provenance at write time so the backend can stamp it on
+  # the entry. Absent (non-git workspace) => omitted => backend keeps it legacy.
+  BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+  HEAD_SHA=$(git rev-parse --short HEAD 2>/dev/null || true)
+  jq -n --arg tid "$TASK" --arg k "$KEY" --arg v "$VALUE" --arg br "$BRANCH" --arg sha "$HEAD_SHA" \\
+    '{task_id: $tid, op: "set", key: $k, value: $v}
+       + (if $br == "" then {} else {branch: $br} end)
+       + (if $sha == "" then {} else {head_sha: $sha} end)' | \\
     curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
       -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
 elif [ "$OP" = "list" ]; then
@@ -571,11 +577,11 @@ else
 fi
 echo ""
 `;
-  fs.writeFileSync(`${WORKSPACE}/playbook`, helperScript, { mode: 0o755 });
+  fs.writeFileSync(`${workspace}/playbook`, helperScript, { mode: 0o755 });
   excludeAgentHelpers();
 }
 
-export function writeMessagesHelper(taskIdRaw: string): void {
+export function writeMessagesHelper(taskIdRaw: string, workspace: string = WORKSPACE): void {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
   const helperScript = `#!/bin/bash
 # Message tool — send messages to the project owner or resolve open messages
@@ -609,7 +615,7 @@ else
 fi
 echo ""
 `;
-  fs.writeFileSync(`${WORKSPACE}/messages`, helperScript, { mode: 0o755 });
+  fs.writeFileSync(`${workspace}/messages`, helperScript, { mode: 0o755 });
   excludeAgentHelpers();
 }
 
@@ -732,6 +738,15 @@ export interface PlaybookEntry {
     reasons?: string[];
     local_match?: boolean;
   };
+  // Branch/HEAD the entry was authored against, stamped at write time. Absent
+  // for legacy entries written before provenance capture. ``diverged`` is set
+  // by the backend when the origin branch differs from the reader's
+  // integration branch — drives the possibly-outdated caveat below.
+  provenance?: {
+    branch?: string;
+    head_sha?: string;
+    diverged?: boolean;
+  };
 }
 
 export function formatPlaybook(
@@ -751,11 +766,15 @@ export function formatPlaybook(
         const relevanceLine = reasons.length > 0
           ? `> Relevance: ${reasons.join('; ')}\n\n`
           : '';
+        const prov = value.provenance;
+        const provenanceLine = prov && (prov.branch || prov.head_sha)
+          ? `> Recorded on ${prov.branch || 'unknown branch'}${prov.head_sha ? ` @ ${prov.head_sha}` : ''}${prov.diverged ? ' (⚠ different branch than yours — code may not exist on your branch)' : ''}\n\n`
+          : '';
         content = value.content;
-        if (value.stale || value.effectiveness_score < 0.3) {
+        if (value.stale || value.provenance?.diverged || value.effectiveness_score < 0.3) {
           caveat = '> ⚠ Possibly outdated or low confidence — verify before applying.\n\n';
         }
-        caveat = `${relevanceLine}${caveat}`;
+        caveat = `${relevanceLine}${provenanceLine}${caveat}`;
       }
       return `### ${key}\n${caveat}${content}`;
     })

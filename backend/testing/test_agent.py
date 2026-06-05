@@ -2842,6 +2842,80 @@ async def test_playbook_set_and_get(client: AsyncClient, db_session):
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
+async def test_playbook_set_stamps_branch_head_provenance(
+    client: AsyncClient, db_session
+):
+    """Branch + short HEAD sha supplied on set are stored on the entry and
+    surfaced by get; omitting them leaves a legacy entry (no provenance keys)."""
+    project = Project(name="Playbook Provenance", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do something"}],
+        vm_instance_id="agent-vm-prov1",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-prov1")
+    headers = {"x-agent-token": token}
+
+    # Set WITH provenance
+    resp = await client.post(
+        "/api/agent/playbook",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "with-prov",
+            "value": "stamped advice",
+            "branch": "blueprint/task-abc",
+            "head_sha": "deadbee",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+    # Set WITHOUT provenance — stays legacy (no branch/head_sha keys persisted)
+    resp_legacy = await client.post(
+        "/api/agent/playbook",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "no-prov",
+            "value": "legacy advice",
+        },
+        headers=headers,
+    )
+    assert resp_legacy.status_code == 200
+
+    await db_session.refresh(project)
+    stamped = project.design_doc["playbook/with-prov"]
+    assert stamped["branch"] == "blueprint/task-abc"
+    assert stamped["head_sha"] == "deadbee"
+    legacy = project.design_doc["playbook/no-prov"]
+    assert "branch" not in legacy
+    assert "head_sha" not in legacy
+
+    # get surfaces provenance for the stamped entry
+    resp_get = await client.post(
+        "/api/agent/playbook",
+        json={"task_id": str(task.id), "op": "get"},
+        headers=headers,
+    )
+    assert resp_get.status_code == 200
+    entries = resp_get.json()["entries"]
+    assert entries["with-prov"]["branch"] == "blueprint/task-abc"
+    assert entries["with-prov"]["head_sha"] == "deadbee"
+    assert entries["no-prov"]["branch"] == ""
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
 async def test_playbook_delete_is_rejected_for_agents(client: AsyncClient, db_session):
     """Agents cannot delete shared playbook entries via POST /api/agent/playbook."""
     project = Project(name="Playbook Delete Rejection Test", user_id="test-user-123")

@@ -2737,6 +2737,26 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             continue
         foundation = resolve_prerequisite_task(prereq, _prereq_candidates)
         if foundation is None or foundation.id == ct.id:
+            # Record the unresolved prerequisite on the task context so it is
+            # visible and operators can detect duplication risk. When a
+            # declared prerequisite fails to resolve to any candidate, the
+            # dependent spawns with no depends_on edge — this persistence
+            # makes the gap detectable rather than silent.
+            if foundation is None:
+                ctx = dict(ct.context or {})
+                unresolved = ctx.get("unresolved_prerequisite") or {}
+                unresolved_list = unresolved if isinstance(unresolved, list) else [unresolved] if unresolved else []
+                unresolved_list.append(prereq)
+                ctx["unresolved_prerequisite"] = unresolved_list
+                ct.context = ctx
+                session.add(ct)
+                logger.warning(
+                    "[RESEARCH] Finding '%s' declared prerequisite %s:%s but no candidate matched; "
+                    "dependent spawned with no depends_on edge (duplication risk)",
+                    findings[fi].get("title", f"#{fi}"),
+                    prereq.get("kind"),
+                    prereq.get("ref"),
+                )
             continue
         foundation_id = str(foundation.id)
         existing_dep = list(ct.depends_on or [])

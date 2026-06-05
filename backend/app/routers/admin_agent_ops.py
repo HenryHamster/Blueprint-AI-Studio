@@ -257,6 +257,8 @@ class PlaybookUpdate(BaseModel):
     applicable_types: List[str] | None = (
         None  # task types this entry applies to; None = all types
     )
+    branch: str | None = None  # git branch the entry was authored on (provenance)
+    head_sha: str | None = None  # short HEAD sha at write time (provenance)
 
 
 _PLAYBOOK_KEY_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-]{0,49}$")
@@ -320,6 +322,8 @@ async def update_playbook(
                     "content": v.get("content", ""),
                     "updated_at": v.get("updated_at", ""),
                     "source_task_id": v.get("source_task_id", ""),
+                    "branch": v.get("branch", ""),
+                    "head_sha": v.get("head_sha", ""),
                 }
         return {"status": "ok", "op": op, "entries": entries}
 
@@ -368,6 +372,13 @@ async def update_playbook(
         }
         if payload.applicable_types is not None:
             entry["applicable_types"] = payload.applicable_types
+        # Provenance: stamp branch + short HEAD sha captured at write time.
+        # Stored only when supplied — absent leaves a legacy entry untouched,
+        # fully backward compatible. Each set overwrites with current truth.
+        if payload.branch:
+            entry["branch"] = payload.branch[:200]
+        if payload.head_sha:
+            entry["head_sha"] = payload.head_sha[:40]
         # Anti-poisoning: until the source task transitions to COMPLETED,
         # the entry is invisible to other tasks (filtered in the get/list
         # paths above and in prompt builders that surface playbook entries).
