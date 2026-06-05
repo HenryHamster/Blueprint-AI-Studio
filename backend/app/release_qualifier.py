@@ -185,6 +185,9 @@ from app.release_qualifier_sweep import (
     _parse_started_at,
     sweep_stuck_qualifications,  # noqa: F401 — re-exported for reaper + tests
 )
+from app.rollup_migration_validation import (
+    check_qualification_migration_identity,
+)
 from app.release_readiness import (
     # Re-exports — release_qualifier is the canonical import surface for the
     # readiness layer (tests access via ``rq.*``; strategic_spawning and
@@ -1302,7 +1305,88 @@ _BLOCKER_LABELS: dict[str, str] = {
     "smoketest_startup_failed": "the smoketest startup suite failed",
     "audit_missing": "the release audit produced no usable report",
     "test_file_deleted": "the diff deleted a test file",
+    "migration_identity_collision": (
+        "an Alembic revision-identity collision between the candidate and the "
+        "deployed promotion target"
+    ),
 }
+
+async def _resolve_migration_identity_at_finalize(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    candidate_sha: str | None,
+) -> tuple[str, str | None]:
+    """Run the deterministic Alembic revision-identity gate at finalize time.
+
+    Resolves the project's GitHub credentials and branch names, then delegates
+    to :func:`check_qualification_migration_identity`, which lists the
+    candidate's migration filenames (at ``candidate_sha``) and the deployed
+    promotion target's current migration filenames (at the promotion-target
+    branch from ``_lts_branch_names``) and runs the existing
+    ``find_content_divergent_revisions`` detector over the two.
+
+    Returns the ``("ok"|"block"|"defer", detail)`` verdict:
+      * ``"ok"``    — no collision; qualification proceeds normally.
+      * ``"block"`` — a confirmed collision; the caller turns this into the
+        ``migration_identity_collision`` hard blocker (confidence forced to 0).
+      * ``"defer"`` — the candidate's / target's migration LIST could not be
+        fetched; the caller HOLDS the release for this attempt rather than waving
+        it through (a fetch error is not "no collision").
+
+    The gate is deliberately scoped to migration-LIST fetch failures. A MISSING
+    ``candidate_sha``, a vanished project, or unresolved GitHub credentials
+    return ``("ok", None)`` so the gate stays inert for those edges — they are
+    ALREADY handled upstream (the promote path's missing-SHA guard; the
+    finalize-time CI re-resolution, which degrades to the ``ci_unresolved`` hard
+    blocker on a missing project / credentials). Letting the gate hold on those
+    too would only double-handle a case CI already blocks, never wave it through.
+    """
+    if not candidate_sha:
+        # The check cannot run without a candidate ref; the promote path's
+        # existing missing-SHA guard handles this case (it returns an error and
+        # stays in stabilize), so do not perturb it here.
+        return ("ok", None)
+    try:
+        project = await session.get(Project, version.project_id)
+        if project is None:
+            # A vanished project is already a ci_unresolved hard blocker via the
+            # finalize CI re-resolution — keep the gate inert rather than convert
+            # that into an infra failure.
+            return ("ok", None)
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved is None:
+            # No credentials → CI re-resolution already degrades to not-green
+            # (ci_unresolved blocker); the gate stays inert (CI blocks anyway).
+            return ("ok", None)
+        token, owner, repo = resolved
+        _integration_branch, promotion_target = _lts_branch_names(project)
+        verdict, detail = await check_qualification_migration_identity(
+            token,
+            owner,
+            repo,
+            candidate_sha,
+            promotion_target,
+            project_id=str(version.project_id),
+        )
+        logger.info(
+            "[RELEASE_QUALIFIER] finalize migration-identity gate for v%d "
+            "candidate %s vs %s: %s (%s)",
+            version.version_number,
+            candidate_sha[:8],
+            promotion_target,
+            verdict,
+            detail or "no divergence",
+        )
+        return verdict, detail
+    except Exception as exc:  # noqa: BLE001 — any failure HOLDS (never waves through)
+        logger.warning(
+            "[RELEASE_QUALIFIER] finalize migration-identity gate failed for "
+            "v%d (holding this attempt): %s",
+            version.version_number,
+            exc,
+        )
+        return ("defer", f"migration-identity gate error: {exc}")
+
 
 async def _finalize_qualification(
     session: AsyncSession,
@@ -1582,6 +1666,28 @@ async def _finalize_qualification(
     # so the agent can target it when smoketest is the binding constraint.
     smoketest_detail = _extract_smoketest_detail(smoketest_result)
 
+    # --- Deterministic Alembic revision-identity safety gate ----------------
+    # A revision-identity collision between the candidate and the deployed
+    # promotion target (the back-merge renumber class, prod incident
+    # 2026-06-04) must be a HARD, clearly-attributed qualification blocker — not
+    # an opaque, score-eroding audit deduction the spawned auditor might miss.
+    # Reuse the existing deterministic detector + GitHub fetch helpers; a fetch
+    # failure DEFERS (holds) the release rather than waving it through. Routed
+    # through _handle_infra_failure so a persistent inability to verify migration
+    # identity surfaces the same way as any other finalize-time infra failure
+    # (no verdict recorded, returned to stabilize, retried by the next cycle).
+    migration_verdict, migration_detail = await _resolve_migration_identity_at_finalize(
+        session, version, candidate_sha
+    )
+    if migration_verdict == "defer":
+        return await _handle_infra_failure(
+            session,
+            version,
+            qual,
+            "migration_identity_check_unavailable",
+        )
+    migration_collision = migration_verdict == "block"
+
     # --- Compute the composite ---------------------------------------------
     composite = compute_composite(
         ci_green=ci_green,
@@ -1591,6 +1697,7 @@ async def _finalize_qualification(
         policy=policy,
         smoketest_enabled=smoketest_enabled,
         ci_state=ci_resolution.get("state", _CI_RED),
+        migration_collision=migration_collision,
     )
 
     finalized_at = _utcnow().isoformat()
@@ -1613,6 +1720,8 @@ async def _finalize_qualification(
         "smoketest_detail": smoketest_detail,
         "audit_missing_reason": audit_missing_reason,
         "audit_reconciliation": audit_reconciliation,
+        "migration_safety": migration_verdict,
+        "migration_safety_detail": migration_detail,
     }
 
     # Per-project override (falls back to the fleet-wide promotion_enabled when
@@ -1666,6 +1775,14 @@ async def _finalize_qualification(
             blocker_label = _BLOCKER_LABELS.get(
                 composite["blocker"], composite["blocker"]
             )
+            # The migration-identity blocker carries the specific diverging
+            # revision so the operator sees WHICH revision collides, not just the
+            # generic blocker label.
+            if (
+                composite["blocker"] == "migration_identity_collision"
+                and migration_detail
+            ):
+                blocker_label = f"{blocker_label} — {migration_detail}"
             notify_event = "release_blocked"
             notify_summary = (
                 f"v{version.version_number} blocked from promotion — "

@@ -201,6 +201,87 @@ async def enforce_premerge_migration_guard(
     return (False, reason)
 
 
+async def check_qualification_migration_identity(
+    gh_token: str,
+    owner: str,
+    repo: str,
+    candidate_ref: str,
+    promotion_target: str,
+    *,
+    project_id: str | None = None,
+) -> tuple[str, str | None]:
+    """Deterministic Alembic revision-identity verdict for release qualification.
+
+    The release qualifier scores an ``automain`` candidate against the deployed
+    ``main`` promotion target, but its quality dimensions (audit / test-erosion /
+    smoketest) have NO deterministic migration-safety check — whether a
+    revision-identity collision blocks the release depends on the spawned audit
+    agent noticing it by reasoning. That is exactly how the revision-0143
+    collision (prod incident 2026-06-04) became a soft, score-eroding audit
+    finding instead of a clear gate, and a future collision could slip through.
+
+    This makes migration-identity safety DETERMINISTIC at qualification time by
+    reusing the SAME detector + fetch helpers the merge-time guards use — it does
+    NOT introduce a second migration-safety rule set. It lists the candidate's
+    Alembic migration filenames (at *candidate_ref* — the candidate SHA the
+    qualifier snapshotted) and the deployed promotion target's CURRENT migration
+    filenames (at *promotion_target*), then runs
+    :func:`find_content_divergent_revisions` over the two sets.
+
+    Returns one of:
+      ``("ok", None)``      — the two refs agree on every shared revision id and
+                              migration identity (no collision).
+      ``("block", reason)`` — a revision-identity collision was found; *reason*
+                              names the specific diverging revision. A HARD
+                              qualification blocker.
+      ``("defer", reason)`` — either side's migration list could not be fetched.
+                              Migration safety is UNKNOWN, so the release must be
+                              HELD (never waved through); the next qualification
+                              cycle retries.
+
+    Fail-safe by construction: an inability to fetch either side's list is
+    ``"defer"``, never ``"ok"`` — a fetch error is not "no collision".
+    """
+    try:
+        candidate_filenames = await github.list_versions_at_ref(
+            gh_token, owner, repo, candidate_ref, project_id=project_id
+        )
+    except Exception as e:  # noqa: BLE001 — a failed fetch HOLDS the release
+        return (
+            "defer",
+            f"could not list candidate '{candidate_ref}' Alembic migrations to "
+            f"check revision-identity safety: {type(e).__name__}: {e}",
+        )
+    try:
+        target_filenames = await github.list_versions_at_ref(
+            gh_token, owner, repo, promotion_target, project_id=project_id
+        )
+    except Exception as e:  # noqa: BLE001 — a failed fetch HOLDS the release
+        return (
+            "defer",
+            f"could not list promotion target '{promotion_target}' Alembic "
+            f"migrations to check revision-identity safety: "
+            f"{type(e).__name__}: {e}",
+        )
+
+    # Compare the deployed promotion target against the candidate. A divergence
+    # means a revision id the deployed DB already applied maps to a DIFFERENT
+    # migration on the candidate (so it would be silently skipped), or a
+    # migration moved revision ids (so it would re-run / mishandle).
+    divergences = find_content_divergent_revisions(
+        target_filenames, candidate_filenames
+    )
+    if divergences:
+        return (
+            "block",
+            f"Alembic revision-identity collision between the candidate and the "
+            f"deployed promotion target '{promotion_target}' (a renumber/reuse "
+            f"that would skip or mishandle a migration the deployed DB already "
+            f"applied): " + "; ".join(divergences),
+        )
+    return ("ok", None)
+
+
 async def _validate_migration_chain_post_merge(
     gh_token: str,
     owner: str,

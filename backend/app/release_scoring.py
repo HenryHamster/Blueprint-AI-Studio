@@ -49,6 +49,7 @@ def compute_composite(
     *,
     smoketest_enabled: bool = True,
     ci_state: str = "red",  # _CI_RED — defined later in module; use literal here
+    migration_collision: bool = False,
 ) -> dict[str, Any]:
     """Compute the composite promotion confidence for a release candidate.
 
@@ -58,6 +59,13 @@ def compute_composite(
         (``"ci_not_green"``).
       * ``not ci_green`` + ``ci_state != _CI_RED``  — CI could not be evaluated
         (pending, no check-runs, or I/O degraded) (``"ci_unresolved"``).
+      * ``migration_collision`` is True — a deterministic Alembic
+        revision-identity collision between the candidate and the deployed
+        promotion target (the back-merge renumber class, prod incident
+        2026-06-04) (``"migration_identity_collision"``).  The caller
+        (``release_qualifier._finalize_qualification``) precomputes this with
+        ``find_content_divergent_revisions`` and the existing GitHub fetch
+        helpers — this function stays pure and only consumes the boolean.
       * ``smoketest_score`` is None — the smoketest never produced a usable
         score, treated as a startup-suite failure
         (``"smoketest_startup_failed"``).  ONLY checked when
@@ -131,6 +139,12 @@ def compute_composite(
         # no check-runs, or GitHub I/O degraded).  Only a real red build is a
         # quality blocker; unresolved CI is a resolution/infrastructure concern.
         blocker = "ci_not_green" if ci_state == _CI_RED else "ci_unresolved"
+    elif migration_collision:
+        # A deterministic Alembic revision-identity collision between the
+        # candidate and the deployed promotion target — checked ahead of the
+        # audit-derived blockers so it is a clear, attributed gate rather than a
+        # soft, score-eroding audit finding the spawned auditor might miss.
+        blocker = "migration_identity_collision"
     elif smoketest_enabled and smoketest_score is None:
         # Only a hard blocker when the smoketest subsystem was actually
         # enabled — a disabled subsystem legitimately produces no score.

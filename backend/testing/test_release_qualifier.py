@@ -2387,6 +2387,18 @@ def _qualifier_ci_resolves_green(mocker):
         "app.github.get_pr_files",
         new=AsyncMock(return_value=[]),
     )
+    # Default the finalize-time deterministic Alembic revision-identity gate to
+    # CLEAN: _finalize_qualification lists the candidate's and the promotion
+    # target's migration filenames via github.list_versions_at_ref and runs
+    # find_content_divergent_revisions over them. Returning the SAME list for
+    # every ref means no revision id diverges, so the gate is "ok" and the
+    # finalize proceeds to the quality composite for the majority of tests where
+    # migration safety is incidental. Tests exercising the gate re-patch this in
+    # their own body (branch-aware / raising); the later patch wins.
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=AsyncMock(return_value=["0001_init.py", "0002_feature.py"]),
+    )
 
 
 # ===========================================================================
@@ -3473,6 +3485,149 @@ async def test_finalize_not_promoted_on_blocker_sets_stabilize(db_session):
     assert version.phase == "stabilize"
     assert version.last_qualification["status"] == "not_promoted"
     assert version.last_qualification["blocker"] == "test_file_deleted"
+
+
+def _versions_by_ref(*, main_list: list[str], candidate_list: list[str]) -> AsyncMock:
+    """Branch-keyed ``list_versions_at_ref``: deployed promotion target vs candidate.
+
+    The finalize-time migration-identity gate lists the candidate's migrations
+    at ``candidate_sha`` and the deployed promotion target's at ``"main"`` — so
+    a ``ref == "main"`` request answers with the deployed list and everything
+    else (the candidate SHA) answers with the candidate list. ``ref`` is the 4th
+    positional arg of ``list_versions_at_ref``.
+    """
+
+    async def _side(token, owner, repo, ref, project_id=None):
+        return list(main_list) if ref == "main" else list(candidate_list)
+
+    return AsyncMock(side_effect=_side)
+
+
+@pytest.mark.asyncio
+async def test_finalize_blocks_on_migration_identity_collision(db_session, mocker):
+    """Reproduces the revision-0143 incident (prod 2026-06-04): deployed main has
+    revision 0143 == vm_contact_last_tool_use, but the candidate independently
+    reassigned 0143 to add_compute_job_persistence and renumbered vm_contact to
+    0144. An otherwise-clean candidate (audit 1.0, smoketest pass, CI green) must
+    be HARD-blocked at qualification: confidence forced to 0, promote False, and
+    the blocker names the 0143 divergence — never a soft audit deduction."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        # A pristine quality profile — without the migration gate this candidate
+        # would promote, isolating the migration collision as the sole blocker.
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Deployed main keeps 0143 == vm_contact_last_tool_use; the candidate maps
+    # 0143 to a DIFFERENT migration (compute-job persistence) and moved
+    # vm_contact to 0144 — the exact divergence the deterministic detector flags.
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_ref(
+            main_list=["0142_parent.py", "0143_vm_contact_last_tool_use.py"],
+            candidate_list=[
+                "0142_parent.py",
+                "0143_add_compute_job_persistence.py",
+                "0144_vm_contact_last_tool_use.py",
+            ],
+        ),
+    )
+
+    # A real collision must NEVER promote, even with promotion enabled.
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "migration_identity_collision"
+    assert result["confidence"] == 0.0
+    promote_spy.assert_not_called()
+
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["status"] == "not_promoted"
+    assert lq["blocker"] == "migration_identity_collision"
+    assert lq["confidence"] == 0.0
+    assert version.phase == "stabilize"
+    # The detail names the specific diverging revision (0143) so the operator
+    # sees WHICH revision collides, not just a generic blocker label.
+    assert lq["migration_safety"] == "block"
+    detail = lq["migration_safety_detail"]
+    assert "0143" in detail
+    assert (
+        "vm_contact_last_tool_use" in detail
+        and "add_compute_job_persistence" in detail
+    )
+
+
+@pytest.mark.asyncio
+async def test_finalize_holds_when_migration_listing_fetch_fails(db_session, mocker):
+    """Fail-safe: when the candidate's / target's migration list cannot be
+    fetched, migration safety is UNKNOWN — the release is HELD (deferred to the
+    next cycle) rather than waved through. A fetch error is not 'no collision'."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # The migration listing fetch fails transiently — uncertainty must HOLD.
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=AsyncMock(side_effect=RuntimeError("GitHub 502")),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Held as an infra failure — no quality verdict, never promoted.
+    assert result["status"] == "infra_failure"
+    assert result["error"] == "migration_identity_check_unavailable"
+    promote_spy.assert_not_called()
+
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+    assert version.last_qualification["status"] == "infra_failure"
 
 
 @pytest.mark.asyncio

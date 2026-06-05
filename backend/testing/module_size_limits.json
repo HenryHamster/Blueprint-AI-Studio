@@ -40,7 +40,7 @@
     "findings_index.py": 350,
     "strategic_completion.py": 3200,
     "rollup_management.py": 4150,
-    "rollup_migration_validation.py": 600,
+    "rollup_migration_validation.py": 850,
     "reaper.py": 4200,
     "reaper_sweeps.py": 2650,
     "reaper_infra_recovery.py": 850,

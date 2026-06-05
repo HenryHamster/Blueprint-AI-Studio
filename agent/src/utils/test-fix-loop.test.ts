@@ -774,3 +774,17 @@ describe('testFixLoop — partial per-runner setup failure (maxFixAttempts: 0)',
     expect(result.testFailuresDetected).toBe(false);
   });
 });
+
+describe('matchesTransientSetupFailure', () => {
+  it('accepts pure transport errors', () => {
+    expect(matchesTransientSetupFailure('registry timeout: connection refused')).toBe(true);
+  });
+
+  it('does not treat bare fetch/download failures as transient setup', () => {
+    expect(matchesTransientSetupFailure('failed to fetch package from registry')).toBe(false);
+  });
+
+  it('still accepts fetch/download failures when transport evidence is present', () => {
+    expect(matchesTransientSetupFailure('failed to download tarball after econnreset')).toBe(true);
+  });
+});
