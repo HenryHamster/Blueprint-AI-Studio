@@ -9,6 +9,7 @@ project's findings. Each route resolves the project/task with a role check via
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 from typing import List
@@ -92,43 +93,13 @@ async def trigger_self_audit(
 
     Members and above can trigger a maturity audit. Returns the new task_id.
     Rejects with 409 if a self_audit is already in flight for this project.
+    Idempotent: concurrent/duplicate submissions use idempotency_key to prevent
+    duplicate audit spawns — a second near-simultaneous trigger coalesces onto
+    the in-flight audit instead of spawning a second one.
     """
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
-
-    # In-flight guard: never spawn a second self_audit when one is already running.
-    # Two concurrent audits produce duplicate findings and waste VM budget.
-    active_audits = (
-        (
-            await session.execute(
-                select(Task).where(
-                    Task.project_id == project.id,
-                    Task.status.in_(
-                        [
-                            TaskStatus.QUEUED,
-                            TaskStatus.PROVISIONING,
-                            TaskStatus.IN_PROGRESS,
-                            TaskStatus.EVALUATING,
-                        ]
-                    ),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    for audit_task in active_audits:
-        audit_payload = audit_task.first_payload
-        if audit_payload.get("type") == "self_audit":
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Self-audit is already in progress for this project "
-                    f"(task {str(audit_task.id)[:8]}, status {audit_task.status}). "
-                    f"Wait for it to complete before starting another."
-                ),
-            )
 
     payload_dict: dict = {
         "type": "self_audit",
@@ -147,6 +118,44 @@ async def trigger_self_audit(
     if body and body.focus_systems:
         title_suffix = f" ({', '.join(body.focus_systems[:3])}{'...' if len(body.focus_systems) > 3 else ''})"
 
+    # Check for any active self_audit tasks (including legacy tasks without idempotency_key).
+    # This check is non-transactional but will be backed by the idempotency_key constraint
+    # if two concurrent requests both pass this check — the database constraint prevents
+    # duplicate inserts and forces coalesce via IntegrityError handling below.
+    active_statuses = [
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+    ]
+    active_tasks = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.status.in_(active_statuses),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for audit_task in active_tasks:
+        if (audit_task.first_payload or {}).get("type") == "self_audit":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Self-audit is already in progress for this project "
+                    f"(task {str(audit_task.id)[:8]}, status {audit_task.status}). "
+                    f"Wait for it to complete before starting another."
+                ),
+            )
+
+    # Use idempotency_key to prevent concurrent duplicates. The key is project-scoped
+    # so concurrent triggers on the same project use the same key; the database
+    # partial unique index ux_task_active_idempotency_key prevents duplicate inserts.
+    idempotency_key = f"operator_self_audit:{project.id}"
+
     new_task = Task(
         project_id=project.id,
         title=f"Self audit{title_suffix}"[:200],
@@ -156,9 +165,38 @@ async def trigger_self_audit(
         status=TaskStatus.QUEUED,
         created_by="USER",
         requires_approval=False,
+        idempotency_key=idempotency_key,
     )
     session.add(new_task)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        # Concurrent submission: another request inserted a task with the same
+        # idempotency_key before this one committed. Fetch the existing active audit
+        # and return it instead of raising an error — coalesce onto the in-flight audit.
+        await session.rollback()
+        existing = (
+            await session.execute(
+                select(Task).where(
+                    Task.idempotency_key == idempotency_key,
+                    Task.status.in_(active_statuses),
+                )
+            )
+        ).scalars().first()
+        if existing is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Self-audit is already in progress for this project.",
+            )
+        logger.info(
+            f"[ADMIN] Concurrent self-audit trigger for project {project.id} "
+            f"coalesced onto existing audit {existing.id}"
+        )
+        return {
+            "task_id": str(existing.id),
+            "project_id": str(project.id),
+            "status": existing.status,
+        }
     await session.refresh(new_task)
 
     history = TaskHistory(

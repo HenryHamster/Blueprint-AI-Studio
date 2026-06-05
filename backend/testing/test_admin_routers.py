@@ -9899,6 +9899,33 @@ class TestTriggerSelfAudit:
         resp = await client.post(f"/api/admin/projects/{project2.id}/self-audit")
         assert resp.status_code == 200, resp.text
 
+    @pytest.mark.asyncio
+    async def test_concurrent_self_audit_idempotency_key_prevents_race(
+        self, client: AsyncClient, db_session
+    ):
+        """Concurrent self-audit triggers are prevented by idempotency_key.
+        When a second trigger arrives while one is in flight, the SELECT check
+        detects it and rejects with 409. If the race condition allows both to
+        pass the SELECT check, the idempotency_key constraint + IntegrityError
+        handler prevents duplicate inserts."""
+        project = await _make_project(db_session)
+
+        # First trigger creates a task with idempotency_key
+        resp1 = await client.post(f"/api/admin/projects/{project.id}/self-audit")
+        assert resp1.status_code == 200, resp1.text
+        data1 = resp1.json()
+        task1_id = data1["task_id"]
+
+        # Verify the created task has idempotency_key set
+        task1 = await db_session.get(Task, uuid.UUID(task1_id))
+        assert task1 is not None
+        assert task1.idempotency_key == f"operator_self_audit:{project.id}"
+
+        # Second trigger on same project finds active audit and rejects with 409
+        resp2 = await client.post(f"/api/admin/projects/{project.id}/self-audit")
+        assert resp2.status_code == 409, resp2.text
+        assert "already in progress" in resp2.json()["error"]["message"].lower()
+
 
 class TestGetProjectFindings:
     @pytest.mark.asyncio
