@@ -61,6 +61,16 @@ vi.mock('../processTracking.js', () => ({
   unregisterChildPid: vi.fn(),
 }));
 
+// runners.ts now imports the playbook/messages writers from ../prompt.js for
+// ambient helper provisioning (provisionAmbientHelpers). Stub them so importing
+// runners.ts does not transitively load the real prompt subsystem under this
+// file's partial ../index.js mock. The ambient block is a guarded no-op here
+// anyway (fs is fully mocked), so these are never meaningfully exercised.
+vi.mock('../prompt.js', () => ({
+  writePlaybookHelper: vi.fn(),
+  writeMessagesHelper: vi.fn(),
+}));
+
 // ── Imports (after mocks) ─────────────────────────────────────────────────────
 import { spawn } from 'child_process';
 import { runProviderAgent } from './runners.js';

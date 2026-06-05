@@ -15,6 +15,7 @@ import {
   WORKSPACE, ClaudeTimeoutError, getAgentToken, log, recordLlmCallStart,
   recordLlmTokens, recordToolUse, sanitize, sendLog, strVal, estimateTokensFromChars,
 } from '../index.js';
+import { writePlaybookHelper, writeMessagesHelper } from '../prompt.js';
 
 export type ProviderName = 'anthropic' | 'openai' | 'gemini';
 export type AuthMode = 'oauth' | 'api_key' | 'service_account';
@@ -450,6 +451,96 @@ export function codexStreamHasTurnCompleted(transcript: string): boolean {
   return false;
 }
 
+/**
+ * Provision the small set of "ambient" helper CLIs that EVERY model task may use
+ * regardless of which handler dispatched it: ./note (annotations), ./playbook
+ * (shared collective memory), and ./messages (operator channel). The prompt
+ * subsystem advertises these broadly — DEFAULT_TOOL_GUIDANCE references ./note
+ * and ./messages, PLAYBOOK_GUIDANCE references ./playbook — and they are emitted
+ * by read-only research-family handlers (web_research, design, memo) that do not
+ * provision them themselves. Writing them here once, for every provider run,
+ * guarantees the prompt/helper contract holds for those handlers and closes the
+ * whole drift class: a future handler cannot forget to provision them.
+ *
+ * Best-effort and idempotent. Every filesystem op is guarded so a provisioning
+ * failure never aborts the model run, and the writers overwrite, so handlers
+ * that ALSO provision these in-handler (code-change, research, strategic) are
+ * unaffected. The workspace is created first (recursive) because the no-clone
+ * handlers (memo, web_research) can run before any directory exists — a plain
+ * existsSync guard would silently skip provisioning and leave their advertised
+ * helpers missing. ./note reads TASK_ID from the environment at run time, so it
+ * is always written; ./playbook and ./messages bake the task id into the script
+ * body, so they are written only when a task id is available.
+ */
+export function provisionAmbientHelpers(taskId: string, workspace: string = WORKSPACE): void {
+  try {
+    fs.mkdirSync(workspace, { recursive: true });
+  } catch { /* best effort — the guarded writes below still attempt to run */ }
+
+  try {
+    const noteScript = `#!/bin/bash
+# Agent annotation tool — leave comments, issues, or vision suggestions
+# Usage:
+#   ./note comment "This module uses deprecated API" --page systems/sys-auth
+#   ./note issue "Tests fail on large repos" --severity high
+#   ./note vision "Consider adding agent reliability metrics"
+
+TYPE="\${1:?Usage: note comment|issue|vision <content> [--page <key>] [--severity low|medium|high]}"
+shift
+
+CONTENT=""
+PAGE=""
+SEVERITY=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --page) PAGE="$2"; shift 2 ;;
+    --severity) SEVERITY="$2"; shift 2 ;;
+    *) CONTENT="\${CONTENT:+$CONTENT }$1"; shift ;;
+  esac
+done
+
+if [ -z "$CONTENT" ]; then
+  echo "Error: content is required" >&2; exit 1
+fi
+
+API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
+TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+TASK="\${TASK_ID:?TASK_ID not set}"
+CURL_OPTS="-f -sS --max-time 15 --connect-timeout 10"
+
+# Build JSON with printf to avoid shell expansion issues
+JSON="{\\"task_id\\":\\"$TASK\\",\\"annotation_type\\":\\"$TYPE\\",\\"content\\":\\"$(echo "$CONTENT" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')\\""
+[ -n "$PAGE" ] && JSON="\${JSON},\\"target_page\\":\\"$PAGE\\""
+[ -n "$SEVERITY" ] && JSON="\${JSON},\\"severity\\":\\"$SEVERITY\\""
+JSON="\${JSON}}"
+
+printf '%s' "$JSON" | \\
+  curl $CURL_OPTS -X POST "$API/api/agent/annotate" \\
+    -H "Content-Type: application/json" \\
+    -H "X-Agent-Token: $TOKEN" \\
+    --data-binary @-
+echo ""
+`;
+    fs.writeFileSync(`${workspace}/note`, noteScript, { mode: 0o755 });
+    try {
+      const excludePath = `${workspace}/.git/info/exclude`;
+      const existing = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, 'utf-8') : '';
+      if (!existing.includes('/note')) {
+        fs.appendFileSync(excludePath, '/note\n');
+      }
+    } catch { /* shallow clone may lack .git/info */ }
+  } catch { /* note provisioning is best-effort */ }
+
+  // ./playbook and ./messages bake the task id into the script body, so only
+  // provision them when one is available. Idempotent overwrites; the writers
+  // call excludeAgentHelpers() so the files stay git-ignored.
+  if (taskId) {
+    try { writePlaybookHelper(taskId, workspace); } catch { /* best effort */ }
+    try { writeMessagesHelper(taskId, workspace); } catch { /* best effort */ }
+  }
+}
+
 export async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean): Promise<{
   exitCode: number; allOutput: string; lastResultText: string;
   codexTurnCompleted?: boolean;
@@ -512,62 +603,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   sendLog(ws, `\n--- ${runner.displayName} starting ---\nPrompt: ${prompt.slice(0, 200)}${prompt.length > 200 ? '...' : ''}\nMode: ${LLM_EXECUTION_MODE}\n\n`);
   log(`Spawning ${runner.displayName} CLI...`);
 
-  try {
-    if (fs.existsSync(WORKSPACE)) {
-      const noteScript = `#!/bin/bash
-# Agent annotation tool — leave comments, issues, or vision suggestions
-# Usage:
-#   ./note comment "This module uses deprecated API" --page systems/sys-auth
-#   ./note issue "Tests fail on large repos" --severity high
-#   ./note vision "Consider adding agent reliability metrics"
-
-TYPE="\${1:?Usage: note comment|issue|vision <content> [--page <key>] [--severity low|medium|high]}"
-shift
-
-CONTENT=""
-PAGE=""
-SEVERITY=""
-
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --page) PAGE="$2"; shift 2 ;;
-    --severity) SEVERITY="$2"; shift 2 ;;
-    *) CONTENT="\${CONTENT:+$CONTENT }$1"; shift ;;
-  esac
-done
-
-if [ -z "$CONTENT" ]; then
-  echo "Error: content is required" >&2; exit 1
-fi
-
-API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
-TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
-TASK="\${TASK_ID:?TASK_ID not set}"
-CURL_OPTS="-f -sS --max-time 15 --connect-timeout 10"
-
-# Build JSON with printf to avoid shell expansion issues
-JSON="{\\"task_id\\":\\"$TASK\\",\\"annotation_type\\":\\"$TYPE\\",\\"content\\":\\"$(echo "$CONTENT" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')\\""
-[ -n "$PAGE" ] && JSON="\${JSON},\\"target_page\\":\\"$PAGE\\""
-[ -n "$SEVERITY" ] && JSON="\${JSON},\\"severity\\":\\"$SEVERITY\\""
-JSON="\${JSON}}"
-
-printf '%s' "$JSON" | \\
-  curl $CURL_OPTS -X POST "$API/api/agent/annotate" \\
-    -H "Content-Type: application/json" \\
-    -H "X-Agent-Token: $TOKEN" \\
-    --data-binary @-
-echo ""
-`;
-      fs.writeFileSync(`${WORKSPACE}/note`, noteScript, { mode: 0o755 });
-      try {
-        const excludePath = `${WORKSPACE}/.git/info/exclude`;
-        const existing = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, 'utf-8') : '';
-        if (!existing.includes('/note')) {
-          fs.appendFileSync(excludePath, '/note\n');
-        }
-      } catch { /* shallow clone may lack .git/info */ }
-    }
-  } catch { /* workspace may not exist yet for some handlers */ }
+  // Provision the ambient helper CLIs (./note, ./playbook, ./messages) that
+  // every model task may use regardless of handler. Self-guarding and
+  // idempotent — see provisionAmbientHelpers.
+  provisionAmbientHelpers(process.env.TASK_ID || '', WORKSPACE);
 
   const exitCode = await new Promise<number>((resolve) => {
     let promptFile = '';
