@@ -297,6 +297,15 @@ if touches agent/; then
       echo "[check] no agent JS/TS files changed, skipping eslint"
     fi
   fi
+
+  # Run the agent vitest suite on EVERY ./check (not gated behind \`test\`):
+  # \`./pr open\` gates on plain \`./check\`, so behind-\`test\` would leave the
+  # suite unenforced by the PR gate — the exact silent-rot this guards against.
+  # The suite is deterministic and ~40s. \`set -o pipefail\` makes the inner
+  # bash propagate vitest's non-zero exit through the \`| tail\` (the outer
+  # script's pipefail does not reach a fresh \`bash -c\`), so \`run\` records a
+  # real failure in FAILED and ./check fails closed.
+  run "agent vitest" bash -c 'set -o pipefail; cd agent && npx vitest run 2>&1 | tail -80'
 fi
 
 if touches backend/; then
