@@ -855,6 +855,25 @@ def _extract_json_array(text: str, *required_keys: str) -> Optional[str]:
     return None
 
 
+def _normalize_findings_array(parsed: Any) -> list[dict]:
+    """Filter a parsed findings array to dict-only elements, defensive normalization.
+
+    When _extract_json_array returns a bracket-balanced span containing the
+    required keys, a malformed-but-parseable JSON like [{"severity":"high"}, "stray"],
+    passes isinstance(parsed, list) but contains non-dict elements. Consumers
+    throughout the handlers iterate findings and call .get() on each element,
+    so a single non-dict entry would raise AttributeError and fail the entire
+    task. This helper normalizes at parse time so bad elements are silently
+    skipped rather than crashing the handler.
+
+    Mirrors the pattern already in use by task_outcomes._findings_list and
+    research_completion.py for defensive filtering.
+    """
+    if not isinstance(parsed, list):
+        return []
+    return [f for f in parsed if isinstance(f, dict)]
+
+
 # Round 4 W1 (audit C3): content snapshot used by ``_ensure_branch`` for
 # lock-window-break validation. Heartbeat-driven ``updated_at`` advances
 # every 30s and would false-defer under load. Validate against the fields
@@ -1389,8 +1408,7 @@ async def _handle_security_audit_completion(
         json_str = _extract_json_array(logs, "severity")
         if json_str:
             parsed = json.loads(json_str)
-            if isinstance(parsed, list):
-                findings = parsed
+            findings = _normalize_findings_array(parsed)
     except (json.JSONDecodeError, AttributeError):
         pass
 
@@ -1621,8 +1639,7 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
         json_str = _extract_json_array(logs, "severity")
         if json_str:
             parsed = json.loads(json_str)
-            if isinstance(parsed, list):
-                findings = parsed
+            findings = _normalize_findings_array(parsed)
     except (json.JSONDecodeError, AttributeError):
         pass
 

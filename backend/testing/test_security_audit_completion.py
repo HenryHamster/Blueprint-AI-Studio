@@ -316,3 +316,48 @@ async def test_audit_passing_grade_resumes_and_spawns(
     )
     await db_session.refresh(task)
     assert task.status == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_audit_with_non_dict_findings_skips_bad_elements(
+    db_session, _quiet_audit_io
+):
+    """Malformed findings array with non-dict elements → handler completes
+    gracefully, skipping bad elements instead of raising AttributeError."""
+    task = await _make_audit_task(db_session)
+    # Mix valid dicts with non-dict elements that would crash .get() if unfiltered
+    malformed_findings = [
+        {
+            "severity": "high",
+            "title": "Missing auth check",
+            "description": "Endpoint lacks @require_role.",
+            "fix_prompt": "Add @require_role('admin').",
+            "file_path": "app/routers/admin.py",
+            "line_number": 7,
+        },
+        "stray string",  # non-dict element
+        42,  # non-dict element
+        {
+            "severity": "medium",
+            "title": "Verbose error",
+            "description": "Leaks stack info.",
+            "file_path": "app/x.py",
+            "line_number": 10,
+        },
+        ["nested", "array"],  # non-dict element
+    ]
+
+    await _handle_security_audit_completion(
+        task, json.dumps(malformed_findings), db_session
+    )
+
+    # One child spawned from the high-severity valid finding
+    children = await _children_of(db_session, task)
+    assert len(children) == 1
+    assert children[0].title == "[HIGH] Missing auth check"
+
+    await db_session.refresh(task)
+    # Handler completes successfully despite malformed elements
+    assert task.status == TaskStatus.EVALUATING
+    # Findings stored should only contain valid dicts (4 valid out of 5 total)
+    assert len(task.plan_output.get("findings", [])) == 2
