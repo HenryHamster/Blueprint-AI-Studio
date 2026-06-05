@@ -60,4 +60,33 @@ describe('parseTimestamp guard: prevent direct new Date(apiString)', () => {
     );
     expect(file).toContain('parseTimestamp(iso)');
   });
+
+  it('messageGrouping.ts imports parseTimestamp', () => {
+    const file = readFileSync(
+      path.join(__dirname, '../components/messageGrouping.ts'),
+      'utf-8'
+    );
+    expect(file).toContain("import { parseTimestamp } from '../utils/time'");
+  });
+
+  it('messageGrouping.ts uses parseTimestamp for created_at', () => {
+    const file = readFileSync(
+      path.join(__dirname, '../components/messageGrouping.ts'),
+      'utf-8'
+    );
+    expect(file).toContain('parseTimestamp(msg.created_at)');
+  });
+
+  it('messageGrouping.ts has no hand-rolled Z-append timestamp parsing', () => {
+    const file = readFileSync(
+      path.join(__dirname, '../components/messageGrouping.ts'),
+      'utf-8'
+    );
+    // The recurring bug class: inline `v + 'Z'` re-implementations of the
+    // shared guard. All backend-timestamp parsing must route through
+    // parseTimestamp from ../utils/time instead.
+    expect(file).not.toContain("v + 'Z'");
+    // No raw new Date() on the API string field either.
+    expect(file).not.toContain('new Date(msg.created_at)');
+  });
 });

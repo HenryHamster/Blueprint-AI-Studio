@@ -7233,6 +7233,66 @@ class TestVersionLifecycleStagedDirections:
         assert resp.json()["staged_directions"] == []
 
 
+class TestVersionLifecycleInFlightCount:
+    """GET /version-lifecycle surfaces in_flight_task_count on the open version."""
+
+    @pytest.mark.asyncio
+    async def test_in_flight_task_count_counts_non_terminal_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        """Non-terminal project tasks are counted; terminal ones are excluded."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=3,
+            phase="stabilize",
+            status="open",
+        )
+        db_session.add(version)
+        # Two in-flight + one terminal.
+        db_session.add_all(
+            [
+                Task(
+                    project_id=project.id,
+                    payloads=[{"type": "create"}],
+                    status=TaskStatus.IN_PROGRESS,
+                ),
+                Task(
+                    project_id=project.id,
+                    payloads=[{"type": "create"}],
+                    status=TaskStatus.QUEUED,
+                ),
+                Task(
+                    project_id=project.id,
+                    payloads=[{"type": "create"}],
+                    status=TaskStatus.COMPLETED,
+                ),
+            ]
+        )
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.get_latest_release_audit_report",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["current_version"]["in_flight_task_count"] == 2
+
+
 class TestQualificationVerdictsAuditMissingReason:
     """GET /api/admin/projects/{id}/qualification-verdicts exposes audit_missing_reason."""
 

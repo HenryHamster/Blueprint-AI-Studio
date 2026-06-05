@@ -1,4 +1,5 @@
 import { ROUTINE_EVENT_LABELS, HIGH_SIGNAL_NOTE_EVENTS } from './eventPrefs';
+import { parseTimestamp } from '../utils/time';
 
 export const STALE_ROUTINE_COLLAPSE_AGE_MS = 3600000; // 1 hour — stale routine notes collapse to a per-day digest
 
@@ -13,7 +14,7 @@ export type MessageWithDivider<T> =
 
 function getMessageDateString(msg: { created_at: string | null }): string {
   if (!msg.created_at) return '';
-  const date = new Date(msg.created_at);
+  const date = parseTimestamp(msg.created_at);
   const today = new Date();
   const yesterday = new Date(today);
   yesterday.setDate(yesterday.getDate() - 1);
@@ -37,11 +38,6 @@ function getMessageDateString(msg: { created_at: string | null }): string {
 export function groupRoutineMessages<T extends { id: string; context: Record<string, unknown>; created_at?: string | null }>(
   msgs: T[],
 ): RoutineRow<T>[] {
-  const parseTimestamp = (v: string | null | undefined): Date => {
-    if (!v) return new Date(0);
-    return new Date(v.endsWith('Z') || v.includes('+') ? v : v + 'Z');
-  };
-
   const TIME_WINDOW_MS = 3600000; // 1 hour
 
   const groupAssignments: number[] = [];
@@ -150,10 +146,8 @@ export function collapseStaleRoutineRows<T extends { id: string; context: Record
   rows: RoutineRow<T>[],
   nowMs: number = Date.now(),
 ): RoutineRow<T>[] {
-  const parseTs = (v: string | null | undefined): number => {
-    if (!v) return 0;
-    return new Date(v.endsWith('Z') || v.includes('+') ? v : v + 'Z').getTime();
-  };
+  const parseTs = (v: string | null | undefined): number =>
+    v ? parseTimestamp(v).getTime() : 0;
   const cutoffMs = nowMs - STALE_ROUTINE_COLLAPSE_AGE_MS;
   const digestBuckets = new Map<string, { msgs: T[]; breakdown: Record<string, number> }>();
   const digestFirstPos = new Map<string, number>();

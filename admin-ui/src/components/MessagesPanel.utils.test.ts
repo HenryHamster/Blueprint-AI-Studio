@@ -5,6 +5,7 @@ import {
   type EventPref,
   eventPrefsKey,
   groupRoutineMessages,
+  insertTimeDividers,
   collapseStaleRoutineRows,
   STALE_ROUTINE_COLLAPSE_AGE_MS,
   isFailingGroup,
@@ -738,6 +739,61 @@ describe('Age-based routine collapse (collapseStaleRoutineRows)', () => {
     expect(collapsed).toHaveLength(1);
     expect(collapsed[0].kind).toBe('single');
     expect(collapsed[0].msg.id).toBe('m1');
+  });
+});
+
+describe('Timezone correctness of day labels (naive backend UTC strings)', () => {
+  // The backend emits naive UTC ISO strings with NO trailing 'Z'. A negative-offset
+  // operator timezone is where a raw `new Date(naiveString)` (local parse) shifts a
+  // near-midnight-UTC message into the wrong calendar day. parseTimestamp must append
+  // 'Z' so the message lands on the correct local day in every timezone.
+  const originalTz = process.env.TZ;
+  beforeEach(() => {
+    process.env.TZ = 'America/New_York';
+    // Freeze "now" well away from the fixture day so day labels render as the
+    // absolute 'Thu Jun 4' heading rather than the relative 'Today'/'Yesterday'.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-01T12:00:00Z'));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    process.env.TZ = originalTz;
+  });
+
+  const mk = (id: string, createdAt: string) => ({ id, created_at: createdAt });
+
+  it('naive UTC string near a UTC day boundary labels onto the correct local day', () => {
+    // 2026-06-05T02:00:00Z is 2026-06-04 22:00 in America/New_York (UTC-4).
+    // The correct local-day divider label is therefore Thu Jun 4, not Fri Jun 5.
+    const dividers = insertTimeDividers([mk('m1', '2026-06-05T02:00:00')]);
+    const labels = dividers.filter(d => d.kind === 'divider').map(d => d.label);
+    expect(labels).toEqual(['Thu Jun 4']);
+  });
+
+  it('a naive string and its explicit-UTC equivalent produce one shared divider', () => {
+    // Same instant expressed naively and with a 'Z'. After routing through the shared
+    // guard both parse identically, so they bucket onto the same local day (one divider).
+    const dividers = insertTimeDividers([
+      mk('m1', '2026-06-05T02:00:00'),
+      mk('m2', '2026-06-05T02:00:00Z'),
+    ]);
+    const labels = dividers.filter(d => d.kind === 'divider').map(d => d.label);
+    expect(labels).toEqual(['Thu Jun 4']);
+  });
+
+  it('groupRoutineMessages buckets a near-boundary naive burst onto one local day', () => {
+    // Three routine messages just after 02:00Z (late-evening local on Jun 4) must all
+    // share a day bucket so the 1h-window grouping fires instead of splitting on a
+    // spurious calendar-day boundary.
+    const msgs = [
+      { id: 'm1', context: { event_type: 'pr_merged' }, created_at: '2026-06-05T02:00:00' },
+      { id: 'm2', context: { event_type: 'pr_merged' }, created_at: '2026-06-05T02:10:00' },
+      { id: 'm3', context: { event_type: 'pr_merged' }, created_at: '2026-06-05T02:20:00' },
+    ];
+    const rows = groupRoutineMessages(msgs);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe('group');
+    expect(rows[0].msgs).toHaveLength(3);
   });
 });
 

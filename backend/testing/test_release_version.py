@@ -265,6 +265,83 @@ async def test_count_merged_since_zero_when_no_tasks(db_session):
 
 
 # ===========================================================================
+# count_in_flight_tasks — non-terminal task count for the version-cut disclosure
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_count_in_flight_counts_all_non_terminal_statuses(db_session):
+    """Every non-terminal status (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING/
+    BLOCKED) is counted as in flight."""
+    project = await _make_project(db_session)
+    now = _utcnow()
+    for status in (
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+        TaskStatus.BLOCKED,
+    ):
+        await _make_task(
+            db_session, project, status=status, context={}, updated_at=now
+        )
+
+    count = await rv.count_in_flight_tasks(db_session, project.id)
+    assert count == 5
+
+
+@pytest.mark.asyncio
+async def test_count_in_flight_excludes_terminal_statuses(db_session):
+    """COMPLETED/FAILED/CANCELLED tasks are terminal and not counted."""
+    project = await _make_project(db_session)
+    now = _utcnow()
+    for status in (
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    ):
+        await _make_task(
+            db_session, project, status=status, context={}, updated_at=now
+        )
+    # One live task to prove the query selects the right rows.
+    await _make_task(
+        db_session, project, status=TaskStatus.IN_PROGRESS, context={}, updated_at=now
+    )
+
+    count = await rv.count_in_flight_tasks(db_session, project.id)
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_count_in_flight_scoped_to_project(db_session):
+    """In-flight tasks are counted per-project, not globally."""
+    project_a = await _make_project(db_session, name="RV-A")
+    project_b = await _make_project(db_session, name="RV-B")
+    now = _utcnow()
+    await _make_task(
+        db_session, project_a, status=TaskStatus.IN_PROGRESS, context={}, updated_at=now
+    )
+    await _make_task(
+        db_session, project_b, status=TaskStatus.QUEUED, context={}, updated_at=now
+    )
+    await _make_task(
+        db_session, project_b, status=TaskStatus.BLOCKED, context={}, updated_at=now
+    )
+
+    assert await rv.count_in_flight_tasks(db_session, project_a.id) == 1
+    assert await rv.count_in_flight_tasks(db_session, project_b.id) == 2
+
+
+@pytest.mark.asyncio
+async def test_count_in_flight_zero_when_no_tasks(db_session):
+    """An empty project returns 0, not None."""
+    project = await _make_project(db_session)
+    count = await rv.count_in_flight_tasks(db_session, project.id)
+    assert count == 0
+    assert isinstance(count, int)
+
+
+# ===========================================================================
 # open_version / current_open_version
 # ===========================================================================
 

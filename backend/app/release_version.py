@@ -243,6 +243,47 @@ async def count_merged_since(
     return int(result.scalar() or 0)
 
 
+# Non-terminal task statuses — work that is still "in flight" against a version.
+# Mirrors the active-status set used by the idempotency partial index in
+# models.py (alembic 0138): QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING/BLOCKED.
+# COMPLETED/FAILED/CANCELLED are terminal and excluded.
+_IN_FLIGHT_TASK_STATUSES = (
+    TaskStatus.QUEUED,
+    TaskStatus.PROVISIONING,
+    TaskStatus.IN_PROGRESS,
+    TaskStatus.EVALUATING,
+    TaskStatus.BLOCKED,
+)
+
+
+async def count_in_flight_tasks(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> int:
+    """Count ``project_id`` tasks still in flight (non-terminal status).
+
+    "In flight" means the task is in a non-terminal status
+    (``QUEUED`` / ``PROVISIONING`` / ``IN_PROGRESS`` / ``EVALUATING`` /
+    ``BLOCKED``) — work that a version cut does NOT stop. Such tasks keep
+    running and land against the freshly-opened next version, so the
+    version-cut confirmation surfaces this count to make that consequence
+    explicit.
+
+    Terminal statuses (``COMPLETED`` / ``FAILED`` / ``CANCELLED``) are
+    excluded — they are already resolved and unaffected by a cut.
+    """
+    stmt = (
+        select(func.count())
+        .select_from(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.status.in_(_IN_FLIGHT_TASK_STATUSES),
+        )
+    )
+    result = await session.execute(stmt)
+    return int(result.scalar() or 0)
+
+
 async def recent_closed_versions(
     session: AsyncSession,
     project_id: uuid.UUID,

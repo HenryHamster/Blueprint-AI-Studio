@@ -127,7 +127,10 @@ async def get_version_lifecycle(
     Projects with no version lifecycle return ``null`` for ``current_version``
     and an empty ``recent_versions`` list.
     """
-    from app.release_version import count_merged_since  # noqa: PLC0415
+    from app.release_version import (  # noqa: PLC0415
+        count_merged_since,
+        count_in_flight_tasks,
+    )
     from app.release_qualifier import (  # noqa: PLC0415
         compute_promotion_readiness,
         get_latest_release_audit_report,
@@ -164,6 +167,7 @@ async def get_version_lifecycle(
     current_version_out: Optional[Dict[str, Any]] = None
     if open_row is not None:
         merged_count = await count_merged_since(session, project_id, open_row.opened_at)
+        in_flight_count = await count_in_flight_tasks(session, project_id)
         qual = open_row.last_qualification or {}
         # Surface the latest release_audit's actual findings/score so a verdict
         # is explainable (the verdict record only keeps the composite, and the
@@ -192,6 +196,10 @@ async def get_version_lifecycle(
             "opened_at": open_row.opened_at.isoformat(),
             "qualification_attempts": open_row.qualification_attempts,
             "merged_task_count": merged_count,
+            # In-flight (non-terminal) tasks that a version cut will NOT stop —
+            # they keep running and land against the freshly-opened next version.
+            # Surfaced so the cut confirmation can disclose this consequence.
+            "in_flight_task_count": in_flight_count,
             "last_qualification": _format_qualification(qual) if qual else None,
             "latest_audit": latest_audit,
         }

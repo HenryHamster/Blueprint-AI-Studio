@@ -1051,6 +1051,9 @@ export interface CurrentVersion {
   opened_at: string;
   qualification_attempts: number;
   merged_task_count: number;
+  /** Non-terminal tasks still in flight against this version. A version cut does
+   *  not stop them — they continue and land against the freshly-opened version. */
+  in_flight_task_count?: number;
   last_qualification: VersionQualification | null;
   latest_audit?: LatestAudit | null;
 }

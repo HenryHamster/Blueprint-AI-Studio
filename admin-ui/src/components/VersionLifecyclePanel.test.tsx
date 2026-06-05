@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { VersionLifecyclePanel } from './VersionLifecyclePanel';
 import * as api from '../api';
 import type { VersionLifecycleResponse } from '../api';
@@ -610,6 +610,92 @@ describe('VersionLifecyclePanel', () => {
       );
 
       expect(screen.queryByTestId('staged-directions')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('cut consequences disclosure', () => {
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    it('discloses activating staged directions and in-flight count before confirming', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ version_number: 6, in_flight_task_count: 3 }),
+            staged_directions: [
+              { id: 'd-1', text: 'Rework packer budget', priority: 'high', staged_for_version: 6, staged_at: '2026-05-01T00:00:00Z', staged_age_days: 35 },
+              { id: 'd-2', text: 'Future-only work', priority: 'low', staged_for_version: 9, staged_at: '2026-05-01T00:00:00Z', staged_age_days: 1 },
+            ],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      // Expand the cut affordance.
+      fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
+
+      const consequences = screen.getByTestId('cut-consequences');
+      expect(consequences).toBeInTheDocument();
+      // Direction targeting v6 (<= 6) activates; v9 (> 6) does not.
+      expect(within(consequences).getByText('Rework packer budget')).toBeInTheDocument();
+      expect(within(consequences).queryByText('Future-only work')).not.toBeInTheDocument();
+      expect(consequences).toHaveTextContent('Start 1 staged direction immediately');
+      expect(consequences).toHaveTextContent('3 in-flight tasks will NOT be stopped');
+    });
+
+    it('shows a no-effect affordance when nothing is staged or in flight', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ version_number: 2, in_flight_task_count: 0 }),
+            staged_directions: [],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
+
+      const consequences = screen.getByTestId('cut-consequences');
+      expect(consequences).toHaveTextContent('No staged directions will activate.');
+      expect(consequences).toHaveTextContent('No tasks are currently in flight.');
+    });
+
+    it('folds consequences into the confirm message', async () => {
+      const cutVersionMock = vi.fn().mockResolvedValue({
+        abandoned_version: { version_number: 6, status: 'abandoned' },
+        new_version: { version_number: 7, phase: 'build', goal: null, opened_at: '2026-01-02T00:00:00Z' },
+      });
+      vi.mocked(api.cutVersion).mockImplementation(cutVersionMock);
+      mockConfirm.mockReturnValue(true);
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ version_number: 6, in_flight_task_count: 2 }),
+            staged_directions: [
+              { id: 'd-1', text: 'Rework packer budget', priority: 'high', staged_for_version: 6, staged_at: '2026-05-01T00:00:00Z', staged_age_days: 35 },
+            ],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
+      fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
+
+      await waitFor(() => {
+        expect(window.confirm).toHaveBeenCalledWith(
+          'Abandon v6 and open a fresh version?\n\nThis will: 1 staged direction will start now; 2 in-flight tasks will keep running against the new version.'
+        );
+      });
     });
   });
 });

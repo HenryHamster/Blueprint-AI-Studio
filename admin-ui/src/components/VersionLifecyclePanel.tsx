@@ -191,6 +191,53 @@ function StagedDirectionsSummary({ staged }: { staged: StagedDirection[] }) {
   );
 }
 
+// Staged directions that a cut of `versionNumber` will activate NOW: those
+// targeting this version or earlier, plus any with a missing target (the backend
+// fails open and activates those too — see activate_eligible_staged_directions).
+function stagedActivatedByCut(staged: StagedDirection[], versionNumber: number): StagedDirection[] {
+  return staged.filter(
+    (s) => s.staged_for_version == null || s.staged_for_version <= versionNumber,
+  );
+}
+
+// Disclosure of a version cut's concrete effects, shown before the operator
+// confirms: which staged directions begin running now and how much in-flight
+// work keeps running against the freshly-opened version.
+function CutConsequences({ cv, staged }: { cv: CurrentVersion; staged: StagedDirection[] }) {
+  const activating = stagedActivatedByCut(staged, cv.version_number);
+  const inFlight = cv.in_flight_task_count ?? 0;
+  return (
+    <div
+      data-testid="cut-consequences"
+      className="text-[10px] text-neutral-300 bg-amber-950/30 border border-amber-900/40 rounded px-2 py-1 space-y-1"
+    >
+      <p className="text-amber-400 font-semibold">Cutting v{cv.version_number} now will:</p>
+      {activating.length > 0 ? (
+        <div className="space-y-0.5">
+          <p>
+            Start {activating.length} staged direction{activating.length !== 1 ? 's' : ''} immediately
+            (rather than waiting for a clean promotion):
+          </p>
+          <ul className="list-disc pl-4 space-y-0.5">
+            {activating.map((s, i) => (
+              <li key={s.id ?? i} className="text-neutral-400 truncate max-w-[260px]" title={s.text ?? undefined}>
+                {s.text ?? '(no description)'}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : (
+        <p className="text-neutral-500">No staged directions will activate.</p>
+      )}
+      <p className={inFlight > 0 ? 'text-neutral-300' : 'text-neutral-500'}>
+        {inFlight > 0
+          ? `${inFlight} in-flight task${inFlight !== 1 ? 's' : ''} will NOT be stopped — they keep running and land against the new version.`
+          : 'No tasks are currently in flight.'}
+      </p>
+    </div>
+  );
+}
+
 export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, userRole }: { data: VersionLifecycleResponse | null; loading: boolean; projectId: string | null; onRefresh: () => void; userRole?: 'admin' | 'user' | null }) {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
@@ -320,7 +367,19 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
 
   const handleCutVersion = async () => {
     if (!projectId || !cv) return;
-    const msg = `Abandon v${cv.version_number} and open a fresh version?`;
+    const activating = stagedActivatedByCut(data?.staged_directions ?? [], cv.version_number);
+    const inFlight = cv.in_flight_task_count ?? 0;
+    const consequences = [
+      activating.length > 0
+        ? `${activating.length} staged direction${activating.length !== 1 ? 's' : ''} will start now`
+        : null,
+      inFlight > 0
+        ? `${inFlight} in-flight task${inFlight !== 1 ? 's' : ''} will keep running against the new version`
+        : null,
+    ].filter(Boolean);
+    const msg = consequences.length
+      ? `Abandon v${cv.version_number} and open a fresh version?\n\nThis will: ${consequences.join('; ')}.`
+      : `Abandon v${cv.version_number} and open a fresh version?`;
     if (!window.confirm(msg)) return;
     setActionLoading('cut');
     setActionMsg(null);
@@ -590,6 +649,10 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 )}
                 {cuttingVersion ? (
                   <div className="flex flex-col gap-1 w-full">
+                    <CutConsequences
+                      cv={cv}
+                      staged={data.staged_directions ?? []}
+                    />
                     <div className="flex flex-wrap items-center gap-1">
                       <input
                         type="text"

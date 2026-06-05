@@ -176,3 +176,60 @@ describe('AutonomousStatus expanded dropdown', () => {
     expect(screen.getByText(/Rate limit: 10\/10 tasks this hour/)).toBeTruthy();
   });
 });
+
+describe('AutonomousStatus staleness', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // A fetch mock whose first call succeeds (stamping lastUpdated) and whose
+  // subsequent calls fail — simulating a poll loop that stalls after one good
+  // read (backend unreachable / swallowed error), so the reading ages out.
+  function freshThenStalledFetch() {
+    let n = 0;
+    return vi.fn().mockImplementation(() => {
+      n += 1;
+      if (n === 1) {
+        return Promise.resolve(statusResponse([makeProject({ autonomous_enabled: true })]));
+      }
+      return Promise.resolve({ ok: false } as Response);
+    });
+  }
+
+  it('does not mark the indicator stale right after a successful poll', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      statusResponse([makeProject({ autonomous_enabled: true })])
+    ));
+    await act(async () => { render(<AutonomousStatus />); });
+    expect(screen.getByText('Active')).toBeTruthy();
+    expect(screen.queryByTitle(/reading is stale/)).toBeNull();
+  });
+
+  it('marks the indicator stale once the last poll ages past the threshold', async () => {
+    vi.stubGlobal('fetch', freshThenStalledFetch());
+    await act(async () => { render(<AutonomousStatus />); });
+    // Past STATUS_STALE_AFTER_SECONDS (90s) with no successful poll.
+    await act(async () => { await vi.advanceTimersByTimeAsync(95_000); });
+    const staleEl = screen.getByTitle(/reading is stale/);
+    expect(staleEl).toBeTruthy();
+    expect(staleEl.className).toContain('opacity-60');
+    expect(staleEl.className).toContain('saturate-50');
+  });
+
+  it('returns to fresh once a successful poll arrives again', async () => {
+    const fetchMock = freshThenStalledFetch();
+    vi.stubGlobal('fetch', fetchMock);
+    await act(async () => { render(<AutonomousStatus />); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(95_000); });
+    expect(screen.queryByTitle(/reading is stale/)).toBeTruthy();
+
+    // Backend recovers — the next poll succeeds and re-stamps lastUpdated.
+    fetchMock.mockResolvedValue(statusResponse([makeProject({ autonomous_enabled: true })]));
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(screen.queryByTitle(/reading is stale/)).toBeNull();
+  });
+});
