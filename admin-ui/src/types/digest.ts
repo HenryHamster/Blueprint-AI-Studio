@@ -137,8 +137,16 @@ export interface EfficiencyBucket {
   run_count: number;
   landed_count: number;
   landed_rate: number | null;
+  // Verified-merge payoff alongside the RAW landed figures: degraded (no-CI
+  // fall-open) merges stay in landed_count/landed_rate but are EXCLUDED here, so
+  // a fall-open merge is not presented as a genuine landing. Optional so older
+  // backends (predating the verified-merge rollup) degrade gracefully — the
+  // panel falls back to the raw landed figures when these are absent.
+  verified_landed_count?: number;
+  verified_landed_rate?: number | null;
   total_cost_usd: number;
-  // Priced LLM dollars per PR that actually landed; null when nothing landed.
+  // Priced LLM dollars per VERIFIED PR that landed; null when nothing
+  // verified-landed (or the bucket is unpriced).
   cost_per_merge: number | null;
   input_tokens: number;
   output_tokens: number;

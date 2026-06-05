@@ -1275,12 +1275,16 @@ def _new_efficiency_bucket() -> Dict[str, Any]:
     return {
         "run_count": 0,
         "landed_count": 0,
+        # Verified landings only (is_verified_merge) — degraded fall-open merges
+        # count in landed_count but NOT here, mirroring compute_llm_cost_breakdown.
+        "verified_landed_count": 0,
         "input_tokens": 0,
         "output_tokens": 0,
         "llm_call_count": 0,
         "cost_usd": 0.0,
-        # Among token-bearing ("priceable") runs only — mirrors
-        # _compute_llm_cost_pricing_coverage so coverage fractions reconcile.
+        # Among token-bearing ("priceable") attempt-rows only — mirrors
+        # compute_llm_cost_breakdown's priced/unpriced attempt accounting so
+        # coverage fractions reconcile.
         "priced_run_count": 0,
         "unpriced_run_count": 0,
     }
@@ -1289,16 +1293,26 @@ def _new_efficiency_bucket() -> Dict[str, Any]:
 def _finalize_efficiency_bucket(b: Dict[str, Any], **extra: Any) -> Dict[str, Any]:
     run_count = int(b["run_count"])
     landed_count = int(b["landed_count"])
+    verified_landed_count = int(b["verified_landed_count"])
     cost = round(float(b["cost_usd"]), 6)
     priceable = int(b["priced_run_count"]) + int(b["unpriced_run_count"])
     out: Dict[str, Any] = {
         "run_count": run_count,
         "landed_count": landed_count,
         "landed_rate": round(landed_count / run_count, 4) if run_count else None,
+        # Verified payoff alongside the raw landed figures: degraded (no-CI
+        # fall-open) merges are kept in landed_count/landed_rate but excluded here.
+        "verified_landed_count": verified_landed_count,
+        "verified_landed_rate": (
+            round(verified_landed_count / run_count, 4) if run_count else None
+        ),
         "total_cost_usd": cost,
         # Cost-per-merge is the headline payoff number: priced LLM dollars spent
-        # per PR that actually landed. None when nothing landed (no denominator).
-        "cost_per_merge": round(cost / landed_count, 6) if landed_count else None,
+        # per VERIFIED PR that landed, so degraded fall-open merges do not make
+        # spend look cheaper. None when nothing verified-landed (no denominator).
+        "cost_per_merge": (
+            round(cost / verified_landed_count, 6) if verified_landed_count else None
+        ),
         "input_tokens": int(b["input_tokens"]),
         "output_tokens": int(b["output_tokens"]),
         "llm_call_count": int(b["llm_call_count"]),
@@ -1316,24 +1330,31 @@ def compute_effort_model_efficiency(tasks: list[Task]) -> Dict[str, Any]:
     """Per-effort-tier and per-actual-model efficiency rollup over finished tasks.
 
     Pure function — no DB calls. For each task it reads the REQUESTED effort from
-    ``task.first_payload["effort"]``, the ACTUAL ``provider`` / ``model`` and
-    token usage from the persisted Task fields (via
-    :func:`get_task_total_llm_totals`), and the landed/merge status from
-    :func:`is_merged_completion` (the same shipped predicate the other cost
-    surfaces use). LLM cost is priced with the shared :data:`LLM_TOKEN_PRICING`
-    table exactly as :func:`compute_llm_cost_breakdown` does, so the totals
-    reconcile with the existing per-model cost surface.
+    ``task.first_payload["effort"]``, then splits the task across its banked
+    attempt history (:func:`_task_llm_attempts`) so each attempt's tokens are
+    priced at the (provider, model) that attempt actually ran on — exactly as
+    :func:`compute_llm_cost_breakdown` does. A task that retried on a different
+    model therefore lands its tokens/cost in each attempt's own model bucket, so
+    the total AND the per-model breakdown reconcile with the sibling cost surface.
+    The landed/merge status comes from :func:`is_merged_completion` (raw landings)
+    and :func:`is_verified_merge` (verified landings). LLM cost is priced with the
+    shared :data:`LLM_TOKEN_PRICING` table.
+
+    Run counts and landed counts stay PER-TASK — credited once per task (and once
+    per distinct model bucket the task touched), never once per attempt-row — so a
+    multi-attempt task never inflates run/landed counts.
 
     Returns a dict with:
       - ``by_effort``: rows keyed by requested effort tier (low->max, then
-        ``unspecified``). Each row carries run count, landed count + rate, priced
-        LLM cost, cost-per-merge, token volume, priced/unpriced coverage, and a
+        ``unspecified``). Each row carries run count, landed count + rate,
+        verified landed count + rate, priced LLM cost, cost-per-merge (over the
+        verified count), token volume, priced/unpriced coverage, and a
         ``resolved_models`` breakdown exposing which actual models that requested
         tier ran on (requested-vs-actual divergence).
       - ``by_model``: rows keyed by actual (provider, model) with a ``priced``
         flag, sorted by cost desc. Unpriced combos appear with 0 cost.
-      - ``totals``: aggregate run/landed/cost/token totals + priced/unpriced
-        coverage.
+      - ``totals``: aggregate run/landed/verified/cost/token totals + priced/
+        unpriced coverage.
       - ``unpriced_combos``: capped list of ``provider:model`` strings with
         non-zero tokens but no pricing entry (never folded into priced cost).
       - ``fallbacks``: aggregate of ``context.model_fallback`` downgrade records
@@ -1342,7 +1363,7 @@ def compute_effort_model_efficiency(tasks: list[Task]) -> Dict[str, Any]:
     from collections import defaultdict  # noqa: PLC0415
 
     effort_buckets: Dict[str, Dict[str, Any]] = defaultdict(_new_efficiency_bucket)
-    # effort -> (provider, model) -> {run_count, landed_count, priced}
+    # effort -> (provider, model) -> {run_count, landed_count}
     effort_models: Dict[str, Dict[tuple[str, str], Dict[str, Any]]] = defaultdict(dict)
     model_buckets: Dict[tuple[str, str], Dict[str, Any]] = defaultdict(
         _new_efficiency_bucket
@@ -1356,23 +1377,56 @@ def compute_effort_model_efficiency(tasks: list[Task]) -> Dict[str, Any]:
     fallback_total = 0
     fallback_combos: Dict[tuple[str, str, str, str], int] = defaultdict(int)
 
-    for t in tasks:
-        input_tokens, output_tokens, call_count = get_task_total_llm_totals(t)
-        has_tokens = (input_tokens > 0) or (output_tokens > 0)
-        if not t.provider or not t.model:
-            provider, model = "unattributed", "unknown"
-        else:
-            provider, model = t.provider.lower(), t.model.lower()
-        key = (provider, model)
-
-        pricing = LLM_TOKEN_PRICING.get(key)
-        priced = pricing is not None
+    def _accumulate_attempt(
+        b: Dict[str, Any],
+        input_tokens: int,
+        output_tokens: int,
+        call_count: int,
+        cost: float,
+        priced: bool,
+    ) -> None:
+        b["input_tokens"] += int(input_tokens)
+        b["output_tokens"] += int(output_tokens)
+        b["llm_call_count"] += int(call_count)
+        b["cost_usd"] += cost
+        # Each token-bearing attempt-row is one priceable unit (mirrors the
+        # sibling's per-attempt priced/unpriced accounting).
         if priced:
-            input_rate, output_rate = pricing
-            cost = input_tokens * input_rate + output_tokens * output_rate
+            b["priced_run_count"] += 1
         else:
-            cost = 0.0
-            if has_tokens:
+            b["unpriced_run_count"] += 1
+
+    for t in tasks:
+        landed = is_merged_completion(t)
+        verified = is_verified_merge(t)
+        effort_raw = (t.first_payload or {}).get("effort")
+        effort = str(effort_raw) if effort_raw else _EFFORT_UNSPECIFIED
+        eff_bucket = effort_buckets[effort]
+
+        # Distinct model buckets this task contributed a token-bearing row to.
+        # Per-task run/landed credit is applied once per distinct bucket below,
+        # never per attempt-row.
+        task_model_keys: set[tuple[str, str]] = set()
+
+        for provider, model, input_tokens, output_tokens, call_count in (
+            _task_llm_attempts(t)
+        ):
+            if input_tokens <= 0 and output_tokens <= 0:
+                continue
+            if not provider or not model:
+                provider, model = "unattributed", "unknown"
+            else:
+                provider, model = provider.lower(), model.lower()
+            key = (provider, model)
+
+            pricing = LLM_TOKEN_PRICING.get(key)
+            priced = pricing is not None
+            if priced:
+                input_rate, output_rate = pricing
+                cost = input_tokens * input_rate + output_tokens * output_rate
+                priced_model_keys.add(key)
+            else:
+                cost = 0.0
                 combo = f"{provider}:{model}"
                 if (
                     combo not in unpriced_combos
@@ -1380,38 +1434,51 @@ def compute_effort_model_efficiency(tasks: list[Task]) -> Dict[str, Any]:
                 ):
                     unpriced_combos.append(combo)
 
-        landed = is_merged_completion(t)
-        effort_raw = (t.first_payload or {}).get("effort")
-        effort = str(effort_raw) if effort_raw else _EFFORT_UNSPECIFIED
+            _accumulate_attempt(
+                eff_bucket, input_tokens, output_tokens, call_count, cost, priced
+            )
+            _accumulate_attempt(
+                model_buckets[key], input_tokens, output_tokens, call_count, cost, priced
+            )
+            _accumulate_attempt(
+                totals, input_tokens, output_tokens, call_count, cost, priced
+            )
+            task_model_keys.add(key)
 
-        def _accumulate(b: Dict[str, Any]) -> None:
-            b["run_count"] += 1
-            b["input_tokens"] += int(input_tokens)
-            b["output_tokens"] += int(output_tokens)
-            b["llm_call_count"] += int(call_count)
-            b["cost_usd"] += cost
-            if landed:
-                b["landed_count"] += 1
-            # Only token-bearing runs carry a cost signal worth a coverage verdict.
-            if has_tokens:
-                if priced:
-                    b["priced_run_count"] += 1
-                else:
-                    b["unpriced_run_count"] += 1
+        # Per-task crediting. A task that burned no LLM tokens still counts as a
+        # run (and lands its merge) under its resolved final (provider, model) so
+        # it is not dropped from the model surface.
+        if task_model_keys:
+            credit_keys = task_model_keys
+        elif t.provider and t.model:
+            credit_keys = {(t.provider.lower(), t.model.lower())}
+        else:
+            credit_keys = {("unattributed", "unknown")}
 
-        _accumulate(effort_buckets[effort])
-        _accumulate(model_buckets[key])
-        _accumulate(totals)
-        if priced:
-            priced_model_keys.add(key)
-
-        em = effort_models[effort].setdefault(
-            key,
-            {"run_count": 0, "landed_count": 0, "priced": priced},
-        )
-        em["run_count"] += 1
+        # Effort is a TASK-level attribute: credit its bucket and the grand total
+        # once per task. Model buckets are credited once per distinct bucket the
+        # task touched, so a multi-attempt/multi-model task never inflates counts.
+        eff_bucket["run_count"] += 1
+        totals["run_count"] += 1
         if landed:
-            em["landed_count"] += 1
+            eff_bucket["landed_count"] += 1
+            totals["landed_count"] += 1
+        if verified:
+            eff_bucket["verified_landed_count"] += 1
+            totals["verified_landed_count"] += 1
+        for key in credit_keys:
+            mb = model_buckets[key]
+            mb["run_count"] += 1
+            if landed:
+                mb["landed_count"] += 1
+            if verified:
+                mb["verified_landed_count"] += 1
+            em = effort_models[effort].setdefault(
+                key, {"run_count": 0, "landed_count": 0}
+            )
+            em["run_count"] += 1
+            if landed:
+                em["landed_count"] += 1
 
         fallback = (t.context or {}).get("model_fallback")
         if isinstance(fallback, dict) and fallback.get("requested"):
@@ -1431,7 +1498,7 @@ def compute_effort_model_efficiency(tasks: list[Task]) -> Dict[str, Any]:
                 "model": mdl,
                 "run_count": int(v["run_count"]),
                 "landed_count": int(v["landed_count"]),
-                "priced": bool(v["priced"]),
+                "priced": (prov, mdl) in priced_model_keys,
             }
             for (prov, mdl), v in effort_models.get(effort, {}).items()
         ]

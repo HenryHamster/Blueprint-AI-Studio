@@ -10,6 +10,8 @@ function bucket(overrides: Partial<EfficiencyBucket> = {}): EfficiencyBucket {
     run_count: 10,
     landed_count: 6,
     landed_rate: 0.6,
+    verified_landed_count: 4,
+    verified_landed_rate: 0.4,
     total_cost_usd: 12.5,
     cost_per_merge: 2.08,
     input_tokens: 1_200_000,
@@ -28,7 +30,17 @@ function makeData(): EffortModelEfficiency {
       { ...bucket(), effort: 'low', resolved_models: [] },
       { ...bucket(), effort: 'medium', resolved_models: [] },
       { ...bucket(), effort: 'high', resolved_models: [] },
-      { ...bucket(), effort: 'max', resolved_models: [] },
+      {
+        ...bucket(),
+        effort: 'max',
+        // Worst-case per-tier divergence: a requested 'max' tier that resolved
+        // onto several models including a long-named unpriced fallback.
+        resolved_models: [
+          { provider: 'anthropic', model: 'claude-opus-4-8', run_count: 5, landed_count: 3, priced: true },
+          { provider: 'anthropic', model: 'claude-sonnet-4-6', run_count: 3, landed_count: 1, priced: true },
+          { provider: 'openai', model: 'gpt-5.3-codex-spark-extra-long-name', run_count: 2, landed_count: 0, priced: false },
+        ],
+      },
     ],
     by_model: [
       { ...bucket(), provider: 'anthropic', model: 'claude-haiku-4-5-20251001', priced: true },
@@ -66,6 +78,11 @@ describe('EffortEfficiencyPanel viewport', () => {
       act(() => {
         root.render(<EffortEfficiencyPanel data={makeData()} />);
       });
+      // Expand every resolved-model reveal so the breakdown is measured, not
+      // just the collapsed summary.
+      container.querySelectorAll('details').forEach((d) => {
+        d.open = true;
+      });
     });
   });
 
@@ -74,6 +91,11 @@ describe('EffortEfficiencyPanel viewport', () => {
       act(() => {
         root.render(<EffortEfficiencyPanel data={makeData()} />);
       });
+      // Expand every resolved-model reveal so the breakdown is measured, not
+      // just the collapsed summary.
+      container.querySelectorAll('details').forEach((d) => {
+        d.open = true;
+      });
     });
   });
 
@@ -81,6 +103,11 @@ describe('EffortEfficiencyPanel viewport', () => {
     await expectNoOverflowAt(1024, async () => {
       act(() => {
         root.render(<EffortEfficiencyPanel data={makeData()} />);
+      });
+      // Expand every resolved-model reveal so the breakdown is measured, not
+      // just the collapsed summary.
+      container.querySelectorAll('details').forEach((d) => {
+        d.open = true;
       });
     });
   });

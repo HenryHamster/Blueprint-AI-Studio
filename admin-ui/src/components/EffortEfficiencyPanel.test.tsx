@@ -13,6 +13,8 @@ function bucket(overrides: Partial<EfficiencyBucket> = {}): EfficiencyBucket {
     run_count: 10,
     landed_count: 6,
     landed_rate: 0.6,
+    verified_landed_count: 6,
+    verified_landed_rate: 0.6,
     total_cost_usd: 12.5,
     cost_per_merge: 2.08,
     input_tokens: 1_200_000,
@@ -36,8 +38,20 @@ function modelRow(provider: string, model: string, overrides: Partial<ModelEffic
 function makeData(overrides: Partial<EffortModelEfficiency> = {}): EffortModelEfficiency {
   return {
     by_effort: [
-      effortRow('low', { landed_count: 8, landed_rate: 0.9, cost_per_merge: 1.0 }),
-      effortRow('high', { landed_count: 3, landed_rate: 0.3, cost_per_merge: 25.0 }),
+      effortRow('low', {
+        landed_count: 8,
+        landed_rate: 0.9,
+        verified_landed_count: 8,
+        verified_landed_rate: 0.9,
+        cost_per_merge: 1.0,
+      }),
+      effortRow('high', {
+        landed_count: 3,
+        landed_rate: 0.3,
+        verified_landed_count: 3,
+        verified_landed_rate: 0.3,
+        cost_per_merge: 25.0,
+      }),
     ],
     by_model: [
       modelRow('anthropic', 'claude-opus-4-8'),
@@ -139,5 +153,80 @@ describe('EffortEfficiencyPanel', () => {
       />,
     );
     expect(screen.getAllByText(/gpt-9 · openai \(unpriced\)/).length).toBeGreaterThan(0);
+  });
+
+  it('reveals a per-tier resolved-model breakdown with a downgraded + unpriced model', () => {
+    render(
+      <EffortEfficiencyPanel
+        data={makeData({
+          by_effort: [
+            effortRow('max', {
+              resolved_models: [
+                { provider: 'anthropic', model: 'claude-opus-4-8', run_count: 6, landed_count: 4, priced: true },
+                { provider: 'anthropic', model: 'claude-sonnet-4-6', run_count: 3, landed_count: 1, priced: true },
+                { provider: 'openai', model: 'gpt-9', run_count: 1, landed_count: 0, priced: false },
+              ],
+            }),
+          ],
+        })}
+      />,
+    );
+    // Summary advertises the count of actual models the tier resolved onto.
+    expect(screen.getAllByText(/Resolved models \(3\)/).length).toBeGreaterThan(0);
+    // The downgraded model and the unpriced flag are visible in the breakdown.
+    expect(screen.getAllByText(/claude-sonnet-4-6 · anthropic/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/\(unpriced\)/).length).toBeGreaterThan(0);
+    // Per-model landed/run counts surfaced.
+    expect(screen.getAllByText(/4\/6 landed/).length).toBeGreaterThan(0);
+  });
+
+  it('omits the resolved-model reveal when a tier carries no breakdown', () => {
+    render(
+      <EffortEfficiencyPanel
+        data={makeData({ by_effort: [effortRow('low', { resolved_models: [] })] })}
+      />,
+    );
+    expect(screen.queryByText(/Resolved models/)).not.toBeInTheDocument();
+  });
+
+  it('shows the verified merge figure as primary with the raw count when they diverge', () => {
+    render(
+      <EffortEfficiencyPanel
+        data={makeData({
+          by_effort: [
+            effortRow('high', {
+              run_count: 10,
+              landed_count: 6,
+              landed_rate: 0.6,
+              verified_landed_count: 4,
+              verified_landed_rate: 0.4,
+            }),
+          ],
+          by_model: [],
+        })}
+      />,
+    );
+    // Verified figure is the headline (4/10 = 40%), not the raw 6/10.
+    expect(screen.getAllByText(/4\/10/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/40%/).length).toBeGreaterThan(0);
+    // Raw landed count is still visible (2 degraded fall-open merges excluded).
+    expect(screen.getAllByText(/raw 6/).length).toBeGreaterThan(0);
+  });
+
+  it('falls back to raw landed figures when verified fields are absent (legacy backend)', () => {
+    const legacy = bucket();
+    delete legacy.verified_landed_count;
+    delete legacy.verified_landed_rate;
+    render(
+      <EffortEfficiencyPanel
+        data={makeData({
+          by_effort: [{ ...legacy, effort: 'low', landed_count: 7, landed_rate: 0.7, resolved_models: [] }],
+          by_model: [],
+        })}
+      />,
+    );
+    // Displays the raw landed rate with no "raw N" annotation.
+    expect(screen.getAllByText(/70%/).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/raw 7/)).not.toBeInTheDocument();
   });
 });
