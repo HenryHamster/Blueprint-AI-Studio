@@ -8,6 +8,11 @@
 export interface ProjectStatusBadge {
   label: string;
   classes: string;
+  /** True when the badge reflects stale/last-known data rather than a live
+   *  reading (the dashboard's last project fetch failed). Renderers use this
+   *  to show a degraded affordance; the label already carries a "· stale"
+   *  suffix and the classes are desaturated/dimmed. */
+  stale: boolean;
 }
 
 export interface ProjectStatusInput {
@@ -15,7 +20,15 @@ export interface ProjectStatusInput {
   paused?: boolean;
   archived?: boolean;
   created_at?: string;
+  /** When true, the underlying data is stale (e.g. the last backend refresh
+   *  failed), so the badge must visibly degrade instead of presenting a
+   *  last-known reading as authoritative. Display-only. */
+  stale?: boolean;
 }
+
+// Tailwind classes appended to any badge whose data is stale: desaturate +
+// dim so a last-known reading never reads as a live, authoritative one.
+const STALE_CLASSES = 'opacity-60 saturate-50';
 
 /**
  * Resolve a per-project status badge that reflects its real operating state.
@@ -34,6 +47,25 @@ export interface ProjectStatusInput {
 export function projectStatusBadge(
   input: ProjectStatusInput | string | null | undefined
 ): ProjectStatusBadge {
+  const stale =
+    typeof input === 'string' || input === null || input === undefined
+      ? false
+      : input.stale ?? false;
+  const base = resolveBaseBadge(input);
+  if (!stale) return { ...base, stale: false };
+  // Degrade: desaturate/dim and mark the label so a last-known reading is never
+  // presented as a live, authoritative one. Display-only — the data is unchanged.
+  return {
+    label: `${base.label} · stale`,
+    classes: `${base.classes} ${STALE_CLASSES}`,
+    stale: true,
+  };
+}
+
+/** Resolve the truthful badge for live data, ignoring freshness. */
+function resolveBaseBadge(
+  input: ProjectStatusInput | string | null | undefined
+): { label: string; classes: string } {
   // Handle backward compatibility: if input is a string, treat it as status
   let status: string | null | undefined;
   let paused = false;

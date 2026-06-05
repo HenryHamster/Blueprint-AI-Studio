@@ -7,6 +7,7 @@ import {
   type AuditFinding,
   type AuditReconciliation,
   type CiResolution,
+  type CurrentVersion,
   type LatestAudit,
   type QualificationVerdictRecord,
   type VersionLifecycleResponse,
@@ -167,6 +168,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
   const [verdicts, setVerdicts] = useState<QualificationVerdictRecord[]>([]);
   const [editingGoal, setEditingGoal] = useState<boolean>(false);
   const [goalInput, setGoalInput] = useState<string>('');
+  const [optimisticOverrides, setOptimisticOverrides] = useState<Partial<CurrentVersion> | null>(null);
   useEffect(() => {
     if (!projectId) { setVerdicts([]); return; }
     fetchQualificationVerdicts(projectId, 10).then(r => setVerdicts(r.verdicts)).catch(() => {});
@@ -176,9 +178,12 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
       setGoalInput(data.current_version.goal || '');
     }
   }, [data?.current_version?.goal]);
+  useEffect(() => {
+    setOptimisticOverrides(null);
+  }, [data?.current_version?.phase, data?.current_version?.goal]);
 
   if (loading || !data || (!data.current_version && data.recent_versions.length === 0)) return null;
-  const cv = data.current_version;
+  const cv = data.current_version ? (optimisticOverrides ? { ...data.current_version, ...optimisticOverrides } : data.current_version) : null;
   const recent = data.recent_versions;
   const promotionEnabled = data.promotion_enabled ?? false;
   const readiness = data.promotion_readiness;
@@ -188,11 +193,17 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
     setActionLoading('phase');
     setActionMsg(null);
     try {
-      await setVersionPhase(projectId, phase, 'operator advance');
+      const response = await setVersionPhase(projectId, phase, 'operator advance');
+      setOptimisticOverrides({
+        phase: response.phase,
+        phase_changed_at: response.phase_changed_at,
+        phase_reasoning: response.phase_reasoning,
+      });
       setActionMsg(`Phase → ${phase}`);
       onRefresh();
     } catch {
       setActionMsg('Request failed');
+      setOptimisticOverrides(null);
     } finally {
       setActionLoading(null);
     }
@@ -203,12 +214,20 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
     setActionLoading('goal');
     setActionMsg(null);
     try {
-      await setVersionGoal(projectId, goalInput || null);
+      const response = await setVersionGoal(projectId, goalInput || null);
+      setOptimisticOverrides({
+        goal: response.goal,
+        goal_updated_at: response.goal_updated_at,
+        goal_editor_info: response.goal_editor_info,
+      });
       setActionMsg('Goal updated');
       setEditingGoal(false);
       onRefresh();
     } catch {
       setActionMsg('Request failed');
+      setOptimisticOverrides(null);
+      setEditingGoal(false);
+      setGoalInput(cv?.goal || '');
     } finally {
       setActionLoading(null);
     }

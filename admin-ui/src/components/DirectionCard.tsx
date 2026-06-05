@@ -94,6 +94,7 @@ export interface DirectionCardProps {
   reviveProposal: (id: string) => Promise<void>;
   reactivateDirection: (id: string) => Promise<void>;
   activateStagedDirection: (id: string) => Promise<void>;
+  retargetStagedDirection?: (id: string, version: number) => Promise<void>;
   cancelStagedDirection: (id: string) => Promise<void>;
   unholdDirection: (id: string) => Promise<void>;
   markDirectionComplete: (id: string) => Promise<void>;
@@ -129,7 +130,7 @@ function DirectionCardImpl({
   setEditingId, setEditText, setEditPriority, setEditStatus, setEditCategory, setEditPathTags, setEditPathInput, setEditCompletionCriteria, setEditCostBudget,
   startEdit,
   updateDirection, approveProposal, rejectProposal, reviveProposal,
-  reactivateDirection, activateStagedDirection, cancelStagedDirection, unholdDirection, markDirectionComplete, quickToggleStatus, deleteDirection,
+  reactivateDirection, activateStagedDirection, retargetStagedDirection, cancelStagedDirection, unholdDirection, markDirectionComplete, quickToggleStatus, deleteDirection,
   applyDirectionUpdate, dismissDirectionUpdate, triggerResearch, reorderDirections,
   taskCounts, activeTasks, cooldownMinutes, researchingIds, researchSuccessIds,
   forceConfirmId, setForceConfirmId,
@@ -142,6 +143,8 @@ function DirectionCardImpl({
   const [historyOpen, setHistoryOpen] = useState(false);
   const [expandedRemediationIds, setExpandedRemediationIds] = useState<Record<string, boolean>>({});
   const showAllRemediation = Boolean(expandedRemediationIds[d.id]);
+  // Pending retarget version for a staged direction (the version input draft).
+  const [retargetVersion, setRetargetVersion] = useState<string>('');
 
   const autoRecoveryLine = useMemo(
     () => formatAutoRecoveryLine(d.held_until),
@@ -433,6 +436,34 @@ function DirectionCardImpl({
               );
             })()}
           </div>
+          {/* Retarget — bind this staged direction to a different (current-or-
+              later) version. Defaults the input to the currently-open version. */}
+          {retargetStagedDirection && (
+            <div className="flex items-center gap-1.5 mt-2">
+              <span className="text-[10px] text-neutral-500">Retarget to v</span>
+              <input
+                type="number"
+                min={stageTargetVersion ?? 1}
+                value={retargetVersion}
+                placeholder={stageTargetVersion != null ? String(stageTargetVersion) : ''}
+                onChange={e => setRetargetVersion(e.target.value)}
+                title="Bind this staged direction to a different version (current open or later)"
+                className="w-16 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-0.5 text-[10px] focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
+              />
+              <button
+                data-viewport-allow-small-target
+                disabled={!retargetVersion.trim() || Number.isNaN(Number(retargetVersion))}
+                onClick={() => {
+                  const v = Number(retargetVersion);
+                  if (Number.isInteger(v)) retargetStagedDirection(d.id, v);
+                  setRetargetVersion('');
+                }}
+                className="text-[10px] px-2 py-0.5 rounded border font-medium transition-colors bg-sky-950/60 border-sky-900/50 text-sky-400 hover:bg-sky-900/50 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Retarget
+              </button>
+            </div>
+          )}
         </div>
       ) : editingId === d.id ? (
         /* Edit mode */

@@ -31,6 +31,7 @@ export interface DirectionsListProps {
   reviveProposal: (id: string) => Promise<void>;
   reactivateDirection: (id: string) => Promise<void>;
   activateStagedDirection: (id: string) => Promise<void>;
+  retargetStagedDirection: (id: string, version: number) => Promise<void>;
   cancelStagedDirection: (id: string) => Promise<void>;
   unholdDirection: (id: string) => Promise<void>;
   markDirectionComplete: (id: string) => Promise<void>;
@@ -132,6 +133,11 @@ export function DirectionsList(props: DirectionsListProps) {
                   <span className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider group-hover:text-neutral-300 transition-colors">
                     {label} ({items.length})
                   </span>
+                  {key === 'staged' && stageTargetVersion != null && (
+                    <span className="text-[10px] text-sky-400/70 normal-case">
+                      current open: v{stageTargetVersion}
+                    </span>
+                  )}
                 </button>
                 {!isCollapsed && (
                   <div className="space-y-2">
@@ -164,6 +170,7 @@ export function DirectionsList(props: DirectionsListProps) {
                         reviveProposal={props.reviveProposal}
                         reactivateDirection={props.reactivateDirection}
                         activateStagedDirection={props.activateStagedDirection}
+                        retargetStagedDirection={props.retargetStagedDirection}
                         cancelStagedDirection={props.cancelStagedDirection}
                         unholdDirection={props.unholdDirection}
                         markDirectionComplete={props.markDirectionComplete}

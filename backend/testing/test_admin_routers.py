@@ -3563,6 +3563,86 @@ class TestMessages:
         assert resp.json()["status"] == "already_resolved"
 
     @pytest.mark.asyncio
+    async def test_resolve_message_concurrent_requests_are_safe(
+        self, client: AsyncClient, db_session
+    ):
+        """Concurrent resolves are safe: one succeeds, the other sees already_resolved."""
+        import asyncio
+
+        project = await _make_project(db_session)
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            content="Help me",
+            status="open",
+        )
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+
+        # Simulate two concurrent resolve requests with different resolutions
+        async def resolve_with(resolution_text):
+            return await client.patch(
+                f"/api/admin/messages/{msg.id}",
+                json={"resolution": resolution_text},
+            )
+
+        resp1, resp2 = await asyncio.gather(
+            resolve_with("First resolution"),
+            resolve_with("Second resolution"),
+        )
+        # Both should succeed (200)
+        assert resp1.status_code == 200
+        assert resp2.status_code == 200
+        # One should be "resolved", the other "already_resolved"
+        statuses = {resp1.json()["status"], resp2.json()["status"]}
+        assert statuses == {"resolved", "already_resolved"}
+
+        # Verify the message is resolved with the first resolution that won
+        await db_session.refresh(msg)
+        assert msg.status == "resolved"
+        assert msg.resolution is not None
+
+    @pytest.mark.asyncio
+    async def test_resolve_message_retried_request_is_safe(
+        self, client: AsyncClient, db_session
+    ):
+        """Retrying a resolve request is safe (idempotent)."""
+        project = await _make_project(db_session)
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            content="Help me",
+            status="open",
+        )
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+
+        # First resolve
+        resp1 = await client.patch(
+            f"/api/admin/messages/{msg.id}",
+            json={"resolution": "Fixed!"},
+        )
+        assert resp1.status_code == 200
+        assert resp1.json()["status"] == "resolved"
+
+        # Retry the same request
+        resp2 = await client.patch(
+            f"/api/admin/messages/{msg.id}",
+            json={"resolution": "Fixed!"},
+        )
+        assert resp2.status_code == 200
+        assert resp2.json()["status"] == "already_resolved"
+
+        # Message should still be resolved
+        await db_session.refresh(msg)
+        assert msg.status == "resolved"
+        assert msg.resolution == "Fixed!"
+
+    @pytest.mark.asyncio
     async def test_delete_message(self, client: AsyncClient, db_session):
         """Can delete an existing message."""
         project = await _make_project(db_session)
@@ -3582,10 +3662,38 @@ class TestMessages:
         assert resp.json()["deleted"] is True
 
     @pytest.mark.asyncio
-    async def test_delete_message_not_found_returns_404(self, client: AsyncClient):
-        """Deleting a non-existent message returns 404."""
+    async def test_delete_message_not_found_is_idempotent(self, client: AsyncClient):
+        """Deleting a non-existent message returns idempotent success."""
         resp = await client.delete(f"/api/admin/messages/{uuid.uuid4()}")
-        assert resp.status_code == 404
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] is True
+
+    @pytest.mark.asyncio
+    async def test_delete_message_twice_is_idempotent(
+        self, client: AsyncClient, db_session
+    ):
+        """Deleting a message twice (retry) is idempotent."""
+        project = await _make_project(db_session)
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            from_type="user",
+            content="Bug found",
+            status="open",
+        )
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+
+        # First delete
+        resp1 = await client.delete(f"/api/admin/messages/{msg.id}")
+        assert resp1.status_code == 200
+        assert resp1.json()["deleted"] is True
+
+        # Retry delete
+        resp2 = await client.delete(f"/api/admin/messages/{msg.id}")
+        assert resp2.status_code == 200
+        assert resp2.json()["deleted"] is True
 
     @pytest.mark.asyncio
     async def test_list_messages_status_filter(self, client: AsyncClient, db_session):

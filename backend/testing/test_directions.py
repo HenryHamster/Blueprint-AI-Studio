@@ -598,6 +598,105 @@ async def test_update_direction_status_stage_sets_version_marker(
 
 
 @pytest.mark.asyncio
+async def test_update_direction_stage_for_explicit_future_version(
+    client: AsyncClient, db_session, mocker
+):
+    """PATCH status='staged' with an explicit future staged_for_version stamps
+    that version rather than the current open one."""
+    project_id = await _deploy_project(client, mocker)
+    project_uuid = uuid.UUID(project_id)
+    from app import release_version as rv
+
+    await rv.open_version(db_session, project_uuid, version_number=3)
+    await db_session.commit()
+
+    direction = await _add_direction(client, project_id)
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"status": "staged", "staged_for_version": 5},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["direction"]["staged_for_version"] == 5
+
+
+@pytest.mark.asyncio
+async def test_update_direction_stage_rejects_already_promoted_version(
+    client: AsyncClient, db_session, mocker
+):
+    """A staged_for_version below the current open version (already promoted) is
+    rejected with 400 rather than auto-activating on the next sweep."""
+    project_id = await _deploy_project(client, mocker)
+    project_uuid = uuid.UUID(project_id)
+    from app import release_version as rv
+
+    await rv.open_version(db_session, project_uuid, version_number=4)
+    await db_session.commit()
+
+    direction = await _add_direction(client, project_id)
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"status": "staged", "staged_for_version": 2},
+    )
+    assert resp.status_code == 400
+    assert "already promoted" in resp.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_update_direction_retarget_staged_direction(
+    client: AsyncClient, db_session, mocker
+):
+    """PATCH staged_for_version on an already-staged direction retargets it to a
+    new version without changing its status."""
+    project_id = await _deploy_project(client, mocker)
+    project_uuid = uuid.UUID(project_id)
+    from app import release_version as rv
+
+    await rv.open_version(db_session, project_uuid, version_number=6)
+    await db_session.commit()
+
+    direction = await _add_direction(client, project_id)
+    direction_id = direction["id"]
+    await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"status": "staged"},
+    )
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"staged_for_version": 8},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()["direction"]
+    assert body["status"] == "staged"
+    assert body["staged_for_version"] == 8
+
+    _, row = await _load_project_and_direction(db_session, project_id, direction_id)
+    assert row is not None and row.data["staged_for_version"] == 8
+
+
+@pytest.mark.asyncio
+async def test_update_direction_retarget_rejects_non_staged(
+    client: AsyncClient, db_session, mocker
+):
+    """Retargeting (staged_for_version without a status change) is rejected with
+    409 when the direction is not currently staged."""
+    project_id = await _deploy_project(client, mocker)
+    project_uuid = uuid.UUID(project_id)
+    from app import release_version as rv
+
+    await rv.open_version(db_session, project_uuid, version_number=6)
+    await db_session.commit()
+
+    direction = await _add_direction(client, project_id)
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"staged_for_version": 7},
+    )
+    assert resp.status_code == 409
+    assert "staged direction" in resp.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
 async def test_update_direction_status_activate_now_clears_stage_marker(
     client: AsyncClient, db_session, mocker
 ):

@@ -234,6 +234,25 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     }
   }
 
+  // Retarget an already-staged direction to a different (current-or-future)
+  // version. Sends only staged_for_version so the backend keeps the direction
+  // staged and re-binds its marker; it validates the target (rejecting an
+  // already-promoted version) and 409s if the direction is no longer staged.
+  async function retargetStagedDirection(id: string, version: number) {
+    setError(null);
+    try {
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ staged_for_version: version }),
+      });
+      if (!res.ok) throw new Error('Failed to retarget staged direction');
+      addToast(`Retargeted to v${version}`, 'success');
+      fetchDirections();
+    } catch {
+      setError('Failed to retarget staged direction. Please try again.');
+    }
+  }
+
   // Cancel a staged direction. DELETE leaves a tombstone (handled backend-side)
   // so the strategist won't immediately re-stage the same idea.
   async function cancelStagedDirection(id: string) {
@@ -455,6 +474,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     quickToggleStatus,
     reactivateDirection,
     activateStagedDirection,
+    retargetStagedDirection,
     cancelStagedDirection,
     unholdDirection,
     markDirectionComplete,

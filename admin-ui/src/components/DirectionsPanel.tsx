@@ -360,6 +360,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
             reviveProposal={data.reviveProposal}
             reactivateDirection={data.reactivateDirection}
             activateStagedDirection={data.activateStagedDirection}
+            retargetStagedDirection={data.retargetStagedDirection}
             cancelStagedDirection={data.cancelStagedDirection}
             unholdDirection={data.unholdDirection}
             markDirectionComplete={data.markDirectionComplete}

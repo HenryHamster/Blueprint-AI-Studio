@@ -632,12 +632,25 @@ async def resolve_message(
             status_code=400,
             detail=f"Content exceeds {MESSAGE_CONTENT_MAX} character limit",
         )
-    msg.status = "resolved"
-    msg.resolution = resolution or None
-    msg.resolved_at = _utcnow()
-    session.add(msg)
+    # Use update with status check for idempotency: only update if still open.
+    # If a concurrent request also resolves before this one commits, the update
+    # will find 0 rows and we return already_resolved for both paths.
+    result = await session.execute(
+        update(ProjectMessage).where(
+            ProjectMessage.id == message_id,
+            ProjectMessage.status == "open"
+        ).values(
+            status="resolved",
+            resolution=resolution or None,
+            resolved_at=_utcnow()
+        )
+    )
     await session.commit()
-    return {"id": str(msg.id), "status": "resolved"}
+    if result.rowcount > 0:
+        return {"id": str(msg.id), "status": "resolved"}
+    else:
+        # Message was already resolved by a concurrent request
+        return {"id": str(msg.id), "status": "already_resolved"}
 
 
 @router.delete("/messages/{message_id}")
@@ -646,13 +659,14 @@ async def delete_message(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Delete a message."""
+    """Delete a message (idempotent)."""
     msg = await session.get(ProjectMessage, message_id)
-    if not msg:
-        raise HTTPException(status_code=404, detail="Message not found")
-    await _get_user_project(msg.project_id, current_user["user_id"], session)
-    await session.delete(msg)
-    await session.commit()
+    if msg:
+        # Verify user has access to the project
+        await _get_user_project(msg.project_id, current_user["user_id"], session)
+        await session.delete(msg)
+        await session.commit()
+    # Return success whether or not the message existed (idempotent)
     return {"deleted": True}
 
 

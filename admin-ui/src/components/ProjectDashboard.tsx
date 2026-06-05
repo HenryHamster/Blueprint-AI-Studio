@@ -35,6 +35,11 @@ interface ProjectDashboardProps {
   /** Called after a project is successfully unarchived, so the parent can
    *  refetch the active list (the project reappears in it). */
   onProjectUnarchived?: (projectId: string) => void;
+  /** True when the last project-list refresh failed, so the rendered project
+   *  rows reflect last-known (stale) data. Drives per-card status-badge
+   *  degradation so no green "Running" badge survives a failed fetch without
+   *  a visible staleness marker. Display-only. */
+  dataStale?: boolean;
 }
 
 /** A project is considered "new / setup incomplete" if it was created within the last hour
@@ -120,7 +125,7 @@ function getMergeGateBadge(project: Project) {
   };
 }
 
-export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectProject, showMembers, onToggleMembers, userRole, onNewProject, onOpenSetupGuide, onProjectDeleted, onProjectReset, onProjectPaused, onProjectArchived, onProjectUnarchived }: ProjectDashboardProps) {
+export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectProject, showMembers, onToggleMembers, userRole, onNewProject, onOpenSetupGuide, onProjectDeleted, onProjectReset, onProjectPaused, onProjectArchived, onProjectUnarchived, dataStale }: ProjectDashboardProps) {
   const [collapsed, setCollapsed] = useState(() => {
     const stored = localStorage.getItem('projectDashboardCollapsed');
     return stored === null ? true : stored === 'true';
@@ -429,11 +434,14 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                         paused: project.paused,
                         archived: project.archived,
                         created_at: project.created_at,
+                        stale: dataStale,
                       });
                       return (
                         <span
                           className={`text-[9px] font-bold rounded px-1 py-0.5 ${badge.classes}`}
-                          title={`Project status: ${badge.label}`}
+                          title={badge.stale
+                            ? `Project status: ${badge.label} (last-known — backend refresh failed)`
+                            : `Project status: ${badge.label}`}
                         >
                           {badge.label}
                         </span>

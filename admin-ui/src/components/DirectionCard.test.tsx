@@ -633,3 +633,33 @@ describe('DirectionCard generalized outcome metrics', () => {
     expect(screen.queryByText(/eval/)).not.toBeInTheDocument();
   });
 });
+
+describe('DirectionCard staged retarget control', () => {
+  function stagedProps(overrides: Partial<Direction> = {}) {
+    const d = makeDirection({ status: 'staged', staged_for_version: 5, ...overrides });
+    return {
+      ...makeProps(d, 'staged'),
+      activateStagedDirection: vi.fn(),
+      cancelStagedDirection: vi.fn(),
+      retargetStagedDirection: vi.fn(),
+      stageTargetVersion: 5,
+    };
+  }
+
+  it('retargets a staged direction to the entered version', () => {
+    const props = stagedProps();
+    render(<DirectionCard {...props} />);
+
+    fireEvent.change(screen.getByPlaceholderText('5'), { target: { value: '7' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Retarget' }));
+
+    expect(props.retargetStagedDirection).toHaveBeenCalledWith('d-1', 7);
+  });
+
+  it('disables the retarget button until a version is entered', () => {
+    const props = stagedProps();
+    render(<DirectionCard {...props} />);
+
+    expect(screen.getByRole('button', { name: 'Retarget' })).toBeDisabled();
+  });
+});

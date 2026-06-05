@@ -89,4 +89,39 @@ describe('projectStatusBadge', () => {
       }).label).toBe('Failed');
     });
   });
+
+  describe('stale data degradation', () => {
+    it('defaults to non-stale for string and object input', () => {
+      expect(projectStatusBadge('DEPLOYING').stale).toBe(false);
+      expect(projectStatusBadge({ status: 'DEPLOYING' }).stale).toBe(false);
+    });
+
+    it('marks the label and desaturates classes when stale', () => {
+      const badge = projectStatusBadge({ status: 'DEPLOYING', stale: true });
+      expect(badge.stale).toBe(true);
+      expect(badge.label).toBe('Running · stale');
+      expect(badge.classes).toContain('opacity-60');
+      expect(badge.classes).toContain('saturate-50');
+    });
+
+    it('preserves the base color classes alongside the dimming', () => {
+      // A stale "Running" reading keeps its emerald base but is visibly dimmed,
+      // so it can never read as a live authoritative green badge.
+      const badge = projectStatusBadge({ status: 'DEPLOYING', stale: true });
+      expect(badge.classes).toContain('text-emerald-400');
+      expect(badge.classes).toContain('opacity-60');
+    });
+
+    it('degrades terminal states too', () => {
+      const badge = projectStatusBadge({ status: 'COMPLETED', stale: true });
+      expect(badge.label).toBe('Completed · stale');
+      expect(badge.classes).toContain('opacity-60');
+    });
+
+    it('does not append the marker when stale is false', () => {
+      const badge = projectStatusBadge({ status: 'DEPLOYING', stale: false });
+      expect(badge.label).toBe('Running');
+      expect(badge.classes).not.toContain('opacity-60');
+    });
+  });
 });

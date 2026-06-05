@@ -670,8 +670,15 @@ async def update_direction(
                 detail="system_id must be a string of at most 100 characters",
             )
 
+    # Resolve and validate the staging TARGET version. Triggered both when a
+    # direction transitions to ``staged`` AND when an already-staged direction is
+    # retargeted to a different version (an explicit ``staged_for_version`` in the
+    # payload without a status change). The target defaults to the current open
+    # version and must be >= it: a version that has already promoted/closed would
+    # auto-activate the direction on the next sweep, which is nonsensical.
     staged_for_version: int | None = None
-    if payload.get("status") == "staged":
+    _wants_staging = payload.get("status") == "staged" or "staged_for_version" in payload
+    if _wants_staging:
         from app.release_version import current_open_version  # noqa: PLC0415
 
         open_version = await current_open_version(session, project.id)
@@ -680,7 +687,24 @@ async def update_direction(
                 status_code=404,
                 detail="No open release version found for this project.",
             )
-        staged_for_version = open_version.version_number
+        target = payload.get("staged_for_version")
+        if target is None:
+            staged_for_version = open_version.version_number
+        elif not isinstance(target, int) or isinstance(target, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="staged_for_version must be an integer version number",
+            )
+        elif target < open_version.version_number:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"staged_for_version {target} has already promoted; choose the "
+                    f"current open version ({open_version.version_number}) or later"
+                ),
+            )
+        else:
+            staged_for_version = target
 
     updated_direction: list = []  # [d] populated by mutate_fn
 
@@ -737,6 +761,18 @@ async def update_direction(
                     # When reviving from expired back to proposed, clear expired_at
                     if payload["status"] == "proposed":
                         d.pop("expired_at", None)
+                # Retarget an already-staged direction to a different version
+                # without re-staging it (no status change). Only a currently
+                # staged direction can be retargeted; the resolved/validated
+                # target replaces its marker so the strategist + activation sweep
+                # bind it to the new version.
+                if "staged_for_version" in payload and payload.get("status") != "staged":
+                    if d.get("status") != "staged":
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Only a staged direction can be retargeted to a different version",
+                        )
+                    d["staged_for_version"] = staged_for_version
                 if "text" in payload:
                     d["text"] = payload["text"]
                 if "paths" in payload:

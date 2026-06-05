@@ -747,6 +747,7 @@ export default function App() {
       <ProjectDashboard
         projects={s.projects}
         tasks={s.tasks}
+        dataStale={s.projectsFetchError != null}
         selectedProjectId={s.selectedProjectId}
         onSelectProject={s.setSelectedProjectId}
         userRole={s.userRole}
