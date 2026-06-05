@@ -23,6 +23,10 @@ from sqlmodel import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.broadcast import broadcast_to_project
+from app.ci_resolution import (
+    BENIGN_UNVERIFIED_REASONS,
+    DEGRADED_UNVERIFIED_REASONS,
+)
 from app.models import (
     Project,
     Task,  # used in the "Task" string annotation on _maybe_create_failure_alert
@@ -363,23 +367,17 @@ _UNVERIFIED_REASON_LABELS = {
     ),
 }
 
-# Severity escalation for no-CI UNVERIFIED-merge reasons: degraded environment/setup
-# failures escalate to ERROR, benign fall-open reasons stay WARNING.
+# Severity escalation for no-CI UNVERIFIED-merge reasons: degraded environment/
+# setup failures escalate to ERROR, benign fall-open reasons stay WARNING.
+#
+# DERIVED — not hand-listed — from the single source of truth in
+# ``app.ci_resolution`` (``DEGRADED_UNVERIFIED_REASONS`` / ``BENIGN_UNVERIFIED_REASONS``)
+# so the benign-vs-degraded partition lives in exactly one place and the
+# AlertSeverity mapping cannot drift from the success-scoring classifier. The
+# resulting dict is byte-for-byte identical to the former literal.
 _UNVERIFIED_REASON_SEVERITY = {
-    # ERROR (degraded): environment/setup failure prevented verification that was expected
-    "verify_setup_failed": AlertSeverity.ERROR,
-    "undetected_runtime": AlertSeverity.ERROR,
-    "suite_all_skipped": AlertSeverity.ERROR,
-    "probe_could_not_run": AlertSeverity.ERROR,
-    "probe_no_artifact": AlertSeverity.ERROR,
-    "documented_command_could_not_run": AlertSeverity.ERROR,
-    "documented_command_no_artifact": AlertSeverity.ERROR,
-    # WARNING (benign): no verification expected or only positive signals obtained
-    "no_detectable_test_command": AlertSeverity.WARNING,
-    "kill_switch_off": AlertSeverity.WARNING,
-    "internal_staging_base": AlertSeverity.WARNING,
-    "probe_passed": AlertSeverity.WARNING,
-    "documented_command_passed": AlertSeverity.WARNING,
+    **{reason: AlertSeverity.ERROR for reason in DEGRADED_UNVERIFIED_REASONS},
+    **{reason: AlertSeverity.WARNING for reason in BENIGN_UNVERIFIED_REASONS},
 }
 
 

@@ -567,10 +567,10 @@ export function DirectionPortfolioSection({
                       <span
                         className={d.cost_per_merge_exceeds_threshold ? 'text-red-400 font-semibold' : 'text-neutral-400'}
                         title={d.cost_per_merge_exceeds_threshold
-                          ? `Cost per merged PR exceeds threshold${medianCostPerMergedPr != null ? ` (project median: $${medianCostPerMergedPr.toFixed(2)})` : ''}`
-                          : 'Cost per merged PR'}
+                          ? `Cost per autonomous merge exceeds threshold${medianCostPerMergedPr != null ? ` (project median: $${medianCostPerMergedPr.toFixed(2)})` : ''}`
+                          : 'Cost per autonomous merge — operator-assisted merges are excluded from the denominator'}
                       >
-                        {d.cost_per_merge_exceeds_threshold && <span className="mr-0.5">⚠</span>}${d.cost_per_merged_pr.toFixed(2)}/PR
+                        {d.cost_per_merge_exceeds_threshold && <span className="mr-0.5">⚠</span>}${d.cost_per_merged_pr.toFixed(2)}/autonomous
                       </span>
                     )}
                     {d.avg_time_to_merge_hours != null && (

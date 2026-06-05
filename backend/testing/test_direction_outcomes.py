@@ -477,6 +477,136 @@ async def test_conversion_rate_division_by_zero(db_session: AsyncSession):
     assert entry["conversion_rate"] is None
 
 
+def test_verified_merged_count_helper():
+    """verified_merged_count prefers verified_prs_merged, falls back to prs_merged."""
+    from app.direction_outcomes import verified_merged_count
+
+    # Legacy entry (no verified_prs_merged) → falls back to raw prs_merged.
+    assert verified_merged_count({"prs_merged": 4}) == 4
+    # New entry → uses verified count (degraded merges already excluded).
+    assert verified_merged_count({"prs_merged": 4, "verified_prs_merged": 2}) == 2
+    # Empty / missing → 0.
+    assert verified_merged_count({}) == 0
+
+
+@pytest.mark.asyncio
+async def test_conversion_rate_excludes_degraded_unverified_merge(
+    db_session: AsyncSession,
+):
+    """Conversion counts verified + benign-unverified merges, NOT degraded ones."""
+    direction_id = "d-verif-conv"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
+    await db_session.flush()
+
+    # Verified merge — no fall-open reason.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        title="verified",
+    )
+    # Benign-unverified merge (no runnable suite) — a legitimate positive signal.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "review_loop": {"unverified_merge_reason": "no_detectable_test_command"},
+        },
+        title="benign",
+    )
+    # Degraded-unverified merge (verify setup failed) — never actually verified.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "review_loop": {"unverified_merge_reason": "verify_setup_failed"},
+        },
+        title="degraded",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["prs_merged"] == 3
+    assert entry["verified_prs_merged"] == 2
+    # Verification-aware: 2 (verified + benign) / 3 created, NOT 3/3.
+    assert entry["conversion_rate"] == round(2 / 3, 3)
+
+
+def test_churn_metrics_excludes_degraded_unverified_merges():
+    """_compute_churn_metrics counts degraded merges as non-merge finished work."""
+    from app.strategic_completion import _compute_churn_metrics
+
+    # Each cycle: 2 completed, 2 merged of which only 1 verified (1 degraded).
+    direction = {
+        "research_history": [
+            {"tasks_completed": 2, "prs_merged": 2, "verified_prs_merged": 1},
+            {"tasks_completed": 2, "prs_merged": 2, "verified_prs_merged": 1},
+            {"tasks_completed": 2, "prs_merged": 2, "verified_prs_merged": 1},
+        ]
+    }
+    metrics = _compute_churn_metrics(direction)
+    # Verified-aware merged = 3 of 6 finished → 0.5 (raw prs_merged would be 1.0).
+    assert metrics["merged"] == 3
+    assert metrics["merge_rate"] == 0.5
+
+
+def test_lifetime_burn_excludes_degraded_unverified_merges():
+    """_compute_lifetime_burn_metrics uses verified counts (window + aggregate)."""
+    from app.strategic_completion import _compute_lifetime_burn_metrics
+
+    direction = {
+        "research_history": [
+            {"tasks_completed": 4, "prs_merged": 4, "verified_prs_merged": 2},
+        ],
+        "history_aggregate": {
+            "total_tasks_completed": 4,
+            "total_prs_merged": 4,
+            "total_verified_prs_merged": 2,
+        },
+    }
+    m = _compute_lifetime_burn_metrics(direction)
+    # lifetime_merged = 2 (window verified) + 2 (agg verified) = 4, of 8 finished.
+    assert m["lifetime_merged"] == 4
+    assert m["lifetime_merge_rate"] == 0.5
+
+
+def test_lifetime_burn_legacy_aggregate_falls_back_to_total_prs_merged():
+    """Aggregates predating total_verified_prs_merged use total_prs_merged."""
+    from app.strategic_completion import _compute_lifetime_burn_metrics
+
+    direction = {
+        "research_history": [],
+        "history_aggregate": {
+            "total_tasks_completed": 4,
+            "total_prs_merged": 4,
+        },
+    }
+    m = _compute_lifetime_burn_metrics(direction)
+    assert m["lifetime_merged"] == 4
+
+
 @pytest.mark.asyncio
 async def test_rejected_and_review_counts_require_completed_status(
     db_session: AsyncSession,
@@ -4129,3 +4259,73 @@ async def test_product_vs_structural_classification_registry_driven(
     # 3 product / 6 total = 0.5, 3 structural.
     assert entry["product_ratio"] == 0.5
     assert entry["structural_count"] == 3
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# verified_prs_merged
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_verified_prs_merged_excludes_degraded(db_session: AsyncSession):
+    """verified_prs_merged counts only merges NOT falling open for a degraded reason."""
+    direction_id = "d-verified-prs"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
+    await db_session.flush()
+
+    # 1. Verified merge (no unverified_merge_reason).
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": True},
+        title="verified-merge",
+    )
+    # 2. Benign unverified merge (project has no test suite — not penalised).
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "review_loop": {"unverified_merge_reason": "no_detectable_test_command"},
+        },
+        title="benign-unverified",
+    )
+    # 3. Degraded unverified merge (env/setup failure blocked verification).
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "review_loop": {"unverified_merge_reason": "verify_setup_failed"},
+        },
+        title="degraded-unverified",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    # All three PR merges count in the raw metric (back-compat).
+    assert entry["prs_merged"] == 3
+    # Only verified + benign count as verified merges (degraded excluded).
+    assert entry["verified_prs_merged"] == 2

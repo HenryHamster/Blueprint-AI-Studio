@@ -206,24 +206,53 @@ function AuditReconciliationRow({ rec }: { rec: AuditReconciliation }) {
 
 function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadiness | null | undefined }) {
   if (!readiness) return null;
-  const { ready, reason, verdicts_evaluated, would_promote_rate, consecutive_clean_passes, recurring_blockers } = readiness;
+  const { ready, reason, verdicts_evaluated, would_promote_rate, consecutive_clean_passes, recurring_blockers, caveat } = readiness;
   const hasBlockers = Object.keys(recurring_blockers ?? {}).length > 0;
+  // Once promotion is live, this dry-run window is frozen pre-go-live history —
+  // it no longer receives verdicts, so it is NOT current readiness. Label it as a
+  // historical calibration window rather than presenting a stale 'ready' number.
+  const isHistoricalCalibration = readiness.is_current_readiness === false;
+  if (isHistoricalCalibration) {
+    return (
+      <div className="mt-1 pt-1 border-t border-neutral-700/50 space-y-0.5">
+        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-neutral-500/10 border-neutral-500/30 text-neutral-400" title={reason}>
+          pre-go-live dry-run calibration (historical)
+        </span>
+        <p className="text-[10px] text-neutral-500 line-clamp-2">{reason}</p>
+        {verdicts_evaluated > 0 && (
+          <p className="text-[9px] text-neutral-600">
+            {verdicts_evaluated} pre-go-live dry-run{verdicts_evaluated !== 1 ? 's' : ''} · {consecutive_clean_passes} clean streak (frozen)
+          </p>
+        )}
+      </div>
+    );
+  }
+  // would_promote_rate is the qualifier's own confidence>=threshold rate — a
+  // self-approval rate, not a validated precision (no post-promotion outcome is
+  // recorded). Surface this honestly rather than implying a "trustworthy" verdict.
+  const selfApprovalCaveat = caveat ?? 'self-approval only — no post-promotion outcome is recorded';
   return (
     <div className="mt-1 pt-1 border-t border-neutral-700/50 space-y-0.5">
       <div className="flex flex-wrap items-center gap-2">
-        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${ready ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-amber-500/10 border-amber-500/30 text-amber-400'}`}>
-          {ready ? 'ready to promote' : 'not ready'}
+        <span
+          className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${ready ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-amber-500/10 border-amber-500/30 text-amber-400'}`}
+          title={selfApprovalCaveat}
+        >
+          {ready ? 'self-approval streak clears thresholds' : 'not ready'}
         </span>
         {verdicts_evaluated > 0 && (
           <span className="text-[10px] text-neutral-500">{verdicts_evaluated} dry-run{verdicts_evaluated !== 1 ? 's' : ''}</span>
         )}
         {verdicts_evaluated > 0 && (
-          <span className="text-[10px] text-neutral-500">{Math.round(would_promote_rate * 100)}% pass rate</span>
+          <span className="text-[10px] text-neutral-500" title={selfApprovalCaveat}>{Math.round(would_promote_rate * 100)}% self-approval rate</span>
         )}
         {consecutive_clean_passes > 0 && (
           <span className="text-[10px] text-neutral-500">{consecutive_clean_passes} clean streak</span>
         )}
       </div>
+      {ready && (
+        <p className="text-[9px] text-neutral-600 italic">{selfApprovalCaveat}</p>
+      )}
       {!ready && reason && (
         <p className="text-[10px] text-neutral-400 line-clamp-2">{reason}</p>
       )}

@@ -190,6 +190,23 @@ describe('FIX_TASK_FOCUS — content invariants', () => {
     const { FIX_TASK_FOCUS } = await import('./task-type-focus.js');
     expect(FIX_TASK_FOCUS).toContain('Cross-file consistency');
   });
+
+  it('requires a reproduce-on-HEAD gate before editing', async () => {
+    const { FIX_TASK_FOCUS } = await import('./task-type-focus.js');
+    expect(FIX_TASK_FOCUS).toContain('Reproduced-on-HEAD gate');
+    expect(FIX_TASK_FOCUS).toContain('still reproduces on current HEAD');
+  });
+
+  it('routes a non-reproducing finding to the already-resolved no-op off-ramp', async () => {
+    const { FIX_TASK_FOCUS } = await import('./task-type-focus.js');
+    expect(FIX_TASK_FOCUS).toContain('./done --already-done');
+    expect(FIX_TASK_FOCUS).toContain('no-op rather than a false fix');
+  });
+
+  it('keeps the not-reproducible bar high so ambiguity falls through to the fix path', async () => {
+    const { FIX_TASK_FOCUS } = await import('./task-type-focus.js');
+    expect(FIX_TASK_FOCUS).toContain('not-reproducible bar HIGH');
+  });
 });
 
 describe('DOCS_TASK_FOCUS — content invariants', () => {

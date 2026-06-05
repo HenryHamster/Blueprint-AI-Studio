@@ -79,6 +79,9 @@ from app.source_ref_validation import (
     summarize_broken_refs,
     summarize_ungrounded_claims,  # noqa: F401 — re-exported for callers/tests
     detect_absent_symbols,
+    resolve_head_commit,
+    cited_paths_changed_since,
+    finding_cited_paths,
 )
 from app.scope_complexity import _composite_complexity_score
 from app.shared_state import (
@@ -112,6 +115,7 @@ from app.task_locking import (
 )
 from app.plan_completion import (
     _validate_plan_dependencies,
+    _break_dependency_cycles,
     _log_file_overlaps,
     TASK_PRIORITY_MAP,
 )
@@ -121,9 +125,15 @@ logger = logging.getLogger(__name__)
 
 # Task types whose effort is driven by the calibrated scope rather than the
 # type-level task_type_efforts config default. These are the "implementation"
-# types where cost should scale with code-change size; specialized types like
-# research/security_audit/qa keep their type-level effort regardless of scope.
-_SCOPE_AWARE_EFFORT_TYPES = frozenset({"create", "fix", "refactor", "plan"})
+# types where cost should scale with code-change size: create, fix, refactor,
+# plan spawn implementation subtasks at scope-derived effort; qa and migrate
+# ship real code/schema changes that scale from trivial (one test/one column) to
+# large (test restructuring/multi-table refactoring), so they benefit from the
+# same scaling. deps and docs are omitted — dependency updates and docs tend to
+# be lightweight and consistent across scope, so their type-level effort is kept.
+_SCOPE_AWARE_EFFORT_TYPES = frozenset(
+    {"create", "fix", "refactor", "plan", "qa", "migrate"}
+)
 
 # Minimum medium-scope exploration fraction. Prevents the adaptive formula from
 # collapsing to 0 for a direction with no successful medium merges, which would
@@ -200,6 +210,38 @@ def _reconcile_verification_basis(
         ungrounded_count,
     )
     return True
+
+
+def _staleness_provenance_warning(
+    finding: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Return a provenance warning when deferred findings need HEAD revalidation."""
+    if finding.get("needs_revalidation") is not True:
+        return None
+    if (
+        finding.get("needs_revalidation_reason")
+        == "cited_files_changed_since_generation"
+    ):
+        return {"cited_files_changed_since_generation": True}
+    return None
+
+
+def _merge_provenance_warnings(
+    finding: Dict[str, Any],
+    *warnings: Optional[Dict[str, Any]],
+) -> None:
+    """Merge provenance warnings onto a finding, preserving existing signals."""
+    merged: Dict[str, Any] = {}
+    existing = finding.get("_provenance_warnings")
+    if isinstance(existing, dict):
+        merged.update(existing)
+    for warning in warnings:
+        if warning:
+            merged.update(warning)
+    if merged:
+        finding["_provenance_warnings"] = merged
+    else:
+        finding.pop("_provenance_warnings", None)
 
 
 def _trim_finding_for_memo(finding: Dict[str, Any]) -> Dict[str, Any]:
@@ -740,6 +782,30 @@ def _apply_structural_actionability_downgrade(findings: list) -> int:
     return downgrades
 
 
+def _record_research_survival_signal(task: Task, *, surviving: int) -> None:
+    """Record the honest research success signal on the task at dispatch time.
+
+    ``surviving`` is the count of findings that survived ingestion validation +
+    dedup + actionability gating and were routed to work (spawned, or deferred
+    only for capacity/health reasons). Stored on ``task.context`` so the outcome
+    evaluator (``task_outcomes._evaluate_research``) scores the cycle on real
+    surviving work rather than the raw parsed-findings list.
+
+    A cycle whose findings were ALL rejected (stale duplicates, citations absent
+    on HEAD, low actionability) yields ``surviving == 0``; in that case any
+    first-attempt-success flag that bare-COMPLETED status set upstream is
+    downgraded to honest ``False`` — a no-surviving cycle is a neutral terminal
+    outcome, not a first-attempt win. The flag is never upgraded to ``True``
+    here (a later attempt keeps its existing ``False``).
+    """
+    ctx = dict(task.context or {})
+    ctx["research_surviving_findings"] = int(surviving)
+    if surviving <= 0 and ctx.get("_first_attempt_succeeded"):
+        ctx["_first_attempt_succeeded"] = False
+    task.context = ctx
+    flag_modified(task, "context")
+
+
 def _summarize_dispatch_outcome(
     spawned: int,
     total_findings: int,
@@ -975,6 +1041,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     if not findings:
         task.latest_status_message = "Research completed with no actionable findings"
         task.plan_output = []
+        _record_research_survival_signal(task, surviving=0)
         session.add(task)
         await session.commit()
         return
@@ -1032,8 +1099,32 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             )
             _src_ref_ctx = {}
 
+    # Record the integration HEAD these findings were generated against, so a
+    # later re-dispatch can answer the one cheap question that gates trust: have
+    # the cited files changed since? Resolved once against the same verification
+    # context the citation checks use. Degrades to None (no stamp) when the SHA
+    # is unknown (no creds + no checkout) — a missing SHA never marks a finding
+    # stale downstream.
+    _generated_head_sha: Optional[str] = None
+    if project_obj is not None:
+        try:
+            _generated_head_sha = await resolve_head_commit(**_src_ref_ctx)
+        except Exception:  # noqa: BLE001 — provenance must never crash ingestion
+            logger.debug(
+                "[RESEARCH] head-commit provenance resolution failed", exc_info=True
+            )
+            _generated_head_sha = None
+
     # Validate optional structured fields: claims and sources.
+    # Count findings whose cited code is absent on the integration HEAD (broken
+    # file citation or ungrounded path:symbol claim). A finding that cites code
+    # not present on HEAD definitionally does not reproduce on HEAD, so this
+    # count is recorded on the task as the honest "rejected for does-not-exist-
+    # on-HEAD" signal — separate from the surviving-finding success signal below.
+    _broken_citation_findings = 0
     for _f in findings:
+        if _generated_head_sha and not _f.get("generated_head_sha"):
+            _f["generated_head_sha"] = _generated_head_sha
         if "claims" in _f and not isinstance(_f.get("claims"), list):
             _f["claims"] = []
         _broken_provenance: Optional[Dict[str, Any]] = None
@@ -1067,12 +1158,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         )
         if _ungrounded is not None:
             _f["_ungrounded_claim_count"] = _ungrounded["ungrounded_claim_count"]
-        # Merge file-citation and symbol grounding warnings into one provenance
-        # blob propagated to child task context.
-        if _broken_provenance and _ungrounded:
-            _f["_provenance_warnings"] = {**_broken_provenance, **_ungrounded}
-        elif _broken_provenance or _ungrounded:
-            _f["_provenance_warnings"] = _broken_provenance or _ungrounded
+        # Merge file-citation, symbol grounding, and any already-known staleness
+        # warnings into the provenance blob propagated to child task context.
+        _merge_provenance_warnings(
+            _f,
+            _broken_provenance,
+            _ungrounded,
+            _staleness_provenance_warning(_f),
+        )
+        if _broken_provenance or _ungrounded:
+            _broken_citation_findings += 1
         # Reconcile the self-reported verification_basis against the validation
         # just computed: a finding cannot honestly claim a verified-against-code
         # tier while its own citations are absent at HEAD. Reuses the broken-ref
@@ -1106,6 +1201,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     task.context = {
         **(task.context or {}),
         "_actionability_structural_downgrades": _structural_downgrades,
+        "research_broken_citation_rejected": _broken_citation_findings,
     }
     session.add(task)
     await session.commit()
@@ -1185,9 +1281,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             )
         prior_actionable = _fresh_actionable
         # Decay: discard findings that have been deferred repeatedly for outcome-blind
-        # reasons (ultra_low_confidence / degradation_gate / low_actionability).
-        # Retrying them unchanged wastes a findings slot each cycle. batch_cap deferrals
-        # are pure capacity constraints and are not decayed.
+        # reasons (ultra_low_confidence / degradation_gate / low_actionability /
+        # prereq_deferred_same_cycle). Retrying them unchanged wastes a findings slot
+        # each cycle. batch_cap deferrals are pure capacity constraints and are not
+        # decayed.
         _decayed: list[dict] = []
         _kept: list[dict] = []
         for f in prior_actionable:
@@ -1199,6 +1296,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 _decayed.append(f)
             elif _reason == "low_actionability" and _count >= 3:
                 _decayed.append(f)
+            elif _reason == "prereq_deferred_same_cycle" and _count >= 3:
+                # Co-deferred dependent whose foundation never re-surfaced in time:
+                # give up after 3 cycles (its deferred foundation has typically
+                # decayed by then too) rather than retrying the coupled pair forever.
+                _decayed.append(f)
             else:
                 _kept.append(f)
         if _decayed:
@@ -1208,6 +1310,26 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 f"titles={[f.get('title') or f.get('description', '')[:60] for f in _decayed]}"
             )
         prior_actionable = _kept
+        # Stale-targeting: a deferred finding carries the integration HEAD it was
+        # generated against. On re-dispatch, ask whether any cited file changed
+        # between that commit and the current branch tip; if so, the finding may
+        # no longer reproduce — flag it for the reproduce-on-HEAD gate rather than
+        # trusting it as fresh. Conservative: an unknown SHA or an uncomputable
+        # diff (no creds + no checkout, API error) never raises the flag.
+        for f in prior_actionable:
+            _gen_sha = f.get("generated_head_sha")
+            if not _gen_sha:
+                continue
+            try:
+                _changed = await cited_paths_changed_since(
+                    _gen_sha, finding_cited_paths(f), **_src_ref_ctx
+                )
+            except Exception:  # noqa: BLE001 — re-validation must never crash recovery
+                _changed = None
+            if _changed is True:
+                f["needs_revalidation"] = True
+                f["needs_revalidation_reason"] = "cited_files_changed_since_generation"
+            _merge_provenance_warnings(f, _staleness_provenance_warning(f))
         if prior_actionable:
             logger.info(
                 f"[RESEARCH] Prepending {len(prior_actionable)} deferred finding(s) from previous cycle "
@@ -1277,8 +1399,28 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 pair[1].get("priority", "medium"), 1
             ),
         )
-        _kept_orig_indices = sorted(i for i, _ in _ranked[:_effective_cap])
-        _kept_set = set(_kept_orig_indices)
+        _kept_set = {i for i, _ in _ranked[:_effective_cap]}
+        # Co-defer any kept finding whose depends_on_indices points at a finding the
+        # cap dropped. Without this, the index remap below silently DROPS that edge
+        # (the target index is not in _old_to_new), and the dependent spawns as an
+        # ordinary child with no edge and no blocking need — dispatching against a
+        # foundation that does not exist yet. Mirror the same-cycle prerequisite
+        # co-deferral: shelve the dependent alongside its deferred foundation so the
+        # pair re-surfaces together next cycle. Iterate to a fixpoint so an entire
+        # dependent chain co-defers, never just the leaf.
+        while True:
+            _co_defer = {
+                i
+                for i in _kept_set
+                if any(
+                    0 <= d < len(findings) and d not in _kept_set
+                    for d in (findings[i].get("depends_on_indices") or [])
+                )
+            }
+            if not _co_defer:
+                break
+            _kept_set -= _co_defer
+        _kept_orig_indices = sorted(_kept_set)
         _batch_cap_deferred = [f for i, f in enumerate(findings) if i not in _kept_set]
         _old_to_new = {old: new for new, old in enumerate(_kept_orig_indices)}
         findings = [findings[i] for i in _kept_orig_indices]
@@ -1322,13 +1464,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         return
     task = relocked
 
-    # Validate dependencies if present
+    # Validate dependencies if present. On a cycle, break it MINIMALLY — drop
+    # only the edges that close a cycle (mirroring the plan path) rather than
+    # wholesale-discarding every declared edge, so valid prerequisite chains
+    # elsewhere in the batch keep gating their dependents.
     if not _validate_plan_dependencies(findings):
+        _dropped_cycle_edges = _break_dependency_cycles(findings, "RESEARCH")
         logger.warning(
-            "[RESEARCH] Findings have circular dependencies — ignoring depends_on_indices"
+            "[RESEARCH] Findings have circular dependencies — broke %d cycle-closing "
+            "edge(s), preserved the remaining declarations",
+            len(_dropped_cycle_edges),
         )
-        for f in findings:
-            f.pop("depends_on_indices", None)
+        if _dropped_cycle_edges:
+            _ctx = dict(task.context or {})
+            _ctx["dropped_finding_cycle_edges"] = _dropped_cycle_edges
+            task.context = _ctx
 
     # Query active/queued tasks for word-overlap deduplication
     existing_tasks = (
@@ -2702,6 +2852,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         dedup_outcome=_dedup_outcome,
         deferred_reason_parts=_deferral_reasons,
     )
+    # Honest success signal: count findings that SURVIVED ingestion validation +
+    # dedup + actionability and were routed to work — spawned, or deferred only
+    # for capacity/health reasons (batch cap, pipeline degradation). Findings
+    # dropped as low-actionability / stale-duplicate / broken-citation did NOT
+    # survive and are excluded, so a cycle whose findings were all rejected
+    # scores neutral instead of a spurious success.
+    _surviving_findings = (
+        _impl_spawned + len(_batch_cap_deferred) + len(_degradation_gate_deferred)
+    )
+    _record_research_survival_signal(task, surviving=_surviving_findings)
     session.add(task)
 
     await session.commit()
@@ -2739,13 +2899,56 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     from app.task_blocked import build_need, enter_blocked_state  # noqa: PLC0415
 
     _prereq_candidates = list(existing_tasks) + list(child_tasks)
+    # Identities (kind, ref) that a finding deferred THIS cycle would satisfy. A
+    # dependent blocked on one of these sits live-blocked behind dormant data: the
+    # deferred foundation is not a real task, so nothing can satisfy the need until
+    # it is both re-surfaced AND re-spawned in some future cycle. If that re-surface
+    # keeps getting throttled (decay / capacity), the dependent exhausts its bounded
+    # blocked re-evaluation budget and is auto-cancelled, discarding researched
+    # work. Such a dependent is co-deferred with its prerequisite (below) so the two
+    # re-surface as a unit instead of being left live.
+    _deferred_identities: set[tuple] = set()
+    for _df in _all_deferred:
+        _dfh = _df.get("finding_hash")
+        if _dfh:
+            _deferred_identities.add(("task", _dfh))
+        _dcap = _df.get("_provides_capability")
+        if isinstance(_dcap, str) and _dcap.strip():
+            _deferred_identities.add(("capability", _dcap.strip()))
+    _codeferred_findings: list[dict] = []
     for ci, ct in enumerate(child_tasks):
         fi = finding_indices[ci]
+        finding_title = findings[fi].get("title", f"#{fi}")
+        # Collect EVERY declared-but-unsatisfied prerequisite for this child into a
+        # single set of machine-resolvable needs, so the dependent stays gated
+        # until ALL of them are accounted for — not just the first. A single
+        # dependent can have more than one unresolved prerequisite, and gating on
+        # only the first one lets it resume (and rebuild the others) the moment
+        # that first foundation lands. Two prerequisite sources contribute:
+        #   (a) EVERY missing sibling finding named via depends_on_indices that was
+        #       deduped/deferred this cycle (previously only missing_dep_indices[0]
+        #       was gated); and
+        #   (b) an explicit {kind, ref} prerequisite that did NOT resolve to an
+        #       in-flight / sibling foundation (previously dropped whenever a
+        #       sibling prerequisite was also missing — the `continue` short-circuit).
+        # A prerequisite that DID resolve still gets a real depends_on edge wired
+        # below (that path is correct); only the unresolved remainder becomes needs.
+        needs: list = []
+        unresolved_entries: list = []
+
         dep_indices = findings[fi].get("depends_on_indices", [])
         missing_dep_indices = [j for j in dep_indices if j not in finding_to_child]
-        if missing_dep_indices:
-            missing_fi = missing_dep_indices[0]
-            missing_finding = findings[missing_fi] if missing_fi < len(findings) else {}
+        for missing_fi in missing_dep_indices:
+            if not (0 <= missing_fi < len(findings)):
+                logger.warning(
+                    "[RESEARCH] Finding '%s' depends_on_indices contains out-of-range "
+                    "index %d (valid range: 0..%d); skipping",
+                    finding_title,
+                    missing_fi,
+                    len(findings) - 1,
+                )
+                continue
+            missing_finding = findings[missing_fi]
             missing_title = missing_finding.get("title", f"#{missing_fi}")
             missing_hash = _finding_hash(
                 str(missing_title),
@@ -2756,127 +2959,157 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     or ""
                 ),
             )
-            ctx = dict(ct.context or {})
-            unresolved = ctx.get("unresolved_prerequisite") or []
-            unresolved_list = unresolved if isinstance(unresolved, list) else [unresolved]
-            unresolved_list.append(
+            unresolved_entries.append(
                 {
                     "finding_index": missing_fi,
                     "title": missing_title,
                     "finding_hash": missing_hash,
                 }
             )
-            ctx["unresolved_prerequisite"] = unresolved_list
-            ct.context = ctx
-            need = build_need("task", missing_hash, label=missing_title)
-            if need:
-                enter_blocked_state(
-                    ct,
-                    waiting_on=f"foundation task:{missing_hash}",
-                    reason=(
-                        f"Finding '{findings[fi].get('title', f'#{fi}')}' declared sibling "
-                        f"prerequisite '{missing_title}' but it was not spawned this cycle; "
-                        "blocked until the prerequisite appears or the blocked-resume sweep resolves it."
-                    ),
-                    source="research_prerequisite",
-                    blocker_kind="upstream_dependency",
-                    need=need,
-                )
-            session.add(ct)
-            logger.warning(
-                "[RESEARCH] Finding '%s' declared sibling prerequisite '%s' but it was not spawned; "
-                "dependent BLOCKED on the unresolved need",
-                findings[fi].get("title", f"#{fi}"),
-                missing_title,
-            )
-            continue
+            sibling_need = build_need("task", missing_hash, label=missing_title)
+            if sibling_need:
+                needs.append(sibling_need)
+
+        # Explicit {kind, ref} prerequisite: wire a real edge if it resolved to an
+        # in-flight / sibling foundation this cycle, otherwise add it to the needs
+        # set. This branch is NO LONGER short-circuited when a sibling prerequisite
+        # is also missing, so an explicit prerequisite is never silently dropped.
         prereq = findings[fi].get("_prerequisite")
-        if not prereq:
-            continue
-        foundation = resolve_prerequisite_task(prereq, _prereq_candidates)
-        if foundation is None or foundation.id == ct.id:
-            # Unresolved prerequisite: a finding declared an explicit {kind, ref}
-            # foundation it must build on, but no in-flight or sibling task
-            # matched. Rather than spawn the dependent as immediately-runnable
-            # (which lets it rebuild the very foundation it declared it needs —
-            # the "blocked dependents duplicating foundations" failure), block it
-            # on the normalized prerequisite as a machine-resolvable NEED and let
-            # the mature blocked-resume sweep gate it: the sweep wires a real
-            # depends_on edge the moment a matching foundation appears in flight
-            # (reaper_sweeps._resolve_need_into_dep_edge), resumes it with no edge
-            # when the foundation has already landed as completed/merged work
-            # (need_satisfied_by_completed), and escalates loudly to the operator
-            # if the foundation never appears within the deadline.
-            #
-            # Policy: BOTH prerequisite kinds (task, capability) trigger blocking.
-            # Prereq kinds are a subset of NEED_KINDS, so the normalized
-            # prerequisite is already a valid need. A kind=capability ref could in
-            # principle already be satisfied by code that was never a task; the
-            # escalation/auto-resume path is the backstop that clears genuinely-
-            # independent or already-satisfied work rather than parking it forever.
-            # We still stamp context['unresolved_prerequisite'] for operator
-            # visibility in addition to entering BLOCKED.
-            if foundation is None:
-                ctx = dict(ct.context or {})
-                unresolved = ctx.get("unresolved_prerequisite") or {}
-                unresolved_list = unresolved if isinstance(unresolved, list) else [unresolved] if unresolved else []
-                unresolved_list.append(prereq)
-                ctx["unresolved_prerequisite"] = unresolved_list
-                ct.context = ctx
-                need = build_need(
+        if prereq:
+            foundation = resolve_prerequisite_task(prereq, _prereq_candidates)
+            if foundation is not None and foundation.id != ct.id:
+                if _would_create_cycle(ct, foundation, _prereq_candidates):
+                    logger.warning(
+                        "[RESEARCH] Finding '%s' prerequisite %s:%s resolved to "
+                        "foundation %s but the edge would close a depends_on cycle "
+                        "— refused at spawn (no edge)",
+                        finding_title,
+                        prereq.get("kind"),
+                        prereq.get("ref"),
+                        foundation.id,
+                    )
+                else:
+                    foundation_id = str(foundation.id)
+                    existing_dep = list(ct.depends_on or [])
+                    if foundation_id not in existing_dep:
+                        existing_dep.append(foundation_id)
+                        ct.depends_on = existing_dep
+                        remember_structural_depends_on(ct, foundation_id)
+                        session.add(ct)
+                        logger.info(
+                            "[RESEARCH] Wired finding '%s' depends_on foundation %s "
+                            "(prerequisite %s:%s)",
+                            finding_title,
+                            foundation_id,
+                            prereq.get("kind"),
+                            prereq.get("ref"),
+                        )
+            elif foundation is None:
+                # Unresolved explicit prerequisite: a finding declared an explicit
+                # {kind, ref} foundation it must build on, but no in-flight or
+                # sibling task matched. Add it to the needs set so the dependent is
+                # gated (BOTH task and capability kinds trigger blocking; the
+                # blocked-resume sweep wires the edge when the foundation appears,
+                # resumes with no edge when it has already landed, or escalates).
+                prereq_need = build_need(
                     prereq.get("kind"),
                     prereq.get("ref"),
                     label=prereq.get("label"),
                 )
-                if need:
-                    enter_blocked_state(
-                        ct,
-                        waiting_on=f"foundation {need['kind']}:{need['ref']}",
-                        reason=(
-                            f"Finding '{findings[fi].get('title', f'#{fi}')}' declared "
-                            f"prerequisite {need['kind']}:{need['ref']} but no candidate "
-                            f"matched at spawn; blocked until the foundation appears or "
-                            f"the operator escalation fires."
-                        ),
-                        source="research_prerequisite",
-                        blocker_kind="upstream_dependency",
-                        need=need,
-                    )
-                session.add(ct)
-                logger.warning(
-                    "[RESEARCH] Finding '%s' declared prerequisite %s:%s but no candidate matched; "
-                    "dependent BLOCKED on the unresolved need (blocked-resume sweep will wire "
-                    "the edge or escalate)",
-                    findings[fi].get("title", f"#{fi}"),
-                    prereq.get("kind"),
-                    prereq.get("ref"),
-                )
+                if prereq_need:
+                    needs.append(prereq_need)
+                    unresolved_entries.append(prereq)
+            # foundation == ct itself (self-prerequisite): neither edge nor need.
+
+        # Deduplicate needs by (kind, ref) to avoid recording duplicate entries.
+        # When a dependent names the same missing sibling more than once, or an
+        # explicit prerequisite that coincides with a missing sibling, we should
+        # record only one need for that (kind, ref) pair.
+        if needs:
+            seen_keys = set()
+            deduped_needs = []
+            for need in needs:
+                key = (need.get("kind"), need.get("ref"))
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    deduped_needs.append(need)
+            needs = deduped_needs
+
+        if not needs:
             continue
-        if _would_create_cycle(ct, foundation, _prereq_candidates):
-            logger.warning(
-                "[RESEARCH] Finding '%s' prerequisite %s:%s resolved to foundation %s "
-                "but the edge would close a depends_on cycle — refused at spawn (no edge)",
-                findings[fi].get("title", f"#{fi}"),
-                prereq.get("kind"),
-                prereq.get("ref"),
-                foundation.id,
+
+        # Co-defer a dependent whose foundation was deferred THIS cycle. Leaving it
+        # live-blocked strands it behind dormant data (see _deferred_identities):
+        # shelve its finding alongside the deferred prerequisite so the two
+        # re-surface as a unit next cycle, and cancel the live task so it cannot
+        # expire its blocked re-evaluation budget. Independent deferred findings
+        # (no live dependent) keep the existing capacity/actionability throttle.
+        if _deferred_identities and any(
+            (n.get("kind"), n.get("ref")) in _deferred_identities for n in needs
+        ):
+            _codeferred_findings.append(
+                _stamp_deferral(findings[fi], "prereq_deferred_same_cycle")
             )
-            continue
-        foundation_id = str(foundation.id)
-        existing_dep = list(ct.depends_on or [])
-        if foundation_id not in existing_dep:
-            existing_dep.append(foundation_id)
-            ct.depends_on = existing_dep
-            remember_structural_depends_on(ct, foundation_id)
+            ct.status = TaskStatus.CANCELLED
+            ct.latest_status_message = (
+                f"Co-deferred with same-cycle-deferred prerequisite: finding "
+                f"'{finding_title}' shelved to re-surface with its foundation"
+            )[:500]
             session.add(ct)
-            logger.info(
-                "[RESEARCH] Wired finding '%s' depends_on foundation %s "
-                "(prerequisite %s:%s)",
-                findings[fi].get("title", f"#{fi}"),
-                foundation_id,
-                prereq.get("kind"),
-                prereq.get("ref"),
+            logger.warning(
+                "[RESEARCH] Co-deferring dependent '%s' with its same-cycle-deferred "
+                "prerequisite (cancelled task %s; both re-surface next cycle)",
+                finding_title,
+                ct.id,
             )
+            continue
+
+        # Block the dependent ONCE on the FULL set of unresolved prerequisites.
+        # enter_blocked_state persists the whole list under context['blocker']
+        # ['needs'] (mirroring needs[0] into the legacy 'need' key), so the
+        # blocked-resume sweep keeps it gated until every prerequisite resolves.
+        ctx = dict(ct.context or {})
+        existing_unresolved = ctx.get("unresolved_prerequisite") or []
+        if not isinstance(existing_unresolved, list):
+            existing_unresolved = [existing_unresolved]
+        existing_unresolved.extend(unresolved_entries)
+        ctx["unresolved_prerequisite"] = existing_unresolved
+        ct.context = ctx
+        primary = needs[0]
+        waiting_on = f"foundation {primary['kind']}:{primary['ref']}"
+        if len(needs) > 1:
+            waiting_on = f"{waiting_on} (+{len(needs) - 1} more)"
+        reason = (
+            f"Finding '{finding_title}' declared {len(needs)} unresolved "
+            "prerequisite(s) not satisfied this cycle; blocked until every "
+            "prerequisite is wired to an in-flight foundation or has landed."
+        )
+        enter_blocked_state(
+            ct,
+            waiting_on=waiting_on,
+            reason=reason,
+            source="research_prerequisite",
+            blocker_kind="upstream_dependency",
+            needs=needs,
+        )
+        session.add(ct)
+        logger.warning(
+            "[RESEARCH] Finding '%s' BLOCKED on %d unresolved prerequisite(s): %s",
+            finding_title,
+            len(needs),
+            ", ".join(f"{n['kind']}:{n['ref']}" for n in needs),
+        )
+
+    # Persist co-deferred dependents into the same deferred_findings list as their
+    # prerequisites so autonomous_research re-injects the coupled set next cycle.
+    if _codeferred_findings:
+        _cd_ctx = dict(task.context or {})
+        _cd_ctx["deferred_findings"] = (
+            list(_cd_ctx.get("deferred_findings") or []) + _codeferred_findings
+        )
+        task.context = _cd_ctx
+        flag_modified(task, "context")
+        session.add(task)
 
     # Chain auto-decomposed siblings: when a finding is split into N sub-tasks
     # by cochange/path clustering, run them serially rather than in parallel.

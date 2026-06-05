@@ -2,7 +2,14 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { writeStrategicHelpers } from './strategic-helpers.js';
+import {
+  writeStrategicHelpers,
+  writeFetchHelper,
+  buildFetchGuidance,
+  RESEARCH_FETCH_VERBS,
+  PLAN_FETCH_VERBS,
+  STRATEGIC_FETCH_VERBS,
+} from './strategic-helpers.js';
 
 // Use the OS temp dir (not a hardcoded /tmp) so this suite runs on Windows too.
 const testWorkspace = path.join(os.tmpdir(), 'test-strategic-helpers-workspace');
@@ -251,5 +258,108 @@ describe('writeStrategicHelpers', () => {
     // First success path should be 2xx check with exit 0
     expect(content).toContain('if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]');
     expect(content).toContain('exit 0');
+  });
+});
+
+describe('writeFetchHelper (verb-subset read-only fetch)', () => {
+  beforeEach(() => {
+    if (!fs.existsSync(testWorkspace)) {
+      fs.mkdirSync(testWorkspace, { recursive: true });
+    }
+  });
+  afterEach(() => {
+    if (fs.existsSync(testWorkspace)) {
+      try { fs.rmSync(testWorkspace, { recursive: true }); } catch { /* ignore */ }
+    }
+  });
+
+  const readFetch = (): string => fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
+
+  it('full strategic verb set is byte-identical to writeStrategicHelpers output', () => {
+    // The strategic path must stay regression-free: the standalone writer with
+    // STRATEGIC_FETCH_VERBS must emit the exact same script writeStrategicHelpers
+    // emits, so the refactor cannot have changed the strategic agent's tooling.
+    writeFetchHelper('t', 'proj-strat', testWorkspace, { verbs: STRATEGIC_FETCH_VERBS });
+    const viaWriter = readFetch();
+    writeStrategicHelpers('t', 'proj-strat', testWorkspace);
+    const viaStrategic = readFetch();
+    expect(viaWriter).toBe(viaStrategic);
+    // Spot-check the load-bearing usage + case lines the strategic suite pins.
+    expect(viaWriter).toContain('fetch problem-model|direction|playbook|gap|message|section [id]');
+    expect(viaWriter).toContain('problem-model) PATH_SUFFIX="problem-model"');
+    expect(viaWriter).toContain('message)    PATH_SUFFIX="messages/$ID"');
+    expect(viaWriter).toContain('section)    PATH_SUFFIX="design-doc/$ID"');
+  });
+
+  it('bakes ONLY the granted verbs into the case statement (research subset)', () => {
+    writeFetchHelper('t', 'proj-1', testWorkspace, { verbs: RESEARCH_FETCH_VERBS });
+    const content = readFetch();
+    // Granted verbs are real case branches.
+    expect(content).toContain('direction)  PATH_SUFFIX="directions/$ID"');
+    expect(content).toContain('problem-model) PATH_SUFFIX="problem-model"');
+    expect(content).toContain('gap)        PATH_SUFFIX="gaps/$ID"');
+    // Non-granted verbs have NO resolving branch.
+    expect(content).not.toContain('PATH_SUFFIX="playbook/$ID"');
+    expect(content).not.toContain('PATH_SUFFIX="messages/$ID"');
+    expect(content).not.toContain('PATH_SUFFIX="design-doc/$ID"');
+    // Usage line lists only the granted subset (canonical order).
+    expect(content).toContain('Usage: fetch problem-model|direction|gap [id]');
+  });
+
+  it('rejects a disallowed-but-valid verb with a clear not-permitted message', () => {
+    writeFetchHelper('t', 'proj-1', testWorkspace, { verbs: RESEARCH_FETCH_VERBS });
+    const content = readFetch();
+    // playbook/message/section are full-vocabulary verbs not granted here — they
+    // get an explicit reject branch rather than a generic "unknown kind".
+    expect(content).toContain('playbook|message|section) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: problem-model|direction|gap)."');
+  });
+
+  it('different subsets bake different verb vocabularies (plan subset)', () => {
+    writeFetchHelper('t', 'proj-2', testWorkspace, { verbs: PLAN_FETCH_VERBS });
+    const content = readFetch();
+    expect(content).toContain('direction)  PATH_SUFFIX="directions/$ID"');
+    expect(content).toContain('section)    PATH_SUFFIX="design-doc/$ID"');
+    expect(content).toContain('playbook)   PATH_SUFFIX="playbook/$ID"');
+    expect(content).toContain('Usage: fetch direction|playbook|section [id]');
+    // problem-model / gap / message are rejected here.
+    expect(content).toContain('problem-model|gap|message) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: direction|playbook|section)."');
+  });
+
+  it('bakes the project id and escapes shell-injection attempts', () => {
+    writeFetchHelper('t', 'proj$(echo hacked)id', testWorkspace, { verbs: RESEARCH_FETCH_VERBS });
+    const content = readFetch();
+    expect(content).toContain('PROJECT="proj\\$(echo hacked)id"');
+    expect(content).not.toContain('PROJECT="proj$(echo hacked)id"');
+    expect(/(^|[^\\])\$\(echo hacked\)/.test(content)).toBe(false);
+  });
+
+  it('writes an executable fetch script and a generalized empty-project guard', () => {
+    writeFetchHelper('t', 'proj-1', testWorkspace, { verbs: RESEARCH_FETCH_VERBS });
+    const stat = fs.statSync(`${testWorkspace}/fetch`);
+    if (process.platform !== 'win32') {
+      expect((stat.mode & 0o111) !== 0).toBe(true);
+    }
+    const content = readFetch();
+    expect(content.startsWith('#!/bin/bash')).toBe(true);
+    // The empty-project guard is generalized (no longer strategic-only wording).
+    expect(content).toContain('no project_id available; ./fetch is unavailable in this workspace');
+    expect(content).not.toContain('strategic-mode tasks');
+  });
+});
+
+describe('buildFetchGuidance', () => {
+  it('lists ONLY the granted verbs and advertises ./fetch', () => {
+    const block = buildFetchGuidance(RESEARCH_FETCH_VERBS);
+    expect(block).toContain('./fetch');
+    expect(block).toContain('`./fetch direction <id>`');
+    expect(block).toContain('`./fetch problem-model`');
+    expect(block).toContain('`./fetch gap <id>`');
+    // Verbs not granted to research are absent from the guidance.
+    expect(block).not.toContain('`./fetch section');
+    expect(block).not.toContain('`./fetch message');
+  });
+
+  it('returns empty string when no verbs are granted', () => {
+    expect(buildFetchGuidance([])).toBe('');
   });
 });

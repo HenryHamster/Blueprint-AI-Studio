@@ -27,7 +27,7 @@ from app.failure_classification import (
     classify_failure as _classify_failure,
     classify_failure_taxonomy as _classify_taxonomy,
 )
-from app.landed_signal import is_merged_completion
+from app.landed_signal import is_merged_completion, merge_verification_status
 from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
 from app.review_pipeline import _is_test_file
 from app.task_capabilities import PRODUCT_TASK_TYPES
@@ -122,6 +122,28 @@ def is_autonomous_merge(task: Task) -> bool:
     if ctx.get("review_dismissed") or ctx.get("user_overrode_review"):
         return False
     return True
+
+
+def verified_merged_count(entry: dict) -> int:
+    """Verification-aware merged-PR count for a research_history entry.
+
+    Returns the merges whose verification was NOT degraded — i.e. verified
+    merges PLUS benign-unverified merges (no runnable suite, or the no-CI gate
+    deliberately off), but EXCLUDING merges whose test/CI verification was
+    blocked by an environment/setup failure (``unverified_degraded``). This is
+    exactly the ``verified_prs_merged`` field computed in
+    ``_update_direction_research_outcomes``.
+
+    Direction- and pipeline-level rates (conversion, merge, churn, lifetime
+    burn) call this so a degraded-unverified merge does not count as a clean
+    success — matching the per-task outcome layer, which already scores such a
+    merge as neutral. Legacy entries written before ``verified_prs_merged`` was
+    recorded fall back to the raw ``prs_merged`` count, so historical data
+    degrades to prior behavior rather than dropping to zero.
+    """
+    if "verified_prs_merged" in entry:
+        return int(entry.get("verified_prs_merged") or 0)
+    return int(entry.get("prs_merged") or 0)
 
 
 _AUTONOMY_RETIREMENT_THRESHOLD = 10
@@ -411,6 +433,15 @@ async def _update_direction_research_outcomes(
     entry["assisted_prs_merged"] = sum(
         1 for ct in _merged_rows if not is_autonomous_merge(ct)
     )
+    # verified_prs_merged: merged completions whose PR was actually verified by
+    # a real test suite (not a fall-open for a degraded environment/setup reason).
+    # Additive alongside prs_merged for back-compat; consumers that need "proven
+    # fix" counts should prefer this field over the raw prs_merged.
+    entry["verified_prs_merged"] = sum(
+        1
+        for ct in _merged_rows
+        if merge_verification_status(ct) != "unverified_degraded"
+    )
     # operator_action_count: tasks in this cycle with any detectable operator intervention
     entry["operator_action_count"] = sum(
         1
@@ -459,8 +490,14 @@ async def _update_direction_research_outcomes(
         and (ct.context or {}).get("_pr_changed_files")
     ]
     _tasks_created = entry.get("tasks_created", 0)
+    # Conversion is verification-aware: degraded-unverified merges (verification
+    # was expected but blocked by an environment/setup failure) are excluded so
+    # the rate agrees with the per-task outcome layer, which scores them neutral.
+    # Benign-unverified and verified merges still count (verified_merged_count).
     entry["conversion_rate"] = (
-        round(entry["prs_merged"] / _tasks_created, 3) if _tasks_created > 0 else None
+        round(verified_merged_count(entry) / _tasks_created, 3)
+        if _tasks_created > 0
+        else None
     )
     # Generalized outcome aggregates — ADDITIVE alongside existing PR metrics.
     # Uses evaluate_task_outcome to count successes across ALL task types (code

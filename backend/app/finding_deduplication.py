@@ -270,8 +270,19 @@ def build_dedup_state(
             continue
         if t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
             failed_hashes[fhash] = t.status
-        # Exclude COMPLETED without pr_merged (code was never shipped).
+        # COMPLETED without pr_merged: code was never shipped. Normally this
+        # leaves the finding eligible for re-dispatch — BUT an affirmative
+        # no-op completion is the exception. When an implementation task takes
+        # the reproduce-on-HEAD off-ramp (`./done --already-done`), it records
+        # a ``no_op_reason`` in its context: the agent verified the asserted
+        # defect does not reproduce / is already resolved. Suppress that
+        # finding hash so the same non-reproducing finding is not re-parsed and
+        # re-dispatched every research cycle. A dropped/abandoned no-PR
+        # completion carries NO ``no_op_reason`` and stays eligible for retry.
         if t.status == TaskStatus.COMPLETED and not ctx.get("pr_merged"):
+            if ctx.get("no_op_reason"):
+                recent_finding_hashes.add(fhash)
+                failed_hashes.setdefault(fhash, "no-op (not reproducing)")
             continue
         # Exclude ghost merges: pr_merged=True but rollup parent failed (code
         # never reached main).

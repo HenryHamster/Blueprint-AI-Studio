@@ -46,7 +46,7 @@ from typing import Any, Callable, Literal
 
 from app.ci_resolution import classify_merge_test_verdict
 from app.direction_outcomes import _counts_as_failure
-from app.landed_signal import is_merged_completion
+from app.landed_signal import is_merged_completion, merge_verification_status
 from app.models import Task
 from app.task_capabilities import WRITE_TASK_TYPES, get_task_capability
 
@@ -112,11 +112,17 @@ def _task_type(task: Task) -> str | None:
 def _evaluate_write(task: Task) -> TaskOutcome:
     """Outcome for a write/PR task type.
 
-    ``success`` iff the task is a merged completion, ``failure`` iff it counts
-    as a genuine failure for direction metrics, else ``neutral`` (e.g. a
-    COMPLETED task that opened no PR, or a BLOCKED holding state).
+    ``success`` iff the task is a verified (or benign-unverified) merged
+    completion, ``failure`` iff it counts as a genuine failure for direction
+    metrics, else ``neutral`` (e.g. a COMPLETED task that opened no PR, a
+    BLOCKED holding state, or a merge that fell open for a *degraded* reason —
+    environment/setup failure blocked real verification, so the claim is not
+    proven on HEAD and must not score as a verified fix).
     """
     if is_merged_completion(task):
+        vs = merge_verification_status(task)
+        if vs == "unverified_degraded":
+            return TaskOutcome("neutral", KIND_CODE_MERGE)
         return TaskOutcome("success", KIND_CODE_MERGE)
     if _counts_as_failure(task):
         return TaskOutcome("failure", KIND_CODE_MERGE)
@@ -144,16 +150,33 @@ def _findings_list(plan_output: Any) -> list[dict]:
 
 
 def _evaluate_research(task: Task) -> TaskOutcome:
-    """Outcome for a research task — judged on actionable findings produced.
+    """Outcome for a research task — judged on findings that SURVIVED ingestion.
 
-    A research task stores its findings as a bare list on ``plan_output``, each
-    a dict carrying a ``title`` and an ``actionability_grade``. Producing at
-    least one titled finding is the honest success signal; producing none is a
-    terminal-but-empty ``neutral`` (no usable output). A FAILED/CANCELLED
-    research task is a ``failure``.
+    The honest success signal is whether at least one finding survived ingestion
+    validation (citations resolve on HEAD), deduplication, and actionability
+    gating and was routed to work — recorded by the completion handler as
+    ``context['research_surviving_findings']`` (spawned + capacity/health-deferred
+    findings). A cycle whose findings were ALL rejected as stale duplicates,
+    citations absent on HEAD, or low-actionability records ``0`` survivors and is
+    a terminal-but-empty ``neutral`` even though its raw ``plan_output`` still
+    holds every parsed finding for admin visibility.
+
+    When the survivor count is absent (a task whose dispatch predates this signal,
+    or that never reached dispatch) we fall back to the legacy heuristic: at least
+    one titled finding on ``plan_output``. A FAILED/CANCELLED research task is a
+    ``failure``.
     """
     if _counts_as_failure(task):
         return TaskOutcome("failure", KIND_RESEARCH_QUALITY)
+    context = _task_local_attr(task, "context")
+    if isinstance(context, dict) and "research_surviving_findings" in context:
+        try:
+            survived = int(context.get("research_surviving_findings") or 0)
+        except (TypeError, ValueError):
+            survived = 0
+        if survived > 0:
+            return TaskOutcome("success", KIND_RESEARCH_QUALITY)
+        return TaskOutcome("neutral", KIND_RESEARCH_QUALITY)
     plan_output = _task_local_attr(task, "plan_output")
     actionable = [f for f in _findings_list(plan_output) if f.get("title")]
     if actionable:
@@ -512,13 +535,20 @@ def _build_verify_tests_summary(task: Task, ctx: SummaryContext) -> dict[str, An
         and not probe.get("could_not_run")
         and probe.get("passed") is False
     )
+    # A CLEAR declared-build failure (the operator's OWN build_cmd) blocks the
+    # merge regardless of suite detection — see classify_merge_test_verdict — so a
+    # green suite that also broke the declared build must NOT show a clean "pass".
+    declared_build_failed = probe_failed and isinstance(probe, dict) and probe.get("declared") is True
     if detected is False:
         # A clear acceptance-probe failure on a no-suite fall-open is a real,
         # merge-blocking verdict (the gate flips it to "fail"); reflect that here
         # so the operator summary matches the gate decision.
         verdict = "fail" if probe_failed else "undetected"
     elif passed:
-        verdict = "pass"
+        # The suite passed, but a declared-build probe that clearly failed blocks
+        # the gate — surface "fail" so the summary cannot read "pass" while the
+        # merge is blocked.
+        verdict = "fail" if declared_build_failed else "pass"
     elif detected is True:
         verdict = "fail"
 

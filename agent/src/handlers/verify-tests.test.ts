@@ -636,20 +636,121 @@ describe('handleVerifyTests', () => {
     expect(verdict.output).toContain('could not run');
   });
 
-  it('detected real pass → no probe run (probe only runs on fall-open)', async () => {
+  it('detected real pass with only a GENERIC probe → no probe attaches (declared-only on passing path)', async () => {
     vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
     vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
+    // A generic (non-declared) probe is available, but the passing path runs
+    // DECLARED builds only — the generic probe is filtered out, so no probe runs.
     vi.mocked(detectAcceptanceProbes).mockReturnValue([PY_PROBE]);
 
     await handleVerifyTests('p5', payload, task, 'tok', 'o', 'r', null, { value: '' });
 
     const verdict = parsedVerdict();
     expect(verdict.detected).toBe(true);
+    expect(verdict.passed).toBe(true);
     expect(verdict.probe).toBeUndefined();
-    // The acceptance probe is never even detected on a real-suite verdict.
-    expect(vi.mocked(detectAcceptanceProbes)).not.toHaveBeenCalled();
-    // The documented-command probe always diffs (git) regardless of the suite
-    // verdict, but no acceptance-probe command should run on a real-suite pass.
+    // detectAcceptanceProbes IS consulted now (to filter for a declared build),
+    // but the generic PY_PROBE is dropped, so no acceptance-probe command runs.
+    const nonGitCalls = vi.mocked(execFileAsync).mock.calls.filter(c => c[0] !== 'git');
+    expect(nonGitCalls).toHaveLength(0);
+  });
+
+  // ── Declared build_cmd probe on the PASSING-suite path ────────────────────
+  it('detected+passing suite + declared build FAILS → declared probe passed=false (backend blocks)', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+    vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([DECLARED_PROBE]);
+    // git snapshots resolve; the declared build itself exits non-zero cleanly.
+    vi.mocked(execFileAsync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'git') return Promise.resolve('');
+      return Promise.reject(Object.assign(new Error('Command failed: npm run build\nwebpack: build error'), {
+        stdout: '', stderr: 'webpack: build error in module foo', status: 1, code: undefined,
+      }));
+    });
+
+    await handleVerifyTests('dp1', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    // The suite still passed — the agent does NOT flip detected/passed; it only
+    // attaches the declared probe and lets the backend decide the block.
+    expect(verdict.detected).toBe(true);
+    expect(verdict.passed).toBe(true);
+    expect(verdict.probe?.ran).toBe(true);
+    expect(verdict.probe?.declared).toBe(true);
+    expect(verdict.probe?.passed).toBe(false);
+    expect(verdict.probe?.could_not_run).toBe(false);
+    expect(verdict.probe?.outcome).toBe('fail');
+    expect(verdict.output).toContain('declared build command `npm run build (admin-ui)` and it FAILED');
+  });
+
+  it('detected+passing suite + declared build PASSES → declared probe attached, verdict still pass', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+    vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([DECLARED_PROBE]);
+    // before !== after: the build wrote a real artifact → normal pass wording.
+    mockProbeWithTree('!! node_modules/\n', '!! node_modules/\n?? dist/bundle.js\n');
+
+    await handleVerifyTests('dp2', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(true);
+    expect(verdict.passed).toBe(true);
+    expect(verdict.probe?.passed).toBe(true);
+    expect(verdict.probe?.declared).toBe(true);
+    expect(verdict.probe?.wrote_no_artifact).toBe(false);
+    expect(verdict.output).toContain('declared build command `npm run build (admin-ui)` and it passed');
+  });
+
+  it('detected+passing suite + declared build CANNOT RUN → pass preserved, no probe block', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+    vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([DECLARED_PROBE]);
+    vi.mocked(execFileAsync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'git') return Promise.resolve('');
+      return Promise.reject(Object.assign(new Error('failed'), {
+        stdout: '', stderr: 'bash: npm: command not found', status: 127, code: undefined,
+      }));
+    });
+
+    await handleVerifyTests('dp3', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(true);
+    expect(verdict.passed).toBe(true);
+    expect(verdict.probe?.could_not_run).toBe(true);
+    expect(verdict.probe?.outcome).toBe('could_not_run');
+    expect(verdict.probe?.declared).toBe(true);
+    expect(verdict.output).toContain('could not run');
+  });
+
+  it('detected+passing suite + NO declared build_cmd → no probe (passing path unchanged)', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+    vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
+    // No probeable ecosystem at all → declared-only filter is empty → no probe.
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([]);
+
+    await handleVerifyTests('dp4', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(true);
+    expect(verdict.passed).toBe(true);
+    expect(verdict.probe).toBeUndefined();
+  });
+
+  it('detected FAILING suite → no declared build probe (only runs on the passing path)', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+    vi.mocked(testFixLoop).mockResolvedValue({
+      passed: false, testFailuresDetected: true, failureSummary: 'AssertionError',
+    });
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([DECLARED_PROBE]);
+
+    await handleVerifyTests('dp5', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(true);
+    expect(verdict.passed).toBe(false);
+    expect(verdict.probe).toBeUndefined();
+    // The declared build probe must NOT run on the failing path.
     const nonGitCalls = vi.mocked(execFileAsync).mock.calls.filter(c => c[0] !== 'git');
     expect(nonGitCalls).toHaveLength(0);
   });

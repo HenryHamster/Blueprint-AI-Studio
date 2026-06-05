@@ -24,7 +24,6 @@ export interface SrCategoryTrend {
   examples?: SrMissExample[];
   below_floor?: boolean | null;
   reasoning_engagement_rate?: number | null;
-  reasoning_quality_rate?: number | null;
   reasoning_engagement_with?: number | null;
   reasoning_engagement_total?: number | null;
   precision_recall_quadrant?: 'healthy' | 'conservative_shift' | 'noisy_shift' | 'both_declining' | 'mixed' | 'flat' | null;

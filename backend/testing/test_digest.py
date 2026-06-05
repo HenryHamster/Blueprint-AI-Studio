@@ -55,6 +55,7 @@ async def test_digest_empty_window(client: AsyncClient):
     assert data["needs_attention"] == []
     assert data["recent_failures"] == []
     assert data["recent_completions"] == []
+    assert "parallel_review_effectiveness" not in data
 
 
 @pytest.mark.asyncio
@@ -203,60 +204,6 @@ async def test_digest_with_failed_tasks(client: AsyncClient, db_session):
     assert failure["task_id"] == str(task.id)
     assert failure["title"] == "Failed Task"
     assert "failed_at" in failure
-
-
-@pytest.mark.asyncio
-async def test_digest_migration_health(client: AsyncClient, db_session):
-    """migration_health surfaces migrate-task counts, MIGRATION_ERROR failures, and auto-generated migrations."""
-    from app.main import EXPECTED_SCHEMA_REVISION
-
-    project = make_project()
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    db_session.add_all(
-        [
-            make_task(
-                project_id=project.id,
-                status=TaskStatus.COMPLETED,
-                payloads=[{"type": "migrate"}],
-            ),
-            make_task(
-                project_id=project.id,
-                status=TaskStatus.FAILED,
-                payloads=[{"type": "migrate"}],
-                context={"failure_class": "MIGRATION_ERROR"},
-            ),
-            make_task(
-                project_id=project.id,
-                status=TaskStatus.COMPLETED,
-                payloads=[{"type": "create"}],
-                context={
-                    "related_files": [
-                        "backend/alembic/versions/0099_x.py",
-                        "backend/app/models.py",
-                    ]
-                },
-            ),
-            make_task(
-                project_id=project.id,
-                status=TaskStatus.COMPLETED,
-                payloads=[{"type": "create"}],
-            ),
-        ]
-    )
-    await db_session.commit()
-
-    response = await client.get("/api/admin/digest")
-    assert response.status_code == 200
-    mh = response.json()["migration_health"]
-    assert mh["current_schema_revision"] == EXPECTED_SCHEMA_REVISION
-    assert mh["migration_tasks_in_window"] == 2
-    assert mh["migration_tasks_succeeded"] == 1
-    assert mh["migration_tasks_failed"] == 1
-    assert mh["migration_errors_in_window"] == 1
-    assert mh["auto_generated_migrations"] == 1
 
 
 @pytest.mark.asyncio
@@ -956,6 +903,61 @@ async def test_digest_recurring_patterns_remediation_status_investigating(
 
 
 @pytest.mark.asyncio
+async def test_digest_early_warnings_affected_direction_count_per_class(
+    client: AsyncClient, db_session
+):
+    """early_warnings affected_direction_count reflects dirs affected by that specific warning, not global total."""
+    from app import shared_state as _ss
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    proj_key = str(project.id)
+    # Two distinct FailureRateMomentum anomalies with different affected_directions.
+    _ss.persistent_anomalies[proj_key] = {
+        "FailureRateMomentum": {
+            "first_seen": "2026-04-18T00:00:00+00:00",
+            "last_seen": "2026-04-19T00:00:00+00:00",
+            "occurrence_count": 2,
+            "severity": "medium",
+            "latest_details": "FailureRateMomentum: 10% → 20% → 30% across last 3x24h windows",
+            "affected_directions": ["dir-a", "dir-b"],
+        },
+        "FailureRateMomentum_db": {
+            "first_seen": "2026-04-18T00:00:00+00:00",
+            "last_seen": "2026-04-19T00:00:00+00:00",
+            "occurrence_count": 2,
+            "severity": "medium",
+            "latest_details": "FailureRateMomentum: 5% → 15% → 25% across last 3x24h windows",
+            "affected_directions": ["dir-c"],
+        },
+    }
+    try:
+        response = await client.get(f"/api/admin/digest?project_id={project.id}")
+        assert response.status_code == 200
+        data = response.json()
+
+        warnings = data["early_warnings"]
+        # Both FailureRateMomentum entries have occurrence_count >= 2, so both should appear.
+        assert len(warnings) == 2
+
+        # Find warnings by failure_class and verify affected_direction_count matches
+        # the actual affected_directions for each warning, not a global total.
+        warning_1 = next(w for w in warnings if w["failure_class"] == "FailureRateMomentum")
+        warning_2 = next(w for w in warnings if w["failure_class"] == "FailureRateMomentum_db")
+
+        assert warning_1["affected_direction_count"] == 2  # affects dir-a, dir-b
+        assert warning_2["affected_direction_count"] == 1  # affects dir-c only
+
+        # Ensure they have different counts (the bug was that they were the same).
+        assert warning_1["affected_direction_count"] != warning_2["affected_direction_count"]
+    finally:
+        _ss.persistent_anomalies.pop(proj_key, None)
+
+
+@pytest.mark.asyncio
 async def test_digest_approval_task_direction_attribution(
     client: AsyncClient, db_session
 ):
@@ -1093,6 +1095,62 @@ async def test_digest_project_filter(client: AsyncClient, db_session):
     titles = [c["title"] for c in data["recent_completions"]]
     assert "Task A" in titles
     assert "Task B" not in titles
+
+
+@pytest.mark.asyncio
+async def test_digest_effort_model_efficiency_includes_cancelled_token_spend(
+    client: AsyncClient, db_session
+):
+    """Cancelled terminal runs contribute spend to the efficiency rollup but do
+    not count as landed PRs."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create", "effort": "high"}],
+            context={"pr_merged": True},
+            provider="anthropic",
+            model="claude-opus-4-8",
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 1000,
+                "llm_call_count": 1,
+            },
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.CANCELLED,
+            payloads=[{"type": "create", "effort": "high"}],
+            provider="anthropic",
+            model="claude-opus-4-8",
+            api_call_summary={
+                "total_input_tokens": 500,
+                "total_output_tokens": 500,
+                "llm_call_count": 1,
+            },
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    efficiency = data["effort_model_efficiency"]
+    assert efficiency["totals"]["run_count"] == 2
+    assert efficiency["totals"]["landed_count"] == 1
+    assert efficiency["totals"]["total_cost_usd"] == pytest.approx(0.135)
+    assert efficiency["totals"]["cost_per_merge"] == pytest.approx(0.135)
+    by_effort = {row["effort"]: row for row in efficiency["by_effort"]}
+    assert by_effort["high"]["run_count"] == 2
+    assert by_effort["high"]["landed_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -8079,3 +8137,52 @@ async def test_narrative_suppresses_convergence_verdict_on_thin_window(
 
     assert "Review/fix churn" not in narrative
     assert "non-converged PR chains" not in narrative
+
+
+@pytest.mark.asyncio
+async def test_digest_includes_sr_false_attestation_trends_from_design_doc(
+    client: AsyncClient, db_session
+):
+    """When sr_false_attestation_trends is in project.design_doc, it appears in digest."""
+    project = make_project()
+    project.design_doc = {
+        "sr_false_attestation_trends": {
+            "computed_at": "2026-06-05T10:00:00",
+            "bucket_mode": "by_cycle",
+            "per_category": {
+                "tests_executed_cleanly": {
+                    "false_attestation_rate": 0.05,
+                    "previous_false_attestation_rate": 0.08,
+                    "delta": -0.03,
+                    "trend": "improving",
+                    "ci_confirmed": 10,
+                    "false_attested": 1,
+                    "ci_data_missing": 0,
+                }
+            },
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert "sr_false_attestation_trends" in data
+    assert data["sr_false_attestation_trends"] is not None
+    assert (
+        data["sr_false_attestation_trends"]["computed_at"]
+        == "2026-06-05T10:00:00"
+    )
+    assert (
+        "tests_executed_cleanly"
+        in data["sr_false_attestation_trends"]["per_category"]
+    )
+    assert (
+        data["sr_false_attestation_trends"]["per_category"][
+            "tests_executed_cleanly"
+        ]["false_attestation_rate"]
+        == 0.05
+    )

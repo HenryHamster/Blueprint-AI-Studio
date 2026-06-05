@@ -2,6 +2,18 @@
 
 Provides the operator-facing readiness verdict (whether promotion is ready) based
 on recent dry-run qualification history, plus formatting helpers for API responses.
+
+GROUND-TRUTH CAVEAT: this signal is a *self-approval* track record, NOT a
+validated trust measurement. ``would_promote`` is the qualifier's own
+confidence >= threshold, so ``would_promote_rate`` is just the rate at which the
+qualifier approved itself. There is no recorded post-promotion outcome on
+QualificationVerdict (was the promoted candidate reverted, did main CI/regression
+follow), and no outcome-feedback code in the release_* modules — so a qualifier
+that systematically over-scores a defect class still reads ~100% here. Until such
+a ground truth is recorded and a true precision/false-positive rate is derived,
+this MUST be surfaced as "qualifier self-approval streak", never as a "trustworthy"
+or validated judgment. The returned ``ground_truth_validated`` flag (always False
+today) and ``caveat`` string exist so every consumer states this honestly.
 """
 
 from __future__ import annotations
@@ -13,6 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import QualificationVerdict, ReleaseVersion
+from app.shared_state import resolve_project_promotion_enabled
 
 # Maps the internal last_qualification status code to a human-readable label
 # for the version-lifecycle panel.
@@ -39,6 +52,46 @@ _READINESS_RECURRING_BLOCKER_MIN = 2
 # Confidence-spread ceiling for the advisory "stable" flag (evidence only — not
 # a hard readiness gate).
 _READINESS_CONFIDENCE_STDEV_MAX = 0.15
+
+# Honest framing of what this signal can and cannot assert. ``would_promote`` is
+# the qualifier's own confidence >= threshold, so the rate is self-referential:
+# no post-promotion outcome is recorded against which a true precision could be
+# computed. Surfaced to every consumer so none of them claims "trustworthy".
+_READINESS_GROUND_TRUTH_CAVEAT = (
+    "self-approval only — no post-promotion outcome (revert / main CI / "
+    "regression) is recorded, so this is the rate at which the qualifier "
+    "approved itself, not a measured precision"
+)
+
+# The readiness window is hardcoded to DRY-RUN-regime verdicts (promotion_enabled
+# is False) — sensible pre-go-live calibration, but stale once promotion goes
+# live, because live promote/promotion-failed verdicts are recorded with
+# promotion ENABLED and never enter this window. So once promotion is effectively
+# enabled for the project, this summary is pre-go-live history, NOT current
+# readiness, and must be labeled as such instead of frozen on aging dry-runs.
+_READINESS_LIVE_REGIME_NOTE = (
+    "promotion is live for this project — this is a pre-go-live dry-run "
+    "calibration window, not current readiness; it stopped receiving verdicts "
+    "when promotion was enabled (live outcomes are recorded with promotion on)"
+)
+
+
+def _annotate_regime(out: dict[str, Any], promotion_enabled: bool) -> dict[str, Any]:
+    """Stamp the promotion regime onto a readiness summary.
+
+    ``is_current_readiness`` is True only in the dry-run (pre-go-live) regime the
+    window actually measures. Once promotion is effectively enabled the window is
+    frozen on stale dry-runs, so we relabel it as a pre-go-live calibration window
+    and force ``ready`` False — a stale dry-run streak must never read as a live
+    'ready' signal.
+    """
+    out["promotion_enabled"] = promotion_enabled
+    out["regime"] = "live" if promotion_enabled else "pre_go_live_calibration"
+    out["is_current_readiness"] = not promotion_enabled
+    if promotion_enabled:
+        out["ready"] = False
+        out["reason"] = _READINESS_LIVE_REGIME_NOTE
+    return out
 
 
 def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
@@ -106,14 +159,31 @@ def _empty_readiness(
         "recurring_blockers": {},
         "blocker_counts": {},
         "thresholds": thresholds,
+        "ground_truth_validated": False,
+        "caveat": _READINESS_GROUND_TRUTH_CAVEAT,
+        "promotion_enabled": False,
+        "regime": "pre_go_live_calibration",
+        "is_current_readiness": True,
     }
 
 
 async def compute_promotion_readiness(
     session: AsyncSession,
     project_id: uuid.UUID,
+    *,
+    promotion_enabled: bool | None = None,
 ) -> dict[str, Any]:
-    """Summarize the dry-run qualification track record into a readiness verdict."""
+    """Summarize the dry-run qualification track record into a readiness verdict.
+
+    ``promotion_enabled`` is the project's EFFECTIVE live-promotion gate; it is
+    resolved from runtime config when not supplied. The dry-run window this
+    function evaluates only reflects *current* readiness while promotion is OFF —
+    once it is on, the window is frozen pre-go-live history (see
+    :func:`_annotate_regime`), so callers get ``regime``/``is_current_readiness``
+    flags and a relabeled, not-ready summary rather than a stale 'ready' number.
+    """
+    if promotion_enabled is None:
+        promotion_enabled = resolve_project_promotion_enabled(project_id)
     thresholds: dict[str, Any] = {
         "min_verdicts": _READINESS_MIN_VERDICTS,
         "min_clean_streak": _READINESS_MIN_CLEAN_STREAK,
@@ -170,7 +240,7 @@ async def compute_promotion_readiness(
             out["reason"] = (
                 "recent qualifications have been infrastructure failures, not quality findings"
             )
-        return out
+        return _annotate_regime(out, promotion_enabled)
 
     would_promote_count = sum(1 for v in verdicts if v.would_promote)
     would_promote_rate = round(would_promote_count / evaluated, 4)
@@ -228,14 +298,16 @@ async def compute_promotion_readiness(
     ready = not reasons
     if ready:
         reason = (
-            f"qualifier looks trustworthy: {would_promote_count}/{evaluated} "
-            f"would-promote (rate {would_promote_rate:.2f}), {consecutive_clean} "
-            f"consecutive clean passes, no recurring blockers"
+            f"qualifier self-approval streak clears thresholds: "
+            f"{would_promote_count}/{evaluated} would-promote "
+            f"(self-approval rate {would_promote_rate:.2f}), {consecutive_clean} "
+            f"consecutive clean passes, no recurring blockers. "
+            f"NOTE: {_READINESS_GROUND_TRUTH_CAVEAT}"
         )
     else:
         reason = "; ".join(reasons)
 
-    return {
+    return _annotate_regime({
         "ready": ready,
         "reason": reason,
         "verdicts_evaluated": evaluated,
@@ -254,4 +326,6 @@ async def compute_promotion_readiness(
         "recurring_blockers": recurring_blockers,
         "blocker_counts": blocker_counts,
         "thresholds": thresholds,
-    }
+        "ground_truth_validated": False,
+        "caveat": _READINESS_GROUND_TRUTH_CAVEAT,
+    }, promotion_enabled)

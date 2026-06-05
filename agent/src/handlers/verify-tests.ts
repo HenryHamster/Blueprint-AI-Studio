@@ -73,15 +73,22 @@ interface VerifyTestsResult {
   // returned null) and on every detected=false / setup-failure path, so older
   // consumers that ignore it are byte-for-byte unaffected.
   coverage?: { passed: number; skipped: number; total: number };
-  // Cheap goal-level acceptance probe, run ONLY on the detected=false fall-open
-  // paths (no suite / thin / all-skipped). Gives the no-CI merge gate at least
-  // one honest execution signal — "does the changed code still compile/build?" —
-  // when the unit suite produced none. CONSERVATIVE: a probe that could not run
-  // (missing deps / unprovisioned setup) degrades to the existing fall-open and
-  // never blocks; only a clear compile/build FAILURE blocks the merge. The
-  // backend (ci_resolution.classify_merge_test_verdict) keys off
-  // ran/passed/could_not_run to decide block-vs-fall-open. Additive: absent on
-  // every detected=true verdict and the setup-failure FAILED path.
+  // Cheap goal-level acceptance probe. Attached on TWO paths:
+  //   - the detected=false fall-open paths (no suite / thin / all-skipped) and
+  //     the setup-failure path, where it may carry EITHER the operator's declared
+  //     build_cmd OR a generic ecosystem compile check (tsc/compileall/…); and
+  //   - the detected=true + PASSED path, where it carries the operator's DECLARED
+  //     build_cmd ONLY (no generic compile probes) — a green unit suite must not
+  //     mask a broken declared build (bundled frontends, tests that run against
+  //     source without the build step). Gives the no-CI merge gate at least one
+  //     honest "does the deliverable still build?" signal even when a passing
+  //     suite produced none for the declared build. CONSERVATIVE: a probe that
+  //     could not run (missing deps / unprovisioned setup) degrades to a fall-open
+  //     and never blocks; only a clear compile/build FAILURE blocks the merge. The
+  //     backend (ci_resolution.classify_merge_test_verdict) keys off
+  //     declared/ran/passed/could_not_run to decide block-vs-fall-open. Additive:
+  //     absent on a detected=true verdict with no declared build_cmd and on the
+  //     setup-failure FAILED path's no-probe case.
   probe?: {
     ran: boolean;
     ecosystem: string;
@@ -242,10 +249,19 @@ async function snapshotWorkingTree(cwd: string): Promise<string | null> {
 async function runAcceptanceProbe(
   ws: WebSocket | null,
   buildConfig: BuildConfig | undefined,
+  opts: { declaredOnly?: boolean } = {},
 ): Promise<VerifyTestsResult['probe']> {
-  const probes = detectAcceptanceProbes(buildConfig).slice(0, MAX_ACCEPTANCE_PROBES);
+  // declaredOnly restricts the run to the operator's OWN declared build_cmd
+  // probe(s) — used on the passing-suite path where a green suite already
+  // exercised the source, so only the authoritative declared build is worth
+  // adding (never the generic tsc/compileall/go-build/cargo-check probes).
+  let candidates = detectAcceptanceProbes(buildConfig);
+  if (opts.declaredOnly) candidates = candidates.filter(p => p.declared);
+  const probes = candidates.slice(0, MAX_ACCEPTANCE_PROBES);
   if (probes.length === 0) {
-    sendLog(ws, 'Acceptance probe: no probeable ecosystem detected — no goal-level probe signal.\n');
+    if (!opts.declaredOnly) {
+      sendLog(ws, 'Acceptance probe: no probeable ecosystem detected — no goal-level probe signal.\n');
+    }
     return undefined;
   }
   let firstPass: AcceptanceProbe | null = null;
@@ -349,6 +365,43 @@ async function attachAcceptanceProbe(
     note = `Acceptance probe passed (${probe.ecosystem}: ${probe.label}) — the changed code still compiles/builds (cheap goal-level signal; unit suite still absent/thin).`;
   } else {
     note = `Acceptance probe could not run (${probe.ecosystem}: ${probe.label}) — missing deps / unprovisioned setup; falling open without a probe block.`;
+  }
+  return { ...base, probe, output: [base.output, note].filter(Boolean).join('\n') };
+}
+
+// Run a DECLARED-build-only acceptance probe on the detected=true + PASSED path
+// and fold its verdict into the result via the existing ``probe`` field. Unlike
+// attachAcceptanceProbe (the fall-open path), this filters to the operator's OWN
+// declared ``build_cmd`` — generic ecosystem compile probes (tsc/compileall/go
+// build/cargo check) are NOT run, because a green suite already exercised the
+// source; we only add the authoritative "does the deliverable build" claim. The
+// backend reads probe.passed=false on a CLEAR declared-build failure and flips
+// the gate to a block. CONSERVATIVE + ADDITIVE: no declared build_cmd → no probe
+// → the pass is byte-for-byte unchanged; a could-not-run declared build (missing
+// deps / unprovisioned setup) falls open without blocking; only a clear declared-
+// build FAILURE blocks. NEVER throws — any error degrades to the unchanged pass.
+async function attachDeclaredBuildProbe(
+  ws: WebSocket | null,
+  buildConfig: BuildConfig | undefined,
+  base: VerifyTestsResult,
+): Promise<VerifyTestsResult> {
+  let probe: VerifyTestsResult['probe'];
+  try {
+    probe = await runAcceptanceProbe(ws, buildConfig, { declaredOnly: true });
+  } catch (e) {
+    sendLog(ws, `Declared build probe errored — skipping (suite passed): ${e instanceof Error ? e.message : String(e)}\n`);
+    return base;
+  }
+  if (!probe) return base;
+  let note: string;
+  if (probe.outcome === 'fail') {
+    note = `We ran your declared build command \`${probe.label}\` and it FAILED — the unit suite passed but the declared build did not succeed; blocking the merge.`;
+  } else if (probe.outcome === 'pass') {
+    note = probe.wrote_no_artifact === true
+      ? `We ran your declared build command \`${probe.label}\` and it exited cleanly but wrote no artifact — possible no-op build (unit suite passed).`
+      : `We ran your declared build command \`${probe.label}\` and it passed — your declared build succeeds (unit suite passed).`;
+  } else {
+    note = `We ran your declared build command \`${probe.label}\` but it could not run — missing deps / unprovisioned setup; not blocking (unit suite passed).`;
   }
   return { ...base, probe, output: [base.output, note].filter(Boolean).join('\n') };
 }
@@ -859,6 +912,14 @@ export async function handleVerifyTests(
         ...(loop.coverage ? { coverage: loop.coverage } : {}),
         output: passed ? '' : (loop.failureSummary ?? '').slice(-VERIFY_TESTS_OUTPUT_LIMIT),
       };
+      // A green suite must not mask a broken DECLARED build. On the passing
+      // path, still exercise the operator's OWN declared build_cmd as a
+      // goal-level acceptance probe (declared-only — no generic compile probes);
+      // the backend blocks the merge only on a CLEAR declared-build failure.
+      if (passed) {
+        statusRef.value = 'Running declared build probe (suite passed)...';
+        result = await attachDeclaredBuildProbe(ws, buildConfig, result);
+      }
     }
   }
 

@@ -19,6 +19,7 @@ from sqlmodel import select
 
 from app import strategic_cycle
 from app.direction_metrics import _compute_direction_quality_score
+from app.direction_outcomes import verified_merged_count
 from app.models import (
     MessageType,
     Project,
@@ -835,7 +836,10 @@ def _compute_churn_metrics(direction: dict) -> dict | None:
     if len(history) < 3 or churn_window <= 0:
         return None
     window = history[-churn_window:]
-    merged = sum(e.get("prs_merged", 0) for e in window)
+    # Verification-aware: degraded-unverified merges are excluded from the merge
+    # count (and so count as non-merge finished work) to match the per-task
+    # outcome layer. Benign-unverified and verified merges still count.
+    merged = sum(verified_merged_count(e) for e in window)
     tasks_complete = sum(e.get("tasks_completed", 0) for e in window)
     # Children that COMPLETED without opening a PR because the deliverable already
     # existed ("no changes needed") are correct no-ops, not churn. Subtract them so
@@ -869,7 +873,9 @@ def _compute_lifetime_burn_metrics(direction: dict) -> dict | None:
     history = direction.get("research_history") or []
     agg = direction.get("history_aggregate") or {}
 
-    window_merged = sum(e.get("prs_merged", 0) for e in history)
+    # Verification-aware merge counts (window + evicted aggregate): degraded
+    # merges are excluded so they don't suppress lifetime non-merge burn.
+    window_merged = sum(verified_merged_count(e) for e in history)
     window_completed = sum(e.get("tasks_completed", 0) for e in history)
     # Correct no-op completions ("deliverable already exists", no PR) are not burn.
     # Subtract them across both the rolling window and the lifetime aggregate. Both
@@ -879,7 +885,9 @@ def _compute_lifetime_burn_metrics(direction: dict) -> dict | None:
         max(0, e.get("tasks_failed", 0) - e.get("tasks_failed_infra", 0))
         for e in history
     )
-    agg_merged = agg.get("total_prs_merged", 0)
+    # Legacy aggregates predate total_verified_prs_merged; fall back to
+    # total_prs_merged so old folded data is unchanged.
+    agg_merged = agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0))
     agg_completed = agg.get("total_tasks_completed", 0)
     agg_no_pr = agg.get("total_tasks_completed_no_pr", 0)
     agg_code_failed = max(

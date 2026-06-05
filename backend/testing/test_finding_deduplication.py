@@ -101,6 +101,36 @@ def test_build_dedup_state_excludes_completed_without_pr_merged():
     assert prior == {}
 
 
+def test_build_dedup_state_suppresses_completed_no_op_reproduce_off_ramp():
+    # COMPLETED-without-pr_merged but carrying a no_op_reason = the agent took
+    # the reproduce-on-HEAD off-ramp and verified the finding does not
+    # reproduce. The finding hash MUST be suppressed so it is not re-dispatched
+    # next cycle, and the failed_hashes label records why there's no PR.
+    t = _make_task(
+        status=TaskStatus.COMPLETED,
+        context={
+            "finding_hash": "noop1",
+            "no_op_reason": "defect already fixed by intervening merge; cited code refactored away",
+        },
+    )
+    hashes, failed, _ = build_dedup_state([t], failed_parent_ids=set())
+    assert "noop1" in hashes
+    assert failed["noop1"] == "no-op (not reproducing)"
+
+
+def test_build_dedup_state_incomplete_no_pr_completion_stays_eligible():
+    # COMPLETED-without-pr_merged and WITHOUT a no_op_reason = a dropped /
+    # abandoned no-PR completion (work was left incomplete). It must remain
+    # eligible for retry, so its finding hash is NOT suppressed.
+    t = _make_task(
+        status=TaskStatus.COMPLETED,
+        context={"finding_hash": "incomplete1"},
+    )
+    hashes, failed, _ = build_dedup_state([t], failed_parent_ids=set())
+    assert "incomplete1" not in hashes
+    assert failed == {}
+
+
 def test_build_dedup_state_includes_completed_pr_merged():
     t = _make_task(
         status=TaskStatus.COMPLETED,

@@ -942,22 +942,40 @@ export interface LlmCostModelRow {
   share_of_total_cost: number | null;
   task_count: number;
   llm_call_count: number;
+  /** Count of tasks in this bucket that landed/merged on the integration branch. */
+  merged_count: number;
+  /** merged_count / task_count, or null when the bucket has no tasks. */
+  merge_rate: number | null;
   priced: boolean;
+  /**
+   * cost_usd / merged_count, present only when the bucket is fully priced AND
+   * has at least one merge. Null for unpriced (understated cost) or zero-merge
+   * buckets so the panel never shows a misleading/divide-by-zero figure.
+   */
+  cost_per_merge: number | null;
 }
 
 export interface LlmCostBreakdownResponse {
   window_days: number;
   generated_at: string;
-  by_provider: Array<Omit<LlmCostModelRow, 'model' | 'priced'>>;
+  by_provider: Array<Omit<LlmCostModelRow, 'model'>>;
   by_model: LlmCostModelRow[];
   totals: {
     total_input_tokens: number;
     total_output_tokens: number;
     total_cost_usd: number;
     task_count: number;
+    merged_count: number;
+    merge_rate: number | null;
     priced_task_count: number;
     unpriced_task_count: number;
     unpriced_coverage_fraction: number | null;
+    /** Tasks whose runtime selection fell back to a provider/model other than
+     * the intended routing — their spend is folded into the resolved model's
+     * bucket, so by-model attribution is not purely the configured routing. */
+    fallback_task_count: number;
+    /** Dollar spend attributable to the fallback tasks above. */
+    fallback_cost_usd: number;
   };
   unpriced_combos: string[];
 }
@@ -1102,6 +1120,16 @@ export interface PromotionReadiness {
   recurring_blockers: Record<string, number>;
   blocker_counts: Record<string, number>;
   thresholds: Record<string, number>;
+  // Always false today: no post-promotion outcome is recorded, so would_promote_rate
+  // is a self-approval rate, not a validated qualifier precision. See `caveat`.
+  ground_truth_validated?: boolean;
+  caveat?: string;
+  // The readiness window only measures DRY-RUN-regime verdicts, so it reflects
+  // *current* readiness only pre-go-live. Once promotion is effectively enabled
+  // the window is frozen pre-go-live history: regime='live', is_current_readiness=false.
+  regime?: 'pre_go_live_calibration' | 'live';
+  is_current_readiness?: boolean;
+  promotion_enabled?: boolean;
 }
 
 export interface StagedDirection {

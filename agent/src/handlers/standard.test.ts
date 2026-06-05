@@ -86,6 +86,14 @@ vi.mock('../workspacePrep.js', () => ({
   prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
 }));
 
+// Spy on the read-only ./fetch writer while keeping buildFetchGuidance and the
+// PLAN_FETCH_VERBS constant real, so prompt-guidance assertions exercise the
+// genuine text and the writer-invocation assertions can inspect the call args.
+vi.mock('./strategic-helpers.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./strategic-helpers.js')>();
+  return { ...actual, writeFetchHelper: vi.fn() };
+});
+
 // fs is consumed by both `import fs from 'fs'` (default import) and
 // `import * as fs from 'fs'` (namespace import) across the codebase under
 // test. Mock both shapes so vitest doesn't reject either access pattern.
@@ -130,6 +138,7 @@ import { setupWorkspace, runClaudeCode } from '../index.js';
 import { captureTestBaseline } from '../utils/test-fix-loop.js';
 import { extractModuleInterfaces, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt } from '../prompt.js';
 import { runCodeChangeTask } from './code-change.js';
+import { writeFetchHelper, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 import { expectCalledWith, expectNotCalledWith } from '../utils/typed-mock-call.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
@@ -395,6 +404,56 @@ describe('viewport infra skip guidance in prompt', () => {
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const prompt = capturedPrompt();
     expect(prompt).toContain('VIEWPORT_GATE_INFRA_UNAVAILABLE');
+  });
+});
+
+// ── Read-only ./fetch provisioning + guidance ─────────────────────────────────
+describe('mid-run ./fetch provisioning for create/refactor', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('handleCreate advertises ./fetch guidance and provisions the writer when project_id is set', async () => {
+    const task = { title: 'Task', description: '', project_metadata: { project_id: 'p-xyz' } };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('MID-RUN FETCH (./fetch)');
+    // Only the provisioned read-only verbs are advertised.
+    expect(prompt).toContain('./fetch direction <id>');
+    expect(prompt).toContain('./fetch section <key>');
+    expect(prompt).toContain('./fetch playbook <key>');
+    // problem-model/gap/message are NOT provisioned for code-change agents.
+    expect(prompt).not.toContain('./fetch problem-model');
+    expect(prompt).not.toContain('./fetch gap <id>');
+    expect(vi.mocked(writeFetchHelper)).toHaveBeenCalledWith(
+      TASK_ID, 'p-xyz', expect.anything(), { verbs: PLAN_FETCH_VERBS },
+    );
+  });
+
+  it('handleCreate omits ./fetch guidance and does not provision when project_id is absent', async () => {
+    const task = { title: 'Task', description: '' };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).not.toContain('MID-RUN FETCH (./fetch)');
+    expect(vi.mocked(writeFetchHelper)).not.toHaveBeenCalled();
+  });
+
+  it('handleRefactor advertises ./fetch guidance and provisions the writer when project_id is set', async () => {
+    const task = { title: 'Refactor task', description: '', project_metadata: { project_id: 'p-abc' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('MID-RUN FETCH (./fetch)');
+    expect(vi.mocked(writeFetchHelper)).toHaveBeenCalledWith(
+      TASK_ID, 'p-abc', expect.anything(), { verbs: PLAN_FETCH_VERBS },
+    );
+  });
+
+  it('handleRefactor omits ./fetch guidance and does not provision when project_id is absent', async () => {
+    const task = { title: 'Refactor task', description: '' };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).not.toContain('MID-RUN FETCH (./fetch)');
+    expect(vi.mocked(writeFetchHelper)).not.toHaveBeenCalled();
   });
 });
 

@@ -21,7 +21,8 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.landed_signal import is_merged_completion
+from app.direction_outcomes import verified_merged_count
+from app.landed_signal import is_merged_completion, merge_verification_status
 from app.models import (
     Task,
     TaskStatus,
@@ -398,6 +399,7 @@ async def compute_pipeline_health_summary(
                 continue
 
             prs_merged = 0
+            verified_merged = 0
             prs_rejected = 0
             tasks_created_total = 0
             sd_totals: Dict[str, int] = {}
@@ -408,6 +410,7 @@ async def compute_pipeline_health_summary(
                     )
                     if entry_ts >= window_start:
                         prs_merged += entry.get("prs_merged") or 0
+                        verified_merged += verified_merged_count(entry)
                         prs_rejected += entry.get("prs_rejected") or 0
                         tasks_created_total += entry.get("tasks_created") or 0
                         for k, v in (entry.get("stage_dropout") or {}).items():
@@ -415,8 +418,10 @@ async def compute_pipeline_health_summary(
                 except (ValueError, TypeError):
                     pass
 
+            # Conversion is verification-aware: degraded-unverified merges are
+            # excluded (verified_merged) to agree with the per-task layer.
             dir_conversion_rate = (
-                round(prs_merged / tasks_created_total, 3)
+                round(verified_merged / tasks_created_total, 3)
                 if tasks_created_total > 0
                 else None
             )
@@ -455,7 +460,7 @@ async def compute_pipeline_health_summary(
         if _safe_ts_in_window(entry.get("timestamp"), window_start)
     )
     _pipeline_total_merged = sum(
-        entry.get("prs_merged") or 0
+        verified_merged_count(entry)
         for d in (project.directions or [] if project else [])
         for entry in (d.get("research_history") or [])
         if _safe_ts_in_window(entry.get("timestamp"), window_start)
@@ -476,17 +481,31 @@ async def compute_pipeline_health_summary(
     def _first_attempt_rate(tasks):
         if not tasks:
             return None
-        first_success = sum(
-            1
-            for t in tasks
-            if (t.context or {}).get("_first_attempt_succeeded") is True
-        )
         # Only count tasks that have the metric recorded
         measured = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
         if not measured:
             return None
         first_success = sum(
             1 for t in measured if t.context["_first_attempt_succeeded"]
+        )
+        return round(first_success / len(measured), 2)
+
+    def _verified_first_attempt_rate(tasks):
+        """Like _first_attempt_rate but excludes degraded-unverified merges.
+
+        A task with _first_attempt_succeeded=True whose PR fell open for a
+        degraded reason (environment/setup failure blocked verification) is NOT
+        a proven fix — exclude it from the verified count.  Benign fall-opens
+        (no suite, kill-switch off) still count as successes.
+        """
+        measured = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
+        if not measured:
+            return None
+        first_success = sum(
+            1
+            for t in measured
+            if t.context["_first_attempt_succeeded"]
+            and merge_verification_status(t) != "unverified_degraded"
         )
         return round(first_success / len(measured), 2)
 
@@ -753,6 +772,11 @@ async def compute_pipeline_health_summary(
         "without_measurements": _first_attempt_rate(tasks_without_measurements)
         if tasks_without_measurements
         else None,
+        # verified_overall: excludes degraded-unverified merges (environment/setup
+        # failures that blocked real test verification). Aligned with the
+        # merge-gate-health verified-vs-fell-open split so strategic scoring is
+        # not misled by unproven fixes. Additive — does not replace "overall".
+        "verified_overall": _verified_first_attempt_rate(terminal_tasks_24h),
     }
 
     # First-review approval rate: of create/refactor tasks that merged, what fraction

@@ -11496,6 +11496,43 @@ async def test_readiness_healthy_streak_ready(db_session):
 
 
 @pytest.mark.asyncio
+async def test_readiness_is_framed_as_self_approval_not_trustworthy(db_session):
+    """The ready signal must NOT claim the qualifier is 'trustworthy' — there is
+    no recorded post-promotion ground truth, so it is a self-approval rate only.
+    The verdict reason and the structured caveat fields must say so."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    for i in range(6):
+        await _seed_verdict(
+            db_session, project.id, version.id, seq=i, would_promote=True, confidence=0.95
+        )
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    assert out["ready"] is True, out["reason"]
+    # No unvalidated "trustworthy" claim; framed honestly as self-approval.
+    assert "trustworthy" not in out["reason"].lower()
+    assert "self-approval" in out["reason"].lower()
+    # Structured caveat fields are present so every consumer states it honestly.
+    assert out["ground_truth_validated"] is False
+    assert "self-approval only" in out["caveat"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_empty_carries_ground_truth_caveat(db_session):
+    """Even the no-verdicts (not-ready) summary carries the ground-truth caveat
+    fields so the UI/strategic payloads never imply a validated signal."""
+    project, _version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    assert out["verdicts_evaluated"] == 0
+    assert out["ground_truth_validated"] is False
+    assert "self-approval only" in out["caveat"]
+
+
+@pytest.mark.asyncio
 async def test_readiness_recurring_blocker_not_ready(db_session):
     """A recurring hard blocker in the history blocks readiness even when the
     most-recent streak, evaluated count and would-promote rate all clear their
@@ -11568,6 +11605,81 @@ async def test_readiness_excludes_promotion_enabled_verdicts(db_session):
 
     assert out["verdicts_evaluated"] == 5
     assert out["ready"] is True, out["reason"]
+    # Pre-go-live (promotion disabled): this IS current readiness.
+    assert out["regime"] == "pre_go_live_calibration"
+    assert out["is_current_readiness"] is True
+
+
+@pytest.mark.asyncio
+async def test_readiness_post_go_live_is_historical_not_current(db_session):
+    """Once promotion is effectively enabled, the dry-run window stops receiving
+    verdicts and is frozen pre-go-live history. The summary must relabel itself as
+    a historical calibration window (regime='live', is_current_readiness=False)
+    and NOT present a stale 'ready' streak as current readiness — otherwise the
+    panel freezes on aging dry-runs while claiming to be current."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    # A healthy dry-run streak that WOULD read as ready pre-go-live...
+    for i in range(6):
+        await _seed_verdict(
+            db_session, project.id, version.id, seq=i, would_promote=True, confidence=0.95
+        )
+
+    # ...but promotion is now live for this project.
+    out = await rq.compute_promotion_readiness(
+        db_session, project.id, promotion_enabled=True
+    )
+
+    assert out["regime"] == "live"
+    assert out["is_current_readiness"] is False
+    assert out["promotion_enabled"] is True
+    # The stale dry-run streak must NOT surface as a live 'ready' signal.
+    assert out["ready"] is False
+    assert "pre-go-live" in out["reason"]
+    # The underlying dry-run evidence is still carried (now labeled historical).
+    assert out["verdicts_evaluated"] == 6
+
+
+@pytest.mark.asyncio
+async def test_readiness_post_go_live_empty_window_is_historical(db_session):
+    """The 'collapsed to no verdicts' post-go-live state is also relabeled as
+    historical rather than presenting a bare not-ready current-readiness number."""
+    project, _version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+
+    out = await rq.compute_promotion_readiness(
+        db_session, project.id, promotion_enabled=True
+    )
+
+    assert out["verdicts_evaluated"] == 0
+    assert out["regime"] == "live"
+    assert out["is_current_readiness"] is False
+    assert out["ready"] is False
+
+
+@pytest.mark.asyncio
+async def test_readiness_resolves_promotion_enabled_from_runtime_config(db_session):
+    """When promotion_enabled is not passed, the regime is resolved from the
+    effective per-project promotion gate (so the panel endpoint, which omits the
+    arg, gets the live relabeling automatically once promotion is enabled)."""
+    from app import shared_state
+
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    for i in range(6):
+        await _seed_verdict(
+            db_session, project.id, version.id, seq=i, would_promote=True, confidence=0.95
+        )
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    try:
+        out = await rq.compute_promotion_readiness(db_session, project.id)
+    finally:
+        shared_state.runtime_config["promotion_enabled"] = False
+
+    assert out["regime"] == "live"
+    assert out["is_current_readiness"] is False
+    assert out["ready"] is False
 
 
 @pytest.mark.asyncio

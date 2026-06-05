@@ -391,6 +391,149 @@ async def classify_existing_paths(
     return present, missing
 
 
+async def _git_output(
+    args: List[str], repo_root: str = _REPO_ROOT, timeout: int = 5
+) -> Optional[str]:
+    """Run ``git <args>`` in *repo_root* and return stdout, or None on any failure.
+
+    Conservative by construction: a missing checkout, non-zero exit, timeout, or
+    any exception all collapse to None so callers degrade rather than guess.
+    """
+    if not repo_root or not os.path.isdir(repo_root):
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            *args,
+            cwd=repo_root,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return None
+        if proc.returncode != 0:
+            return None
+        return stdout.decode(errors="replace")
+    except Exception:
+        logger.debug("[SOURCE_REF_VALIDATION] git %s failed", args, exc_info=True)
+        return None
+
+
+async def resolve_head_commit(
+    *,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    project_id: str | None = None,
+    cwd: str = "/tmp/workspace",
+) -> Optional[str]:
+    """Resolve the current HEAD commit SHA of the integration/verification branch.
+
+    Uses the GitHub API (the branch tip) when ``token/owner/repo/branch`` are all
+    provided — the backend has no local checkout in prod — and falls back to the
+    local checkout's ``git rev-parse HEAD`` otherwise (the agent VM has one).
+    Returns None when indeterminate (no creds + no checkout, or any API/git
+    error) so a finding is never stamped with a bogus provenance SHA. Mirrors the
+    conservative degradation of :func:`validate_source_refs`.
+    """
+    if all([token, owner, repo, branch]):
+        try:
+            from app.github_refs import get_branch_sha
+
+            return await get_branch_sha(
+                str(token), str(owner), str(repo), str(branch)
+            )
+        except Exception:
+            logger.debug(
+                "[SOURCE_REF_VALIDATION] head-commit GitHub resolution failed",
+                exc_info=True,
+            )
+    out = await _git_output(["rev-parse", "HEAD"], cwd)
+    return out.strip() if out and out.strip() else None
+
+
+def finding_cited_paths(finding: Dict[str, Any]) -> List[str]:
+    """Extract the file paths a finding cites via its file-type ``sources``.
+
+    PR and message sources are skipped; line/range suffixes are stripped. Only
+    refs that look like file paths are returned, ready to test against a diff.
+    """
+    paths: List[str] = []
+    if not isinstance(finding, dict):
+        return paths
+    for src in finding.get("sources") or []:
+        if not isinstance(src, dict):
+            continue
+        if (src.get("type") or "").lower() in ("pr", "message"):
+            continue
+        ref = src.get("ref")
+        if not isinstance(ref, str) or not ref:
+            continue
+        path, _, _ = _parse_ref(ref)
+        if path and _looks_like_file_path(path):
+            paths.append(path)
+    return paths
+
+
+async def cited_paths_changed_since(
+    sha: Optional[str],
+    paths: list,
+    *,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    project_id: str | None = None,
+    cwd: str = "/tmp/workspace",
+) -> Optional[bool]:
+    """Return whether any of *paths* changed between *sha* and current HEAD.
+
+    Tri-state, mirroring :func:`validate_source_refs`:
+      * True  — the diff was computed and at least one cited path appears in it.
+      * False — the diff was computed and none of the cited paths changed.
+      * None  — indeterminate (unknown SHA, no cited paths, no creds + no
+                checkout, or an API/git error). Callers MUST NOT treat None as
+                "changed": only an affirmative True flags a finding stale.
+    """
+    if not sha:
+        return None
+    norm = {
+        _parse_ref(p)[0] for p in paths if isinstance(p, str) and p
+    }
+    norm.discard("")
+    if not norm:
+        return None
+    if all([token, owner, repo, branch]):
+        try:
+            from app.github_refs import get_files_changed_between_refs
+
+            changed = await get_files_changed_between_refs(
+                str(token),
+                str(owner),
+                str(repo),
+                sha,
+                str(branch),
+                project_id=project_id,
+            )
+        except Exception:
+            logger.debug(
+                "[SOURCE_REF_VALIDATION] changed-files GitHub compare failed",
+                exc_info=True,
+            )
+            changed = None
+    else:
+        out = await _git_output(["diff", "--name-only", f"{sha}..HEAD"], cwd)
+        changed = out.splitlines() if out is not None else None
+    if changed is None:
+        return None
+    changed_set = {c for c in changed if c}
+    return any(c in changed_set for c in norm)
+
+
 # Recognizes the `path/to/file.ext:symbol` convention used in finding claims
 # (e.g. "backend/app/x.py:my_func stores Y"). The symbol must start with a
 # letter or underscore, which excludes line-number refs like file.py:42.

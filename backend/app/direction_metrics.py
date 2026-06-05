@@ -24,6 +24,11 @@ _HISTORY_AGG_DEFAULTS = {
     "total_cycles": 0,
     "total_tasks_created": 0,
     "total_prs_merged": 0,
+    # Verification-aware lifetime merge count: total_prs_merged minus merges
+    # whose verification was degraded (blocked by an environment/setup failure).
+    # _compute_lifetime_burn_metrics reads this so a degraded merge does not
+    # suppress lifetime non-merge burn even after its cycle is evicted.
+    "total_verified_prs_merged": 0,
     "total_prs_rejected": 0,
     "total_tasks_failed": 0,
     "total_tasks_failed_infra": 0,
@@ -318,6 +323,11 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
         agg["total_cycles"] += 1
         agg["total_tasks_created"] += ev.get("tasks_created", 0)
         agg["total_prs_merged"] += ev.get("prs_merged", 0)
+        # Legacy fallback: pre-verification entries have no verified_prs_merged;
+        # treat all merges as verified so lifetime burn is unchanged for old data.
+        agg["total_verified_prs_merged"] += ev.get(
+            "verified_prs_merged", ev.get("prs_merged", 0)
+        )
         agg["total_prs_rejected"] += ev.get("prs_rejected", 0)
         agg["total_tasks_failed"] += ev.get("tasks_failed", 0)
         agg["total_tasks_failed_infra"] += ev.get("tasks_failed_infra", 0)

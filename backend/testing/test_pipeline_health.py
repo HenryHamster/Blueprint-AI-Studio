@@ -460,6 +460,56 @@ async def test_direction_stats_conversion_rate():
 
 
 @pytest.mark.asyncio
+async def test_conversion_rate_excludes_degraded_unverified_merges():
+    """Direction- and pipeline-level conversion exclude degraded-unverified merges.
+
+    Cycle has 3 merged PRs from 4 tasks created, but only 2 verified (verified +
+    benign-unverified); 1 was degraded-unverified. Conversion must be 2/4=0.5,
+    not 3/4=0.75 — agreeing with the per-task verification layer.
+    """
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    direction_id = str(uuid.uuid4())
+
+    project = make_project(
+        directions=[
+            {
+                "id": direction_id,
+                "status": "active",
+                "text": "Improve test coverage",
+                "research_history": [
+                    {
+                        "timestamp": (now - timedelta(hours=5)).isoformat(),
+                        "prs_merged": 3,
+                        "verified_prs_merged": 2,
+                        "tasks_created": 4,
+                    },
+                ],
+            }
+        ]
+    )
+
+    tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": direction_id},
+            created_at=now - timedelta(hours=4),
+        ),
+    ]
+    session = _make_mock_session(tasks=tasks, project=project)
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    stats = result["direction_stats"]
+    assert len(stats) == 1
+    assert stats[0]["conversion_rate"] == 0.5
+    # Pipeline-level conversion is verification-aware too: 2 verified / 4 created.
+    assert result["pipeline_conversion_rate"] == 0.5
+
+
+@pytest.mark.asyncio
 async def test_direction_with_zero_cycles_excluded():
     """Active direction with no completed research cycles in window is excluded from stats."""
     now = _utcnow()

@@ -2366,14 +2366,18 @@ export const MAX_DISABLED_TEST_MARKERS = 20;
 // Path heuristics for "this is a TEST file" — restrict the scan so unrelated
 // prose or a non-test ``# ignore``-style comment cannot false-positive. Mirrors
 // the common ecosystem conventions: ``*.test.*`` / ``*.spec.*`` (JS/TS), Go
-// ``*_test.go``, Python ``test_*.py`` / ``*_test.py``, Ruby ``*_spec.rb``, and
-// anything under a ``tests/`` / ``__tests__/`` / ``spec/`` directory.
+// ``*_test.go``, Python ``test_*.py`` / ``*_test.py``, Ruby ``*_spec.rb``,
+// Rust ``*_test.rs`` / ``*_spec.rs``, Java/Kotlin ``*Test.java`` / ``*Test.kt``,
+// and anything under a ``tests/`` / ``test/`` / ``__tests__/`` / ``spec/`` directory.
 const TEST_FILE_PATTERNS: RegExp[] = [
   /\.(test|spec)\.[a-z0-9]+$/i,
   /_test\.go$/i,
   /(^|\/)test_[^/]*\.py$/i,
   /_test\.py$/i,
   /_spec\.rb$/i,
+  /_test\.rs$/i,
+  /_spec\.rs$/i,
+  /Test\.(java|kt|kts)$/i,
   /(^|\/)(tests?|__tests__|spec)\//i,
 ];
 
@@ -2384,35 +2388,69 @@ export function isTestFilePath(relPath: string): boolean {
   return TEST_FILE_PATTERNS.some(re => re.test(p));
 }
 
+/** Detect the language(s) of a test file based on its path and extension. */
+function detectTestLanguages(relPath: string): string[] {
+  const p = (relPath || '').trim().toLowerCase();
+  const languages = new Set<string>();
+
+  // File extension-based detection
+  if (p.endsWith('.ts') || p.endsWith('.tsx') || p.endsWith('.js') || p.endsWith('.jsx')) {
+    languages.add('js-ts');
+  } else if (p.endsWith('.py')) {
+    languages.add('python');
+  } else if (p.endsWith('.go')) {
+    languages.add('go');
+  } else if (p.endsWith('.rs')) {
+    languages.add('rust');
+  } else if (p.endsWith('.rb')) {
+    languages.add('ruby');
+  } else if (p.endsWith('.java') || p.endsWith('.kt') || p.endsWith('.kts')) {
+    languages.add('jvm');
+  }
+
+  // Directory-based detection (for ambiguous test files under tests/ directories)
+  if (p.includes('/__tests__/') || p.includes('/tests/') || p.includes('/test/') || p.includes('/spec/')) {
+    // If directory alone can't determine the language, we need to preserve multi-language detection
+    if (languages.size === 0) {
+      // Ambiguous case: /tests/ dir but no clear extension. This shouldn't happen
+      // since test files should have extensions, but be conservative.
+      return ['js-ts', 'python', 'go', 'rust', 'ruby', 'jvm'];
+    }
+  }
+
+  return Array.from(languages);
+}
+
 // Each marker is anchored so it matches REAL usage (``it.skip(`` …), not a
 // substring inside an identifier or a longer marker name. ``kind`` is the
-// human-facing label surfaced in the verdict.
-const DISABLED_TEST_MARKERS: Array<{ kind: string; re: RegExp }> = [
+// human-facing label surfaced in the verdict. ``languages`` restricts the
+// marker to only test files of the specified language(s).
+const DISABLED_TEST_MARKERS: Array<{ kind: string; re: RegExp; languages: string[] }> = [
   // JS / TS (Jest / Vitest / Mocha / Jasmine).
-  { kind: 'it.skip', re: /\bit\.skip\b/ },
-  { kind: 'test.skip', re: /\btest\.skip\b/ },
-  { kind: 'describe.skip', re: /\bdescribe\.skip\b/ },
-  { kind: 'context.skip', re: /\bcontext\.skip\b/ },
-  { kind: 'xit', re: /\bxit\s*\(/ },
-  { kind: 'xdescribe', re: /\bxdescribe\s*\(/ },
-  { kind: 'xtest', re: /\bxtest\s*\(/ },
+  { kind: 'it.skip', re: /\bit\.skip\b/, languages: ['js-ts'] },
+  { kind: 'test.skip', re: /\btest\.skip\b/, languages: ['js-ts'] },
+  { kind: 'describe.skip', re: /\bdescribe\.skip\b/, languages: ['js-ts'] },
+  { kind: 'context.skip', re: /\bcontext\.skip\b/, languages: ['js-ts'] },
+  { kind: 'xit', re: /\bxit\s*\(/, languages: ['js-ts'] },
+  { kind: 'xdescribe', re: /\bxdescribe\s*\(/, languages: ['js-ts'] },
+  { kind: 'xtest', re: /\bxtest\s*\(/, languages: ['js-ts'] },
   // Python — pytest markers and unittest decorators.
-  { kind: '@pytest.mark.skipif', re: /@pytest\.mark\.skipif\b/ },
-  { kind: '@pytest.mark.skip', re: /@pytest\.mark\.skip\b/ },
-  { kind: '@pytest.mark.xfail', re: /@pytest\.mark\.xfail\b/ },
-  { kind: '@unittest.skip', re: /@(?:unittest\.)?skip(?:If|Unless)?\b/ },
+  { kind: '@pytest.mark.skipif', re: /@pytest\.mark\.skipif\b/, languages: ['python'] },
+  { kind: '@pytest.mark.skip', re: /@pytest\.mark\.skip\b/, languages: ['python'] },
+  { kind: '@pytest.mark.xfail', re: /@pytest\.mark\.xfail\b/, languages: ['python'] },
+  { kind: '@unittest.skip', re: /@(?:unittest\.)?skip(?:If|Unless)?\b/, languages: ['python'] },
   // Go — testing.T skip calls.
-  { kind: 't.Skip()', re: /\b[a-zA-Z_]\w*\.Skip(?:Now)?\s*\(/ },
+  { kind: 't.Skip()', re: /\b[a-zA-Z_]\w*\.Skip(?:Now)?\s*\(/, languages: ['go'] },
   // Rust — ignored test attribute.
-  { kind: '#[ignore]', re: /#\[\s*ignore\b/ },
+  { kind: '#[ignore]', re: /#\[\s*ignore\b/, languages: ['rust'] },
   // JUnit (Java/Kotlin).
-  { kind: '@Disabled', re: /@Disabled\b/ },
-  { kind: '@Ignore', re: /@Ignore\b/ },
+  { kind: '@Disabled', re: /@Disabled\b/, languages: ['jvm'] },
+  { kind: '@Ignore', re: /@Ignore\b/, languages: ['jvm'] },
   // RSpec (Ruby) — ``pending`` marks an example as not-yet-passing.
   // Avoid false positives on string literals ("pending"), symbols (:pending),
   // and identifiers containing "pending". Match only genuine RSpec calls:
   // pending followed by space/paren/brace/do or end-of-line.
-  { kind: 'pending', re: /(?<!:)\bpending\b(?:\s|$|\(|\{|do\b)/ },
+  { kind: 'pending', re: /(?<!:)\bpending\b(?:\s|$|\(|\{|do\b)/, languages: ['ruby'] },
 ];
 
 // Whether a (trimmed) added line is a comment we should NOT scan for markers —
@@ -2443,8 +2481,9 @@ export interface DiscoverDisabledTestsInput {
  * Discover the test-skip / disable markers a PR NEWLY introduces. Scans ONLY the
  * added lines (``+`` lines) of changed TEST files, so pre-existing skips and
  * non-test files are ignored. Anchored, ecosystem-aware marker matching keeps
- * prose / comments from false-positiving. Pure — no filesystem access — so it is
- * directly unit-testable. Bounded to ``max`` markers.
+ * prose / comments from false-positiving. Language-scoped markers are only checked
+ * for languages matching the test file (e.g., RSpec 'pending' only in Ruby files).
+ * Pure — no filesystem access — so it is directly unit-testable. Bounded to ``max`` markers.
  */
 export function discoverNewlyDisabledTests(
   input: DiscoverDisabledTestsInput,
@@ -2459,11 +2498,18 @@ export function discoverNewlyDisabledTests(
     if (!Object.prototype.hasOwnProperty.call(input.addedLinesByFile, rel)) continue;
     const added = input.addedLinesByFile[rel];
     if (added.length === 0) continue;
+
+    // Detect the file's language(s) and filter markers accordingly.
+    const fileLanguages = detectTestLanguages(rel);
+
     for (const raw of added) {
       if (out.length >= max) break;
       const line = (raw || '').trim();
       if (!line || isCommentLine(line)) continue;
-      const hit = DISABLED_TEST_MARKERS.find(m => m.re.test(line));
+      // Only check markers whose language(s) match the file's detected language(s).
+      const hit = DISABLED_TEST_MARKERS.find(
+        m => m.languages.some(lang => fileLanguages.includes(lang)) && m.re.test(line),
+      );
       if (hit) out.push({ file: rel, marker: hit.kind, line });
     }
   }

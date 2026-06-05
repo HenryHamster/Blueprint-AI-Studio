@@ -6,7 +6,6 @@ related quality signals. Imported and re-exported by digest_metrics so
 existing call sites keep working without changes.
 """
 
-import statistics
 from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
@@ -15,6 +14,7 @@ from app.review_learning import _categorize_review_issues
 from app.sr_blind_spots import (
     _REVIEWER_ORIGINS,
     is_skipped_sr_outcome,
+    reviewer_confirmed_categories,
 )
 from app.time_utils import _to_naive_utc
 
@@ -508,7 +508,11 @@ def compute_sr_prediction_accuracy(
     for t in tasks_with_both:
         ctx = t.context or {}
         check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
-        human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
+        # All-iterations reviewer-confirmed truth set (falls back to the
+        # first-attempt set only when absent) — shared with the sibling FP
+        # surfaces so a later-iteration confirmation is not scored as a false
+        # alarm and all "false alarm" figures reconcile.
+        human_cats = reviewer_confirmed_categories(ctx)
         sr_failed = _author_sr_failed_categories(check_results)
         total_human += len(human_cats)
         total_overlap += len(human_cats & sr_failed)
@@ -560,65 +564,6 @@ def compute_sr_prediction_accuracy(
         )
         if tasks_with_rejections > 0
         else None,
-    }
-
-
-def _compute_parallel_review_effectiveness(
-    terminal_tasks: List[Task],
-) -> Dict[str, Any] | None:
-    """Compare approval rates between parallelized and serial review tasks.
-
-    Buckets review tasks by review_was_parallelized from task.context and
-    returns per-bucket metrics. Returns None when either bucket has <3 tasks.
-    """
-    review_tasks = [
-        t
-        for t in terminal_tasks
-        if (t.first_payload or {}).get("type") == "review"
-        and (t.context or {}).get("blueprint_review_verdict") is not None
-    ]
-
-    parallel = [
-        t for t in review_tasks if (t.context or {}).get("review_was_parallelized")
-    ]
-    serial = [
-        t for t in review_tasks if not (t.context or {}).get("review_was_parallelized")
-    ]
-
-    if len(parallel) < 3 or len(serial) < 3:
-        return None
-
-    def _approval_rate(tasks):
-        approvals = sum(
-            1
-            for t in tasks
-            if (t.context or {}).get("blueprint_review_verdict") == "APPROVE"
-        )
-        return round(approvals / len(tasks), 2)
-
-    def _mean_issues(tasks):
-        # issues_count is not always stored; use 0 when absent
-        counts = [(t.context or {}).get("issues_count", 0) for t in tasks]
-        return round(statistics.mean(counts), 2)
-
-    def _mean_iterations(tasks):
-        counts = [(t.context or {}).get("iteration_count", 1) for t in tasks]
-        return round(statistics.mean(counts), 2)
-
-    return {
-        "parallel": {
-            "count": len(parallel),
-            "approval_rate": _approval_rate(parallel),
-            "mean_issues_per_iteration": _mean_issues(parallel),
-            "mean_iterations": _mean_iterations(parallel),
-        },
-        "serial": {
-            "count": len(serial),
-            "approval_rate": _approval_rate(serial),
-            "mean_issues_per_iteration": _mean_issues(serial),
-            "mean_iterations": _mean_iterations(serial),
-        },
-        "sample_sizes": {"parallel": len(parallel), "serial": len(serial)},
     }
 
 
@@ -708,9 +653,8 @@ def compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any]
     self_review_prediction_accuracy = compute_sr_prediction_accuracy(tasks_with_both)
     fresh_reviewer_effectiveness = _compute_fresh_reviewer_effectiveness(terminal_tasks)
     edges_considered_metrics = _compute_edges_considered_metrics(terminal_tasks)
-    parallel_review_effectiveness = _compute_parallel_review_effectiveness(
-        terminal_tasks
-    )
+    # Retired: parallel_review_effectiveness measured review-task parallelization,
+    # but had no consumer and two placeholder subfields never had real inputs.
 
     return {
         "self_review_effectiveness": self_review_effectiveness,
@@ -718,5 +662,4 @@ def compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any]
         "review_accuracy": review_accuracy,
         "fresh_reviewer_effectiveness": fresh_reviewer_effectiveness,
         "edges_considered_metrics": edges_considered_metrics,
-        "parallel_review_effectiveness": parallel_review_effectiveness,
     }

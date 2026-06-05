@@ -275,7 +275,7 @@ export function CatchUpOperationalMetricsSection({
             <span className="text-[10px] text-neutral-400">· {mh.migration_tasks_in_window} task{mh.migration_tasks_in_window === 1 ? '' : 's'}</span>
             <span className="text-[10px] text-emerald-400">· {mh.migration_tasks_succeeded} ok</span>
             <span className={`text-[10px] ${mh.migration_tasks_failed > 0 ? 'text-red-400' : 'text-neutral-500'}`}>· {mh.migration_tasks_failed} failed</span>
-            <span className={`text-[10px] ${mh.migration_errors_in_window > 0 ? 'text-red-400' : 'text-neutral-500'}`}>· {mh.migration_errors_in_window} errors</span>
+            <span className={`text-[10px] ${mh.migration_errors_in_window > 0 ? 'text-red-400' : 'text-neutral-500'}`}>· {mh.migration_errors_in_window} migration errors</span>
             {mh.auto_generated_migrations > 0 && (
               <span className="text-[10px] text-amber-400 font-semibold">· ⚠ {mh.auto_generated_migrations} auto-generated</span>
             )}

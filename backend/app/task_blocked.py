@@ -112,6 +112,29 @@ def get_blocker_metadata(task: Task) -> Dict[str, Any]:
     return dict(meta) if isinstance(meta, dict) else {}
 
 
+def get_blocker_needs(task: Task) -> list:
+    """Return the full list of machine-resolvable needs recorded on a blocker.
+
+    A blocked dependent can wait on MORE THAN ONE unresolved prerequisite. The
+    canonical store is ``context['blocker']['needs']`` (a list). For backward
+    compatibility with rows written before multi-need support — which carry only
+    the single ``context['blocker']['need']`` key — this falls back to ``[need]``.
+    Returns ``[]`` when the blocker records no machine-resolvable need at all.
+    Only well-formed dict entries are returned, so a malformed row degrades to the
+    legacy single-need behaviour rather than raising.
+    """
+    meta = get_blocker_metadata(task)
+    raw = meta.get("needs")
+    if isinstance(raw, list):
+        valid = [n for n in raw if isinstance(n, dict)]
+        if valid:
+            return valid
+    need = meta.get("need")
+    if isinstance(need, dict):
+        return [need]
+    return []
+
+
 def is_blocked(task: Task) -> bool:
     """True if the task is in the first-class BLOCKED state."""
     return task.status == TaskStatus.BLOCKED
@@ -129,6 +152,7 @@ def enter_blocked_state(
     deadline_at: Optional[datetime] = None,
     escalated: bool = False,
     need: Optional[Dict[str, Any]] = None,
+    needs: Optional[list] = None,
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Transition ``task`` into the BLOCKED state and persist blocker metadata.
@@ -162,15 +186,37 @@ def enter_blocked_state(
         "deadline_at": _iso(deadline_at),
         "escalated": bool(escalated),
     }
-    # Normalized machine-resolvable prerequisite, if the caller supplied one.
-    # Re-validated through build_need so a malformed dict is never persisted;
-    # absent/invalid need leaves the metadata shape exactly as before.
+    # Normalized machine-resolvable prerequisite(s). A blocked dependent can wait
+    # on MORE THAN ONE unresolved prerequisite, so the canonical store is a LIST
+    # under ``meta['needs']``. For backward compatibility we ALSO mirror the first
+    # entry into the legacy single ``meta['need']`` key, which existing consumers
+    # and already-persisted rows still read (and ``get_blocker_needs`` falls back
+    # to). Each entry is re-validated through ``build_need`` so a malformed dict is
+    # never persisted; duplicates (same kind+ref) are collapsed. Absent/invalid
+    # input leaves the metadata shape exactly as before (no need/needs keys). The
+    # ``needs`` list and the single ``need`` argument are both accepted and merged
+    # (needs first), so legacy single-need call sites keep working unchanged.
+    raw_needs: list = []
+    if isinstance(needs, list):
+        raw_needs.extend(needs)
     if isinstance(need, dict):
-        normalized_need = build_need(
-            need.get("kind"), need.get("ref"), need.get("label")
-        )
-        if normalized_need:
-            meta["need"] = normalized_need
+        raw_needs.append(need)
+    normalized_needs: list = []
+    seen_need_keys: set = set()
+    for raw in raw_needs:
+        if not isinstance(raw, dict):
+            continue
+        normalized = build_need(raw.get("kind"), raw.get("ref"), raw.get("label"))
+        if normalized is None:
+            continue
+        key = (normalized["kind"], normalized["ref"])
+        if key in seen_need_keys:
+            continue
+        seen_need_keys.add(key)
+        normalized_needs.append(normalized)
+    if normalized_needs:
+        meta["needs"] = normalized_needs
+        meta["need"] = normalized_needs[0]
     ctx = dict(task.context or {})
     ctx[BLOCKER_CONTEXT_KEY] = meta
     # Preserve BLOCKED_PRECONDITION classification compatibility so historical

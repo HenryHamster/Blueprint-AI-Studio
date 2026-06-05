@@ -10,7 +10,7 @@ import {
   writeDesignDocHelper,
 } from './prompt.js';
 import * as promptModule from './prompt.js';
-import { writeStrategicHelpers } from './handlers/strategic-helpers.js';
+import { writeStrategicHelpers, writeFetchHelper, RESEARCH_FETCH_VERBS } from './handlers/strategic-helpers.js';
 import { provisionAmbientHelpers } from './providers/runners.js';
 
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -136,6 +136,7 @@ describe('per-handler prompt/helper provisioning parity', () => {
     writeMessagesHelper: (ws) => { writeMessagesHelper('t-helpertest', ws); },
     writeDesignDocHelper: (ws) => { writeDesignDocHelper('t-helpertest', ws); },
     writeStrategicHelpers: (ws) => { writeStrategicHelpers('t-helpertest', 'p-helpertest', ws); },
+    writeFetchHelper: (ws) => { writeFetchHelper('t-helpertest', 'p-helpertest', ws, { verbs: RESEARCH_FETCH_VERBS }); },
   };
 
   // Every model-prompt-emitting handler whose prompt advertises helpers. The
@@ -150,6 +151,10 @@ describe('per-handler prompt/helper provisioning parity', () => {
     { type: 'plan', sources: ['handlers/research-plan.ts'] },
     { type: 'strategic_review', sources: ['handlers/strategic.ts'] },
     { type: 'design_doc_update', sources: ['handlers/design-doc.ts'] },
+    { type: 'create', sources: ['handlers/standard.ts'] },
+    { type: 'refactor', sources: ['handlers/standard.ts'] },
+    { type: 'review', sources: ['handlers/review-fix.ts'] },
+    { type: 'fix', sources: ['handlers/review-fix.ts'] },
   ];
 
   let ws: string;

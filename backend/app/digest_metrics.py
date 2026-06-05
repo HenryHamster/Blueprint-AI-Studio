@@ -15,11 +15,12 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.landed_signal import has_landed_signal
+from app.database import resolve_dialect_name
+from app.landed_signal import has_landed_signal, merge_verification_status
 from app.models import (
     Alert,
     Project,
@@ -38,6 +39,12 @@ from app.digest_remediation import (  # noqa: F401
 # Per-direction progress aggregation (the single largest analytic) relocated to
 # its own module. Re-exported here so existing import paths are unchanged.
 from app.digest_direction_progress import compute_direction_progress  # noqa: F401
+
+# Per-effort-tier / per-actual-model efficiency rollup lives next to the shared
+# LLM pricing table in efficiency_snapshot (so its totals reconcile with the
+# per-model cost breakdown). Re-exported here so the digest consumer and tests
+# import it from the same module as the other digest metrics.
+from app.efficiency_snapshot import compute_effort_model_efficiency  # noqa: F401
 
 # SR/review-quality metrics cluster relocated to its own module.
 # Re-exported here so existing import paths are unchanged.
@@ -59,7 +66,6 @@ from app.sr_review_quality_metrics import (  # noqa: F401
     _reviewer_caught_author_miss,
     _compute_edges_considered_metrics,
     compute_sr_prediction_accuracy,
-    _compute_parallel_review_effectiveness,
     compute_review_quality_metrics,
 )
 from app.failure_classification import (
@@ -181,8 +187,27 @@ def _compute_first_attempt_breakdowns(
             for cat, count in sorted(cat_counts.items(), key=lambda x: -x[1])
         }
 
+    # verified_overall: excludes degraded-unverified merges from the success
+    # count.  A task with _first_attempt_succeeded=True whose PR merged via a
+    # degraded fall-open (environment/setup failure blocked verification) is not
+    # a proven fix on HEAD and should not inflate the success rate.  Benign
+    # fall-opens (no detectable suite, kill-switch off) still count.  Additive
+    # — does not replace "overall".
+    def _fa_verified_rate(tasks):
+        measured = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
+        if not measured:
+            return None
+        succ = sum(
+            1
+            for t in measured
+            if t.context["_first_attempt_succeeded"]
+            and merge_verification_status(t) != "unverified_degraded"
+        )
+        return round(succ / len(measured), 2)
+
     return {
         "overall": overall,
+        "verified_overall": _fa_verified_rate(terminal_tasks),
         "with_playbook": _fa_rate(with_pb),
         "without_playbook": _fa_rate(without_pb),
         "with_arch_context": _fa_rate(with_arch),
@@ -1241,6 +1266,10 @@ _FOUNDATION_OVERLAP_THRESHOLD = 0.5
 # Defensive caps on the surfaced lists so a large backlog never bloats the digest.
 _PARKED_BLOCKER_LIST_LIMIT = 100
 _DUPLICATE_FOUNDATION_LIST_LIMIT = 50
+# Unresumable-cancellation aggregate: how far back to count terminal give-ups,
+# and the cap on the surfaced per-task list.
+_UNRESUMABLE_CANCEL_WINDOW = timedelta(days=7)
+_UNRESUMABLE_CANCEL_LIST_LIMIT = 100
 
 
 def _task_related_files(t: "Task") -> set:
@@ -1358,6 +1387,70 @@ def compute_duplicate_foundation_signal(
     return {
         "total": len(candidates),
         "candidates": candidates[:_DUPLICATE_FOUNDATION_LIST_LIMIT],
+    }
+
+
+def compute_unresumable_cancellation_summary(
+    cancelled_tasks: List["Task"],
+    *,
+    window_start: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Count blocked dependents terminally CANCELLED because they can never resume.
+
+    Pure function — no database calls. Reads the durable
+    ``reaper_sweeps.UNRESUMABLE_CANCEL_CONTEXT_KEY`` marker stamped by
+    ``_cancel_blocker_as_dead`` when the resume system gives up on a blocked
+    dependent (its foundation died, or its need outlived the bounded parked
+    re-evaluations). This give-up IS the failure mode of structural gating, so its
+    rate is the single best health signal — a spike (e.g. from a resume-matcher
+    regression stranding finding-hash/capability needs) is otherwise invisible in
+    aggregate.
+
+    Tasks with no marker are skipped. When ``window_start`` is given, a marker
+    whose ``at`` timestamp is older (or unparseable) is skipped, so the count
+    reflects only a recent window. Returns the total plus breakdowns by give-up
+    class and by originating direction, and a capped newest-first task list.
+    """
+    from app.reaper_sweeps import UNRESUMABLE_CANCEL_CONTEXT_KEY
+
+    rows: List[Dict[str, Any]] = []
+    by_class: Dict[str, int] = defaultdict(int)
+    by_direction: Dict[str, int] = defaultdict(int)
+    window_iso = window_start.isoformat() if window_start else None
+
+    for t in cancelled_tasks:
+        marker = (t.context or {}).get(UNRESUMABLE_CANCEL_CONTEXT_KEY)
+        if not isinstance(marker, dict):
+            continue
+        at = marker.get("at")
+        # ISO-8601 strings from a common naive-UTC source sort lexicographically,
+        # so a string compare is a correct, cheap window filter.
+        if window_iso and (not isinstance(at, str) or at < window_iso):
+            continue
+        give_up_class = marker.get("give_up_class") or "unknown"
+        direction_id = marker.get("direction_id") or "(none)"
+        by_class[give_up_class] += 1
+        by_direction[direction_id] += 1
+        rows.append(
+            {
+                "task_id": str(t.id),
+                "title": t.title or str(t.id)[:8],
+                "project_id": str(t.project_id)
+                if getattr(t, "project_id", None) is not None
+                else None,
+                "give_up_class": give_up_class,
+                "need": marker.get("need"),
+                "direction_id": marker.get("direction_id"),
+                "at": at,
+            }
+        )
+
+    rows.sort(key=lambda r: r["at"] or "", reverse=True)
+    return {
+        "total": len(rows),
+        "by_class": dict(by_class),
+        "by_direction": dict(by_direction),
+        "tasks": rows[:_UNRESUMABLE_CANCEL_LIST_LIMIT],
     }
 
 
@@ -1490,10 +1583,49 @@ async def compute_dependency_health_signals(
         .all()
     )
 
+    # Terminal give-up cancellations of blocked dependents over a recent window.
+    # Cheaply pre-filtered by updated_at (advances on the CANCELLED transition);
+    # the summarizer refines by the marker's own ``at`` and buckets the counts.
+    from app.reaper_sweeps import UNRESUMABLE_CANCEL_CONTEXT_KEY
+    from app.time_utils import _utcnow
+
+    window_start = _utcnow() - _UNRESUMABLE_CANCEL_WINDOW
+    # Key-existence on ``Task.context``: ``has_key`` compiles to the Postgres
+    # JSONB ``?`` operator (fails on the SQLite smoke gate with a parameter
+    # placeholder error), so branch the SQLite path through ``json_extract``,
+    # which resolves the marker to NULL only when the key is absent.
+    if resolve_dialect_name(session) == "sqlite":
+        marker_present = func.json_extract(
+            Task.context, f"$.{UNRESUMABLE_CANCEL_CONTEXT_KEY}"
+        ).is_not(None)
+    else:
+        marker_present = Task.context.has_key(UNRESUMABLE_CANCEL_CONTEXT_KEY)
+    cancel_filters = [
+        Task.status == TaskStatus.CANCELLED,
+        marker_present,
+        Task.updated_at >= window_start,
+    ]
+    if project_id is not None:
+        cancel_filters.append(Task.project_id == project_id)
+    cancelled = (
+        (
+            await session.execute(
+                select(Task)
+                .where(*cancel_filters)
+                .limit(_UNRESUMABLE_CANCEL_LIST_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
     return {
         "parked_blockers": compute_parked_blocker_summary(list(blocked)),
         "duplicate_foundation_candidates": compute_duplicate_foundation_signal(
             list(active)
+        ),
+        "unresumable_cancellations": compute_unresumable_cancellation_summary(
+            list(cancelled), window_start=window_start
         ),
     }
 
@@ -1673,7 +1805,7 @@ def compute_migration_health(
     _migrate_failed = [t for t in failed_tasks if _task_type(t) == "migrate"]
     _migration_errors = sum(
         1
-        for t in failed_tasks
+        for t in _migrate_failed
         if (t.context or {}).get("failure_class") == "MIGRATION_ERROR"
         or _mig_classify(t, error_log_map.get(str(t.id))) == "MIGRATION_ERROR"
     )
@@ -1986,37 +2118,14 @@ def compute_digest_cost_economics(
     pipeline_operator_action_count = sum(
         d.get("operator_action_count") or 0 for d in direction_progress_list
     )
-    pipeline_generalized_successes = sum(
-        d.get("generalized_successes", d.get("prs_merged", 0)) or 0
-        for d in direction_progress_list
-    )
-    pipeline_generalized_terminal_outcomes = sum(
-        d.get("generalized_terminal_outcomes", 0) or 0 for d in direction_progress_list
-    )
-    pipeline_generalized_health_rate = (
-        round(
-            pipeline_generalized_successes / pipeline_generalized_terminal_outcomes, 3
-        )
-        if pipeline_generalized_terminal_outcomes > 0
-        else None
-    )
+    # Retired: generalized success / health / outcome-kind rollups were computed here
+    # but never surfaced to /api/admin/digest or any UI consumer.
     overall_type_distribution: Dict[str, int] = {}
     for d in direction_progress_list:
         for ttype, cnt in (d.get("type_distribution") or {}).items():
             overall_type_distribution[ttype] = (
                 overall_type_distribution.get(ttype, 0) + cnt
             )
-
-    pipeline_outcome_kind_breakdown: Dict[str, Dict[str, int]] = {}
-    for d in direction_progress_list:
-        for kind, counts in (d.get("outcome_kind_breakdown") or {}).items():
-            bucket = pipeline_outcome_kind_breakdown.setdefault(
-                kind, {"success": 0, "neutral": 0, "failure": 0}
-            )
-            if not isinstance(counts, dict):
-                continue
-            for status in ("success", "neutral", "failure"):
-                bucket[status] += counts.get(status, 0) or 0
 
     pipeline_filter_funnel: Dict[str, int] = {}
     for d in direction_progress_list:
@@ -2041,9 +2150,6 @@ def compute_digest_cost_economics(
         "pipeline_autonomous_prs_merged": pipeline_autonomous_prs_merged,
         "pipeline_assisted_prs_merged": pipeline_assisted_prs_merged,
         "pipeline_operator_action_count": pipeline_operator_action_count,
-        "pipeline_generalized_successes": pipeline_generalized_successes,
-        "pipeline_generalized_health_rate": pipeline_generalized_health_rate,
-        "pipeline_outcome_kind_breakdown": pipeline_outcome_kind_breakdown,
         "overall_type_distribution": overall_type_distribution,
         "pipeline_filter_funnel": pipeline_filter_funnel,
     }

@@ -319,6 +319,19 @@ what lets the dry-run track record be retained and aggregated into a
 promotion-readiness recommendation (`release_qualifier.compute_promotion_readiness`).
 Writes are best-effort and never roll back a qualification or promotion.
 
+> **No ground truth (self-approval only).** `compute_promotion_readiness`
+> aggregates `would_promote`, which is the qualifier's *own* confidence ≥
+> threshold — so `would_promote_rate` is the rate at which the qualifier approved
+> itself, not a validated precision. There is **no** post-promotion outcome column
+> on this model (was the promoted candidate reverted, did main CI / a regression
+> follow) and no outcome-feedback code in the `release_*` modules. A qualifier that
+> systematically over-scores a defect class therefore reads ~100% "ready" while
+> being wrong. The signal is consequently surfaced as a **qualifier self-approval
+> streak** (the readiness dict carries `ground_truth_validated: False` and a
+> `caveat` string; the UI and reason text drop the "trustworthy" wording). To
+> upgrade this into a validated trust signal, add a post-promotion outcome record
+> here, stamp it when known, and derive a true precision / false-positive rate.
+
 ```python
 class QualificationVerdict(SQLModel, table=True):
     id: UUID

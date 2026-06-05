@@ -1381,8 +1381,9 @@ def test_classify_verdict_no_probe_key_unchanged_undetected():
     ) == ("undetected", "")
 
 
-def test_classify_verdict_detected_true_ignores_probe():
-    # A real suite verdict is never reinterpreted by a probe field.
+def test_classify_verdict_detected_true_ignores_generic_probe():
+    # A real suite verdict is never reinterpreted by a GENERIC (non-declared)
+    # probe field — the generic compile probe stays detected=false-only.
     outcome, _ = ci_resolution.classify_merge_test_verdict(
         {
             "detected": True,
@@ -1391,6 +1392,90 @@ def test_classify_verdict_detected_true_ignores_probe():
         }
     )
     assert outcome == "pass"
+
+
+# ── Declared build probe BLOCKS regardless of suite detection ─────────────────
+# A green unit suite must NOT mask a broken DECLARED build (bundled frontends,
+# tests that exercise source without the build step). The declared-build clear
+# failure is HIGH precedence and fires even on detected=true + passed.
+def test_classify_verdict_declared_build_fail_blocks_passing_suite():
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "probe": {
+                "ran": True,
+                "passed": False,
+                "could_not_run": False,
+                "declared": True,
+                "ecosystem": "node",
+                "output": "webpack: build error in module foo",
+                "label": "npm run build (admin-ui)",
+            },
+        }
+    )
+    assert outcome == "fail"
+    assert "Declared build command `npm run build (admin-ui)` failed" in detail
+    assert "webpack: build error" in detail
+    # Routes to the block-and-fix path carrying the declared-build output.
+    ci_result = ci_resolution.build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "failure"
+
+
+def test_classify_verdict_declared_build_pass_on_passing_suite_stays_pass():
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "probe": {
+                "ran": True,
+                "passed": True,
+                "could_not_run": False,
+                "declared": True,
+                "label": "npm run build (admin-ui)",
+            },
+        }
+    )
+    assert outcome == "pass"
+    assert detail == ""
+
+
+def test_classify_verdict_declared_build_could_not_run_on_passing_suite_stays_pass():
+    # A declared build that could not run (missing deps / unprovisioned setup)
+    # must NOT block a passing suite — conservative fall-open.
+    outcome, _ = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "probe": {
+                "ran": True,
+                "passed": False,
+                "could_not_run": True,
+                "declared": True,
+                "label": "npm run build (admin-ui)",
+            },
+        }
+    )
+    assert outcome == "pass"
+
+
+def test_declared_build_is_clear_failure_predicate():
+    # Fires only for a declared probe that ran, did not pass, and was not a
+    # could-not-run degrade. A generic / passing / could-not-run / missing probe
+    # returns False.
+    assert ci_resolution.declared_build_is_clear_failure(
+        {"ran": True, "passed": False, "could_not_run": False, "declared": True}
+    )
+    assert not ci_resolution.declared_build_is_clear_failure(
+        {"ran": True, "passed": False, "could_not_run": False}  # not declared
+    )
+    assert not ci_resolution.declared_build_is_clear_failure(
+        {"ran": True, "passed": True, "could_not_run": False, "declared": True}
+    )
+    assert not ci_resolution.declared_build_is_clear_failure(
+        {"ran": True, "passed": False, "could_not_run": True, "declared": True}
+    )
+    assert not ci_resolution.declared_build_is_clear_failure(None)
 
 
 # ── Acceptance probe: classify_unverified_fall_open_reason ────────────────────
@@ -1650,3 +1735,64 @@ def test_runtime_block_malformed_history_is_defensive():
     assert "recent_outcomes" not in block
     assert "unverified_reason_counts" not in block
     assert "summary" not in block
+
+
+# --- benign-vs-degraded UNVERIFIED-merge reason partition -------------------
+
+
+def test_unverified_reason_sets_are_disjoint():
+    """The benign and degraded reason sets must not overlap — a key is one or
+    the other, never both."""
+    overlap = (
+        ci_resolution.BENIGN_UNVERIFIED_REASONS
+        & ci_resolution.DEGRADED_UNVERIFIED_REASONS
+    )
+    assert not overlap, f"reason keys classified as BOTH benign and degraded: {sorted(overlap)}"
+
+
+def test_unverified_reason_sets_union_is_canonical():
+    """Their union must equal the canonical 12-key emitted reason set."""
+    canonical = {
+        "no_detectable_test_command",
+        "kill_switch_off",
+        "internal_staging_base",
+        "undetected_runtime",
+        "suite_all_skipped",
+        "verify_setup_failed",
+        "probe_passed",
+        "probe_could_not_run",
+        "probe_no_artifact",
+        "documented_command_could_not_run",
+        "documented_command_passed",
+        "documented_command_no_artifact",
+    }
+    union = (
+        ci_resolution.BENIGN_UNVERIFIED_REASONS
+        | ci_resolution.DEGRADED_UNVERIFIED_REASONS
+    )
+    assert union == canonical
+
+
+def test_is_degraded_unverified_reason_true_for_degraded():
+    for reason in ci_resolution.DEGRADED_UNVERIFIED_REASONS:
+        assert ci_resolution.is_degraded_unverified_reason(reason) is True, reason
+
+
+def test_is_degraded_unverified_reason_false_for_benign_and_unknown():
+    for reason in ci_resolution.BENIGN_UNVERIFIED_REASONS:
+        assert ci_resolution.is_degraded_unverified_reason(reason) is False, reason
+    assert ci_resolution.is_degraded_unverified_reason("totally_unknown") is False
+    assert ci_resolution.is_degraded_unverified_reason(None) is False
+
+
+def test_alert_severity_map_derives_from_shared_sets():
+    """The alert-layer severity map must agree with the shared partition byte-for-
+    byte: every degraded reason -> ERROR, every benign reason -> WARNING, and the
+    map covers exactly the canonical union (single-source-of-truth wiring)."""
+    from app.alert_dispatch import _UNVERIFIED_REASON_SEVERITY, AlertSeverity
+
+    expected = {
+        **{r: AlertSeverity.ERROR for r in ci_resolution.DEGRADED_UNVERIFIED_REASONS},
+        **{r: AlertSeverity.WARNING for r in ci_resolution.BENIGN_UNVERIFIED_REASONS},
+    }
+    assert _UNVERIFIED_REASON_SEVERITY == expected

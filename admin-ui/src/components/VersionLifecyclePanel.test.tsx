@@ -928,4 +928,64 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.queryByTestId('promotion-in-flight-note')).not.toBeInTheDocument();
     });
   });
+
+  describe('promotion readiness regime labeling', () => {
+    function makeReadiness(overrides: Partial<api.PromotionReadiness> = {}): api.PromotionReadiness {
+      return {
+        ready: true,
+        reason: 'qualifier self-approval streak clears thresholds',
+        verdicts_evaluated: 6,
+        would_promote_count: 6,
+        would_promote_rate: 1,
+        consecutive_clean_passes: 6,
+        confidence: { mean: 0.95, stdev: 0.01, min: 0.94, max: 0.97, stable: true },
+        recurring_blockers: {},
+        blocker_counts: {},
+        thresholds: {},
+        regime: 'pre_go_live_calibration',
+        is_current_readiness: true,
+        ...overrides,
+      };
+    }
+
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    it('presents a current readiness streak pre-go-live', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ promotion_readiness: makeReadiness() })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByText(/self-approval streak clears thresholds/)).toBeInTheDocument();
+      expect(screen.queryByText(/pre-go-live dry-run calibration \(historical\)/)).not.toBeInTheDocument();
+    });
+
+    it('relabels as historical calibration once promotion is live (not current readiness)', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            promotion_readiness: makeReadiness({
+              ready: false,
+              is_current_readiness: false,
+              regime: 'live',
+              promotion_enabled: true,
+              reason: 'promotion is live for this project — this is a pre-go-live dry-run calibration window, not current readiness',
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      // Stale dry-run streak is NOT presented as a live "ready" signal.
+      expect(screen.queryByText(/self-approval streak clears thresholds/)).not.toBeInTheDocument();
+      expect(screen.getByText(/pre-go-live dry-run calibration \(historical\)/)).toBeInTheDocument();
+      expect(screen.getByText(/frozen/)).toBeInTheDocument();
+    });
+  });
 });

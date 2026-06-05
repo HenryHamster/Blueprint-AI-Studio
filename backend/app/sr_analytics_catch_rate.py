@@ -21,7 +21,7 @@ from app.sr_analytics_common import (
     _finalize_examples,
     _is_trend_significant,
 )
-from app.sr_blind_spots import _REVIEWER_ORIGINS
+from app.sr_blind_spots import _REVIEWER_ORIGINS, is_skipped_sr_outcome
 
 
 def _partition_edges_by_origin(edges: list) -> "tuple[list, list]":
@@ -197,14 +197,28 @@ def _stats_for_tasks(
 ]:
     """Compute SR stats for a pre-filtered task list (no date filtering).
 
+    The "ground truth" these rates are scored against is the automated
+    review-pipeline (reviewer-LLM) verdict history, NOT a human reviewer.
+    Catch/miss/precision/recall here therefore measure author-SR-agent vs.
+    reviewer-LLM-agent AGREEMENT — an inter-agent agreement signal, not a
+    catch rate against an external/human truth. Variables are named
+    ``reviewer_*`` accordingly. (The persisted ``*human_count`` aggregation
+    keys keep their legacy names for serialized/UI contract stability.)
+
+    Deliberately-skipped self-reviews (the ``./done`` fallback envelope,
+    detected via :func:`is_skipped_sr_outcome`) are EXCLUDED so a skip is not
+    counted as a miss — matching the sibling reasoning-engagement and
+    execution-evidence metrics. The separate skip rate is surfaced by
+    :func:`_sr_skip_stats`.
+
     Returns (count, cat_stats, type_cat_stats, all_iter_cat_stats, sev_stats,
     scope_cat_stats). ``all_iter_cat_stats`` uses ALL review iterations as the
-    human-truth set (not just iteration 0). Falls back to first-attempt
-    categories when ``review_loop.review_history`` is absent (backward compat).
-    ``sev_stats`` accumulates per-severity hit/miss counts from review_history
-    issues across all categories. ``scope_cat_stats`` mirrors
-    ``type_cat_stats`` keyed by task scope (small|medium|large) instead of
-    task type, using ``task.context['scope']`` (default: small).
+    reviewer-confirmed truth set (not just iteration 0). Falls back to
+    first-attempt categories when ``review_loop.review_history`` is absent
+    (backward compat). ``sev_stats`` accumulates per-severity hit/miss counts
+    from review_history issues across all categories. ``scope_cat_stats``
+    mirrors ``type_cat_stats`` keyed by task scope (small|medium|large)
+    instead of task type, using ``task.context['scope']`` (default: small).
     """
     _sw = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
 
@@ -226,7 +240,14 @@ def _stats_for_tasks(
         ctx = t.context or {}
         if "_self_review_outcome" not in ctx:
             continue
-        check_results = ctx["_self_review_outcome"].get("check_results") or {}
+        sro = ctx["_self_review_outcome"]
+        # Exclude deliberately-skipped self-reviews: their check_results are
+        # empty, so every reviewer-confirmed category would otherwise land in
+        # the miss bucket, conflating "agent skipped review" with "agent
+        # reviewed and missed". The skip rate is surfaced separately.
+        if is_skipped_sr_outcome(sro):
+            continue
+        check_results = sro.get("check_results") or {}
         # Combined view (author SR + reviewer save) — feeds hit/origin-split
         # counters below where _origin_bucket separates `sr_alone` vs
         # `reviewer_save`, so reviewer-stamped entries must remain present.
@@ -246,17 +267,18 @@ def _stats_for_tasks(
             rev_cats = _categorize_review_issues(rev_hist)
             for cat_name, issues in rev_cats.items():
                 cat_weights[cat_name] = max(_sw.get(i["severity"], 1) for i in issues)
-        human_cats = set(ctx.get("_first_attempt_rejection_categories") or {}) - {
-            "other"
-        }
+        reviewer_confirmed_cats = set(
+            ctx.get("_first_attempt_rejection_categories") or {}
+        ) - {"other"}
 
-        # FP tracking: among SR-failed categories, count those never confirmed by
-        # any human reviewer across all review iterations (first rejection OR later).
-        # Runs for every task (even those with no first-attempt rejection) because
-        # those are exactly the cases where SR may have flagged a false positive.
-        # Uses the author-only view so reviewer-stamped overrides are not
-        # falsely attributed to the author SR's precision.
-        all_human_flagged = set(rev_cats.keys()) | human_cats
+        # FP tracking: among SR-failed categories, count those never confirmed
+        # by any reviewer-LLM verdict across all review iterations (first
+        # rejection OR later). Runs for every task (even those with no
+        # first-attempt rejection) because those are exactly the cases where SR
+        # may have flagged a false positive. Uses the author-only view so
+        # reviewer-stamped overrides are not falsely attributed to the author
+        # SR's precision.
+        all_reviewer_flagged = set(rev_cats.keys()) | reviewer_confirmed_cats
         for cat in sr_failed_author:
             if cat not in cat_stats:
                 cat_stats[cat] = {
@@ -273,10 +295,10 @@ def _stats_for_tasks(
             cat_stats[cat].setdefault("sr_failed_count", 0)
             cat_stats[cat].setdefault("fp_count", 0)
             cat_stats[cat]["sr_failed_count"] += 1
-            if cat not in all_human_flagged:
+            if cat not in all_reviewer_flagged:
                 cat_stats[cat]["fp_count"] += 1
 
-        if not human_cats:
+        if not reviewer_confirmed_cats:
             continue
         count += 1
         for cat_name, issues in rev_cats.items():
@@ -291,7 +313,7 @@ def _stats_for_tasks(
                     sev_stats[sev]["hit_count"] += 1
         task_type = t.first_payload.get("type", "")
         task_scope = (t.context or {}).get("scope", DEFAULT_TASK_SCOPE)
-        for cat in human_cats:
+        for cat in reviewer_confirmed_cats:
             if cat not in cat_stats:
                 cat_stats[cat] = {
                     "hit_count": 0,
@@ -368,7 +390,7 @@ def _stats_for_tasks(
                         scope_cat_stats[task_scope][cat]["miss_examples"].append(
                             {"desc": issue["desc"], "severity": issue["severity"]}
                         )
-        # All-iterations human truth: prefer persisted _all_iterations_rejection_categories
+        # All-iterations reviewer-confirmed truth: prefer persisted _all_iterations_rejection_categories
         # (written by task_lifecycle on every rejection iteration); fall back to
         # categorising review_history in-line, then to first-attempt categories.
         _stored_all_iter = ctx.get("_all_iterations_rejection_categories") or {}
@@ -379,7 +401,7 @@ def _stats_for_tasks(
                 "other"
             }
         else:
-            all_iter_cats = human_cats
+            all_iter_cats = reviewer_confirmed_cats
         for cat in all_iter_cats:
             if cat not in all_iter_cat_stats:
                 all_iter_cat_stats[cat] = {"hit_count": 0, "human_count": 0}
