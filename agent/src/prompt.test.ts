@@ -2176,6 +2176,52 @@ describe('configureAgentPermissions', () => {
   it('returns [] for an unknown task type', () => {
     expect(configureAgentPermissions('unknown_type')).toEqual([]);
   });
+
+  it('installs exit-1 pre-commit and pre-push block hooks for a read-only type', () => {
+    configureAgentPermissions('research');
+    const writes = vi.mocked(fs.writeFileSync).mock.calls;
+    const hookPaths = writes.map((c) => c[0]);
+    expect(hookPaths).toContain('/tmp/workspace/.git/hooks/pre-commit');
+    expect(hookPaths).toContain('/tmp/workspace/.git/hooks/pre-push');
+    for (const [, body] of writes) {
+      expect(typeof body).toBe('string');
+      expect(body as string).toContain('exit 1');
+      expect(body as string).toContain('read-only analysis task');
+    }
+  });
+
+  // Regression: a write task reusing a warm VM whose prior role was read-only
+  // must clear the leftover block hooks, or it can't commit/push its work.
+  it('removes leftover read-only block hooks for a write type on a reused warm VM', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string)
+      .mockReturnValue(
+        '#!/bin/sh\necho "ERROR: This is a read-only analysis task. Do NOT commit or push." >&2\nexit 1\n',
+      );
+
+    const result = configureAgentPermissions('fix');
+
+    expect(result).toEqual([]);
+    const unlinked = vi.mocked(fs.unlinkSync).mock.calls.map((c) => c[0]);
+    expect(unlinked).toContain('/tmp/workspace/.git/hooks/pre-commit');
+    expect(unlinked).toContain('/tmp/workspace/.git/hooks/pre-push');
+  });
+
+  it('leaves a non-read-only hook untouched for a write type (marker guard)', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string)
+      .mockReturnValue('#!/bin/sh\nnpm run lint\n');
+
+    configureAgentPermissions('fix');
+
+    expect(fs.unlinkSync).not.toHaveBeenCalled();
+  });
+
+  it('is a no-op for a write type when no leftover hooks exist', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    configureAgentPermissions('fix');
+    expect(fs.unlinkSync).not.toHaveBeenCalled();
+  });
 });
 
 // ── getTaskTypeHints ──────────────────────────────────────────────────────────

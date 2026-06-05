@@ -2416,7 +2416,38 @@ async def _spawn_pipeline_task(
         await session.rollback()
         existing = await _get_active_pipeline_task_by_key(session, idempotency_key)
         if existing is None:
-            raise
+            # The colliding task can race OUT of the active-status window between
+            # our failed commit and this re-query — e.g. a sibling fix task that
+            # was QUEUED at insert time gets BLOCKED on a file-conflict lock (or
+            # goes terminal) before we look. The active-only lookup then misses
+            # it and the old code re-raised, surfacing the IntegrityError to
+            # operators as a bogus "CI check error" that wedged the whole review
+            # chain. A row with this idempotency_key DID exist in an active
+            # status at commit time (that is exactly what the
+            # ux_task_active_idempotency_key partial index enforces), so re-query
+            # WITHOUT the status filter instead of crashing.
+            existing = (
+                (
+                    await session.execute(
+                        select(Task)
+                        .where(Task.idempotency_key == idempotency_key)
+                        .order_by(Task.created_at.desc())
+                    )
+                )
+                .scalars()
+                .first()
+            )
+        if existing is None:
+            # Truly nothing with this key post-rollback (would require a hard
+            # delete racing us — not observed in practice). Treat as a benign
+            # idempotency race and suppress this spawn rather than crashing the
+            # caller; the next rollup pass re-evaluates with a fresh iteration key.
+            logger.warning(
+                f"[PIPELINE] {task_type} spawn for PR #{pr_number} hit idempotency "
+                f"key but found no row post-rollback; suppressing spawn "
+                f"(benign idempotency race)."
+            )
+            return (None, False)
         logger.warning(
             f"[PIPELINE] Concurrent {task_type} spawn for PR #{pr_number} "
             f"hit idempotency key; using existing task {existing.id}"

@@ -72,25 +72,52 @@ export { excludeAgentHelpers };
  * Also installs git hooks to block commit/push for read-only agents.
  * Call this AFTER cloning the repo but BEFORE running Claude Code.
  */
+// Marker embedded in the read-only block hooks. Used to WRITE the hooks (read-only
+// path) and to RECOGNISE+REMOVE our own hooks when a warm VM is reused for a write
+// task (write path). Single source of truth so the two paths can't drift apart.
+const READ_ONLY_BLOCK_MARKER = 'This is a read-only analysis task. Do NOT commit or push.';
+const READ_ONLY_BLOCK_HOOK = `#!/bin/sh\necho "ERROR: ${READ_ONLY_BLOCK_MARKER}" >&2\nexit 1\n`;
+const READ_ONLY_BLOCKED_HOOKS = ['pre-commit', 'pre-push'] as const;
+
 export function configureAgentPermissions(taskType: string): string[] {
+  const hooksDir = `${WORKSPACE}/.git/hooks`;
   if (isReadOnlyTaskType(taskType)) {
     // Strip GitHub token from git remote so the agent can't push
     try {
       execFileSync('git', ['remote', 'set-url', 'origin', 'https://github.com/readonly/readonly.git'], { cwd: WORKSPACE });
     } catch { /* git dir may not exist yet */ }
 
-    // Block git commit via pre-commit hook (backup enforcement)
-    const hooksDir = `${WORKSPACE}/.git/hooks`;
+    // Block git commit/push via hooks (backup enforcement)
     try {
       fs.mkdirSync(hooksDir, { recursive: true });
-      const blockScript = '#!/bin/sh\necho "ERROR: This is a read-only analysis task. Do NOT commit or push." >&2\nexit 1\n';
-      fs.writeFileSync(`${hooksDir}/pre-commit`, blockScript, { mode: 0o755 });
-      fs.writeFileSync(`${hooksDir}/pre-push`, blockScript, { mode: 0o755 });
+      for (const hook of READ_ONLY_BLOCKED_HOOKS) {
+        fs.writeFileSync(`${hooksDir}/${hook}`, READ_ONLY_BLOCK_HOOK, { mode: 0o755 });
+      }
     } catch { /* hooks dir may not exist before clone completes */ }
 
     return ['Write', 'Edit', 'NotebookEdit'];
   }
-  // Write types: no restrictions
+
+  // Write types: no Claude restrictions — but warm VMs reuse the workspace (and
+  // its .git) across sequential roles, and the read-only branch above only ever
+  // ADDS the block hooks, never removes them. A write task (fix/create/migrate/…)
+  // that lands on a VM whose prior role was read-only would otherwise inherit the
+  // `exit 1` pre-commit/pre-push hooks and be physically unable to commit or push
+  // its work — the authenticated remote is restored at push time, but these hooks
+  // are not. (Real incident: a "Fix PR" task resolved a merge conflict, ./check
+  // green, but ./pr open failed at push for 3 attempts on the leftover hooks,
+  // wedging the whole research strand for ~10h.) Idempotently remove OUR block
+  // hooks so the VM matches the current write role. Guard on the marker so a
+  // legitimate repo-provided hook (should one ever live here) is left untouched.
+  for (const hook of READ_ONLY_BLOCKED_HOOKS) {
+    const hookPath = `${hooksDir}/${hook}`;
+    try {
+      if (fs.existsSync(hookPath)
+          && fs.readFileSync(hookPath, 'utf-8').includes(READ_ONLY_BLOCK_MARKER)) {
+        fs.unlinkSync(hookPath);
+      }
+    } catch { /* nothing to clear / hooks dir absent */ }
+  }
   return [];
 }
 
