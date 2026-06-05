@@ -28,7 +28,7 @@ from app.models import (
     TaskStatus,
     ReleaseVersion,
 )
-from app.time_utils import _coerce_naive_utc
+from app.time_utils import _coerce_naive_utc, _utcnow
 # Remediation funnel + recurring-failure-pattern helpers relocated to their own
 # module. Re-exported here so existing import paths are unchanged.
 from app.digest_remediation import (  # noqa: F401
@@ -1272,6 +1272,13 @@ _DUPLICATE_FOUNDATION_LIST_LIMIT = 50
 # and the cap on the surfaced per-task list.
 _UNRESUMABLE_CANCEL_WINDOW = timedelta(days=7)
 _UNRESUMABLE_CANCEL_LIST_LIMIT = 100
+# Live blocked-population aggregate: cap on the surfaced per-task drill-down list,
+# and the coarse age buckets (in hours) the waiting population is bucketed into.
+_LIVE_BLOCKED_LIST_LIMIT = 100
+# Blocked-resume aggregate: how far back to count successful resumes, and the cap
+# on the surfaced per-task list. Same window as the symmetric give-up signal.
+_BLOCKED_RESUME_WINDOW = timedelta(days=7)
+_BLOCKED_RESUME_LIST_LIMIT = 100
 
 
 def _task_related_files(t: "Task") -> set:
@@ -1453,6 +1460,129 @@ def compute_unresumable_cancellation_summary(
         "by_class": dict(by_class),
         "by_direction": dict(by_direction),
         "tasks": rows[:_UNRESUMABLE_CANCEL_LIST_LIMIT],
+    }
+
+
+def compute_live_blocked_summary(blocked_tasks: List["Task"]) -> Dict[str, Any]:
+    """Summarize the CURRENT BLOCKED population — the healthy waiting set.
+
+    Pure function — no database calls. Unlike ``compute_parked_blocker_summary``
+    (which deliberately counts ONLY parked/escalated blockers — the unhealthy tail),
+    this counts EVERY currently-BLOCKED task, including not-yet-escalated dependents
+    that are healthily waiting for a foundation to land. A regression where resumes
+    stall shows up here as a growing population with ageing waits, which the
+    parked-only and give-up signals cannot see until escalation.
+
+    Buckets each task by how long it has been blocked (derived from ``blocked_at``):
+    ``<1h``, ``1-6h``, ``6-24h``, ``>24h`` (``unknown`` when ``blocked_at`` is
+    missing). Returns the total, the bucket histogram, and a capped newest-blocked-
+    first task list for drill-down.
+    """
+    now = _utcnow()
+    rows: List[Dict[str, Any]] = []
+    by_age: Dict[str, int] = defaultdict(int)
+    for t in blocked_tasks:
+        blocked_at = getattr(t, "blocked_at", None)
+        if blocked_at is None:
+            bucket = "unknown"
+        else:
+            # blocked_at is naive-UTC like _utcnow(); guard tz-aware just in case.
+            age_hours = (now - blocked_at).total_seconds() / 3600.0
+            if age_hours < 1:
+                bucket = "<1h"
+            elif age_hours < 6:
+                bucket = "1-6h"
+            elif age_hours < 24:
+                bucket = "6-24h"
+            else:
+                bucket = ">24h"
+        by_age[bucket] += 1
+        ctx = t.context or {}
+        rows.append(
+            {
+                "task_id": str(t.id),
+                "title": t.title or str(t.id)[:8],
+                "project_id": str(t.project_id)
+                if getattr(t, "project_id", None) is not None
+                else None,
+                "blocker_kind": getattr(t, "blocker_kind", None),
+                "blocked_reason": getattr(t, "blocked_reason", None)
+                or t.latest_status_message,
+                "blocked_at": blocked_at.isoformat() if blocked_at else None,
+                "age_bucket": bucket,
+                "direction_id": ctx.get("direction_id"),
+            }
+        )
+    rows.sort(key=lambda r: r["blocked_at"] or "", reverse=True)
+    return {
+        "total": len(rows),
+        "by_age": dict(by_age),
+        "tasks": rows[:_LIVE_BLOCKED_LIST_LIMIT],
+    }
+
+
+def compute_blocked_resume_summary(
+    resumed_tasks: List["Task"],
+    *,
+    window_start: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Count blocked dependents that successfully RESUMED when their foundation landed.
+
+    Pure function — no database calls. The positive, symmetric counterpart to
+    ``compute_unresumable_cancellation_summary``: reads the durable
+    ``reaper_sweeps.RESUME_MARKER_CONTEXT_KEY`` marker stamped by
+    ``_apply_needs_disposition`` when a blocked dependent is requeued (status →
+    QUEUED). The transient status message and the in-memory ``requeued`` counter do
+    not survive, so without this marker a regression where resumes stall looks
+    identical to 'all healthy'.
+
+    Tasks with no marker are skipped. When ``window_start`` is given, a marker whose
+    ``at`` timestamp is older (or unparseable) is skipped, so the count reflects only
+    a recent window. Returns the total plus a breakdown by ``resolved_by`` (``edge``
+    vs ``completed``) and by originating direction, and a capped newest-first task
+    list. NOTE: resumed tasks advance past QUEUED through IN_PROGRESS to terminal
+    states while keeping the marker, so the DB query that feeds this MUST be
+    status-agnostic.
+    """
+    from app.reaper_sweeps import RESUME_MARKER_CONTEXT_KEY
+
+    rows: List[Dict[str, Any]] = []
+    by_resolved_by: Dict[str, int] = defaultdict(int)
+    by_direction: Dict[str, int] = defaultdict(int)
+    window_iso = window_start.isoformat() if window_start else None
+
+    for t in resumed_tasks:
+        marker = (t.context or {}).get(RESUME_MARKER_CONTEXT_KEY)
+        if not isinstance(marker, dict):
+            continue
+        at = marker.get("at")
+        # Naive-UTC ISO-8601 strings sort lexicographically — a cheap window filter.
+        if window_iso and (not isinstance(at, str) or at < window_iso):
+            continue
+        resolved_by = marker.get("resolved_by") or "unknown"
+        direction_id = marker.get("direction_id") or "(none)"
+        by_resolved_by[resolved_by] += 1
+        by_direction[direction_id] += 1
+        rows.append(
+            {
+                "task_id": str(t.id),
+                "title": t.title or str(t.id)[:8],
+                "project_id": str(t.project_id)
+                if getattr(t, "project_id", None) is not None
+                else None,
+                "resolved_by": resolved_by,
+                "foundation": marker.get("foundation"),
+                "direction_id": marker.get("direction_id"),
+                "at": at,
+            }
+        )
+
+    rows.sort(key=lambda r: r["at"] or "", reverse=True)
+    return {
+        "total": len(rows),
+        "by_resolved_by": dict(by_resolved_by),
+        "by_direction": dict(by_direction),
+        "tasks": rows[:_BLOCKED_RESUME_LIST_LIMIT],
     }
 
 
@@ -1670,6 +1800,55 @@ async def compute_dependency_health_signals(
         .all()
     )
 
+    # Live BLOCKED population — the healthy waiting set the parked-only signal
+    # deliberately excludes. Status-scoped (BLOCKED) so it counts every dependent
+    # currently waiting, escalated or not.
+    live_blocked_filters = [Task.status == TaskStatus.BLOCKED]
+    if project_id is not None:
+        live_blocked_filters.append(Task.project_id == project_id)
+    live_blocked = (
+        (
+            await session.execute(
+                select(Task)
+                .where(*live_blocked_filters)
+                .limit(_LIVE_BLOCKED_LIST_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # Successful blocked-dependent resumes over a recent window. The marker
+    # persists past the QUEUED transition into IN_PROGRESS/terminal states, so this
+    # query is STATUS-AGNOSTIC — it filters ONLY on marker presence and the
+    # updated_at pre-filter, then the summarizer refines by the marker's own ``at``.
+    from app.reaper_sweeps import RESUME_MARKER_CONTEXT_KEY
+
+    resume_window_start = _utcnow() - _BLOCKED_RESUME_WINDOW
+    if resolve_dialect_name(session) == "sqlite":
+        resume_marker_present = func.json_extract(
+            Task.context, f"$.{RESUME_MARKER_CONTEXT_KEY}"
+        ).is_not(None)
+    else:
+        resume_marker_present = Task.context.has_key(RESUME_MARKER_CONTEXT_KEY)
+    resume_filters = [
+        resume_marker_present,
+        Task.updated_at >= resume_window_start,
+    ]
+    if project_id is not None:
+        resume_filters.append(Task.project_id == project_id)
+    resumed = (
+        (
+            await session.execute(
+                select(Task)
+                .where(*resume_filters)
+                .limit(_BLOCKED_RESUME_LIST_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
     if resolve_dialect_name(session) == "sqlite":
         give_up_present = func.json_extract(
             Task.context, "$.finding_structural_give_up"
@@ -1699,6 +1878,10 @@ async def compute_dependency_health_signals(
         ),
         "finding_structural_give_up": _compute_finding_structural_give_up_summary(
             list(finding_give_up)
+        ),
+        "live_blocked": compute_live_blocked_summary(list(live_blocked)),
+        "resumes": compute_blocked_resume_summary(
+            list(resumed), window_start=resume_window_start
         ),
     }
 

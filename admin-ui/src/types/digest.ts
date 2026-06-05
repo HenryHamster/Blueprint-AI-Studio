@@ -230,6 +230,29 @@ export interface UnresumableCancellationTask {
   direction_id?: string | null;
   at: string | null;
 }
+// Live currently-BLOCKED population — the healthy waiting set (includes
+// not-yet-escalated dependents). Mirrors backend compute_live_blocked_summary.
+export interface LiveBlockedTask {
+  task_id: string;
+  title: string;
+  project_id: string | null;
+  blocker_kind: string | null;
+  blocked_reason: string | null;
+  blocked_at: string | null;
+  age_bucket: string;
+  direction_id?: string | null;
+}
+// A blocked dependent that successfully RESUMED when its foundation landed.
+// Mirrors backend compute_blocked_resume_summary.
+export interface BlockedResumeTask {
+  task_id: string;
+  title: string;
+  project_id: string | null;
+  resolved_by: string;
+  foundation?: string | null;
+  direction_id?: string | null;
+  at: string | null;
+}
 export interface DependencyHealthSignals {
   parked_blockers: { total: number; tasks: ParkedBlockerTask[] };
   duplicate_foundation_candidates: { total: number; candidates: DuplicateFoundationCandidate[] };
@@ -238,6 +261,20 @@ export interface DependencyHealthSignals {
     by_class?: Record<string, number>;
     by_direction?: Record<string, number>;
     tasks: UnresumableCancellationTask[];
+  };
+  // Affirmative health signals (additive). live_blocked: the current BLOCKED
+  // population with coarse age bucketing; resumes: successful blocked-dependent
+  // resumes over the digest window with an edge-vs-completed breakdown.
+  live_blocked?: {
+    total: number;
+    by_age?: Record<string, number>;
+    tasks: LiveBlockedTask[];
+  };
+  resumes?: {
+    total: number;
+    by_resolved_by?: Record<string, number>;
+    by_direction?: Record<string, number>;
+    tasks: BlockedResumeTask[];
   };
   finding_structural_give_up?: {
     total: number;

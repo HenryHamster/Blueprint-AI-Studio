@@ -7383,6 +7383,104 @@ async def test_unblock_sweep_resolves_task_need_into_dep_edge_and_requeues(
 
 
 @pytest.mark.asyncio
+async def test_unblock_sweep_stamps_resume_marker_on_edge_resolution(
+    reaper_db, mocker
+):
+    """A blocked dependent resumed by wiring an in-flight dependency edge gets a
+    durable RESUME_MARKER_CONTEXT_KEY marker stamped (resolved_by='edge',
+    foundation=[<foundation id>], direction_id, at), symmetric to the give-up
+    marker. Observability only — the resume decision is unchanged."""
+    from app.reaper_sweeps import RESUME_MARKER_CONTEXT_KEY
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    foundation = Task(
+        project_id=project.id, title="foundation", description="x",
+        status=TaskStatus.IN_PROGRESS, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}], context={}, status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: needs the foundation task first",
+        depends_on=[],
+        context={
+            "direction_id": "d-resume",
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "foundation",
+                "reason": "BLOCKER: needs the foundation task first",
+                "need": {"kind": "task", "ref": str(foundation.id)},
+            },
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    marker = (t.context or {}).get(RESUME_MARKER_CONTEXT_KEY)
+    assert isinstance(marker, dict)
+    assert marker["resolved_by"] == "edge"
+    assert str(foundation.id) in marker["foundation"]
+    assert marker["direction_id"] == "d-resume"
+    assert isinstance(marker["at"], str) and marker["at"]
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_stamps_resume_marker_on_completed_work(reaper_db, mocker):
+    """A blocked dependent resumed by already-completed/landed work gets a resume
+    marker with resolved_by='completed' (no edge wired)."""
+    from app.reaper_sweeps import RESUME_MARKER_CONTEXT_KEY
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    foundation = Task(
+        project_id=project.id, title="foundation", description="x",
+        status=TaskStatus.COMPLETED, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}], context={"pr_merged": True}, status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: waiting on foundation",
+        depends_on=[],
+        context={
+            "direction_id": "d-resume",
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "foundation",
+                "reason": "BLOCKER: waiting on foundation",
+                "need": {"kind": "task", "ref": str(foundation.id)},
+            },
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    assert not (t.depends_on or [])
+    marker = (t.context or {}).get(RESUME_MARKER_CONTEXT_KEY)
+    assert isinstance(marker, dict)
+    assert marker["resolved_by"] == "completed"
+    assert marker["direction_id"] == "d-resume"
+    assert isinstance(marker["at"], str) and marker["at"]
+
+
+@pytest.mark.asyncio
 async def test_unblock_sweep_resolves_finding_hash_need_into_dep_edge(
     reaper_db, mocker
 ):

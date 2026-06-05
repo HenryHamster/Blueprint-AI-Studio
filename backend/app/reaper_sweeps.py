@@ -544,6 +544,15 @@ _BLOCKED_OPTIMISTIC_RETRY_CAP = 3
 # only: stamping it changes nothing about WHEN or WHETHER a dependent is
 # cancelled.
 UNRESUMABLE_CANCEL_CONTEXT_KEY = "_unresumable_cancellation"
+# Durable marker for the GOOD outcome, symmetric to the give-up marker above: a
+# blocked dependent that successfully RESUMED (status → QUEUED) when its foundation
+# landed. The transient latest_status_message and the in-memory ``requeued`` counter
+# do not survive, so a regression where resumes stall looks identical to 'all
+# healthy'. This queryable JSONB marker (no migration) feeds the dependency-health
+# digest's positive resume signal (``digest_metrics.compute_blocked_resume_summary``).
+# Observability only: stamping it changes nothing about WHEN or WHETHER a dependent
+# resumes.
+RESUME_MARKER_CONTEXT_KEY = "_blocked_resume"
 # Give-up classes — the two reasons a blocked dependent can provably never resume.
 GIVE_UP_FOUNDATION_DIED = "foundation_died"  # needed foundation reached terminal FAILED/CANCELLED
 GIVE_UP_NEVER_SATISFIABLE = "never_satisfiable"  # need outlived its bounded parked re-evals
@@ -1295,16 +1304,36 @@ async def _apply_needs_disposition(
     #    foundation was already verified base-safe in step 2 (a base-unsafe
     #    completed need would have been captured in recut_pending above and held).
     #    Wire any in-flight edges and resume.
+    # Capture the originating direction before _clear_blocked_fields runs (it
+    # preserves direction_id, but read defensively in case that changes), mirroring
+    # _cancel_blocker_as_dead.
+    direction_id = (task.context or {}).get("direction_id")
     edged = _wire_edges(task, edges)
     _clear_blocked_fields(task, preserve_first_blocked=False)
     task.status = TaskStatus.QUEUED
     if edged:
         message = "Unblocked — all needs resolved into dependency edges, requeued"
+        resolved_by = "edge"
+        foundation = list(edges)
     elif completed_needs:
         message = "Unblocked — all needs satisfied by completed work, requeued"
+        resolved_by = "completed"
+        foundation = list(completed_needs)
     else:
         message = "Unblocked — all needs resolved, requeued"
+        resolved_by = "completed"
+        foundation = list(completed_needs)
     task.latest_status_message = message
+    # Stamp the durable resume marker (symmetric to UNRESUMABLE_CANCEL_CONTEXT_KEY).
+    # Re-read ctx after _clear_blocked_fields cleared the structured blocker metadata.
+    ctx = task.context or {}
+    ctx[RESUME_MARKER_CONTEXT_KEY] = {
+        "resolved_by": resolved_by,
+        "foundation": foundation,
+        "direction_id": direction_id,
+        "at": _utcnow().isoformat(),
+    }
+    task.context = ctx
     flag_modified(task, "context")
     if edged:
         flag_modified(task, "depends_on")

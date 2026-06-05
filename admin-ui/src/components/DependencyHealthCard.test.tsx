@@ -49,17 +49,29 @@ describe('DependencyHealthCard', () => {
     expect(screen.getByText(/Base re-cut conflict/)).toBeInTheDocument();
   });
 
-  it('renders nothing when all counts are zero', () => {
-    const { container } = render(
+  it('renders the affirmative healthy state when all failure counts are zero', () => {
+    // No parked/duplicate/unresumable failures, but a live-blocked population
+    // and resumes over the window — the card must render as a health gauge,
+    // not disappear.
+    render(
       <DependencyHealthCard
         data={makeData({
           parked_blockers: { total: 0, tasks: [] },
           duplicate_foundation_candidates: { total: 0, candidates: [] },
           unresumable_cancellations: { total: 0, tasks: [] },
+          live_blocked: { total: 3, by_age: { '<1h': 2, '1-6h': 1 }, tasks: [] },
+          resumes: { total: 5, by_resolved_by: { edge: 3, completed: 2 }, by_direction: {}, tasks: [] },
         })}
       />,
     );
-    expect(container).toBeEmptyDOMElement();
+    // Card renders (does not return null) — gauge title is present.
+    expect(screen.getByText('Dependency Health')).toBeInTheDocument();
+    // Affirmative line surfaces the live-blocked and resumed-this-window counts.
+    const affirmative = screen.getByText(/blocked & waiting/);
+    expect(affirmative).toHaveTextContent('3');
+    expect(affirmative).toHaveTextContent('blocked & waiting');
+    expect(affirmative).toHaveTextContent('5');
+    expect(affirmative).toHaveTextContent('resumed this window');
   });
 
   it('renders nothing when data is null', () => {

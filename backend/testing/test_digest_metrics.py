@@ -2442,6 +2442,194 @@ async def test_dependency_health_signals_query_surfaces_finding_structural_give_
     assert agg["findings"][0]["title"] == "Use shared helper"
 
 
+def test_live_blocked_summary_counts_and_buckets_by_age():
+    """The live-blocked summarizer counts EVERY currently-BLOCKED task (not just
+    parked/escalated ones) and buckets them by how long they have been blocked."""
+    from app.digest_metrics import compute_live_blocked_summary
+
+    now = _utcnow()
+
+    def _blocked(age_hours, direction_id=None):
+        return make_task(
+            status=TaskStatus.BLOCKED,
+            title=f"blocked-{age_hours}h",
+            blocked_at=now - timedelta(hours=age_hours),
+            context={"direction_id": direction_id} if direction_id else {},
+        )
+
+    fresh = _blocked(0.5, "d-aaa")  # <1h
+    mid = _blocked(3, "d-aaa")  # 1-6h
+    older = _blocked(12)  # 6-24h
+    ancient = _blocked(48)  # >24h
+    # No blocked_at → unknown bucket, still counted.
+    no_ts = make_task(status=TaskStatus.BLOCKED, title="no-ts", blocked_at=None)
+
+    result = compute_live_blocked_summary([fresh, mid, older, ancient, no_ts])
+
+    assert result["total"] == 5
+    assert result["by_age"] == {
+        "<1h": 1,
+        "1-6h": 1,
+        "6-24h": 1,
+        ">24h": 1,
+        "unknown": 1,
+    }
+    # Newest-blocked first: the 0.5h task leads (excluding the no-ts null sort).
+    titles = [t["title"] for t in result["tasks"]]
+    assert "blocked-0.5h" in titles
+    assert result["tasks"][0]["title"] == "blocked-0.5h"
+
+
+def test_blocked_resume_summary_counts_and_breaks_down_by_resolved_by():
+    """The pure resume summarizer counts resume markers and breaks them down by
+    ``resolved_by`` (edge vs completed) and by originating direction; tasks with no
+    marker are skipped."""
+    from app.digest_metrics import compute_blocked_resume_summary
+    from app.reaper_sweeps import RESUME_MARKER_CONTEXT_KEY
+
+    def _resumed(resolved_by, direction_id, at):
+        return make_task(
+            status=TaskStatus.COMPLETED,
+            context={
+                RESUME_MARKER_CONTEXT_KEY: {
+                    "resolved_by": resolved_by,
+                    "foundation": ["f-1"],
+                    "direction_id": direction_id,
+                    "at": at,
+                }
+            },
+        )
+
+    edge_a = _resumed("edge", "d-aaa", "2026-06-04T10:00:00")
+    edge_b = _resumed("edge", "d-bbb", "2026-06-04T11:00:00")
+    completed_a = _resumed("completed", "d-aaa", "2026-06-04T12:00:00")
+    # No marker → excluded.
+    plain = make_task(status=TaskStatus.QUEUED, context={})
+
+    result = compute_blocked_resume_summary([edge_a, edge_b, completed_a, plain])
+
+    assert result["total"] == 3
+    assert result["by_resolved_by"] == {"edge": 2, "completed": 1}
+    assert result["by_direction"] == {"d-aaa": 2, "d-bbb": 1}
+    # Newest-first.
+    assert result["tasks"][0]["task_id"] == str(completed_a.id)
+
+
+def test_blocked_resume_summary_filters_by_window_and_empty_case():
+    """A marker whose ``at`` precedes ``window_start`` is excluded; an all-stale set
+    yields an empty (zeroed) summary."""
+    from app.digest_metrics import compute_blocked_resume_summary
+    from app.reaper_sweeps import RESUME_MARKER_CONTEXT_KEY
+
+    def _resumed(at):
+        return make_task(
+            status=TaskStatus.COMPLETED,
+            context={
+                RESUME_MARKER_CONTEXT_KEY: {
+                    "resolved_by": "edge",
+                    "foundation": ["f-1"],
+                    "direction_id": "d-aaa",
+                    "at": at,
+                }
+            },
+        )
+
+    recent = _resumed("2026-06-04T10:00:00")
+    stale = _resumed("2026-05-01T10:00:00")
+
+    result = compute_blocked_resume_summary(
+        [recent, stale], window_start=datetime(2026, 6, 1, 0, 0, 0)
+    )
+    assert result["total"] == 1
+    assert result["tasks"][0]["task_id"] == str(recent.id)
+
+    # Empty case: every marker stale → zeroed summary.
+    empty = compute_blocked_resume_summary(
+        [stale], window_start=datetime(2026, 6, 1, 0, 0, 0)
+    )
+    assert empty["total"] == 0
+    assert empty["by_resolved_by"] == {}
+    assert empty["tasks"] == []
+
+
+@pytest.mark.asyncio
+async def test_dependency_health_signals_query_surfaces_live_blocked(db_session):
+    """The DB-backed query surfaces the live BLOCKED population — including a
+    not-yet-escalated dependent the parked-blocker signal deliberately omits."""
+    project = make_project(name="Live blocked query", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    waiting = make_task(
+        project_id=project.id,
+        status=TaskStatus.BLOCKED,
+        title="healthy-waiting-dependent",
+        blocked_at=_utcnow() - timedelta(hours=2),
+        context={"direction_id": "d-aaa"},  # no _blocked_escalated
+    )
+    queued = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        title="not-blocked",
+    )
+    db_session.add_all([waiting, queued])
+    await db_session.commit()
+
+    result = await compute_dependency_health_signals(db_session, project_id=project.id)
+
+    live = result["live_blocked"]
+    assert live["total"] == 1
+    assert live["tasks"][0]["title"] == "healthy-waiting-dependent"
+    assert live["by_age"] == {"1-6h": 1}
+    # The not-yet-escalated waiter is NOT in the parked-only signal.
+    assert result["parked_blockers"]["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_dependency_health_signals_query_surfaces_blocked_resumes(db_session):
+    """The DB-backed query is STATUS-AGNOSTIC for resume markers: a resumed task
+    that has advanced past QUEUED (e.g. to DONE) still carries the marker and is
+    counted within the window; an unmarked task is excluded."""
+    from app.reaper_sweeps import RESUME_MARKER_CONTEXT_KEY
+
+    project = make_project(name="Blocked resume query", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Status-agnostic proof: marker present on a DONE (non-QUEUED) task.
+    resumed_done = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        title="resumed-then-done",
+        context={
+            RESUME_MARKER_CONTEXT_KEY: {
+                "resolved_by": "completed",
+                "foundation": [{"kind": "task", "ref": "foo"}],
+                "direction_id": "d-aaa",
+                "at": _utcnow().isoformat(),
+            }
+        },
+    )
+    unmarked = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        title="plain-done",
+        context={},
+    )
+    db_session.add_all([resumed_done, unmarked])
+    await db_session.commit()
+
+    result = await compute_dependency_health_signals(db_session, project_id=project.id)
+
+    agg = result["resumes"]
+    assert agg["total"] == 1
+    assert agg["by_resolved_by"] == {"completed": 1}
+    assert agg["by_direction"] == {"d-aaa": 1}
+    assert agg["tasks"][0]["title"] == "resumed-then-done"
+
+
 def test_duplicate_foundation_signal_flags_cross_parent_overlap():
     """Two active write-tasks under DIFFERENT parents whose related-file sets
     strongly overlap are surfaced; a disjoint task is not."""
