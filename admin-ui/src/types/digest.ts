@@ -120,6 +120,13 @@ export interface MergeGateFleetHealth {
   project_count: number;
 }
 
+export interface FindingStructuralGiveUpItem {
+  task_id: string;
+  title: string;
+  reason: string;
+  direction_id?: string | null;
+}
+
 // Per-effort-tier / per-actual-model LLM efficiency rollup (read-only).
 // Mirrors the backend `compute_effort_model_efficiency` payload
 // (efficiency_snapshot.py): each row carries run/landed counts + rate, priced
@@ -223,6 +230,12 @@ export interface DependencyHealthSignals {
     by_class?: Record<string, number>;
     by_direction?: Record<string, number>;
     tasks: UnresumableCancellationTask[];
+  };
+  finding_structural_give_up?: {
+    total: number;
+    by_reason: Record<string, number>;
+    by_direction: Record<string, number>;
+    findings: FindingStructuralGiveUpItem[];
   };
 }
 

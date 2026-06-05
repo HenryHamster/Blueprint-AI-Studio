@@ -3185,6 +3185,39 @@ async def test_independent_deferred_finding_keeps_throttle(db_session, mocker):
 
 
 @_pytest.mark.asyncio
+async def test_repeatedly_deferred_sibling_prerequisite_is_counted_as_give_up(
+    db_session, mocker
+):
+    """A co-deferred dependent that finally decays is counted on the parent task."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq09")
+    decayed = _make_finding("Use shared helper", direction_id=direction["id"])
+    decayed["deferred_reason"] = "prereq_deferred_same_cycle"
+    decayed["deferred_count"] = 3
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding("Fresh sentinel", direction_id=direction["id"])],
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+    task.context = {"research_depth": 0, "prior_deferred_findings": [decayed]}
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    give_up = (task.context or {}).get("finding_structural_give_up")
+    assert give_up is not None
+    assert give_up["total"] == 1
+    assert give_up["by_reason"] == {"prereq_deferred_same_cycle": 1}
+    assert give_up["by_direction"] == {direction["id"]: 1}
+    assert give_up["sample"][0]["reason"] == "prereq_deferred_same_cycle"
+
+
+@_pytest.mark.asyncio
 async def test_cyclic_prerequisite_refused_at_spawn(db_session, mocker):
     """Two findings each declaring the other as a capability prerequisite would
     close a depends_on cycle. The acyclicity check refuses the edge that would

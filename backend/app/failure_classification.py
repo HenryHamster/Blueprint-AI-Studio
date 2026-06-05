@@ -227,6 +227,44 @@ VIEWPORT_REGRESSION = "VIEWPORT_REGRESSION"
 # key in RegressionRemediationCase rows created by the coverage-drop signal.
 VIEWPORT_COVERAGE_DROP = "viewport_coverage_drop"
 
+# Context key stamped on a co-deferred dependent task's context. When a research
+# cycle decomposes findings, a dependent finding whose prerequisite was deferred
+# in the SAME cycle is "co-deferred": its spawned task is set to CANCELLED and the
+# finding is re-shelved so the dependent/prerequisite pair re-surfaces together in
+# a later cycle. This is a deliberate, RECOVERABLE shelving — the work is coming
+# back — NOT a genuine death. It must NOT be overloaded onto SCOPE_EMPTY (a
+# completed no-op): the distinct key lets the death-semantics policy
+# (:func:`is_non_death_cancellation`) recognize it without conflating the two.
+CO_DEFERRED_SHELVED = "_co_deferred_shelved"
+
+
+def is_non_death_cancellation(task: "Task") -> bool:
+    """True if ``task`` is a terminal-but-NOT-genuinely-dead cancellation.
+
+    Single source of truth for the "this terminal task is not a dead foundation"
+    policy, consulted by both the resume system's dead-foundation detector
+    (:func:`app.blocked_need_resolution.need_matched_dead_foundation`) and the
+    dispatch-time cascade-cancel classifier
+    (:func:`app.orchestrator_health._check_candidate_task_deps`). Recognizes three
+    non-death markers, all of which mean the work either continues elsewhere or is
+    coming back:
+
+    - ``_replaced_by_task_id`` — a requeue-replacement clone; work continues under
+      the replacement.
+    - ``failure_category == SCOPE_EMPTY`` — a deliberate "scope already covered"
+      no-op exit; the branch is intact.
+    - ``_co_deferred_shelved`` — a co-deferred dependent re-shelved alongside its
+      same-cycle-deferred prerequisite; recoverable shelving, not a failure.
+    """
+    ctx = getattr(task, "context", None) or {}
+    if ctx.get("_replaced_by_task_id"):
+        return True
+    if ctx.get("failure_category") == SCOPE_EMPTY:
+        return True
+    if ctx.get(CO_DEFERRED_SHELVED):
+        return True
+    return False
+
 
 # Substrings emitted by expectNoOverflowAt() / expectNoTextTruncationAt() /
 # expectMinTouchTargetAt() in admin-ui/src/test/viewport.ts. Kept narrow so

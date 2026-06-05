@@ -44,7 +44,11 @@ from app.direction_metrics import (  # noqa: F401 — re-exported for callers/te
     _compute_productivity_score,
     _update_cycle_history,
 )
-from app.failure_classification import INFRA_CLASSES, classify_failure
+from app.failure_classification import (
+    CO_DEFERRED_SHELVED,
+    INFRA_CLASSES,
+    classify_failure,
+)
 from app.finding_deduplication import (
     build_dedup_state,
     deduplicate_findings,
@@ -1243,6 +1247,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # These were already researched but couldn't be spawned; prepend them so they go through
     # the full dedup + health gate pipeline alongside this cycle's new findings.
     prior_deferred = (task.context or {}).get("prior_deferred_findings", [])
+    # Initialized unconditionally: the give-up marker is consulted far below
+    # (when stamping task.context) on every code path, including the one where
+    # there were no prior-deferred findings to decay.
+    _finding_give_up: dict | None = None
     if prior_deferred:
         # Filter out non-actionable types that would have been handled separately above
         prior_actionable = [
@@ -1309,6 +1317,30 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 f"from task {task.id}: "
                 f"titles={[f.get('title') or f.get('description', '')[:60] for f in _decayed]}"
             )
+            _by_reason: dict[str, int] = {}
+            _by_direction: dict[str, int] = {}
+            for f in _decayed:
+                _reason_key = f.get("deferred_reason") or "unknown"
+                _by_reason[_reason_key] = _by_reason.get(_reason_key, 0) + 1
+                _direction_key = (
+                    f.get("direction_id") or (task.context or {}).get("direction_id") or "(none)"
+                )
+                _by_direction[_direction_key] = _by_direction.get(_direction_key, 0) + 1
+            _finding_give_up = {
+                "at": _utcnow().isoformat(),
+                "total": len(_decayed),
+                "by_reason": _by_reason,
+                "by_direction": _by_direction,
+                "sample": [
+                    {
+                        "title": f.get("title") or f.get("description", "")[:60],
+                        "reason": f.get("deferred_reason") or "unknown",
+                        "direction_id": f.get("direction_id")
+                        or (task.context or {}).get("direction_id"),
+                    }
+                    for f in _decayed[:5]
+                ],
+            }
         prior_actionable = _kept
         # Stale-targeting: a deferred finding carries the integration HEAD it was
         # generated against. On re-dispatch, ask whether any cited file changed
@@ -2824,10 +2856,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     if _batch_cap_deferred:
         _deferral_reasons.append(f"batch cap ({len(_batch_cap_deferred)})")
 
-    if _all_deferred or _scope_skip_counts or _spawned_memo_ids:
+    if _all_deferred or _scope_skip_counts or _spawned_memo_ids or _finding_give_up:
         ctx = dict(task.context or {})
         if _all_deferred:
             ctx["deferred_findings"] = _all_deferred
+        if _finding_give_up:
+            ctx["finding_structural_give_up"] = _finding_give_up
         if _scope_skip_counts:
             ctx["skipped_low_confidence_by_scope"] = _scope_skip_counts
         if _spawned_memo_ids:
@@ -3050,6 +3084,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _codeferred_findings.append(
                 _stamp_deferral(findings[fi], "prereq_deferred_same_cycle")
             )
+            # Stamp a durable non-death marker so the death-semantics policy
+            # (failure_classification.is_non_death_cancellation, consulted by the
+            # resume system's dead-foundation detector and the dispatch-time
+            # cascade-cancel classifier) recognizes this CANCELLED task as
+            # recoverable shelving — NOT a genuine death. Without it, any blocked
+            # dependent whose need matches this shelved task would be wrongly
+            # terminated as "foundation died".
+            co_ctx = dict(ct.context or {})
+            co_ctx[CO_DEFERRED_SHELVED] = True
+            ct.context = co_ctx
+            flag_modified(ct, "context")
             ct.status = TaskStatus.CANCELLED
             ct.latest_status_message = (
                 f"Co-deferred with same-cycle-deferred prerequisite: finding "

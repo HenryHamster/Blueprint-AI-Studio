@@ -2258,6 +2258,49 @@ async def test_dependency_health_signals_query_surfaces_unresumable_cancellation
     assert agg["tasks"][0]["title"] == "gave-up-dependent"
 
 
+@pytest.mark.asyncio
+async def test_dependency_health_signals_query_surfaces_finding_structural_give_up(
+    db_session,
+):
+    """The dependency-health rollup counts research findings that were finally dropped."""
+    project = make_project(name="Finding give-up query", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    dropped = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        title="research cycle with give-up",
+        context={
+            "finding_structural_give_up": {
+                "at": "2026-06-04T12:00:00",
+                "total": 2,
+                "by_reason": {"prereq_deferred_same_cycle": 2},
+                "by_direction": {"d-aaa": 2},
+                "sample": [
+                    {
+                        "title": "Use shared helper",
+                        "reason": "prereq_deferred_same_cycle",
+                        "direction_id": "d-aaa",
+                    }
+                ],
+            }
+        },
+    )
+    plain = make_task(project_id=project.id, status=TaskStatus.COMPLETED, title="plain")
+    db_session.add_all([dropped, plain])
+    await db_session.commit()
+
+    result = await compute_dependency_health_signals(db_session, project_id=project.id)
+
+    agg = result["finding_structural_give_up"]
+    assert agg["total"] == 2
+    assert agg["by_reason"] == {"prereq_deferred_same_cycle": 2}
+    assert agg["by_direction"] == {"d-aaa": 2}
+    assert agg["findings"][0]["title"] == "Use shared helper"
+
+
 def test_duplicate_foundation_signal_flags_cross_parent_overlap():
     """Two active write-tasks under DIFFERENT parents whose related-file sets
     strongly overlap are surfaced; a disjoint task is not."""

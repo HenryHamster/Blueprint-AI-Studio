@@ -8303,6 +8303,61 @@ async def test_dead_foundation_cancel_stamps_unresumable_marker(reaper_db, mocke
 
 
 @pytest.mark.asyncio
+async def test_co_deferred_shelved_foundation_not_dead_dependent_stays_blocked(
+    reaper_db, mocker
+):
+    """A co-deferred (shelved) foundation is recoverable, NOT dead: a blocked
+    dependent whose need matches it must stay BLOCKED-and-waiting (it re-surfaces
+    with its prerequisite), it must NOT be cascade-cancelled as foundation-died,
+    and the foundation_died give-up count must NOT be polluted by the shelving."""
+    from app.failure_classification import CO_DEFERRED_SHELVED
+    from app.reaper_sweeps import UNRESUMABLE_CANCEL_CONTEXT_KEY
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    # The dependent's foundation was co-deferred this cycle: CANCELLED + the
+    # durable non-death marker, advertising a capability the dependent needs.
+    shelved = Task(
+        project_id=project.id, title="co-deferred-foundation", description="x",
+        status=TaskStatus.CANCELLED, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}],
+        context={"provides_capability": "auth-tokens", CO_DEFERRED_SHELVED: True},
+        status_log=[],
+    )
+    reaper_db.add(shelved)
+    await reaper_db.commit()
+    need = {"kind": "capability", "ref": "auth-tokens"}
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: waiting on foundation",
+        depends_on=[],
+        blocked_at=now - timedelta(hours=8),
+        context={
+            "direction_id": "d-abc123",
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "foundation",
+                "reason": "BLOCKER: waiting on foundation",
+                "need": need,
+            },
+            "_blocked_escalated": True,
+            "_blocked_parked_reevals": 0,
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    await reaper_db.refresh(t)
+    # Stays blocked-and-waiting — not cascade-cancelled as a dead foundation.
+    assert t.status == TaskStatus.BLOCKED
+    # No foundation_died give-up was stamped, so the health summary is unpolluted.
+    assert (t.context or {}).get(UNRESUMABLE_CANCEL_CONTEXT_KEY) is None
+
+
+@pytest.mark.asyncio
 async def test_never_satisfiable_cancel_stamps_unresumable_marker(reaper_db, mocker):
     """The never-satisfiable terminal cancel (parked re-eval cap reached) stamps
     the durable marker with the never_satisfiable give-up class and the need."""

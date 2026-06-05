@@ -106,6 +106,8 @@ _FAILURE_CLASS_LABELS = {
     NO_PROGRESS_TIMEOUT: "No-Progress Timeout",
 }
 
+_FINDING_STRUCTURAL_GIVE_UP_LIST_LIMIT = 5
+
 
 def _compute_first_attempt_breakdowns(
     terminal_tasks: List[Task],
@@ -1454,6 +1456,46 @@ def compute_unresumable_cancellation_summary(
     }
 
 
+def _compute_finding_structural_give_up_summary(
+    research_tasks: List["Task"],
+) -> Dict[str, Any]:
+    rows: List[Dict[str, Any]] = []
+    by_reason: Dict[str, int] = defaultdict(int)
+    by_direction: Dict[str, int] = defaultdict(int)
+    for t in research_tasks:
+        marker = (t.context or {}).get("finding_structural_give_up")
+        if not isinstance(marker, dict):
+            continue
+        rows.append(
+            {
+                "task_id": str(t.id),
+                "title": t.title or str(t.id)[:8],
+                "at": marker.get("at") or _coerce_naive_utc(t.updated_at).isoformat(),
+                "sample": list(marker.get("sample") or []),
+                "total": _coerce_count(marker.get("total")) or 0,
+            }
+        )
+        for reason, count in (marker.get("by_reason") or {}).items():
+            by_reason[reason or "unknown"] += _coerce_count(count) or 0
+        for direction_id, count in (marker.get("by_direction") or {}).items():
+            by_direction[direction_id or "(none)"] += _coerce_count(count) or 0
+    rows.sort(key=lambda r: r["at"] or "", reverse=True)
+    sample: List[Dict[str, Any]] = []
+    for row in rows:
+        for item in row["sample"]:
+            sample.append({"task_id": row["task_id"], **item})
+            if len(sample) >= _FINDING_STRUCTURAL_GIVE_UP_LIST_LIMIT:
+                break
+        if len(sample) >= _FINDING_STRUCTURAL_GIVE_UP_LIST_LIMIT:
+            break
+    return {
+        "total": sum(row["total"] for row in rows),
+        "by_reason": dict(by_reason),
+        "by_direction": dict(by_direction),
+        "findings": sample,
+    }
+
+
 # Action-confidence threshold for *converging* (serializing) a pair — strictly
 # ABOVE the observability threshold. Strong overlap alone is intentionally NOT
 # enough: the pipeline lets independent tasks edit shared-infrastructure files in
@@ -1554,13 +1596,22 @@ async def compute_dependency_health_signals(
     Without the ``_recut_escalated`` arm the summarizer's re-cut branch would be
     unreachable in production.
     """
-    parked_predicate = or_(
-        and_(
-            Task.status == TaskStatus.BLOCKED,
-            Task.context["_blocked_escalated"].astext == "true",
-        ),
-        Task.context["_recut_escalated"].astext == "true",
-    )
+    if resolve_dialect_name(session) == "sqlite":
+        parked_predicate = or_(
+            and_(
+                Task.status == TaskStatus.BLOCKED,
+                func.json_extract(Task.context, "$._blocked_escalated").is_not(None),
+            ),
+            func.json_extract(Task.context, "$._recut_escalated").is_not(None),
+        )
+    else:
+        parked_predicate = or_(
+            and_(
+                Task.status == TaskStatus.BLOCKED,
+                Task.context["_blocked_escalated"].astext == "true",
+            ),
+            Task.context["_recut_escalated"].astext == "true",
+        )
     blocked_filters = [parked_predicate]
     if project_id is not None:
         blocked_filters.append(Task.project_id == project_id)
@@ -1619,6 +1670,25 @@ async def compute_dependency_health_signals(
         .all()
     )
 
+    if resolve_dialect_name(session) == "sqlite":
+        give_up_present = func.json_extract(
+            Task.context, "$.finding_structural_give_up"
+        ).is_not(None)
+    else:
+        give_up_present = Task.context.has_key("finding_structural_give_up")
+    give_up_filters = [Task.updated_at >= window_start, give_up_present]
+    if project_id is not None:
+        give_up_filters.append(Task.project_id == project_id)
+    finding_give_up = (
+        (
+            await session.execute(
+                select(Task).where(*give_up_filters).limit(1000)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
     return {
         "parked_blockers": compute_parked_blocker_summary(list(blocked)),
         "duplicate_foundation_candidates": compute_duplicate_foundation_signal(
@@ -1626,6 +1696,9 @@ async def compute_dependency_health_signals(
         ),
         "unresumable_cancellations": compute_unresumable_cancellation_summary(
             list(cancelled), window_start=window_start
+        ),
+        "finding_structural_give_up": _compute_finding_structural_give_up_summary(
+            list(finding_give_up)
         ),
     }
 

@@ -376,3 +376,31 @@ def test_dead_match_never_self_matches():
     blocked = _task(status=TaskStatus.FAILED)
     need = {"kind": "task", "ref": str(blocked.id)}
     assert need_matched_dead_foundation(blocked, need, [blocked]) is False
+
+
+def test_dead_match_excludes_co_deferred_shelving_by_finding_hash():
+    # A co-deferred dependent's task is CANCELLED but RECOVERABLE — it re-surfaces
+    # with its same-cycle-deferred prerequisite next cycle. A blocked dependent
+    # whose finding-hash need matches it must NOT be classified as foundation-died.
+    from app.failure_classification import CO_DEFERRED_SHELVED
+
+    shelved = _task(
+        status=TaskStatus.CANCELLED,
+        context={"finding_hash": "f00dcafe0000dead", CO_DEFERRED_SHELVED: True},
+    )
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": "f00dcafe0000dead"}
+    assert need_matched_dead_foundation(blocked, need, [shelved]) is False
+
+
+def test_dead_match_excludes_co_deferred_shelving_by_capability():
+    # The capability-kind need path must equally exclude a co-deferred shelving.
+    from app.failure_classification import CO_DEFERRED_SHELVED
+
+    shelved = _task(
+        status=TaskStatus.CANCELLED,
+        context={"provides_capability": "auth-tokens", CO_DEFERRED_SHELVED: True},
+    )
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "capability", "ref": "auth-tokens"}
+    assert need_matched_dead_foundation(blocked, need, [shelved]) is False

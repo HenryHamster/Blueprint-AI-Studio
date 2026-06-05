@@ -267,24 +267,23 @@ def need_matched_dead_foundation(
     is untouched. ``dead_candidates`` is the pre-fetched set of same-project tasks
     in :data:`TERMINAL_CANDIDATE_STATUSES`.
 
-    A requeue-replaced cancellation (``_replaced_by_task_id``) or a clean
-    "scope already covered" exit (``failure_category == SCOPE_EMPTY``) is NOT a
-    genuine death — the work either continues under a replacement clone or was a
-    deliberate no-op — so such candidates are excluded and never trigger a
-    termination.
+    A non-death cancellation is NOT a genuine death and is excluded so it never
+    triggers a termination: a requeue-replaced clone (``_replaced_by_task_id``),
+    a clean "scope already covered" no-op (``failure_category == SCOPE_EMPTY``),
+    or a co-deferred shelving (``_co_deferred_shelved``) whose work re-surfaces in
+    a later cycle. The shared predicate
+    :func:`app.failure_classification.is_non_death_cancellation` is the single
+    source of this policy, so it cannot drift from the dispatch-time classifier.
     """
     if not isinstance(need, dict):
         return False
-    from app.failure_classification import SCOPE_EMPTY
+    from app.failure_classification import is_non_death_cancellation
 
     eligible = []
     for c in dead_candidates:
         if c.id == task.id:
             continue
-        ctx = c.context or {}
-        if ctx.get("_replaced_by_task_id"):
-            continue
-        if ctx.get("failure_category") == SCOPE_EMPTY:
+        if is_non_death_cancellation(c):
             continue
         eligible.append(c)
     return _match_need(need, eligible) is not None

@@ -317,6 +317,47 @@ async def test_digest_merge_gate_fleet_health_empty(client: AsyncClient, db_sess
 
 
 @pytest.mark.asyncio
+async def test_digest_dependency_health_surfaces_finding_structural_give_up(
+    client: AsyncClient, db_session
+):
+    """The admin digest wires through the finding-level structural give-up signal."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        title="research cycle with give-up",
+        context={
+            "finding_structural_give_up": {
+                "at": "2026-06-04T12:00:00",
+                "total": 1,
+                "by_reason": {"prereq_deferred_same_cycle": 1},
+                "by_direction": {"d-aaa": 1},
+                "sample": [
+                    {
+                        "title": "Use shared helper",
+                        "reason": "prereq_deferred_same_cycle",
+                        "direction_id": "d-aaa",
+                    }
+                ],
+            }
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    give_up = response.json()["dependency_health_signals"]["finding_structural_give_up"]
+    assert give_up["total"] == 1
+    assert give_up["by_reason"] == {"prereq_deferred_same_cycle": 1}
+    assert give_up["by_direction"] == {"d-aaa": 1}
+
+
+@pytest.mark.asyncio
 async def test_digest_merge_gate_fleet_health_window_filters_stale(
     client: AsyncClient, db_session
 ):
