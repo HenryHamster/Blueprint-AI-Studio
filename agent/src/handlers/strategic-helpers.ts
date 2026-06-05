@@ -108,10 +108,38 @@ if [ "$KIND" != "problem-model" ] && [ -z "$ID" ]; then
   exit 1
 fi
 
-curl -sS --max-time 20 --connect-timeout 10 \\
+# Fetch with HTTP status awareness. Capture response body and status code
+# separately so we can surface HTTP errors clearly.
+response=$(curl -sS --max-time 20 --connect-timeout 10 \\
   -X GET "$API/api/agent/projects/$PROJECT/$PATH_SUFFIX" \\
-  -H "X-Agent-Token: $TOKEN"
+  -H "X-Agent-Token: $TOKEN" \\
+  -w '\\n%{http_code}')
+http_code=$(printf '%s' "$response" | tail -n1)
+body=$(printf '%s' "$response" | head -n -1)
+
+# On 2xx: pass body through as today (success)
+if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+  printf '%s' "$body"
+  echo ""
+  exit 0
+fi
+
+# On 409: ambiguous ref or constraint violation. Surface the body (which contains
+# candidate refs and minimum hex length) with a clear ambiguity signal so the
+# agent knows to retry with a longer ref.
+if [ "$http_code" -eq 409 ]; then
+  printf '%s' "$body"
+  echo "[AMBIGUOUS] fetch $KIND: multiple candidates found; candidates and minimum ref length in response above" >&2
+  echo ""
+  exit 1
+fi
+
+# On any other non-2xx (404, 400, 5xx, etc.): surface the body and report error.
+# The agent can then decide how to handle missing/invalid refs.
+printf '%s' "$body" >&2
+echo "[ERROR] fetch $KIND failed (HTTP $http_code)" >&2
 echo ""
+exit 1
 `;
 }
 

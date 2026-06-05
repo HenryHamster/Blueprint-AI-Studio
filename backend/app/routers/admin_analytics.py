@@ -247,6 +247,7 @@ async def get_task_cost_breakdown(
     project_id: uuid.UUID | None = Query(None),
     window: str = Query("1h"),
     top_n: int = Query(5, ge=1, le=20),
+    max_tasks: int = Query(5000, ge=1, le=20000),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
@@ -285,6 +286,15 @@ async def get_task_cost_breakdown(
                     )
                 )
                 .where(*filters)
+                # Windowing is by completion time (derived in Python from
+                # status_log/context), so we cannot push the cutoff into SQL.
+                # Bound the materialized set instead: most-recently-created
+                # tasks first, capped at max_tasks, so a large unarchived
+                # backlog cannot OOM the worker. completed_at >= created_at,
+                # so ordering by created_at desc keeps the recent window's
+                # tasks at the front of the result set.
+                .order_by(Task.created_at.desc())
+                .limit(max_tasks)
             )
         )
         .scalars()
@@ -381,6 +391,8 @@ async def get_task_cost_breakdown(
         "window_ms": _TASK_COST_WINDOW_MS[window] if window != "all" else None,
         "window_start": cutoff.isoformat() if cutoff else None,
         "task_count": len(rows),
+        "max_tasks": max_tasks,
+        "truncated": len(tasks) >= max_tasks,
         "total_estimated_cost_usd": round(total_cost, 2),
         "task_type_breakdown": task_type_breakdown,
         "direction_breakdown": direction_breakdown,

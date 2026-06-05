@@ -200,4 +200,43 @@ describe('writeStrategicHelpers', () => {
     expect(content).toContain('design-doc');
     expect(content).toContain('/api/agent/design-doc');
   });
+
+  it('handles HTTP 409 (ambiguous ref) on message fetch with clear signal', () => {
+    const taskId = 'test-task-123';
+    const projectId = 'test-project-456';
+    writeStrategicHelpers(taskId, projectId, testWorkspace);
+
+    const content = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
+    // Verify the fetch script captures HTTP status and handles 409
+    expect(content).toContain('http_code=$(printf');
+    expect(content).toContain('if [ "$http_code" -eq 409 ]');
+    expect(content).toContain('[AMBIGUOUS]');
+    expect(content).toContain('multiple candidates found');
+    // 409 should exit with error code (exit 1) so agent knows to retry
+    expect(content).toContain('exit 1');
+  });
+
+  it('handles HTTP 404 and other non-2xx errors on fetch', () => {
+    const taskId = 'test-task-123';
+    const projectId = 'test-project-456';
+    writeStrategicHelpers(taskId, projectId, testWorkspace);
+
+    const content = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
+    // Verify the fetch script has generic error handling for non-2xx responses
+    expect(content).toContain('[ERROR] fetch $KIND failed');
+    expect(content).toContain('HTTP $http_code');
+    // Non-success responses should exit with error (exit 1)
+    expect(content).toMatch(/exit 1[\s\n]*$/);
+  });
+
+  it('fetch script returns 0 only on 2xx success', () => {
+    const taskId = 'test-task-123';
+    const projectId = 'test-project-456';
+    writeStrategicHelpers(taskId, projectId, testWorkspace);
+
+    const content = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
+    // First success path should be 2xx check with exit 0
+    expect(content).toContain('if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]');
+    expect(content).toContain('exit 0');
+  });
 });
