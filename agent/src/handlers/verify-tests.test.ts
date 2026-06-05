@@ -577,9 +577,12 @@ describe('handleVerifyTests', () => {
     const verdict = parsedVerdict();
     expect(verdict.detected).toBe(true);
     expect(verdict.probe).toBeUndefined();
-    // The probe is never even detected on a real-suite verdict.
+    // The acceptance probe is never even detected on a real-suite verdict.
     expect(vi.mocked(detectAcceptanceProbes)).not.toHaveBeenCalled();
-    expect(vi.mocked(execFileAsync)).not.toHaveBeenCalled();
+    // The documented-command probe always diffs (git) regardless of the suite
+    // verdict, but no acceptance-probe command should run on a real-suite pass.
+    const nonGitCalls = vi.mocked(execFileAsync).mock.calls.filter(c => c[0] !== 'git');
+    expect(nonGitCalls).toHaveLength(0);
   });
 
   it('runs testFixLoop once with maxFixAttempts 0 (no fix loop)', async () => {
@@ -601,15 +604,17 @@ describe('handleVerifyTests', () => {
     vi.mocked(detectAcceptanceProbes).mockReturnValue([genericProbe, declaredProbe]);
 
     // Track calls to execFileAsync to verify timeout values
-    const callsWithTimeouts: Array<{ timeoutMs?: number }> = [];
-    vi.mocked(execFileAsync).mockImplementation((_cmd: unknown, _args: unknown, opts?: unknown) => {
-      callsWithTimeouts.push(opts as { timeoutMs?: number });
+    const probeCalls: Array<{ cmd: string; timeoutMs?: number }> = [];
+    vi.mocked(execFileAsync).mockImplementation((cmd: unknown, _args: unknown, opts?: unknown) => {
+      probeCalls.push({ cmd: cmd as string, timeoutMs: (opts as { timeoutMs?: number } | undefined)?.timeoutMs });
       return Promise.resolve('');
     });
 
     await handleVerifyTests('timeout1', payload, task, 'tok', 'o', 'r', null, { value: '' });
 
-    // Should have 2 calls to execFileAsync (one generic, one declared)
+    // Filter out the documented-command probe's git-diff calls — this test is
+    // about the two acceptance-probe timeouts (one generic, one declared).
+    const callsWithTimeouts = probeCalls.filter(c => c.cmd !== 'git');
     expect(callsWithTimeouts).toHaveLength(2);
     // The generic Python probe should use the smaller timeout (TEST_BASELINE_TIMEOUT = 60_000)
     expect(callsWithTimeouts[0].timeoutMs).toBe(60_000);

@@ -1488,3 +1488,440 @@ export function buildTargetedPytestRunners(runners: TestRunner[], selectors: str
 
 // isDockerRunner is used by callers in index.ts via re-export
 export { isDockerRunner };
+
+// ── Diff-aware documented / PR-introduced command discovery ──────────────────
+// The no-CI merge gate runs the repo's STORED suite + a cheap acceptance probe,
+// but it never executes commands the PR ITSELF introduces or documents — a newly
+// added package.json script, a newly added Makefile/justfile/Taskfile target, a
+// newly declared console-script entrypoint, or a command shown in a touched
+// README/docs usage block. So a PR can document/add a command, claim it works,
+// and merge with that claim entirely unexercised. These helpers discover that
+// small set of commands CONSERVATIVELY (structured sources preferred over
+// free-text prose) and ALLOWLISTED (every candidate is refused unless it clears
+// the destructive/network/privilege denylist), so the gate can run them. The
+// execution + timeout discipline lives in the verify-tests handler; this module
+// is the pure, unit-testable discovery + safety logic.
+
+/** A single command the PR introduces/documents, ready to run by the gate. */
+export interface DocumentedCommand {
+  /** Shell command string to execute (e.g. ``npm run build``, ``make test``). */
+  command: string;
+  /** Absolute working directory to run it from. */
+  cwd: string;
+  /** Where it was discovered (``package.json scripts.build``, ``make target test``…). */
+  source: string;
+  /** Human label surfaced in the verdict (``npm run build (agent/package.json)``). */
+  label: string;
+  /** Heavier build commands get the larger build timeout; cheap ones the baseline. */
+  heavy: boolean;
+}
+
+// Hard cap on discovered commands so a PR touching many manifests cannot fan out
+// an unbounded set of probe processes. The handler runs each ONCE under a
+// bounded timeout (no retries beyond the gate's existing discipline).
+export const MAX_DOCUMENTED_COMMANDS = 4;
+
+// Executables that are destructive, escalate privilege, touch the network, or
+// mutate global state. A documented/PR-introduced command — OR any sub-command
+// it chains into, OR the BODY of a script/target it would invoke — that runs one
+// of these is refused outright.
+const UNSAFE_EXECUTABLES = new Set([
+  'rm', 'rmdir', 'sudo', 'su', 'doas', 'curl', 'wget', 'nc', 'ncat', 'netcat',
+  'ssh', 'scp', 'sftp', 'telnet', 'ftp', 'rsync', 'docker', 'podman', 'kubectl',
+  'helm', 'systemctl', 'service', 'mkfs', 'dd', 'chmod', 'chown', 'chgrp',
+  'kill', 'killall', 'pkill', 'reboot', 'shutdown', 'poweroff', 'halt', 'mount',
+  'umount', 'apt', 'apt-get', 'yum', 'dnf', 'pacman', 'apk', 'brew', 'snap',
+  'git', 'gh', 'aws', 'gcloud', 'az', 'terraform', 'ansible',
+]);
+
+// Sub-command verbs that fetch from the network, escalate, or publish/deploy.
+// Refused wherever they appear as a token after the runner — covers
+// ``npm publish``, ``pip install x``, ``cargo install``, ``go get``, and any
+// ``<runner> deploy|release|publish`` shape.
+const UNSAFE_VERBS = new Set([
+  'install', 'publish', 'deploy', 'release', 'add', 'get', 'push', 'login',
+  'logout', 'uninstall', 'remove', 'update', 'upgrade', 'token', 'audit',
+]);
+
+// Leading ``NAME=value`` env-assignment tokens (``FOO=1 rm -rf /``) hide the
+// real executable from a head-only check — strip them before inspecting.
+const ENV_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+// Wrapper commands that run ANOTHER command passed as their argument
+// (``env curl …``, ``timeout 5 rm …``, ``xargs rm``). They mask the real
+// executable, so a documented/introduced command that leads with one is
+// refused outright rather than trying to peel and re-validate the inner shape.
+const WRAPPER_COMMANDS = new Set([
+  'env', 'time', 'timeout', 'xargs', 'nice', 'ionice', 'command', 'exec',
+  'nohup', 'setsid', 'stdbuf', 'chrt', 'sudo', 'su', 'doas',
+]);
+
+// Basename of a token, lowercased — so an absolute/relative path (``/bin/rm``,
+// ``./curl``) is matched against the denylist by its final component.
+function commandBasename(token: string): string {
+  const slash = token.lastIndexOf('/');
+  return (slash >= 0 ? token.slice(slash + 1) : token).toLowerCase();
+}
+
+function isSafeSubCommand(sub: string): boolean {
+  let tokens = sub.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return false;
+  // Strip leading env-assignment tokens so ``FOO=1 rm -rf /`` is judged on ``rm``.
+  while (tokens.length > 0 && ENV_ASSIGN_RE.test(tokens[0])) tokens = tokens.slice(1);
+  if (tokens.length === 0) return false;
+  const head = commandBasename(tokens[0]);
+  // Reject wrapper commands that hide the real executable (``env``, ``timeout``,
+  // ``xargs``, ``sudo`` …) before any other check.
+  if (WRAPPER_COMMANDS.has(head)) return false;
+  // Check the basename of EVERY token (not just the head) against the denylist
+  // so an absolute path (``/bin/rm``), a wrapper-smuggled executable, or a
+  // chained dangerous binary that survived sub-command splitting is refused.
+  if (tokens.some(t => UNSAFE_EXECUTABLES.has(commandBasename(t)))) return false;
+  // Inline code-eval (``bash -c``, ``node -e``, ``python -c`` …) executes
+  // arbitrary code — refuse regardless of what follows.
+  if (
+    /^(bash|sh|zsh|ksh|node|deno|bun|python3?|perl|ruby|php)$/.test(head) &&
+    tokens.slice(1).some(t => /^(-c|-e|--eval|--command|--exec)$/i.test(t))
+  ) {
+    return false;
+  }
+  if (tokens.slice(1).some(t => UNSAFE_VERBS.has(t.toLowerCase()))) return false;
+  return true;
+}
+
+/**
+ * Whether a command (or a script/target body the gate would invoke) is safe to
+ * run. CONSERVATIVE — refuses command substitution, redirection to absolute /
+ * system paths, and any sub-command that invokes a destructive/network/privilege
+ * executable or a network-install / deploy / publish verb. A chain of SAFE
+ * commands (``tsc && vite build``) is allowed; a chain that smuggles a dangerous
+ * command (``build && rm -rf /``) is refused. When in doubt, returns false.
+ */
+export function isSafeDocumentedCommand(command: string): boolean {
+  const cmd = (command || '').trim();
+  if (!cmd) return false;
+  // Command substitution — hidden execution.
+  if (/`|\$\(/.test(cmd)) return false;
+  // Output redirection to an absolute / system path (``> /etc/x``, ``>>/usr/…``).
+  if (/>>?\s*\//.test(cmd)) return false;
+  // Validate EACH chained sub-command.
+  const subs = cmd.split(/&&|\|\||;|\|/).map(s => s.trim()).filter(Boolean);
+  if (subs.length === 0) return false;
+  return subs.every(isSafeSubCommand);
+}
+
+// Known-safe runner first-tokens for LAST-RESORT free-text (README/docs)
+// extraction. A prose command is considered only when its first token is one of
+// these AND it additionally clears ``isSafeDocumentedCommand``. Structured
+// sources do NOT use this list — they are preferred and gated on the body
+// denylist instead.
+const ALLOWLISTED_RUNNERS = new Set([
+  'npm', 'yarn', 'pnpm', 'npx', 'node', 'make', 'just', 'task', 'cargo', 'go',
+  'python', 'python3', 'pytest', 'tox', 'nox', 'bundle', 'rake', 'mix',
+  'dotnet', 'mvn', 'gradle', './gradlew', 'gradlew', 'composer', 'poetry',
+  'ruff', 'eslint', 'tsc', 'vitest', 'jest', 'deno', 'bun',
+]);
+
+/** Whether a free-text command's first token is a known-safe runner shape. */
+export function isAllowlistedRunnerShape(command: string): boolean {
+  const tokens = command.trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return false;
+  return ALLOWLISTED_RUNNERS.has(tokens[0].toLowerCase());
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// The script/target names worth exercising — the verbs the direction cares about
+// (test/build/lint/check + type-check aliases). Bounded so a manifest declaring
+// dozens of scripts cannot fan out.
+const INTERESTING_NAMES = ['test', 'build', 'lint', 'check', 'typecheck', 'type-check'];
+
+// A name is "newly introduced" when a declaration line for it appears in the
+// PR's added diff lines. Matches both quoted JSON keys (``"build":``) and bare
+// target/key declarations (``build:`` / ``  build:``).
+function addedDeclaresName(addedLines: string[], name: string): boolean {
+  const esc = escapeRegExp(name);
+  const jsonKey = new RegExp(`"${esc}"\\s*:`);
+  const decl = new RegExp(`(^|\\s)${esc}\\s*[:=]`);
+  return addedLines.some(l => jsonKey.test(l) || decl.test(l));
+}
+
+function parsePackageJsonCommands(
+  text: string, addedLines: string[], cwd: string, label: string,
+): DocumentedCommand[] {
+  let parsed: unknown;
+  try { parsed = JSON.parse(text); } catch { return []; }
+  const scripts = (parsed && typeof parsed === 'object'
+    ? (parsed as { scripts?: Record<string, unknown> }).scripts
+    : undefined);
+  if (!scripts || typeof scripts !== 'object') return [];
+  const out: DocumentedCommand[] = [];
+  for (const name of INTERESTING_NAMES) {
+    const body = scripts[name];
+    if (typeof body !== 'string' || !body.trim()) continue;
+    if (!addedDeclaresName(addedLines, name)) continue;   // not newly introduced
+    if (!isSafeDocumentedCommand(body)) continue;         // script BODY denylist
+    const command = name === 'test' ? 'npm test' : `npm run ${name}`;
+    out.push({
+      command, cwd, source: `package.json scripts.${name}`,
+      label: `${command} (${label})`, heavy: name === 'build',
+    });
+  }
+  return out;
+}
+
+function indentWidth(line: string): number {
+  const m = line.match(/^[ \t]*/);
+  return m ? m[0].length : 0;
+}
+
+// The body lines belonging to a make/just/task target: every line after the
+// declaration that is MORE indented than the declaration, until a same-or-less
+// indented (non-blank) line. Works for tab-indented make recipes, indented just
+// recipes, and nested Taskfile ``cmds:`` blocks.
+function targetBodyLines(lines: string[], declIndex: number): string[] {
+  const baseIndent = indentWidth(lines[declIndex]);
+  const body: string[] = [];
+  for (let i = declIndex + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) continue;                 // blanks don't end the block
+    if (indentWidth(line) <= baseIndent) break; // dedent → block ended
+    body.push(line.trim());
+  }
+  return body;
+}
+
+function parseTargetCommands(
+  text: string, addedLines: string[], cwd: string, label: string,
+  kind: 'make' | 'just' | 'task',
+): DocumentedCommand[] {
+  const lines = text.split(/\r?\n/);
+  const runner = kind === 'make' ? 'make' : kind === 'just' ? 'just' : 'task';
+  // make/just targets sit at column 0; Taskfile targets are indented under
+  // ``tasks:``. Both forms end in ``:``.
+  const declRe = (name: string): RegExp => kind === 'task'
+    ? new RegExp(`^\\s+${escapeRegExp(name)}\\s*:`)
+    : new RegExp(`^${escapeRegExp(name)}\\s*:`);
+  const out: DocumentedCommand[] = [];
+  for (const name of INTERESTING_NAMES) {
+    const re = declRe(name);
+    const declIndex = lines.findIndex(l => re.test(l));
+    if (declIndex < 0) continue;
+    if (!addedDeclaresName(addedLines, name)) continue;   // not newly introduced
+    // Refuse if any recipe/command line in the target body is dangerous.
+    const body = targetBodyLines(lines, declIndex)
+      .map(l => l.replace(/^[-*]\s*/, '').replace(/^cmd:\s*/, '').trim())
+      .filter(Boolean);
+    if (!body.every(isSafeDocumentedCommand)) continue;
+    const command = `${runner} ${name}`;
+    out.push({
+      command, cwd, source: `${kind} target ${name}`,
+      label: `${command} (${label})`, heavy: name === 'build',
+    });
+  }
+  return out;
+}
+
+// Console-script / entrypoint names declared in pyproject.toml
+// (``[project.scripts]`` / ``[tool.poetry.scripts]``) or setup.cfg
+// (``console_scripts`` under ``[options.entry_points]``).
+function parseConsoleScriptNames(text: string, kind: 'pyproject' | 'setup.cfg'): string[] {
+  const lines = text.split(/\r?\n/);
+  const names: string[] = [];
+  if (kind === 'pyproject') {
+    let inScripts = false;
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (/^\[/.test(line)) {
+        inScripts = /^\[(project\.scripts|tool\.poetry\.scripts)\]/.test(line);
+        continue;
+      }
+      if (!inScripts) continue;
+      const m = line.match(/^([A-Za-z][\w.-]*)\s*=/);
+      if (m) names.push(m[1]);
+    }
+    return names;
+  }
+  // setup.cfg: a ``console_scripts =`` key whose entries are indented beneath it.
+  let inConsole = false;
+  let consoleIndent = -1;
+  for (const raw of lines) {
+    if (!raw.trim()) continue;
+    const indent = indentWidth(raw);
+    const trimmed = raw.trim();
+    if (inConsole) {
+      if (indent <= consoleIndent) {
+        inConsole = false; // dedent — re-evaluate this line below
+      } else {
+        const m = trimmed.match(/^([A-Za-z][\w.-]*)\s*=/);
+        if (m) names.push(m[1]);
+        continue;
+      }
+    }
+    if (/^console_scripts\s*=/.test(trimmed)) {
+      inConsole = true;
+      consoleIndent = indent;
+    }
+  }
+  return names;
+}
+
+function parseConsoleScriptCommands(
+  text: string, addedLines: string[], cwd: string, label: string,
+  kind: 'pyproject' | 'setup.cfg',
+): DocumentedCommand[] {
+  const out: DocumentedCommand[] = [];
+  for (const name of parseConsoleScriptNames(text, kind)) {
+    if (!/^[A-Za-z][\w.-]*$/.test(name)) continue;        // sane binary name only
+    if (!addedDeclaresName(addedLines, name)) continue;   // not newly introduced
+    // Exercise the entrypoint cheaply + safely: ``<name> --help``. The entrypoint
+    // must be installed (provisioning runs the project install), so a missing
+    // binary degrades to could_not_run downstream rather than blocking.
+    const command = `${name} --help`;
+    if (!isSafeDocumentedCommand(command)) continue;
+    out.push({
+      command, cwd, source: `console_script ${name}`,
+      label: `${command} (${label})`, heavy: false,
+    });
+  }
+  return out;
+}
+
+// Lines inside fenced code blocks (``` / ~~~), trimmed. Used for LAST-RESORT
+// README/docs extraction.
+function extractFencedCommandLines(text: string): string[] {
+  const lines = text.split(/\r?\n/);
+  const out: string[] = [];
+  let inFence = false;
+  for (const raw of lines) {
+    const trimmed = raw.trim();
+    if (/^(```|~~~)/.test(trimmed)) { inFence = !inFence; continue; }
+    if (inFence && trimmed) out.push(trimmed);
+  }
+  return out;
+}
+
+function parseDocumentedProseCommands(
+  text: string, addedLines: string[], cwd: string, label: string,
+): DocumentedCommand[] {
+  const addedSet = new Set(addedLines.map(l => l.trim()));
+  const out: DocumentedCommand[] = [];
+  for (const line of extractFencedCommandLines(text)) {
+    // Only commands the PR NEWLY documented (the fenced line is in the diff).
+    if (!addedSet.has(line)) continue;
+    // Strip a leading shell prompt (``$ `` / ``> ``).
+    const cmd = line.replace(/^[$>]\s+/, '').trim();
+    if (!cmd) continue;
+    if (!isAllowlistedRunnerShape(cmd)) continue;         // strict runner shape
+    if (!isSafeDocumentedCommand(cmd)) continue;          // denylist
+    out.push({
+      command: cmd, cwd, source: `documented command (${label})`,
+      label: `${cmd} (${label})`, heavy: /(^|\s)build(\s|$)/.test(cmd),
+    });
+  }
+  return out;
+}
+
+/** Input for {@link discoverDocumentedCommands}. */
+export interface DiscoverDocumentedCommandsInput {
+  /** PR-vs-base changed files, repo-root-relative (``git diff --name-only``). */
+  changedFiles: string[];
+  /** Added diff lines (``+`` lines, ``+`` stripped, trimmed). */
+  addedLines: string[];
+  /**
+   * Added diff lines keyed by the repo-relative file they belong to. When
+   * present, a script/target/entrypoint is judged "newly introduced" ONLY when
+   * its declaration appears in the added lines of the SAME manifest being
+   * parsed — so a matching declaration shape in an unrelated file cannot make a
+   * pre-existing script in a separately-changed manifest look new. Falls back to
+   * the global {@link addedLines} when a file has no entry (keeps callers/tests
+   * that pass only the flat list working unchanged).
+   */
+  addedLinesByFile?: Record<string, string[]>;
+  /** Read a repo-relative file's text; return null when absent/unreadable. */
+  readFile: (relPath: string) => string | null;
+  /** Workspace root (absolute). Defaults to the module workspace. */
+  workspace?: string;
+  /** Max commands to return. Defaults to {@link MAX_DOCUMENTED_COMMANDS}. */
+  max?: number;
+}
+
+/**
+ * Discover the small, allowlisted set of commands a PR INTRODUCES or DOCUMENTS,
+ * diffing against the base. STRUCTURED sources (added package.json scripts,
+ * added Makefile/justfile/Taskfile targets, declared console-script entrypoints)
+ * are preferred; free-text README/docs extraction is LAST-RESORT and only pulls
+ * fenced-block lines matching a strict runner allowlist. Every candidate clears
+ * the destructive/network/privilege denylist (script/target BODIES too). Bounded
+ * to ``max`` commands and deduped by cwd+command. Pure — all filesystem access
+ * goes through the injected ``readFile`` so the logic is unit-testable.
+ */
+export function discoverDocumentedCommands(
+  input: DiscoverDocumentedCommandsInput,
+): DocumentedCommand[] {
+  const workspace = input.workspace ?? WORKSPACE;
+  const max = input.max ?? MAX_DOCUMENTED_COMMANDS;
+  const out: DocumentedCommand[] = [];
+  const seen = new Set<string>();
+  const push = (c: DocumentedCommand): void => {
+    if (out.length >= max) return;
+    const key = `${c.cwd}::${c.command}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(c);
+  };
+  const dirOf = (relPath: string): string => {
+    const slash = relPath.lastIndexOf('/');
+    const dir = slash >= 0 ? relPath.slice(0, slash) : '';
+    return dir ? `${workspace}/${dir}` : workspace;
+  };
+
+  // Added lines scoped to ONE file: the per-file map when supplied, else the
+  // global list (so a declaration shape in an unrelated changed file cannot make
+  // a pre-existing script in a separately-changed manifest look newly added).
+  const addedFor = (rel: string): string[] =>
+    input.addedLinesByFile?.[rel] ?? input.addedLines;
+
+  // Structured sources first; defer README/docs to a last-resort pass.
+  const proseFiles: string[] = [];
+  for (const rel of input.changedFiles) {
+    if (out.length >= max) break;
+    const slash = rel.lastIndexOf('/');
+    const base = slash >= 0 ? rel.slice(slash + 1) : rel;
+    const lower = base.toLowerCase();
+    const cwd = dirOf(rel);
+    const added = addedFor(rel);
+    if (lower === 'package.json') {
+      const text = input.readFile(rel);
+      if (text != null) for (const c of parsePackageJsonCommands(text, added, cwd, rel)) push(c);
+    } else if (lower === 'makefile' || lower === 'gnumakefile') {
+      const text = input.readFile(rel);
+      if (text != null) for (const c of parseTargetCommands(text, added, cwd, rel, 'make')) push(c);
+    } else if (lower === 'justfile') {
+      const text = input.readFile(rel);
+      if (text != null) for (const c of parseTargetCommands(text, added, cwd, rel, 'just')) push(c);
+    } else if (lower === 'taskfile.yml' || lower === 'taskfile.yaml') {
+      const text = input.readFile(rel);
+      if (text != null) for (const c of parseTargetCommands(text, added, cwd, rel, 'task')) push(c);
+    } else if (lower === 'pyproject.toml' || lower === 'setup.cfg') {
+      const text = input.readFile(rel);
+      if (text != null) for (const c of parseConsoleScriptCommands(text, added, cwd, rel, lower === 'setup.cfg' ? 'setup.cfg' : 'pyproject')) push(c);
+    } else if (/\.(md|markdown|rst)$/i.test(lower) || lower === 'readme') {
+      proseFiles.push(rel);
+    }
+  }
+
+  // Last-resort: free-text README/docs. Prose commands run from the repo root
+  // (docs commonly live under docs/ but are invoked from the project root).
+  if (out.length < max) {
+    for (const rel of proseFiles) {
+      if (out.length >= max) break;
+      const text = input.readFile(rel);
+      if (text != null) for (const c of parseDocumentedProseCommands(text, addedFor(rel), workspace, rel)) push(c);
+    }
+  }
+
+  return out;
+}

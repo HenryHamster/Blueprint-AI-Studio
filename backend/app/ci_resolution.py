@@ -327,9 +327,38 @@ def classify_merge_test_verdict(
     path fires carrying the probe output. Every other probe state (pass /
     could-not-run / absent / old-shape verdict) keeps today's ``"undetected"``
     fall-open, so missing-deps / unprovisioned setup never hard-blocks a merge.
+
+    Documented-command probe (HIGH precedence, runs regardless of suite
+    detection): the agent may attach a ``documentedCommands`` block describing the
+    outcome of running a command the PR INTRODUCES or DOCUMENTS (a newly added
+    package.json script, Makefile/justfile/Taskfile target, declared
+    console-script entrypoint, or a command shown in a touched README/docs block).
+    A CLEAR documented-command failure — it ran, did not pass, and was NOT a
+    could-not-run degrade — maps to ``"fail"`` EVEN WHEN a unit suite was detected
+    and passed, because the documented command is a DISTINCT claim the PR
+    introduced that must be exercised. Every other state (pass / could-not-run /
+    absent / old-shape verdict) does NOT block — an older agent that emits no
+    ``documentedCommands`` behaves exactly as before.
     """
     if not isinstance(verdict, dict):
         return ("undetected", "")
+    # HIGH precedence: a documented / PR-introduced command that CLEARLY failed
+    # blocks the merge regardless of whether a unit suite was detected & passed.
+    documented = verdict.get("documentedCommands")
+    if _documented_command_is_clear_failure(documented):
+        output = str(documented.get("output") or "").strip()
+        label = str(documented.get("label") or "").strip()
+        prefix = (
+            f"PR-documented command `{label}` failed: "
+            if label
+            else "PR-documented command failed: "
+        )
+        return (
+            "fail",
+            (prefix + output)
+            if output
+            else (prefix + "the documented command did not succeed."),
+        )
     # Partial-setup failure: SOME-but-not-all test runners failed environment
     # setup, so at least one suite never executed (a polyglot repo where e.g. the
     # Python suite ran but the TS runner's ``npm ci`` failed). The runners that
@@ -396,6 +425,25 @@ def _probe_is_clear_failure(probe: Any) -> bool:
     if probe.get("could_not_run"):
         return False
     return probe.get("passed") is False
+
+
+def _documented_command_is_clear_failure(documented: Any) -> bool:
+    """Whether a ``documentedCommands`` block represents a CLEAR, blocking failure.
+
+    Mirrors :func:`_probe_is_clear_failure` for the diff-aware documented /
+    PR-introduced command probe (same ``ran``/``could_not_run``/``passed`` shape).
+    True only when the command ran, was not a could-not-run degrade, and did not
+    pass. Defensive about a missing / non-dict / old-shape field (returns False),
+    so a verdict from an older agent that emits no ``documentedCommands`` keeps
+    today's gate behavior exactly.
+    """
+    if not isinstance(documented, dict):
+        return False
+    if not documented.get("ran"):
+        return False
+    if documented.get("could_not_run"):
+        return False
+    return documented.get("passed") is False
 
 
 def build_no_ci_gate_ci_result(
@@ -471,12 +519,42 @@ def classify_unverified_fall_open_reason(
     The probe signal takes precedence over the all-skipped phrasing because it is
     the stronger execution evidence we have for this fall-open.
 
+    Documented-command probe: when the merge falls open and a
+    ``documentedCommands`` block is present (a command the PR INTRODUCES or
+    DOCUMENTS), surface DISTINCT operator-visible reason keys —
+    ``documented_command_could_not_run`` when missing deps / unprovisioned setup
+    degraded it (the claim went unverified), or ``documented_command_passed``
+    when the documented command was the positive execution evidence (no unit
+    suite ran but the documented command executed and passed). This signal takes
+    precedence over the acceptance-probe / all-skipped phrasing because a command
+    the PR itself introduced is the most specific claim we can speak to. A CLEAR
+    documented-command failure never reaches here — it blocks via
+    :func:`classify_merge_test_verdict`.
+
     Purely a refinement of the operator-visible reason: it never changes the
     pass/fail/undetected merge decision.  Defensive about a missing / old-shape
-    verdict (an older agent that does not emit ``noTestsReason`` keeps the
-    generic reason).
+    verdict (an older agent that does not emit ``noTestsReason`` /
+    ``documentedCommands`` keeps the generic reason).
     """
     if isinstance(verdict, dict):
+        documented = verdict.get("documentedCommands")
+        if isinstance(documented, dict) and documented.get("ran"):
+            label = str(documented.get("label") or "").strip()
+            if documented.get("could_not_run"):
+                phrase = (
+                    f"a PR-introduced/documented command could not be run ({label})"
+                    if label
+                    else "a PR-introduced/documented command could not be run "
+                    "(missing deps/unprovisioned setup)"
+                )
+                return (phrase, "documented_command_could_not_run")
+            if documented.get("passed") is True:
+                phrase = (
+                    f"a PR-introduced/documented command was executed and passed ({label})"
+                    if label
+                    else "a PR-introduced/documented command was executed and passed"
+                )
+                return (phrase, "documented_command_passed")
         probe = verdict.get("probe")
         if isinstance(probe, dict) and probe.get("ran"):
             # A declared probe ran the project's OWN ``build_cmd`` — surface

@@ -514,6 +514,15 @@ _BLOCKED_ESCALATED_PARK = timedelta(days=3650)
 # re-escalates or re-alerts, so it does not reintroduce per-cycle churn. Parked
 # blockers with NO need keep the multi-year horizon and stay for the operator.
 _BLOCKED_PARKED_REEVAL_INTERVAL = timedelta(hours=6)
+# Bounded number of parked re-evaluations a still-unsatisfiable need is given
+# before the dependent is terminated. A need that never becomes satisfiable —
+# e.g. a capability no task ever advertises — would otherwise re-arm the parked
+# re-evaluation at the low cadence forever. After this many parked re-evals with
+# no resolution and no provably-dead foundation, the dependent reaches a bounded
+# TERMINAL (CANCELLED) outcome instead of parking forever. The legitimate
+# "foundation might still appear" case keeps its resume behavior within the
+# bound — only an exhausted, never-satisfiable need terminates.
+_BLOCKED_PARKED_REEVAL_CAP = 4
 # A no-dependency agent/lifecycle blocker is often a TRANSIENT infra failure
 # (orchestrator ./pr open 5xx, git push stale-lease) that clears on its own, but
 # can also be a durable precondition (missing base branch/file). We can't tell
@@ -856,6 +865,137 @@ async def _fetch_completed_candidates(session, project_id) -> list:
     )
 
 
+async def _fetch_dead_candidates(session, project_id) -> list:
+    """Terminally failed/cancelled tasks — foundations that have definitively DIED.
+
+    Statuses mirror ``blocked_need_resolution.TERMINAL_CANDIDATE_STATUSES``: a
+    blocked dependent whose named foundation reached one of these states will
+    never be satisfied by it, so the dependent is terminated (CANCELLED) rather
+    than parked to re-arm forever.
+    """
+    from app.blocked_need_resolution import TERMINAL_CANDIDATE_STATUSES
+
+    dead = [TaskStatus(s) for s in TERMINAL_CANDIDATE_STATUSES]
+    return (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.status.in_(dead),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def _cancel_blocker_as_dead(
+    task, session, *, detail: str, message: str, pending_broadcasts: list
+) -> None:
+    """Terminally CANCEL a blocked dependent that can provably never resume.
+
+    Mirrors the dispatch-time cascade-cancel of an edged dead dependency
+    (``orchestrator._cascade_cancel_dependent`` sets CANCELLED): a needed-but-
+    never-edged foundation that has definitively FAILED/CANCELLED — or a need that
+    has outlived its bounded parked re-evaluations without ever becoming
+    satisfiable — makes this work impossible. Raises ONE deduplicated operator
+    alert (so the auto-cancel is visible) and clears the blocker metadata.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.alert_dispatch import _maybe_create_blocked_escalation_alert
+
+    await _maybe_create_blocked_escalation_alert(
+        task,
+        session,
+        blocker_kind=task.blocker_kind or "upstream dependency",
+        detail=detail,
+    )
+    _clear_blocked_fields(task, preserve_first_blocked=False)
+    task.status = TaskStatus.CANCELLED
+    task.latest_status_message = message
+    flag_modified(task, "context")
+    session.add(task)
+    pending_broadcasts.append(
+        (
+            str(task.project_id),
+            {"task_id": str(task.id), "status": "CANCELLED", "message": message},
+        )
+    )
+
+
+async def _maybe_cancel_unresumable_blocker(
+    task, ctx, session, *, dead_cache: dict, pending_broadcasts: list, parked: bool
+) -> bool:
+    """Terminate a blocker that can provably never resume; else no-op.
+
+    Two unresumable cases (the legitimate foundation-might-still-appear case is
+    left untouched — it keeps parking/resuming as before):
+
+      1. The need names a foundation that has reached a terminal FAILED/CANCELLED
+         state. It matches neither the active nor the completed candidate set, so
+         it can never be satisfied — cancel the dependent the same way the dispatch
+         path cascade-cancels an edged dead dependency, promptly (not only once
+         parked).
+      2. (parked only) The need has outlived ``_BLOCKED_PARKED_REEVAL_CAP`` parked
+         re-evaluations without ever becoming satisfiable — cancel rather than
+         re-arm the parked re-evaluation forever.
+
+    Returns ``True`` when the task was cancelled (caller should ``continue``);
+    ``False`` (only a bumped re-eval counter in the parked case) otherwise, so the
+    caller's existing park/recheck logic runs unchanged.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.task_blocked import get_blocker_metadata
+    from app.blocked_need_resolution import need_matched_dead_foundation
+
+    need = get_blocker_metadata(task).get("need")
+    # Only the missing-edge need case — an edged dead dependency is already
+    # handled by the dispatch cascade-cancel / "dead" precondition state.
+    if not isinstance(need, dict) or task.depends_on:
+        return False
+
+    dead = dead_cache.get(task.project_id)
+    if dead is None:
+        dead = await _fetch_dead_candidates(session, task.project_id)
+        dead_cache[task.project_id] = dead
+    if need_matched_dead_foundation(task, need, dead):
+        await _cancel_blocker_as_dead(
+            task,
+            session,
+            detail=(
+                "Needed foundation has terminally failed or was cancelled — this "
+                "task can never run as-is. Auto-cancelled (re-scope, re-point the "
+                "need, or recreate the foundation to retry)."
+            ),
+            message="Cancelled — needed foundation terminally failed/cancelled",
+            pending_broadcasts=pending_broadcasts,
+        )
+        return True
+
+    if not parked:
+        return False
+
+    reevals = int(ctx.get("_blocked_parked_reevals", 0)) + 1
+    if reevals >= _BLOCKED_PARKED_REEVAL_CAP:
+        await _cancel_blocker_as_dead(
+            task,
+            session,
+            detail=(
+                f"Blocked need was never satisfiable after {reevals} parked "
+                "re-evaluations — no task ever provided it. Auto-cancelled "
+                "(re-scope or re-point the need to retry)."
+            ),
+            message="Cancelled — blocked need never became satisfiable",
+            pending_broadcasts=pending_broadcasts,
+        )
+        return True
+    ctx["_blocked_parked_reevals"] = reevals
+    task.context = ctx
+    flag_modified(task, "context")
+    return False
+
+
 async def _maybe_resume_parked_blocker(
     task,
     ctx,
@@ -990,6 +1130,10 @@ async def sweep_unblock_blocked_tasks(
     # blocker's need may now be satisfied by already-merged/shipped work.
     candidate_cache: dict = {}
     completed_cache: dict = {}
+    # Terminally-dead foundations (FAILED/CANCELLED): a needed-but-never-edged
+    # foundation that has definitively died makes its dependent impossible — it is
+    # cancelled rather than parked to re-arm forever.
+    dead_cache: dict = {}
 
     async def _escalate_blocked_task(
         task,
@@ -1045,6 +1189,22 @@ async def sweep_unblock_blocked_tasks(
                 pending_broadcasts=pending_broadcasts,
             ):
                 requeued += 1
+                changed = True
+                continue
+            # Not resumable by an in-flight/landed foundation. Before re-parking,
+            # check whether the dependent can provably NEVER resume — its named
+            # foundation has terminally died, or its need has outlived the bounded
+            # parked re-evaluations without ever becoming satisfiable — and if so
+            # terminate it (CANCELLED) instead of re-arming the parked re-eval
+            # forever.
+            if await _maybe_cancel_unresumable_blocker(
+                task,
+                ctx,
+                session,
+                dead_cache=dead_cache,
+                pending_broadcasts=pending_broadcasts,
+                parked=True,
+            ):
                 changed = True
                 continue
             # Not resumable — re-park without re-alerting. A blocker that still
@@ -1130,6 +1290,22 @@ async def sweep_unblock_blocked_tasks(
                     )
                 )
                 continue
+
+        # Foundation definitively DIED before an edge was wired: a need naming a
+        # task/PR now in a terminal failed/cancelled state can never be satisfied
+        # (it matches neither the active nor the completed set). Cancel the
+        # dependent the same way the dispatch path cascade-cancels an edged dead
+        # dependency, rather than letting it park and re-arm forever.
+        if await _maybe_cancel_unresumable_blocker(
+            task,
+            ctx,
+            session,
+            dead_cache=dead_cache,
+            pending_broadcasts=pending_broadcasts,
+            parked=False,
+        ):
+            changed = True
+            continue
 
         state = await _blocked_precondition_state(task, session, verify_pr_merged)
         if state == "clear":

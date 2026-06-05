@@ -43,6 +43,15 @@ ACTIVE_CANDIDATE_STATUSES = ("QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATIN
 # the work is already done — so resumption simply lets the task proceed.
 COMPLETED_CANDIDATE_STATUSES = ("COMPLETED",)
 
+# Statuses a foundation is in once it has definitively DIED. A blocked dependent
+# whose machine-resolvable need names a task now in one of these terminal states
+# will NEVER be satisfied by it — it matches neither the active nor the completed
+# set, so without this signal the parked re-evaluation re-arms forever (the
+# existing dead-dependency cascade only fires when a real depends_on edge already
+# exists). :func:`need_matched_dead_foundation` recognizes that provably-dead
+# case so the dependent can be terminated like an edged dead dependency.
+TERMINAL_CANDIDATE_STATUSES = ("FAILED", "CANCELLED")
+
 
 def _candidate_pr_number(candidate: Task) -> Optional[int]:
     """Return the candidate's owned PR number from its leading payload, if any."""
@@ -161,6 +170,43 @@ def need_satisfied_by_completed(
     if not isinstance(need, dict):
         return False
     eligible = [c for c in completed_candidates if c.id != task.id]
+    return _match_need(need, eligible) is not None
+
+
+def need_matched_dead_foundation(
+    task: Task, need: Dict[str, Any], dead_candidates: List[Task]
+) -> bool:
+    """True if ``need`` names a foundation that has definitively FAILED/CANCELLED.
+
+    The live (active) and completed (merged) resolution paths only consider work
+    that may still land or already has; a parked blocker whose named foundation
+    has since reached a terminal failed/cancelled state matches NEITHER and would
+    re-arm forever. This recognizes that provably-dead case using the SAME exact
+    signals as the other paths (task id / PR number / explicit capability marker)
+    — never a fuzzy guess — so the legitimate "foundation might still appear" case
+    is untouched. ``dead_candidates`` is the pre-fetched set of same-project tasks
+    in :data:`TERMINAL_CANDIDATE_STATUSES`.
+
+    A requeue-replaced cancellation (``_replaced_by_task_id``) or a clean
+    "scope already covered" exit (``failure_category == SCOPE_EMPTY``) is NOT a
+    genuine death — the work either continues under a replacement clone or was a
+    deliberate no-op — so such candidates are excluded and never trigger a
+    termination.
+    """
+    if not isinstance(need, dict):
+        return False
+    from app.failure_classification import SCOPE_EMPTY
+
+    eligible = []
+    for c in dead_candidates:
+        if c.id == task.id:
+            continue
+        ctx = c.context or {}
+        if ctx.get("_replaced_by_task_id"):
+            continue
+        if ctx.get("failure_category") == SCOPE_EMPTY:
+            continue
+        eligible.append(c)
     return _match_need(need, eligible) is not None
 
 

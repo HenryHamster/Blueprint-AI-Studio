@@ -10,7 +10,8 @@ import { resolveBuildConfig } from '../build-config.js';
 import {
   detectTestRunners, detectAutoTestRunners, describeRunnerDirectory,
   detectAcceptanceProbes, classifyProbeOutcome, detectProvisioningSteps,
-  type BuildConfig, type TestRunner, type AcceptanceProbe,
+  discoverDocumentedCommands, runnerFromCommand, MAX_DOCUMENTED_COMMANDS,
+  type BuildConfig, type TestRunner, type AcceptanceProbe, type DocumentedCommand,
 } from '../utils/test-runners.js';
 import { testFixLoop } from '../utils/test-fix-loop.js';
 
@@ -81,6 +82,28 @@ interface VerifyTestsResult {
     // operator's authoritative build) rather than a generic ecosystem compile
     // check. The backend surfaces declared-vs-generic wording from this flag.
     declared?: boolean;
+  };
+  // Diff-aware probe of commands the PR INTRODUCES or DOCUMENTS — a newly added
+  // package.json script, a newly added Makefile/justfile/Taskfile target, a
+  // declared console-script entrypoint, or an allowlisted command in a touched
+  // README/docs usage block. Runs REGARDLESS of whether a unit suite was
+  // detected (a documented command must be exercised even when the repo already
+  // has a passing suite). Mirrors the ``probe`` block shape so the backend can
+  // reuse the SAME clear-failure detection (ran && !could_not_run && !passed).
+  // ADDITIVE + CONSERVATIVE: absent when the diff introduces/documents nothing
+  // runnable, when the base ref is unavailable / the diff can't be computed
+  // (degrade to could-not-run fall-open → field omitted), and on every
+  // setup-failure FAILED path. A clean command failure → outcome 'fail' (block);
+  // a missing tool/dep/unprovisioned setup / spawn / timeout → 'could_not_run'
+  // (fall-open); success → 'pass'. An older backend that ignores it sees
+  // byte-for-byte today's gate.
+  documentedCommands?: {
+    ran: boolean;
+    outcome: 'pass' | 'fail' | 'could_not_run';
+    passed: boolean;
+    could_not_run: boolean;
+    output: string;
+    label: string;
   };
 }
 
@@ -218,6 +241,140 @@ async function attachAcceptanceProbe(
     note = `Acceptance probe could not run (${probe.ecosystem}: ${probe.label}) — missing deps / unprovisioned setup; falling open without a probe block.`;
   }
   return { ...base, probe, output: [base.output, note].filter(Boolean).join('\n') };
+}
+
+// ── Diff-aware documented / PR-introduced command probe ──────────────────────
+// Cap on commands actually RUN (the discovery layer is already bounded to the
+// same constant). Each runs ONCE under a bounded timeout, no retries.
+const MAX_DOCUMENTED_COMMAND_RUNS = MAX_DOCUMENTED_COMMANDS;
+
+// Compute the PR head's changed files + added lines against its base, discover
+// the small allowlisted set of commands the PR INTRODUCES/DOCUMENTS, run each
+// under a bounded timeout, and reduce to a single verdict mirroring the
+// acceptance-probe block (fail-fast: a clean command FAILURE blocks; otherwise a
+// PASS wins over a could-not-run; all-could-not-run degrades to could_not_run).
+// Returns undefined when there is nothing to run (no discovered command) or the
+// diff cannot be computed (base ref unavailable) — the field is then simply
+// absent and the gate is byte-for-byte unchanged.
+async function runDocumentedCommandsProbe(
+  ws: WebSocket | null,
+  baseBranch: string,
+): Promise<VerifyTestsResult['documentedCommands']> {
+  // Three-dot diff uses the merge-base, so only the PR's own additions count. If
+  // the base ref is unavailable or the diff can't be computed, degrade silently.
+  const baseRef = `origin/${baseBranch}`;
+  let changedFiles: string[];
+  let addedLines: string[];
+  const addedLinesByFile: Record<string, string[]> = {};
+  try {
+    const namesOut = await execFileAsync('git', ['diff', '--name-only', `${baseRef}...HEAD`], { cwd: WORKSPACE, timeoutMs: GENERIC_PROBE_TIMEOUT });
+    changedFiles = namesOut.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    const diffOut = await execFileAsync('git', ['diff', '--unified=0', `${baseRef}...HEAD`], { cwd: WORKSPACE, timeoutMs: GENERIC_PROBE_TIMEOUT });
+    addedLines = [];
+    // Attribute each added (``+``) line to the file its hunk belongs to, tracked
+    // by the ``+++ b/<path>`` header, so discovery can judge "newly introduced"
+    // per-manifest rather than against the whole PR's added lines.
+    let currentFile: string | null = null;
+    for (const raw of diffOut.split(/\r?\n/)) {
+      const header = raw.match(/^\+\+\+ (?:b\/)?(.+)$/);
+      if (header) {
+        const path = header[1].trim();
+        currentFile = path === '/dev/null' ? null : path;
+        continue;
+      }
+      if (!raw.startsWith('+') || raw.startsWith('+++')) continue;
+      const line = raw.slice(1).trim();
+      if (!line) continue;
+      addedLines.push(line);
+      if (currentFile) (addedLinesByFile[currentFile] ??= []).push(line);
+    }
+  } catch {
+    sendLog(ws, `Documented-command probe: could not compute PR diff against ${baseRef} — skipping (fall-open).\n`);
+    return undefined;
+  }
+  if (changedFiles.length === 0) return undefined;
+
+  const readFile = (relPath: string): string | null => {
+    try { return fs.readFileSync(`${WORKSPACE}/${relPath}`, 'utf-8'); } catch { return null; }
+  };
+  const discovered = discoverDocumentedCommands({
+    changedFiles, addedLines, addedLinesByFile, readFile, workspace: WORKSPACE, max: MAX_DOCUMENTED_COMMAND_RUNS,
+  });
+  if (discovered.length === 0) {
+    sendLog(ws, 'Documented-command probe: PR introduces/documents no runnable command — skipping.\n');
+    return undefined;
+  }
+
+  sendLog(ws, `Documented-command probe: running ${discovered.length} PR-introduced/documented command(s): ${discovered.map(d => d.label).join(', ')}\n`);
+
+  let firstPass: DocumentedCommand | null = null;
+  let firstCouldNotRun: DocumentedCommand | null = null;
+  for (const cmd of discovered) {
+    const runner = runnerFromCommand(cmd.command, cmd.cwd);
+    const timeoutMs = cmd.heavy ? DECLARED_BUILD_TIMEOUT : GENERIC_PROBE_TIMEOUT;
+    let outcome: 'pass' | 'fail' | 'could_not_run';
+    let output = '';
+    try {
+      await execFileAsync(runner.cmd, runner.args, { cwd: runner.cwd, timeoutMs });
+      outcome = 'pass';
+    } catch (err: unknown) {
+      const e = err as Error & { stdout?: string; stderr?: string; code?: string; status?: number | null };
+      output = [e.stdout, e.stderr, e.message].filter(Boolean).join('\n');
+      // Documented/introduced commands are classified authoritatively (like a
+      // declared build): a CLEAN non-zero exit is a real FAILURE; a missing
+      // tool/dep/unprovisioned-setup or spawn/timeout degrades to could_not_run.
+      outcome = classifyProbeOutcome(output, e, true);
+    }
+    sendLog(ws, `Documented-command probe [${cmd.label}]: ${outcome}\n`);
+    if (outcome === 'fail') {
+      return {
+        ran: true, outcome: 'fail', passed: false, could_not_run: false,
+        output: output.slice(-VERIFY_TESTS_OUTPUT_LIMIT),
+        label: `PR-introduced command failed: ${cmd.label}`,
+      };
+    }
+    if (outcome === 'pass' && firstPass === null) firstPass = cmd;
+    if (outcome === 'could_not_run' && firstCouldNotRun === null) firstCouldNotRun = cmd;
+  }
+  if (firstPass !== null) {
+    return {
+      ran: true, outcome: 'pass', passed: true, could_not_run: false,
+      output: '', label: `PR-introduced command passed: ${firstPass.label}`,
+    };
+  }
+  const cnr = firstCouldNotRun as DocumentedCommand;
+  return {
+    ran: true, outcome: 'could_not_run', passed: false, could_not_run: true,
+    output: '', label: `PR-introduced command could not run: ${cnr.label}`,
+  };
+}
+
+// Run the documented-command probe and fold its verdict into a result. A clear
+// FAIL carries documentedCommands.passed=false (the backend flips this to a
+// merge block); pass / could-not-run leave the result intact, annotating output
+// for the operator. NEVER throws — any error degrades to the unchanged result.
+async function attachDocumentedCommandsProbe(
+  ws: WebSocket | null,
+  base: VerifyTestsResult,
+  baseBranch: string,
+): Promise<VerifyTestsResult> {
+  let block: VerifyTestsResult['documentedCommands'];
+  try {
+    block = await runDocumentedCommandsProbe(ws, baseBranch);
+  } catch (e) {
+    sendLog(ws, `Documented-command probe errored — skipping (fall-open): ${e instanceof Error ? e.message : String(e)}\n`);
+    return base;
+  }
+  if (!block) return base;
+  let note: string;
+  if (block.outcome === 'fail') {
+    note = `Documented/PR-introduced command probe FAILED — ${block.label}; blocking the merge.`;
+  } else if (block.outcome === 'pass') {
+    note = `Documented/PR-introduced command probe passed — ${block.label} (cheap goal-level signal).`;
+  } else {
+    note = `Documented/PR-introduced command probe could not run — ${block.label}; falling open without a block.`;
+  }
+  return { ...base, documentedCommands: block, output: [base.output, note].filter(Boolean).join('\n') };
 }
 
 // ── Stale-command self-heal ──────────────────────────────────────────────────
@@ -530,6 +687,13 @@ export async function handleVerifyTests(
       };
     }
   }
+
+  // Diff-aware probe of commands the PR INTRODUCES or DOCUMENTS. Runs on the
+  // COMPLETED path REGARDLESS of whether a unit suite was detected (the early
+  // setup-failure FAILED paths return above and are intentionally skipped). It
+  // is additive: when nothing runnable is introduced/documented, or the base ref
+  // is unavailable, the field is simply absent and the verdict is unchanged.
+  result = await attachDocumentedCommandsProbe(ws, result, baseBranch);
 
   // Write the result file (parity with smoketest's /tmp result file — useful
   // for operator inspection); the authoritative copy is the artifact logs.

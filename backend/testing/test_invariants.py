@@ -8323,7 +8323,8 @@ class TestAgentTestRunnerParseHelpers:
 # Canonical set of fall-open reason keys, with their emit sites:
 #   internal_staging_base / kill_switch_off / no_detectable_test_command /
 #   verify_setup_failed        -> app/orchestrator.py no-CI gate
-#   undetected_runtime / suite_all_skipped / probe_passed / probe_could_not_run
+#   undetected_runtime / suite_all_skipped / probe_passed / probe_could_not_run /
+#   documented_command_could_not_run / documented_command_passed
 #                              -> ci_resolution.classify_unverified_fall_open_reason
 _UNVERIFIED_REASON_KEYS = frozenset(
     {
@@ -8335,6 +8336,8 @@ _UNVERIFIED_REASON_KEYS = frozenset(
         "verify_setup_failed",
         "probe_passed",
         "probe_could_not_run",
+        "documented_command_could_not_run",
+        "documented_command_passed",
     }
 )
 

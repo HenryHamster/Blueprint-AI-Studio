@@ -8,6 +8,7 @@ covered separately in ``test_reaper.py``.
 import uuid
 
 from app.blocked_need_resolution import (
+    need_matched_dead_foundation,
     need_satisfied_by_completed,
     resolve_blocked_need,
 )
@@ -187,3 +188,60 @@ def test_completed_need_never_self_satisfies():
     need = {"kind": "task", "ref": str(blocked.id)}
     # The blocked task itself, even if somehow in the completed set, is excluded.
     assert need_satisfied_by_completed(blocked, need, [blocked]) is False
+
+
+# ── need_matched_dead_foundation (provably-dead foundation) ───────────────────
+
+def test_dead_task_need_matches_failed_foundation():
+    dead = _task(status=TaskStatus.FAILED)
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": str(dead.id)}
+    assert need_matched_dead_foundation(blocked, need, [dead]) is True
+
+
+def test_dead_pr_need_matches_cancelled_owning_task():
+    dead = _task(
+        status=TaskStatus.CANCELLED, payloads=[{"type": "fix", "pr_number": 8200}]
+    )
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "pr", "ref": "8200"}
+    assert need_matched_dead_foundation(blocked, need, [dead]) is True
+
+
+def test_dead_match_returns_false_when_no_terminal_candidate():
+    dead = _task(status=TaskStatus.CANCELLED)
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": str(uuid.uuid4())}
+    assert need_matched_dead_foundation(blocked, need, [dead]) is False
+    # Malformed / empty inputs are conservatively unmatched.
+    assert need_matched_dead_foundation(blocked, {}, [dead]) is False
+    assert need_matched_dead_foundation(blocked, need, []) is False
+
+
+def test_dead_match_excludes_requeue_replaced_cancellation():
+    # A CANCELLED foundation that was requeue-replaced is NOT genuinely dead —
+    # its work continues under the replacement clone, so it must not terminate.
+    dead = _task(
+        status=TaskStatus.CANCELLED,
+        context={"_replaced_by_task_id": str(uuid.uuid4())},
+    )
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": str(dead.id)}
+    assert need_matched_dead_foundation(blocked, need, [dead]) is False
+
+
+def test_dead_match_excludes_scope_empty_clean_exit():
+    # A SCOPE_EMPTY exit is a deliberate "scope already covered" no-op, not a
+    # defect, so it must not trigger a dead-foundation termination.
+    dead = _task(
+        status=TaskStatus.CANCELLED, context={"failure_category": "SCOPE_EMPTY"}
+    )
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": str(dead.id)}
+    assert need_matched_dead_foundation(blocked, need, [dead]) is False
+
+
+def test_dead_match_never_self_matches():
+    blocked = _task(status=TaskStatus.FAILED)
+    need = {"kind": "task", "ref": str(blocked.id)}
+    assert need_matched_dead_foundation(blocked, need, [blocked]) is False

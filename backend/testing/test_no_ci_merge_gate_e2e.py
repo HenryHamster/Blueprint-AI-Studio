@@ -1008,6 +1008,200 @@ async def test_no_ci_probe_could_not_run_falls_open_with_distinct_reason(
 
 
 # ---------------------------------------------------------------------------
+# 3c. Documented / PR-introduced command probe gates the merge as a distinct
+#     claim — it runs REGARDLESS of whether a unit suite ran.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_no_ci_documented_command_failure_blocks_merge_even_with_passing_suite(
+    db_session, mocker
+):
+    """A command the PR INTRODUCES/DOCUMENTS that clearly fails must BLOCK the
+    merge and spawn a fix carrying its output — EVEN WHEN a unit suite was
+    detected and passed, because the documented command is a distinct claim."""
+    _patch_github(mocker)
+    merge_mock = mocker.patch("app.github.merge_pull_request", return_value=None)
+
+    project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    verify_task, was_created = await _spawn_pipeline_task(
+        parent, "verify_tests", db_session, PR_NUMBER, BRANCH, BASE,
+        original_task_id=str(parent.id), suppress_warm_handoff=True,
+    )
+    assert was_created is True
+
+    # Agent verdict: the unit suite was detected AND passed, but a newly added
+    # package.json script the PR documents fails — a clear FAIL that must still
+    # block, since the documented command is a separate claim.
+    documented_output = (
+        "> widget@1.0.0 lint\n> eslint .\n\n"
+        "/widget/src/index.ts\n  3:1  error  'x' is not defined  no-undef\n"
+        "1 problem (1 error, 0 warnings)"
+    )
+    await _plant_verdict(
+        db_session, verify_task,
+        {
+            "detected": True,
+            "passed": True,
+            "tests": [{"name": "tests/test_ok.py::test_pass", "passed": True}],
+            "output": "All unit tests passed.",
+            "documentedCommands": {
+                "ran": True,
+                "outcome": "fail",
+                "passed": False,
+                "could_not_run": False,
+                "output": documented_output,
+                "label": "npm run lint",
+            },
+        },
+    )
+
+    verdict = await _latest_artifact_logs(
+        db_session, verify_task.id, ArtifactType.MERGE_TEST_RESULT
+    )
+    outcome, detail = classify_merge_test_verdict(verdict)
+    assert outcome == "fail", "a documented-command failure blocks even when the suite passed"
+    assert "no-undef" in detail
+    assert "npm run lint" in detail
+
+    ci_result = build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "failure"
+    assert "no-undef" in ci_result["failed_logs"]
+
+    parent = await db_session.get(Task, parent.id)
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    merge_mock.assert_not_called()  # the documented-command failure blocked merge
+
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars().all()
+    )
+    fix_tasks = [t for t in all_tasks if t.first_payload.get("type") == "fix"]
+    assert len(fix_tasks) == 1, "a documented-command failure must spawn one fix task"
+    assert "no-undef" in fix_tasks[0].context["ci_failure_logs"]
+
+    await db_session.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED
+
+    # A real execution signal (a failing documented command) ran to a FAIL verdict.
+    await _record_gate_runtime(
+        db_session, project, outcome=outcome, unverified_reason=None
+    )
+    runtime = merge_gate_runtime_block(project)
+    assert runtime["executed_real_tests"] is True
+
+
+@pytest.mark.asyncio
+async def test_no_ci_documented_command_passing_proceeds_to_merge(db_session, mocker):
+    """A documented command that PASSES does not block — the merge proceeds. With
+    no unit suite, the documented command is the positive execution evidence, so
+    the fall-open reason is the distinct ``documented_command_passed``."""
+    _patch_github(mocker)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", return_value={"merged": True}
+    )
+
+    pass_verdict = {
+        "detected": False,
+        "noTestsReason": "no_suite",
+        "documentedCommands": {
+            "ran": True,
+            "outcome": "pass",
+            "passed": True,
+            "could_not_run": False,
+            "output": "build succeeded",
+            "label": "make build",
+        },
+    }
+    outcome, detail = classify_merge_test_verdict(pass_verdict)
+    assert outcome == "undetected" and detail == ""
+    _, reason_key = classify_unverified_fall_open_reason(pass_verdict)
+    assert reason_key == "documented_command_passed"
+
+    ci_result = build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "success"
+
+    project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    parent = await db_session.get(Task, parent.id)
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    merge_mock.assert_called_once()  # a passing documented command does not block
+
+    await _record_gate_runtime(
+        db_session, project, outcome=outcome, unverified_reason=reason_key
+    )
+    runtime = merge_gate_runtime_block(project)
+    assert runtime["executed_real_tests"] is False
+    assert runtime["last_unverified_reason"] == "documented_command_passed"
+
+
+@pytest.mark.asyncio
+async def test_no_ci_documented_command_could_not_run_falls_open_with_distinct_reason(
+    db_session, mocker
+):
+    """A documented command that CANNOT RUN (missing deps / unprovisioned setup)
+    must NOT hard-block: the merge falls open UNVERIFIED ('undetected'), with the
+    distinct ``documented_command_could_not_run`` reason recorded so an operator
+    can see the claim went unverified."""
+    _patch_github(mocker)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", return_value={"merged": True}
+    )
+
+    cnr_verdict = {
+        "detected": False,
+        "noTestsReason": "no_suite",
+        "documentedCommands": {
+            "ran": True,
+            "outcome": "could_not_run",
+            "passed": False,
+            "could_not_run": True,
+            "output": "make: command not found",
+            "label": "make build",
+        },
+    }
+    outcome, detail = classify_merge_test_verdict(cnr_verdict)
+    assert outcome == "undetected" and detail == ""
+    _, reason_key = classify_unverified_fall_open_reason(cnr_verdict)
+    assert reason_key == "documented_command_could_not_run"
+
+    ci_result = build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "success"
+
+    project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    parent = await db_session.get(Task, parent.id)
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    merge_mock.assert_called_once()  # could-not-run does NOT block
+
+    await _record_gate_runtime(
+        db_session, project, outcome=outcome, unverified_reason=reason_key
+    )
+    runtime = merge_gate_runtime_block(project)
+    assert runtime["executed_real_tests"] is False
+    assert runtime["last_unverified_reason"] == "documented_command_could_not_run"
+
+
+# ---------------------------------------------------------------------------
 # 4. UNVERIFIED merge raises exactly one operator alert (and dedups on re-entry)
 # ---------------------------------------------------------------------------
 

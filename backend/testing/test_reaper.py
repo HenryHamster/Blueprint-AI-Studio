@@ -7118,6 +7118,7 @@ from app.reaper_sweeps import (  # noqa: E402
     _BLOCKED_ESCALATE_AFTER,
     _BLOCKED_ESCALATED_PARK,
     _BLOCKED_OPTIMISTIC_RETRY_CAP,
+    _BLOCKED_PARKED_REEVAL_CAP,
 )
 from app.time_utils import _utcnow  # noqa: E402
 
@@ -7509,6 +7510,131 @@ async def test_unblock_sweep_resumes_when_need_satisfied_by_completed_work(
     # Blocker metadata cleared on requeue.
     assert "blocker" not in (t.context or {})
     assert "completed work" in (t.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_cancels_when_needed_foundation_terminally_dead(
+    reaper_db, mocker
+):
+    """A blocked dependent whose need names a foundation that has reached a
+    terminal FAILED state — with no edge ever wired — can never resume. It is
+    cancelled the same way the dispatch path cascade-cancels an edged dead
+    dependency, rather than parking to re-arm forever."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    # The named foundation died before any depends_on edge was wired.
+    dead = Task(
+        project_id=project.id, title="dead-foundation", description="x",
+        status=TaskStatus.FAILED, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}], context={}, status_log=[],
+    )
+    reaper_db.add(dead)
+    await reaper_db.commit()
+    await reaper_db.refresh(dead)
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: waiting on foundation",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "foundation",
+                "reason": "BLOCKER: waiting on foundation",
+                "need": {"kind": "task", "ref": str(dead.id)},
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    # Bounded terminal outcome — not parked forever.
+    assert t.status == TaskStatus.CANCELLED
+    assert "terminally failed" in (t.latest_status_message or "").lower()
+    # Blocker metadata cleared on the terminal transition.
+    assert "blocker" not in (t.context or {})
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_cancels_never_provided_capability_after_reeval_cap(
+    reaper_db, mocker
+):
+    """A parked blocker whose capability need is never advertised by any task is
+    given a bounded number of parked re-evaluations, then terminated (CANCELLED)
+    instead of re-arming the low-cadence re-evaluation indefinitely."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    # Already parked (escalated), one re-eval short of the cap, and the capability
+    # has never been (and is not now) advertised by any task.
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: needs an auth subsystem",
+        depends_on=[],
+        blocked_at=now - timedelta(hours=30),
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "auth subsystem",
+                "reason": "BLOCKER: needs an auth subsystem",
+                "need": {"kind": "capability", "ref": "nonexistent-capability"},
+            },
+            "_blocked_escalated": True,
+            "_blocked_parked_reevals": _BLOCKED_PARKED_REEVAL_CAP - 1,
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.CANCELLED
+    assert "never became satisfiable" in (t.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_parked_capability_below_cap_stays_blocked(
+    reaper_db, mocker
+):
+    """The legitimate foundation-might-still-appear case is untouched: a parked
+    blocker with a not-yet-satisfiable need below the re-eval cap stays BLOCKED
+    (re-parked, re-eval counter bumped), it does NOT terminate early."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: needs an auth subsystem",
+        depends_on=[],
+        blocked_at=now - timedelta(hours=8),
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "auth subsystem",
+                "reason": "BLOCKER: needs an auth subsystem",
+                "need": {"kind": "capability", "ref": "nonexistent-capability"},
+            },
+            "_blocked_escalated": True,
+            "_blocked_parked_reevals": 0,
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    # Re-eval counter advanced toward the cap; task re-parked, not terminated.
+    assert t.context.get("_blocked_parked_reevals") == 1
+    assert t.recheck_after is not None and t.recheck_after > now
 
 
 @pytest.mark.asyncio

@@ -21,6 +21,8 @@ export const UNVERIFIED_REASON_LABELS: Record<string, string> = {
   verify_setup_failed: 'the detected test suite exists but could not be run (setup/runner infrastructure failed after retries)',
   probe_passed: 'no unit suite ran; only a cheap acceptance probe (compile/build) passed — not real test verification',
   probe_could_not_run: 'no unit suite ran and the acceptance probe could not run (missing deps/unprovisioned setup)',
+  documented_command_could_not_run: 'a command the PR introduced/documented could not be run (missing deps/unprovisioned setup) -- claim unverified',
+  documented_command_passed: 'no unit suite ran; a command the PR introduced/documented was executed and passed',
 };
 
 /**

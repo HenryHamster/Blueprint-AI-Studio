@@ -91,7 +91,9 @@ describe('handleVerifyTests — dependency provisioning', () => {
 
     await handleVerifyTests('p1', payload, task, 'tok', 'o', 'r', null, { value: '' });
 
-    expect(callLog).toEqual(['exec:make', 'suite']);
+    // The documented-command probe appends git-diff calls on the COMPLETED
+    // path; filter them out — this test asserts provisioning precedes the suite.
+    expect(callLog.filter(c => !c.startsWith('exec:git'))).toEqual(['exec:make', 'suite']);
     expect(lastPostedPayload().status).toBe('COMPLETED');
     expect(parsedVerdict().detected).toBe(true);
   });
@@ -146,7 +148,8 @@ describe('handleVerifyTests — dependency provisioning', () => {
 
     await handleVerifyTests('p4', payload, task, 'tok', 'o', 'r', null, { value: '' });
 
-    expect(callLog).toEqual(['suite']);
+    // Filter out the documented-command probe's git-diff calls (COMPLETED path).
+    expect(callLog.filter(c => !c.startsWith('exec:git'))).toEqual(['suite']);
     expect(lastPostedPayload().status).toBe('COMPLETED');
   });
 });
