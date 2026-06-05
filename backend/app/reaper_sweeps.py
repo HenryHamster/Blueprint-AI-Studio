@@ -534,6 +534,20 @@ _BLOCKED_PARKED_REEVAL_CAP = 4
 # few wasted runs for auto-recovery instead of a multi-hour operator wedge.
 _BLOCKED_OPTIMISTIC_RETRY_CAP = 3
 
+# Durable context marker stamped on a blocked dependent that the resume system
+# terminally CANCELS because it can provably never resume. The terminal
+# transition clears all structured blocker metadata, so without this marker the
+# give-up is invisible in aggregate (only a free-text status message + one
+# deduplicated alert survive). The marker is queryable JSONB — no migration — and
+# feeds the fleet-wide unresumable-cancellation health signal
+# (``digest_metrics.compute_unresumable_cancellation_summary``). Observability
+# only: stamping it changes nothing about WHEN or WHETHER a dependent is
+# cancelled.
+UNRESUMABLE_CANCEL_CONTEXT_KEY = "_unresumable_cancellation"
+# Give-up classes — the two reasons a blocked dependent can provably never resume.
+GIVE_UP_FOUNDATION_DIED = "foundation_died"  # needed foundation reached terminal FAILED/CANCELLED
+GIVE_UP_NEVER_SATISFIABLE = "never_satisfiable"  # need outlived its bounded parked re-evals
+
 
 def _next_recheck_delay(attempts: int) -> timedelta:
     """Exponential backoff for the next recheck, capped at ``_BLOCKED_RECHECK_MAX``."""
@@ -703,45 +717,119 @@ async def _fetch_active_candidates(session, project_id) -> list:
     )
 
 
-async def _resolve_need_into_dep_edge(
-    task, ctx, session, *, candidate_cache: dict
-) -> bool:
-    """Turn a blocked task's machine-resolvable need into a real depends_on edge.
+async def _classify_blocker_needs(
+    task, session, *, candidate_cache: dict, completed_cache: dict, dead_cache: dict
+) -> dict:
+    """Classify EVERY recorded need of a blocked task against the live foundations.
 
-    Returns ``True`` when a foundation was matched and an edge wired (the caller
-    then requeues the task to QUEUED and SHORT-CIRCUITS the optimistic-retry /
-    escalate-and-park path). Returns ``False`` (no mutation) when the task has no
-    need, already carries a dependency edge, or no conservative match exists — so
-    the existing precondition machinery runs unchanged.
+    A blocked dependent can wait on MORE THAN ONE unresolved prerequisite (see
+    :func:`task_blocked.get_blocker_needs`). This evaluates each one against the
+    active / completed / dead candidate sets and returns a disposition dict:
+
+      ``had_needs``       — the task carried ≥1 machine-resolvable need
+      ``edges``           — foundation ids to wire (need → active in-flight task)
+      ``completed_needs`` — needs satisfied by already-completed/merged work
+      ``residual``        — needs not yet accounted for (no foundation matches)
+      ``dead``            — ≥1 need names a terminally FAILED/CANCELLED foundation
+
+    Resolution per need is active → completed → dead → residual, mirroring the
+    single-need ordering. Reuses the shared conservative predicates in
+    :mod:`app.blocked_need_resolution` (no parallel matcher); candidate sets are
+    fetched lazily and cached per project across the sweep batch. A foundation
+    already present in ``task.depends_on`` is treated as already-wired (it is not
+    re-added to ``edges``), so a partially-resolved blocker keeps converging.
     """
-    from app.task_blocked import get_blocker_metadata
-    from app.blocked_need_resolution import resolve_blocked_need
+    from app.task_blocked import get_blocker_needs
+    from app.blocked_need_resolution import (
+        resolve_blocked_need,
+        completed_foundation_for_need,
+        need_matched_dead_foundation,
+    )
 
-    # Only attempt resolution for a need with NO existing edge: a task that
-    # already depends on something is carried by the structural-wait path.
-    if task.depends_on:
-        return False
-    need = get_blocker_metadata(task).get("need")
-    if not isinstance(need, dict):
-        return False
+    needs = get_blocker_needs(task)
+    disp = {
+        "had_needs": bool(needs),
+        "edges": [],
+        "completed_needs": [],
+        "residual": [],
+        "dead": False,
+        # The first need that matched a terminally-dead foundation, recorded so the
+        # foundation-died cancel can stamp it into the unresumable marker.
+        "dead_need": None,
+    }
+    if not needs:
+        return disp
 
-    candidates = candidate_cache.get(task.project_id)
-    if candidates is None:
-        candidates = await _fetch_active_candidates(session, task.project_id)
-        candidate_cache[task.project_id] = candidates
+    active = candidate_cache.get(task.project_id)
+    if active is None:
+        active = await _fetch_active_candidates(session, task.project_id)
+        candidate_cache[task.project_id] = active
+    completed = completed_cache.get(task.project_id)
+    if completed is None:
+        completed = await _fetch_completed_candidates(session, task.project_id)
+        completed_cache[task.project_id] = completed
+    dead = dead_cache.get(task.project_id)
+    if dead is None:
+        dead = await _fetch_dead_candidates(session, task.project_id)
+        dead_cache[task.project_id] = dead
 
-    match = resolve_blocked_need(task, need, candidates)
-    if match is None:
-        return False
+    existing_edges = {str(d) for d in (task.depends_on or [])}
+    for need in needs:
+        match = resolve_blocked_need(task, need, active)
+        if match is not None:
+            match_id = str(match.id)
+            if match_id not in existing_edges and match_id not in disp["edges"]:
+                disp["edges"].append(match_id)
+            continue
+        if completed_foundation_for_need(task, need, completed) is not None:
+            disp["completed_needs"].append(need)
+            continue
+        if need_matched_dead_foundation(task, need, dead):
+            disp["dead"] = True
+            if disp["dead_need"] is None:
+                disp["dead_need"] = need
+            continue
+        disp["residual"].append(need)
+    return disp
 
-    # Idempotently add the foundation as a dependency. Full-list reassignment so
-    # SQLAlchemy observes the JSONB change (flag_modified is applied by callers).
-    match_id = str(match.id)
+
+def _wire_edges(task, edge_ids: list) -> bool:
+    """Idempotently append ``edge_ids`` to ``task.depends_on``. Returns True if any
+    edge was newly added. Full-list reassignment so SQLAlchemy observes the JSONB
+    change (``flag_modified`` is applied by callers)."""
     existing = [str(d) for d in (task.depends_on or [])]
-    if match_id not in existing:
-        task.depends_on = existing + [match_id]
-    remember_structural_depends_on(task, match_id)
-    return True
+    added = False
+    for match_id in edge_ids:
+        if match_id not in existing:
+            existing.append(match_id)
+            remember_structural_depends_on(task, match_id)
+            added = True
+    if added:
+        task.depends_on = existing
+    return added
+
+
+def _persist_residual_needs(task, residual: list) -> None:
+    """Re-persist only the still-unsatisfied needs back into the blocker metadata.
+
+    Drops needs resolved this round (wired into an edge or satisfied by completed
+    work) and keeps only ``residual``, recomputing the legacy single ``need``
+    mirror = ``residual[0]``. The blocker record is NOT cleared — the task stays
+    BLOCKED on the remaining needs so the next tick re-evaluates only those.
+    ``residual`` MUST be non-empty (the all-accounted path clears the blocker
+    instead).
+    """
+    from app.task_blocked import BLOCKER_CONTEXT_KEY
+
+    ctx = dict(task.context or {})
+    meta = ctx.get(BLOCKER_CONTEXT_KEY)
+    if not isinstance(meta, dict):
+        return
+    meta = dict(meta)
+    meta["needs"] = list(residual)
+    meta["need"] = residual[0]
+    ctx[BLOCKER_CONTEXT_KEY] = meta
+    task.context = ctx
 
 
 async def sweep_converge_duplicate_foundations(session, now=None) -> int:
@@ -925,7 +1013,14 @@ async def _fetch_dead_candidates(session, project_id) -> list:
 
 
 async def _cancel_blocker_as_dead(
-    task, session, *, detail: str, message: str, pending_broadcasts: list
+    task,
+    session,
+    *,
+    detail: str,
+    message: str,
+    pending_broadcasts: list,
+    give_up_class: str,
+    need=None,
 ) -> None:
     """Terminally CANCEL a blocked dependent that can provably never resume.
 
@@ -935,6 +1030,12 @@ async def _cancel_blocker_as_dead(
     has outlived its bounded parked re-evaluations without ever becoming
     satisfiable — makes this work impossible. Raises ONE deduplicated operator
     alert (so the auto-cancel is visible) and clears the blocker metadata.
+
+    Stamps a durable ``UNRESUMABLE_CANCEL_CONTEXT_KEY`` marker recording the
+    ``give_up_class`` (foundation-died vs never-satisfiable), the unresolved
+    ``need``, and the originating direction, so this terminal give-up is queryable
+    and countable fleet-wide (the structured blocker metadata is otherwise cleared
+    by ``_clear_blocked_fields`` on the same transition). Observability only.
     """
     from sqlalchemy.orm.attributes import flag_modified
     from app.alert_dispatch import _maybe_create_blocked_escalation_alert
@@ -945,7 +1046,18 @@ async def _cancel_blocker_as_dead(
         blocker_kind=task.blocker_kind or "upstream dependency",
         detail=detail,
     )
+    # Capture the originating direction before _clear_blocked_fields runs (it
+    # preserves direction_id, but read defensively in case that changes).
+    direction_id = (task.context or {}).get("direction_id")
     _clear_blocked_fields(task, preserve_first_blocked=False)
+    ctx = task.context or {}
+    ctx[UNRESUMABLE_CANCEL_CONTEXT_KEY] = {
+        "give_up_class": give_up_class,
+        "need": need if isinstance(need, dict) else None,
+        "direction_id": direction_id,
+        "at": _utcnow().isoformat(),
+    }
+    task.context = ctx
     task.status = TaskStatus.CANCELLED
     task.latest_status_message = message
     flag_modified(task, "context")
@@ -958,166 +1070,208 @@ async def _cancel_blocker_as_dead(
     )
 
 
-async def _maybe_cancel_unresumable_blocker(
-    task, ctx, session, *, dead_cache: dict, pending_broadcasts: list, parked: bool
-) -> bool:
-    """Terminate a blocker that can provably never resume; else no-op.
+async def _apply_needs_disposition(
+    task,
+    ctx,
+    session,
+    now,
+    disp,
+    *,
+    completed_cache: dict,
+    pending_broadcasts: list,
+    parked: bool,
+) -> str:
+    """Apply a multi-need classification (:func:`_classify_blocker_needs`).
 
-    Two unresumable cases (the legitimate foundation-might-still-appear case is
-    left untouched — it keeps parking/resuming as before):
+    A dependent is resumable to QUEUED ONLY when EVERY recorded need is accounted
+    for: an edge for each in-flight foundation, and no edge for a need already
+    satisfied by completed/merged work (verified base-safe). When only some needs
+    resolve, the resolvable edges are wired, the residual still-unsatisfied needs
+    are re-persisted, and the task stays BLOCKED so the next tick re-evaluates only
+    the remainder. If ANY need names a terminally dead foundation the dependent is
+    cancelled; the parked re-evaluation cap applies per the parked path.
 
-      1. The need names a foundation that has reached a terminal FAILED/CANCELLED
-         state. It matches neither the active nor the completed candidate set, so
-         it can never be satisfied — cancel the dependent the same way the dispatch
-         path cascade-cancels an edged dead dependency, promptly (not only once
-         parked).
-      2. (parked only) The need has outlived ``_BLOCKED_PARKED_REEVAL_CAP`` parked
-         re-evaluations without ever becoming satisfiable — cancel rather than
-         re-arm the parked re-evaluation forever.
-
-    Returns ``True`` when the task was cancelled (caller should ``continue``);
-    ``False`` (only a bumped re-eval counter in the parked case) otherwise, so the
-    caller's existing park/recheck logic runs unchanged.
+    Returns one of:
+      ``"resumed"``   — every need accounted for; task → QUEUED (caller counts it)
+      ``"cancelled"`` — a dead foundation, or the parked re-eval cap was exceeded
+      ``"held"``      — needs remain (partial / unsatisfiable / re-cut conflict);
+                        task stays BLOCKED, residual re-persisted, recheck re-armed
+      ``"escalate"``  — non-parked, residual needs remain, an edge is already wired
+                        and the escalation deadline has passed; caller escalates
+      ``"none"``      — non-parked, residual remains, no edge yet: caller falls
+                        through to the legacy precondition state machine
     """
     from sqlalchemy.orm.attributes import flag_modified
-    from app.task_blocked import get_blocker_metadata
-    from app.blocked_need_resolution import need_matched_dead_foundation
+    from app.alert_dispatch import _resolve_blocked_escalation_alert
 
-    need = get_blocker_metadata(task).get("need")
-    # Only the missing-edge need case — an edged dead dependency is already
-    # handled by the dispatch cascade-cancel / "dead" precondition state.
-    if not isinstance(need, dict) or task.depends_on:
-        return False
-
-    dead = dead_cache.get(task.project_id)
-    if dead is None:
-        dead = await _fetch_dead_candidates(session, task.project_id)
-        dead_cache[task.project_id] = dead
-    if need_matched_dead_foundation(task, need, dead):
+    # 1) ANY need names a terminally-dead foundation → cancel (both paths). A
+    #    single provably-dead foundation makes the dependent impossible regardless
+    #    of how the other needs resolve, mirroring the dispatch-time cascade.
+    if disp["dead"]:
         await _cancel_blocker_as_dead(
             task,
             session,
             detail=(
-                "Needed foundation has terminally failed or was cancelled — this "
+                "A needed foundation has terminally failed or was cancelled — this "
                 "task can never run as-is. Auto-cancelled (re-scope, re-point the "
                 "need, or recreate the foundation to retry)."
             ),
             message="Cancelled — needed foundation terminally failed/cancelled",
             pending_broadcasts=pending_broadcasts,
+            give_up_class=GIVE_UP_FOUNDATION_DIED,
+            need=disp.get("dead_need"),
         )
-        return True
+        return "cancelled"
 
-    if not parked:
-        return False
+    residual = list(disp["residual"])
+    edges = disp["edges"]
+    completed_needs = disp["completed_needs"]
 
-    reevals = int(ctx.get("_blocked_parked_reevals", 0)) + 1
-    if reevals >= _BLOCKED_PARKED_REEVAL_CAP:
-        await _cancel_blocker_as_dead(
-            task,
-            session,
-            detail=(
-                f"Blocked need was never satisfiable after {reevals} parked "
-                "re-evaluations — no task ever provided it. Auto-cancelled "
-                "(re-scope or re-point the need to retry)."
-            ),
-            message="Cancelled — blocked need never became satisfiable",
-            pending_broadcasts=pending_broadcasts,
-        )
-        return True
-    ctx["_blocked_parked_reevals"] = reevals
-    task.context = ctx
-    flag_modified(task, "context")
-    return False
-
-
-async def _maybe_resume_parked_blocker(
-    task,
-    ctx,
-    session,
-    now,
-    *,
-    candidate_cache: dict,
-    completed_cache: dict,
-    pending_broadcasts: list,
-) -> bool:
-    """Re-evaluate a PARKED (escalated) blocker against the live foundation set.
-
-    A parked blocker that carries a machine-resolvable need is rechecked at the
-    low parked cadence. If its need now resolves to an in-flight foundation, wire
-    a ``depends_on`` edge and requeue — the dispatch-time gate then holds the task
-    until the foundation lands. If the need is instead already satisfied by
-    completed/merged work, requeue with NO edge so the task simply proceeds. Either
-    way the parked/escalated state is cleared cleanly (so the task is no longer
-    counted as parked) and the stale 'permanently blocked' operator alert is
-    reconciled. Returns ``True`` when the task resumed.
-
-    Conservative by construction: only a task with a structured need and NO
-    existing dependency edge is considered, resolution uses the SAME exact-match
-    signal as the live need-resolution path (never a fuzzy guess), and resume
-    never re-escalates or re-alerts. Returns ``False`` (no mutation) otherwise, so
-    a need-less or still-unsatisfiable blocker stays parked for the operator.
-    """
-    from sqlalchemy.orm.attributes import flag_modified
-    from app.task_blocked import get_blocker_metadata
-    from app.blocked_need_resolution import need_satisfied_by_completed
-    from app.alert_dispatch import _resolve_blocked_escalation_alert
-
-    # Only resume the missing-edge case — a parked task that already carries an
-    # edge is a different (dead-dependency) failure mode left for the operator.
-    if task.depends_on:
-        return False
-    need = get_blocker_metadata(task).get("need")
-    if not isinstance(need, dict):
-        return False
-
-    # 1) In-flight foundation: wire the edge; the dispatch gate holds the task.
-    wired = await _resolve_need_into_dep_edge(
-        task, ctx, session, candidate_cache=candidate_cache
-    )
-    if wired:
-        message = "Resumed from parked — need resolved into dependency edge, requeued"
-    else:
-        # 2) Already satisfied by completed/merged work: requeue with NO edge.
+    # 2) Verify each completed foundation is base-safe BEFORE treating it as
+    #    accounted-for — on BOTH the partial- and full-resolution paths. A need
+    #    satisfied by ALREADY-completed work carries no edge, so the dispatch-time
+    #    re-cut (which only inspects edged candidates) can never fire for it; a
+    #    cross-base GENUINE code foundation must have the dependent's base re-cut
+    #    from integration first. _completed_foundation_base_safe performs that
+    #    re-cut as a side effect (idempotent; once per need this tick) and returns
+    #    False when a re-cut is required but conflicts / hits a transient error.
+    #    A need whose re-cut is not yet safe is held back in ``recut_pending`` so
+    #    it is re-checked next tick rather than dropped unverified — closing the
+    #    partial-resolution gap where a cross-base completed need silently vanished
+    #    and the dependent later resumed against a stale base. Such a need DID
+    #    match a foundation (it is mid-recut, not genuinely unprovided), so it must
+    #    always HOLD and must NOT fall through to the legacy precondition machine.
+    recut_pending: list = []
+    if completed_needs:
         completed = completed_cache.get(task.project_id)
         if completed is None:
             completed = await _fetch_completed_candidates(session, task.project_id)
             completed_cache[task.project_id] = completed
-        if not need_satisfied_by_completed(task, need, completed):
-            return False
-        # The completed foundation carries no edge, so the dispatch-time re-cut
-        # cannot fire. If it is a cross-base genuine code dependency, re-cut the
-        # base from integration BEFORE resuming; hold (stay parked) on conflict/
-        # error so we never resume against a base missing the landed code.
-        if not await _completed_foundation_base_safe(task, need, completed, session):
-            return False
-        message = "Resumed from parked — need satisfied by completed work, requeued"
+        base_safe: list = []
+        for need in completed_needs:
+            if await _completed_foundation_base_safe(task, need, completed, session):
+                base_safe.append(need)
+            else:
+                recut_pending.append(need)
+        completed_needs = base_safe
+        # base-safe REPLACES and COMMITS task.context with a fresh dict carrying
+        # the _recut_* escalation accounting on its False path; re-read the local
+        # ctx so the disposition branches below don't clobber that persisted state.
+        ctx = task.context or {}
 
-    # Clear parked/escalated state cleanly: _blocked_escalated, the structured
-    # blocker record (incl. its escalated flag), and recheck_after are all reset
-    # so the task is no longer counted as parked and never re-locked at the park
-    # horizon.
+    progressed = bool(edges) or bool(completed_needs)
+    # A still-unsatisfied need is either genuinely unprovided (``residual``) or a
+    # completed foundation mid-recut (``recut_pending``). Both are re-persisted as
+    # needs so the next tick re-evaluates them; only the all-accounted-for path
+    # (both empty) leaves BLOCKED.
+    unresolved = residual + recut_pending
+
+    # 3) Unresolved needs remain → cannot fully resume this tick.
+    if unresolved:
+        if progressed or recut_pending:
+            # Partial resolution (or a need mid-recut): wire the resolvable edges,
+            # drop the resolved (and base-safe-verified completed) needs, keep ONLY
+            # the unresolved set, and stay BLOCKED so the next tick re-evaluates the
+            # remainder. A recut_pending need ALWAYS holds here — it matched a
+            # foundation, so it must never fall through to the precondition machine.
+            # Progress resets the parked re-eval cap.
+            edged = _wire_edges(task, edges)
+            _persist_residual_needs(task, unresolved)
+            ctx = task.context or {}
+            if progressed:
+                ctx.pop("_blocked_parked_reevals", None)
+            attempts = int(ctx.get("_blocked_recheck_attempts", 0)) + 1
+            ctx["_blocked_recheck_attempts"] = attempts
+            task.context = ctx
+            flag_modified(task, "context")
+            if edged:
+                flag_modified(task, "depends_on")
+            task.recheck_after = now + (
+                _BLOCKED_PARKED_REEVAL_INTERVAL
+                if parked
+                else _next_recheck_delay(attempts)
+            )
+            session.add(task)
+            return "held"
+
+        # No need resolved this round (and none mid-recut).
+        if parked:
+            # Apply the per-need parked re-evaluation cap: cancel rather than
+            # re-arm a never-satisfiable parked blocker forever.
+            reevals = int(ctx.get("_blocked_parked_reevals", 0)) + 1
+            if reevals >= _BLOCKED_PARKED_REEVAL_CAP:
+                await _cancel_blocker_as_dead(
+                    task,
+                    session,
+                    detail=(
+                        f"Blocked need was never satisfiable after {reevals} parked "
+                        "re-evaluations — no task ever provided it. Auto-cancelled "
+                        "(re-scope or re-point the need to retry)."
+                    ),
+                    message="Cancelled — blocked need never became satisfiable",
+                    pending_broadcasts=pending_broadcasts,
+                    give_up_class=GIVE_UP_NEVER_SATISFIABLE,
+                    need=residual[0] if residual else None,
+                )
+                return "cancelled"
+            ctx["_blocked_parked_reevals"] = reevals
+            task.context = ctx
+            flag_modified(task, "context")
+            task.recheck_after = now + _BLOCKED_PARKED_REEVAL_INTERVAL
+            session.add(task)
+            return "held"
+
+        # Non-parked, no progress. With NO edge wired the task can safely fall
+        # through to the legacy precondition machine (optimistic retry / waiting /
+        # deadline escalation) exactly as a single unresolved need did before. But
+        # if an edge is ALREADY wired (a prerequisite resolved on an earlier tick)
+        # the task must NOT be resumed by that edge clearing while other needs are
+        # still missing — keep it BLOCKED, escalating only at the deadline.
+        if not (task.depends_on or []):
+            return "none"
+        if (
+            task.blocked_at is not None
+            and (now - task.blocked_at) >= _BLOCKED_ESCALATE_AFTER
+        ):
+            return "escalate"
+        attempts = int(ctx.get("_blocked_recheck_attempts", 0)) + 1
+        ctx["_blocked_recheck_attempts"] = attempts
+        task.context = ctx
+        flag_modified(task, "context")
+        task.recheck_after = now + _next_recheck_delay(attempts)
+        session.add(task)
+        return "held"
+
+    # 4) Nothing unresolved → every need is accounted for AND every completed
+    #    foundation was already verified base-safe in step 2 (a base-unsafe
+    #    completed need would have been captured in recut_pending above and held).
+    #    Wire any in-flight edges and resume.
+    edged = _wire_edges(task, edges)
     _clear_blocked_fields(task, preserve_first_blocked=False)
     task.status = TaskStatus.QUEUED
+    if edged:
+        message = "Unblocked — all needs resolved into dependency edges, requeued"
+    elif completed_needs:
+        message = "Unblocked — all needs satisfied by completed work, requeued"
+    else:
+        message = "Unblocked — all needs resolved, requeued"
     task.latest_status_message = message
     flag_modified(task, "context")
-    if wired:
+    if edged:
         flag_modified(task, "depends_on")
     session.add(task)
     pending_broadcasts.append(
         (
             str(task.project_id),
-            {
-                "task_id": str(task.id),
-                "status": "QUEUED",
-                "message": message,
-            },
+            {"task_id": str(task.id), "status": "QUEUED", "message": message},
         )
     )
-    # Reconcile the now-stale 'permanently blocked' operator alert. Best-effort:
-    # a reconcile failure must never abort the resume that triggered it.
-    with contextlib.suppress(Exception):
-        await _resolve_blocked_escalation_alert(task, session)
-    return True
+    # Reconcile the now-stale 'permanently blocked' operator alert when resuming a
+    # parked blocker. Best-effort: a reconcile failure must never abort the resume.
+    if parked:
+        with contextlib.suppress(Exception):
+            await _resolve_blocked_escalation_alert(task, session)
+    return "resumed"
 
 
 async def sweep_unblock_blocked_tasks(
@@ -1138,7 +1292,6 @@ async def sweep_unblock_blocked_tasks(
     from sqlalchemy.orm.attributes import flag_modified
     from app.alert_dispatch import _maybe_create_blocked_escalation_alert
     from app.broadcast import broadcast_to_project as _bcast
-    from app.task_blocked import get_blocker_metadata
 
     if verify_pr_merged is None:
         from app.rollup_pr_verification import _verify_pr_merged
@@ -1209,169 +1362,97 @@ async def sweep_unblock_blocked_tasks(
 
     for task in due:
         ctx = task.context or {}
+        # Multi-need classification (shared by the parked and live paths): a
+        # blocked dependent can wait on MORE THAN ONE prerequisite. Classify EVERY
+        # recorded need once against the live active / completed / dead foundation
+        # sets, then apply the disposition — resume only when ALL needs resolve.
+        disp = await _classify_blocker_needs(
+            task,
+            session,
+            candidate_cache=candidate_cache,
+            completed_cache=completed_cache,
+            dead_cache=dead_cache,
+        )
+
         # Already escalated terminally — leave parked for the operator. On
-        # escalation we push recheck_after to a far-future sentinel so these
-        # rows drop out of the due set entirely. Backstop: if a legacy/None
-        # recheck_after let one resurface here, evict it the same way so it
-        # stops being re-SELECTed and FOR UPDATE-locked every reaper cycle.
+        # escalation we push recheck_after to a far-future sentinel so these rows
+        # drop out of the due set entirely. Backstop: if a legacy/None
+        # recheck_after let one resurface here, evict it the same way so it stops
+        # being re-SELECTed and FOR UPDATE-locked every reaper cycle.
         if ctx.get("_blocked_escalated"):
-            # Parked-blocker auto-resume: a parked blocker that carries a still-
-            # satisfiable machine-resolvable need is resumed (edge + requeue, or
+            # Parked-blocker auto-resume / cancel / hold: a parked blocker that
+            # carries still-satisfiable needs is resumed (edges wired + requeue, or
             # proceed when satisfied by completed work) and its stale alert is
-            # reconciled. Runs at the low parked cadence — never re-escalates.
-            if await _maybe_resume_parked_blocker(
-                task,
-                ctx,
-                session,
-                now,
-                candidate_cache=candidate_cache,
-                completed_cache=completed_cache,
-                pending_broadcasts=pending_broadcasts,
-            ):
-                requeued += 1
-                changed = True
-                continue
-            # Not resumable by an in-flight/landed foundation. Before re-parking,
-            # check whether the dependent can provably NEVER resume — its named
-            # foundation has terminally died, or its need has outlived the bounded
-            # parked re-evaluations without ever becoming satisfiable — and if so
-            # terminate it (CANCELLED) instead of re-arming the parked re-eval
-            # forever.
-            if await _maybe_cancel_unresumable_blocker(
-                task,
-                ctx,
-                session,
-                dead_cache=dead_cache,
-                pending_broadcasts=pending_broadcasts,
-                parked=True,
-            ):
-                changed = True
-                continue
-            # Not resumable — re-park without re-alerting. A blocker that still
-            # carries a need is re-examined at the low cadence so it resumes once
-            # its foundation lands; one with no (or an unsatisfiable) need keeps
-            # the multi-year horizon and stays parked for the operator as today.
+            # reconciled; one whose needs are partially resolved keeps converging;
+            # one whose needs are provably dead or have outlived the bounded parked
+            # re-evaluations is terminated. Runs at the low parked cadence — never
+            # re-escalates.
+            if disp["had_needs"]:
+                outcome = await _apply_needs_disposition(
+                    task,
+                    ctx,
+                    session,
+                    now,
+                    disp,
+                    completed_cache=completed_cache,
+                    pending_broadcasts=pending_broadcasts,
+                    parked=True,
+                )
+                if outcome == "resumed":
+                    requeued += 1
+                    changed = True
+                    continue
+                if outcome in ("cancelled", "held"):
+                    changed = True
+                    continue
+            # Need-less parked blocker — re-park without re-alerting, keeping the
+            # multi-year horizon so it stays for the operator exactly as today.
             if task.recheck_after is None or task.recheck_after <= now:
-                has_need = isinstance(
-                    get_blocker_metadata(task).get("need"), dict
-                )
-                task.recheck_after = now + (
-                    _BLOCKED_PARKED_REEVAL_INTERVAL
-                    if has_need
-                    else _BLOCKED_ESCALATED_PARK
-                )
+                task.recheck_after = now + _BLOCKED_ESCALATED_PARK
                 session.add(task)
                 changed = True
             continue
 
         # Cross-task RESOLUTION (runs BEFORE the optimistic-retry / escalate path):
-        # if this task's machine-resolvable need names an in-flight foundation,
-        # wire a real depends_on edge onto it and requeue. The dispatch-time
-        # dependency gate then holds the task until the foundation lands and the
-        # blocked-resume machinery carries it — no wasted re-dispatch. A successful
-        # resolution SHORT-CIRCUITS the bounded optimistic retry below.
-        if await _resolve_need_into_dep_edge(
-            task, ctx, session, candidate_cache=candidate_cache
-        ):
-            _clear_blocked_fields(task, preserve_first_blocked=False)
-            task.status = TaskStatus.QUEUED
-            task.latest_status_message = (
-                "Unblocked — need resolved into dependency edge, requeued"
+        # wire a real depends_on edge for each need that names an in-flight
+        # foundation, resume with no edge for any need already satisfied by
+        # completed/merged work, and stay BLOCKED on the residual until EVERY need
+        # is accounted for. A dead foundation cancels; a fully-resolved set
+        # SHORT-CIRCUITS the bounded optimistic retry below. A task that still has
+        # an unresolved need with no edge falls through ("none") to the legacy
+        # precondition machine unchanged.
+        if disp["had_needs"]:
+            outcome = await _apply_needs_disposition(
+                task,
+                ctx,
+                session,
+                now,
+                disp,
+                completed_cache=completed_cache,
+                pending_broadcasts=pending_broadcasts,
+                parked=False,
             )
-            flag_modified(task, "context")
-            flag_modified(task, "depends_on")
-            session.add(task)
-            requeued += 1
-            changed = True
-            pending_broadcasts.append(
-                (
-                    str(task.project_id),
-                    {
-                        "task_id": str(task.id),
-                        "status": "QUEUED",
-                        "message": task.latest_status_message,
-                    },
-                )
-            )
-            continue
-
-        # Foundation already landed: if the need is satisfied by completed/merged
-        # work, requeue with no edge (the work is already done). Reuses the same
-        # exact-match check as the parked-resume path, never a fuzzy guess.
-        from app.task_blocked import get_blocker_metadata
-        from app.blocked_need_resolution import need_satisfied_by_completed
-
-        need = get_blocker_metadata(task).get("need")
-        if isinstance(need, dict) and not task.depends_on:
-            completed = completed_cache.get(task.project_id)
-            if completed is None:
-                completed = await _fetch_completed_candidates(
-                    session, task.project_id
-                )
-                completed_cache[task.project_id] = completed
-            if need_satisfied_by_completed(task, need, completed):
-                # The satisfying foundation carries no edge, so the dispatch-time
-                # re-cut cannot fire. If it is a cross-base genuine code
-                # dependency, re-cut the base from integration BEFORE leaving
-                # BLOCKED; on conflict/transient error HOLD (re-arm a backed-off
-                # recheck) so we never dispatch against a base missing the landed
-                # code. Same-base / ordering-only foundations need no re-cut and
-                # resume exactly as before.
-                if not await _completed_foundation_base_safe(
-                    task, need, completed, session
-                ):
-                    # _completed_foundation_base_safe -> ensure_dependent_base_recut
-                    # REPLACES and COMMITS task.context with a fresh dict carrying the
-                    # _recut_* escalation accounting on a HOLD. Re-read it here so the
-                    # stale loop-local `ctx` (captured before the call) does not clobber
-                    # those counters when we stamp the blocked-recheck backoff below —
-                    # otherwise the consecutive-conflict counter resets every cycle and
-                    # a persistently-conflicting dependent never escalates.
-                    ctx = task.context or {}
-                    attempts = int(ctx.get("_blocked_recheck_attempts", 0)) + 1
-                    ctx["_blocked_recheck_attempts"] = attempts
-                    task.context = ctx
-                    task.recheck_after = now + _next_recheck_delay(attempts)
-                    flag_modified(task, "context")
-                    session.add(task)
-                    changed = True
-                    continue
-                _clear_blocked_fields(task, preserve_first_blocked=False)
-                task.status = TaskStatus.QUEUED
-                task.latest_status_message = (
-                    "Unblocked — need satisfied by completed work, requeued"
-                )
-                flag_modified(task, "context")
-                session.add(task)
+            if outcome == "resumed":
                 requeued += 1
                 changed = True
-                pending_broadcasts.append(
-                    (
-                        str(task.project_id),
-                        {
-                            "task_id": str(task.id),
-                            "status": "QUEUED",
-                            "message": task.latest_status_message,
-                        },
-                    )
-                )
                 continue
-
-        # Foundation definitively DIED before an edge was wired: a need naming a
-        # task/PR now in a terminal failed/cancelled state can never be satisfied
-        # (it matches neither the active nor the completed set). Cancel the
-        # dependent the same way the dispatch path cascade-cancels an edged dead
-        # dependency, rather than letting it park and re-arm forever.
-        if await _maybe_cancel_unresumable_blocker(
-            task,
-            ctx,
-            session,
-            dead_cache=dead_cache,
-            pending_broadcasts=pending_broadcasts,
-            parked=False,
-        ):
-            changed = True
-            continue
+            if outcome in ("cancelled", "held"):
+                changed = True
+                continue
+            if outcome == "escalate":
+                await _escalate_blocked_task(
+                    task,
+                    ctx,
+                    blocker_kind=task.blocker_kind or "upstream dependency",
+                    detail=(
+                        "Task has unresolved prerequisites that never appeared "
+                        "within the deadline — needs operator intervention "
+                        "(re-scope, re-point the need, or recreate the foundation)."
+                    ),
+                )
+                changed = True
+                continue
+            # outcome == "none": fall through to the precondition state machine.
 
         state = await _blocked_precondition_state(task, session, verify_pr_merged)
         if state == "clear":

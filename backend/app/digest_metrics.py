@@ -15,10 +15,11 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.database import resolve_dialect_name
 from app.landed_signal import has_landed_signal
 from app.models import (
     Alert,
@@ -1241,6 +1242,10 @@ _FOUNDATION_OVERLAP_THRESHOLD = 0.5
 # Defensive caps on the surfaced lists so a large backlog never bloats the digest.
 _PARKED_BLOCKER_LIST_LIMIT = 100
 _DUPLICATE_FOUNDATION_LIST_LIMIT = 50
+# Unresumable-cancellation aggregate: how far back to count terminal give-ups,
+# and the cap on the surfaced per-task list.
+_UNRESUMABLE_CANCEL_WINDOW = timedelta(days=7)
+_UNRESUMABLE_CANCEL_LIST_LIMIT = 100
 
 
 def _task_related_files(t: "Task") -> set:
@@ -1358,6 +1363,70 @@ def compute_duplicate_foundation_signal(
     return {
         "total": len(candidates),
         "candidates": candidates[:_DUPLICATE_FOUNDATION_LIST_LIMIT],
+    }
+
+
+def compute_unresumable_cancellation_summary(
+    cancelled_tasks: List["Task"],
+    *,
+    window_start: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Count blocked dependents terminally CANCELLED because they can never resume.
+
+    Pure function — no database calls. Reads the durable
+    ``reaper_sweeps.UNRESUMABLE_CANCEL_CONTEXT_KEY`` marker stamped by
+    ``_cancel_blocker_as_dead`` when the resume system gives up on a blocked
+    dependent (its foundation died, or its need outlived the bounded parked
+    re-evaluations). This give-up IS the failure mode of structural gating, so its
+    rate is the single best health signal — a spike (e.g. from a resume-matcher
+    regression stranding finding-hash/capability needs) is otherwise invisible in
+    aggregate.
+
+    Tasks with no marker are skipped. When ``window_start`` is given, a marker
+    whose ``at`` timestamp is older (or unparseable) is skipped, so the count
+    reflects only a recent window. Returns the total plus breakdowns by give-up
+    class and by originating direction, and a capped newest-first task list.
+    """
+    from app.reaper_sweeps import UNRESUMABLE_CANCEL_CONTEXT_KEY
+
+    rows: List[Dict[str, Any]] = []
+    by_class: Dict[str, int] = defaultdict(int)
+    by_direction: Dict[str, int] = defaultdict(int)
+    window_iso = window_start.isoformat() if window_start else None
+
+    for t in cancelled_tasks:
+        marker = (t.context or {}).get(UNRESUMABLE_CANCEL_CONTEXT_KEY)
+        if not isinstance(marker, dict):
+            continue
+        at = marker.get("at")
+        # ISO-8601 strings from a common naive-UTC source sort lexicographically,
+        # so a string compare is a correct, cheap window filter.
+        if window_iso and (not isinstance(at, str) or at < window_iso):
+            continue
+        give_up_class = marker.get("give_up_class") or "unknown"
+        direction_id = marker.get("direction_id") or "(none)"
+        by_class[give_up_class] += 1
+        by_direction[direction_id] += 1
+        rows.append(
+            {
+                "task_id": str(t.id),
+                "title": t.title or str(t.id)[:8],
+                "project_id": str(t.project_id)
+                if getattr(t, "project_id", None) is not None
+                else None,
+                "give_up_class": give_up_class,
+                "need": marker.get("need"),
+                "direction_id": marker.get("direction_id"),
+                "at": at,
+            }
+        )
+
+    rows.sort(key=lambda r: r["at"] or "", reverse=True)
+    return {
+        "total": len(rows),
+        "by_class": dict(by_class),
+        "by_direction": dict(by_direction),
+        "tasks": rows[:_UNRESUMABLE_CANCEL_LIST_LIMIT],
     }
 
 
@@ -1490,10 +1559,49 @@ async def compute_dependency_health_signals(
         .all()
     )
 
+    # Terminal give-up cancellations of blocked dependents over a recent window.
+    # Cheaply pre-filtered by updated_at (advances on the CANCELLED transition);
+    # the summarizer refines by the marker's own ``at`` and buckets the counts.
+    from app.reaper_sweeps import UNRESUMABLE_CANCEL_CONTEXT_KEY
+    from app.time_utils import _utcnow
+
+    window_start = _utcnow() - _UNRESUMABLE_CANCEL_WINDOW
+    # Key-existence on ``Task.context``: ``has_key`` compiles to the Postgres
+    # JSONB ``?`` operator (fails on the SQLite smoke gate with a parameter
+    # placeholder error), so branch the SQLite path through ``json_extract``,
+    # which resolves the marker to NULL only when the key is absent.
+    if resolve_dialect_name(session) == "sqlite":
+        marker_present = func.json_extract(
+            Task.context, f"$.{UNRESUMABLE_CANCEL_CONTEXT_KEY}"
+        ).is_not(None)
+    else:
+        marker_present = Task.context.has_key(UNRESUMABLE_CANCEL_CONTEXT_KEY)
+    cancel_filters = [
+        Task.status == TaskStatus.CANCELLED,
+        marker_present,
+        Task.updated_at >= window_start,
+    ]
+    if project_id is not None:
+        cancel_filters.append(Task.project_id == project_id)
+    cancelled = (
+        (
+            await session.execute(
+                select(Task)
+                .where(*cancel_filters)
+                .limit(_UNRESUMABLE_CANCEL_LIST_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
     return {
         "parked_blockers": compute_parked_blocker_summary(list(blocked)),
         "duplicate_foundation_candidates": compute_duplicate_foundation_signal(
             list(active)
+        ),
+        "unresumable_cancellations": compute_unresumable_cancellation_summary(
+            list(cancelled), window_start=window_start
         ),
     }
 

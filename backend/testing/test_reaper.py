@@ -8100,6 +8100,102 @@ async def test_unblock_sweep_cancels_never_provided_capability_after_reeval_cap(
 
 
 @pytest.mark.asyncio
+async def test_dead_foundation_cancel_stamps_unresumable_marker(reaper_db, mocker):
+    """The foundation-died terminal cancel stamps a durable, queryable marker
+    recording the give-up class, the unresolved need, and the originating
+    direction — so the give-up is countable fleet-wide after the structured
+    blocker metadata is cleared on the same transition."""
+    from app.reaper_sweeps import (
+        UNRESUMABLE_CANCEL_CONTEXT_KEY,
+        GIVE_UP_FOUNDATION_DIED,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    dead = Task(
+        project_id=project.id, title="dead-foundation", description="x",
+        status=TaskStatus.FAILED, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}], context={}, status_log=[],
+    )
+    reaper_db.add(dead)
+    await reaper_db.commit()
+    await reaper_db.refresh(dead)
+    need = {"kind": "task", "ref": str(dead.id)}
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: waiting on foundation",
+        depends_on=[],
+        context={
+            "direction_id": "d-abc123",
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "foundation",
+                "reason": "BLOCKER: waiting on foundation",
+                "need": need,
+            },
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.CANCELLED
+    marker = (t.context or {}).get(UNRESUMABLE_CANCEL_CONTEXT_KEY)
+    assert isinstance(marker, dict)
+    assert marker["give_up_class"] == GIVE_UP_FOUNDATION_DIED
+    assert marker["need"] == need
+    assert marker["direction_id"] == "d-abc123"
+    assert isinstance(marker["at"], str) and marker["at"]
+
+
+@pytest.mark.asyncio
+async def test_never_satisfiable_cancel_stamps_unresumable_marker(reaper_db, mocker):
+    """The never-satisfiable terminal cancel (parked re-eval cap reached) stamps
+    the durable marker with the never_satisfiable give-up class and the need."""
+    from app.reaper_sweeps import (
+        UNRESUMABLE_CANCEL_CONTEXT_KEY,
+        GIVE_UP_NEVER_SATISFIABLE,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    need = {"kind": "capability", "ref": "nonexistent-capability"}
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: needs an auth subsystem",
+        depends_on=[],
+        blocked_at=now - timedelta(hours=30),
+        context={
+            "direction_id": "d-deadbeef",
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "auth subsystem",
+                "reason": "BLOCKER: needs an auth subsystem",
+                "need": need,
+            },
+            "_blocked_escalated": True,
+            "_blocked_parked_reevals": _BLOCKED_PARKED_REEVAL_CAP - 1,
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.CANCELLED
+    marker = (t.context or {}).get(UNRESUMABLE_CANCEL_CONTEXT_KEY)
+    assert isinstance(marker, dict)
+    assert marker["give_up_class"] == GIVE_UP_NEVER_SATISFIABLE
+    assert marker["need"] == need
+    assert marker["direction_id"] == "d-deadbeef"
+
+
+@pytest.mark.asyncio
 async def test_unblock_sweep_parked_capability_below_cap_stays_blocked(
     reaper_db, mocker
 ):
@@ -8236,11 +8332,14 @@ async def test_unblock_sweep_resumes_research_prerequisite_when_foundation_lande
 
 
 @pytest.mark.asyncio
-async def test_unblock_sweep_does_not_resolve_when_dep_edge_already_present(
+async def test_unblock_sweep_wires_recorded_need_alongside_existing_edge(
     reaper_db, mocker
 ):
-    """A task that already carries a depends_on edge is left to the structural-
-    wait path — resolution only fills the MISSING-edge gap."""
+    """A blocked dependent that already carries an UNRELATED depends_on edge AND
+    records a machine-resolvable need must still have that need wired: a dependent
+    with a partly-resolved prerequisite set keeps converging on the rest. Once
+    every recorded need is accounted for, it resumes to QUEUED with BOTH edges (the
+    dispatch gate holds it until both in-flight foundations land)."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
     now = _utcnow()
@@ -8275,11 +8374,302 @@ async def test_unblock_sweep_does_not_resolve_when_dep_edge_already_present(
 
     requeued = await sweep_unblock_blocked_tasks(reaper_db, now, verify_pr_merged=verify)
 
-    # The in-flight existing dep keeps it BLOCKED; no new edge appended.
+    # The recorded need resolves to the in-flight foundation → edge wired; that was
+    # the only need, so the task resumes with BOTH edges present.
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    assert str(dep.id) in (t.depends_on or [])
+    assert str(foundation.id) in (t.depends_on or [])
+    assert "blocker" not in (t.context or {})
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_partial_needs_resolution_stays_blocked(
+    reaper_db, mocker
+):
+    """A dependent BLOCKED on TWO needs where only ONE resolves to an in-flight
+    foundation stays BLOCKED: the edge is wired for the resolved need, the residual
+    still-unsatisfied need is re-persisted, and the task is NOT requeued until every
+    need is accounted for."""
+    from app.task_blocked import enter_blocked_state, get_blocker_needs
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    found1 = Task(
+        project_id=project.id, title="foundation-1", description="x",
+        status=TaskStatus.IN_PROGRESS, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}], context={}, status_log=[],
+    )
+    reaper_db.add(found1)
+    await reaper_db.commit()
+    await reaper_db.refresh(found1)
+    missing_id = str(_uuid_mod.uuid4())  # names a foundation that does not exist yet
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        depends_on=[],
+        context={},
+    )
+    enter_blocked_state(
+        t,
+        waiting_on="two foundations",
+        reason="Finding declared two prerequisites",
+        source="research_prerequisite",
+        blocker_kind="upstream_dependency",
+        needs=[
+            {"kind": "task", "ref": str(found1.id)},
+            {"kind": "task", "ref": missing_id},
+        ],
+    )
+    t.recheck_after = now - timedelta(minutes=1)
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
     assert requeued == 0
     await reaper_db.refresh(t)
+    # Edge wired for the resolved foundation, but the task stays BLOCKED on the
+    # residual missing need.
     assert t.status == TaskStatus.BLOCKED
-    assert t.depends_on == [str(dep.id)]
+    assert str(found1.id) in (t.depends_on or [])
+    residual = get_blocker_needs(t)
+    assert [n["ref"] for n in residual] == [missing_id], (
+        "only the still-unsatisfied need must remain; the resolved one is dropped"
+    )
+    # The legacy single 'need' mirror is recomputed to residual[0].
+    assert (t.context or {})["blocker"]["need"]["ref"] == missing_id
+    assert t.recheck_after is not None and t.recheck_after > now
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_full_needs_resolution_requeues(reaper_db, mocker):
+    """A dependent BLOCKED on TWO needs unblocks to QUEUED once ALL are accounted
+    for: an edge for the in-flight foundation, and no edge for the need already
+    satisfied by completed work."""
+    from app.task_blocked import enter_blocked_state
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    inflight = Task(
+        project_id=project.id, title="inflight-foundation", description="x",
+        status=TaskStatus.IN_PROGRESS, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}], context={}, status_log=[],
+    )
+    landed = Task(
+        project_id=project.id, title="landed-foundation", description="x",
+        status=TaskStatus.COMPLETED, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}], context={}, status_log=[],
+    )
+    reaper_db.add_all([inflight, landed])
+    await reaper_db.commit()
+    await reaper_db.refresh(inflight)
+    await reaper_db.refresh(landed)
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        depends_on=[],
+        context={},
+    )
+    enter_blocked_state(
+        t,
+        waiting_on="two foundations",
+        reason="Finding declared two prerequisites",
+        source="research_prerequisite",
+        blocker_kind="upstream_dependency",
+        needs=[
+            {"kind": "task", "ref": str(inflight.id)},
+            {"kind": "task", "ref": str(landed.id)},
+        ],
+    )
+    t.recheck_after = now - timedelta(minutes=1)
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    # Edge wired only for the in-flight foundation; the completed one needs none.
+    assert str(inflight.id) in (t.depends_on or [])
+    assert str(landed.id) not in (t.depends_on or [])
+    assert "blocker" not in (t.context or {})
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_partial_resolution_runs_base_safe_for_completed_need(
+    reaper_db, mocker
+):
+    """Regression: during PARTIAL multi-need resolution, a need satisfied by an
+    ALREADY-COMPLETED CROSS-BASE foundation must be run through the base re-cut
+    BEFORE it is dropped from the persisted set — it must not be silently discarded
+    while another need is still missing.
+
+    needs = [A (completed cross-base, re-cut succeeds), B (missing)]. The dependent
+    stays BLOCKED on B, but A's re-cut (the integration merge) MUST have fired this
+    tick so A's landed code is in the base; only then is A dropped from the residual.
+    Previously the partial branch persisted only the genuine residual and never ran
+    base-safe, so A vanished unverified and the task later resumed against a stale base.
+    """
+    from app.task_blocked import enter_blocked_state, get_blocker_needs
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock, return_value=("tok", "owner", "repo"),
+    )
+    merge = mocker.patch(
+        "app.github.merge_branch",
+        new_callable=AsyncMock, return_value={"merged": True},
+    )
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    foundation = await _cross_base_completed_foundation(reaper_db, project)
+    missing_id = str(_uuid_mod.uuid4())  # a foundation that does not exist yet
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: waiting on foundations",
+        depends_on=[],
+        payloads=[{"type": "fix", "base_branch": "rollup/dep"}],
+        context={"related_files": ["app/foo.py"]},
+    )
+    enter_blocked_state(
+        t,
+        waiting_on="two foundations",
+        reason="Finding declared two prerequisites",
+        source="research_prerequisite",
+        blocker_kind="upstream_dependency",
+        needs=[
+            {"kind": "task", "ref": str(foundation.id)},
+            {"kind": "task", "ref": missing_id},
+        ],
+    )
+    t.recheck_after = now - timedelta(minutes=1)
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    # The cross-base re-cut for the completed need DID fire this partial tick.
+    assert merge.await_count == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    # The completed (now base-safe) need is dropped; only the missing one remains.
+    residual = get_blocker_needs(t)
+    assert [n["ref"] for n in residual] == [missing_id]
+    assert t.recheck_after is not None and t.recheck_after > now
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_partial_resolution_retains_completed_need_on_conflict(
+    reaper_db, mocker
+):
+    """Regression (counterpart): during PARTIAL resolution, a completed cross-base
+    need whose re-cut CONFLICTS must be RETAINED as a residual need — not dropped —
+    so it is re-checked next tick rather than letting the dependent later resume
+    against a base missing its landed code.
+
+    needs = [A (completed cross-base, re-cut conflicts), B (missing)]. The dependent
+    stays BLOCKED and BOTH A and B remain in the persisted needs set.
+    """
+    from app.task_blocked import enter_blocked_state, get_blocker_needs
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock, return_value=("tok", "owner", "repo"),
+    )
+    merge = mocker.patch(
+        "app.github.merge_branch",
+        new_callable=AsyncMock, return_value={"conflict": True},
+    )
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    foundation = await _cross_base_completed_foundation(reaper_db, project)
+    missing_id = str(_uuid_mod.uuid4())
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: waiting on foundations",
+        depends_on=[],
+        payloads=[{"type": "fix", "base_branch": "rollup/dep"}],
+        context={"related_files": ["app/foo.py"]},
+    )
+    enter_blocked_state(
+        t,
+        waiting_on="two foundations",
+        reason="Finding declared two prerequisites",
+        source="research_prerequisite",
+        blocker_kind="upstream_dependency",
+        needs=[
+            {"kind": "task", "ref": str(foundation.id)},
+            {"kind": "task", "ref": missing_id},
+        ],
+    )
+    t.recheck_after = now - timedelta(minutes=1)
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    assert merge.await_count == 1  # base-safe attempted the re-cut and it conflicted
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    # The conflicting completed need is NOT dropped — both needs are retained.
+    residual_refs = {n["ref"] for n in get_blocker_needs(t)}
+    assert residual_refs == {str(foundation.id), missing_id}
+    assert t.recheck_after is not None and t.recheck_after > now
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_legacy_single_need_row_resolves_unchanged(
+    reaper_db, mocker
+):
+    """Back-compat: a blocker row carrying ONLY the legacy single 'need' key (no
+    'needs' list, exactly as rows persisted before multi-need support) resolves
+    exactly as before — the need is wired into an edge and the task requeues."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    foundation = Task(
+        project_id=project.id, title="legacy-foundation", description="x",
+        status=TaskStatus.IN_PROGRESS, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}], context={}, status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+    # Hand-build the legacy blocker shape: only context['blocker']['need'], no
+    # 'needs' list — the row a pre-multi-need deployment would have persisted.
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        depends_on=[],
+        context={
+            "blocker": {
+                "source": "research_prerequisite",
+                "waiting_on": "foundation",
+                "reason": "BLOCKER: waiting on foundation",
+                "need": {"kind": "task", "ref": str(foundation.id)},
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    assert str(foundation.id) in (t.depends_on or [])
+    assert "blocker" not in (t.context or {})
 
 
 @pytest.mark.asyncio

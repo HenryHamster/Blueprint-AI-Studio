@@ -1,6 +1,6 @@
 """Unit tests for digest metric helpers (app.digest_metrics / sr_review_quality_metrics)."""
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -2107,6 +2107,137 @@ async def test_dependency_health_signals_query_surfaces_recut_escalated(db_sessi
     assert parked["total"] == 2
     assert titles == {"recut-held-dependent", "blocked-escalated-dependent"}
     assert "plain-queued" not in titles
+
+
+def test_unresumable_cancellation_summary_counts_and_buckets():
+    """The pure summarizer counts terminal give-up cancellations and breaks them
+    down by give-up class and by originating direction; tasks with no marker are
+    skipped."""
+    from app.digest_metrics import compute_unresumable_cancellation_summary
+    from app.reaper_sweeps import (
+        UNRESUMABLE_CANCEL_CONTEXT_KEY,
+        GIVE_UP_FOUNDATION_DIED,
+        GIVE_UP_NEVER_SATISFIABLE,
+    )
+
+    def _cancelled(give_up_class, direction_id, at):
+        return make_task(
+            status=TaskStatus.CANCELLED,
+            context={
+                UNRESUMABLE_CANCEL_CONTEXT_KEY: {
+                    "give_up_class": give_up_class,
+                    "need": {"kind": "capability", "ref": "x"},
+                    "direction_id": direction_id,
+                    "at": at,
+                }
+            },
+        )
+
+    died_a = _cancelled(GIVE_UP_FOUNDATION_DIED, "d-aaa", "2026-06-04T10:00:00")
+    died_b = _cancelled(GIVE_UP_FOUNDATION_DIED, "d-bbb", "2026-06-04T11:00:00")
+    never_a = _cancelled(GIVE_UP_NEVER_SATISFIABLE, "d-aaa", "2026-06-04T12:00:00")
+    # No marker → excluded.
+    plain = make_task(status=TaskStatus.CANCELLED, context={})
+
+    result = compute_unresumable_cancellation_summary(
+        [died_a, died_b, never_a, plain]
+    )
+
+    assert result["total"] == 3
+    assert result["by_class"] == {
+        GIVE_UP_FOUNDATION_DIED: 2,
+        GIVE_UP_NEVER_SATISFIABLE: 1,
+    }
+    assert result["by_direction"] == {"d-aaa": 2, "d-bbb": 1}
+    # Newest-first.
+    assert result["tasks"][0]["task_id"] == str(never_a.id)
+
+
+def test_unresumable_cancellation_summary_filters_by_window():
+    """A marker whose ``at`` precedes ``window_start`` is excluded from the count."""
+    from app.digest_metrics import compute_unresumable_cancellation_summary
+    from app.reaper_sweeps import (
+        UNRESUMABLE_CANCEL_CONTEXT_KEY,
+        GIVE_UP_FOUNDATION_DIED,
+    )
+
+    recent = make_task(
+        status=TaskStatus.CANCELLED,
+        context={
+            UNRESUMABLE_CANCEL_CONTEXT_KEY: {
+                "give_up_class": GIVE_UP_FOUNDATION_DIED,
+                "need": None,
+                "direction_id": "d-aaa",
+                "at": "2026-06-04T10:00:00",
+            }
+        },
+    )
+    stale = make_task(
+        status=TaskStatus.CANCELLED,
+        context={
+            UNRESUMABLE_CANCEL_CONTEXT_KEY: {
+                "give_up_class": GIVE_UP_FOUNDATION_DIED,
+                "need": None,
+                "direction_id": "d-aaa",
+                "at": "2026-05-01T10:00:00",
+            }
+        },
+    )
+
+    result = compute_unresumable_cancellation_summary(
+        [recent, stale], window_start=datetime(2026, 6, 1, 0, 0, 0)
+    )
+
+    assert result["total"] == 1
+    assert result["tasks"][0]["task_id"] == str(recent.id)
+
+
+@pytest.mark.asyncio
+async def test_dependency_health_signals_query_surfaces_unresumable_cancellations(
+    db_session,
+):
+    """The DB-backed dependency-health query surfaces the unresumable-cancellation
+    aggregate: CANCELLED tasks carrying the marker within the recent window are
+    counted; an unmarked CANCELLED task is excluded."""
+    from app.reaper_sweeps import (
+        UNRESUMABLE_CANCEL_CONTEXT_KEY,
+        GIVE_UP_FOUNDATION_DIED,
+    )
+
+    project = make_project(name="Unresumable cancel query", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    marked = make_task(
+        project_id=project.id,
+        status=TaskStatus.CANCELLED,
+        title="gave-up-dependent",
+        context={
+            UNRESUMABLE_CANCEL_CONTEXT_KEY: {
+                "give_up_class": GIVE_UP_FOUNDATION_DIED,
+                "need": {"kind": "task", "ref": "foo"},
+                "direction_id": "d-aaa",
+                "at": _utcnow().isoformat(),
+            }
+        },
+    )
+    unmarked = make_task(
+        project_id=project.id,
+        status=TaskStatus.CANCELLED,
+        title="plain-cancelled",
+        context={},
+    )
+    db_session.add_all([marked, unmarked])
+    await db_session.commit()
+
+    result = await compute_dependency_health_signals(db_session, project_id=project.id)
+
+    agg = result["unresumable_cancellations"]
+    assert agg["total"] == 1
+    assert agg["by_class"] == {GIVE_UP_FOUNDATION_DIED: 1}
+    assert agg["by_direction"] == {"d-aaa": 1}
+    assert agg["tasks"][0]["title"] == "gave-up-dependent"
 
 
 def test_duplicate_foundation_signal_flags_cross_parent_overlap():

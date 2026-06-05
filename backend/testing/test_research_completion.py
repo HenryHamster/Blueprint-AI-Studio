@@ -2771,6 +2771,123 @@ async def test_deferred_sibling_prerequisite_blocks_dependent(db_session, mocker
 
 
 @_pytest.mark.asyncio
+async def test_two_deferred_sibling_prerequisites_both_recorded_as_needs(
+    db_session, mocker
+):
+    """A finding declaring TWO unspawned sibling prerequisites is BLOCKED with
+    BOTH recorded as needs — not just the first. Gating on only the first lets the
+    dependent resume (and rebuild the second foundation) the moment the first one
+    lands; recording the full set keeps it gated until ALL prerequisites resolve."""
+    from app.research_completion import _finding_hash
+    from app.task_blocked import get_blocker_needs
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq06")
+    prereq_a = _make_finding(title="Define helper A", direction_id=direction["id"])
+    prereq_a["actionability_grade"] = "LOW"
+    prereq_b = _make_finding(title="Define helper B", direction_id=direction["id"])
+    prereq_b["actionability_grade"] = "LOW"
+    dependent = _make_finding(title="Use helpers A and B", direction_id=direction["id"])
+    dependent["depends_on_indices"] = [0, 1]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[prereq_a, prereq_b, dependent],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    blocked = [
+        c
+        for c in children
+        if c.title == dependent["title"] and c.status == TaskStatus.BLOCKED
+    ]
+    assert len(blocked) == 1
+    child = blocked[0]
+    assert not (child.depends_on or [])
+    needs = get_blocker_needs(child)
+    hash_a = _finding_hash(prereq_a["title"], prereq_a["description"])
+    hash_b = _finding_hash(prereq_b["title"], prereq_b["description"])
+    refs = {n["ref"] for n in needs}
+    assert refs == {hash_a, hash_b}, (
+        "both unspawned sibling prerequisites must be recorded as needs"
+    )
+    # Backward-compat: the legacy single 'need' mirror still equals needs[0].
+    from app.task_blocked import get_blocker_metadata
+
+    assert get_blocker_metadata(child).get("need") == needs[0]
+    # Both unresolved prerequisites are stamped for operator visibility.
+    unresolved = (child.context or {}).get("unresolved_prerequisite", [])
+    unresolved_hashes = {
+        u.get("finding_hash")
+        for u in (unresolved if isinstance(unresolved, list) else [unresolved])
+    }
+    assert {hash_a, hash_b} <= unresolved_hashes
+
+
+@_pytest.mark.asyncio
+async def test_missing_sibling_and_explicit_prerequisite_both_recorded(
+    db_session, mocker
+):
+    """A finding declaring a missing sibling prerequisite AND an explicit
+    {kind, ref} prerequisite is BLOCKED with BOTH recorded — the explicit one is
+    no longer dropped by the sibling branch's short-circuit ``continue``."""
+    from app.research_completion import _finding_hash
+    from app.task_blocked import get_blocker_needs
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq07")
+    prereq = _make_finding(title="Define shared base", direction_id=direction["id"])
+    prereq["actionability_grade"] = "LOW"
+    dependent = _make_finding(title="Build on shared base", direction_id=direction["id"])
+    dependent["depends_on_indices"] = [0]
+    dependent["prerequisite"] = {"kind": "task", "ref": "nonexistent-foundation-id"}
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[prereq, dependent],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    blocked = [
+        c
+        for c in children
+        if c.title == dependent["title"] and c.status == TaskStatus.BLOCKED
+    ]
+    assert len(blocked) == 1
+    child = blocked[0]
+    assert not (child.depends_on or [])
+    needs = get_blocker_needs(child)
+    sibling_hash = _finding_hash(prereq["title"], prereq["description"])
+    refs = {n["ref"] for n in needs}
+    assert sibling_hash in refs, "the missing sibling prerequisite must be recorded"
+    assert "nonexistent-foundation-id" in refs, (
+        "the explicit prerequisite must be recorded (not dropped by the sibling branch)"
+    )
+
+
+@_pytest.mark.asyncio
 async def test_cyclic_prerequisite_refused_at_spawn(db_session, mocker):
     """Two findings each declaring the other as a capability prerequisite would
     close a depends_on cycle. The acyclicity check refuses the edge that would

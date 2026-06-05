@@ -2741,11 +2741,30 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _prereq_candidates = list(existing_tasks) + list(child_tasks)
     for ci, ct in enumerate(child_tasks):
         fi = finding_indices[ci]
+        finding_title = findings[fi].get("title", f"#{fi}")
+        # Collect EVERY declared-but-unsatisfied prerequisite for this child into a
+        # single set of machine-resolvable needs, so the dependent stays gated
+        # until ALL of them are accounted for — not just the first. A single
+        # dependent can have more than one unresolved prerequisite, and gating on
+        # only the first one lets it resume (and rebuild the others) the moment
+        # that first foundation lands. Two prerequisite sources contribute:
+        #   (a) EVERY missing sibling finding named via depends_on_indices that was
+        #       deduped/deferred this cycle (previously only missing_dep_indices[0]
+        #       was gated); and
+        #   (b) an explicit {kind, ref} prerequisite that did NOT resolve to an
+        #       in-flight / sibling foundation (previously dropped whenever a
+        #       sibling prerequisite was also missing — the `continue` short-circuit).
+        # A prerequisite that DID resolve still gets a real depends_on edge wired
+        # below (that path is correct); only the unresolved remainder becomes needs.
+        needs: list = []
+        unresolved_entries: list = []
+
         dep_indices = findings[fi].get("depends_on_indices", [])
         missing_dep_indices = [j for j in dep_indices if j not in finding_to_child]
-        if missing_dep_indices:
-            missing_fi = missing_dep_indices[0]
-            missing_finding = findings[missing_fi] if missing_fi < len(findings) else {}
+        for missing_fi in missing_dep_indices:
+            missing_finding = (
+                findings[missing_fi] if missing_fi < len(findings) else {}
+            )
             missing_title = missing_finding.get("title", f"#{missing_fi}")
             missing_hash = _finding_hash(
                 str(missing_title),
@@ -2756,127 +2775,106 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     or ""
                 ),
             )
-            ctx = dict(ct.context or {})
-            unresolved = ctx.get("unresolved_prerequisite") or []
-            unresolved_list = unresolved if isinstance(unresolved, list) else [unresolved]
-            unresolved_list.append(
+            unresolved_entries.append(
                 {
                     "finding_index": missing_fi,
                     "title": missing_title,
                     "finding_hash": missing_hash,
                 }
             )
-            ctx["unresolved_prerequisite"] = unresolved_list
-            ct.context = ctx
-            need = build_need("task", missing_hash, label=missing_title)
-            if need:
-                enter_blocked_state(
-                    ct,
-                    waiting_on=f"foundation task:{missing_hash}",
-                    reason=(
-                        f"Finding '{findings[fi].get('title', f'#{fi}')}' declared sibling "
-                        f"prerequisite '{missing_title}' but it was not spawned this cycle; "
-                        "blocked until the prerequisite appears or the blocked-resume sweep resolves it."
-                    ),
-                    source="research_prerequisite",
-                    blocker_kind="upstream_dependency",
-                    need=need,
-                )
-            session.add(ct)
-            logger.warning(
-                "[RESEARCH] Finding '%s' declared sibling prerequisite '%s' but it was not spawned; "
-                "dependent BLOCKED on the unresolved need",
-                findings[fi].get("title", f"#{fi}"),
-                missing_title,
-            )
-            continue
+            sibling_need = build_need("task", missing_hash, label=missing_title)
+            if sibling_need:
+                needs.append(sibling_need)
+
+        # Explicit {kind, ref} prerequisite: wire a real edge if it resolved to an
+        # in-flight / sibling foundation this cycle, otherwise add it to the needs
+        # set. This branch is NO LONGER short-circuited when a sibling prerequisite
+        # is also missing, so an explicit prerequisite is never silently dropped.
         prereq = findings[fi].get("_prerequisite")
-        if not prereq:
-            continue
-        foundation = resolve_prerequisite_task(prereq, _prereq_candidates)
-        if foundation is None or foundation.id == ct.id:
-            # Unresolved prerequisite: a finding declared an explicit {kind, ref}
-            # foundation it must build on, but no in-flight or sibling task
-            # matched. Rather than spawn the dependent as immediately-runnable
-            # (which lets it rebuild the very foundation it declared it needs —
-            # the "blocked dependents duplicating foundations" failure), block it
-            # on the normalized prerequisite as a machine-resolvable NEED and let
-            # the mature blocked-resume sweep gate it: the sweep wires a real
-            # depends_on edge the moment a matching foundation appears in flight
-            # (reaper_sweeps._resolve_need_into_dep_edge), resumes it with no edge
-            # when the foundation has already landed as completed/merged work
-            # (need_satisfied_by_completed), and escalates loudly to the operator
-            # if the foundation never appears within the deadline.
-            #
-            # Policy: BOTH prerequisite kinds (task, capability) trigger blocking.
-            # Prereq kinds are a subset of NEED_KINDS, so the normalized
-            # prerequisite is already a valid need. A kind=capability ref could in
-            # principle already be satisfied by code that was never a task; the
-            # escalation/auto-resume path is the backstop that clears genuinely-
-            # independent or already-satisfied work rather than parking it forever.
-            # We still stamp context['unresolved_prerequisite'] for operator
-            # visibility in addition to entering BLOCKED.
-            if foundation is None:
-                ctx = dict(ct.context or {})
-                unresolved = ctx.get("unresolved_prerequisite") or {}
-                unresolved_list = unresolved if isinstance(unresolved, list) else [unresolved] if unresolved else []
-                unresolved_list.append(prereq)
-                ctx["unresolved_prerequisite"] = unresolved_list
-                ct.context = ctx
-                need = build_need(
+        if prereq:
+            foundation = resolve_prerequisite_task(prereq, _prereq_candidates)
+            if foundation is not None and foundation.id != ct.id:
+                if _would_create_cycle(ct, foundation, _prereq_candidates):
+                    logger.warning(
+                        "[RESEARCH] Finding '%s' prerequisite %s:%s resolved to "
+                        "foundation %s but the edge would close a depends_on cycle "
+                        "— refused at spawn (no edge)",
+                        finding_title,
+                        prereq.get("kind"),
+                        prereq.get("ref"),
+                        foundation.id,
+                    )
+                else:
+                    foundation_id = str(foundation.id)
+                    existing_dep = list(ct.depends_on or [])
+                    if foundation_id not in existing_dep:
+                        existing_dep.append(foundation_id)
+                        ct.depends_on = existing_dep
+                        remember_structural_depends_on(ct, foundation_id)
+                        session.add(ct)
+                        logger.info(
+                            "[RESEARCH] Wired finding '%s' depends_on foundation %s "
+                            "(prerequisite %s:%s)",
+                            finding_title,
+                            foundation_id,
+                            prereq.get("kind"),
+                            prereq.get("ref"),
+                        )
+            elif foundation is None:
+                # Unresolved explicit prerequisite: a finding declared an explicit
+                # {kind, ref} foundation it must build on, but no in-flight or
+                # sibling task matched. Add it to the needs set so the dependent is
+                # gated (BOTH task and capability kinds trigger blocking; the
+                # blocked-resume sweep wires the edge when the foundation appears,
+                # resumes with no edge when it has already landed, or escalates).
+                prereq_need = build_need(
                     prereq.get("kind"),
                     prereq.get("ref"),
                     label=prereq.get("label"),
                 )
-                if need:
-                    enter_blocked_state(
-                        ct,
-                        waiting_on=f"foundation {need['kind']}:{need['ref']}",
-                        reason=(
-                            f"Finding '{findings[fi].get('title', f'#{fi}')}' declared "
-                            f"prerequisite {need['kind']}:{need['ref']} but no candidate "
-                            f"matched at spawn; blocked until the foundation appears or "
-                            f"the operator escalation fires."
-                        ),
-                        source="research_prerequisite",
-                        blocker_kind="upstream_dependency",
-                        need=need,
-                    )
-                session.add(ct)
-                logger.warning(
-                    "[RESEARCH] Finding '%s' declared prerequisite %s:%s but no candidate matched; "
-                    "dependent BLOCKED on the unresolved need (blocked-resume sweep will wire "
-                    "the edge or escalate)",
-                    findings[fi].get("title", f"#{fi}"),
-                    prereq.get("kind"),
-                    prereq.get("ref"),
-                )
+                if prereq_need:
+                    needs.append(prereq_need)
+                    unresolved_entries.append(prereq)
+            # foundation == ct itself (self-prerequisite): neither edge nor need.
+
+        if not needs:
             continue
-        if _would_create_cycle(ct, foundation, _prereq_candidates):
-            logger.warning(
-                "[RESEARCH] Finding '%s' prerequisite %s:%s resolved to foundation %s "
-                "but the edge would close a depends_on cycle — refused at spawn (no edge)",
-                findings[fi].get("title", f"#{fi}"),
-                prereq.get("kind"),
-                prereq.get("ref"),
-                foundation.id,
-            )
-            continue
-        foundation_id = str(foundation.id)
-        existing_dep = list(ct.depends_on or [])
-        if foundation_id not in existing_dep:
-            existing_dep.append(foundation_id)
-            ct.depends_on = existing_dep
-            remember_structural_depends_on(ct, foundation_id)
-            session.add(ct)
-            logger.info(
-                "[RESEARCH] Wired finding '%s' depends_on foundation %s "
-                "(prerequisite %s:%s)",
-                findings[fi].get("title", f"#{fi}"),
-                foundation_id,
-                prereq.get("kind"),
-                prereq.get("ref"),
-            )
+
+        # Block the dependent ONCE on the FULL set of unresolved prerequisites.
+        # enter_blocked_state persists the whole list under context['blocker']
+        # ['needs'] (mirroring needs[0] into the legacy 'need' key), so the
+        # blocked-resume sweep keeps it gated until every prerequisite resolves.
+        ctx = dict(ct.context or {})
+        existing_unresolved = ctx.get("unresolved_prerequisite") or []
+        if not isinstance(existing_unresolved, list):
+            existing_unresolved = [existing_unresolved]
+        existing_unresolved.extend(unresolved_entries)
+        ctx["unresolved_prerequisite"] = existing_unresolved
+        ct.context = ctx
+        primary = needs[0]
+        waiting_on = f"foundation {primary['kind']}:{primary['ref']}"
+        if len(needs) > 1:
+            waiting_on = f"{waiting_on} (+{len(needs) - 1} more)"
+        reason = (
+            f"Finding '{finding_title}' declared {len(needs)} unresolved "
+            "prerequisite(s) not satisfied this cycle; blocked until every "
+            "prerequisite is wired to an in-flight foundation or has landed."
+        )
+        enter_blocked_state(
+            ct,
+            waiting_on=waiting_on,
+            reason=reason,
+            source="research_prerequisite",
+            blocker_kind="upstream_dependency",
+            needs=needs,
+        )
+        session.add(ct)
+        logger.warning(
+            "[RESEARCH] Finding '%s' BLOCKED on %d unresolved prerequisite(s): %s",
+            finding_title,
+            len(needs),
+            ", ".join(f"{n['kind']}:{n['ref']}" for n in needs),
+        )
 
     # Chain auto-decomposed siblings: when a finding is split into N sub-tasks
     # by cochange/path clustering, run them serially rather than in parallel.
