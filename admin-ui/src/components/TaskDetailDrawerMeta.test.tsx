@@ -566,3 +566,84 @@ describe('DetailsTab — Knowledge Document', () => {
     expect(await screen.findByText(/Detailed markdown/)).toBeInTheDocument();
   });
 });
+
+describe('DetailsTab — Structural Gating', () => {
+  afterEach(() => cleanup());
+
+  it('renders foundation convergence reason when task is serialized behind a duplicate', () => {
+    const foundationTask = makeTask({ id: 'foundation-1', title: 'Original API implementation' });
+    const task = makeTask({
+      id: 'duplicate-task',
+      context: {
+        _foundation_converged: {
+          foundation_id: 'foundation-1',
+          reason: 'shared finding origin',
+          shared_files: ['backend/api.py', 'backend/models.py'],
+        },
+      },
+    });
+    render(<DetailsTab task={task} tasks={[task, foundationTask]} />);
+    expect(screen.getByText('Structural Serialization')).toBeInTheDocument();
+    expect(screen.getByText('Serialized behind duplicate foundation')).toBeInTheDocument();
+    expect(screen.getByText('shared finding origin')).toBeInTheDocument();
+    expect(screen.getByText('backend/api.py')).toBeInTheDocument();
+    expect(screen.getByText('backend/models.py')).toBeInTheDocument();
+  });
+
+  it('links to foundation task and shows title when available', () => {
+    const foundationTask = makeTask({ id: 'foundation-1', title: 'Original API implementation' });
+    const task = makeTask({
+      context: {
+        _foundation_converged: {
+          foundation_id: 'foundation-1',
+          reason: 'near-identical file sets',
+          shared_files: ['file.ts'],
+        },
+      },
+    });
+    const mockNavigate = vi.fn();
+    render(<DetailsTab task={task} tasks={[task, foundationTask]} onNavigateToTask={mockNavigate} />);
+    const link = screen.getByText('Original API implementation');
+    expect(link).toBeInTheDocument();
+    expect(link.closest('button')).toBeInTheDocument();
+  });
+
+  it('renders blocked need when task carries a machine-resolvable need', () => {
+    const blockedTask = makeTask({
+      status: 'BLOCKED',
+      context: {
+        blocker: {
+          need: {
+            kind: 'task',
+            ref: 'prerequisite-123',
+            label: 'Foundation task must complete first',
+          },
+        },
+      },
+    });
+    const prereqTask = makeTask({ id: 'prerequisite-123', title: 'Foundation task' });
+    render(<DetailsTab task={blockedTask} tasks={[blockedTask, prereqTask]} />);
+    expect(screen.getByText('Blocker')).toBeInTheDocument();
+    expect(screen.getByText('Waiting for task')).toBeInTheDocument();
+    expect(screen.getByText('Foundation task must complete first')).toBeInTheDocument();
+  });
+
+  it('shows blocked need ref as text when prerequisite task not found', () => {
+    const task = makeTask({
+      status: 'BLOCKED',
+      context: {
+        blocker: {
+          need: {
+            kind: 'capability',
+            ref: 'capability:database-migration',
+            label: 'Database migration capability',
+          },
+        },
+      },
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Waiting for capability')).toBeInTheDocument();
+    expect(screen.getByText('capability:database-migration')).toBeInTheDocument();
+    expect(screen.getByText('Database migration capability')).toBeInTheDocument();
+  });
+});

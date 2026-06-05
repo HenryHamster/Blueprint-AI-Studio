@@ -143,6 +143,56 @@ def _inject_file_overlap_deps(subtasks: List[Dict], label: str = "PLAN") -> None
                 )
 
 
+def _inject_build_on_deps(subtasks: List[Dict], label: str = "PLAN") -> List[tuple]:
+    """Serialize cross-file BUILD-ON relationships between subtasks.
+
+    ``_inject_file_overlap_deps`` only orders subtasks that touch a SHARED
+    file. The canonical foundational shape — subtask A creates a brand-new
+    module/file and a LATER subtask B (in a DIFFERENT file) imports or
+    otherwise consumes A's new code — shares no files, so it gets no
+    automatic edge and the same-base siblings would dispatch in parallel.
+
+    This closes that hole conservatively: when a later subtask's prompt
+    references a file that an earlier subtask OWNS in its ``related_files``
+    but the later subtask does NOT edit itself, the later subtask is
+    consuming the earlier one's output and must run after it. Only forward
+    edges (consumer after producer) are added so independent work — and
+    additive edits to shared infra, which the same-file pass already
+    handles — stay parallel.
+
+    Returns the list of (producer_idx, consumer_idx, file) edges added so the
+    caller can observe them. Additive only — merged with existing deps.
+    """
+    added: List[tuple] = []
+    for consumer_idx, consumer in enumerate(subtasks):
+        prompt = consumer.get("prompt", "") or ""
+        if not prompt:
+            continue
+        consumer_files = set(consumer.get("related_files", []))
+        for producer_idx in range(consumer_idx):
+            producer = subtasks[producer_idx]
+            for f in producer.get("related_files", []):
+                # Same-file case is already handled by overlap injection.
+                if f in consumer_files:
+                    continue
+                # Bounded match so a short path (a.py) does not match inside a
+                # longer token (data.py); the consumer must reference the
+                # producer's file as a standalone path.
+                if re.search(rf"(?<![\w/.]){re.escape(f)}(?![\w])", prompt):
+                    existing = consumer.setdefault("depends_on_indices", [])
+                    if producer_idx not in existing:
+                        existing.append(producer_idx)
+                        added.append((producer_idx, consumer_idx, f))
+                        logger.info(
+                            f"[{label}] Build-on edge: "
+                            f"{producer.get('title', f'#{producer_idx}')!r} → "
+                            f"{consumer.get('title', f'#{consumer_idx}')!r} "
+                            f"(consumer prompt consumes producer file: {f})"
+                        )
+                    break  # one edge per producer/consumer pair is enough
+    return added
+
+
 async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     """Parse plan output and create child tasks with dependency tracking."""
     from app.alert_dispatch import _maybe_create_failure_alert
@@ -413,10 +463,14 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         i: list(st.get("depends_on_indices", [])) for i, st in enumerate(subtasks)
     }
     _inject_file_overlap_deps(subtasks, "PLAN")
+    # Close the cross-file build-on hole: a subtask consuming a NEW module a
+    # sibling creates shares no file with it, so the same-file pass above adds
+    # no edge. Order the consumer after the producer it references.
+    _inject_build_on_deps(subtasks, "PLAN")
 
     if not _validate_plan_dependencies(subtasks):
         logger.error(
-            "[PLAN] Circular dependency after file overlap injection — reverting to explicit deps only"
+            "[PLAN] Circular dependency after dependency injection — reverting to explicit deps only"
         )
         for i, st in enumerate(subtasks):
             if original_deps.get(i):

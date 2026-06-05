@@ -4656,6 +4656,42 @@ class TestCrossBaseCodeDependencyPolicy:
         dependent = self._dependent("create", ["backend/testing/test_foo.py"])
         assert is_genuine_code_dependency(dependent, dep) is False
 
+    def test_transforming_dependent_with_file_overlap_is_genuine(self):
+        from app.orchestrator_health import is_genuine_code_dependency
+
+        # A fix/refactor that overlaps the dependency's files is a genuine code
+        # relationship — transforming dependent + overlap = real code dep.
+        dep = self._dep("create", ["backend/app/foo.py", "backend/app/bar.py"])
+        dependent = self._dependent("fix", ["backend/app/foo.py", "backend/app/baz.py"])
+        assert is_genuine_code_dependency(dependent, dep) is True
+
+    def test_transforming_dependent_refactor_with_disjoint_files_is_ordering_only(self):
+        from app.orchestrator_health import is_genuine_code_dependency
+
+        # Refactor transforming dependent with provably disjoint files from dependency
+        # is ordering-only (no code relationship).
+        dep = self._dep("create", ["backend/app/old_implementation.py"])
+        dependent = self._dependent("refactor", ["backend/app/new_structure.py"])
+        assert is_genuine_code_dependency(dependent, dep) is False
+
+    def test_transforming_dependent_modify_dependent_without_files_is_genuine(self):
+        from app.orchestrator_health import is_genuine_code_dependency
+
+        # A modify dependent with no declared files against a code-producing dep
+        # cannot disprove overlap, so it's treated as genuine (hold rather than risk).
+        dep = self._dep("create", ["backend/app/foo.py"])
+        dependent = self._dependent("modify", [])  # no files declared
+        assert is_genuine_code_dependency(dependent, dep) is True
+
+    def test_transforming_dependent_fix_with_dependency_having_no_files_is_genuine(self):
+        from app.orchestrator_health import is_genuine_code_dependency
+
+        # When the dependency declares no files, we cannot disprove overlap, so the
+        # transforming-dependent edge (fix) is treated as genuine.
+        dep = self._dep("create", [])  # no files
+        dependent = self._dependent("fix", ["backend/app/foo.py"])
+        assert is_genuine_code_dependency(dependent, dep) is True
+
 
 class TestCrossBaseDependencyGate:
     """``_check_candidate_task_deps`` HOLDS a cross-rollup GENUINE code-dependent

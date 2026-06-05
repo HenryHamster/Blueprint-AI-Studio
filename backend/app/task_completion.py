@@ -54,6 +54,7 @@ from app.plan_completion import (
     # broke every downstream importer. noqa pins them so a future --fix sweep
     # can't repeat the regression.
     _handle_plan_completion,  # noqa: F401
+    _inject_build_on_deps,  # noqa: F401
     _inject_file_overlap_deps,  # noqa: F401
     _log_file_overlaps,  # noqa: F401
     _parse_plan_output,  # noqa: F401

@@ -233,6 +233,36 @@ function ResearchOriginSection({ task, tasks, onNavigateToTask }: { task: Task; 
   );
 }
 
+function BlockedNeedSection({ need, tasks, onNavigateToTask }: { need: Record<string, unknown> | undefined; tasks?: Task[]; onNavigateToTask?: (id: string) => void }) {
+  if (!need) return null;
+  const kind = need.kind as string | undefined;
+  const ref = need.ref as string | undefined;
+  const label = need.label as string | undefined;
+  if (!kind || !ref) return null;
+
+  const linkedTask = kind === 'task' ? tasks?.find(t => t.id === ref) : undefined;
+
+  return (
+    <>
+      <DetailRow label={`Waiting for ${kind}`}>
+        <span className="inline-flex flex-col gap-1.5 min-w-0">
+          {linkedTask && kind === 'task' ? (
+            <button
+              onClick={() => onNavigateToTask?.(ref)}
+              className="text-blue-400 hover:text-blue-300 transition-colors text-left font-mono text-sm"
+            >
+              {linkedTask.title.length > 50 ? linkedTask.title.slice(0, 50) + '…' : linkedTask.title}
+            </button>
+          ) : (
+            <span className="font-mono text-sm text-neutral-300 break-all">{ref}</span>
+          )}
+          {label && <span className="text-xs text-neutral-400">{label}</span>}
+        </span>
+      </DetailRow>
+    </>
+  );
+}
+
 /** Surface the knowledge document a completed design / web_research task
  *  produced. The completion handler mirrors the document's id, title, summary,
  *  tags and forward-quality verdict into plan_output.knowledge_document, so the
@@ -763,6 +793,11 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
               </span>
             </DetailRow>
           )}
+          {(() => {
+            const blocker = task.context?.blocker as Record<string, unknown> | undefined;
+            const need = blocker?.need as Record<string, unknown> | undefined;
+            return <BlockedNeedSection need={need} tasks={tasks} onNavigateToTask={onNavigateToTask} />;
+          })()}
         </>
       )}
 
@@ -1396,6 +1431,43 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
           </div>
         </>
       )}
+
+      {(() => {
+        const ctx = task.context as Record<string, unknown> | undefined;
+        const fc = ctx?._foundation_converged as { foundation_id?: string; reason?: string; shared_files?: string[] } | undefined;
+        if (!fc?.foundation_id) return null;
+        const foundationId = fc.foundation_id;
+        const foundationTask = tasks?.find(t => t.id === foundationId);
+        return (
+          <>
+            <SectionHeader>Structural Serialization</SectionHeader>
+            <div className="space-y-2 bg-blue-950/10 rounded-lg p-3 border border-blue-900/30">
+              <div className="text-sm text-blue-200">Serialized behind duplicate foundation</div>
+              <DetailRow label="Foundation">
+                {foundationTask && onNavigateToTask ? (
+                  <button
+                    onClick={() => onNavigateToTask(foundationId)}
+                    className="text-blue-400 hover:text-blue-300 transition-colors text-left"
+                  >
+                    {foundationTask.title.length > 50 ? foundationTask.title.slice(0, 50) + '…' : foundationTask.title}
+                  </button>
+                ) : (
+                  <span className="font-mono text-sm text-neutral-300">{foundationId}</span>
+                )}
+              </DetailRow>
+              {fc.reason && <DetailRow label="Reason"><span className="text-sm text-blue-100/90 break-words">{fc.reason}</span></DetailRow>}
+              {fc.shared_files && fc.shared_files.length > 0 && (
+                <DetailRow label="Shared Files">
+                  <div className="space-y-0.5">
+                    {fc.shared_files.slice(0, 3).map((f, i) => <div key={i} className="text-xs text-neutral-400 font-mono break-all">{f}</div>)}
+                    {fc.shared_files.length > 3 && <div className="text-xs text-neutral-500">+{fc.shared_files.length - 3} more</div>}
+                  </div>
+                </DetailRow>
+              )}
+            </div>
+          </>
+        );
+      })()}
 
       {task.child_task_ids && task.child_task_ids.length > 0 && (
         <>

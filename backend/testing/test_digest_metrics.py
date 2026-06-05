@@ -2084,3 +2084,394 @@ def test_duplicate_foundation_signal_ignores_non_write_tasks():
 
     assert result["total"] == 0
     assert result["candidates"] == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Section: Foundation Convergence Predicate Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_genuine_duplicate_reason_shared_finding_origin():
+    """Genuine duplicate: two write-tasks with identical finding_hash."""
+    from app.digest_metrics import _genuine_duplicate_reason
+
+    t1 = make_task(
+        payloads=[{"type": "fix"}],
+        context={"finding_hash": "abc123"},
+    )
+    t2 = make_task(
+        payloads=[{"type": "fix"}],
+        context={"finding_hash": "abc123"},
+    )
+    reason = _genuine_duplicate_reason(t1, set(), t2, set())
+    assert reason is not None
+    assert "shared finding origin" in reason
+    assert "abc123" in reason
+
+
+def test_genuine_duplicate_reason_shared_capability():
+    """Genuine duplicate: two write-tasks with a shared capability marker."""
+    from app.digest_metrics import _genuine_duplicate_reason
+
+    t1 = make_task(
+        payloads=[{"type": "create"}],
+        context={"provides_capability": "linting"},
+    )
+    t2 = make_task(
+        payloads=[{"type": "create"}],
+        context={"provides_capability": "linting"},
+    )
+    reason = _genuine_duplicate_reason(t1, set(), t2, set())
+    assert reason is not None
+    assert "shared capability" in reason
+    assert "linting" in reason
+
+
+def test_genuine_duplicate_reason_near_identical_files_at_threshold():
+    """Genuine duplicate: file overlap exactly at the 0.85 convergence threshold."""
+    from app.digest_metrics import _genuine_duplicate_reason
+
+    # Create exact threshold case: 85 shared, 15 unique to i, 0 unique to j = 85/100 = 0.85 >= 0.85
+    shared_files = {f"file_{i}.py" for i in range(85)}
+    fi = shared_files | {f"unique_i_{i}.py" for i in range(15)}
+    fj = shared_files
+
+    t1 = make_task(payloads=[{"type": "refactor"}])
+    t2 = make_task(payloads=[{"type": "refactor"}])
+    reason = _genuine_duplicate_reason(t1, fi, t2, fj)
+    assert reason is not None
+    assert "near-identical file sets" in reason
+    overlap = 85 / 100
+    assert f"{round(overlap, 3)}" in reason
+
+
+def test_genuine_duplicate_reason_below_convergence_threshold_returns_none():
+    """Below convergence threshold (0.85): strong-but-partial overlap is NOT genuine.
+
+    This is the incidental-shared-infra case where tasks can safely run in parallel
+    and reconcile at merge. They should NOT be serialized.
+    """
+    from app.digest_metrics import _genuine_duplicate_reason, _FOUNDATION_CONVERGE_THRESHOLD
+
+    # Create a case just below the threshold: 5 shared, 5 unique each = 5/10 = 0.50
+    fi = {"a.py", "b.py", "c.py", "d.py", "e.py", "f1.py", "g1.py", "h1.py", "i1.py", "j1.py"}
+    fj = {"a.py", "b.py", "c.py", "d.py", "e.py", "f2.py", "g2.py", "h2.py", "i2.py", "j2.py"}
+
+    t1 = make_task(payloads=[{"type": "create"}])
+    t2 = make_task(payloads=[{"type": "create"}])
+    reason = _genuine_duplicate_reason(t1, fi, t2, fj)
+    assert reason is None, (
+        f"Overlap {len(fi & fj)}/{len(fi | fj)} should be below {_FOUNDATION_CONVERGE_THRESHOLD}"
+    )
+
+
+def test_genuine_duplicate_reason_prefers_earliest_signal():
+    """Among multiple signals, any one is sufficient (shared finding > shared cap > file overlap)."""
+    from app.digest_metrics import _genuine_duplicate_reason
+
+    # Both have finding hash AND shared capability
+    t1 = make_task(
+        payloads=[{"type": "fix"}],
+        context={"finding_hash": "xyz789", "provides_capability": "auth"},
+    )
+    t2 = make_task(
+        payloads=[{"type": "fix"}],
+        context={"finding_hash": "xyz789", "provides_capability": "auth"},
+    )
+    reason = _genuine_duplicate_reason(t1, set(), t2, set())
+    # Should return the first match (finding hash)
+    assert "shared finding origin" in reason
+
+
+def test_compute_foundation_convergence_actions_shared_finding_origin():
+    """Acting convergence predicate: genuine duplicate with shared finding origin."""
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    now = _utcnow()
+    t1 = make_task(
+        created_at=now - timedelta(hours=1),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "fix"}],
+        context={"finding_hash": "finding001"},
+    )
+    t2 = make_task(
+        created_at=now,
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),  # Different parent
+        payloads=[{"type": "fix"}],
+        context={"finding_hash": "finding001"},
+    )
+
+    actions = compute_foundation_convergence_actions([t1, t2])
+
+    assert len(actions) == 1
+    assert actions[0]["foundation_id"] == str(t1.id)
+    assert actions[0]["dependent_id"] == str(t2.id)
+    assert "finding001" in actions[0]["reason"]
+
+
+def test_compute_foundation_convergence_actions_shared_capability():
+    """Acting convergence predicate: genuine duplicate with shared capability."""
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    now = _utcnow()
+    t1 = make_task(
+        created_at=now - timedelta(hours=2),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create"}],
+        context={"provides_capability": "performance-tuning"},
+    )
+    t2 = make_task(
+        created_at=now - timedelta(hours=1),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create"}],
+        context={"provides_capability": "performance-tuning"},
+    )
+
+    actions = compute_foundation_convergence_actions([t1, t2])
+
+    assert len(actions) == 1
+    assert actions[0]["foundation_id"] == str(t1.id)
+    assert actions[0]["dependent_id"] == str(t2.id)
+    assert "shared capability" in actions[0]["reason"]
+
+
+def test_compute_foundation_convergence_actions_file_overlap_at_threshold():
+    """Acting convergence predicate: high file overlap at/above convergence threshold."""
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    now = _utcnow()
+    # File overlap at threshold: 6 shared, 0 unique in files_i, 0 unique in files_j
+    # This gives intersection=6, union=6, ratio=1.0 >= 0.85
+    # Actually, let's be more realistic: 6 shared, 1 unique to each = 6/(6+1+1)=6/8=0.75 < 0.85
+    # So we need: shared=6, unique_i=0, unique_j=0 for ratio=1.0
+    # Or: shared=17, unique_i=3, unique_j=3 for ratio=17/23=0.739 < 0.85
+    # Let's use: shared=85, unique_i=15, unique_j=0 for ratio=85/100=0.85
+    shared_files = {f"file_{i}.py" for i in range(85)}
+    files_i = shared_files | {f"unique_i_{i}.py" for i in range(15)}
+    files_j = shared_files
+
+    t1 = make_task(
+        created_at=now - timedelta(minutes=30),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "refactor"}],
+        context={"related_files": list(files_i)},
+    )
+    t2 = make_task(
+        created_at=now,
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "refactor"}],
+        context={"related_files": list(files_j)},
+    )
+
+    actions = compute_foundation_convergence_actions([t1, t2])
+
+    assert len(actions) == 1
+    assert actions[0]["foundation_id"] == str(t1.id)
+    assert actions[0]["dependent_id"] == str(t2.id)
+    assert "near-identical file sets" in actions[0]["reason"]
+    # 85/100 = 0.85, exactly at threshold
+    assert "0.85" in actions[0]["reason"]
+
+
+def test_compute_foundation_convergence_actions_below_threshold_no_convergence():
+    """Below convergence threshold: overlapping files do NOT trigger convergence."""
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    now = _utcnow()
+    # Overlap: 50 shared, 50 unique to each = 50/100 = 0.5 << 0.85
+    # This is the shared-infrastructure case where tasks should run in parallel
+    shared_files = {f"shared/file_{i}.py" for i in range(50)}
+    files_i = shared_files | {f"only_i_{i}.py" for i in range(50)}
+    files_j = shared_files | {f"only_j_{i}.py" for i in range(50)}
+
+    t1 = make_task(
+        created_at=now - timedelta(hours=1),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create"}],
+        context={"related_files": list(files_i)},
+    )
+    t2 = make_task(
+        created_at=now,
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create"}],
+        context={"related_files": list(files_j)},
+    )
+
+    actions = compute_foundation_convergence_actions([t1, t2])
+
+    assert len(actions) == 0, "Below-threshold overlap should not trigger convergence"
+
+
+def test_compute_foundation_convergence_actions_same_parent_excluded():
+    """Same-parent siblings are excluded (handled by intra-decomposition depends_on)."""
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    now = _utcnow()
+    parent_id = uuid4()
+    # Both tasks have the same parent, so they should NOT be serialized by this path
+    t1 = make_task(
+        created_at=now - timedelta(hours=1),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=parent_id,
+        payloads=[{"type": "fix"}],
+        context={"finding_hash": "same_finding"},
+    )
+    t2 = make_task(
+        created_at=now,
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=parent_id,  # Same parent
+        payloads=[{"type": "fix"}],
+        context={"finding_hash": "same_finding"},
+    )
+
+    actions = compute_foundation_convergence_actions([t1, t2])
+
+    assert len(actions) == 0, "Same-parent siblings should be excluded"
+
+
+def test_compute_foundation_convergence_actions_earlier_task_is_canonical():
+    """Earlier-created task becomes canonical foundation; later depends on earlier."""
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    now = _utcnow()
+    # t2 created first, but t1 will be created later so t2 is canonical
+    t2 = make_task(
+        created_at=now - timedelta(hours=2),
+        id=uuid4(),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create"}],
+        context={"finding_hash": "finding_x"},
+    )
+    t1 = make_task(
+        created_at=now - timedelta(hours=1),
+        id=uuid4(),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create"}],
+        context={"finding_hash": "finding_x"},
+    )
+
+    actions = compute_foundation_convergence_actions([t2, t1])
+
+    assert len(actions) == 1
+    # t2 is earlier (created_at), so it's canonical
+    assert actions[0]["foundation_id"] == str(t2.id)
+    assert actions[0]["dependent_id"] == str(t1.id)
+
+
+def test_compute_foundation_convergence_actions_id_tiebreaker_when_same_time():
+    """When created_at is identical, use ID as tiebreaker (deterministic ordering)."""
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    now = _utcnow()
+    t1 = make_task(
+        created_at=now,
+        id=uuid4(),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "fix"}],
+        context={"provides_capability": "test"},
+    )
+    t2 = make_task(
+        created_at=now,
+        id=uuid4(),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "fix"}],
+        context={"provides_capability": "test"},
+    )
+
+    actions = compute_foundation_convergence_actions([t1, t2])
+
+    assert len(actions) == 1
+    # One should be canonical, the other dependent, but which depends on ID ordering
+    assert actions[0]["foundation_id"] in (str(t1.id), str(t2.id))
+    assert actions[0]["dependent_id"] in (str(t1.id), str(t2.id))
+    assert actions[0]["foundation_id"] != actions[0]["dependent_id"]
+
+
+def test_compute_foundation_convergence_actions_shared_files_populated():
+    """Action payload includes shared files for visibility."""
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    now = _utcnow()
+    # Create files with 85 shared, 15 unique to t1, 0 unique to t2 = 85/100 = 0.85 >= 0.85
+    shared = [f"lib/core_{i}.py" for i in range(85)]
+    unique_t1 = [f"lib/only_t1_{i}.py" for i in range(15)]
+
+    t1 = make_task(
+        created_at=now - timedelta(hours=1),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "refactor"}],
+        context={"related_files": shared + unique_t1},
+    )
+    t2 = make_task(
+        created_at=now,
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "refactor"}],
+        context={"related_files": shared},
+    )
+
+    actions = compute_foundation_convergence_actions([t1, t2])
+
+    assert len(actions) == 1
+    shared_set = set(actions[0]["shared_files"])
+    assert shared_set == set(shared)
+    for f in unique_t1:
+        assert f not in shared_set
+
+
+def test_compute_foundation_convergence_actions_multiple_pairs():
+    """Multiple independent cross-parent pairs all trigger convergence."""
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    now = _utcnow()
+    # Pair 1: two creates with shared finding
+    t1a = make_task(
+        created_at=now,
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create"}],
+        context={"finding_hash": "hash_A"},
+    )
+    t1b = make_task(
+        created_at=now + timedelta(minutes=1),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create"}],
+        context={"finding_hash": "hash_A"},
+    )
+    # Pair 2: two fixes with shared capability
+    t2a = make_task(
+        created_at=now + timedelta(minutes=2),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "fix"}],
+        context={"provides_capability": "auth"},
+    )
+    t2b = make_task(
+        created_at=now + timedelta(minutes=3),
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "fix"}],
+        context={"provides_capability": "auth"},
+    )
+
+    actions = compute_foundation_convergence_actions([t1a, t1b, t2a, t2b])
+
+    assert len(actions) == 2
+    # Verify both pairs are represented
+    pair_ids = {(a["foundation_id"], a["dependent_id"]) for a in actions}
+    assert (str(t1a.id), str(t1b.id)) in pair_ids
+    assert (str(t2a.id), str(t2b.id)) in pair_ids

@@ -2000,6 +2000,13 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     expect(p).toContain('depends_on_indices');
   });
 
+  it('handlePlan prompt instructs cross-file BUILD-ON ordering (consumer after producer)', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('BUILD-ON ordering');
+    expect(p).toContain('DIFFERENT files');
+  });
+
   it('handlePlan prompt contains "subtasks" (plan JSON output schema root key)', async () => {
     await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
     const p = vi.mocked(runClaudeCode).mock.calls[0][0];

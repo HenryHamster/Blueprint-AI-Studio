@@ -1307,6 +1307,7 @@ Rules:
 - Keep prompts concise — describe what to achieve, not step-by-step how
 - Order subtasks so that dependencies flow forward (a subtask can only depend on earlier subtasks)
 - If subtasks involve structural refactors of the same files (renames, interface changes, restructuring), set depends_on_indices between them. Small additive changes to shared files can stay parallel.
+- BUILD-ON ordering (critical): if a subtask CONSUMES code or artifacts another subtask produces — it imports a module/file the other creates, calls a new function/class it adds, or builds a feature on top of its output — set depends_on_indices so the consumer comes AFTER the producer, EVEN IF the two touch DIFFERENT files. Sibling subtasks run concurrently against a clone of the same base; if the producer has not merged, the consumer's clone is missing the new code and it will fail to import it or re-create a conflicting stub. Genuinely independent subtasks (including small additive edits to shared infra) MUST stay parallel — only order true producer→consumer relationships, and make the consumer's related_files/prompt name the producer's file so the ordering is explicit.
 - Aim for 1-4 subtasks. Prefer 1-2 large subtasks over 4-6 small ones. If the task can be one PR, output a single subtask.
 - Do NOT include review, testing, or deployment subtasks — those are handled automatically by the pipeline
 - Use effort=high only for complex architectural subtasks. Leave null for simple additive changes — the orchestrator resolves the model from provider routing.
