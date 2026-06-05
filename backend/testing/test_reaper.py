@@ -7512,6 +7512,190 @@ async def test_unblock_sweep_resumes_when_need_satisfied_by_completed_work(
     assert "completed work" in (t.latest_status_message or "").lower()
 
 
+async def _cross_base_completed_foundation(db, project, *, landed=True):
+    """A COMPLETED code-producing foundation on the integration trunk whose
+    related files overlap a dependent's, so it is a genuine cross-base code dep."""
+    ctx = {"related_files": ["app/foo.py"]}
+    if landed:
+        ctx["landed_on_integration"] = True
+        ctx["pr_merged"] = True
+    foundation = Task(
+        project_id=project.id, title="foundation", description="x",
+        status=TaskStatus.COMPLETED, created_by="u", requires_approval=False,
+        payloads=[{"type": "create", "base_branch": "main"}], context=ctx,
+        status_log=[],
+    )
+    db.add(foundation)
+    await db.commit()
+    await db.refresh(foundation)
+    return foundation
+
+
+async def _cross_base_blocked_dependent(db, project, foundation, now):
+    """A blocked dependent on its OWN rollup base (≠ integration) whose need names
+    the completed foundation, with no dependency edge wired yet."""
+    return await _blocked_task(
+        db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: waiting on foundation",
+        depends_on=[],
+        payloads=[{"type": "fix", "base_branch": "rollup/dep"}],
+        context={
+            "related_files": ["app/foo.py"],
+            "blocker": {
+                "source": "agent", "waiting_on": "foundation",
+                "reason": "BLOCKER: waiting on foundation",
+                "need": {"kind": "task", "ref": str(foundation.id)},
+            },
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_recuts_base_when_cross_base_foundation_landed(
+    reaper_db, mocker
+):
+    """A blocked dependent resuming because its CROSS-BASE genuine code foundation
+    already landed must have its base re-cut from integration BEFORE it leaves
+    BLOCKED — otherwise it dispatches against a stale base missing the landed code."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    token = mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock, return_value=("tok", "owner", "repo"),
+    )
+    merge = mocker.patch(
+        "app.github.merge_branch",
+        new_callable=AsyncMock, return_value={"merged": True},
+    )
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    foundation = await _cross_base_completed_foundation(reaper_db, project)
+    t = await _cross_base_blocked_dependent(reaper_db, project, foundation, now)
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    # The shared re-cut helper merged integration into the dependent's base.
+    assert token.await_count == 1
+    assert merge.await_count == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    assert not (t.depends_on or [])
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_same_base_completed_foundation_skips_recut(
+    reaper_db, mocker
+):
+    """A SAME-BASE completed foundation needs no re-cut — the dependent resumes
+    exactly as before and no merge is attempted (no false serialization)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    merge = mocker.patch(
+        "app.github.merge_branch",
+        new_callable=AsyncMock, return_value={"merged": True},
+    )
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    # Foundation and dependent share the same (default integration) base branch.
+    foundation = Task(
+        project_id=project.id, title="foundation", description="x",
+        status=TaskStatus.COMPLETED, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}],
+        context={"related_files": ["app/foo.py"],
+                 "landed_on_integration": True, "pr_merged": True},
+        status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: waiting on foundation",
+        depends_on=[],
+        context={
+            "related_files": ["app/foo.py"],
+            "blocker": {
+                "source": "agent", "waiting_on": "foundation",
+                "reason": "BLOCKER: waiting on foundation",
+                "need": {"kind": "task", "ref": str(foundation.id)},
+            },
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    merge.assert_not_awaited()
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_holds_dependent_when_recut_conflicts(reaper_db, mocker):
+    """When the cross-base re-cut CONFLICTS, the dependent is HELD (kept BLOCKED,
+    re-armed for next cycle) rather than resumed against an un-recut base."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock, return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.merge_branch",
+        new_callable=AsyncMock, return_value={"conflict": True},
+    )
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    foundation = await _cross_base_completed_foundation(reaper_db, project)
+    t = await _cross_base_blocked_dependent(reaper_db, project, foundation, now)
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    # Held: still BLOCKED, never resumed, and re-armed for a later recheck.
+    assert t.status == TaskStatus.BLOCKED
+    assert "blocker" in (t.context or {})
+    assert t.recheck_after is not None and t.recheck_after > now
+
+
+@pytest.mark.asyncio
+async def test_parked_blocker_holds_when_cross_base_recut_conflicts(reaper_db, mocker):
+    """The parked-resume path applies the SAME cross-base re-cut guard: a conflict
+    keeps the parked blocker BLOCKED instead of resuming it against a stale base."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock, return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.merge_branch",
+        new_callable=AsyncMock, return_value={"conflict": True},
+    )
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    foundation = await _cross_base_completed_foundation(reaper_db, project)
+    t = await _parked_blocker(
+        reaper_db, project,
+        need={"kind": "task", "ref": str(foundation.id)}, now=now,
+    )
+    # Give the parked dependent its own rollup base + overlapping files so the
+    # completed foundation is a genuine cross-base code dependency.
+    t.payloads = [{"type": "fix", "base_branch": "rollup/dep"}]
+    t.context = {**(t.context or {}), "related_files": ["app/foo.py"]}
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    assert t.context.get("_blocked_escalated") is True
+
+
 @pytest.mark.asyncio
 async def test_unblock_sweep_cancels_when_needed_foundation_terminally_dead(
     reaper_db, mocker

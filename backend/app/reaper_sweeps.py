@@ -868,6 +868,37 @@ async def _fetch_completed_candidates(session, project_id) -> list:
     )
 
 
+async def _completed_foundation_base_safe(task, need, completed, session) -> bool:
+    """Re-cut a resuming dependent's base when its landed foundation is cross-base.
+
+    A blocked dependent that resumes because its need is satisfied by ALREADY-
+    completed work carries NO ``depends_on`` edge, so the dispatch-time re-cut
+    (which only inspects edged candidates) can never fire for it. If the completed
+    foundation that satisfied the need is a GENUINE cross-base code dependency that
+    has landed on integration, the dependent would otherwise dispatch against a
+    staging base forked before the foundation landed — exactly the failure the
+    re-cut machinery exists to prevent.
+
+    Resolve the actual landed foundation and run it through the SAME shared re-cut
+    helper the dispatch/completion paths use (``ensure_dependent_base_recut``):
+
+      * Same-base or ordering-only foundation → no re-cut needed → returns ``True``
+        (the dependent resumes exactly as before — no false serialization).
+      * Cross-base code foundation, re-cut succeeds → ``True`` (base now contains
+        the landed code; safe to resume).
+      * Cross-base code foundation, re-cut conflicts or hits a transient error →
+        ``False`` — the caller must HOLD the dependent (keep it blocked / re-park
+        and retry next cycle), never resume against an un-recut base.
+    """
+    from app.blocked_need_resolution import completed_foundation_for_need
+    from app.orchestrator_health import ensure_dependent_base_recut
+
+    foundation = completed_foundation_for_need(task, need, completed)
+    if foundation is None:  # defensive — caller already confirmed satisfaction
+        return True
+    return await ensure_dependent_base_recut(task, [foundation], session)
+
+
 async def _fetch_dead_candidates(session, project_id) -> list:
     """Terminally failed/cancelled tasks — foundations that have definitively DIED.
 
@@ -1052,6 +1083,12 @@ async def _maybe_resume_parked_blocker(
             completed = await _fetch_completed_candidates(session, task.project_id)
             completed_cache[task.project_id] = completed
         if not need_satisfied_by_completed(task, need, completed):
+            return False
+        # The completed foundation carries no edge, so the dispatch-time re-cut
+        # cannot fire. If it is a cross-base genuine code dependency, re-cut the
+        # base from integration BEFORE resuming; hold (stay parked) on conflict/
+        # error so we never resume against a base missing the landed code.
+        if not await _completed_foundation_base_safe(task, need, completed, session):
             return False
         message = "Resumed from parked — need satisfied by completed work, requeued"
 
@@ -1273,6 +1310,24 @@ async def sweep_unblock_blocked_tasks(
                 )
                 completed_cache[task.project_id] = completed
             if need_satisfied_by_completed(task, need, completed):
+                # The satisfying foundation carries no edge, so the dispatch-time
+                # re-cut cannot fire. If it is a cross-base genuine code
+                # dependency, re-cut the base from integration BEFORE leaving
+                # BLOCKED; on conflict/transient error HOLD (re-arm a backed-off
+                # recheck) so we never dispatch against a base missing the landed
+                # code. Same-base / ordering-only foundations need no re-cut and
+                # resume exactly as before.
+                if not await _completed_foundation_base_safe(
+                    task, need, completed, session
+                ):
+                    attempts = int(ctx.get("_blocked_recheck_attempts", 0)) + 1
+                    ctx["_blocked_recheck_attempts"] = attempts
+                    task.context = ctx
+                    task.recheck_after = now + _next_recheck_delay(attempts)
+                    flag_modified(task, "context")
+                    session.add(task)
+                    changed = True
+                    continue
                 _clear_blocked_fields(task, preserve_first_blocked=False)
                 task.status = TaskStatus.QUEUED
                 task.latest_status_message = (

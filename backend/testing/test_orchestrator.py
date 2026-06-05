@@ -2595,6 +2595,156 @@ class TestMarkUnblockedDependents:
         await db_session.refresh(dependent)
         assert dependent.context.get("_deps_satisfied") is True
 
+    @pytest.mark.asyncio
+    async def test_does_not_mark_dependent_when_recut_conflicts(
+        self, db_session, mocker
+    ):
+        """Completion-side warm-claim path: when a re-cut conflicts, the marker
+        is NOT stamped, so the dependent stays unmarked and must wait for
+        dispatch's retry path to resolve the conflict.
+
+        Regression guard: a conflicting re-cut must prevent warm-claim stamping
+        BEFORE it happens (not clear it after). This ensures a dependent never
+        becomes warm-claimable against a base missing the landed dependency code."""
+        from app.orchestrator import _mark_unblocked_dependents
+        from app.landed_signal import mark_landed_on_integration
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            return_value={"merged": False, "conflict": True},
+        )
+        project = make_project(
+            name="UnblockConflict", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Cross-base code dependency that has landed.
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        mark_landed_on_integration(dep)
+        # Dependent on a different base where re-cut will conflict.
+        completed = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "base_branch": "plan/bbb"}],
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add_all([dep, completed])
+        await db_session.commit()
+        await db_session.refresh(dep)
+        await db_session.refresh(completed)
+
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "plan/bbb"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep.id), str(completed.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+        await db_session.refresh(dependent)
+
+        mocker.patch(
+            "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
+
+        # Re-cut conflicts → no dependents marked.
+        marked = await _mark_unblocked_dependents(completed, self._verify_true)
+        assert marked == 0
+
+        # Dependent must NOT have the warm-claim marker.
+        db_session.expire(dependent)
+        await db_session.refresh(dependent)
+        assert not (dependent.context or {}).get("_deps_satisfied")
+
+    @pytest.mark.asyncio
+    async def test_does_not_mark_dependent_when_recut_errors(
+        self, db_session, mocker
+    ):
+        """Completion-side warm-claim path: transient re-cut errors (GitHub API
+        failures, credential issues) hold the dependent for retry next cycle
+        instead of stamping it as warm-claimable against an un-recut base.
+
+        The dependent stays QUEUED and unmarked, so it will be re-evaluated on
+        the next completion cycle (once the transient error resolves or an
+        operator manually retries)."""
+        from app.orchestrator import _mark_unblocked_dependents
+        from app.landed_signal import mark_landed_on_integration
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        # Simulate a transient GitHub API error (e.g. rate limit, timeout).
+        mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            side_effect=Exception("GitHub API timeout"),
+        )
+        project = make_project(
+            name="UnblockTransient", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Cross-base code dependency that has landed.
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        mark_landed_on_integration(dep)
+        # Dependent on a different base where re-cut will error.
+        completed = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "base_branch": "plan/bbb"}],
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add_all([dep, completed])
+        await db_session.commit()
+        await db_session.refresh(dep)
+        await db_session.refresh(completed)
+
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "plan/bbb"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep.id), str(completed.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+        await db_session.refresh(dependent)
+
+        mocker.patch(
+            "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
+
+        # Transient error → no dependents marked.
+        marked = await _mark_unblocked_dependents(completed, self._verify_true)
+        assert marked == 0
+
+        # Dependent must NOT have the warm-claim marker; stays QUEUED for retry.
+        db_session.expire(dependent)
+        await db_session.refresh(dependent)
+        assert not (dependent.context or {}).get("_deps_satisfied")
+        assert dependent.status == TaskStatus.QUEUED
+
 
 class TestOrchestratorClosureSafety:
     """Regression: a `from app.compute import X` inside orchestrator_worker

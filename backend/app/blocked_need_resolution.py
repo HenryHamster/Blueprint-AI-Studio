@@ -152,6 +152,23 @@ def _match_need(need: Dict[str, Any], candidates: List[Task]) -> Optional[Task]:
     return None
 
 
+def completed_foundation_for_need(
+    task: Task, need: Dict[str, Any], completed_candidates: List[Task]
+) -> Optional[Task]:
+    """Return the already-completed task that satisfies ``need``, or ``None``.
+
+    Same exact-match signals as the live path (task id / PR number / explicit
+    capability marker) — never a fuzzy guess. Exposed (alongside the boolean
+    :func:`need_satisfied_by_completed`) so a resume path can inspect the actual
+    landed foundation — e.g. to decide whether a cross-base base re-cut is
+    required before the dependent leaves BLOCKED.
+    """
+    if not isinstance(need, dict):
+        return None
+    eligible = [c for c in completed_candidates if c.id != task.id]
+    return _match_need(need, eligible)
+
+
 def need_satisfied_by_completed(
     task: Task, need: Dict[str, Any], completed_candidates: List[Task]
 ) -> bool:
@@ -167,10 +184,7 @@ def need_satisfied_by_completed(
     explicit capability marker) — never a fuzzy guess. ``completed_candidates`` is
     the pre-fetched set of same-project tasks in :data:`COMPLETED_CANDIDATE_STATUSES`.
     """
-    if not isinstance(need, dict):
-        return False
-    eligible = [c for c in completed_candidates if c.id != task.id]
-    return _match_need(need, eligible) is not None
+    return completed_foundation_for_need(task, need, completed_candidates) is not None
 
 
 def need_matched_dead_foundation(
