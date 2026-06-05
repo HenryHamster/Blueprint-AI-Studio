@@ -17,6 +17,7 @@ import { ScopeTrendsSection, type ScopeBaselinesResponse } from './ScopeTrendsSe
 import { ProviderCostPanel } from './ProviderCostPanel';
 import { ProviderModelBreakdownPanel } from './ProviderModelBreakdownPanel';
 import { LlmCostBreakdownPanel } from './LlmCostBreakdownPanel';
+import { EffortEfficiencyPanel } from './EffortEfficiencyPanel';
 import { DriftSignalsCard } from './DriftSignalsCard';
 import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHealthPanel';
 import { SystemMaturityCard, type SystemMaturityRow } from './SystemMaturityCard';
@@ -751,6 +752,9 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
 
           {/* Section 2g: LLM Cost by Model */}
           <LlmCostBreakdownPanel selectedProjectId={selectedProjectId} />
+
+          {/* Section 2h: Effort-tier & actual-model efficiency (cost vs landed) */}
+          {!loading && <EffortEfficiencyPanel data={digest?.effort_model_efficiency} />}
 
           {/* Drift Signals */}
           {!!selectedProjectId && <DriftSignalsCard projectId={selectedProjectId} />}

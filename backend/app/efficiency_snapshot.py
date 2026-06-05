@@ -1164,6 +1164,251 @@ def _compute_llm_cost_pricing_coverage(
     }
 
 
+# ---------------------------------------------------------------------------
+# Per-effort-tier and per-actual-model efficiency rollup (operator payoff view)
+# ---------------------------------------------------------------------------
+# Agent runs are scaled along an effort ladder (low->haiku, medium->sonnet,
+# high/max->opus) where higher effort selects a more capable AND more expensive
+# model. The existing cost surfaces break spend down by task TYPE and give a
+# per-MODEL cost breakdown, but neither answers the direction question: does
+# paying for a higher effort tier (or a pricier resolved model) actually earn
+# its money in LANDED PRs? This rollup attributes LLM token cost — reusing the
+# same LLM_TOKEN_PRICING table and the same is_merged_completion "shipped"
+# predicate the other cost surfaces use, so its totals reconcile with
+# compute_llm_cost_breakdown — to BOTH:
+#   * the REQUESTED effort tier (task.first_payload["effort"]), and
+#   * the ACTUAL resolved (provider, model),
+# alongside run count, landed/merge rate, cost-per-merge, and token volume.
+#
+# Honesty rules (mirrors compute_llm_cost_breakdown):
+#   * Unpriced (provider, model) combos contribute 0 cost but are still counted
+#     in run/token totals and surfaced in ``unpriced_combos`` +
+#     ``unpriced_coverage_fraction`` — never silently folded into priced totals.
+#   * Requested-vs-actual divergence is made explicit: each effort row carries a
+#     ``resolved_models`` breakdown (which models a given requested tier actually
+#     ran on), and the top-level ``fallbacks`` block aggregates the
+#     ``context.model_fallback`` downgrade records (preview->GA etc.).
+
+# Canonical effort-ladder ordering for stable, low->max row sorting. Unknown /
+# unspecified efforts sort last (alphabetically among themselves).
+_EFFORT_TIER_ORDER: dict[str, int] = {"low": 0, "medium": 1, "high": 2, "max": 3}
+_EFFORT_UNSPECIFIED = "unspecified"
+# Cap on the surfaced model-fallback divergence list so a noisy window never
+# bloats the digest payload.
+_FALLBACK_LIST_CAP = 20
+
+
+def _new_efficiency_bucket() -> Dict[str, Any]:
+    return {
+        "run_count": 0,
+        "landed_count": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "llm_call_count": 0,
+        "cost_usd": 0.0,
+        # Among token-bearing ("priceable") runs only — mirrors
+        # _compute_llm_cost_pricing_coverage so coverage fractions reconcile.
+        "priced_run_count": 0,
+        "unpriced_run_count": 0,
+    }
+
+
+def _finalize_efficiency_bucket(b: Dict[str, Any], **extra: Any) -> Dict[str, Any]:
+    run_count = int(b["run_count"])
+    landed_count = int(b["landed_count"])
+    cost = round(float(b["cost_usd"]), 6)
+    priceable = int(b["priced_run_count"]) + int(b["unpriced_run_count"])
+    out: Dict[str, Any] = {
+        "run_count": run_count,
+        "landed_count": landed_count,
+        "landed_rate": round(landed_count / run_count, 4) if run_count else None,
+        "total_cost_usd": cost,
+        # Cost-per-merge is the headline payoff number: priced LLM dollars spent
+        # per PR that actually landed. None when nothing landed (no denominator).
+        "cost_per_merge": round(cost / landed_count, 6) if landed_count else None,
+        "input_tokens": int(b["input_tokens"]),
+        "output_tokens": int(b["output_tokens"]),
+        "llm_call_count": int(b["llm_call_count"]),
+        "priced_run_count": int(b["priced_run_count"]),
+        "unpriced_run_count": int(b["unpriced_run_count"]),
+        "unpriced_coverage_fraction": (
+            round(b["priced_run_count"] / priceable, 4) if priceable else None
+        ),
+    }
+    out.update(extra)
+    return out
+
+
+def compute_effort_model_efficiency(tasks: list[Task]) -> Dict[str, Any]:
+    """Per-effort-tier and per-actual-model efficiency rollup over finished tasks.
+
+    Pure function — no DB calls. For each task it reads the REQUESTED effort from
+    ``task.first_payload["effort"]``, the ACTUAL ``provider`` / ``model`` and
+    token usage from the persisted Task fields (via
+    :func:`get_task_total_llm_totals`), and the landed/merge status from
+    :func:`is_merged_completion` (the same shipped predicate the other cost
+    surfaces use). LLM cost is priced with the shared :data:`LLM_TOKEN_PRICING`
+    table exactly as :func:`compute_llm_cost_breakdown` does, so the totals
+    reconcile with the existing per-model cost surface.
+
+    Returns a dict with:
+      - ``by_effort``: rows keyed by requested effort tier (low->max, then
+        ``unspecified``). Each row carries run count, landed count + rate, priced
+        LLM cost, cost-per-merge, token volume, priced/unpriced coverage, and a
+        ``resolved_models`` breakdown exposing which actual models that requested
+        tier ran on (requested-vs-actual divergence).
+      - ``by_model``: rows keyed by actual (provider, model) with a ``priced``
+        flag, sorted by cost desc. Unpriced combos appear with 0 cost.
+      - ``totals``: aggregate run/landed/cost/token totals + priced/unpriced
+        coverage.
+      - ``unpriced_combos``: capped list of ``provider:model`` strings with
+        non-zero tokens but no pricing entry (never folded into priced cost).
+      - ``fallbacks``: aggregate of ``context.model_fallback`` downgrade records
+        (requested != effective resolved model), with a capped per-combo list.
+    """
+    from collections import defaultdict  # noqa: PLC0415
+
+    effort_buckets: Dict[str, Dict[str, Any]] = defaultdict(_new_efficiency_bucket)
+    # effort -> (provider, model) -> {run_count, landed_count, priced}
+    effort_models: Dict[str, Dict[tuple[str, str], Dict[str, Any]]] = defaultdict(dict)
+    model_buckets: Dict[tuple[str, str], Dict[str, Any]] = defaultdict(
+        _new_efficiency_bucket
+    )
+    priced_model_keys: set[tuple[str, str]] = set()
+    unpriced_combos: list[str] = []
+
+    totals = _new_efficiency_bucket()
+
+    # Model-fallback (requested-vs-actual divergence) aggregation.
+    fallback_total = 0
+    fallback_combos: Dict[tuple[str, str, str, str], int] = defaultdict(int)
+
+    for t in tasks:
+        input_tokens, output_tokens, call_count = get_task_total_llm_totals(t)
+        has_tokens = (input_tokens > 0) or (output_tokens > 0)
+        if not t.provider or not t.model:
+            provider, model = "unattributed", "unknown"
+        else:
+            provider, model = t.provider.lower(), t.model.lower()
+        key = (provider, model)
+
+        pricing = LLM_TOKEN_PRICING.get(key)
+        priced = pricing is not None
+        if priced:
+            input_rate, output_rate = pricing
+            cost = input_tokens * input_rate + output_tokens * output_rate
+        else:
+            cost = 0.0
+            if has_tokens:
+                combo = f"{provider}:{model}"
+                if (
+                    combo not in unpriced_combos
+                    and len(unpriced_combos) < _UNPRICED_COMBOS_CAP
+                ):
+                    unpriced_combos.append(combo)
+
+        landed = is_merged_completion(t)
+        effort_raw = (t.first_payload or {}).get("effort")
+        effort = str(effort_raw) if effort_raw else _EFFORT_UNSPECIFIED
+
+        def _accumulate(b: Dict[str, Any]) -> None:
+            b["run_count"] += 1
+            b["input_tokens"] += int(input_tokens)
+            b["output_tokens"] += int(output_tokens)
+            b["llm_call_count"] += int(call_count)
+            b["cost_usd"] += cost
+            if landed:
+                b["landed_count"] += 1
+            # Only token-bearing runs carry a cost signal worth a coverage verdict.
+            if has_tokens:
+                if priced:
+                    b["priced_run_count"] += 1
+                else:
+                    b["unpriced_run_count"] += 1
+
+        _accumulate(effort_buckets[effort])
+        _accumulate(model_buckets[key])
+        _accumulate(totals)
+        if priced:
+            priced_model_keys.add(key)
+
+        em = effort_models[effort].setdefault(
+            key,
+            {"run_count": 0, "landed_count": 0, "priced": priced},
+        )
+        em["run_count"] += 1
+        if landed:
+            em["landed_count"] += 1
+
+        fallback = (t.context or {}).get("model_fallback")
+        if isinstance(fallback, dict) and fallback.get("requested"):
+            fallback_total += 1
+            fcombo = (
+                str(fallback.get("requested") or ""),
+                str(fallback.get("effective") or ""),
+                str(fallback.get("provider") or ""),
+                str(fallback.get("reason") or ""),
+            )
+            fallback_combos[fcombo] += 1
+
+    def _resolved_models(effort: str) -> list[Dict[str, Any]]:
+        rows = [
+            {
+                "provider": prov,
+                "model": mdl,
+                "run_count": int(v["run_count"]),
+                "landed_count": int(v["landed_count"]),
+                "priced": bool(v["priced"]),
+            }
+            for (prov, mdl), v in effort_models.get(effort, {}).items()
+        ]
+        rows.sort(key=lambda r: (-r["run_count"], r["provider"], r["model"]))
+        return rows
+
+    by_effort = [
+        _finalize_efficiency_bucket(
+            effort_buckets[effort], effort=effort, resolved_models=_resolved_models(effort)
+        )
+        for effort in sorted(
+            effort_buckets, key=lambda e: (_EFFORT_TIER_ORDER.get(e, 99), e)
+        )
+    ]
+    by_model = [
+        _finalize_efficiency_bucket(
+            model_buckets[key],
+            provider=key[0],
+            model=key[1],
+            priced=key in priced_model_keys,
+        )
+        for key in sorted(
+            model_buckets, key=lambda k: (-model_buckets[k]["cost_usd"], k[0], k[1])
+        )
+    ]
+    fallback_list = [
+        {
+            "requested": req,
+            "effective": eff,
+            "provider": prov,
+            "reason": reason,
+            "count": count,
+        }
+        for (req, eff, prov, reason), count in sorted(
+            fallback_combos.items(), key=lambda kv: (-kv[1], kv[0])
+        )[:_FALLBACK_LIST_CAP]
+    ]
+
+    return {
+        "by_effort": by_effort,
+        "by_model": by_model,
+        "totals": _finalize_efficiency_bucket(totals),
+        "unpriced_combos": unpriced_combos,
+        "fallbacks": {
+            "total": fallback_total,
+            "combos": fallback_list,
+        },
+    }
+
+
 def _compute_vm_cold_start_p50_ms(tasks: list[Task]) -> Optional[float]:
     samples = [int(t.vm_cold_start_ms) for t in tasks if t.vm_cold_start_ms is not None]
     if not samples:

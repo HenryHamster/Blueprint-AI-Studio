@@ -40,6 +40,12 @@ from app.digest_remediation import (  # noqa: F401
 # its own module. Re-exported here so existing import paths are unchanged.
 from app.digest_direction_progress import compute_direction_progress  # noqa: F401
 
+# Per-effort-tier / per-actual-model efficiency rollup lives next to the shared
+# LLM pricing table in efficiency_snapshot (so its totals reconcile with the
+# per-model cost breakdown). Re-exported here so the digest consumer and tests
+# import it from the same module as the other digest metrics.
+from app.efficiency_snapshot import compute_effort_model_efficiency  # noqa: F401
+
 # SR/review-quality metrics cluster relocated to its own module.
 # Re-exported here so existing import paths are unchanged.
 from app.sr_review_quality_metrics import (  # noqa: F401

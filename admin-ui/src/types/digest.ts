@@ -120,6 +120,71 @@ export interface MergeGateFleetHealth {
   project_count: number;
 }
 
+// Per-effort-tier / per-actual-model LLM efficiency rollup (read-only).
+// Mirrors the backend `compute_effort_model_efficiency` payload
+// (efficiency_snapshot.py): each row carries run/landed counts + rate, priced
+// LLM cost, cost-per-merge, token volume, and priced/unpriced coverage so an
+// understated (unpriced) cost is visible rather than silently folded into the
+// priced total.
+export interface EfficiencyBucket {
+  run_count: number;
+  landed_count: number;
+  landed_rate: number | null;
+  total_cost_usd: number;
+  // Priced LLM dollars per PR that actually landed; null when nothing landed.
+  cost_per_merge: number | null;
+  input_tokens: number;
+  output_tokens: number;
+  llm_call_count: number;
+  // Token-bearing ("priceable") runs split by whether the (provider, model)
+  // combo has a pricing entry. Unpriced runs contribute 0 cost.
+  priced_run_count: number;
+  unpriced_run_count: number;
+  unpriced_coverage_fraction: number | null;
+}
+
+// Which actual models a requested effort tier ran on (requested-vs-actual
+// divergence — e.g. a high-effort run that fell back to a cheaper model).
+export interface EfficiencyResolvedModel {
+  provider: string;
+  model: string;
+  run_count: number;
+  landed_count: number;
+  priced: boolean;
+}
+
+export interface EffortEfficiencyRow extends EfficiencyBucket {
+  effort: string;
+  resolved_models: EfficiencyResolvedModel[];
+}
+
+export interface ModelEfficiencyRow extends EfficiencyBucket {
+  provider: string;
+  model: string;
+  priced: boolean;
+}
+
+// Aggregated model-fallback (downgrade) records: a requested model resolved to
+// a different effective model (preview->GA, rate-limit fallback, etc.).
+export interface EfficiencyFallbackCombo {
+  requested: string;
+  effective: string;
+  provider: string;
+  reason: string;
+  count: number;
+}
+
+export interface EffortModelEfficiency {
+  by_effort: EffortEfficiencyRow[];
+  by_model: ModelEfficiencyRow[];
+  totals: EfficiencyBucket;
+  unpriced_combos: string[];
+  fallbacks: {
+    total: number;
+    combos: EfficiencyFallbackCombo[];
+  };
+}
+
 export interface DigestData<DP = unknown> {
   // ----- core contract (validated by assertDigestContract) -----
   failed_count: number;
@@ -183,6 +248,9 @@ export interface DigestData<DP = unknown> {
   cost_by_failure_class?: Record<string, number> | null;
   total_failed_cost_usd?: number | null;
   median_cost_per_merged_pr?: number | null;
+  // Per-effort-tier / per-actual-model efficiency rollup (additive; absent on
+  // older backends that predate compute_effort_model_efficiency).
+  effort_model_efficiency?: EffortModelEfficiency | null;
 
   // ----- scope conversion -----
   scope_conversion_rates?: ScopeConversionRates | null;

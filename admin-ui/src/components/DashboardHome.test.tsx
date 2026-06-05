@@ -2285,4 +2285,87 @@ describe('DashboardHome', () => {
     expect(screen.queryByText('backend example 1')).not.toBeInTheDocument();
     expect(screen.getByText('frontend example 1')).toBeInTheDocument();
   });
+
+  describe('EffortEfficiencyPanel mount', () => {
+    const efficiencyDigest = {
+      failed_count: 0,
+      pending_approval_count: 0,
+      completed_count: 0,
+      failure_groups: [],
+      direction_progress: [],
+      recent_completions: [],
+      effort_model_efficiency: {
+        by_effort: [
+          {
+            effort: 'high',
+            run_count: 5,
+            landed_count: 2,
+            landed_rate: 0.4,
+            total_cost_usd: 30,
+            cost_per_merge: 15,
+            input_tokens: 1000,
+            output_tokens: 500,
+            llm_call_count: 12,
+            priced_run_count: 5,
+            unpriced_run_count: 0,
+            unpriced_coverage_fraction: 1,
+            resolved_models: [],
+          },
+        ],
+        by_model: [
+          {
+            provider: 'anthropic',
+            model: 'claude-opus-4-8',
+            priced: true,
+            run_count: 5,
+            landed_count: 2,
+            landed_rate: 0.4,
+            total_cost_usd: 30,
+            cost_per_merge: 15,
+            input_tokens: 1000,
+            output_tokens: 500,
+            llm_call_count: 12,
+            priced_run_count: 5,
+            unpriced_run_count: 0,
+            unpriced_coverage_fraction: 1,
+          },
+        ],
+        totals: {
+          run_count: 5,
+          landed_count: 2,
+          landed_rate: 0.4,
+          total_cost_usd: 30,
+          cost_per_merge: 15,
+          input_tokens: 1000,
+          output_tokens: 500,
+          llm_call_count: 12,
+          priced_run_count: 5,
+          unpriced_run_count: 0,
+          unpriced_coverage_fraction: 1,
+        },
+        unpriced_combos: [],
+        fallbacks: { total: 0, combos: [] },
+      },
+    };
+
+    it('renders the panel when the digest carries the effort/model rollup', async () => {
+      setupApiMocks({ digest: efficiencyDigest, diagnostics: makeDiagnostics() });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      expect(await screen.findByText('Effort & Model Efficiency')).toBeInTheDocument();
+    });
+
+    it('omits the panel when the digest has no effort/model rollup', async () => {
+      setupApiMocks({
+        digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      await screen.findByText('All systems healthy');
+      expect(screen.queryByText('Effort & Model Efficiency')).not.toBeInTheDocument();
+    });
+  });
 });

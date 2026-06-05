@@ -180,6 +180,75 @@ class TestScopeBudgetGate:
         assert cal_from == "medium"
 
 
+class TestScopeAwareEffortMapping:
+    """Scope-aware effort scaling: verify scope→effort mapping for code-producing task types."""
+
+    def test_scope_aware_types_include_qa_and_migrate(self):
+        """qa and migrate are in _SCOPE_AWARE_EFFORT_TYPES."""
+        from app.research_completion import _SCOPE_AWARE_EFFORT_TYPES
+
+        assert "qa" in _SCOPE_AWARE_EFFORT_TYPES
+        assert "migrate" in _SCOPE_AWARE_EFFORT_TYPES
+
+    def test_original_scope_aware_types_still_present(self):
+        """Original types (create, fix, refactor, plan) remain in _SCOPE_AWARE_EFFORT_TYPES."""
+        from app.research_completion import _SCOPE_AWARE_EFFORT_TYPES
+
+        expected = {"create", "fix", "refactor", "plan"}
+        assert expected.issubset(_SCOPE_AWARE_EFFORT_TYPES)
+
+    def test_scope_to_effort_mapping(self):
+        """scope_to_effort correctly maps scopes to effort levels."""
+        from app.branch_resolution import scope_to_effort
+
+        assert scope_to_effort("small") == "low"
+        assert scope_to_effort("medium") == "medium"
+        assert scope_to_effort("large") == "high"
+        # Unknown scopes fall back to medium
+        assert scope_to_effort("unknown") == "medium"
+        assert scope_to_effort(None) == "medium"
+
+    def test_qa_small_maps_to_low_effort(self):
+        """A small-scope qa task should map to low effort."""
+        from app.branch_resolution import scope_to_effort
+
+        scope = "small"
+        effort = scope_to_effort(scope)
+        assert effort == "low"
+
+    def test_qa_medium_maps_to_medium_effort(self):
+        """A medium-scope qa task should map to medium effort."""
+        from app.branch_resolution import scope_to_effort
+
+        scope = "medium"
+        effort = scope_to_effort(scope)
+        assert effort == "medium"
+
+    def test_qa_large_maps_to_high_effort(self):
+        """A large-scope qa task should map to high effort."""
+        from app.branch_resolution import scope_to_effort
+
+        scope = "large"
+        effort = scope_to_effort(scope)
+        assert effort == "high"
+
+    def test_migrate_small_maps_to_low_effort(self):
+        """A small-scope migrate task should map to low effort."""
+        from app.branch_resolution import scope_to_effort
+
+        scope = "small"
+        effort = scope_to_effort(scope)
+        assert effort == "low"
+
+    def test_migrate_large_maps_to_high_effort(self):
+        """A large-scope migrate task should map to high effort."""
+        from app.branch_resolution import scope_to_effort
+
+        scope = "large"
+        effort = scope_to_effort(scope)
+        assert effort == "high"
+
+
 class TestLowActionabilityDecay:
     """Low-actionability deferral gate: discard findings after 3 consecutive deferrals."""
 

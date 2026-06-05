@@ -125,9 +125,15 @@ logger = logging.getLogger(__name__)
 
 # Task types whose effort is driven by the calibrated scope rather than the
 # type-level task_type_efforts config default. These are the "implementation"
-# types where cost should scale with code-change size; specialized types like
-# research/security_audit/qa keep their type-level effort regardless of scope.
-_SCOPE_AWARE_EFFORT_TYPES = frozenset({"create", "fix", "refactor", "plan"})
+# types where cost should scale with code-change size: create, fix, refactor,
+# plan spawn implementation subtasks at scope-derived effort; qa and migrate
+# ship real code/schema changes that scale from trivial (one test/one column) to
+# large (test restructuring/multi-table refactoring), so they benefit from the
+# same scaling. deps and docs are omitted — dependency updates and docs tend to
+# be lightweight and consistent across scope, so their type-level effort is kept.
+_SCOPE_AWARE_EFFORT_TYPES = frozenset(
+    {"create", "fix", "refactor", "plan", "qa", "migrate"}
+)
 
 # Minimum medium-scope exploration fraction. Prevents the adaptive formula from
 # collapsing to 0 for a direction with no successful medium merges, which would

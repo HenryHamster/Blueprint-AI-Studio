@@ -27,6 +27,9 @@ import {
   formatDecompositionOutcomes,
 } from './research-direction-context.js';
 import { renderDirection } from './direction-renderer.js';
+import {
+  writeFetchHelper, buildFetchGuidance, RESEARCH_FETCH_VERBS, PLAN_FETCH_VERBS,
+} from './strategic-helpers.js';
 export {
   formatCochangeHints,
   formatDecompositionOutcomes,
@@ -1215,6 +1218,13 @@ export async function handlePlan(
   // The plan prompt advertises `./design-doc get <key>` for architectural
   // grounding; provision the read-only helper so that contract is honest.
   writeDesignDocHelper(taskId, WORKSPACE, { readOnly: true });
+  // Provision the read-only ./fetch helper (direction|section|playbook) so the
+  // planner can resolve refs trimmed from its launch snapshot. project_id is set
+  // for all task types by the backend; if it is missing we skip BOTH the helper
+  // and its prompt advertisement so we never promise a helper we didn't write.
+  const planProjectId = ((task.project_metadata as Record<string, unknown> | undefined)?.project_id as string | undefined) ?? '';
+  if (planProjectId) writeFetchHelper(taskId, planProjectId, WORKSPACE, { verbs: PLAN_FETCH_VERBS });
+  const planFetchGuidance = planProjectId ? buildFetchGuidance(PLAN_FETCH_VERBS) : '';
   const disallowedTools = configureAgentPermissions('plan');
   const promptFingerprint = computeResearchPlanPromptFingerprint('plan');
   const setPromptFingerprint = (indexMod as { setCurrentPromptFingerprint?: (fp: string) => void }).setCurrentPromptFingerprint;
@@ -1320,7 +1330,7 @@ Rules:
 - IMPORTANT: Write your plan JSON to /tmp/plan_output_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.
 - ALSO write /tmp/plan_progress_${taskId}.md — a concise markdown summary (under ~3000 chars) of your decomposition: which areas of the codebase you explored, the rationale for how you split the work, the file targets and key constraints per subtask, and any risks or open questions. This artifact is surfaced to retry agents if this task fails, so they can pick up without re-investigating.${planPromptSuffix}${planFirstTaskSection}${PLAYBOOK_GUIDANCE}
 
-${DEFAULT_TOOL_GUIDANCE}`;
+${planFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
 
   statusRef.value = `Running ${getProviderRunner().displayName} for planning...`;
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(planPrompt, ws, statusRef, model, effort, disallowedTools);
@@ -1402,6 +1412,13 @@ export async function handleResearch(
   // The research prompt advertises `./design-doc get <key>` for architectural
   // grounding; provision the read-only helper so that contract is honest.
   writeDesignDocHelper(taskId, WORKSPACE, { readOnly: true });
+  // Provision the read-only ./fetch helper (direction|problem-model|gap) so the
+  // research agent can resolve refs trimmed from its launch snapshot. project_id
+  // is set for all task types by the backend; if missing we skip BOTH the helper
+  // and its prompt advertisement so we never promise a helper we didn't write.
+  const researchProjectId = ((task.project_metadata as Record<string, unknown> | undefined)?.project_id as string | undefined) ?? '';
+  if (researchProjectId) writeFetchHelper(taskId, researchProjectId, WORKSPACE, { verbs: RESEARCH_FETCH_VERBS });
+  const researchFetchGuidance = researchProjectId ? buildFetchGuidance(RESEARCH_FETCH_VERBS) : '';
   const researchMode = strVal(payload.research_mode as string, 'research');
   const disallowedTools = configureAgentPermissions(researchMode);
   const promptFingerprint = computeResearchPlanPromptFingerprint('research');
@@ -1876,7 +1893,7 @@ Routing: large scope → plan agent (decomposition), medium → create agent (si
 
   const researchPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   statusRef.value = 'Running codebase research...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPrompt + researchPromptSuffix + researchFirstTaskSection + PLAYBOOK_GUIDANCE + '\nNote: If your research uncovered operational knowledge (build patterns, module relationships, common failure modes), save the most reusable findings to the playbook.\n' + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPrompt + researchPromptSuffix + researchFirstTaskSection + PLAYBOOK_GUIDANCE + '\nNote: If your research uncovered operational knowledge (build patterns, module relationships, common failure modes), save the most reusable findings to the playbook.\n' + `\n\n${researchFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   // Prefer reading findings from /tmp/ file (avoids output truncation), fall back to output parsing
   const researchFindings = readHandlerOutput(taskId, 'research_findings', ws);

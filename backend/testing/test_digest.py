@@ -1098,6 +1098,62 @@ async def test_digest_project_filter(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_digest_effort_model_efficiency_includes_cancelled_token_spend(
+    client: AsyncClient, db_session
+):
+    """Cancelled terminal runs contribute spend to the efficiency rollup but do
+    not count as landed PRs."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create", "effort": "high"}],
+            context={"pr_merged": True},
+            provider="anthropic",
+            model="claude-opus-4-8",
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 1000,
+                "llm_call_count": 1,
+            },
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.CANCELLED,
+            payloads=[{"type": "create", "effort": "high"}],
+            provider="anthropic",
+            model="claude-opus-4-8",
+            api_call_summary={
+                "total_input_tokens": 500,
+                "total_output_tokens": 500,
+                "llm_call_count": 1,
+            },
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    efficiency = data["effort_model_efficiency"]
+    assert efficiency["totals"]["run_count"] == 2
+    assert efficiency["totals"]["landed_count"] == 1
+    assert efficiency["totals"]["total_cost_usd"] == pytest.approx(0.135)
+    assert efficiency["totals"]["cost_per_merge"] == pytest.approx(0.135)
+    by_effort = {row["effort"]: row for row in efficiency["by_effort"]}
+    assert by_effort["high"]["run_count"] == 2
+    assert by_effort["high"]["landed_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_digest_active_count(client: AsyncClient, db_session):
     """In-progress tasks appear in active_count/active_tasks and not in completed_count."""
     project = make_project()

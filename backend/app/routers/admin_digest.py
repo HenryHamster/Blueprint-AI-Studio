@@ -49,6 +49,7 @@ from app.digest_metrics import (
     _stash_projected_task_fields,
     _task_prompt_fingerprint,  # noqa: F401  re-exported for external importers
     compute_anomaly_adjustment_summary,  # noqa: F401  re-exported for external importers
+    compute_effort_model_efficiency,
     compute_dependency_health_signals,
     compute_merge_gate_fleet_health,
     compute_digest_cost_economics,
@@ -276,7 +277,7 @@ async def _compute_digest(
         await session.execute(text("SET LOCAL statement_timeout = '30s'"))
 
     # --- Query tasks from extended lookback window ---
-    # Load terminal tasks (COMPLETED/FAILED) for digest stats, plus any task
+    # Load terminal tasks (COMPLETED/FAILED/CANCELLED) for digest stats, plus any task
     # with requires_approval=True so we can surface pending-approval items in
     # needs_attention even while they are still IN_PROGRESS/QUEUED/etc.
     # QUEUED/PROVISIONING/IN_PROGRESS without approval flags are excluded here
@@ -285,7 +286,9 @@ async def _compute_digest(
     task_filters = [
         Task.created_at >= lookback_start,
         or_(
-            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            Task.status.in_(
+                [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+            ),
             Task.requires_approval.is_(True),
         ),
     ]
@@ -336,6 +339,15 @@ async def _compute_digest(
                     # Per-(provider, model) cost attribution on direction CPM.
                     Task.provider,
                     Task.model,
+                    # Token telemetry for the per-effort/per-model LLM efficiency
+                    # rollup (compute_effort_model_efficiency). api_call_summary is
+                    # accessed directly (not via __dict__), so it MUST be loaded
+                    # here or the async access would trigger a lazy-load error; the
+                    # banked *_db columns back the property fallbacks.
+                    Task.api_call_summary,
+                    Task.llm_input_tokens_banked_db,
+                    Task.llm_output_tokens_banked_db,
+                    Task.llm_call_count_banked_db,
                 )
             )
             .limit(_DIGEST_TASK_ROW_CAP)
@@ -382,6 +394,12 @@ async def _compute_digest(
                     # Per-(provider, model) cost attribution on direction CPM.
                     Task.provider,
                     Task.model,
+                    # Token telemetry for the per-effort/per-model LLM efficiency
+                    # rollup (compute_effort_model_efficiency).
+                    Task.api_call_summary,
+                    Task.llm_input_tokens_banked_db,
+                    Task.llm_output_tokens_banked_db,
+                    Task.llm_call_count_banked_db,
                 )
             )
             .limit(_DIGEST_TASK_ROW_CAP)
@@ -407,6 +425,11 @@ async def _compute_digest(
         for t in all_tasks
         if t.status == TaskStatus.FAILED and _derive_completed_at(t) >= window_start
     ]
+    cancelled_tasks = [
+        t
+        for t in all_tasks
+        if t.status == TaskStatus.CANCELLED and _derive_completed_at(t) >= window_start
+    ]
     # Approval tasks use created_at (they haven't completed yet)
     # _to_naive_utc strips tz from t.created_at (TIMESTAMPTZ since 0061) for
     # comparison with naive window_start. See time_utils._to_naive_utc.
@@ -414,7 +437,8 @@ async def _compute_digest(
         t
         for t in all_tasks
         if t.requires_approval
-        and t.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+        and t.status
+        not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
         and _to_naive_utc(t.created_at) >= window_start
     ]
 
@@ -927,6 +951,14 @@ async def _compute_digest(
     overall_type_distribution = _cost_econ["overall_type_distribution"]
     pipeline_filter_funnel = _cost_econ["pipeline_filter_funnel"]
 
+    # Per-effort-tier / per-actual-model LLM efficiency rollup over the window's
+    # finished (terminal) tasks. Additive — answers whether effort-tier scaling
+    # earns its money in landed PRs. Reuses the shared LLM pricing so its totals
+    # reconcile with the per-model cost surface.
+    effort_model_efficiency = compute_effort_model_efficiency(
+        completed_tasks + failed_tasks + cancelled_tasks
+    )
+
     # --- Scope mismatch diagnostics ---
     # Aggregate calibration data across terminal tasks in the window to surface
     # systematic scope-estimation drift and chronic-calibration directions.
@@ -1300,6 +1332,7 @@ async def _compute_digest(
         "median_cost_per_merged_pr": median_cost_per_merged_pr,
         "cost_per_merge_by_type": cost_per_merge_by_type,
         "median_cost_per_merge_by_type": _median_cpm_by_type,
+        "effort_model_efficiency": effort_model_efficiency,
         "overall_type_distribution": overall_type_distribution or None,
         "total_estimated_cost_usd": total_estimated_cost_usd,
         "spot_cost_usd": total_spot_cost_usd,

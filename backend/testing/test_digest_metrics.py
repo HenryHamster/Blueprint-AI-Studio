@@ -16,6 +16,7 @@ from app.digest_metrics import (
     _compute_non_code_outcomes,
     compute_churn_direction,
     compute_digest_cost_economics,
+    compute_effort_model_efficiency,
     compute_digest_trend_history,
     compute_failure_grouping,
     compute_migration_health,
@@ -2692,6 +2693,245 @@ def test_compute_foundation_convergence_actions_multiple_pairs():
     pair_ids = {(a["foundation_id"], a["dependent_id"]) for a in actions}
     assert (str(t1a.id), str(t1b.id)) in pair_ids
     assert (str(t2a.id), str(t2b.id)) in pair_ids
+
+
+# ---------------------------------------------------------------------------
+# compute_effort_model_efficiency — per-effort-tier / per-actual-model rollup
+# ---------------------------------------------------------------------------
+
+
+def _eff_task(
+    *,
+    effort=None,
+    provider="anthropic",
+    model="claude-opus-4-8",
+    input_tokens=0,
+    output_tokens=0,
+    call_count=1,
+    landed=False,
+    status=TaskStatus.COMPLETED,
+    context=None,
+):
+    """Build a terminal task for the effort/model efficiency rollup tests.
+
+    Tokens go through ``api_call_summary`` (the current-attempt source
+    ``get_task_total_llm_totals`` reads); ``landed`` stamps the canonical
+    ``pr_merged`` landed signal that ``is_merged_completion`` reads.
+    """
+    payload = {"type": "create"}
+    if effort is not None:
+        payload["effort"] = effort
+    ctx = dict(context or {})
+    if landed:
+        ctx["pr_merged"] = True
+    return make_task(
+        status=status,
+        provider=provider,
+        model=model,
+        payloads=[payload],
+        context=ctx,
+        api_call_summary={
+            "total_input_tokens": input_tokens,
+            "total_output_tokens": output_tokens,
+            "llm_call_count": call_count,
+        },
+    )
+
+
+def test_effort_model_efficiency_aggregates_by_effort_and_model():
+    """Per-effort and per-model rows carry honest run/landed/cost numbers, and
+    cost is priced with the shared LLM_TOKEN_PRICING table."""
+    tasks = [
+        # high/opus, landed: 1000*15e-6 + 2000*75e-6 = 0.165
+        _eff_task(effort="high", model="claude-opus-4-8",
+                  input_tokens=1000, output_tokens=2000, landed=True),
+        # high/opus, NOT landed: 1000*15e-6 + 1000*75e-6 = 0.09
+        _eff_task(effort="high", model="claude-opus-4-8",
+                  input_tokens=1000, output_tokens=1000, landed=False),
+        # medium/sonnet, landed: 2000*3e-6 + 1000*15e-6 = 0.021
+        _eff_task(effort="medium", model="claude-sonnet-4-6",
+                  input_tokens=2000, output_tokens=1000, landed=True),
+    ]
+
+    result = compute_effort_model_efficiency(tasks)
+
+    by_effort = {r["effort"]: r for r in result["by_effort"]}
+    # Effort rows are ordered low->max: medium precedes high.
+    assert [r["effort"] for r in result["by_effort"]] == ["medium", "high"]
+
+    high = by_effort["high"]
+    assert high["run_count"] == 2
+    assert high["landed_count"] == 1
+    assert high["landed_rate"] == 0.5
+    assert high["total_cost_usd"] == pytest.approx(0.255)
+    # cost_per_merge = priced cost / landed PRs.
+    assert high["cost_per_merge"] == pytest.approx(0.255)
+    assert high["input_tokens"] == 2000
+    assert high["output_tokens"] == 3000
+
+    medium = by_effort["medium"]
+    assert medium["run_count"] == 1
+    assert medium["landed_rate"] == 1.0
+    assert medium["cost_per_merge"] == pytest.approx(0.021)
+
+    by_model = {(r["provider"], r["model"]): r for r in result["by_model"]}
+    opus = by_model[("anthropic", "claude-opus-4-8")]
+    assert opus["run_count"] == 2 and opus["priced"] is True
+    assert opus["total_cost_usd"] == pytest.approx(0.255)
+    # by_model is sorted by cost desc — opus (0.255) before sonnet (0.021).
+    assert result["by_model"][0]["model"] == "claude-opus-4-8"
+
+    totals = result["totals"]
+    assert totals["run_count"] == 3
+    assert totals["landed_count"] == 2
+    assert totals["total_cost_usd"] == pytest.approx(0.276)
+    assert totals["unpriced_coverage_fraction"] == 1.0
+
+
+def test_effort_model_efficiency_cancelled_runs_add_spend_not_landings():
+    """Cancelled terminal runs can burn tokens, so they must add spend/run count
+    without inflating landed/merge counts."""
+    tasks = [
+        _eff_task(
+            effort="high",
+            model="claude-opus-4-8",
+            input_tokens=1000,
+            output_tokens=1000,
+            landed=True,
+            status=TaskStatus.COMPLETED,
+        ),
+        _eff_task(
+            effort="high",
+            model="claude-opus-4-8",
+            input_tokens=500,
+            output_tokens=500,
+            landed=False,
+            status=TaskStatus.CANCELLED,
+        ),
+    ]
+
+    result = compute_effort_model_efficiency(tasks)
+
+    high = {r["effort"]: r for r in result["by_effort"]}["high"]
+    assert high["run_count"] == 2
+    assert high["landed_count"] == 1
+    assert high["landed_rate"] == 0.5
+    # 1000*15e-6 + 1000*75e-6 + 500*15e-6 + 500*75e-6
+    assert high["total_cost_usd"] == pytest.approx(0.135)
+    assert high["cost_per_merge"] == pytest.approx(0.135)
+
+    totals = result["totals"]
+    assert totals["run_count"] == 2
+    assert totals["landed_count"] == 1
+    assert totals["total_cost_usd"] == pytest.approx(0.135)
+
+
+def test_effort_model_efficiency_reconciles_with_llm_cost_breakdown():
+    """Total priced LLM cost equals compute_llm_cost_breakdown over the same tasks —
+    the two cost surfaces must not diverge."""
+    from app.efficiency_snapshot import compute_llm_cost_breakdown
+
+    tasks = [
+        _eff_task(effort="high", model="claude-opus-4-8",
+                  input_tokens=1500, output_tokens=2500, landed=True),
+        _eff_task(effort="low", model="claude-haiku-4-5-20251001",
+                  input_tokens=4000, output_tokens=1000, landed=False),
+    ]
+
+    eff = compute_effort_model_efficiency(tasks)
+    breakdown = compute_llm_cost_breakdown(tasks)
+
+    assert eff["totals"]["total_cost_usd"] == pytest.approx(
+        breakdown["totals"]["total_cost_usd"]
+    )
+
+
+def test_effort_model_efficiency_unpriced_combo_not_folded_into_priced():
+    """An unpriced (provider, model) combo contributes 0 cost, is counted as a
+    run/token bearer, and is surfaced in unpriced_combos — never folded in."""
+    tasks = [
+        _eff_task(effort="high", model="claude-opus-4-8",
+                  input_tokens=1000, output_tokens=1000, landed=True),
+        # Unknown model with real tokens — priceable but unpriced.
+        _eff_task(effort="low", provider="anthropic", model="claude-mystery-9",
+                  input_tokens=5000, output_tokens=5000, landed=False),
+    ]
+
+    result = compute_effort_model_efficiency(tasks)
+
+    assert "anthropic:claude-mystery-9" in result["unpriced_combos"]
+    low = {r["effort"]: r for r in result["by_effort"]}["low"]
+    assert low["total_cost_usd"] == 0.0
+    assert low["unpriced_run_count"] == 1
+    assert low["priced_run_count"] == 0
+    assert low["unpriced_coverage_fraction"] == 0.0
+    # The unpriced run still counts toward run/token volume.
+    assert low["run_count"] == 1
+    assert low["input_tokens"] == 5000
+    # Totals: only the opus task's cost is folded in (the mystery model adds 0).
+    assert result["totals"]["total_cost_usd"] == pytest.approx(0.09)
+    assert result["totals"]["unpriced_coverage_fraction"] == 0.5
+
+
+def test_effort_model_efficiency_surfaces_fallback_divergence():
+    """A requested->effective model downgrade is surfaced both in the fallbacks
+    block and as a divergent resolved_model under the requested effort tier."""
+    tasks = [
+        _eff_task(
+            effort="high",
+            model="claude-sonnet-4-6",  # actually ran on sonnet, not opus
+            input_tokens=1000,
+            output_tokens=1000,
+            landed=True,
+            context={
+                "model_fallback": {
+                    "requested": "claude-opus-4-8",
+                    "effective": "claude-sonnet-4-6",
+                    "provider": "anthropic",
+                    "reason": "no_account_with_opus_access",
+                }
+            },
+        ),
+    ]
+
+    result = compute_effort_model_efficiency(tasks)
+
+    assert result["fallbacks"]["total"] == 1
+    combo = result["fallbacks"]["combos"][0]
+    assert combo["requested"] == "claude-opus-4-8"
+    assert combo["effective"] == "claude-sonnet-4-6"
+    assert combo["count"] == 1
+
+    high = {r["effort"]: r for r in result["by_effort"]}["high"]
+    resolved = high["resolved_models"]
+    assert len(resolved) == 1
+    # High effort was requested but the run resolved onto sonnet — visible divergence.
+    assert resolved[0]["model"] == "claude-sonnet-4-6"
+    assert resolved[0]["run_count"] == 1
+
+
+def test_effort_model_efficiency_missing_effort_buckets_unspecified():
+    """Tasks with no declared effort fall into the 'unspecified' bucket rather
+    than being dropped."""
+    tasks = [
+        _eff_task(effort=None, model="claude-opus-4-8",
+                  input_tokens=100, output_tokens=100, landed=True),
+    ]
+    result = compute_effort_model_efficiency(tasks)
+    efforts = {r["effort"] for r in result["by_effort"]}
+    assert efforts == {"unspecified"}
+
+
+def test_effort_model_efficiency_empty_input():
+    """Empty input yields empty rows and zeroed totals, not an error."""
+    result = compute_effort_model_efficiency([])
+    assert result["by_effort"] == []
+    assert result["by_model"] == []
+    assert result["unpriced_combos"] == []
+    assert result["fallbacks"]["total"] == 0
+    assert result["totals"]["run_count"] == 0
+    assert result["totals"]["landed_rate"] is None
+    assert result["totals"]["cost_per_merge"] is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
