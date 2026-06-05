@@ -229,6 +229,44 @@ _EVIDENCE_PROGRESS_RATIONALE_MAX = 300
 EVIDENCE_PROGRESS_CONTEXT_KEY = "_strategic_evidence_progress"
 
 
+async def _link_clustered_bug_messages(
+    session: AsyncSession,
+    project: Project,
+    anchor_msg: ProjectMessage,
+    *,
+    kind: str,
+    identifier: str,
+    resolution_text: str,
+) -> int:
+    """Link other open bug-class messages that share the anchor's structured signature."""
+    from app.message_convergence import (
+        bug_message_cluster_signature as _bug_message_cluster_signature,
+        bug_messages_share_cluster as _bug_messages_share_cluster,
+        link_message_to_outcome as _link_message_to_outcome,
+    )
+
+    if _bug_message_cluster_signature(anchor_msg) is None:
+        return 0
+
+    result = await session.execute(
+        select(ProjectMessage).where(
+            ProjectMessage.project_id == project.id,
+            ProjectMessage.status == "open",
+        )
+    )
+    linked = 0
+    for candidate in result.scalars().all():
+        if candidate.id == anchor_msg.id:
+            continue
+        if not _bug_messages_share_cluster(anchor_msg, candidate):
+            continue
+        _link_message_to_outcome(candidate, kind, identifier)
+        candidate.resolution = resolution_text
+        session.add(candidate)
+        linked += 1
+    return linked
+
+
 def _normalize_version_phase(value: object) -> str | None:
     """Return a canonical version phase string or None.
 
@@ -2990,6 +3028,12 @@ async def _handle_strategic_completion(
         resolved_entries = [
             {"id": mid} for mid in (parsed.get("resolved_message_ids") or [])
         ]
+    from app.message_convergence import (
+        LINKED_STATUS as _LINKED_STATUS,
+        is_bug_class as _is_bug_class,
+        link_message_to_outcome as _link_message_to_outcome,
+    )
+
     for entry in resolved_entries[:10]:
         try:
             msg_id = entry.get("id") if isinstance(entry, dict) else str(entry)
@@ -2998,38 +3042,79 @@ async def _handle_strategic_completion(
                 if isinstance(entry, dict)
                 else "Addressed by strategic review"
             )
+            # Ownership fields signal that the fix is in-flight rather than already landed.
+            owned_by_direction = (
+                entry.get("owned_by_direction") if isinstance(entry, dict) else None
+            )
+            owned_by_task = (
+                entry.get("owned_by_task") if isinstance(entry, dict) else None
+            )
             msg = await session.get(ProjectMessage, uuid.UUID(str(msg_id)))
-            if msg and msg.project_id == project.id and msg.status == "open":
-                msg.status = "resolved"
-                if resolution_text:
-                    rt = str(resolution_text)
+            # Accept both 'open' and 'linked' so an explicit terminal resolve can
+            # always move a linked message to 'resolved' (the operator's escape hatch).
+            if msg and msg.project_id == project.id and msg.status in {
+                "open",
+                _LINKED_STATUS,
+            }:
+                if _is_bug_class(msg) and (owned_by_direction or owned_by_task):
+                    # Bug-class message with ownership info: record the forward
+                    # link and move to 'linked' state. The actual convergence to
+                    # 'resolved' happens when the owning outcome lands (reaper sweep).
+                    kind = "direction" if owned_by_direction else "task"
+                    identifier = owned_by_direction or owned_by_task
+                    rt = str(resolution_text or f"Fix owned by {kind}: {identifier}")
                     if len(rt) > STRATEGIC_RESOLUTION_MAX:
-                        logger.warning(
-                            f"[STRATEGIC] Task {task.id}: truncating resolution {len(rt)}→{STRATEGIC_RESOLUTION_MAX} chars"
-                        )
-                    msg.resolution = rt[:STRATEGIC_RESOLUTION_MAX]
+                        rt = rt[:STRATEGIC_RESOLUTION_MAX]
+                    _link_message_to_outcome(msg, kind, str(identifier))
+                    msg.resolution = rt
+                    session.add(msg)
+                    clustered = await _link_clustered_bug_messages(
+                        session,
+                        project,
+                        msg,
+                        kind=kind,
+                        identifier=str(identifier),
+                        resolution_text=rt,
+                    )
+                    msgs_resolved += 1 + clustered
+                    logger.info(
+                        f"[STRATEGIC] Task {task.id}: linked {msg.message_type} "
+                        f"message {msg.id} to {kind}={identifier} "
+                        f"(clustered={clustered})"
+                    )
                 else:
-                    msg.resolution = "Addressed by strategic review"
-                msg.resolved_at = _utcnow()
-                session.add(msg)
-                msgs_resolved += 1
-                if msg.message_type == MessageType.FEEDBACK:
-                    try:
-                        from app.notification_dispatch import (
-                            post_feedback_acknowledgment,
-                        )
+                    # Explicit terminal resolve: operator/strategist dismisses
+                    # the message (no ownership info, or not a bug-class type).
+                    msg.status = "resolved"
+                    if resolution_text:
+                        rt = str(resolution_text)
+                        if len(rt) > STRATEGIC_RESOLUTION_MAX:
+                            logger.warning(
+                                f"[STRATEGIC] Task {task.id}: truncating resolution {len(rt)}→{STRATEGIC_RESOLUTION_MAX} chars"
+                            )
+                        msg.resolution = rt[:STRATEGIC_RESOLUTION_MAX]
+                    else:
+                        msg.resolution = "Addressed by strategic review"
+                    msg.resolved_at = _utcnow()
+                    session.add(msg)
+                    msgs_resolved += 1
+                    if msg.message_type == MessageType.FEEDBACK:
+                        try:
+                            from app.notification_dispatch import (
+                                post_feedback_acknowledgment,
+                            )
 
-                        await post_feedback_acknowledgment(
-                            session,
-                            project.id,
-                            msg.id,
-                            msg.resolution or "Addressed by strategic review",
-                            task.id,
-                        )
-                    except Exception as _e:  # noqa: BLE001
-                        logger.warning(
-                            f"[NOTIFY] Failed to post feedback acknowledgment: {_e}"
-                        )
+                            await post_feedback_acknowledgment(
+                                session,
+                                project.id,
+                                msg.id,
+                                msg.resolution or "Addressed by strategic review",
+                                task.id,
+                            )
+                        except Exception as _e:  # noqa: BLE001
+                            logger.warning(
+                                f"[NOTIFY] Failed to post feedback acknowledgment: {_e}"
+                            )
         except (ValueError, TypeError):  # noqa: PERF203
             pass
 

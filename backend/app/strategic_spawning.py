@@ -1449,42 +1449,6 @@ def _build_operator_steering_directive(
     )
 
 
-async def _fetch_open_messages(
-    project_id: uuid.UUID, session: AsyncSession
-) -> list[dict]:
-    """Fetch currently-open messages for the strategic agent.
-
-    Returns ALL currently-open messages (status=='open'), bounded to a sane cap
-    (50) but independent of any recency cap, ordered oldest-first. This ensures
-    the strategist can see ALL open BUG_REPORT and BLOCKER items regardless of
-    thread age, and can resolve them by id.
-
-    Replaces the prior pattern of filtering open messages from a 15-row
-    conversation-thread snapshot, which silently aged out messages older than
-    the 15 most recent rows of ANY status.
-    """
-    result = await session.execute(
-        select(ProjectMessage)
-        .where(
-            ProjectMessage.project_id == project_id,
-            ProjectMessage.status == "open",
-        )
-        .order_by(ProjectMessage.created_at.asc())
-        .limit(50)
-    )
-    return [
-        {
-            "id": str(m.id),
-            "type": m.message_type,
-            "content": m.content,
-            "context": m.context,
-            "from": m.from_type,
-            "created_at": m.created_at.isoformat() if m.created_at else None,
-        }
-        for m in result.scalars().all()
-    ]
-
-
 def _summarize_conversation_thread(thread: list) -> list:
     """Keep the most recent N conversation messages."""
     if (
@@ -1537,6 +1501,128 @@ def _summarize_memo_citations(memos: list) -> list:
     ]
 
 
+# ── Open-message inbox (the strategist's authoritative feed) ──────────────────
+# The strategist's open-message inbox is its OWN status-filtered query — NOT a
+# slice of the capped conversation_thread. Without this, an OPEN BUG_REPORT or
+# BLOCKER older than the 15 newest messages ages out of the thread window and
+# the strategist never sees it, so it can never be acted on or resolved and
+# stays open forever. The feed is size-bounded two ways (a hard message count +
+# a per-message excerpt cap) and priority-ordered so unresolved
+# BUG_REPORT/BLOCKER items (then the oldest-open items) are the LAST to be
+# dropped under budget pressure, never the first.
+_OPEN_MESSAGES_FETCH_LIMIT = 200       # DB window over open-status rows
+_OPEN_MESSAGES_KEEP = 40               # count bound for the packed feed
+_OPEN_MESSAGES_KEEP_WHEN_TRIMMED = 20  # tighter bound for the summarize fallback
+_OPEN_MESSAGE_EXCERPT_MAX_CHARS = 800  # per-message content excerpt cap
+_CRITICAL_OPEN_MESSAGE_TYPES = (
+    MessageType.BUG_REPORT.value,
+    MessageType.BLOCKER.value,
+)
+
+
+def _open_message_survival_key(msg: dict) -> tuple:
+    """Sort key ranking an open message's survival priority HIGH→LOW.
+
+    Critical types (BUG_REPORT/BLOCKER) rank first; within a tier, oldest-open
+    items rank first (ascending created_at). The HEAD of the sorted list
+    survives when the feed must be bounded, so BUG_REPORT/BLOCKER and the
+    oldest-open items are the last to be dropped.
+    """
+    is_critical = msg.get("type") in _CRITICAL_OPEN_MESSAGE_TYPES
+    return (0 if is_critical else 1, msg.get("created_at") or "")
+
+
+def _bound_open_messages(messages: list, keep: int) -> list:
+    """Bound *messages* to *keep* items and cap each message's excerpt length.
+
+    Lowest-priority survivors are dropped first: BUG_REPORT/BLOCKER (then the
+    oldest-open) items are the LAST to go. Survivors are returned in oldest-open
+    chronological order so the strategist reads a stable inbox regardless of
+    which items were trimmed.
+    """
+    if not isinstance(messages, list):
+        return messages
+    capped: list = []
+    for m in messages:
+        if isinstance(m, dict) and isinstance(m.get("content"), str):
+            content = m["content"]
+            if len(content) > _OPEN_MESSAGE_EXCERPT_MAX_CHARS:
+                m = {**m, "content": content[:_OPEN_MESSAGE_EXCERPT_MAX_CHARS]}
+        capped.append(m)
+    if len(capped) <= keep:
+        return capped
+    survivors = sorted(
+        (m for m in capped if isinstance(m, dict)),
+        key=_open_message_survival_key,
+    )[:keep]
+    # Re-sort survivors chronologically (oldest-open first) for a stable read.
+    survivors.sort(key=lambda m: m.get("created_at") or "")
+    return survivors
+
+
+def _summarize_open_messages(messages: list) -> list:
+    """Budget-pressure fallback for the open-message inbox.
+
+    Rather than dropping the entire inbox wholesale when the strategic payload
+    is over budget, trim it to a tighter bound that PRESERVES unresolved
+    BUG_REPORT/BLOCKER (and the oldest-open) items and drops the rest — so the
+    critical inbox items survive budget pressure instead of vanishing.
+    """
+    return _bound_open_messages(messages, _OPEN_MESSAGES_KEEP_WHEN_TRIMMED)
+
+
+async def _fetch_open_messages(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    limit: int = _OPEN_MESSAGES_KEEP,
+) -> list[dict]:
+    """Authoritative open-message feed for a strategic spawn payload.
+
+    Queries messages whose status is open DIRECTLY (backed by
+    ``ix_projectmessage_project_status``), independent of the capped
+    conversation_thread, so an OPEN BUG_REPORT/BLOCKER stays visible to the
+    strategist until it is fixed or explicitly resolved no matter how many newer
+    messages have accumulated. The result is size-bounded: at most *limit*
+    messages, priority-ordered so BUG_REPORT/BLOCKER and oldest-open items
+    survive, with per-message excerpts capped.
+
+    Shared by every strategic spawn path (strategic_review + design_doc_update)
+    so the open-message access pattern stops drifting apart. Each row carries
+    its full ``id`` (UUID string) so the agent can resolve it by reference.
+    """
+    # status == "open" is the ONLY actionable status. Messages in "linked"
+    # state (bug-class messages whose fix is in-flight, owned by a direction
+    # or task) are intentionally excluded here — they already have an owner
+    # and the strategist should not act on them again. Messages with status
+    # "resolved" are terminal and also excluded. This filter is sufficient:
+    # no extra clause is needed to exclude linked messages.
+    result = await session.execute(
+        select(ProjectMessage)
+        .where(
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.status == "open",
+        )
+        .order_by(ProjectMessage.created_at.asc())
+        .limit(_OPEN_MESSAGES_FETCH_LIMIT)
+    )
+    messages = [
+        {
+            "id": str(m.id),
+            "type": m.message_type,
+            "content": m.content,
+            "context": m.context,
+            "from": m.from_type,
+            "status": m.status,
+            "resolution": m.resolution,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+            "resolved_at": m.resolved_at.isoformat() if m.resolved_at else None,
+        }
+        for m in result.scalars().all()
+    ]
+    return _bound_open_messages(messages, limit)
+
+
 # Schemas for pack_under_budget. Each key declares its priority tier and an
 # optional summarize_fn. Critical = always shipped (raises if can't fit).
 # High = shipped unless budget exhausted by summarized criticals + earlier
@@ -1557,8 +1643,11 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "prompt_suffix": {"priority": "high"},
     # Vision + intent — small but load-bearing for every decision
     "vision": {"priority": "critical"},
-    # User-facing state the agent must respond to
-    "open_messages": {"priority": "high"},
+    # User-facing state the agent must respond to. The open-message inbox is
+    # packed high but with a summarize fallback so BUG_REPORT/BLOCKER (and the
+    # oldest-open) items survive budget pressure instead of the whole inbox
+    # being dropped wholesale.
+    "open_messages": {"priority": "high", "summarize": _summarize_open_messages},
     "running_update": {"priority": "high"},
     "running_update_acknowledged_at": {"priority": "high"},
     "user_last_active_at": {"priority": "high"},
@@ -1656,7 +1745,7 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     "model": {"priority": "critical"},
     "effort": {"priority": "critical"},
     "vision": {"priority": "critical"},
-    "open_messages": {"priority": "high"},
+    "open_messages": {"priority": "high", "summarize": _summarize_open_messages},
     "design_doc": {"priority": "high", "summarize": _agent_view_design_doc},
     "problem_model": {
         "priority": "high",
@@ -2654,8 +2743,10 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         or None
     )
 
-    # Fetch open messages for the design doc agent
-    open_msgs = await _fetch_open_messages(project.id, session)
+    # Fetch open messages for the design doc agent via the shared authoritative
+    # feed (status-filtered query, size-bounded, BUG_REPORT/BLOCKER-prioritized)
+    # so this path and the strategic_review path stay unified.
+    open_msgs = await _fetch_open_messages(session, project.id)
 
     # Build shipped_changes_manifest: tasks merged since the last arch review
     shipped_changes_manifest = await _build_shipped_changes_manifest(project, session)
@@ -3063,10 +3154,12 @@ async def _spawn_strategic_review(
         }
         for m in all_thread_msgs
     ]
-    # Fetch open messages from a dedicated query (status-filtered, independent of
-    # recency cap) so the strategist sees ALL open BUG_REPORT/BLOCKER items,
-    # not just those within the 15-message conversation-thread window.
-    open_msgs = await _fetch_open_messages(project.id, session)
+    # The strategist's open-message inbox is its OWN authoritative status query
+    # — NOT a slice of the conversation_thread above (capped at 15 by recency).
+    # Deriving it from that slice meant any OPEN BUG_REPORT/BLOCKER older than
+    # the 15 newest messages aged out of the strategist's view and could never
+    # be resolved. _fetch_open_messages keeps them visible until fixed/resolved.
+    open_msgs = await _fetch_open_messages(session, project.id)
 
     # When did the user last engage? Last ProjectMessage from_type='user'.
     # The strategic agent uses this to frame its running_update "since last

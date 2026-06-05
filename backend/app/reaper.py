@@ -893,6 +893,7 @@ from app.reaper_sweeps import (  # noqa: E402
     sweep_unblock_blocked_tasks,
     sweep_activate_staged_directions,
     sweep_stale_staged_directions,
+    sweep_converge_linked_bug_messages,
     sweep_converge_duplicate_foundations,
 )
 
@@ -3835,7 +3836,22 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
-                # Step 15: Converge duplicate foundations — serialize a high-
+                # Step 15: Linked bug-class message convergence / resurfacing —
+                # reconcile each 'linked' BUG_REPORT/BLOCKER with its owning
+                # outcome: resolve when landed, reopen when failed/cancelled/
+                # retired/missing, or when in-flight beyond the time bound.
+                _mark_reaper_progress()
+                try:
+                    await sweep_converge_linked_bug_messages(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Linked-message convergence sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 16: Converge duplicate foundations — serialize a high-
                 # confidence cross-parent duplicate code-change task behind its
                 # canonical sibling by wiring a depends_on edge, so the second
                 # task rebases on the first's landed foundation instead of

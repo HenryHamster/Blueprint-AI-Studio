@@ -8317,7 +8317,345 @@ async def test_full_reaper_cycle_does_not_reap_blocked_task(
     assert t.status == TaskStatus.BLOCKED
 
 
-# ── Step 15: converge duplicate foundations ───────────────────────────────
+# ── Step 15: linked bug-class message convergence / resurfacing sweep ─────────
+
+from app.reaper_sweeps import sweep_converge_linked_bug_messages  # noqa: E402
+from app.models import MessageType, ProjectMessage  # noqa: E402
+from app.models import Direction  # noqa: E402
+from app.message_convergence import link_message_to_outcome  # noqa: E402
+
+
+async def _make_bug_message(
+    db,
+    project,
+    *,
+    msg_type=MessageType.BUG_REPORT,
+    status="open",
+    context=None,
+):
+    """Create a ProjectMessage of bug-class type and flush it."""
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=msg_type,
+        from_type="system",
+        content="Test bug report",
+        status=status,
+        context=context or {},
+    )
+    db.add(msg)
+    await db.commit()
+    await db.refresh(msg)
+    return msg
+
+
+async def _make_direction_row(db, project, *, direction_key="d-abc123", status="active"):
+    """Create a Direction row for convergence tests."""
+    row = Direction(
+        project_id=project.id,
+        direction_key=direction_key,
+        status=status,
+        data={"id": direction_key, "status": status},
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+@pytest.mark.asyncio
+async def test_linked_message_converges_when_task_lands_with_merged_pr(reaper_db):
+    """A 'linked' bug message is resolved when its owning task is COMPLETED + pr_merged."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(reaper_db, project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_url": "https://github.com/example/repo/pull/42", "pr_merged": True},
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    link_message_to_outcome(
+        msg,
+        "task",
+        str(task.id),
+        linked_at=_utcnow() - timedelta(hours=1),
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+
+    acted = await sweep_converge_linked_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution is not None
+    assert "landed" in msg.resolution
+    assert msg.resolved_at is not None
+    assert msg.context.get("_convergence_converged_at") is not None
+
+
+@pytest.mark.asyncio
+async def test_linked_message_left_linked_when_task_completed_but_not_landed(reaper_db):
+    """COMPLETED != merged: a task that completed WITHOUT the landed signal has not
+    actually landed the fix (its PR may be open/unmerged, tracked only in Artifact),
+    so within the time bound the message stays 'linked' rather than being silently
+    converged — the exact false-convergence this feature exists to prevent."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(reaper_db, project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.COMPLETED,
+        context={},  # no landed signal → COMPLETED but not merged
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    link_message_to_outcome(
+        msg,
+        "task",
+        str(task.id),
+        linked_at=_utcnow() - timedelta(hours=1),
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+
+    acted = await sweep_converge_linked_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "linked"
+
+
+@pytest.mark.asyncio
+async def test_linked_message_resurfaces_when_task_fails(reaper_db):
+    """A 'linked' bug message resurfaces to 'open' when its owning task FAILED."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(reaper_db, project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.FAILED,
+        context={},
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    link_message_to_outcome(msg, "task", str(task.id))
+    reaper_db.add(msg)
+    await reaper_db.commit()
+
+    acted = await sweep_converge_linked_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+    ctx = msg.context or {}
+    assert ctx.get("_convergence_link_stale") is not None
+    assert "_convergence_link" not in ctx
+    assert "FAILED" in (ctx.get("_convergence_resurfaced_reason") or "")
+
+
+@pytest.mark.asyncio
+async def test_linked_message_resurfaces_when_task_cancelled(reaper_db):
+    """A 'linked' bug message resurfaces to 'open' when its owning task is CANCELLED."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(reaper_db, project, msg_type=MessageType.BLOCKER)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.CANCELLED,
+        context={},
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    link_message_to_outcome(msg, "task", str(task.id))
+    reaper_db.add(msg)
+    await reaper_db.commit()
+
+    acted = await sweep_converge_linked_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+    assert "CANCELLED" in (msg.context or {}).get("_convergence_resurfaced_reason", "")
+
+
+@pytest.mark.asyncio
+async def test_linked_message_converges_when_direction_completed(reaper_db):
+    """A 'linked' bug message is resolved when its owning direction is 'completed'."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(reaper_db, project)
+    dir_row = await _make_direction_row(
+        reaper_db, project, direction_key="d-comp1", status="completed"
+    )
+
+    link_message_to_outcome(msg, "direction", dir_row.direction_key)
+    reaper_db.add(msg)
+    await reaper_db.commit()
+
+    acted = await sweep_converge_linked_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert "completed" in (msg.resolution or "")
+    assert msg.resolved_at is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dir_status", ["retired", "rejected", "expired", "superseded"])
+async def test_linked_message_resurfaces_when_direction_ended_without_landing(
+    reaper_db, dir_status
+):
+    """A 'linked' bug message resurfaces when its owning direction ends non-completed."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(reaper_db, project)
+    dir_row = await _make_direction_row(
+        reaper_db, project, direction_key=f"d-{dir_status}", status=dir_status
+    )
+
+    link_message_to_outcome(msg, "direction", dir_row.direction_key)
+    reaper_db.add(msg)
+    await reaper_db.commit()
+
+    acted = await sweep_converge_linked_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+    ctx = msg.context or {}
+    assert ctx.get("_convergence_link_stale") is not None
+    assert dir_status in (ctx.get("_convergence_resurfaced_reason") or "")
+
+
+@pytest.mark.asyncio
+async def test_linked_message_resurfaces_when_owning_task_missing(reaper_db):
+    """A 'linked' bug message resurfaces when its owning task no longer exists."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(reaper_db, project)
+    import uuid as _uuid
+
+    nonexistent_id = str(_uuid.uuid4())
+    link_message_to_outcome(msg, "task", nonexistent_id)
+    reaper_db.add(msg)
+    await reaper_db.commit()
+
+    acted = await sweep_converge_linked_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+    assert "no longer exists" in (msg.context or {}).get("_convergence_resurfaced_reason", "")
+
+
+@pytest.mark.asyncio
+async def test_linked_message_left_linked_when_outcome_still_in_flight(reaper_db):
+    """A 'linked' message is untouched when its owning task is still actively in flight."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(reaper_db, project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.IN_PROGRESS,
+        context={},
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    # Link very recently — well within the 7-day resurface window.
+    link_message_to_outcome(
+        msg, "task", str(task.id), linked_at=_utcnow() - timedelta(hours=2)
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+
+    acted = await sweep_converge_linked_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "linked"
+
+
+@pytest.mark.asyncio
+async def test_linked_message_resurfaces_when_in_flight_exceeds_time_bound(reaper_db):
+    """A 'linked' message resurfaces when its task is still in flight past the time bound."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(reaper_db, project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.QUEUED,
+        context={},
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    # Link older than the default 7-day resurface window.
+    link_message_to_outcome(
+        msg, "task", str(task.id), linked_at=_utcnow() - timedelta(days=8)
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+
+    acted = await sweep_converge_linked_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+    assert "QUEUED" in (msg.context or {}).get("_convergence_resurfaced_reason", "")
+
+
+@pytest.mark.asyncio
+async def test_linked_message_resurfaces_when_task_completed_but_never_landed(reaper_db):
+    """A task COMPLETED but never landed (no merge signal) past the time bound
+    resurfaces — the fix never actually merged, so the bug returns to the strategist."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(reaper_db, project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.COMPLETED,
+        context={},  # COMPLETED but no landed signal → never merged
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    # Linked longer ago than the default 7-day resurface window.
+    link_message_to_outcome(
+        msg, "task", str(task.id), linked_at=_utcnow() - timedelta(days=8)
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+
+    acted = await sweep_converge_linked_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+    ctx = msg.context or {}
+    assert ctx.get("_convergence_link_stale") is not None
+    assert "did not land" in (ctx.get("_convergence_resurfaced_reason") or "")
+
+
+# ── Step 16: converge duplicate foundations ───────────────────────────────
 
 
 async def _conv_task(

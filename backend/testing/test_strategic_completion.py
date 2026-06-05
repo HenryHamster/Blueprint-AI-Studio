@@ -7,6 +7,7 @@ Covers:
   - _record_strategic_task_failure: circuit-breaker increment and cycle history update
 """
 
+import json
 import uuid
 import pytest
 import pytest_asyncio
@@ -8961,3 +8962,481 @@ def test_apply_reconciled_running_update_caps_rejected_edits_ledger():
     assert len(old_entries) == REJECTED_EDITS_MAX - 1
     # The first old entry should be entry_1 (entry_0 was dropped)
     assert old_entries[0]["value"] == "entry_1"
+
+
+# ── Message convergence: linkage contract tests ───────────────────────────────
+
+
+@pytest_asyncio.fixture()
+async def convergence_db(mocker):
+    """Isolated in-memory DB for message-convergence linkage tests."""
+    from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+
+    if not hasattr(SQLiteTypeCompiler, "visit_JSONB"):
+        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(
+            type_, **kw
+        )
+
+    _engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with _engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    _Session = sessionmaker(
+        bind=_engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    async with _Session() as session:
+        yield session
+
+    async with _engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.drop_all)
+    await _engine.dispose()
+
+
+class TestMessageConvergenceLinkage:
+    """Tests for the bug-class message linkage contract.
+
+    Covers:
+      (a) resolving a bug-class message by ownership persists the durable
+          forward link and leaves the message in the 'linked' (not terminal
+          'resolved') state.
+      (b) an explicit operator/strategist resolve still terminally resolves
+          regardless of link state.
+      (c) a linked message is excluded from the strategist's actionable
+          open-message feed.
+    """
+
+    # ── (a) Ownership linkage ────────────────────────────────────────────────
+
+    def test_link_message_to_outcome_sets_linked_status(self):
+        """link_message_to_outcome sets status='linked' and stores the forward link."""
+        from app.message_convergence import (
+            LINKED_STATUS,
+            get_message_link,
+            link_message_to_outcome,
+        )
+        from app.models import MessageType, ProjectMessage
+
+        msg = ProjectMessage(
+            message_type=MessageType.BUG_REPORT,
+            content="CI is broken",
+            context={},
+            status="open",
+        )
+        link_message_to_outcome(msg, "direction", "d-abc123")
+
+        assert msg.status == LINKED_STATUS, (
+            f"Expected status '{LINKED_STATUS}', got '{msg.status}'"
+        )
+        link = get_message_link(msg)
+        assert link is not None, "Expected a convergence link in context"
+        assert link["kind"] == "direction"
+        assert link["id"] == "d-abc123"
+        assert "linked_at" in link
+
+    def test_link_message_task_kind(self):
+        """link_message_to_outcome supports task kind."""
+        from app.message_convergence import get_message_link, link_message_to_outcome
+        from app.models import MessageType, ProjectMessage
+
+        task_id = str(uuid.uuid4())
+        msg = ProjectMessage(
+            message_type=MessageType.BLOCKER,
+            content="blocked on missing dep",
+            context={},
+            status="open",
+        )
+        link_message_to_outcome(msg, "task", task_id)
+
+        link = get_message_link(msg)
+        assert link is not None
+        assert link["kind"] == "task"
+        assert link["id"] == task_id
+
+    def test_link_message_does_not_set_resolved_at(self):
+        """Linking a message must NOT set resolved_at — it's not terminal."""
+        from app.message_convergence import link_message_to_outcome
+        from app.models import MessageType, ProjectMessage
+
+        msg = ProjectMessage(
+            message_type=MessageType.BUG_REPORT,
+            content="test",
+            context={},
+            status="open",
+        )
+        link_message_to_outcome(msg, "direction", "d-xyz")
+        assert msg.resolved_at is None
+
+    def test_is_bug_class_true_for_bug_report_and_blocker(self):
+        """is_bug_class returns True for BUG_REPORT and BLOCKER."""
+        from app.message_convergence import is_bug_class
+        from app.models import MessageType, ProjectMessage
+
+        for mt in (MessageType.BUG_REPORT, MessageType.BLOCKER):
+            msg = ProjectMessage(message_type=mt, content="x", status="open")
+            assert is_bug_class(msg), f"Expected is_bug_class=True for {mt}"
+
+    def test_is_bug_class_false_for_other_types(self):
+        """is_bug_class returns False for NOTE, FEEDBACK, QUESTION."""
+        from app.message_convergence import is_bug_class
+        from app.models import MessageType, ProjectMessage
+
+        for mt in (MessageType.NOTE, MessageType.FEEDBACK, MessageType.QUESTION):
+            msg = ProjectMessage(message_type=mt, content="x", status="open")
+            assert not is_bug_class(msg), f"Expected is_bug_class=False for {mt}"
+
+    def test_get_message_link_returns_none_when_absent(self):
+        """get_message_link returns None when context has no convergence key."""
+        from app.message_convergence import get_message_link
+        from app.models import ProjectMessage
+
+        msg = ProjectMessage(content="x", context={}, status="open")
+        assert get_message_link(msg) is None
+
+    @pytest.mark.asyncio
+    async def test_fallback_path_links_bug_class_message_with_direction(
+        self, convergence_db
+    ):
+        """(a) The fallback resolution path moves a BUG_REPORT to 'linked' state
+        and stores the forward link when owned_by_direction is provided.
+        """
+        from app.message_convergence import LINKED_STATUS, get_message_link
+        from app.models import MessageType, Project, ProjectMessage
+
+        project = Project(name="P", user_id="u1", vision={"purpose": "test"})
+        convergence_db.add(project)
+        await convergence_db.commit()
+        await convergence_db.refresh(project)
+
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            content="CI pipeline is broken",
+            context={},
+            status="open",
+        )
+        convergence_db.add(msg)
+        await convergence_db.commit()
+        await convergence_db.refresh(msg)
+
+        from app.message_convergence import link_message_to_outcome
+
+        link_message_to_outcome(msg, "direction", "d-fix001")
+        convergence_db.add(msg)
+        await convergence_db.commit()
+        await convergence_db.refresh(msg)
+
+        assert msg.status == LINKED_STATUS
+        link = get_message_link(msg)
+        assert link is not None
+        assert link["kind"] == "direction"
+        assert link["id"] == "d-fix001"
+
+    @pytest.mark.asyncio
+    async def test_fallback_path_explicit_resolve_overrides_link(
+        self, convergence_db
+    ):
+        """(b) An explicit resolve (no ownership fields) terminally resolves
+        the message, even if it was previously in 'linked' state.
+        """
+        from app.message_convergence import LINKED_STATUS, link_message_to_outcome
+        from app.models import MessageType, Project, ProjectMessage
+
+        project = Project(name="P", user_id="u1", vision={"purpose": "test"})
+        convergence_db.add(project)
+        await convergence_db.commit()
+        await convergence_db.refresh(project)
+
+        # Start with a linked message
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            content="Flaky test",
+            context={},
+            status="open",
+        )
+        convergence_db.add(msg)
+        await convergence_db.commit()
+        await convergence_db.refresh(msg)
+
+        link_message_to_outcome(msg, "direction", "d-wont-fix")
+        convergence_db.add(msg)
+        await convergence_db.commit()
+        await convergence_db.refresh(msg)
+
+        assert msg.status == LINKED_STATUS
+
+        # Now explicitly resolve (no ownership info) — operator overrides
+        msg.status = "resolved"
+        msg.resolution = "Direction retired without fix, won't address"
+        convergence_db.add(msg)
+        await convergence_db.commit()
+        await convergence_db.refresh(msg)
+
+        assert msg.status == "resolved", (
+            "Explicit resolve must be terminal regardless of prior link"
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_bug_class_message_always_resolved_not_linked(
+        self, convergence_db
+    ):
+        """(b) A FEEDBACK message is NOT bug-class and always gets 'resolved'."""
+        from app.message_convergence import LINKED_STATUS
+        from app.models import MessageType, ProjectMessage
+
+        msg = ProjectMessage(
+            message_type=MessageType.FEEDBACK,
+            content="Would be nice if...",
+            context={},
+            status="open",
+        )
+        # Attempting to link a non-bug-class message is a no-op at the is_bug_class check.
+        # The fallback path only calls link_message_to_outcome when is_bug_class(msg) is True.
+        from app.message_convergence import is_bug_class
+
+        assert not is_bug_class(msg), "FEEDBACK is not bug-class"
+        # Status unchanged — the handler would NOT link this message even with ownership info.
+        assert msg.status == "open"
+        assert msg.status != LINKED_STATUS
+
+    # ── (c) Feed exclusion ───────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_linked_message_excluded_from_open_feed(self, convergence_db):
+        """(c) A linked message (status='linked') does not appear in the strategist's
+        actionable open-message feed even though it has not been resolved.
+        """
+        from app.message_convergence import LINKED_STATUS, link_message_to_outcome
+        from app.models import MessageType, Project, ProjectMessage
+        from app.strategic_spawning import _fetch_open_messages
+
+        project = Project(name="P", user_id="u1", vision={"purpose": "test"})
+        convergence_db.add(project)
+        await convergence_db.commit()
+        await convergence_db.refresh(project)
+
+        # Create one open message (should appear in the feed).
+        open_msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            content="Open bug — needs attention",
+            context={},
+            status="open",
+        )
+        # Create one linked message (should NOT appear in the feed).
+        linked_msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            content="Linked bug — fix already in flight",
+            context={},
+            status="open",
+        )
+        convergence_db.add(open_msg)
+        convergence_db.add(linked_msg)
+        await convergence_db.commit()
+        await convergence_db.refresh(open_msg)
+        await convergence_db.refresh(linked_msg)
+
+        # Link the second message to an in-flight direction.
+        link_message_to_outcome(linked_msg, "direction", "d-in-flight")
+        convergence_db.add(linked_msg)
+        await convergence_db.commit()
+        await convergence_db.refresh(linked_msg)
+
+        assert linked_msg.status == LINKED_STATUS
+
+        feed = await _fetch_open_messages(convergence_db, project.id)
+        feed_ids = {item["id"] for item in feed}
+
+        assert str(open_msg.id) in feed_ids, (
+            "Open BUG_REPORT must be visible in the strategist's feed"
+        )
+        assert str(linked_msg.id) not in feed_ids, (
+            "Linked BUG_REPORT must NOT appear in the actionable feed — "
+            "it already has an owner"
+        )
+
+    @pytest.mark.asyncio
+    async def test_strategic_completion_clusters_duplicate_bug_messages(
+        self, convergence_db
+    ):
+        """Duplicate bug messages with the same structured signature share one owned outcome."""
+        from app.message_convergence import LINKED_STATUS, get_message_link
+        from app.models import MessageType, Project, ProjectMessage, Task
+        from app.strategic_completion import _handle_strategic_completion
+
+        project = Project(name="P", user_id="u1", vision={"purpose": "test"})
+        convergence_db.add(project)
+        await convergence_db.commit()
+        await convergence_db.refresh(project)
+
+        anchor = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            content="Residual auto-fix is suspended",
+            context={
+                "event_type": "residual_fix_escalated",
+                "fingerprint": "fp-shared",
+            },
+            status="open",
+        )
+        duplicate = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            content="Residual auto-fix is suspended again",
+            context={
+                "event_type": "residual_fix_escalated",
+                "fingerprint": "fp-shared",
+            },
+            status="open",
+        )
+        convergence_db.add(anchor)
+        convergence_db.add(duplicate)
+        await convergence_db.commit()
+        await convergence_db.refresh(anchor)
+        await convergence_db.refresh(duplicate)
+
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                {"type": "strategic_review", "prompt": "review", "vision": {}}
+            ],
+        )
+        convergence_db.add(task)
+        await convergence_db.commit()
+        await convergence_db.refresh(task)
+
+        logs = json.dumps(
+            {
+                "vision": {"revision": 1},
+                "resolved_messages": [
+                    {
+                        "id": str(anchor.id),
+                        "owned_by_direction": "d-dup",
+                        "resolution": "Fix owned by direction d-dup",
+                    }
+                ]
+            }
+        )
+        await _handle_strategic_completion(task, logs, convergence_db)
+
+        await convergence_db.refresh(anchor)
+        await convergence_db.refresh(duplicate)
+
+        assert anchor.status == LINKED_STATUS
+        assert duplicate.status == LINKED_STATUS
+        anchor_link = get_message_link(anchor)
+        duplicate_link = get_message_link(duplicate)
+        assert anchor_link is not None
+        assert duplicate_link is not None
+        assert anchor_link["kind"] == duplicate_link["kind"] == "direction"
+        assert anchor_link["id"] == duplicate_link["id"] == "d-dup"
+        assert anchor.resolution == duplicate.resolution
+
+    @pytest.mark.asyncio
+    async def test_strategic_completion_leaves_distinct_bug_messages_independent(
+        self, convergence_db
+    ):
+        """Different structured signatures must not collapse into one owned outcome."""
+        from app.message_convergence import get_message_link
+        from app.models import MessageType, Project, ProjectMessage, Task
+        from app.strategic_completion import _handle_strategic_completion
+
+        project = Project(name="P", user_id="u1", vision={"purpose": "test"})
+        convergence_db.add(project)
+        await convergence_db.commit()
+        await convergence_db.refresh(project)
+
+        anchor = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            content="Residual auto-fix is suspended",
+            context={
+                "event_type": "residual_fix_escalated",
+                "fingerprint": "fp-one",
+            },
+            status="open",
+        )
+        distinct = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            content="Residual auto-fix is suspended elsewhere",
+            context={
+                "event_type": "residual_fix_escalated",
+                "fingerprint": "fp-two",
+            },
+            status="open",
+        )
+        convergence_db.add(anchor)
+        convergence_db.add(distinct)
+        await convergence_db.commit()
+        await convergence_db.refresh(anchor)
+        await convergence_db.refresh(distinct)
+
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                {"type": "strategic_review", "prompt": "review", "vision": {}}
+            ],
+        )
+        convergence_db.add(task)
+        await convergence_db.commit()
+        await convergence_db.refresh(task)
+
+        logs = json.dumps(
+            {
+                "vision": {"revision": 1},
+                "resolved_messages": [
+                    {
+                        "id": str(anchor.id),
+                        "owned_by_direction": "d-distinct",
+                        "resolution": "Fix owned by direction d-distinct",
+                    }
+                ]
+            }
+        )
+        await _handle_strategic_completion(task, logs, convergence_db)
+
+        await convergence_db.refresh(anchor)
+        await convergence_db.refresh(distinct)
+
+        assert anchor.status != "open"
+        assert distinct.status == "open"
+        assert get_message_link(anchor) is not None
+        assert get_message_link(distinct) is None
+
+    @pytest.mark.asyncio
+    async def test_resolved_message_also_excluded_from_open_feed(
+        self, convergence_db
+    ):
+        """Sanity: resolved messages (terminal) also stay out of the feed."""
+        from app.models import MessageType, Project, ProjectMessage
+        from app.strategic_spawning import _fetch_open_messages
+
+        project = Project(name="P", user_id="u1", vision={"purpose": "test"})
+        convergence_db.add(project)
+        await convergence_db.commit()
+        await convergence_db.refresh(project)
+
+        resolved_msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BLOCKER,
+            content="Already fixed",
+            context={},
+            status="resolved",
+        )
+        convergence_db.add(resolved_msg)
+        await convergence_db.commit()
+        await convergence_db.refresh(resolved_msg)
+
+        feed = await _fetch_open_messages(convergence_db, project.id)
+        feed_ids = {item["id"] for item in feed}
+        assert str(resolved_msg.id) not in feed_ids

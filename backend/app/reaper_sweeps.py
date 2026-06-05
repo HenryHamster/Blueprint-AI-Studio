@@ -1475,3 +1475,369 @@ async def sweep_stale_staged_directions(session) -> int:
             len(by_project),
         )
     return total_alerts
+
+
+# ── Step 15: linked bug-class message convergence / resurfacing sweep ────────
+#
+# A BUG_REPORT or BLOCKER message placed in 'linked' state has a durable forward
+# link recorded in its JSONB context (see message_convergence.py). This sweep
+# closes the loop: it reads the owning outcome's current lifecycle state and
+# either terminally resolves the message (CONVERGENCE) or reopens it (RESURFACING).
+#
+# CONVERGENCE fires when the owning outcome actually *lands*:
+#   - Direction: status == 'completed'
+#   - Task: is_merged_completion(task) — COMPLETED AND carries the landed
+#     signal (app.landed_signal). COMPLETED-but-not-landed is treated as
+#     still in-flight, never converged.
+#
+# RESURFACING fires when the owning outcome ended without landing (failed,
+# cancelled, retired, rejected, expired, superseded), went missing, or has been
+# in-flight longer than _CONVERGENCE_RESURFACE_AFTER without delivering.
+#
+# Operator-resolved messages (status == 'resolved', not 'linked') are never
+# touched — only 'linked' messages participate.  The sweep is idempotent: both
+# the convergence and resurfacing transitions change the message status away from
+# 'linked', so re-running on the same message is a no-op.
+
+# Default time bound: a linked message whose owning outcome has not yet landed
+# after this many days is resurfaced so the strategist can reassign the fix.
+_CONVERGENCE_RESURFACE_AFTER = timedelta(days=7)
+
+# Direction statuses that indicate the direction ended without landing the fix.
+_DIRECTION_FAILED_STATUSES: frozenset[str] = frozenset(
+    {"retired", "rejected", "expired", "superseded"}
+)
+
+
+def _converge_message(msg, now: datetime, rationale: str) -> None:
+    """Stamp msg as resolved — the owning outcome landed.
+
+    Mutates msg.status, msg.resolution, msg.resolved_at, and msg.context in
+    place.  Does NOT call session.add() or commit.
+    """
+    msg.status = "resolved"
+    msg.resolution = f"Owned outcome landed: {rationale}"
+    msg.resolved_at = now
+    ctx = dict(msg.context or {})
+    ctx["_convergence_converged_at"] = now.isoformat()
+    msg.context = ctx
+
+
+def _resurface_message(msg, now: datetime, reason: str) -> None:
+    """Reopen a linked bug-class message — owning outcome failed/missing/stale.
+
+    Moves the stale forward link to ``_convergence_link_stale`` (audit trail),
+    records why it came back, and sets status back to 'open'.
+    Does NOT call session.add() or commit.
+    """
+    msg.status = "open"
+    ctx = dict(msg.context or {})
+    old_link = ctx.pop("_convergence_link", None)
+    if old_link:
+        ctx["_convergence_link_stale"] = old_link
+    ctx["_convergence_resurfaced_at"] = now.isoformat()
+    ctx["_convergence_resurfaced_reason"] = reason
+    msg.context = ctx
+
+
+async def sweep_converge_linked_bug_messages(
+    session,
+    now: datetime,
+    *,
+    batch_size: int = 200,
+) -> int:
+    """Step 15: reconcile linked BUG_REPORT/BLOCKER messages with owned outcomes.
+
+    For each 'linked' bug-class message:
+    - CONVERGE to 'resolved' when the owning outcome lands.
+    - RESURFACE to 'open' when the owning outcome fails, is cancelled/retired/
+      rejected/expired/superseded, goes missing, or has been in-flight for longer
+      than _CONVERGENCE_RESURFACE_AFTER without delivering.
+    - Leave untouched when the owning outcome is still legitimately in-flight
+      within the time bound.
+
+    Returns the number of messages acted on (converged + resurfaced).
+    """
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.models import Direction, ProjectMessage
+    from app.message_convergence import BUG_CLASS_TYPES, LINKED_STATUS, get_message_link
+    from app.landed_signal import is_merged_completion
+    from app.time_utils import _coerce_naive_utc
+    from app.shared_state import runtime_config
+
+    resurface_days = int(
+        runtime_config.get(
+            "convergence_resurface_after_days", _CONVERGENCE_RESURFACE_AFTER.days
+        )
+    )
+    resurface_after = timedelta(days=resurface_days)
+
+    msgs = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.status == LINKED_STATUS,
+                    ProjectMessage.message_type.in_(list(BUG_CLASS_TYPES)),
+                )
+                .order_by(ProjectMessage.created_at)
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(msgs) >= batch_size:
+        logger.warning(
+            "[REAPER] convergence sweep hit cap=%d linked bug-class messages — "
+            "result truncated; next cycle continues",
+            batch_size,
+        )
+
+    if not msgs:
+        return 0
+
+    acted = 0
+    pending_broadcasts: list[tuple[str, dict]] = []
+
+    for msg in msgs:
+        link = get_message_link(msg)
+        if not link:
+            continue
+
+        kind = link.get("kind")
+        outcome_id = link.get("id")
+        linked_at_raw = link.get("linked_at")
+
+        if not kind or not outcome_id:
+            continue
+
+        linked_at: datetime | None = None
+        if linked_at_raw:
+            try:
+                linked_at = _coerce_naive_utc(
+                    datetime.fromisoformat(str(linked_at_raw))
+                )
+            except (ValueError, TypeError):
+                linked_at = None
+
+        if kind == "direction":
+            dir_row = (
+                (
+                    await session.execute(
+                        select(Direction).where(
+                            Direction.project_id == msg.project_id,
+                            Direction.direction_key == outcome_id,
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+
+            if dir_row is None:
+                reason = f"Owning direction '{outcome_id}' no longer exists"
+                _resurface_message(msg, now, reason)
+                session.add(msg)
+                pending_broadcasts.append(
+                    (str(msg.project_id), {"message_id": str(msg.id)})
+                )
+                acted += 1
+                logger.info(
+                    "[REAPER] Step 15: resurfaced message %s — direction '%s' missing",
+                    msg.id,
+                    outcome_id,
+                )
+                continue
+
+            dir_status = dir_row.status or "active"
+
+            if dir_status == "completed":
+                rationale = f"Direction '{outcome_id}' reached completed status"
+                _converge_message(msg, now, rationale)
+                session.add(msg)
+                pending_broadcasts.append(
+                    (str(msg.project_id), {"message_id": str(msg.id)})
+                )
+                acted += 1
+                logger.info(
+                    "[REAPER] Step 15: converged message %s — direction '%s' completed",
+                    msg.id,
+                    outcome_id,
+                )
+            elif dir_status in _DIRECTION_FAILED_STATUSES:
+                reason = (
+                    f"Owning direction '{outcome_id}' ended with status "
+                    f"'{dir_status}' without landing"
+                )
+                _resurface_message(msg, now, reason)
+                session.add(msg)
+                pending_broadcasts.append(
+                    (str(msg.project_id), {"message_id": str(msg.id)})
+                )
+                acted += 1
+                logger.info(
+                    "[REAPER] Step 15: resurfaced message %s — direction '%s' ended '%s'",
+                    msg.id,
+                    outcome_id,
+                    dir_status,
+                )
+            elif linked_at is not None and (now - linked_at) >= resurface_after:
+                reason = (
+                    f"Owning direction '{outcome_id}' still in status "
+                    f"'{dir_status}' after {(now - linked_at).days} days "
+                    f"without delivering the fix"
+                )
+                _resurface_message(msg, now, reason)
+                session.add(msg)
+                pending_broadcasts.append(
+                    (str(msg.project_id), {"message_id": str(msg.id)})
+                )
+                acted += 1
+                logger.info(
+                    "[REAPER] Step 15: resurfaced message %s — direction '%s' "
+                    "still in-flight after %d days",
+                    msg.id,
+                    outcome_id,
+                    (now - linked_at).days,
+                )
+            # else: in-flight within time bound — leave linked
+
+        elif kind == "task":
+            try:
+                task_uuid = uuid.UUID(str(outcome_id))
+            except (ValueError, AttributeError):
+                reason = f"Owning task id '{outcome_id}' is not a valid UUID"
+                _resurface_message(msg, now, reason)
+                session.add(msg)
+                pending_broadcasts.append(
+                    (str(msg.project_id), {"message_id": str(msg.id)})
+                )
+                acted += 1
+                logger.info(
+                    "[REAPER] Step 15: resurfaced message %s — task id '%s' "
+                    "is not a valid UUID",
+                    msg.id,
+                    outcome_id,
+                )
+                continue
+
+            task_row = await session.get(Task, task_uuid)
+
+            if task_row is None:
+                reason = f"Owning task '{outcome_id}' no longer exists"
+                _resurface_message(msg, now, reason)
+                session.add(msg)
+                pending_broadcasts.append(
+                    (str(msg.project_id), {"message_id": str(msg.id)})
+                )
+                acted += 1
+                logger.info(
+                    "[REAPER] Step 15: resurfaced message %s — task '%s' missing",
+                    msg.id,
+                    outcome_id,
+                )
+                continue
+
+            task_status = task_row.status
+
+            # CONVERGENCE requires a genuine *landing*, not merely COMPLETED.
+            # COMPLETED != merged is a deliberate invariant in this codebase:
+            # a fix task can reach COMPLETED with an open, unmerged PR (whose
+            # URL canonically lives in the Artifact table, not task.context), so
+            # deriving "landed" from a context pr_url heuristic would silently
+            # close a live bug report. Reuse the canonical landed detector.
+            if is_merged_completion(task_row):
+                rationale = f"Owning task '{outcome_id}' completed and PR merged"
+                _converge_message(msg, now, rationale)
+                session.add(msg)
+                pending_broadcasts.append(
+                    (str(msg.project_id), {"message_id": str(msg.id)})
+                )
+                acted += 1
+                logger.info(
+                    "[REAPER] Step 15: converged message %s — task '%s' landed",
+                    msg.id,
+                    outcome_id,
+                )
+
+            elif task_status == TaskStatus.COMPLETED:
+                # COMPLETED but not landed (PR open / unmerged) — treat as still
+                # in-flight, subject to the time-bound resurfacing below.
+                if linked_at is not None and (now - linked_at) >= resurface_after:
+                    reason = (
+                        f"Owning task '{outcome_id}' completed but did not land "
+                        f"(PR not merged) after {(now - linked_at).days} days"
+                    )
+                    _resurface_message(msg, now, reason)
+                    session.add(msg)
+                    pending_broadcasts.append(
+                        (str(msg.project_id), {"message_id": str(msg.id)})
+                    )
+                    acted += 1
+                    logger.info(
+                        "[REAPER] Step 15: resurfaced message %s — task '%s' "
+                        "completed but did not land after %d days",
+                        msg.id,
+                        outcome_id,
+                        (now - linked_at).days,
+                    )
+                # else: COMPLETED but not landed yet, within time bound — leave linked
+
+            elif task_status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                status_str = getattr(task_status, "value", str(task_status))
+                reason = (
+                    f"Owning task '{outcome_id}' ended with status "
+                    f"'{status_str}' without landing"
+                )
+                _resurface_message(msg, now, reason)
+                session.add(msg)
+                pending_broadcasts.append(
+                    (str(msg.project_id), {"message_id": str(msg.id)})
+                )
+                acted += 1
+                logger.info(
+                    "[REAPER] Step 15: resurfaced message %s — task '%s' %s",
+                    msg.id,
+                    outcome_id,
+                    status_str,
+                )
+            elif linked_at is not None and (now - linked_at) >= resurface_after:
+                status_str = getattr(task_status, "value", str(task_status))
+                reason = (
+                    f"Owning task '{outcome_id}' still in status "
+                    f"'{status_str}' after {(now - linked_at).days} days"
+                )
+                _resurface_message(msg, now, reason)
+                session.add(msg)
+                pending_broadcasts.append(
+                    (str(msg.project_id), {"message_id": str(msg.id)})
+                )
+                acted += 1
+                logger.info(
+                    "[REAPER] Step 15: resurfaced message %s — task '%s' "
+                    "still in-flight after %d days",
+                    msg.id,
+                    outcome_id,
+                    (now - linked_at).days,
+                )
+            # else: in-flight within time bound — leave linked
+
+    if acted:
+        await session.commit()
+        for project_id, payload in pending_broadcasts:
+            try:
+                await _bcast(project_id, "message_updated", payload)
+            except Exception as _bcast_err:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] convergence broadcast failed for message %s: %s",
+                    payload.get("message_id"),
+                    _bcast_err,
+                )
+        logger.info(
+            "[REAPER] Step 15: acted on %d linked bug-class message(s) "
+            "(converged or resurfaced)",
+            acted,
+        )
+
+    return acted

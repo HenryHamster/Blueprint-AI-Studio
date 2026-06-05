@@ -1441,6 +1441,34 @@ async def strategic_operation(
             raise HTTPException(status_code=404, detail="Message not found")
         if msg.status == "resolved":
             return _resp({"status": "already_resolved"})
+        owned_by_direction = data.get("owned_by_direction")
+        owned_by_task_id = data.get("owned_by_task")
+        from app.message_convergence import (
+            is_bug_class as _is_bug_class,
+            link_message_to_outcome as _link_message_to_outcome,
+        )
+        if _is_bug_class(msg) and (owned_by_direction or owned_by_task_id):
+            # Bug-class message with ownership info: record forward link and move
+            # to 'linked' state. Terminal 'resolved' happens when outcome lands.
+            kind = "direction" if owned_by_direction else "task"
+            identifier = owned_by_direction or owned_by_task_id
+            _link_message_to_outcome(msg, kind, str(identifier))
+            resolution_raw = data.get(
+                "resolution", f"Fix owned by {kind}: {identifier}"
+            )
+            msg.resolution = _cap_str(
+                resolution_raw, STRATEGIC_RESOLUTION_MAX, "resolution", warnings
+            )
+            session.add(msg)
+            await session.commit()
+            return _resp(
+                {
+                    "status": "ok",
+                    "op": "resolve_message",
+                    "message_id": str(msg.id),
+                    "linked_to": {"kind": kind, "id": str(identifier)},
+                }
+            )
         msg.status = "resolved"
         resolution_raw = data.get("resolution", "Addressed by strategic review")
         msg.resolution = _cap_str(

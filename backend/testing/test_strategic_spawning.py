@@ -7489,6 +7489,135 @@ async def test_empty_goal_leaves_strategic_payload_blank(db_session):
     assert payload["open_messages"] == []
 
 
+@pytest.mark.asyncio
+async def test_open_bug_report_survives_thread_cap_in_strategic_review(db_session):
+    """An OPEN BUG_REPORT created before 15+ newer messages must still appear in
+    the strategic_review open_messages inbox — not only in the architecture cycle.
+
+    Regression guard for the thread-slice behavior: previously open_messages was
+    derived by filtering the conversation_thread (capped at the 15 newest rows),
+    so an old open BUG_REPORT aged out of the strategist's view entirely and
+    could never be resolved.
+    """
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Oldest row: an OPEN BUG_REPORT the strategist must keep seeing.
+    bug_text = "Bug: strategist never sees this aged-out open report"
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            from_type="agent",
+            message_type=MessageType.BUG_REPORT,
+            content=bug_text,
+            status="open",
+            created_at=datetime(2026, 5, 1, 0, 0, 0),
+        )
+    )
+    # 30 newer messages — well beyond the 15-row conversation_thread cap.
+    for i in range(30):
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                from_type="user",
+                message_type=MessageType.NOTE,
+                content=f"newer chatter #{i}",
+                status="open",
+                created_at=datetime(2026, 6, 1, 0, 0, i),
+            )
+        )
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    # The aged-out bug report is gone from the recency-capped thread...
+    thread_contents = [m["content"] for m in payload["conversation_thread"]]
+    assert bug_text not in thread_contents
+    assert len(payload["conversation_thread"]) == 15
+    # ...but the authoritative open-message inbox still surfaces it.
+    open_contents = [m["content"] for m in payload["open_messages"]]
+    assert bug_text in open_contents
+
+
+@pytest.mark.asyncio
+async def test_open_messages_not_derived_from_capped_thread(db_session):
+    """The open-message inbox can exceed the 15-row conversation_thread cap.
+
+    Proves open_messages is its own query, not a byproduct of the capped thread.
+    """
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for i in range(25):
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                from_type="user",
+                message_type=MessageType.NOTE,
+                content=f"open message #{i}",
+                status="open",
+                created_at=datetime(2026, 6, 1, 0, 0, i),
+            )
+        )
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    # All 25 open messages surface, far more than the thread cap of 15.
+    assert len(payload["open_messages"]) == 25
+    assert len(payload["conversation_thread"]) == 15
+
+
+def test_summarize_open_messages_preserves_critical_and_oldest():
+    """The budget-pressure fallback keeps BUG_REPORT/BLOCKER + oldest-open items
+    and trims the rest, instead of dropping the whole inbox."""
+    from app.strategic_spawning import (
+        _summarize_open_messages,
+        _OPEN_MESSAGES_KEEP_WHEN_TRIMMED,
+        _OPEN_MESSAGE_EXCERPT_MAX_CHARS,
+    )
+
+    messages = []
+    # One old critical BUG_REPORT (oldest) and one BLOCKER.
+    messages.append(
+        {"id": "bug", "type": "BUG_REPORT", "content": "x" * 5000,
+         "created_at": "2026-05-01T00:00:00"}
+    )
+    messages.append(
+        {"id": "blk", "type": "BLOCKER", "content": "blocked",
+         "created_at": "2026-05-02T00:00:00"}
+    )
+    # Many newer NOTEs that should be trimmed away first.
+    for i in range(50):
+        messages.append(
+            {"id": f"note{i}", "type": "NOTE", "content": f"note {i}",
+             "created_at": f"2026-06-01T00:00:{i:02d}"}
+        )
+
+    trimmed = _summarize_open_messages(messages)
+
+    assert len(trimmed) == _OPEN_MESSAGES_KEEP_WHEN_TRIMMED
+    ids = {m["id"] for m in trimmed}
+    # Critical items survive trimming.
+    assert "bug" in ids
+    assert "blk" in ids
+    # Per-message excerpt is capped.
+    bug = next(m for m in trimmed if m["id"] == "bug")
+    assert len(bug["content"]) == _OPEN_MESSAGE_EXCERPT_MAX_CHARS
+
+
 class TestParallelismHint:
     """_build_parallelism_hint nudges toward enough INDEPENDENT direction lanes.
 
