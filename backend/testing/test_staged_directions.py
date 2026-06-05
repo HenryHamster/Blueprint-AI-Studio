@@ -206,6 +206,185 @@ async def test_activation_helper_fail_open_on_missing_marker(db_session):
 
 
 # ---------------------------------------------------------------------------
+# 2b. Active-direction cap is a genuine ceiling across auto-activation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_activation_respects_active_cap(db_session, monkeypatch):
+    """Auto-activation never pushes the project past the active-direction cap:
+    with N eligible staged directions but only ``slots`` free, exactly ``slots``
+    flip and the remainder stay staged with their markers intact."""
+    from app import shared_state
+
+    monkeypatch.setitem(shared_state.runtime_config, "max_active_directions", 3)
+
+    project = Project(
+        name="Cap-Ceiling",
+        user_id="staged-user",
+        autonomous_enabled=True,
+        directions=[
+            _active_direction("d-act1"),  # 2 active already → 1 free slot
+            _active_direction("d-act2"),
+            _staged_direction("d-s1", staged_for_version=1, staged_at="2026-01-01T00:00:00"),
+            _staged_direction("d-s2", staged_for_version=1, staged_at="2026-01-02T00:00:00"),
+            _staged_direction("d-s3", staged_for_version=1, staged_at="2026-01-03T00:00:00"),
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    activated = await activate_eligible_staged_directions(
+        db_session, project.id, promoted_version_number=1
+    )
+    # Only one slot was free (cap 3, two already active) → exactly one flips.
+    assert activated == ["d-s1"]
+
+    await db_session.refresh(project)
+    by_id = {d["id"]: d for d in project.directions}
+    assert by_id["d-s1"]["status"] == "active"
+    # Overflow stays staged with its target marker intact for the next sweep.
+    for did in ("d-s2", "d-s3"):
+        assert by_id[did]["status"] == "staged"
+        assert by_id[did]["staged_for_version"] == 1
+        assert "staged_activated_at" not in by_id[did]
+
+
+@pytest.mark.asyncio
+async def test_activation_at_cap_activates_none(db_session, monkeypatch):
+    """Already at the cap: activation returns [] and every staged direction stays
+    staged (no slot to flip into)."""
+    from app import shared_state
+
+    monkeypatch.setitem(shared_state.runtime_config, "max_active_directions", 2)
+
+    project = Project(
+        name="Cap-Full",
+        user_id="staged-user",
+        autonomous_enabled=True,
+        directions=[
+            _active_direction("d-act1"),
+            _active_direction("d-act2"),  # already at cap 2
+            _staged_direction("d-s1", staged_for_version=1),
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    activated = await activate_eligible_staged_directions(
+        db_session, project.id, promoted_version_number=1
+    )
+    assert activated == []
+
+    await db_session.refresh(project)
+    by_id = {d["id"]: d for d in project.directions}
+    assert by_id["d-s1"]["status"] == "staged"
+    assert by_id["d-s1"]["staged_for_version"] == 1
+
+
+@pytest.mark.asyncio
+async def test_activation_drains_overflow_across_sweeps(db_session, monkeypatch):
+    """Overflow held back by the cap drains on a later sweep once an active slot
+    frees — staged work is never permanently stranded."""
+    from app import shared_state
+
+    monkeypatch.setitem(shared_state.runtime_config, "max_active_directions", 2)
+
+    project = Project(
+        name="Cap-Drain",
+        user_id="staged-user",
+        autonomous_enabled=True,
+        directions=[
+            _active_direction("d-act1"),  # 1 active → 1 free slot
+            _staged_direction("d-s1", staged_for_version=1, staged_at="2026-01-01T00:00:00"),
+            _staged_direction("d-s2", staged_for_version=1, staged_at="2026-01-02T00:00:00"),
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # First sweep: only one slot free → only the oldest staged direction flips.
+    first = await activate_eligible_staged_directions(
+        db_session, project.id, promoted_version_number=1
+    )
+    assert first == ["d-s1"]
+
+    # Free an active slot (simulate a direction completing), then re-sweep.
+    await db_session.refresh(project)
+
+    def _complete_act1(directions):
+        for d in directions:
+            if d["id"] == "d-act1":
+                d["status"] = "completed"
+
+    from app.task_locking import with_directions_locked
+
+    await with_directions_locked(db_session, project.id, _complete_act1)
+    await db_session.commit()
+
+    second = await activate_eligible_staged_directions(
+        db_session, project.id, promoted_version_number=1
+    )
+    assert second == ["d-s2"]
+
+    await db_session.refresh(project)
+    by_id = {d["id"]: d for d in project.directions}
+    assert by_id["d-s2"]["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_activation_cap_ordering(db_session, monkeypatch):
+    """When a single slot is contested, the higher-priority direction wins; among
+    equal priority the older ``staged_at`` (FIFO) wins."""
+    from app import shared_state
+
+    monkeypatch.setitem(shared_state.runtime_config, "max_active_directions", 1)
+
+    project = Project(
+        name="Cap-Order",
+        user_id="staged-user",
+        autonomous_enabled=True,
+        directions=[
+            # No active directions → exactly one free slot.
+            _staged_direction(
+                "d-low", staged_for_version=1, priority="low",
+                staged_at="2026-01-01T00:00:00",
+            ),
+            _staged_direction(
+                "d-high", staged_for_version=1, priority="high",
+                staged_at="2026-01-05T00:00:00",
+            ),
+            _staged_direction(
+                "d-high-older", staged_for_version=1, priority="high",
+                staged_at="2026-01-02T00:00:00",
+            ),
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    activated = await activate_eligible_staged_directions(
+        db_session, project.id, promoted_version_number=1
+    )
+    # High priority beats low; among the two high, the older staged_at wins.
+    assert activated == ["d-high-older"]
+
+    await db_session.refresh(project)
+    by_id = {d["id"]: d for d in project.directions}
+    assert by_id["d-high-older"]["status"] == "active"
+    assert by_id["d-high"]["status"] == "staged"
+    assert by_id["d-low"]["status"] == "staged"
+
+
+# ---------------------------------------------------------------------------
 # 3. Reaper backstop
 # ---------------------------------------------------------------------------
 
