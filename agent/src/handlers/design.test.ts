@@ -38,6 +38,12 @@ vi.mock('fs', () => ({
   default: {
     readFileSync: vi.fn().mockReturnValue(''),
     existsSync: vi.fn().mockReturnValue(false),
+    // handleDesign now provisions the read-only ./design-doc and ./fetch
+    // helpers (writeDesignDocHelper / writeFetchHelper), which write files; the
+    // helper exclusion path appends to .git/info/exclude. Mock the writers so
+    // provisioning is a no-op rather than throwing on the bare fs mock.
+    writeFileSync: vi.fn(),
+    appendFileSync: vi.fn(),
   },
 }));
 

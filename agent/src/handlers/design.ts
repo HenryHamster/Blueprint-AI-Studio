@@ -12,8 +12,11 @@ import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   configureAgentPermissions, computePromptFingerprint, buildFileTree,
   DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, buildContextPrefix, buildRetryContext, readClaudeMd,
-  writePlaybookHelper, formatPlaybook, type PlaybookEntry,
+  writePlaybookHelper, writeDesignDocHelper, formatPlaybook, type PlaybookEntry,
 } from '../prompt.js';
+import {
+  writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS,
+} from './strategic-helpers.js';
 import {
   extractJsonObjectDetailed, describeJsonExtractionResult,
 } from '../json-extract.js';
@@ -131,6 +134,16 @@ export async function handleDesign(
     branch: baseBranch, baseBranch, depth: DEFAULT_CLONE_DEPTH,
   });
   writePlaybookHelper(taskId);
+  // The design prompt advertises `./design-doc get <key>` for architectural
+  // grounding; provision the read-only helper so that contract is honest.
+  writeDesignDocHelper(taskId, WORKSPACE, { readOnly: true });
+  // Provision the read-only ./fetch helper (direction|section|playbook) so the
+  // design agent can resolve refs trimmed from its launch snapshot. project_id is
+  // set for all task types by the backend; if it is missing we skip BOTH the
+  // helper AND its prompt advertisement so we never promise a helper we didn't write.
+  const designProjectId = ((task.project_metadata as Record<string, unknown> | undefined)?.project_id as string | undefined) ?? '';
+  if (designProjectId) writeFetchHelper(taskId, designProjectId, WORKSPACE, { verbs: PLAN_FETCH_VERBS });
+  const designFetchGuidance = designProjectId ? buildFetchGuidance(PLAN_FETCH_VERBS) : '';
 
   const disallowedTools = configureAgentPermissions('design');
 
@@ -180,9 +193,11 @@ ALSO write ${progressPath} — a concise markdown summary (under ~3000 chars) of
 ## Codebase
 ${fileTreeSection}
 
+Read full design-doc section prose on demand with \`./design-doc get <key>\` (list keys with \`./design-doc list\`).
+
 ${PLAYBOOK_GUIDANCE}
 
-${DEFAULT_TOOL_GUIDANCE}`;
+${designFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
 
   statusRef.value = 'Running design analysis...';
   const fingerprint = computePromptFingerprint('design');

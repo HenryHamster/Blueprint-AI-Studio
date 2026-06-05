@@ -22,7 +22,20 @@ import {
 import { resolveBuildConfig } from '../build-config.js';
 import { runCodeChangeTask } from './code-change.js';
 import { isParallelAuditEnabled, resolveCandidateSha } from './audits.js';
+import { writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 export { resolveCandidateSha, handleSecurityAudit, handleSelfAudit, handleReleaseAudit } from './audits.js';
+
+// Provision the read-only ./fetch helper (direction|section|playbook) so a
+// specialized handler can resolve refs trimmed from its launch snapshot.
+// project_id is set for all task types by the backend; when it is absent we
+// provision NOTHING and advertise nothing, so a prompt never promises a helper
+// that wasn't written. Returns the ./fetch guidance block (or '' when missing).
+function provisionFetchHelper(taskId: string, task: Record<string, unknown>): string {
+  const projectId = ((task.project_metadata as Record<string, unknown> | undefined)?.project_id as string | undefined) ?? '';
+  if (!projectId) return '';
+  writeFetchHelper(taskId, projectId, WORKSPACE, { verbs: PLAN_FETCH_VERBS });
+  return buildFetchGuidance(PLAN_FETCH_VERBS);
+}
 
 // ── Migration layout resolution ──────────────────────────────────────────────
 // Blueprint's database layout (`backend/alembic/versions/`, `app/models/`,
@@ -79,6 +92,7 @@ export async function handleMigrate(
   });
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  const migrateFetchGuidance = provisionFetchHelper(taskId, task);
   const disallowedTools = configureAgentPermissions('migrate');
   const migrateBuildConfig = resolveBuildConfig(task);
 
@@ -198,7 +212,7 @@ CRITICAL RULES:
     + READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + PRIOR_ATTEMPT_DIVERGENCE + BEYOND_SCOPE_REPORTING
     + migratePromptSuffix + `
 
-${DEFAULT_TOOL_GUIDANCE}`;
+${migrateFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
   const migrateFingerprint = computePromptFingerprint('migrate', migrateBuildConfig, {
     codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig: migrateBuildConfig, owner, repo }),
   });
@@ -294,6 +308,7 @@ export async function handleSmoketest(
 
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  const smoketestFetchGuidance = provisionFetchHelper(taskId, task);
   const disallowedTools = configureAgentPermissions('smoketest');
 
   const smoketestBuildConfig = (task.build_config ?? {}) as BuildConfig;
@@ -344,7 +359,7 @@ Set top-level "passed" to true only if ALL suites passed and there are no guardr
 
 IMPORTANT: Always write /tmp/smoketest_result_${taskId}.json even if you cannot run any tests (use status "skip" with a message explaining why). Never leave the file unwritten.${smoketestFirstTaskSection}
 
-${DEFAULT_TOOL_GUIDANCE}`;
+${smoketestFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
 
   statusRef.value = 'Running smoke tests...';
   const smoketestFingerprint = computePromptFingerprint('smoketest', smoketestBuildConfig);
@@ -438,6 +453,7 @@ export async function handleDebug(
   });
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  const debugFetchGuidance = provisionFetchHelper(taskId, task);
   const disallowedTools = configureAgentPermissions('debug');
 
   // Gather git context upfront to include in the prompt
@@ -508,7 +524,7 @@ IMPORTANT: Always write /tmp/debug_report_${taskId}.json even if you cannot dete
   setCurrentPromptFingerprint(debugFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: debugFingerprint });
   const debugParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
-  const { allOutput } = await runClaudeCode(debugPrompt + debugFirstTaskSection + debugParallelGuidance + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const { allOutput } = await runClaudeCode(debugPrompt + debugFirstTaskSection + debugParallelGuidance + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${debugFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   const debugResult = readHandlerOutput(taskId, 'debug_report', ws) as { root_cause: string; affected_files: string[]; fix_prompt: string; confidence: string } | null;
 
@@ -550,6 +566,7 @@ export async function handlePerf(
   });
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  const perfFetchGuidance = provisionFetchHelper(taskId, task);
   const disallowedTools = configureAgentPermissions('perf');
 
   const perfBuildConfig = resolveBuildConfig(task);
@@ -609,7 +626,7 @@ Rules:
   setCurrentPromptFingerprint(perfFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: perfFingerprint });
   const perfParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfPrompt + perfTypeHint + perfFirstTaskSection + perfPerfSuffix + perfParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfPrompt + perfTypeHint + perfFirstTaskSection + perfPerfSuffix + perfParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${perfFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   const perfFindings = readHandlerOutput(taskId, 'perf_report', ws);
   let logs = perfFindings !== null ? sanitize(JSON.stringify(perfFindings)) : '';
@@ -665,6 +682,7 @@ export async function handleInvestigate(
   });
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  const investigateFetchGuidance = provisionFetchHelper(taskId, task);
   const disallowedTools = configureAgentPermissions('investigate');
   const investigateRetryContext = buildRetryContext(task);
   const investigateFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
@@ -726,7 +744,7 @@ IMPORTANT:
   setCurrentPromptFingerprint(investigateFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: investigateFingerprint });
   const investigateParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(investigatePrompt + investigateFirstTaskSection + investigateParallelGuidance + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(investigatePrompt + investigateFirstTaskSection + investigateParallelGuidance + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${investigateFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   let investigationResult = readHandlerOutput(taskId, 'investigation_report', ws);
   if (investigationResult === null) {

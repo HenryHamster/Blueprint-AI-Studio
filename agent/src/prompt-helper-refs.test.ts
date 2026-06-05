@@ -155,6 +155,15 @@ describe('per-handler prompt/helper provisioning parity', () => {
     { type: 'refactor', sources: ['handlers/standard.ts'] },
     { type: 'review', sources: ['handlers/review-fix.ts'] },
     { type: 'fix', sources: ['handlers/review-fix.ts'] },
+    { type: 'migrate', sources: ['handlers/specialized.ts'] },
+    { type: 'debug', sources: ['handlers/specialized.ts'] },
+    { type: 'perf', sources: ['handlers/specialized.ts'] },
+    { type: 'investigate', sources: ['handlers/specialized.ts'] },
+    { type: 'smoketest', sources: ['handlers/specialized.ts'] },
+    { type: 'security_audit', sources: ['handlers/audits.ts'] },
+    { type: 'self_audit', sources: ['handlers/audits.ts'] },
+    { type: 'release_audit', sources: ['handlers/audits.ts'] },
+    { type: 'panel_review', sources: ['handlers/panel-review.ts'] },
   ];
 
   let ws: string;
