@@ -3041,6 +3041,48 @@ class TestMessages:
         assert strategic_refresh_pending(vision) is False
 
     @pytest.mark.asyncio
+    async def test_canonical_message_arm_rollback_does_not_500(
+        self, client: AsyncClient, db_session
+    ):
+        """Under real row contention the arm path rolls the session back to
+        clear the aborted bounded-lock acquire, which EXPIRES the
+        already-committed message. The endpoint must still return 200 with the
+        persisted id — not 500 on a sync lazy-load (MissingGreenlet) of an
+        expired ``msg.id``. Regression for the operator-message 500 where the
+        message committed but the request still errored (prompting a double-post
+        on retry). Distinct from ``..._reports_not_armed``, whose mock returns
+        False WITHOUT rolling back, so it never expired the instance.
+        """
+        project = await _make_project(db_session)
+
+        async def _rollback_then_fail(session, *args, **kwargs):
+            # Mirror request_strategic_refresh's OperationalError handler: roll
+            # the session back to keep the txn usable, which expires the
+            # committed msg in the caller's session.
+            await session.rollback()
+            return False
+
+        with patch(
+            "app.strategic_trigger.request_strategic_refresh",
+            new=AsyncMock(side_effect=_rollback_then_fail),
+        ):
+            resp = await client.post(
+                "/api/admin/messages",
+                json={
+                    "project_id": str(project.id),
+                    "message_type": "FEEDBACK",
+                    "content": "steer me while a cycle is running",
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "created"
+        assert body["arming"] == "not_armed"
+        # The id is the scalar snapshotted before the expire, not a lazy-load.
+        assert isinstance(body["id"], str) and len(body["id"]) == 36
+
+    @pytest.mark.asyncio
     async def test_canonical_message_burst_coalesces(
         self, client: AsyncClient, db_session
     ):

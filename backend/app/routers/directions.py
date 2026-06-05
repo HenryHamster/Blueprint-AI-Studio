@@ -1183,6 +1183,11 @@ async def create_message(
     session.add(msg)
     await session.commit()
     await session.refresh(msg)
+    # Snapshot the id before arming: maybe_arm_operator_refresh's bounded lock
+    # acquire can OperationalError + roll back under project-row contention,
+    # expiring this committed msg; a later ``str(msg.id)`` would then sync
+    # lazy-load (MissingGreenlet) and 500 an already-committed message.
+    message_id = str(msg.id)
 
     # An operator message that warrants strategist attention (steering /
     # feedback / question / blocker — anything but a passive NOTE) arms the
@@ -1208,7 +1213,7 @@ async def create_message(
     if arming == ARMING_STEERING:
         await session.commit()
 
-    return {"id": str(msg.id), "status": "created", "arming": arming}
+    return {"id": message_id, "status": "created", "arming": arming}
 
 
 @router.get("/projects/{project_id}/messages")

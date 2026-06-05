@@ -581,6 +581,13 @@ async def create_message(
                 }
         raise
     await session.refresh(msg)
+    # Snapshot the id before arming. maybe_arm_operator_refresh's bounded lock
+    # acquire can raise OperationalError under project-row contention (an active
+    # strategic cycle) and roll the session back, which EXPIRES this committed
+    # msg. A later ``str(msg.id)`` would then trigger a sync lazy-load
+    # (MissingGreenlet) and 500 a request whose message already durably
+    # committed. The captured scalar is immune to that expire.
+    message_id = str(msg.id)
 
     # Wake the strategist on genuine operator steering. This is the live-chat
     # surface the admin MessagesPanel composer hits, and it must steer exactly
@@ -607,7 +614,7 @@ async def create_message(
     )
     if arming == ARMING_STEERING:
         await session.commit()
-    return {"id": str(msg.id), "status": "created", "arming": arming}
+    return {"id": message_id, "status": "created", "arming": arming}
 
 
 @router.patch("/messages/{message_id}")
