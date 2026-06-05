@@ -258,6 +258,72 @@ def test_empty_pre_trim_marker_not_surfaced():
     assert out["_packer_meta"]["gap_memory_trimmed"] == []
 
 
+def test_floor_key_survives_when_higher_volume_siblings_exhaust_budget():
+    """A key with a ``floor`` callback always ships at least its floored value,
+    even when same-tier siblings that sort ahead would otherwise exhaust the
+    budget. Other recoverable context degrades/drops before the floored key.
+
+    This is the in-payload delivery guarantee: without the floor reservation,
+    the big high-tier siblings pack first and ``model`` (whose full size sorts
+    it last in the high tier) would be dropped entirely.
+    """
+    payload = {
+        "model": {"gaps": ["g"] * 400},  # big full value, sorts last in high tier
+        "sibling_a": "x" * 600,
+        "sibling_b": "y" * 600,
+    }
+    schema = {
+        # floor strips the model down to a tiny (~32B) guaranteed working set
+        "model": {
+            "priority": "high",
+            "summarize": lambda v: {"gaps": v["gaps"][:1], "floored": True},
+            "floor": lambda v: {"gaps": v["gaps"][:1], "floored": True},
+        },
+        "sibling_a": {"priority": "high"},
+        "sibling_b": {"priority": "high"},
+    }
+    # Budget is tight: the two ~602B siblings fit with only ~6B to spare — too
+    # little for the ~32B floored model. WITHOUT the reservation the siblings
+    # win the race and the model is dropped; WITH it a sibling drops instead.
+    out = pack_under_budget(payload, schema, budget=1210)
+    assert "model" in out, "floored key was starved out by higher-volume siblings"
+    assert out["model"] == {"gaps": ["g"], "floored": True}
+    dropped_keys = {d["key"] for d in out["_packer_meta"]["dropped"]}
+    assert "model" not in dropped_keys
+    # A recoverable sibling degraded (dropped) before the floored model vanished.
+    assert "sibling_a" not in out or "sibling_b" not in out
+
+
+def test_floor_used_when_summarize_absent_or_raises():
+    """When a floor key has no summarize_fn (or it raises), the floor still
+    ships rather than the key being dropped."""
+    payload = {"model": {"big": "z" * 5000}}
+    schema = {
+        "model": {
+            "priority": "high",
+            "floor": lambda v: {"floored": True},
+        },
+    }
+    out = pack_under_budget(payload, schema, budget=200)
+    assert out["model"] == {"floored": True}
+    assert {"key": "model", "kind": "floored"} in out["_packer_meta"]["trimmed"]
+
+
+def test_floor_full_value_ships_when_budget_allows():
+    """The floor is a guarantee, not a cap — when the budget fits the full
+    value, the full (un-floored) value ships."""
+    payload = {"model": {"gaps": ["g1", "g2", "g3"]}}
+    schema = {
+        "model": {
+            "priority": "high",
+            "floor": lambda v: {"gaps": v["gaps"][:1]},
+        },
+    }
+    out = pack_under_budget(payload, schema, budget=10_000)
+    assert out["model"] == {"gaps": ["g1", "g2", "g3"]}
+    assert out["_packer_meta"]["trimmed"] == []
+
+
 def test_summarize_returning_larger_value_falls_back_to_original(caplog):
     """If summarize_fn returns something larger (caller bug), use original.
 
@@ -496,6 +562,57 @@ def test_gcd_problem_model_round_trips_under_single_pass_budget():
     assert out["problem_model"].get("gaps"), "packed problem_model lost its active gaps"
     # archived_gaps is intentionally stripped by the agent view.
     assert "archived_gaps" not in out["problem_model"]
+
+
+def test_problem_model_survives_bloated_real_payload_with_many_high_sections():
+    """The real strategic payload path: when MANY high-tier sections are present
+    together and collectively blow the budget, the problem_model is still
+    delivered in-payload (floored, never dropped) while other recoverable
+    high-tier context degrades or drops first.
+
+    This exercises the production ``_STRATEGIC_REVIEW_SCHEMA`` + default budget,
+    not isolated unit inputs — the guarantee must hold under real bloat.
+    """
+    from app.problem_model import gc_problem_model
+    from app.strategic_spawning import (
+        _STRATEGIC_REVIEW_SCHEMA,
+        _agent_view_problem_model,
+    )
+
+    model = _worst_case_durable_problem_model()
+    gc_problem_model(model)
+
+    # A realistic-but-oversized cycle payload: the problem_model alongside
+    # several other high-tier sections each padded with enough bulk that the
+    # sum far exceeds the 120 KB budget, forcing real eviction pressure.
+    bulk = "x" * 45_000
+    payload = {
+        "type": "strategic_review",
+        "research_mode": False,
+        "project_name": "Blueprint",
+        "base_branch": "main",
+        "vision": {"purpose": "demo"},
+        "problem_model": _agent_view_problem_model(model.model_dump()),
+        # High-tier siblings without summarize_fns that would otherwise win the
+        # budget race and starve the problem_model out of the payload.
+        "running_update": bulk,
+        "cycle_start_reconciliation": {"conflicts": [bulk]},
+        "deployment_state": {"deployed": bulk},
+    }
+    out = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA)
+
+    assert "problem_model" in out, (
+        "problem_model was dropped under real multi-high-section budget pressure"
+    )
+    dropped_keys = {d["key"] for d in out["_packer_meta"]["dropped"]}
+    assert "problem_model" not in dropped_keys, (
+        f"problem_model dropped by the packer: {out['_packer_meta']['dropped']}"
+    )
+    # The delivered model is a meaningful working set (still carries live gaps).
+    assert out["problem_model"].get("gaps"), "delivered problem_model lost its gaps"
+    # Other recoverable context degraded first — at least one high sibling dropped.
+    assert dropped_keys, "expected recoverable siblings to drop before the floor"
+    assert out["_packer_meta"]["budget_used"] <= 120 * 1024
 
 
 def test_gap_memory_trimmed_surfaced_for_capped_model():

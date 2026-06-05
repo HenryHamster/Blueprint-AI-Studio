@@ -1759,6 +1759,11 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "problem_model": {
         "priority": "high",
         "summarize": _agent_view_problem_model_packed,
+        # Floor reservation: the packer reserves the floored model's bytes off
+        # the top of the budget so the strategist's working set is GUARANTEED
+        # in-payload every cycle — other recoverable sections degrade before the
+        # problem_model is ever dropped entirely.
+        "floor": _agent_view_problem_model_packed,
     },
     # Tiny, load-bearing soft size/health signal computed from the DURABLE
     # problem_model (honest counts, not the trimmed agent view). High priority,
@@ -1835,6 +1840,11 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     "problem_model": {
         "priority": "high",
         "summarize": _agent_view_problem_model_packed,
+        # Floor reservation: the packer reserves the floored model's bytes off
+        # the top of the budget so the strategist's working set is GUARANTEED
+        # in-payload every cycle — other recoverable sections degrade before the
+        # problem_model is ever dropped entirely.
+        "floor": _agent_view_problem_model_packed,
     },
     # See _STRATEGIC_REVIEW_SCHEMA: tiny, load-bearing soft size/health signal.
     "model_health": {"priority": "high"},

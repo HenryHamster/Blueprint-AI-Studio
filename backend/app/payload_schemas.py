@@ -503,12 +503,21 @@ def pack_under_budget(
     ``summarize: (value) -> trimmed_value`` callback. Missing schema entries
     default to ``priority="low"`` with a logged warning.
 
+    A schema entry may ALSO declare a ``floor: (value) -> floored_value``
+    callback producing a guaranteed-minimum representation. Floored bytes are
+    reserved off the top of the budget so a floored key is NEVER starved out
+    by other sections — even same- or higher-tier ones that sort ahead of it.
+    The floored value always ships (the full/summarized value ships when the
+    remaining budget allows); other recoverable context degrades first. This
+    is the in-payload delivery guarantee for the strategic ``problem_model``.
+
     Algorithm: sort by (tier desc, size asc) so within a tier smaller items
     pack first — a 50KB high won't evict a 5KB high purely by insertion
     order. Then greedy-fill: try full size; if over remaining budget call
-    ``summarize`` once; if still over, drop. Critical-tier items that can't
-    fit (even after summarize) raise :class:`PayloadTooLargeError` —
-    silently dropping critical context is worse than failing loudly.
+    ``summarize`` once; if still over, ship the ``floor`` (if any) or drop.
+    Critical-tier items that can't fit (even after summarize) raise
+    :class:`PayloadTooLargeError` — silently dropping critical context is
+    worse than failing loudly.
 
     Returns a new dict containing the packed keys plus a ``_packer_meta``
     entry describing what was trimmed/dropped and the budget accounting.
@@ -565,6 +574,44 @@ def pack_under_budget(
         )
     )
 
+    # Floor reservations: keys whose schema declares a ``floor`` callback are
+    # GUARANTEED to ship at least their floored representation. We reserve that
+    # many bytes off the top of the budget so other sections — even same- or
+    # higher-tier ones that sort ahead — degrade or drop BEFORE a floored key
+    # disappears. This is the in-payload delivery guarantee for the strategic
+    # problem_model: a cycle never runs with the model dropped entirely.
+    floors: dict[str, dict] = {}
+    for p in parts:
+        if p["unserializable"]:
+            continue
+        floor_fn = (schema.get(p["key"]) or {}).get("floor")
+        if floor_fn is None:
+            continue
+        try:
+            floored = floor_fn(p["value"])
+            floored_size = _serialized_size(floored)
+        except Exception as exc:  # noqa: BLE001 — floor fns must not crash the packer
+            logger.warning(
+                "pack_under_budget: floor for key %r raised %s — no reservation",
+                p["key"],
+                exc,
+            )
+            continue
+        floors[p["key"]] = {"value": floored, "size": floored_size}
+    reserved_remaining = sum(f["size"] for f in floors.values())
+    # If the floor reservations alone exceed the budget we cannot honor them all;
+    # abandon the reservation guarantee (floored keys then pack best-effort)
+    # rather than starve the critical-tier identity keys into a hard failure.
+    if reserved_remaining > budget:
+        logger.warning(
+            "pack_under_budget: floor reservations (%d) exceed budget (%d) — "
+            "dropping the floor guarantee for this pack",
+            reserved_remaining,
+            budget,
+        )
+        floors = {}
+        reserved_remaining = 0
+
     packed: dict = {}
     used = 0
     trimmed: list[dict] = []
@@ -572,10 +619,15 @@ def pack_under_budget(
 
     for p in parts:
         key = p["key"]
+        floor = floors.get(key)
+        if floor is not None:
+            # Release this key's reservation: those bytes are now claimable by it
+            # while the OTHER floored keys' reservations stay protected.
+            reserved_remaining -= floor["size"]
         if p["unserializable"]:
             dropped.append({"key": key, "reason": "value not JSON-serializable"})
             continue
-        remaining = budget - used
+        remaining = budget - used - reserved_remaining
         if p["size"] <= remaining:
             packed[key] = p["value"]
             used += p["size"]
@@ -631,6 +683,16 @@ def pack_under_budget(
                             trimmed.append({"key": key, "kind": "summarized"})
                         included = True
         if not included:
+            if floor is not None:
+                # Guaranteed-floor fallback: ship the floored value, which is
+                # certain to fit within the bytes reserved for this key (just
+                # released into ``remaining`` above). Reached only when there is
+                # no summarize_fn or it failed/overflowed — the floored value is
+                # the last-resort working set the strategist must always receive.
+                packed[key] = floor["value"]
+                used += floor["size"]
+                trimmed.append({"key": key, "kind": "floored"})
+                continue
             if p["priority"] == "critical":
                 top_keys = sorted(
                     ((pp["key"], pp["size"] or 0) for pp in parts),

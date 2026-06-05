@@ -421,6 +421,72 @@ def _format_circuit_breaker(cb: dict) -> CircuitBreakerInfo:
     }
 
 
+def _build_problem_model_trim_verdict(payload: dict) -> Optional[dict]:
+    """Summarize how read-time packing treated the problem_model in a strategic payload.
+
+    Operators already see when a strategic cycle was *skipped* because the assembled
+    payload exceeded the hard cap (``payload_bloat_skip``). They do NOT see when a cycle
+    that actually RAN shipped a summarized / floored / dropped problem_model because the
+    byte-budget packer (``pack_under_budget``) trimmed it to fit. This derives that
+    verdict from the assembled task payload's ``_packer_meta`` plus the agent-view markers
+    the packer leaves on the problem_model itself (``_agent_view_floor_applied`` /
+    ``_gap_memory_trimmed``), so the verdict is visible without inspecting raw payload JSON.
+
+    ``status`` is one of: ``full`` (shipped untrimmed), ``summarized`` (byte-budget
+    summarize ran), ``floor`` (summarize degraded it to the read-time floor), ``dropped``
+    (omitted entirely). Returns None when the payload carries no packer metadata.
+    """
+    meta = payload.get("_packer_meta")
+    if not isinstance(meta, dict):
+        return None
+    pm = payload.get("problem_model")
+    pm = pm if isinstance(pm, dict) else {}
+
+    dropped_entry = next(
+        (
+            d
+            for d in (meta.get("dropped") or [])
+            if isinstance(d, dict) and d.get("key") == "problem_model"
+        ),
+        None,
+    )
+    summarized = any(
+        isinstance(t, dict) and t.get("key") == "problem_model"
+        for t in (meta.get("trimmed") or [])
+    )
+    floor = pm.get("_agent_view_floor_applied")
+    floor = floor if isinstance(floor, dict) else None
+
+    if dropped_entry is not None:
+        status = "dropped"
+    elif floor:
+        status = "floor"
+    elif summarized:
+        status = "summarized"
+    else:
+        status = "full"
+
+    gap_trimmed = pm.get("_gap_memory_trimmed")
+    gap_trimmed_count = len(gap_trimmed) if isinstance(gap_trimmed, list) else 0
+
+    verdict: dict = {
+        "status": status,
+        "budget_total": meta.get("budget_total"),
+        "budget_used": meta.get("budget_used"),
+        "gap_memory_trimmed_count": gap_trimmed_count,
+    }
+    if floor:
+        verdict["floor"] = {
+            "floor_bytes": floor.get("floor_bytes"),
+            "stripped_gap_fields": floor.get("stripped_gap_fields") or [],
+            "dropped_gaps": int(floor.get("dropped_gaps", 0) or 0),
+            "still_over_floor": bool(floor.get("still_over_floor")),
+        }
+    if dropped_entry is not None and dropped_entry.get("reason"):
+        verdict["dropped_reason"] = dropped_entry.get("reason")
+    return verdict
+
+
 # ---------------------------------------------------------------------------
 # GET /api/admin/projects/{project_id}/autonomy-debug
 # ---------------------------------------------------------------------------
@@ -769,6 +835,36 @@ async def get_strategic_debug(
         active_strategic_task = result
         active_phase = (result.first_payload).get("type")
 
+    # Last read-time packing verdict for the problem_model: derived from the most
+    # recent strategic task's assembled payload (any status, so the verdict survives
+    # after the cycle completes). Surfaces whether the strategist actually saw the
+    # problem_model in full or a summarized / floored / dropped view — the success-case
+    # complement to the payload_bloat_skip (cap-exceeded skip) signal below.
+    latest_strategic = (
+        await session.execute(
+            select(Task)
+            .where(
+                Task.project_id == project_id,
+                Task.payloads[0]["type"].astext.in_(sorted(STRATEGIC_TASK_TYPES)),
+            )
+            .order_by(Task.created_at.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    problem_model_trim: Optional[dict] = None
+    if latest_strategic is not None:
+        problem_model_trim = _build_problem_model_trim_verdict(
+            latest_strategic.first_payload
+        )
+        if problem_model_trim is not None:
+            problem_model_trim["task_id"] = str(latest_strategic.id)
+            problem_model_trim["task_status"] = latest_strategic.status
+            problem_model_trim["assembled_at"] = (
+                latest_strategic.created_at.isoformat()
+                if latest_strategic.created_at
+                else None
+            )
+
     # Trigger countdowns
     strategic_frequency = vision.get(
         "_strategic_frequency_override"
@@ -906,6 +1002,7 @@ async def get_strategic_debug(
         "phase": phase,
         "blocking_guards": blocking_guards,
         "payload_bloat_skip": payload_bloat_skip,
+        "problem_model_trim": problem_model_trim,
         "has_purpose": has_purpose,
         "research_spawn_count": research_spawn_count,
         "strategic_cycle_count": strategic_cycle_count,

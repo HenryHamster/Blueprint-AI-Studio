@@ -16,6 +16,7 @@ from app.routers.admin_debug import (
     _build_stuck_tasks,
     _build_direction_portfolio_summary,
     _build_direction_remediation_state,
+    _build_problem_model_trim_verdict,
     get_global_diagnostics,
     get_project_diagnostics,
     DIAGNOSTICS_TOP_N,
@@ -1076,6 +1077,75 @@ def test_portfolio_summary_skips_code_only_direction():
         }
     ]
     assert _build_direction_portfolio_summary(project) == []
+
+
+# ── _build_problem_model_trim_verdict ────────────────────────────────────────
+
+
+def test_trim_verdict_none_without_packer_meta():
+    """Payloads without packer metadata (older / unpacked) yield no verdict."""
+    assert _build_problem_model_trim_verdict({"problem_model": {"gaps": []}}) is None
+
+
+def test_trim_verdict_full_counts_gap_memory_trim():
+    """A problem_model that shipped untrimmed reports status 'full' but still
+    surfaces how many gaps had their append-only memory pre-trimmed."""
+    payload = {
+        "problem_model": {
+            "gaps": [{"id": "g1"}],
+            "_gap_memory_trimmed": [{"gap_id": "g1", "fields": {"history": {"shown": 5, "total": 20}}}],
+        },
+        "_packer_meta": {"budget_total": 122880, "budget_used": 40000, "trimmed": [], "dropped": []},
+    }
+    v = _build_problem_model_trim_verdict(payload)
+    assert v["status"] == "full"
+    assert v["gap_memory_trimmed_count"] == 1
+    assert v["budget_total"] == 122880
+    assert "floor" not in v
+
+
+def test_trim_verdict_summarized():
+    """problem_model listed in _packer_meta.trimmed (but not floored) is 'summarized'."""
+    payload = {
+        "problem_model": {"gaps": []},
+        "_packer_meta": {"trimmed": [{"key": "problem_model", "kind": "summarized"}], "dropped": []},
+    }
+    assert _build_problem_model_trim_verdict(payload)["status"] == "summarized"
+
+
+def test_trim_verdict_floor_takes_precedence_over_summarized():
+    """When the summarize path degraded the model to the floor, status is 'floor'
+    and the floor detail (stripped fields / dropped gaps) is surfaced."""
+    payload = {
+        "problem_model": {
+            "gaps": [],
+            "_agent_view_floor_applied": {
+                "floor_bytes": 32768,
+                "stripped_gap_fields": ["history", "evidence"],
+                "dropped_gaps": 3,
+                "still_over_floor": True,
+            },
+        },
+        "_packer_meta": {"trimmed": [{"key": "problem_model"}], "dropped": []},
+    }
+    v = _build_problem_model_trim_verdict(payload)
+    assert v["status"] == "floor"
+    assert v["floor"]["dropped_gaps"] == 3
+    assert v["floor"]["stripped_gap_fields"] == ["history", "evidence"]
+    assert v["floor"]["still_over_floor"] is True
+
+
+def test_trim_verdict_dropped_carries_reason():
+    """A problem_model in _packer_meta.dropped is 'dropped' with its reason."""
+    payload = {
+        "_packer_meta": {
+            "trimmed": [],
+            "dropped": [{"key": "problem_model", "reason": "exceeds remaining budget"}],
+        },
+    }
+    v = _build_problem_model_trim_verdict(payload)
+    assert v["status"] == "dropped"
+    assert v["dropped_reason"] == "exceeds remaining budget"
 
 
 def test_portfolio_summary_skips_inactive_and_empty():

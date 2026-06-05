@@ -88,6 +88,22 @@ interface PayloadBloatSkip {
   top_contributors?: { key: string; size: number }[];
 }
 
+interface ProblemModelTrim {
+  status: 'full' | 'summarized' | 'floor' | 'dropped';
+  budget_total?: number | null;
+  budget_used?: number | null;
+  gap_memory_trimmed_count?: number;
+  floor?: {
+    floor_bytes?: number | null;
+    stripped_gap_fields?: string[];
+    dropped_gaps?: number;
+    still_over_floor?: boolean;
+  };
+  dropped_reason?: string;
+  task_status?: string;
+  assembled_at?: string | null;
+}
+
 interface StrategicCycleEntry {
   cycle_id?: string;
   started_at?: string;
@@ -104,6 +120,7 @@ interface StrategicDebug {
   phase: number;
   blocking_guards: StrategicBlockingGuard[];
   payload_bloat_skip?: PayloadBloatSkip | null;
+  problem_model_trim?: ProblemModelTrim | null;
   has_purpose: boolean;
   research_spawn_count: number;
   strategic_cycle_count: number;
@@ -462,13 +479,65 @@ function PayloadBloatIndicator({ skip }: { skip: PayloadBloatSkip }) {
   );
 }
 
+const TRIM_STATUS_META: Record<ProblemModelTrim['status'], { label: string; tone: string }> = {
+  full: { label: 'shipped in full', tone: 'text-emerald-400' },
+  summarized: { label: 'summarized to fit budget', tone: 'text-amber-400' },
+  floor: { label: 'degraded to read-time floor', tone: 'text-amber-400' },
+  dropped: { label: 'dropped from payload', tone: 'text-red-400' },
+};
+
+function ProblemModelTrimIndicator({ trim }: { trim: ProblemModelTrim }) {
+  const meta = TRIM_STATUS_META[trim.status] ?? TRIM_STATUS_META.full;
+  // "full" is the healthy case — show a compact one-liner; trimmed states get a
+  // callout box explaining what the strategist actually saw.
+  if (trim.status === 'full') {
+    const trimmedGaps = trim.gap_memory_trimmed_count ?? 0;
+    return (
+      <div className="flex items-center justify-between text-[11px] text-neutral-500">
+        <span className="flex items-center gap-1">
+          <FileText className="w-3 h-3 shrink-0" />Problem model
+        </span>
+        <span className="font-mono text-[10px] text-emerald-400">
+          full{trimmedGaps > 0 ? ` · ${trimmedGaps} gap${trimmedGaps === 1 ? '' : 's'} trimmed` : ''}
+        </span>
+      </div>
+    );
+  }
+  const floor = trim.floor;
+  const droppedGaps = floor?.dropped_gaps ?? 0;
+  const stripped = floor?.stripped_gap_fields ?? [];
+  return (
+    <div className="rounded-md bg-amber-500/10 border border-amber-500/30 px-2.5 py-2">
+      <div className="flex items-center justify-between">
+        <span className={`text-[10px] font-semibold uppercase tracking-wider flex items-center gap-1 ${meta.tone}`}>
+          <AlertTriangle className="w-3 h-3 shrink-0" />Problem model {meta.label}
+        </span>
+        {trim.assembled_at && (
+          <span className="font-mono text-[10px] text-amber-400/70">{formatTimeAgoShort(trim.assembled_at)}</span>
+        )}
+      </div>
+      <p className="text-[11px] leading-tight text-amber-300 mt-1">
+        Read-time packing trimmed the problem_model, so the strategist saw a reduced view.
+        {trim.status === 'dropped' && (trim.dropped_reason ? ` ${trim.dropped_reason}.` : ' It was omitted entirely.')}
+        {trim.status === 'floor' && droppedGaps > 0 && ` Dropped ${droppedGaps} low-priority gap${droppedGaps === 1 ? '' : 's'}.`}
+        {trim.status === 'floor' && stripped.length > 0 && ` Stripped per-gap ${stripped.join(', ')}.`}
+        {floor?.still_over_floor && ' Still over the floor after trimming.'}
+      </p>
+    </div>
+  );
+}
+
 function StrategicSection({ strategic }: { strategic: StrategicDebug }) {
   const bloat = strategic.payload_bloat_skip;
+  const trim = strategic.problem_model_trim;
   const otherGuards = strategic.blocking_guards.filter((g) => g.guard !== 'payload_bloat_skip');
   return (
     <div className="mt-3 pt-3 border-t border-neutral-800 space-y-1.5">
       {/* Payload-bloat stall takes precedence over the green countdown */}
       {bloat && <PayloadBloatIndicator skip={bloat} />}
+
+      {/* Last read-time packing verdict for the problem_model the strategist saw */}
+      {trim && <ProblemModelTrimIndicator trim={trim} />}
 
       {/* Active task or next countdown */}
       {strategic.active_task ? (
