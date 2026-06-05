@@ -151,6 +151,7 @@ from app.release_scoring import (
     _extract_excluded_audit_findings,
     _extract_smoketest_detail,  # noqa: F401 — re-exported for callers/tests
     _extract_test_erosion_detail,  # noqa: F401 — re-exported for callers/tests
+    _finding_subject_is_authorized_divergence,  # noqa: F401 — re-exported for tests
     _fmt_sub_scores,
     _score_audit,
     _score_smoketest,

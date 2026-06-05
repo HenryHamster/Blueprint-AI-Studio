@@ -1190,6 +1190,91 @@ class TestScoreAuditVerification:
         assert rq._audit_missing_reason(report) == "all_findings_unverified"
 
 
+class TestScoreAuditAuthorizedDivergence:
+    """An authorized, registry-listed Alembic revision-identity divergence is
+    owned by the deterministic migration-identity gate, so the release audit
+    scorer must NOT deduct for it (no double-counting). Unrelated findings and
+    genuine migration-body defects still deduct."""
+
+    _AUTH_VNOTE = (
+        "Read git diff main...candidate: the old 0143 migration is replaced by a "
+        "new 0143 plus a renumbered 0144 — revision-identity collision vs deployed main."
+    )
+
+    def test_authorized_renumber_finding_not_deducted(self):
+        """A medium finding whose subject is the authorized 0143 renumber does
+        not deduct — the gate owns it."""
+        report = {
+            "findings": [
+                {
+                    "severity": "medium",
+                    "summary": "The 0143 back-merge renumber reuses revision id 0143 and renumbers 0144.",
+                    "file": "backend/alembic/versions/0143_add_compute_job_persistence.py",
+                    "verification_note": self._AUTH_VNOTE,
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0), "authorized revision-identity divergence must not deduct"
+
+    def test_authorized_divergence_excluded_but_unrelated_finding_still_deducts(self):
+        """The authorized renumber is delegated to the gate; an unrelated medium
+        finding in the same report still deducts normally."""
+        report = {
+            "findings": [
+                {
+                    "severity": "medium",
+                    "summary": "0143 revision-identity collision: revision id reused on the back-merge.",
+                    "file": "backend/alembic/versions/0143_add_compute_job_persistence.py",
+                    "verification_note": self._AUTH_VNOTE,
+                },
+                {
+                    "severity": "medium",
+                    "summary": "Missing null check.",
+                    "file": "app/api.py",
+                    "verification_note": "Read app/api.py lines 55-70: payload.user may be None, dereferenced without guard.",
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        # Only the unrelated medium deducts: 1.0 - 0.07
+        assert audit == pytest.approx(1.0 - 0.07)
+
+    def test_genuine_migration_body_defect_still_deducts(self):
+        """A real migration-BODY defect on the same 0143 file (missing downgrade)
+        is NOT a revision-identity concern and must still deduct."""
+        report = {
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "0143 add_compute_job_persistence has no downgrade — irreversible, data-loss on rollback.",
+                    "file": "backend/alembic/versions/0143_add_compute_job_persistence.py",
+                    "verification_note": "Read 0143: downgrade() is a bare pass so the computejob table is never dropped — destructive rollback risk.",
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0 - 0.15), "migration-body defect must still deduct"
+
+    def test_helper_matches_authorized_and_rejects_unrelated(self):
+        """_finding_subject_is_authorized_divergence: matches a listed-revision
+        renumber finding, rejects an unrelated finding and a same-file body defect."""
+        auth = {
+            "severity": "medium",
+            "summary": "0143 revision-identity collision (renumber).",
+            "verification_note": self._AUTH_VNOTE,
+        }
+        unrelated = {"severity": "medium", "summary": "Missing null check in app/api.py."}
+        body_defect = {
+            "severity": "high",
+            "summary": "0143 add_compute_job_persistence has no downgrade().",
+            "verification_note": "downgrade() is a bare pass — destructive.",
+        }
+        assert rq._finding_subject_is_authorized_divergence(auth) is True
+        assert rq._finding_subject_is_authorized_divergence(unrelated) is False
+        assert rq._finding_subject_is_authorized_divergence(body_defect) is False
+
+
 class TestScoreAuditComputedErosion:
     """_score_audit prefers computed_test_erosion (authoritative, deterministic
     from git diff) over the LLM's self-reported test_erosion when the key is present."""
@@ -3505,12 +3590,18 @@ def _versions_by_ref(*, main_list: list[str], candidate_list: list[str]) -> Asyn
 
 @pytest.mark.asyncio
 async def test_finalize_blocks_on_migration_identity_collision(db_session, mocker):
-    """Reproduces the revision-0143 incident (prod 2026-06-04): deployed main has
-    revision 0143 == vm_contact_last_tool_use, but the candidate independently
-    reassigned 0143 to add_compute_job_persistence and renumbered vm_contact to
-    0144. An otherwise-clean candidate (audit 1.0, smoketest pass, CI green) must
-    be HARD-blocked at qualification: confidence forced to 0, promote False, and
-    the blocker names the 0143 divergence — never a soft audit deduction."""
+    """An UNAUTHORIZED revision-identity collision (a revision id reused for
+    different content, NOT on the authorized-reconciliation registry) must be a
+    HARD qualification blocker end-to-end: deployed main keeps revision 0138 ==
+    digest_cache_table, the candidate reassigned 0138 to task_blocked_state_fields.
+    An otherwise-clean candidate (audit 1.0, smoketest pass, CI green) must be
+    HARD-blocked at qualification: confidence forced to 0, promote False, and the
+    blocker names the diverging revision — never a soft audit deduction.
+
+    (The revision-0143 renumber is the ONE authorized, deploy-time-reconciled
+    divergence — its non-blocking path is covered by
+    ``test_qualification_gate_authorizes_reconciled_0143_divergence`` in
+    test_migration_divergence.py; using it here would no longer block.)"""
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = True
@@ -3537,18 +3628,15 @@ async def test_finalize_blocks_on_migration_identity_collision(db_session, mocke
         },
     )
 
-    # Deployed main keeps 0143 == vm_contact_last_tool_use; the candidate maps
-    # 0143 to a DIFFERENT migration (compute-job persistence) and moved
-    # vm_contact to 0144 — the exact divergence the deterministic detector flags.
+    # Deployed main keeps 0138 == digest_cache_table; the candidate reused 0138
+    # for a DIFFERENT migration (task_blocked_state_fields) — an unrelated
+    # revision-identity collision the deterministic detector flags, and one NOT
+    # on the authorized-reconciliation registry (so it still hard-blocks).
     mocker.patch(
         "app.github.list_versions_at_ref",
         new=_versions_by_ref(
-            main_list=["0142_parent.py", "0143_vm_contact_last_tool_use.py"],
-            candidate_list=[
-                "0142_parent.py",
-                "0143_add_compute_job_persistence.py",
-                "0144_vm_contact_last_tool_use.py",
-            ],
+            main_list=["0138_digest_cache_table.py"],
+            candidate_list=["0138_task_blocked_state_fields.py"],
         ),
     )
 
@@ -3569,15 +3657,12 @@ async def test_finalize_blocks_on_migration_identity_collision(db_session, mocke
     assert lq["blocker"] == "migration_identity_collision"
     assert lq["confidence"] == 0.0
     assert version.phase == "stabilize"
-    # The detail names the specific diverging revision (0143) so the operator
+    # The detail names the specific diverging revision (0138) so the operator
     # sees WHICH revision collides, not just a generic blocker label.
     assert lq["migration_safety"] == "block"
     detail = lq["migration_safety_detail"]
-    assert "0143" in detail
-    assert (
-        "vm_contact_last_tool_use" in detail
-        and "add_compute_job_persistence" in detail
-    )
+    assert "0138" in detail
+    assert "digest_cache_table" in detail
 
 
 @pytest.mark.asyncio

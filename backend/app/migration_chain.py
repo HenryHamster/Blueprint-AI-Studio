@@ -233,42 +233,89 @@ def find_content_divergent_revisions(
     only catches an *added* id colliding with an existing one; a renumber that
     moves a migration to a brand-new id leaves the on-disk chain valid and slips
     past every structural check while still breaking the live DB.
+
+    Thin string wrapper over :func:`find_content_divergence_records` (which
+    callers needing to classify a divergence — e.g. against an authorized
+    reconciliation registry — use directly).
     """
-    def _rev_to_desc(filenames: list[str]) -> dict[str, str | None]:
-        out: dict[str, str | None] = {}
-        for fn in filenames:
-            rev = _filename_revision_prefix(fn)
-            if rev is not None:
-                out[rev] = _filename_description(fn)
-        return out
+    return [
+        rec["message"]
+        for rec in find_content_divergence_records(base_filenames, head_filenames)
+    ]
 
-    def _desc_to_rev(filenames: list[str]) -> dict[str | None, str]:
-        out: dict[str | None, str] = {}
-        for fn in filenames:
-            rev = _filename_revision_prefix(fn)
-            if rev is not None:
-                out[_filename_description(fn)] = rev
-        return out
 
+def _rev_to_desc(filenames: list[str]) -> dict[str, str | None]:
+    out: dict[str, str | None] = {}
+    for fn in filenames:
+        rev = _filename_revision_prefix(fn)
+        if rev is not None:
+            out[rev] = _filename_description(fn)
+    return out
+
+
+def _desc_to_rev(filenames: list[str]) -> dict[str | None, str]:
+    out: dict[str | None, str] = {}
+    for fn in filenames:
+        rev = _filename_revision_prefix(fn)
+        if rev is not None:
+            out[_filename_description(fn)] = rev
+    return out
+
+
+def find_content_divergence_records(
+    base_filenames: list[str], head_filenames: list[str]
+) -> list[dict]:
+    """Structured form of :func:`find_content_divergent_revisions`.
+
+    Each record describes one divergence so callers can classify it (e.g. match
+    it against an authorized-reconciliation registry) instead of pattern-matching
+    the human-readable string. The two record shapes mirror the two divergence
+    classes:
+
+      ``{"kind": "reused", "revision", "base_identity", "head_identity", "message"}``
+          the SAME revision id names a DIFFERENT migration on each ref; and
+      ``{"kind": "renumbered", "identity", "base_revision", "head_revision",
+         "message"}``
+          the SAME migration appears under DIFFERENT revision ids.
+
+    Ordering matches the string detector: all ``reused`` records (sorted by
+    revision) first, then all ``renumbered`` records (sorted by identity).
+    """
     base_rev, head_rev = _rev_to_desc(base_filenames), _rev_to_desc(head_filenames)
     base_desc, head_desc = _desc_to_rev(base_filenames), _desc_to_rev(head_filenames)
 
-    divergences: list[str] = [
-        f"revision '{rev}' maps to migration '{base_rev[rev]}' on one ref but "
-        f"'{head_rev[rev]}' on the other — the same revision id was reused for "
-        f"different content; a DB that applied the first will silently skip the "
-        f"second"
+    reused: list[dict] = [
+        {
+            "kind": "reused",
+            "revision": rev,
+            "base_identity": base_rev[rev],
+            "head_identity": head_rev[rev],
+            "message": (
+                f"revision '{rev}' maps to migration '{base_rev[rev]}' on one ref "
+                f"but '{head_rev[rev]}' on the other — the same revision id was "
+                f"reused for different content; a DB that applied the first will "
+                f"silently skip the second"
+            ),
+        }
         for rev in sorted(set(base_rev) & set(head_rev))
         if base_rev[rev] != head_rev[rev]
     ]
-    divergences += [
-        f"migration '{desc}' is revision '{base_desc[desc]}' on one ref but "
-        f"'{head_desc[desc]}' on the other — it was renumbered; a DB that "
-        f"applied it under the old id will mishandle the new id"
+    renumbered: list[dict] = [
+        {
+            "kind": "renumbered",
+            "identity": desc,
+            "base_revision": base_desc[desc],
+            "head_revision": head_desc[desc],
+            "message": (
+                f"migration '{desc}' is revision '{base_desc[desc]}' on one ref but "
+                f"'{head_desc[desc]}' on the other — it was renumbered; a DB that "
+                f"applied it under the old id will mishandle the new id"
+            ),
+        }
         for desc in sorted(d for d in (set(base_desc) & set(head_desc)) if d)
         if base_desc[desc] != head_desc[desc]
     ]
-    return divergences
+    return reused + renumbered
 
 
 def validate_added_migrations(sources: dict[str, str]) -> str | None:

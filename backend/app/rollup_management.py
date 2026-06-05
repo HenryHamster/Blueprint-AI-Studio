@@ -2233,7 +2233,12 @@ async def _check_and_trigger_rollup(
                     # subsequent task. Fail-safe: fetch/parse failure does not
                     # auto-merge. Runs in this unlocked window (GitHub I/O).
                     alembic_status, alembic_reason = await _validate_rollup_migration_chain(
-                        gh_token, owner, repo, rollup_pr_number, target_branch
+                        gh_token,
+                        owner,
+                        repo,
+                        rollup_pr_number,
+                        target_branch,
+                        promotion_target=promotion_target,
                     )
 
                     # Re-acquire to apply mutations / dispatch alerts.

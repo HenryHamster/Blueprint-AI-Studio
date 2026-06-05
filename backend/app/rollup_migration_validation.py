@@ -4,6 +4,7 @@ import app.github as github
 from app.migration_chain import (
     _filename_revision_prefix,
     build_migration_chain,
+    find_content_divergence_records,
     find_content_divergent_revisions,
     find_filename_revision_mismatches,
     find_heads,
@@ -13,6 +14,10 @@ from app.migration_chain import (
     validate_combined_migration_chain,
 )
 from app.migration_path import is_migration_file
+from app.migration_reconciliation import (
+    AUTHORIZED_DIVERGENCES,
+    AuthorizedDivergence,
+)
 
 # Alembic versions directory, used to resolve a bare migration basename (as
 # returned by ``github.list_versions_at_ref``) back to its full repo path for a
@@ -83,6 +88,7 @@ async def _validate_rollup_migration_chain(
     repo: str,
     pr_number: int,
     target_branch: str | None = None,
+    promotion_target: str | None = None,
 ) -> tuple[str, str | None]:
     """Fail-safe Alembic-chain guard for rollup auto-merge.
 
@@ -101,6 +107,18 @@ async def _validate_rollup_migration_chain(
     target branch's migrations is fail-safe (``"defer"``), mirroring the
     diff-fetch handling. With no *target_branch* the guard degrades to the
     in-isolation check.
+
+    When *promotion_target* is given (and distinct from *target_branch*), the
+    added migrations are ALSO compared against the DEPLOYED promotion target's
+    current chain — catching the cross-branch revision-identity collision that
+    birthed the revision-0143 incident (prod 2026-06-04): a migration added on
+    the integration branch reusing a revision id the deployed target already
+    stamped to a DIFFERENT migration. That is a clean addition against the
+    integration branch (so the target-branch checks above pass) yet a deploy-
+    time collision that only surfaces at promotion — too late to renumber
+    cheaply. Caught here it flows to the same ``block`` -> auto-reconcile
+    renumber path. A failure to list the promotion target's migrations is
+    fail-safe (``"defer"``), mirroring the target-branch handling.
     """
     try:
         files = await github.get_pr_files(gh_token, owner, repo, pr_number)
@@ -167,6 +185,43 @@ async def _validate_rollup_migration_chain(
             f"mishandle a migration the live DB already applied): "
             + "; ".join(divergences),
         )
+
+    # Cross-BRANCH revision-identity guard against the DEPLOYED promotion target.
+    # The checks above validate the rollup only against the INTEGRATION branch it
+    # merges into; they are blind to a migration added on integration that reuses
+    # a revision id the DEPLOYED promotion target already stamped to a DIFFERENT
+    # migration — the revision-0143 collision class (prod incident 2026-06-04).
+    # Comparing the added migrations against the promotion target's CURRENT chain
+    # catches it BEFORE it lands (the block flows to the auto-reconcile renumber
+    # path) instead of discovering it at qualification/deploy. Normal integration
+    # ahead-ness is NOT flagged: find_content_divergent_revisions only reports a
+    # SHARED revision id whose migration identity differs (or a shared migration
+    # under a different id), never a revision present on only one side. A failed
+    # fetch is fail-safe (``"defer"``), mirroring the target-branch handling.
+    if promotion_target and promotion_target != target_branch:
+        try:
+            promotion_filenames = await github.list_versions_at_ref(
+                gh_token, owner, repo, promotion_target
+            )
+        except Exception as e:
+            return (
+                "defer",
+                f"could not list promotion target '{promotion_target}' migrations "
+                f"to validate cross-branch Alembic revision identity: "
+                f"{type(e).__name__}: {e}",
+            )
+        promotion_divergences = find_content_divergent_revisions(
+            promotion_filenames, list(added_sources.keys())
+        )
+        if promotion_divergences:
+            return (
+                "block",
+                f"Alembic revision-identity collision between the candidate and "
+                f"the deployed promotion target '{promotion_target}' (a rollup "
+                f"migration reuses a revision id the deployed DB already stamped "
+                f"to a different migration; it would be silently skipped at "
+                f"deploy): " + "; ".join(promotion_divergences),
+            )
     return ("ok", None)
 
 
@@ -176,6 +231,7 @@ async def enforce_premerge_migration_guard(
     repo: str,
     pr_number: int,
     target_branch: str | None,
+    promotion_target: str | None = None,
 ) -> tuple[bool, str | None]:
     """Fail-safe pre-merge Alembic dual-head guard for non-autoreconcile paths.
 
@@ -194,11 +250,50 @@ async def enforce_premerge_migration_guard(
     second migration-safety rule set.
     """
     verdict, reason = await _validate_rollup_migration_chain(
-        gh_token, owner, repo, pr_number, target_branch=target_branch
+        gh_token,
+        owner,
+        repo,
+        pr_number,
+        target_branch=target_branch,
+        promotion_target=promotion_target,
     )
     if verdict == "ok":
         return (True, None)
     return (False, reason)
+
+
+def _divergence_record_is_authorized(
+    record: dict,
+    authorized: tuple[AuthorizedDivergence, ...] = AUTHORIZED_DIVERGENCES,
+) -> bool:
+    """Is *record* an EXACT match for an authorized, already-handled divergence?
+
+    The deploy-time reconciliation (:mod:`app.migration_reconciliation`) makes a
+    SPECIFIC back-merge renumber safe; that registry is the single source of
+    truth for which divergences are handled. A detected divergence matches an
+    authorized entry only when BOTH the revision id AND the pair of migration
+    identities match exactly — a different revision id, or a different identity
+    pair, is NOT authorized and must still hard-block.
+
+    The reused/renumbered classes are two complementary views of the same
+    authorized renumber: ``reused`` matches the colliding revision + its identity
+    pair; ``renumbered`` matches the deployed identity moving from the colliding
+    revision to its renumbered slot.
+    """
+    for auth in authorized:
+        if record["kind"] == "reused" and record["revision"] == auth.revision and {
+            record["base_identity"],
+            record["head_identity"],
+        } == {auth.deployed_identity, auth.integration_identity}:
+            return True
+        if record["kind"] == "renumbered" and record[
+            "identity"
+        ] == auth.deployed_identity and {
+            record["base_revision"],
+            record["head_revision"],
+        } == {auth.revision, auth.integration_revision}:
+            return True
+    return False
 
 
 async def check_qualification_migration_identity(
@@ -246,7 +341,7 @@ async def check_qualification_migration_identity(
         candidate_filenames = await github.list_versions_at_ref(
             gh_token, owner, repo, candidate_ref, project_id=project_id
         )
-    except Exception as e:  # noqa: BLE001 — a failed fetch HOLDS the release
+    except Exception as e:
         return (
             "defer",
             f"could not list candidate '{candidate_ref}' Alembic migrations to "
@@ -256,7 +351,7 @@ async def check_qualification_migration_identity(
         target_filenames = await github.list_versions_at_ref(
             gh_token, owner, repo, promotion_target, project_id=project_id
         )
-    except Exception as e:  # noqa: BLE001 — a failed fetch HOLDS the release
+    except Exception as e:
         return (
             "defer",
             f"could not list promotion target '{promotion_target}' Alembic "
@@ -268,16 +363,34 @@ async def check_qualification_migration_identity(
     # means a revision id the deployed DB already applied maps to a DIFFERENT
     # migration on the candidate (so it would be silently skipped), or a
     # migration moved revision ids (so it would re-run / mishandle).
-    divergences = find_content_divergent_revisions(
-        target_filenames, candidate_filenames
-    )
-    if divergences:
+    records = find_content_divergence_records(target_filenames, candidate_filenames)
+    unauthorized = [r for r in records if not _divergence_record_is_authorized(r)]
+    authorized = [r for r in records if _divergence_record_is_authorized(r)]
+
+    # Any divergence NOT on the authorized-reconciliation registry still hard-
+    # blocks — the registry is purely additive and never weakens an unknown
+    # collision.
+    if unauthorized:
         return (
             "block",
             f"Alembic revision-identity collision between the candidate and the "
             f"deployed promotion target '{promotion_target}' (a renumber/reuse "
             f"that would skip or mishandle a migration the deployed DB already "
-            f"applied): " + "; ".join(divergences),
+            f"applied): " + "; ".join(r["message"] for r in unauthorized),
+        )
+
+    # Only authorized, already-reconciled divergences remain. The deploy-time
+    # reconciliation makes this exact renumber safe, so it is non-blocking — but
+    # record an informational note so the qualification record shows WHY this
+    # known divergence was waved through (it self-clears once the version
+    # promotes and the branches agree).
+    if authorized:
+        return (
+            "ok",
+            f"authorized reconciled Alembic revision-identity divergence(s) vs "
+            f"deployed promotion target '{promotion_target}' (handled by deploy-"
+            f"time reconciliation, non-blocking): "
+            + "; ".join(r["message"] for r in authorized),
         )
     return ("ok", None)
 
