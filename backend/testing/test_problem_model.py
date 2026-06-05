@@ -15,6 +15,8 @@ from app.problem_model import (
     PROBLEM_MODEL_BYTE_BUDGET,
     GAP_HISTORY_DURABLE_MAX,
     GAP_PAST_MOVES_DURABLE_MAX,
+    GAP_APPEND_ONLY_GC_FLOOR,
+    MODEL_SIZE_HEALTHY_BYTES,
     MODEL_SIZE_HEALTHY_CAPABILITIES,
     MODEL_SIZE_HEALTHY_FRICTION,
     MODEL_SIZE_HEALTHY_GAPS,
@@ -659,6 +661,8 @@ def test_apply_agent_update_byte_gc_keeps_model_roundtrippable():
     large rejected-edits ledger is GC'd under the byte budget — and the eviction
     is observable in the diff + revision log — while live state is untouched."""
     big = "y" * 5_000
+    history = [f"e{i}-{('x' * 1000)}" for i in range(60)]
+    past_moves = [f"d-{i}-{('z' * 1000)}" for i in range(60)]
     current = {
         "revision": 3,
         "archived_gaps": [
@@ -681,25 +685,42 @@ def test_apply_agent_update_byte_gc_keeps_model_roundtrippable():
             }
             for i in range(5)
         ],
-        "gaps": [{"id": "g-live", "name": "live", "status": "active"}],
+        "gaps": [_gap_with_memory(history, past_moves)],
         "capabilities": [{"name": "cap-x", "status": "working"}],
         "pending_user_confirmation": [
             {"id": "p-1", "type": "access_needed", "proposal": "grant access"}
         ],
     }
-    proposed = {"gaps": [{"id": "g-live", "name": "live", "status": "active"}]}
+    proposed = {"gaps": [_gap_with_memory(history[-5:], past_moves[-5:])]}
 
     new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
 
     persisted = ProblemModel.model_validate(new_raw)
     assert _serialized_bytes(persisted) <= PROBLEM_MODEL_BYTE_BUDGET
-    # GC dropped reference-only state and recorded it in the diff + revision log.
-    assert diff.get("archived_gaps_evicted")
+    assert list(diff) == [
+        "archived_gaps_evicted",
+        "rejected_agent_edits_trimmed",
+        "active_gap_tails_trimmed",
+    ]
+    gap = new_raw["gaps"][0]
+    assert gap["id"] == "g-mem"
+    assert len(gap["history"]) == GAP_APPEND_ONLY_GC_FLOOR
+    assert gap["history"][0]["event"] == history[-GAP_APPEND_ONLY_GC_FLOOR]
+    assert len(gap["past_moves"]) == GAP_APPEND_ONLY_GC_FLOOR
+    assert gap["past_moves"][0] == past_moves[-GAP_APPEND_ONLY_GC_FLOOR]
+
+    round_tripped, _ = apply_agent_update(
+        new_raw,
+        {"gaps": [_gap_with_memory(history[-5:], past_moves[-5:])]},
+        "2026-04-21T12:05:00",
+    )
+    assert round_tripped["gaps"][0]["history"] == gap["history"]
+    assert round_tripped["gaps"][0]["past_moves"] == gap["past_moves"]
+
     last_entry = new_raw["revision_log"][-1]
-    assert "archived_gaps_evicted" in last_entry["changes"]
+    assert "active_gap_tails_trimmed" in last_entry["changes"]
     assert "GC evicted" in last_entry["summary"]
     # Live, semantically meaningful state survives untouched.
-    assert {g["id"] for g in new_raw["gaps"]} == {"g-live"}
     assert {c["name"] for c in new_raw["capabilities"]} == {"cap-x"}
     assert {p["id"] for p in new_raw["pending_user_confirmation"]} == {"p-1"}
 
@@ -2408,3 +2429,70 @@ def test_model_size_signal_footprint_includes_friction_description():
     terse_footprint = compute_model_size_signal(terse_model)["estimated_token_footprint"]
     verbose_footprint = compute_model_size_signal(verbose_model)["estimated_token_footprint"]
     assert verbose_footprint > terse_footprint
+
+
+def test_model_size_signal_includes_serialized_bytes():
+    """The signal now includes the actual serialized byte size of the model."""
+    model = ProblemModel(gaps=_gaps(2))
+    sig = compute_model_size_signal(model)
+    assert "serialized_bytes" in sig
+    assert isinstance(sig["serialized_bytes"], int)
+    assert sig["serialized_bytes"] > 0
+
+
+def test_model_size_signal_byte_aware_small_model_healthy():
+    """A small model with few bytes and few entries is healthy."""
+    model = ProblemModel(gaps=_gaps(2))
+    sig = compute_model_size_signal(model)
+    assert sig["serialized_bytes"] < MODEL_SIZE_HEALTHY_BYTES
+    assert sig["model_size_status"] == "healthy"
+
+
+def test_model_size_signal_byte_aware_large_verbose_model_triggers_status():
+    """A model that is byte-heavy but count-light (verbose entries) is classified
+    as large/oversized by the byte dimension, triggering worst-dimension-wins even
+    when entry counts look healthy."""
+    # Create gaps with verbose descriptions that exceed the byte threshold
+    # while keeping the count well under the healthy threshold.
+    # Use larger descriptions to reliably push past the healthy byte threshold.
+    big_description = "x" * 20_000
+    gaps = [
+        Gap(
+            id=f"g-{i}",
+            name=f"gap {i}",
+            description=big_description,
+            evidence=big_description,
+            status="active",
+        )
+        for i in range(3)  # Only 3 gaps (well under healthy count of 12)
+    ]
+    model = ProblemModel(gaps=gaps)
+    sig = compute_model_size_signal(model)
+
+    # Entry counts are healthy, but bytes push it to large/oversized.
+    assert sig["active_gap_count"] == 3  # Under healthy threshold of 12
+    assert sig["serialized_bytes"] > MODEL_SIZE_HEALTHY_BYTES
+    # Worst-dimension-wins: byte dimension is growing/large/oversized,
+    # so overall status reflects the byte pressure
+    assert sig["model_size_status"] in ("growing", "large", "oversized")
+
+
+def test_model_size_signal_byte_dimension_is_part_of_worst_wins():
+    """The byte dimension is included in worst-dimension-wins status calculation."""
+    # Verify a model where all dimensions are healthy would stay healthy
+    small = ProblemModel(gaps=_gaps(2), capabilities=_caps(2), friction=_friction(2))
+    sig_small = compute_model_size_signal(small)
+    assert sig_small["active_gap_count"] <= MODEL_SIZE_HEALTHY_GAPS
+    assert sig_small["capability_count"] <= MODEL_SIZE_HEALTHY_CAPABILITIES
+    assert sig_small["active_friction_count"] <= MODEL_SIZE_HEALTHY_FRICTION
+    assert sig_small["serialized_bytes"] < MODEL_SIZE_HEALTHY_BYTES
+    assert sig_small["model_size_status"] == "healthy"
+
+    # Verify a model with many gaps triggers worst-dimension-wins
+    many_gaps = ProblemModel(gaps=_gaps(MODEL_SIZE_HEALTHY_GAPS * 3))
+    sig_many = compute_model_size_signal(many_gaps)
+    # Gap count dominates: 36 gaps >> 12 healthy threshold
+    assert sig_many["model_size_status"] == "oversized"
+    # Byte information is always present
+    assert "serialized_bytes" in sig_many
+    assert sig_many["serialized_bytes"] > 0

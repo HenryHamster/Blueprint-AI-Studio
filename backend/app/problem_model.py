@@ -396,6 +396,9 @@ GAP_PAST_MOVES_DURABLE_MAX = 200
 """Cap on a surviving gap's durable ``past_moves`` after write-back restore —
 see :data:`GAP_HISTORY_DURABLE_MAX`."""
 
+GAP_APPEND_ONLY_GC_FLOOR = 12
+"""Per-active-gap floor kept by the byte GC for ``history`` / ``past_moves``."""
+
 
 ARCHIVED_GAPS_DURABLE_MAX = 200
 """Hard cap on the durable ``archived_gaps`` collection — the only durable
@@ -501,6 +504,25 @@ def _archived_gap_recency_key(gap: Gap) -> str:
     return gap.closed or gap.opened or ""
 
 
+def _active_gap_recency_key(gap: Gap) -> str:
+    """Sort key for active-gap tail trimming — oldest active gaps first."""
+    return gap.opened or (gap.history[0].ts if gap.history else "")
+
+
+def _trim_gap_append_only_tail(gap: Gap) -> dict[str, Any] | None:
+    """Trim one active gap to the durable append-only floor."""
+    trimmed: dict[str, Any] = {"gap_id": gap.id}
+    if len(gap.history) > GAP_APPEND_ONLY_GC_FLOOR:
+        trimmed["history_trimmed"] = len(gap.history) - GAP_APPEND_ONLY_GC_FLOOR
+        gap.history = gap.history[-GAP_APPEND_ONLY_GC_FLOOR:]
+    if len(gap.past_moves) > GAP_APPEND_ONLY_GC_FLOOR:
+        trimmed["past_moves_trimmed"] = (
+            len(gap.past_moves) - GAP_APPEND_ONLY_GC_FLOOR
+        )
+        gap.past_moves = gap.past_moves[-GAP_APPEND_ONLY_GC_FLOOR:]
+    return trimmed if len(trimmed) > 1 else None
+
+
 def _serialized_model_bytes(model: ProblemModel) -> int:
     """Serialized byte length of the durable model, matching how the strategic
     op endpoint measures an incoming payload (``json.dumps(..., default=str)``)."""
@@ -510,26 +532,25 @@ def _serialized_model_bytes(model: ProblemModel) -> int:
 def _byte_evictable(model: ProblemModel) -> bool:
     """Whether the byte pass can actually bring ``model`` under the budget.
 
-    The byte pass only touches reference-only history — ``archived_gaps`` and the
-    ``rejected_agent_edits`` ledger. If the live/active state alone (everything
-    that survives once BOTH of those are emptied) already exceeds the budget,
-    evicting that history cannot get the model under the cap; doing so would be
-    futile destruction of re-fetchable reference state on every mature project
-    (a healthy within-caps model carries enough active gaps/history to exceed the
-    budget on its own). So gate eviction on it actually being achievable: measure
-    the floor with both evictable collections cleared, restore them, and only let
-    the caller evict when that floor fits. The legitimate target — a model whose
-    individual archived/ledger entries are large enough to blow the cap despite a
-    small active core — still has a sub-budget floor and is GC'd normally."""
-    saved_archived = model.archived_gaps
-    saved_ledger = model.rejected_agent_edits
-    model.archived_gaps = []
-    model.rejected_agent_edits = []
-    try:
-        floor_bytes = _serialized_model_bytes(model)
-    finally:
-        model.archived_gaps = saved_archived
-        model.rejected_agent_edits = saved_ledger
+    The byte pass only touches reference-only history — ``archived_gaps``, the
+    ``rejected_agent_edits`` ledger, and the oldest active-gap append-only tails.
+    If the live/active state alone (everything that survives once those are
+    reduced to their durable floor) already exceeds the budget, evicting that
+    history cannot get the model under the cap; doing so would be futile
+    destruction of re-fetchable reference state on every mature project (a
+    healthy within-caps model carries enough active gaps/history to exceed the
+    budget on its own). So gate eviction on it actually being achievable:
+    measure the floor with the evictable collections cleared and active tails
+    trimmed, restore the model, and only let the caller evict when that floor
+    fits. The legitimate target — a model whose individual archived/ledger
+    entries are large enough to blow the cap despite a small active core — still
+    has a sub-budget floor and is GC'd normally."""
+    floor_model = model.model_copy(deep=True)
+    floor_model.archived_gaps = []
+    floor_model.rejected_agent_edits = []
+    for gap in sorted(floor_model.gaps, key=_active_gap_recency_key):
+        _trim_gap_append_only_tail(gap)
+    floor_bytes = _serialized_model_bytes(floor_model)
     return floor_bytes <= PROBLEM_MODEL_BYTE_BUDGET
 
 
@@ -547,17 +568,19 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
        the oldest entries by ``closed``/``opened`` timestamp.
     2. **Byte cap** — after the count cap, measures the serialized model and,
        while it exceeds :data:`PROBLEM_MODEL_BYTE_BUDGET` (set safely under the
-       100KB write cap), evicts the oldest archived gaps and then trims the
-       oldest rejected-agent-edits ledger entries until the model fits. This
-       guards models whose individual entries are large enough to blow the cap
-       despite being under the count caps, so the durable model stays writable
-       back through the strategic op endpoint. The byte pass is gated on
-       :func:`_byte_evictable`: it runs ONLY when emptying the evictable
-       reference-only collections could actually bring the model under budget. A
-       healthy within-caps model can carry enough active gaps/history to exceed
-       the budget on its own, and the byte pass cannot touch that live state — so
-       evicting archived history there is futile destruction and is skipped,
-       leaving such a model bounded by the count cap alone.
+       100KB write cap), evicts the oldest archived gaps, then trims the oldest
+       rejected-agent-edits ledger entries, and finally trims the oldest active
+       gaps' append-only tails until the model fits. This guards models whose
+       individual entries are large enough to blow the cap despite being under
+       the count caps, so the durable model stays writable back through the
+       strategic op endpoint. The byte pass is gated on :func:`_byte_evictable`:
+       it runs ONLY when emptying the evictable reference-only collections and
+       reducing active tails to the durable floor could actually bring the model
+       under budget. A healthy within-caps model can carry enough active
+       gaps/history to exceed the budget on its own, and the byte pass cannot
+       touch that live state — so evicting archived history there is futile
+       destruction and is skipped, leaving such a model bounded by the count cap
+       alone.
 
     It deliberately does NOT touch active gaps, capabilities, friction, or
     pending confirmations — those are live, semantically meaningful state that
@@ -573,6 +596,7 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
     """
     summary: dict[str, Any] = {}
     evicted_ids: list[str] = []
+    active_gap_tails_trimmed: list[dict[str, Any]] = []
 
     if len(model.archived_gaps) > ARCHIVED_GAPS_DURABLE_MAX:
         # Stable sort newest-last by recency, then keep the most-recent N.
@@ -600,11 +624,18 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
             else:
                 model.rejected_agent_edits.pop(0)
                 ledger_trimmed += 1
+        for gap in sorted(model.gaps, key=_active_gap_recency_key):
+            if _serialized_model_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET:
+                break
+            if trimmed := _trim_gap_append_only_tail(gap):
+                active_gap_tails_trimmed.append(trimmed)
 
     if evicted_ids:
         summary["archived_gaps_evicted"] = evicted_ids
     if ledger_trimmed:
         summary["rejected_agent_edits_trimmed"] = ledger_trimmed
+    if active_gap_tails_trimmed:
+        summary["active_gap_tails_trimmed"] = active_gap_tails_trimmed
 
     return summary
 
@@ -659,6 +690,11 @@ MODEL_SIZE_HEALTHY_FRICTION = 8
 """At or below this many ACTIVE friction items (status=='active') the friction
 dimension is ``healthy``."""
 
+MODEL_SIZE_HEALTHY_BYTES = 40_000
+"""At or below this many serialized bytes the byte dimension is ``healthy``.
+Set well under the 90KB PROBLEM_MODEL_BYTE_BUDGET to signal when the model
+is approaching the structural limit even if entry counts look healthy."""
+
 MODEL_SIZE_GROWING_MULTIPLIER = 1.5
 """A dimension at >= 1.5x its healthy threshold is at least ``growing``."""
 
@@ -712,8 +748,12 @@ def compute_model_size_signal(model: ProblemModel) -> dict[str, Any]:
       - ``estimated_token_footprint`` — an EXPLICITLY APPROXIMATE estimate of how
         many tokens the model costs to read (see the ``_TOKENS_PER_*`` weights);
         do not treat it as precise
+      - ``serialized_bytes`` — the durable model's actual serialized byte length,
+        which is what determines whether it fits the strategic-cycle payload
       - ``model_size_status`` — worst-dimension-wins classification, one of
-        ``healthy`` / ``growing`` / ``large`` / ``oversized``
+        ``healthy`` / ``growing`` / ``large`` / ``oversized``. Now byte-aware:
+        a model that is heavy by bytes but light by count will be classified as
+        ``large`` or ``oversized`` to signal the byte pressure
 
     The status is purely advisory: it tells the thinker the model is getting
     expensive to audit, never a hard cap that blocks opening new gaps. The
@@ -746,10 +786,15 @@ def compute_model_size_signal(model: ProblemModel) -> dict[str, Any]:
         )
     )
 
+    # Byte-aware dimension: the serialized model size relative to the byte budget.
+    serialized_bytes = _serialized_model_bytes(model)
+    byte_status = _dimension_status(serialized_bytes, MODEL_SIZE_HEALTHY_BYTES)
+
     statuses = (
         _dimension_status(active_gap_count, MODEL_SIZE_HEALTHY_GAPS),
         _dimension_status(capability_count, MODEL_SIZE_HEALTHY_CAPABILITIES),
         _dimension_status(active_friction_count, MODEL_SIZE_HEALTHY_FRICTION),
+        byte_status,
     )
     order: list[ModelSizeStatus] = ["healthy", "growing", "large", "oversized"]
     model_size_status = max(statuses, key=order.index)
@@ -759,6 +804,7 @@ def compute_model_size_signal(model: ProblemModel) -> dict[str, Any]:
         "capability_count": capability_count,
         "active_friction_count": active_friction_count,
         "estimated_token_footprint": estimated_token_footprint,
+        "serialized_bytes": serialized_bytes,
         "model_size_status": model_size_status,
     }
 
@@ -851,6 +897,8 @@ def _diff_summary(diff: dict[str, Any]) -> str:
         parts.append(f"GC evicted {len(evicted)} archived gap(s)")
     if trimmed := diff.get("rejected_agent_edits_trimmed"):
         parts.append(f"GC trimmed {trimmed} rejected-edit ledger entry(ies)")
+    if tails := diff.get("active_gap_tails_trimmed"):
+        parts.append(f"GC trimmed {len(tails)} active gap tail(s)")
     return "; ".join(parts) if parts else "no structural changes"
 
 

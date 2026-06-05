@@ -493,6 +493,7 @@ async def test_spawn_review_includes_model_health_signal(db_session):
         "capability_count",
         "active_friction_count",
         "estimated_token_footprint",
+        "serialized_bytes",
         "model_size_status",
     }
 

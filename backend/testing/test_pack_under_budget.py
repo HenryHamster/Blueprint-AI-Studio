@@ -446,7 +446,12 @@ def test_gcd_problem_model_round_trips_under_single_pass_budget():
     ``pack_under_budget`` budget) and assert the ``problem_model`` section is
     present in the output and NOT in ``_packer_meta["dropped"]``.
     """
-    from app.problem_model import ARCHIVED_GAPS_DURABLE_MAX, gc_problem_model
+    from app.problem_model import (
+        ARCHIVED_GAPS_DURABLE_MAX,
+        PROBLEM_MODEL_BYTE_BUDGET,
+        _serialized_model_bytes,
+        gc_problem_model,
+    )
     from app.strategic_spawning import (
         _STRATEGIC_REVIEW_SCHEMA,
         _agent_view_problem_model,
@@ -454,12 +459,19 @@ def test_gcd_problem_model_round_trips_under_single_pass_budget():
 
     model = _worst_case_durable_problem_model()
 
-    # Real backend GC: evicts archived_gaps down to the cap, mutating in place.
+    # Real backend GC: the count pass evicts archived_gaps down to the cap, then
+    # the byte pass evicts further (archived below the cap + active-gap
+    # append-only tails) to bring the serialized model under the byte budget.
     summary = gc_problem_model(model)
     assert summary.get("archived_gaps_evicted"), (
         "fixture should overfill archived_gaps so GC actually evicts"
     )
-    assert len(model.archived_gaps) == ARCHIVED_GAPS_DURABLE_MAX
+    # The byte pass can drive archived_gaps below the count cap (even to empty)
+    # when that is what it takes to fit the budget, so assert the cap is an upper
+    # bound and that the durable model actually fits — the real round-trip
+    # invariant this test guards.
+    assert len(model.archived_gaps) <= ARCHIVED_GAPS_DURABLE_MAX
+    assert _serialized_model_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET
 
     # Reproduce the production payload wiring: the durable model is dumped,
     # trimmed by the agent view, and packed under the SAME schema object the
@@ -491,8 +503,7 @@ def test_gap_memory_trimmed_surfaced_for_capped_model():
     ``_packer_meta['gap_memory_trimmed']`` for the worst-case model, so the
     strategist knows a gap's append-only memory was shortened to a window."""
     from app.problem_model import (
-        GAP_HISTORY_DURABLE_MAX,
-        GAP_PAST_MOVES_DURABLE_MAX,
+        GAP_APPEND_ONLY_GC_FLOOR,
         gc_problem_model,
     )
     from app.strategic_spawning import (
@@ -515,9 +526,11 @@ def test_gap_memory_trimmed_surfaced_for_capped_model():
     assert gmt, "expected per-gap pre-trim markers to be surfaced"
     pm_entry = next((e for e in gmt if e["key"] == "problem_model"), None)
     assert pm_entry is not None
-    # Every active gap had history/past_moves above the keep window, so each
-    # reports a pre-trim total at the durable cap.
+    # The byte pass first trims every active gap's append-only history/past_moves
+    # down to the durable GC floor; the agent view then trims that floor down to
+    # its keep window and surfaces the (post-GC) pre-trim total, which is the GC
+    # floor rather than the durable cap.
     a_gap = pm_entry["gaps"][0]
     assert a_gap["fields"]["history"]["shown"] == _GAP_HISTORY_KEEP
-    assert a_gap["fields"]["history"]["total"] == GAP_HISTORY_DURABLE_MAX
-    assert a_gap["fields"]["past_moves"]["total"] == GAP_PAST_MOVES_DURABLE_MAX
+    assert a_gap["fields"]["history"]["total"] == GAP_APPEND_ONLY_GC_FLOOR
+    assert a_gap["fields"]["past_moves"]["total"] == GAP_APPEND_ONLY_GC_FLOOR
