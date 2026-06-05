@@ -1320,6 +1320,14 @@ async def sweep_unblock_blocked_tasks(
                 if not await _completed_foundation_base_safe(
                     task, need, completed, session
                 ):
+                    # _completed_foundation_base_safe -> ensure_dependent_base_recut
+                    # REPLACES and COMMITS task.context with a fresh dict carrying the
+                    # _recut_* escalation accounting on a HOLD. Re-read it here so the
+                    # stale loop-local `ctx` (captured before the call) does not clobber
+                    # those counters when we stamp the blocked-recheck backoff below —
+                    # otherwise the consecutive-conflict counter resets every cycle and
+                    # a persistently-conflicting dependent never escalates.
+                    ctx = task.context or {}
                     attempts = int(ctx.get("_blocked_recheck_attempts", 0)) + 1
                     ctx["_blocked_recheck_attempts"] = attempts
                     task.context = ctx

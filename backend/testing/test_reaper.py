@@ -7662,6 +7662,56 @@ async def test_unblock_sweep_holds_dependent_when_recut_conflicts(reaper_db, moc
 
 
 @pytest.mark.asyncio
+async def test_unblock_sweep_persistent_recut_conflict_accumulates_and_escalates(
+    reaper_db, mocker
+):
+    """Regression: the blocked-resume HOLD must PRESERVE the ``_recut_*`` escalation
+    accounting that ``ensure_dependent_base_recut`` committed, so a persistently-
+    conflicting cross-base dependent eventually escalates instead of resetting its
+    consecutive-conflict counter every cycle and parking invisibly forever.
+
+    Previously the caller reassigned ``task.context`` to a stale loop-local dict
+    captured before the re-cut helper replaced+committed the context, wiping the
+    ``_recut_conflict_attempts`` counter so it never reached the escalation bound.
+    """
+    from app.orchestrator_health import _RECUT_CONFLICT_ESCALATION_THRESHOLD
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock, return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.merge_branch",
+        new_callable=AsyncMock, return_value={"conflict": True},
+    )
+    project = await _make_project(reaper_db)
+    base_now = _utcnow()
+    foundation = await _cross_base_completed_foundation(reaper_db, project)
+    t = await _cross_base_blocked_dependent(reaper_db, project, foundation, base_now)
+
+    # Run enough consecutive conflicting cycles to cross the escalation bound. Each
+    # cycle advances `now` past the backed-off recheck_after so the task re-selects.
+    for i in range(_RECUT_CONFLICT_ESCALATION_THRESHOLD):
+        await reaper_db.refresh(t)
+        cycle_now = (t.recheck_after or base_now) + timedelta(minutes=1)
+        await sweep_unblock_blocked_tasks(reaper_db, cycle_now)
+        await reaper_db.refresh(t)
+        # The consecutive-conflict counter ACCUMULATES across cycles (it is not
+        # wiped by the stale-ctx clobber the regression guards against).
+        assert t.context.get("_recut_conflict_attempts") == i + 1
+        assert t.status == TaskStatus.BLOCKED
+
+    # On reaching the bound the dependent is escalated exactly once with an
+    # operator-facing marker — it no longer parks invisibly forever.
+    assert t.context.get("_recut_escalated") is True
+    assert (
+        t.context.get("_recut_conflict_attempts")
+        >= _RECUT_CONFLICT_ESCALATION_THRESHOLD
+    )
+
+
+@pytest.mark.asyncio
 async def test_parked_blocker_holds_when_cross_base_recut_conflicts(reaper_db, mocker):
     """The parked-resume path applies the SAME cross-base re-cut guard: a conflict
     keeps the parked blocker BLOCKED instead of resuming it against a stale base."""

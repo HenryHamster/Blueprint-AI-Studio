@@ -5181,3 +5181,240 @@ class TestCrossBaseBaseRecut:
         _, kwargs = merge_mock.await_args
         assert kwargs.get("base") == "plan/bbb"
         assert kwargs.get("head") == "main"
+
+
+class TestCrossBaseRecutBounding:
+    """A held cross-base re-cut that keeps failing is BOUNDED and ESCALATED rather
+    than retried silently forever: a persistent genuine conflict raises ONE
+    deduplicated operator alert (with an observable status message + context
+    marker), a transient error keeps retrying with backoff and never escalates,
+    and a later successful re-cut clears the accounting and resolves the alert
+    (``orchestrator_health.ensure_dependent_base_recut``)."""
+
+    @staticmethod
+    def _landed_cross_base_pair(project):
+        from app.landed_signal import mark_landed_on_integration
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        mark_landed_on_integration(dep)
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "plan/bbb"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        return dep, dependent
+
+    @staticmethod
+    async def _open_escalation_alerts(db_session, dependent):
+        from sqlmodel import select
+        from app.models import Alert
+
+        return (
+            (
+                await db_session.execute(
+                    select(Alert).where(
+                        Alert.task_id == dependent.id,
+                        Alert.dismissed_at.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    @pytest.mark.asyncio
+    async def test_single_conflict_increments_attempts_and_holds(
+        self, db_session, mocker
+    ):
+        """A single conflict holds the dependent (False), records ONE consecutive
+        conflict, and — being below the bound — does NOT escalate."""
+        from app.orchestrator_health import ensure_dependent_base_recut
+
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            return_value={"merged": False, "conflict": True},
+        )
+        project = make_project(
+            name="RecutBound1", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        dep, dependent = self._landed_cross_base_pair(project)
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        ok = await ensure_dependent_base_recut(dependent, [dep], db_session)
+        assert ok is False
+        assert dependent.context.get("_recut_conflict_attempts") == 1
+        assert dependent.context.get("_recut_last_outcome") == "conflict"
+        assert dependent.context.get("_recut_escalated") is None
+        assert await self._open_escalation_alerts(db_session, dependent) == []
+
+    @pytest.mark.asyncio
+    async def test_persistent_conflict_escalates_exactly_once(
+        self, db_session, mocker
+    ):
+        """After the bound is reached a persistent conflict escalates EXACTLY ONCE
+        (deduplicated); the task carries the status message + context marker, and
+        running the path again does not create a second alert."""
+        from app.orchestrator_health import (
+            ensure_dependent_base_recut,
+            _RECUT_CONFLICT_ESCALATION_THRESHOLD,
+        )
+        from app.models import AlertSeverity
+
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            return_value={"merged": False, "conflict": True},
+        )
+        project = make_project(
+            name="RecutBound2", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        dep, dependent = self._landed_cross_base_pair(project)
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        # Drive consecutive conflicts up to (and past) the escalation bound.
+        for _ in range(_RECUT_CONFLICT_ESCALATION_THRESHOLD):
+            assert await ensure_dependent_base_recut(dependent, [dep], db_session) is False
+
+        assert dependent.context.get("_recut_escalated") is True
+        assert "persistent merge conflict" in (dependent.latest_status_message or "")
+        alerts = await self._open_escalation_alerts(db_session, dependent)
+        assert len(alerts) == 1
+        assert alerts[0].severity == AlertSeverity.ERROR
+
+        # Running again must NOT create a second alert (deduped + post-escalation
+        # backoff short-circuits the merge call).
+        assert await ensure_dependent_base_recut(dependent, [dep], db_session) is False
+        alerts_again = await self._open_escalation_alerts(db_session, dependent)
+        assert len(alerts_again) == 1
+
+    @pytest.mark.asyncio
+    async def test_transient_error_retries_with_backoff_without_escalating(
+        self, db_session, mocker
+    ):
+        """A transient re-cut error retries with backoff WITHOUT escalating: no
+        alert, the consecutive-conflict streak stays at 0, and the backed-off
+        recheck accounting increments no matter how many times it recurs."""
+        from app.orchestrator_health import (
+            ensure_dependent_base_recut,
+            _RECUT_CONFLICT_ESCALATION_THRESHOLD,
+        )
+
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            return_value={"merged": False, "conflict": False},
+        )
+        project = make_project(
+            name="RecutBound3", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        dep, dependent = self._landed_cross_base_pair(project)
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        # Far more attempts than the conflict bound — a transient class must never
+        # escalate.
+        for _ in range(_RECUT_CONFLICT_ESCALATION_THRESHOLD + 2):
+            assert await ensure_dependent_base_recut(dependent, [dep], db_session) is False
+
+        assert dependent.context.get("_recut_conflict_attempts") == 0
+        assert dependent.context.get("_recut_last_outcome") == "error"
+        assert dependent.context.get("_recut_escalated") is None
+        assert dependent.context.get("_recut_recheck_attempts") == (
+            _RECUT_CONFLICT_ESCALATION_THRESHOLD + 2
+        )
+        assert dependent.recheck_after is not None
+        assert await self._open_escalation_alerts(db_session, dependent) == []
+
+    @pytest.mark.asyncio
+    async def test_successful_recut_clears_accounting_and_resolves_alert(
+        self, db_session, mocker
+    ):
+        """A re-cut that later SUCCEEDS clears the ``_recut_*`` accounting, lets the
+        dependent dispatch normally (True), and resolves the open escalation."""
+        from app.orchestrator_health import (
+            ensure_dependent_base_recut,
+            _utcnow,
+            _RECUT_CONFLICT_ESCALATION_THRESHOLD,
+        )
+
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        merge_mock = mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            return_value={"merged": False, "conflict": True},
+        )
+        project = make_project(
+            name="RecutBound4", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        dep, dependent = self._landed_cross_base_pair(project)
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        # Escalate via persistent conflicts.
+        for _ in range(_RECUT_CONFLICT_ESCALATION_THRESHOLD):
+            await ensure_dependent_base_recut(dependent, [dep], db_session)
+        assert dependent.context.get("_recut_escalated") is True
+        assert len(await self._open_escalation_alerts(db_session, dependent)) == 1
+
+        # Rewind the post-escalation backoff window so the next attempt re-issues
+        # the merge, and make that merge succeed.
+        dependent.context = {
+            **dependent.context,
+            "_recut_recheck_after": (_utcnow() - timedelta(hours=1)).isoformat(),
+        }
+        db_session.add(dependent)
+        await db_session.commit()
+        merge_mock.return_value = {"merged": True, "already": False}
+
+        ok = await ensure_dependent_base_recut(dependent, [dep], db_session)
+        assert ok is True
+        # Accounting fully cleared.
+        assert not any(
+            str(k).startswith("_recut_") for k in (dependent.context or {})
+        )
+        # Open escalation reconciled (dismissed).
+        assert await self._open_escalation_alerts(db_session, dependent) == []

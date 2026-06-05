@@ -763,4 +763,78 @@ describe('DetailsTab — Structural Gating', () => {
     expect(screen.getByText('capability:database-migration')).toBeInTheDocument();
     expect(screen.getByText('Database migration capability')).toBeInTheDocument();
   });
+
+  it('displays base re-cut hold section when task has merge conflict', () => {
+    const task = makeTask({
+      status: 'QUEUED',
+      context: {
+        _recut_recheck_attempts: 5,
+        _recut_last_outcome: 'conflict',
+        _recut_conflict_attempts: 3,
+        _recut_escalated: true,
+      },
+      payloads: [{
+        type: 'create',
+      }],
+    });
+    render(<DetailsTab task={task} />);
+    const heading = screen.getByText('Base Re-cut Hold');
+    expect(heading).toBeInTheDocument();
+    const section = heading.closest('div')?.parentElement;
+    expect(section?.textContent).toContain('Held pending re-cut of base');
+    expect(section?.textContent).toContain('from integration');
+    expect(section?.textContent).toContain('Conflict');
+    expect(section?.textContent).toContain('5');
+    expect(section?.textContent).toContain('Escalated');
+  });
+
+  it('displays base re-cut hold section when task has transient error', () => {
+    const task = makeTask({
+      status: 'QUEUED',
+      context: {
+        _recut_recheck_attempts: 2,
+        _recut_last_outcome: 'error',
+        _recut_conflict_attempts: 0,
+      },
+      payloads: [{
+        type: 'fix',
+      }],
+    });
+    render(<DetailsTab task={task} />);
+    const heading = screen.getByText('Base Re-cut Hold');
+    expect(heading).toBeInTheDocument();
+    const section = heading.closest('div')?.parentElement;
+    expect(section?.textContent).toContain('Held pending re-cut of base');
+    expect(section?.textContent).toContain('from integration');
+    expect(section?.textContent).toContain('Transient Error');
+    expect(section?.textContent).toContain('2');
+    expect(section?.textContent).not.toContain('Escalated');
+  });
+
+  it('hides base re-cut hold section when no re-cut context exists', () => {
+    const task = makeTask({
+      status: 'QUEUED',
+      context: {},
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.queryByText('Base Re-cut Hold')).toBeNull();
+  });
+
+  it('shows (default) base placeholder and integration as re-cut source when base_branch not specified', () => {
+    const task = makeTask({
+      status: 'QUEUED',
+      context: {
+        _recut_recheck_attempts: 1,
+        _recut_last_outcome: 'conflict',
+      },
+      payloads: [{ type: 'create' }],
+    });
+    render(<DetailsTab task={task} />);
+    const heading = screen.getByText('Base Re-cut Hold');
+    expect(heading).toBeInTheDocument();
+    const section = heading.closest('div')?.parentElement;
+    expect(section?.textContent).toContain('Held pending re-cut of base');
+    expect(section?.textContent).toContain('(default)');
+    expect(section?.textContent).toContain('from integration');
+  });
 });

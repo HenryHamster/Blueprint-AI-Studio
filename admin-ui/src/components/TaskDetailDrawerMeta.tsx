@@ -1491,6 +1491,34 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         );
       })()}
 
+      {(() => {
+        const ctx = task.context as Record<string, unknown> | undefined;
+        const recutAttempts = ctx?._recut_recheck_attempts as number | undefined;
+        const recutOutcome = ctx?._recut_last_outcome as string | undefined;
+        const recutEscalated = ctx?._recut_escalated as boolean | undefined;
+        if (!recutAttempts || recutOutcome === undefined) return null;
+        const payload = task.payloads?.[0] as Record<string, unknown> | undefined;
+        const baseBranch = (payload?.base_branch as string) || '(default)';
+        const isConflict = recutOutcome === 'conflict';
+        return (
+          <>
+            <SectionHeader>Base Re-cut Hold</SectionHeader>
+            <div className={`space-y-2 rounded-lg p-3 border ${isConflict ? 'bg-red-950/10 border-red-900/30' : 'bg-orange-950/10 border-orange-900/30'}`}>
+              <div className={`text-sm ${isConflict ? 'text-red-200' : 'text-orange-200'}`}>
+                Held pending re-cut of base <span className="font-mono">{baseBranch}</span> from integration
+              </div>
+              <DetailRow label="Status">
+                <span className={`inline-block px-2 py-1 rounded text-xs font-mono ${isConflict ? 'bg-red-500/20 text-red-300' : 'bg-orange-500/20 text-orange-300'}`}>
+                  {isConflict ? 'Conflict' : 'Transient Error'}
+                </span>
+              </DetailRow>
+              <DetailRow label="Attempts">{recutAttempts}</DetailRow>
+              {recutEscalated && <DetailRow label="Escalation"><span className="text-xs text-red-300 font-mono">Escalated</span></DetailRow>}
+            </div>
+          </>
+        );
+      })()}
+
       {task.child_task_ids && task.child_task_ids.length > 0 && (
         <>
           <SectionHeader>Child Tasks</SectionHeader>

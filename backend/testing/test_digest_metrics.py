@@ -18,6 +18,7 @@ from app.digest_metrics import (
     compute_digest_trend_history,
     compute_failure_grouping,
     compute_narrative_summary,
+    compute_dependency_health_signals,
     compute_recurring_error_clusters,
     compute_release_qualifier_infra_metrics,
     compute_retry_analytics,
@@ -2003,6 +2004,109 @@ def test_parked_blocker_summary_counts_only_escalated_blocked():
     assert row["blocker_kind"] == "upstream_dependency"
     assert row["direction_id"] == "d-1"
     assert row["blocked_at"] is not None
+
+
+def test_parked_blocker_summary_includes_recut_escalated_tasks():
+    """Tasks with ``_recut_escalated`` marker (persistent re-cut conflicts) are
+    included in the parked summary alongside BLOCKED-escalated tasks. Only
+    escalated re-cuts are included; a still-retrying re-cut (no escalation) is
+    excluded even if it has re-cut context."""
+    from app.digest_metrics import compute_parked_blocker_summary
+
+    now = _utcnow()
+    recut_conflict_escalated = make_task(
+        status=TaskStatus.QUEUED,
+        title="dependent-held-by-conflict",
+        created_at=now - timedelta(hours=6),
+        recheck_after=now + timedelta(days=1),
+        context={
+            "_recut_escalated": True,
+            "_recut_recheck_attempts": 5,
+            "_recut_last_outcome": "conflict",
+            "_recut_conflict_attempts": 3,
+        },
+    )
+    recut_still_retrying = make_task(
+        status=TaskStatus.QUEUED,
+        title="dependent-held-by-error",
+        created_at=now - timedelta(hours=2),
+        context={
+            "_recut_recheck_attempts": 2,
+            "_recut_last_outcome": "error",
+            "_recut_conflict_attempts": 0,
+            # No _recut_escalated marker
+        },
+    )
+    not_held = make_task(
+        status=TaskStatus.QUEUED,
+        title="normal-queued",
+        context={"_blocked_recheck_attempts": 1},  # Different context, no re-cut
+    )
+
+    result = compute_parked_blocker_summary([recut_conflict_escalated, recut_still_retrying, not_held])
+
+    assert result["total"] == 1  # Only the escalated re-cut
+    assert len(result["tasks"]) == 1
+    # Verify conflict is present
+    conflict_row = result["tasks"][0]
+    assert conflict_row["title"] == "dependent-held-by-conflict"
+    assert conflict_row["blocker_kind"] == "Base re-cut conflict"
+    # Verify still-retrying is excluded
+    retrying_row = next((t for t in result["tasks"] if t["title"] == "dependent-held-by-error"), None)
+    assert retrying_row is None
+
+
+@pytest.mark.asyncio
+async def test_dependency_health_signals_query_surfaces_recut_escalated(db_session):
+    """Regression: the DB-backed query in ``compute_dependency_health_signals``
+    must feed BOTH parked classes to the pure summarizer — not just
+    BLOCKED+``_blocked_escalated`` tasks but also ``_recut_escalated`` tasks,
+    which the producer stamps on QUEUED (or BLOCKED-without-``_blocked_escalated``)
+    dependents. A previous version filtered to ``status == BLOCKED AND
+    _blocked_escalated`` only, making the summarizer's re-cut branch unreachable
+    in production even though the unit test passed by calling the pure function
+    directly."""
+    project = make_project(name="Dep health query test", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # QUEUED dependent held by a persistent re-cut conflict (no _blocked_escalated).
+    recut_held = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        title="recut-held-dependent",
+        context={
+            "_recut_escalated": True,
+            "_recut_recheck_attempts": 5,
+            "_recut_last_outcome": "conflict",
+            "_recut_conflict_attempts": 3,
+        },
+    )
+    # BLOCKED + operator-escalated block.
+    blocked_escalated = make_task(
+        project_id=project.id,
+        status=TaskStatus.BLOCKED,
+        title="blocked-escalated-dependent",
+        context={"_blocked_escalated": True},
+    )
+    # Neither marker → must be excluded.
+    plain_queued = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        title="plain-queued",
+        context={"_blocked_recheck_attempts": 1},
+    )
+    db_session.add_all([recut_held, blocked_escalated, plain_queued])
+    await db_session.commit()
+
+    result = await compute_dependency_health_signals(db_session, project_id=project.id)
+
+    parked = result["parked_blockers"]
+    titles = {t["title"] for t in parked["tasks"]}
+    assert parked["total"] == 2
+    assert titles == {"recut-held-dependent", "blocked-escalated-dependent"}
+    assert "plain-queued" not in titles
 
 
 def test_duplicate_foundation_signal_flags_cross_parent_overlap():

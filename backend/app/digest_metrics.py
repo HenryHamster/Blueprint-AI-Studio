@@ -15,6 +15,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
+from sqlalchemy import and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -1251,23 +1252,42 @@ def _task_related_files(t: "Task") -> set:
 
 
 def compute_parked_blocker_summary(blocked_tasks: List[Task]) -> Dict[str, Any]:
-    """Count and list BLOCKED tasks that were escalated and parked awaiting requeue.
+    """Count and list BLOCKED tasks and base-re-cut-held tasks that are parked.
 
-    Pure function — no database calls. A *parked* blocker is a BLOCKED task whose
-    context carries ``_blocked_escalated`` (set by
-    ``reaper_sweeps._escalate_blocked_task`` ONLY after a tracked operator
-    escalation alert was emitted). The recovery sweep stops rechecking these and
-    pushes ``recheck_after`` far into the future, so they need a manual operator
-    requeue. Returns the total count plus a capped list with enough context to
-    find and requeue each one. Newest-parked first.
+    Pure function — no database calls. A *parked* item is either:
+      * A BLOCKED task whose context carries ``_blocked_escalated`` (set by
+        ``reaper_sweeps._escalate_blocked_task`` after an operator escalation alert),
+        which stops rechecking and pushes ``recheck_after`` far into the future, OR
+      * A task (any status) with ``_recut_escalated`` marker (set by
+        ``orchestrator_health._record_recut_failure`` when a cross-base re-cut hits
+        conflict threshold), which indicates a persistent base re-cut failure.
+
+    Returns the total count plus a capped list with enough context to find and
+    requeue each one. Newest-parked first.
     """
     parked: List[Dict[str, Any]] = []
     for t in blocked_tasks:
         ctx = t.context or {}
-        if not ctx.get("_blocked_escalated"):
+        is_blocked_escalated = bool(ctx.get("_blocked_escalated"))
+        is_recut_escalated = bool(ctx.get("_recut_escalated"))
+
+        if not (is_blocked_escalated or is_recut_escalated):
             continue
+
         blocked_at = getattr(t, "blocked_at", None)
         recheck_after = getattr(t, "recheck_after", None)
+
+        # For re-cut holds, use created_at as the "blocked_at" equivalent
+        if is_recut_escalated and not blocked_at:
+            blocked_at = getattr(t, "created_at", None)
+
+        hold_reason = None
+        if is_recut_escalated:
+            outcome = ctx.get("_recut_last_outcome", "unknown")
+            hold_reason = f"Base re-cut {outcome}" if outcome != "unknown" else "Base re-cut hold"
+        elif is_blocked_escalated:
+            hold_reason = None  # blocked_reason will be populated from blocker_kind
+
         parked.append(
             {
                 "task_id": str(t.id),
@@ -1275,7 +1295,7 @@ def compute_parked_blocker_summary(blocked_tasks: List[Task]) -> Dict[str, Any]:
                 "project_id": str(t.project_id)
                 if getattr(t, "project_id", None) is not None
                 else None,
-                "blocker_kind": getattr(t, "blocker_kind", None),
+                "blocker_kind": hold_reason or getattr(t, "blocker_kind", None),
                 "blocked_reason": getattr(t, "blocked_reason", None)
                 or t.latest_status_message,
                 "blocked_at": blocked_at.isoformat() if blocked_at else None,
@@ -1427,14 +1447,26 @@ async def compute_dependency_health_signals(
 ) -> Dict[str, Any]:
     """Surface the parked-blocker and duplicate-foundation observability signals.
 
-    Read-only: runs two small self-contained queries (escalated/parked BLOCKED
-    tasks; active IN_PROGRESS tasks) and delegates to the pure summarizers above.
-    Never mutates state. Scoped to ``project_id`` when provided, else fleet-wide.
+    Read-only: runs two small self-contained queries (parked tasks; active
+    IN_PROGRESS tasks) and delegates to the pure summarizers above. Never mutates
+    state. Scoped to ``project_id`` when provided, else fleet-wide.
+
+    The parked query matches BOTH parked classes the summarizer handles:
+      * BLOCKED tasks carrying ``_blocked_escalated`` (operator-escalated blocks), AND
+      * any-status tasks carrying ``_recut_escalated`` (persistent base re-cut holds,
+        set by ``orchestrator_health._record_recut_failure`` on the dependent —
+        which may be QUEUED or BLOCKED-without-``_blocked_escalated``).
+    Without the ``_recut_escalated`` arm the summarizer's re-cut branch would be
+    unreachable in production.
     """
-    blocked_filters = [
-        Task.status == TaskStatus.BLOCKED,
-        Task.context["_blocked_escalated"].astext == "true",
-    ]
+    parked_predicate = or_(
+        and_(
+            Task.status == TaskStatus.BLOCKED,
+            Task.context["_blocked_escalated"].astext == "true",
+        ),
+        Task.context["_recut_escalated"].astext == "true",
+    )
+    blocked_filters = [parked_predicate]
     if project_id is not None:
         blocked_filters.append(Task.project_id == project_id)
     blocked = (

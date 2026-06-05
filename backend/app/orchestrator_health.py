@@ -11,19 +11,41 @@ Re-exports from ``app.orchestrator`` keep existing callers
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import uuid
+from datetime import datetime
 from typing import Callable, Dict
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 import app.shared_state as _shared_state
 from app.landed_signal import has_landed_signal
 from app.models import Project, Task, TaskStatus
 from app.orchestrator_filters import _prod_files
+from app.time_utils import _utcnow
 
 logger = logging.getLogger("blueprint")
+
+
+# ---------------------------------------------------------------------------
+# Bounded base-re-cut accounting
+# ---------------------------------------------------------------------------
+
+# A held cross-base dependent whose re-cut keeps CONFLICTING never self-resolves
+# (a genuine merge conflict between the dependent's staging base and integration
+# requires a human / fix task). After this many CONSECUTIVE genuine-conflict
+# re-cut attempts the dependent is escalated to the operator exactly once instead
+# of being retried — and re-issuing the GitHub merge call — every cycle forever.
+# A TRANSIENT GitHub/credential error never counts toward this bound; it resets
+# the consecutive-conflict streak and keeps retrying with backoff.
+_RECUT_CONFLICT_ESCALATION_THRESHOLD = 3
+
+# blocker_kind encoded into the deduplicated escalation alert title so the
+# operator-facing message reads clearly and dedups on (task_id, title).
+_RECUT_CONFLICT_BLOCKER_KIND = "cross-base re-cut conflict"
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +508,133 @@ def _has_landed_cross_base_code_dep(dependent: Task, dep_tasks: list) -> bool:
     )
 
 
+def _recut_backoff_active(ctx: dict) -> bool:
+    """True while an escalated dependent is inside its backed-off recheck window.
+
+    Once a dependent has been escalated, we stop re-issuing the GitHub merge call
+    every dispatch/reaper cycle and only re-attempt the re-cut after the
+    backed-off ``_recut_recheck_after`` window elapses — so a genuinely stuck
+    dependent is not hammering the merge API, yet can still recover if the
+    conflict is later resolved (a successful re-cut clears the accounting)."""
+    raw = ctx.get("_recut_recheck_after")
+    if not raw:
+        return False
+    try:
+        due = datetime.fromisoformat(str(raw))
+    except (ValueError, TypeError):
+        return False
+    return _utcnow() < due
+
+
+async def _clear_recut_accounting(dependent: Task, session: AsyncSession) -> None:
+    """Clear all ``_recut_*`` accounting after a successful (or no-longer-needed)
+    re-cut, and reconcile any open escalation alert.
+
+    Mirrors the resume path's alert reconciliation: when a previously-escalated
+    dependent finally re-cuts cleanly, the ``Task permanently blocked`` ERROR
+    alert that declared it stuck no longer describes a real condition and is
+    dismissed (best-effort, exactly as ``reaper_sweeps`` does on resume)."""
+    ctx = dict(dependent.context or {})
+    recut_keys = [k for k in ctx if str(k).startswith("_recut_")]
+    if not recut_keys:
+        return
+    had_escalation = bool(ctx.get("_recut_escalated"))
+    for k in recut_keys:
+        ctx.pop(k, None)
+    dependent.context = ctx
+    flag_modified(dependent, "context")
+    session.add(dependent)
+    await session.commit()
+    if had_escalation:
+        from app.alert_dispatch import _resolve_blocked_escalation_alert
+
+        with contextlib.suppress(Exception):
+            await _resolve_blocked_escalation_alert(dependent, session)
+
+
+async def _record_recut_failure(
+    dependent: Task, outcome: str, session: AsyncSession
+) -> None:
+    """Persist a failed re-cut attempt and escalate a PERSISTENT true conflict.
+
+    Records, in a distinct ``_recut_*`` context namespace (never colliding with
+    the reaper's ``_blocked_recheck_attempts`` counter):
+
+      * ``_recut_recheck_attempts`` — consecutive failures, driving the backed-off
+        recheck schedule (reusing ``_next_recheck_delay`` / ``recheck_after``).
+      * ``_recut_conflict_attempts`` — consecutive GENUINE conflicts. A transient
+        ``"error"`` resets this to 0, so only a persistent true conflict ever
+        reaches the escalation bound.
+      * ``_recut_last_outcome`` — ``"conflict"`` vs ``"error"`` for observability.
+
+    On reaching ``_RECUT_CONFLICT_ESCALATION_THRESHOLD`` consecutive conflicts the
+    dependent is escalated EXACTLY ONCE via the same deduplicated machinery the
+    blocked-task escalation uses (``_maybe_create_blocked_escalation_alert``,
+    deduped on ``(task_id, title)``), and an observable ``latest_status_message``
+    plus a ``_recut_escalated`` context marker are stamped so the stuck state is
+    no longer invisible.
+    """
+    from app.reaper_sweeps import _next_recheck_delay
+
+    ctx = dict(dependent.context or {})
+    recheck_attempts = int(ctx.get("_recut_recheck_attempts", 0) or 0) + 1
+    ctx["_recut_recheck_attempts"] = recheck_attempts
+    ctx["_recut_last_outcome"] = outcome
+
+    conflict_attempts = 0
+    if outcome == "conflict":
+        conflict_attempts = int(ctx.get("_recut_conflict_attempts", 0) or 0) + 1
+        ctx["_recut_conflict_attempts"] = conflict_attempts
+    else:
+        # A transient error breaks the consecutive-conflict streak: keep retrying
+        # with backoff, but NEVER escalate a transient class.
+        ctx["_recut_conflict_attempts"] = 0
+
+    delay = _next_recheck_delay(recheck_attempts)
+    due = _utcnow() + delay
+    ctx["_recut_recheck_after"] = due.isoformat()
+    # Reuse the existing recheck_after backoff column so the reaper resume sweep
+    # backs off too (the BLOCKED-path caller may overwrite it with its own
+    # blocked-recheck backoff — both are the same backoff family).
+    dependent.recheck_after = due
+
+    escalate = (
+        outcome == "conflict"
+        and conflict_attempts >= _RECUT_CONFLICT_ESCALATION_THRESHOLD
+        and not ctx.get("_recut_escalated")
+    )
+    detail = ""
+    if escalate:
+        ctx["_recut_escalated"] = True
+        detail = (
+            f"Cross-base base re-cut has conflicted on {conflict_attempts} "
+            f"consecutive attempts merging integration into base "
+            f"{(dependent.first_payload or {}).get('base_branch') or '(default)'}. "
+            "The dependent cannot dispatch against a base missing its landed "
+            "dependency code; a conflict resolution / fix task or operator "
+            "action is required."
+        )
+        dependent.latest_status_message = (
+            "Held: cross-base base re-cut blocked by a persistent merge conflict "
+            f"after {conflict_attempts} attempts — escalated to operator"
+        )
+
+    dependent.context = ctx
+    flag_modified(dependent, "context")
+    session.add(dependent)
+    await session.commit()
+
+    if escalate:
+        from app.alert_dispatch import _maybe_create_blocked_escalation_alert
+
+        await _maybe_create_blocked_escalation_alert(
+            dependent,
+            session,
+            blocker_kind=_RECUT_CONFLICT_BLOCKER_KIND,
+            detail=detail,
+        )
+
+
 async def ensure_dependent_base_recut(
     dependent: Task, dep_tasks: list, session: AsyncSession
 ) -> bool:
@@ -497,24 +646,54 @@ async def ensure_dependent_base_recut(
 
     Returns True when the base is safe to dispatch against — either no re-cut was
     needed, or the re-cut succeeded — and False when a re-cut is required but
-    could not complete (merge conflict or transient GitHub error), so the caller
-    must keep HOLDING the dependent rather than dispatch it against a base
-    missing the landed code.
+    could not complete, so the caller must keep HOLDING the dependent rather than
+    dispatch it against a base missing the landed code.
+
+    The chokepoint distinguishes the underlying ``"ok"`` / ``"conflict"`` /
+    ``"error"`` outcome and BOUNDS a persistently-failing re-cut so all four call
+    sites inherit the behavior without duplicating the accounting:
+
+      * ``"ok"``       — clear any ``_recut_*`` accounting (recovery), reconcile a
+                         stale escalation alert, and return True.
+      * ``"error"``    — a TRANSIENT GitHub/credential error: record a backed-off
+                         recheck, reset the consecutive-conflict streak, NEVER
+                         escalate, and return False (retry next cycle).
+      * ``"conflict"`` — a GENUINE merge conflict: record it; after
+                         ``_RECUT_CONFLICT_ESCALATION_THRESHOLD`` consecutive
+                         conflicts escalate exactly once (deduplicated) with an
+                         observable status message + context marker, and stop
+                         hammering the merge API every cycle (re-attempt only
+                         after the backed-off recheck window). Returns False.
 
     Single source of truth for the re-cut, shared by the dispatch driver
-    (:func:`recut_landed_cross_base_dependents`) and the completion-side
-    warm-claim trigger (``orchestrator._mark_unblocked_dependents``).
+    (:func:`recut_landed_cross_base_dependents`), the completion-side warm-claim
+    trigger (``orchestrator._mark_unblocked_dependents``), and the reaper resume
+    sweep (``reaper_sweeps._completed_foundation_base_safe``).
     """
     if not _has_landed_cross_base_code_dep(dependent, dep_tasks):
+        # No re-cut needed. If this dependent previously accrued re-cut failures
+        # (e.g. it was held, the dep later changed), clear that stale accounting.
+        await _clear_recut_accounting(dependent, session)
         return True
     project = await session.get(Project, dependent.project_id)
     if project is None:
         # Cannot resolve the integration branch — hold to be safe.
         return False
+    # Once escalated, do not re-issue the GitHub merge call every cycle: only
+    # re-attempt after the backed-off recheck window so a stuck dependent stops
+    # hammering the merge API, while still allowing eventual recovery.
+    if (dependent.context or {}).get("_recut_escalated") and _recut_backoff_active(
+        dependent.context or {}
+    ):
+        return False
     from app.branch_resolution import recut_dependent_base_from_integration
 
     outcome = await recut_dependent_base_from_integration(dependent, project, session)
-    return outcome == "ok"
+    if outcome == "ok":
+        await _clear_recut_accounting(dependent, session)
+        return True
+    await _record_recut_failure(dependent, outcome, session)
+    return False
 
 
 async def recut_landed_cross_base_dependents(
@@ -533,8 +712,12 @@ async def recut_landed_cross_base_dependents(
     qualify->promote gate are preserved). A candidate whose re-cut cannot
     complete (merge conflict or transient GitHub error) is DROPPED from this
     cycle's eligible set so it never dispatches against a base missing its
-    dependency's code; it stays QUEUED and is retried next cycle (a persistent
-    conflict surfaces for a fix task / operator).
+    dependency's code; it stays QUEUED and is retried next cycle. The retry is
+    BOUNDED inside :func:`ensure_dependent_base_recut`: a transient error keeps
+    retrying with backoff, while a persistent genuine conflict is escalated to
+    the operator exactly once (a deduplicated ERROR alert + an observable status
+    message / context marker) after a few consecutive conflicts, instead of
+    silently re-issuing the merge call forever.
 
     Idempotent: when a candidate's base already bases on the integration trunk,
     or already contains integration's HEAD, the re-cut is a cheap no-op.
