@@ -198,6 +198,60 @@ async def test_cache_propagates_when_no_prior_good_result():
 
 
 @pytest.mark.asyncio
+async def test_get_or_compute_meta_reports_served_stale():
+    """get_or_compute_meta returns served_stale=False on a fresh compute,
+    True when a failure falls back to the last good result, and clears the
+    flag again on recovery."""
+    cache = DigestCache(default_ttl=0.05, stale_retry_ttl=60)
+    calls = 0
+    fail = False
+
+    async def compute():
+        nonlocal calls
+        calls += 1
+        if fail:
+            raise RuntimeError("statement timeout")
+        return {"value": calls}
+
+    # Fresh compute → not stale.
+    result, served_stale = await cache.get_or_compute_meta("k", compute)
+    assert result == {"value": 1}
+    assert served_stale is False
+
+    # Expire the fresh entry, then make the compute fail → last-good served.
+    await asyncio.sleep(0.1)
+    fail = True
+    result, served_stale = await cache.get_or_compute_meta("k", compute)
+    assert result == {"value": 1}
+    assert served_stale is True
+
+    # Reads inside the negative-cache window also report served_stale.
+    result, served_stale = await cache.get_or_compute_meta("k", compute)
+    assert result == {"value": 1}
+    assert served_stale is True
+
+    # Recovery: expire the negative cache, let the compute succeed → flag clears.
+    await asyncio.sleep(0.1)
+    cache._results.clear()  # drop the negative-cache entry to force a recompute
+    fail = False
+    result, served_stale = await cache.get_or_compute_meta("k", compute)
+    assert result["value"] >= 2
+    assert served_stale is False
+
+
+@pytest.mark.asyncio
+async def test_get_or_compute_delegates_to_meta_result_only():
+    """The result-only wrapper returns just the value (not the tuple) so the
+    three unrelated callers stay byte-compatible."""
+    cache = DigestCache(default_ttl=60)
+
+    async def compute():
+        return {"ok": True}
+
+    assert await cache.get_or_compute("k", compute) == {"ok": True}
+
+
+@pytest.mark.asyncio
 async def test_cache_does_not_serve_stale_on_cancellation():
     """CancelledError must propagate even with a prior good result — a
     cancelled request is not a compute failure to mask with stale data."""
