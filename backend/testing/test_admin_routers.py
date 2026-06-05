@@ -6946,6 +6946,11 @@ class TestCutVersion:
         assert old.status == "abandoned"
         assert old.last_qualification["operator"] == TEST_USER_EMAIL
         assert old.last_qualification["reason"] == "candidate can never pass"
+        history = (await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")).json()["recent_versions"]
+        abandoned = next(row for row in history if row["version_number"] == 1)
+        assert abandoned["abandoned_by"] == TEST_USER_EMAIL
+        assert abandoned["abandon_reason"] == "candidate can never pass"
+        assert abandoned["abandoned_at"]
 
     @pytest.mark.asyncio
     async def test_version_cut_no_open_version_returns_404(

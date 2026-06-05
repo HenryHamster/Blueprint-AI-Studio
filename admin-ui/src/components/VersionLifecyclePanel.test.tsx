@@ -316,6 +316,67 @@ describe('VersionLifecyclePanel', () => {
     });
   });
 
+  describe('per-project promotion control', () => {
+    it('arms live promotion for the project and reports the override source', async () => {
+      const setProjectPromotionEnabledMock = vi.fn().mockResolvedValue({
+        project_id: 'proj-1', override: true, effective: true, source: 'project', cleared: false,
+      });
+      vi.mocked(api.setProjectPromotionEnabled).mockImplementation(setProjectPromotionEnabledMock);
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            promotion_enabled: false,
+            promotion_enabled_effective: false,
+            promotion_enabled_override: null,
+            promotion_enabled_source: 'fleet',
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+          userRole="admin"
+        />
+      );
+
+      expect(screen.getByText(/fleet default/)).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: /^Arm$/ }));
+
+      await waitFor(() => {
+        expect(setProjectPromotionEnabledMock).toHaveBeenCalledWith('proj-1', true);
+      });
+    });
+
+    it('offers a clear control that falls back to the fleet default when an override is set', async () => {
+      vi.mocked(api.setProjectPromotionEnabled).mockResolvedValue({
+        project_id: 'proj-1', override: null, effective: false, source: 'fleet', cleared: true,
+      });
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            promotion_enabled: false,
+            promotion_enabled_effective: true,
+            promotion_enabled_override: true,
+            promotion_enabled_source: 'project',
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+          userRole="admin"
+        />
+      );
+
+      expect(screen.getByText(/project override/)).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: /Use fleet default/ }));
+
+      await waitFor(() => {
+        expect(api.setProjectPromotionEnabled).toHaveBeenCalledWith('proj-1', null);
+      });
+    });
+  });
+
   describe('cut/abandon version', () => {
     it('renders cut/abandon button when there is an open version', async () => {
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
@@ -448,6 +509,67 @@ describe('VersionLifecyclePanel', () => {
       await waitFor(() => {
         expect(screen.getByText('Cut v5 → opened v6')).toBeInTheDocument();
       });
+    });
+  });
+
+  describe('history rendering', () => {
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    it('shows operator provenance for abandoned versions', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: null,
+            recent_versions: [
+              {
+                version_number: 1,
+                status: 'abandoned',
+                opened_at: '2026-01-01T00:00:00Z',
+                promoted_at: null,
+                qualification_attempts: 1,
+                last_qualification: null,
+                abandoned_at: '2026-01-02T03:04:05Z',
+                abandoned_by: 'alice@example.com',
+                abandon_reason: 'candidate can never pass',
+              },
+            ],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.getByText('abandoned')).toBeInTheDocument();
+      expect(screen.getByText(/cut by alice@example.com: candidate can never pass/)).toBeInTheDocument();
+    });
+
+    it('does not add provenance text to non-abandoned rows', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: null,
+            recent_versions: [
+              {
+                version_number: 2,
+                status: 'promoted',
+                opened_at: '2026-01-01T00:00:00Z',
+                promoted_at: '2026-01-03T00:00:00Z',
+                qualification_attempts: 2,
+                last_qualification: null,
+              },
+            ],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.getByText('promoted')).toBeInTheDocument();
+      expect(screen.queryByText(/cut by /)).not.toBeInTheDocument();
     });
   });
 

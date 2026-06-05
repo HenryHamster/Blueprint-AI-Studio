@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { apiFetch, fetchVersionLifecycle } from '../api';
 import { useDirectionForm } from './useDirectionForm';
 import { useAutonomousConfig } from './useAutonomousConfig';
+import { usePoller } from './usePoller';
 import type { Direction } from '../components/DirectionsPanel';
 import type { ProblemModel, ProblemModelSizeHealth, RunningUpdateReconciliation } from '../types';
 
@@ -67,6 +68,22 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedProjectId]);
+
+  // Periodically refresh directions to keep time-derived badges (cooldown countdown,
+  // hold auto-recovery countdown, staged waiting age) live while the panel is open.
+  usePoller(
+    () => {
+      if (selectedProjectId) {
+        return fetchDirectionsLatestRef.current();
+      }
+    },
+    {
+      intervalMs: 10_000,
+      enabled: Boolean(selectedProjectId),
+      leading: false,
+      deps: [selectedProjectId],
+    },
+  );
 
   // Always points at the latest fetchDirections closure (recreated each render).
   const fetchDirectionsLatestRef = useRef(fetchDirections);

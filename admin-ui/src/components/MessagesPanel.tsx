@@ -1063,7 +1063,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       {/* Strategic-refresh indicator: either pending (armed but not yet fired) or
           a receipt showing when a prior steer was picked up and acted upon. Hidden
           once the cycle starts (strategistActive), at which point "Strategist working…"
-          takes over. */}
+          takes over. Displays the queued directive excerpt and coalesce count. */}
       {strategicRefresh && !strategistActive && (
         <div className={`px-4 md:px-6 py-2 border-b ${strategicRefresh.requested_at ? 'border-neutral-800 bg-amber-950/40' : 'border-green-800 bg-emerald-950/40'} flex items-center gap-2 shrink-0`} role="status" aria-live="polite">
           <span className={`w-2 h-2 rounded-full ${strategicRefresh.requested_at ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400'}`} aria-hidden="true" />
@@ -1071,6 +1071,15 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
             {strategicRefresh.requested_at ? (
               <>
                 Strategic cycle pending{strategicRefresh.origin ? ` · ${strategicRefresh.origin}` : ''}
+                {strategicRefresh.excerpt && (
+                  <>
+                    {' · '}
+                    <span className="italic">{strategicRefresh.excerpt.slice(0, 120)}{strategicRefresh.excerpt.length > 120 ? '…' : ''}</span>
+                  </>
+                )}
+                {strategicRefresh.count && strategicRefresh.count > 1 && (
+                  <> · +{strategicRefresh.count - 1} {strategicRefresh.count - 1 === 1 ? 'steer' : 'steers'} coalesced</>
+                )}
                 {` · armed ${timeAgo(strategicRefresh.requested_at)}`}
               </>
             ) : (

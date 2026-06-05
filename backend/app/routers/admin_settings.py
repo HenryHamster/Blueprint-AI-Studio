@@ -119,6 +119,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "notification_config",
         "productive_direction_cooldown_minutes",
         "promotion_enabled",
+        "promotion_enabled_by_project",
         "promotion_threshold",
         "promotion_weights",
         "provider_selection_mode",
@@ -352,6 +353,12 @@ async def get_settings(
             "ci_backstop_timeout_minutes", 60
         ),
         "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
+        "promotion_enabled_by_project": {
+            str(k): bool(v)
+            for k, v in (
+                _runtime_config.get("promotion_enabled_by_project") or {}
+            ).items()
+        },
         "smoketest_enabled": bool(_runtime_config.get("smoketest_enabled", False)),
         "promotion_threshold": _runtime_config.get("promotion_threshold"),
         "promotion_weights": _runtime_config.get("promotion_weights"),
@@ -676,6 +683,33 @@ async def _apply_settings(
         _runtime_config["promotion_enabled"] = bool(payload["promotion_enabled"])
     if "smoketest_enabled" in payload:
         _runtime_config["smoketest_enabled"] = bool(payload["smoketest_enabled"])
+    if "promotion_enabled_by_project" in payload:
+        raw = payload["promotion_enabled_by_project"]
+        # Per-project live-promotion overrides: a mapping of project-id strings to
+        # booleans. An empty map means every project falls back to the fleet-wide
+        # promotion_enabled. Validated strictly (reject 400 on a non-mapping or an
+        # empty key) then normalized to bools before storing.
+        if not isinstance(raw, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "promotion_enabled_by_project must be a mapping of "
+                    "project-id strings to booleans"
+                ),
+            )
+        cleaned_promo: dict[str, bool] = {}
+        for key, value in raw.items():
+            sid = str(key).strip()
+            if not sid:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "promotion_enabled_by_project keys must be "
+                        "non-empty project ids"
+                    ),
+                )
+            cleaned_promo[sid] = bool(value)
+        _runtime_config["promotion_enabled_by_project"] = cleaned_promo
     if "promotion_threshold" in payload:
         try:
             val = float(payload["promotion_threshold"])
@@ -2123,6 +2157,17 @@ async def _apply_settings(
                     "promotion_enabled": bool(
                         _runtime_config.get("promotion_enabled", False)
                     ),
+                    # Persist the per-project live-promotion overrides so a
+                    # per-project arm/hold (set via /promotion-enabled or the raw
+                    # PATCH) survives a Cloud Run restart. runtime_config_state.
+                    # sync_* reads this key back on boot; without it the in-memory
+                    # map reverts to {} (all-fleet-default) and overrides are lost.
+                    "promotion_enabled_by_project": {
+                        str(k): bool(v)
+                        for k, v in (
+                            _runtime_config.get("promotion_enabled_by_project") or {}
+                        ).items()
+                    },
                     "smoketest_enabled": bool(
                         _runtime_config.get("smoketest_enabled", False)
                     ),

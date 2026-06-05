@@ -1062,6 +1062,9 @@ export interface RecentVersion {
   promoted_at: string | null;
   qualification_attempts: number;
   last_qualification: VersionQualification | null;
+  abandoned_at?: string | null;
+  abandoned_by?: string | null;
+  abandon_reason?: string | null;
 }
 
 export interface PromotionReadinessConfidence {
@@ -1098,8 +1101,35 @@ export interface VersionLifecycleResponse {
   current_version: CurrentVersion | null;
   recent_versions: RecentVersion[];
   promotion_enabled?: boolean;
+  /** The promotion gate value actually consulted for this project (override when set, else fleet default). */
+  promotion_enabled_effective?: boolean;
+  /** The explicit per-project override, or null when the project rides the fleet default. */
+  promotion_enabled_override?: boolean | null;
+  /** Which value is in effect: a per-project override or the fleet-wide default. */
+  promotion_enabled_source?: 'project' | 'fleet';
   promotion_readiness?: PromotionReadiness | null;
   staged_directions?: StagedDirection[];
+}
+
+export interface SetPromotionEnabledResponse {
+  project_id: string;
+  override: boolean | null;
+  effective: boolean;
+  source: 'project' | 'fleet';
+  cleared: boolean;
+}
+
+/** Arm (true), hold (false), or clear (null) this project's per-project live-promotion override. */
+export async function setProjectPromotionEnabled(
+  projectId: string,
+  enabled: boolean | null,
+): Promise<SetPromotionEnabledResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/promotion-enabled`, {
+    method: 'POST',
+    body: JSON.stringify({ enabled }),
+  });
+  if (!res.ok) throw new Error(`Failed to set promotion enablement: ${res.status}`);
+  return res.json();
 }
 
 export async function fetchVersionLifecycle(projectId: string): Promise<VersionLifecycleResponse> {

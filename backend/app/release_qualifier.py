@@ -203,6 +203,7 @@ from app.release_readiness import (
 )
 from app.shared_state import (
     get_project_integration_branch,
+    resolve_project_promotion_enabled,
     runtime_config as _runtime_config,
 )
 from app.time_utils import _utcnow
@@ -1597,7 +1598,10 @@ async def _finalize_qualification(
         "audit_reconciliation": audit_reconciliation,
     }
 
-    promotion_enabled = bool(_runtime_config.get("promotion_enabled"))
+    # Per-project override (falls back to the fleet-wide promotion_enabled when
+    # this project has no explicit override) — additive, behavior unchanged for
+    # projects without one.
+    promotion_enabled = resolve_project_promotion_enabled(version.project_id)
 
     logger.info(
         "[RELEASE_QUALIFIER] v%d composite=%.4f promote=%s blocker=%s "

@@ -268,6 +268,13 @@ vi.mock('../api', () => ({
     new_version: { version_number: 43, phase: 'build', goal: null, opened_at: '2026-05-20T12:00:00Z' },
   })),
   patchAdminSettings: vi.fn(async () => ({ promotion_enabled: false })),
+  setProjectPromotionEnabled: vi.fn(async () => ({
+    project_id: 'p1',
+    override: true,
+    effective: true,
+    source: 'project',
+    cleared: false,
+  })),
   fetchQualificationVerdicts: vi.fn(async () => ({
     verdicts: [
       { id: 'v1', release_version_id: 'rv1', candidate_sha: 'abc1234def56', confidence: 0.83, sub_scores: { audit: 0.90, test_erosion: 0.75, smoketest: 0.88 }, blocker: null, would_promote: true, promotion_enabled: false, terminal_status: 'dry_run', threshold: 0.80, started_at: '2026-05-20T10:00:00Z', finalized_at: '2026-05-20T11:00:00Z', created_at: '2026-05-20T11:00:00Z' },

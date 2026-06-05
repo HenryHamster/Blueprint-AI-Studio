@@ -7,11 +7,13 @@
  * `routine_event` were recorded but do not wake it. `not_armed` is a genuine
  * steering message the server tried to arm but could NOT persist (the project
  * row was momentarily contended), so the strategist was NOT woken — surfaced
- * truthfully instead of a false `steering` promise. Kept in its own module (not
- * the component file) so these helpers can be exported without tripping
- * react-refresh's only-export-components rule.
+ * truthfully instead of a false `steering` promise. `duplicate` indicates the
+ * message was already sent (same idempotency key), so the steer was already armed
+ * and no new action is needed. Kept in its own module (not the component file)
+ * so these helpers can be exported without tripping react-refresh's
+ * only-export-components rule.
  */
-export type ArmingOutcome = 'steering' | 'passive_note' | 'routine_event' | 'not_armed';
+export type ArmingOutcome = 'steering' | 'passive_note' | 'routine_event' | 'not_armed' | 'duplicate';
 
 // Outcome → composer hint copy.
 const ARMING_HINT: Record<ArmingOutcome, string> = {
@@ -19,6 +21,7 @@ const ARMING_HINT: Record<ArmingOutcome, string> = {
   passive_note: 'Recorded as a note — won’t wake the strategist.',
   routine_event: 'Routine event — won’t wake the strategist.',
   not_armed: 'Couldn’t wake the strategist — try resending in a moment.',
+  duplicate: 'Message already sent — steer already armed.',
 };
 
 // Pre-send hint shown when a strategic cycle is already running: a steering
@@ -32,6 +35,7 @@ const ARMING_TOAST: Record<ArmingOutcome, string> = {
   passive_note: 'Note recorded — won’t wake the strategist',
   routine_event: 'Recorded — routine event, won’t wake the strategist',
   not_armed: 'Message saved, but the strategist wasn’t woken — try resending',
+  duplicate: 'Message already sent — steer already armed',
 };
 
 /** Composer hint copy for a given (real or predicted) arming outcome. */
@@ -77,7 +81,8 @@ export function parseArmingOutcome(value: unknown): ArmingOutcome | null {
   return value === 'steering' ||
     value === 'passive_note' ||
     value === 'routine_event' ||
-    value === 'not_armed'
+    value === 'not_armed' ||
+    value === 'duplicate'
     ? value
     : null;
 }

@@ -3,6 +3,7 @@ import {
   cutVersion,
   fetchQualificationVerdicts,
   patchAdminSettings,
+  setProjectPromotionEnabled,
   setVersionPhase,
   setVersionGoal,
   triggerQualify,
@@ -301,6 +302,22 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
     }
   };
 
+  const handleSetProjectPromotion = async (enabled: boolean | null) => {
+    if (!projectId) return;
+    if (enabled === true && !window.confirm('Arm live promotion for THIS project only? Passing qualify runs will push this project to main.')) return;
+    setActionLoading('project-promotion');
+    setActionMsg(null);
+    try {
+      await setProjectPromotionEnabled(projectId, enabled);
+      setActionMsg(enabled === null ? 'Using fleet default' : enabled ? 'Project live promotion armed' : 'Project live promotion held');
+      onRefresh();
+    } catch {
+      setActionMsg('Request failed');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
   const handleCutVersion = async () => {
     if (!projectId || !cv) return;
     const msg = `Abandon v${cv.version_number} and open a fresh version?`;
@@ -346,6 +363,51 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 </div>
                 <span className="text-[9px] text-neutral-600">Fleet-wide setting</span>
               </div>
+              {data.promotion_enabled_effective !== undefined && (
+                <div className="flex flex-col gap-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${data.promotion_enabled_effective ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-neutral-500/10 border-neutral-500/30 text-neutral-400'}`} title="Effective promotion mode for THIS project">
+                      {data.promotion_enabled_effective ? 'LIVE' : 'DRY-RUN'}
+                    </span>
+                    {projectId && userRole === 'admin' && (
+                      <>
+                        {/* eslint-disable-next-line viewport/min-touch-target */}
+                        <button
+                          onClick={() => handleSetProjectPromotion(true)}
+                          disabled={actionLoading !== null || (data.promotion_enabled_source === 'project' && data.promotion_enabled_override === true)}
+                          className="text-[10px] px-1.5 py-0.5 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                          title="Arm live promotion for this project only"
+                        >
+                          {actionLoading === 'project-promotion' ? '…' : 'Arm'}
+                        </button>
+                        {/* eslint-disable-next-line viewport/min-touch-target */}
+                        <button
+                          onClick={() => handleSetProjectPromotion(false)}
+                          disabled={actionLoading !== null || (data.promotion_enabled_source === 'project' && data.promotion_enabled_override === false)}
+                          className="text-[10px] px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                          title="Hold live promotion for this project only"
+                        >
+                          Hold
+                        </button>
+                        {data.promotion_enabled_source === 'project' && (
+                          // eslint-disable-next-line viewport/min-touch-target
+                          <button
+                            onClick={() => handleSetProjectPromotion(null)}
+                            disabled={actionLoading !== null}
+                            className="text-[10px] px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                            title="Clear this project's override and follow the fleet default"
+                          >
+                            Use fleet default
+                          </button>
+                        )}
+                      </>
+                    )}
+                  </div>
+                  <span className="text-[9px] text-neutral-600">
+                    This project · {data.promotion_enabled_source === 'project' ? 'project override' : 'fleet default'}
+                  </span>
+                </div>
+              )}
             </>
           )}
         </div>
@@ -603,10 +665,17 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
             <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">History</p>
             <div className="space-y-0.5">
               {recent.slice(0, 4).map(v => (
-                <div key={v.version_number} className="flex flex-wrap items-center gap-2 text-[10px]">
+                <div key={v.version_number} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px]">
                   <span className="text-neutral-400 font-mono w-8">v{v.version_number}</span>
                   <span className="text-neutral-500">{v.status}</span>
                   <QualSummary q={v.last_qualification} />
+                  {v.status === 'abandoned' && (v.abandoned_by || v.abandon_reason || v.abandoned_at) && (
+                    <span className="text-neutral-400">
+                      cut by {v.abandoned_by ?? 'unknown'}
+                      {v.abandon_reason ? `: ${v.abandon_reason}` : ''}
+                      {v.abandoned_at ? ` · ${timeAgo(v.abandoned_at)}` : ''}
+                    </span>
+                  )}
                 </div>
               ))}
             </div>

@@ -6,7 +6,7 @@ import { MessagesPanel } from './MessagesPanel';
 import { classifySignalLevel, effectiveSignal, loadEventPrefs, saveEventPrefs, EVENT_PREFS_KEY, eventPrefsKey, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity, isCriticalSeverity, loadTemporaryMutes, saveTemporaryMutes, isEventTypeTemporarilyMuted } from './MessagesPanel.utils';
 import type { ProjectMessage } from './MessageBubble';
 import type { SavedView } from './MessagesPanel.utils';
-import { armingToastCopy, armingHintCopy, type ArmingOutcome } from './messageArming';
+import { armingToastCopy, armingHintCopy, parseArmingOutcome, type ArmingOutcome } from './messageArming';
 
 // Full replacement (NOT a partial mock): the real `../firebase` calls
 // initializeApp()/getAuth() at module load, which we must not run in jsdom.
@@ -368,6 +368,55 @@ describe('isFailingGroup', () => {
 
   test('returns false for empty array', () => {
     expect(isFailingGroup([])).toBe(false);
+  });
+});
+
+// ── armingToastCopy / parseArmingOutcome unit tests ──────────────────────────
+
+describe('arming outcomes', () => {
+  describe('parseArmingOutcome', () => {
+    test('recognizes steering', () => {
+      expect(parseArmingOutcome('steering')).toBe('steering');
+    });
+
+    test('recognizes passive_note', () => {
+      expect(parseArmingOutcome('passive_note')).toBe('passive_note');
+    });
+
+    test('recognizes routine_event', () => {
+      expect(parseArmingOutcome('routine_event')).toBe('routine_event');
+    });
+
+    test('recognizes not_armed', () => {
+      expect(parseArmingOutcome('not_armed')).toBe('not_armed');
+    });
+
+    test('recognizes duplicate', () => {
+      expect(parseArmingOutcome('duplicate')).toBe('duplicate');
+    });
+
+    test('returns null for unknown outcomes', () => {
+      expect(parseArmingOutcome('unknown')).toBeNull();
+      expect(parseArmingOutcome(123)).toBeNull();
+      expect(parseArmingOutcome(null)).toBeNull();
+      expect(parseArmingOutcome(undefined)).toBeNull();
+    });
+  });
+
+  describe('armingToastCopy', () => {
+    test('returns truthful toast for duplicate resend', () => {
+      expect(armingToastCopy('duplicate')).toBe('Message already sent — steer already armed');
+    });
+
+    test('returns generic copy for null outcome', () => {
+      expect(armingToastCopy(null)).toBe('Message sent');
+    });
+  });
+
+  describe('armingHintCopy', () => {
+    test('returns truthful hint for duplicate resend', () => {
+      expect(armingHintCopy('duplicate')).toBe('Message already sent — steer already armed.');
+    });
   });
 });
 
@@ -3686,5 +3735,75 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
     expect(el.textContent).toContain('Steer picked up');
     const cancelBtn = Array.from(el.querySelectorAll('button')).find(b => b.textContent === 'Cancel');
     expect(cancelBtn).toBeFalsy();
+  });
+
+  test('displays the directive excerpt when present', async () => {
+    const el = await renderPanel({
+      _strategic_refresh: {
+        requested_at: new Date(Date.now() - 60_000).toISOString(),
+        excerpt: 'Fix the flaky test in the auth module by adding proper setup/teardown',
+        origin: 'operator',
+        count: 1,
+      },
+    });
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).toContain('Fix the flaky test in the auth module by adding proper setup/teardown');
+  });
+
+  test('truncates long directives with ellipsis', async () => {
+    const longExcerpt = 'This is a very long directive text that should be truncated with ellipsis because it exceeds the maximum display length and we want to keep the UI compact and readable for the operator'.repeat(2);
+    const el = await renderPanel({
+      _strategic_refresh: {
+        requested_at: new Date(Date.now() - 60_000).toISOString(),
+        excerpt: longExcerpt,
+        origin: 'operator',
+        count: 1,
+      },
+    });
+    expect(el.textContent).toContain('Strategic cycle pending');
+    // Should contain first 120 chars of the excerpt
+    expect(el.textContent).toContain(longExcerpt.slice(0, 120));
+    expect(el.textContent).toContain('…');
+  });
+
+  test('displays coalesce count when count > 1', async () => {
+    const el = await renderPanel({
+      _strategic_refresh: {
+        requested_at: new Date(Date.now() - 60_000).toISOString(),
+        excerpt: 'Update the problem model for the new version',
+        origin: 'qualification',
+        count: 3,
+      },
+    });
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).toContain('+2 steers coalesced');
+  });
+
+  test('does not display coalesce info when count = 1', async () => {
+    const el = await renderPanel({
+      _strategic_refresh: {
+        requested_at: new Date(Date.now() - 60_000).toISOString(),
+        excerpt: 'Update the problem model for the new version',
+        origin: 'operator',
+        count: 1,
+      },
+    });
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).not.toContain('coalesced');
+  });
+
+  test('displays multiple pending details together', async () => {
+    const el = await renderPanel({
+      _strategic_refresh: {
+        requested_at: new Date(Date.now() - 120_000).toISOString(),
+        excerpt: 'Investigate the performance regression in the query handler',
+        origin: 'operator',
+        count: 5,
+      },
+    });
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).toContain('Investigate the performance regression in the query handler');
+    expect(el.textContent).toContain('+4 steers coalesced');
+    expect(el.textContent).toContain('armed 2m ago');
   });
 });

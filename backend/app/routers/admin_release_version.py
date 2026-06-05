@@ -17,7 +17,11 @@ from app.models import (
 )
 from app.auth import get_current_user
 from app.admin import _get_user_project_with_role
-from app.shared_state import runtime_config as _runtime_config
+from app.shared_state import (
+    promotion_enabled_by_project_map,
+    resolve_project_promotion_enabled,
+    runtime_config as _runtime_config,
+)
 from app import release_version as _release_version
 
 router = APIRouter()
@@ -222,10 +226,40 @@ async def get_version_lifecycle(
                 "last_qualification": _format_qualification(v.last_qualification)
                 if v.last_qualification
                 else None,
+                "abandoned_at": (
+                    (v.last_qualification or {}).get("abandoned_at")
+                    if v.status == "abandoned"
+                    else None
+                ),
+                "abandoned_by": (
+                    (v.last_qualification or {}).get("operator")
+                    if v.status == "abandoned"
+                    else None
+                ),
+                "abandon_reason": (
+                    (v.last_qualification or {}).get("reason")
+                    if v.status == "abandoned"
+                    else None
+                ),
             }
             for v in history_rows
         ],
         "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
+        # Per-project live-promotion enablement. ``promotion_enabled_effective``
+        # is the value the promotion gate actually consults for THIS project (the
+        # override when set, else the fleet default). ``promotion_enabled_override``
+        # is the explicit per-project value (None when the project rides the fleet
+        # default), and ``promotion_enabled_source`` tells the operator which one
+        # is in effect.
+        "promotion_enabled_effective": resolve_project_promotion_enabled(project_id),
+        "promotion_enabled_override": promotion_enabled_by_project_map().get(
+            str(project_id)
+        ),
+        "promotion_enabled_source": (
+            "project"
+            if str(project_id) in promotion_enabled_by_project_map()
+            else "fleet"
+        ),
         "promotion_readiness": promotion_readiness,
         # Directions deliberately queued (status=staged) to begin only after the
         # current version promotes. Surfaced read-only so an operator can confirm
@@ -389,6 +423,68 @@ async def cut_version(
             if new_version.opened_at
             else None,
         },
+    }
+
+
+class _SetPromotionEnabledBody(BaseModel):
+    enabled: bool | None = _Field(default=None)
+
+
+@router.post("/projects/{project_id}/promotion-enabled")
+async def set_promotion_enabled(
+    project_id: uuid.UUID,
+    payload: _SetPromotionEnabledBody,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Arm, hold, or clear ONE project's per-project live-promotion override.
+
+    Owner-gated. The request body is ``{"enabled": true | false | null}``:
+
+    * ``true`` arms live promotion for THIS project, ``false`` holds it — either
+      way the project's promotion gate consults that explicit value independently
+      of the fleet-wide ``promotion_enabled`` and of every other project;
+    * ``null`` CLEARS this project's override so it falls back to the fleet-wide
+      default, restoring byte-identical behavior to a project with no override.
+
+    The map is read-modify-written under ``runtime_config_lock`` so a concurrent
+    edit to a DIFFERENT project is never clobbered, then persisted via the durable
+    settings path (:func:`admin_settings._apply_settings`) so the change survives a
+    Cloud Run restart.
+
+    Response keys (additive-only): ``project_id``, ``override`` (the explicit
+    per-project value now stored, or ``None`` when cleared), ``effective`` (the
+    value the gate will consult after fleet fallback), ``source``
+    (``"project"`` | ``"fleet"``), and ``cleared``.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    from app.routers.admin_settings import _apply_settings
+    from app.shared_state import runtime_config, runtime_config_lock
+
+    sid = str(project_id)
+    async with runtime_config_lock:
+        promo_map = dict(promotion_enabled_by_project_map())
+        if payload.enabled is None:
+            cleared = sid in promo_map
+            promo_map.pop(sid, None)
+        else:
+            cleared = False
+            promo_map[sid] = bool(payload.enabled)
+        await _apply_settings(
+            {"promotion_enabled_by_project": promo_map}, session, runtime_config
+        )
+        resulting = promotion_enabled_by_project_map()
+        effective = resolve_project_promotion_enabled(project_id)
+
+    return {
+        "project_id": sid,
+        "override": resulting.get(sid),
+        "effective": effective,
+        "source": "project" if sid in resulting else "fleet",
+        "cleared": cleared,
     }
 
 
