@@ -874,6 +874,61 @@ describe('VersionLifecyclePanel', () => {
     });
   });
 
+  describe('promotion-in-flight locks qualify + phase controls', () => {
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    const promotionInFlightState: api.QualificationState = {
+      state: 'promotion_in_flight',
+      summary: 'Audit PASSED; a promotion PR is open and auto-merge is armed.',
+      promotion_pr_number: 4242,
+      promotion_pr_url: 'https://example/pr/4242',
+    };
+
+    it('disables Run Qualify and the phase flip while a promotion is in flight', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              phase: 'stabilize',
+              qualification_state: promotionInFlightState,
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.getByRole('button', { name: /Run Qualify/ })).toBeDisabled();
+      // In stabilize phase, the phase-flip button targets build.
+      expect(screen.getByRole('button', { name: /build/ })).toBeDisabled();
+      // The note makes the locked state legible.
+      expect(screen.getByTestId('promotion-in-flight-note')).toHaveTextContent('#4242');
+    });
+
+    it('leaves qualify + phase controls actionable when no promotion is in flight', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              phase: 'stabilize',
+              qualification_state: { state: 'qualifying', summary: 'Audit in flight.' },
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.getByRole('button', { name: /Run Qualify/ })).toBeEnabled();
+      expect(screen.getByRole('button', { name: /build/ })).toBeEnabled();
+      expect(screen.queryByTestId('promotion-in-flight-note')).not.toBeInTheDocument();
+    });
+  });
+
   describe('promotion readiness regime labeling', () => {
     function makeReadiness(overrides: Partial<api.PromotionReadiness> = {}): api.PromotionReadiness {
       return {

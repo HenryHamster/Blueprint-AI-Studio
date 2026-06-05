@@ -23,6 +23,11 @@ export interface HealthOverviewResponse {
   precomputed?: boolean;
   precomputed_at?: string | null;
   precompute_age_seconds?: number | null;
+  // True when the backend served the LAST GOOD payload because the live health
+  // compute failed (e.g. the scan exceeded its statement timeout). The reading
+  // may be recent in wall-clock terms yet is NOT a live verdict, so the card
+  // must dim it even when precompute_age_seconds is under the stale threshold.
+  served_stale?: boolean;
 }
 
 // A cached snapshot older than this many seconds is presented as stale: the
@@ -62,11 +67,15 @@ export function SystemHealthCard({
   const issues = data?.actionable_issues ?? [];
   const trendColor = sr?.trend === 'improving' ? 'text-emerald-400' : sr?.trend === 'declining' ? 'text-red-400' : 'text-neutral-400';
   const trendIcon = sr?.trend === 'improving' ? '↑' : sr?.trend === 'declining' ? '↓' : '→';
-  const { asOfLabel, stale } = snapshotFreshness(
+  const { asOfLabel, stale: freshnessStale } = snapshotFreshness(
     data?.precomputed_at,
     data?.precompute_age_seconds,
     SNAPSHOT_STALE_AFTER_SECONDS,
   );
+  // A served-stale reading (compute currently failing, last-good returned) is
+  // never live regardless of its age — OR it into the staleness decision so the
+  // verdict dims/marks even inside the freshness window.
+  const stale = freshnessStale || data?.served_stale === true;
 
   return (
     <section>

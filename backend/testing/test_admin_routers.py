@@ -6734,6 +6734,37 @@ class TestSetVersionPhase:
         assert resp.json()["phase"] == "build"
 
     @pytest.mark.asyncio
+    async def test_set_phase_rejects_promotion_in_flight(
+        self, client: AsyncClient, db_session
+    ):
+        """A phase flip while a promotion PR is open and auto-merging is rejected
+        with a 409 — flipping back to build would clear the in-flight indication
+        without cancelling anything, leaving the operator levers disagreeing."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        version.last_qualification = {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 8642,
+                "pr_url": "https://example/pr/8642",
+                "auto_merge_enabled": True,
+            },
+        }
+        db_session.add(version)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-phase",
+            json={"phase": "build"},
+        )
+        assert resp.status_code == 409
+        assert "promotion PR is open and auto-merging" in resp.text
+
+        # Phase unchanged — the flip was refused before any mutation.
+        await db_session.refresh(version)
+        assert version.phase == "stabilize"
+
+    @pytest.mark.asyncio
     async def test_set_phase_no_open_version_returns_404(
         self, client: AsyncClient, db_session
     ):
@@ -8938,6 +8969,62 @@ class TestModifyTaskApplySeam:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+class TestTriggerQualify:
+    @pytest.mark.asyncio
+    async def test_qualify_rejects_promotion_in_flight(
+        self, client: AsyncClient, db_session
+    ):
+        """Re-running qualification while a promotion PR is open and auto-merging
+        is rejected with a 409 — run_qualification no-ops (promotion_in_flight)
+        and the endpoint surfaces it, mirroring the version-cut lever, instead of
+        spawning a fresh audit/smoketest pair that clobbers the pending record."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        # A terminal audit child — by the child-task definition this is NOT "in
+        # flight", so only the promotion-in-flight guard catches it.
+        audit_task = Task(
+            project_id=project.id,
+            title="audit-done",
+            payloads=[{"type": "release_audit", "base_branch": "main"}],
+            vm_instance_id="vm-audit-promo",
+            status=TaskStatus.COMPLETED,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "abc123",
+            "audit_task_id": str(audit_task.id),
+            "smoketest_enabled": False,
+            "promotion_pending": {
+                "pr_number": 9753,
+                "pr_url": "https://example/pr/9753",
+                "auto_merge_enabled": True,
+            },
+        }
+        db_session.add(version)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/qualify")
+        assert resp.status_code == 409
+        assert "promotion PR is open and auto-merging" in resp.text
+
+        # The promotion-pending record survives untouched.
+        await db_session.refresh(version)
+        assert version.last_qualification["promotion_pending"]["pr_number"] == 9753
+
+    @pytest.mark.asyncio
+    async def test_qualify_no_open_version_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns 404 when there is no open release version to qualify."""
+        project = await _make_project(db_session)
+        resp = await client.post(f"/api/admin/projects/{project.id}/qualify")
+        assert resp.status_code == 404
+
+
 class TestClearWaveDeps:
     @pytest.mark.asyncio
     async def test_preserves_missing_depends_on_for_queued_tasks(
@@ -9898,6 +9985,33 @@ class TestTriggerSelfAudit:
         # Trigger on project 2 should succeed
         resp = await client.post(f"/api/admin/projects/{project2.id}/self-audit")
         assert resp.status_code == 200, resp.text
+
+    @pytest.mark.asyncio
+    async def test_concurrent_self_audit_idempotency_key_prevents_race(
+        self, client: AsyncClient, db_session
+    ):
+        """Concurrent self-audit triggers are prevented by idempotency_key.
+        When a second trigger arrives while one is in flight, the SELECT check
+        detects it and rejects with 409. If the race condition allows both to
+        pass the SELECT check, the idempotency_key constraint + IntegrityError
+        handler prevents duplicate inserts."""
+        project = await _make_project(db_session)
+
+        # First trigger creates a task with idempotency_key
+        resp1 = await client.post(f"/api/admin/projects/{project.id}/self-audit")
+        assert resp1.status_code == 200, resp1.text
+        data1 = resp1.json()
+        task1_id = data1["task_id"]
+
+        # Verify the created task has idempotency_key set
+        task1 = await db_session.get(Task, uuid.UUID(task1_id))
+        assert task1 is not None
+        assert task1.idempotency_key == f"operator_self_audit:{project.id}"
+
+        # Second trigger on same project finds active audit and rejects with 409
+        resp2 = await client.post(f"/api/admin/projects/{project.id}/self-audit")
+        assert resp2.status_code == 409, resp2.text
+        assert "already in progress" in resp2.json()["error"]["message"].lower()
 
 
 class TestGetProjectFindings:

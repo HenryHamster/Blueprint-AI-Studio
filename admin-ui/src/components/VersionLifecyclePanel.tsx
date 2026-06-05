@@ -378,6 +378,13 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   const promotionEnabled = data.promotion_enabled ?? false;
   const optimisticPromotionEnabled = promotionEnabledOverride ?? promotionEnabled;
   const readiness = data.promotion_readiness;
+  // A promotion in flight (audit passed, promotion PR open and auto-merging)
+  // makes the qualify + phase-flip levers unsafe: re-qualifying clobbers the
+  // promotion-pending record and a phase flip clears the in-flight indication
+  // without cancelling anything. The backend refuses both with a 409; disable
+  // the controls here so the panel presents the same truth, consistent with how
+  // the cut lever already surfaces this state.
+  const promotionInFlight = cv?.qualification_state?.state === 'promotion_in_flight';
 
   const handleSetPhase = async (phase: 'build' | 'stabilize') => {
     if (!projectId) return;
@@ -758,7 +765,8 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 {cv.phase === 'build' ? (
                   <button
                     onClick={() => handleSetPhase('stabilize')}
-                    disabled={actionLoading !== null}
+                    disabled={actionLoading !== null || promotionInFlight}
+                    title={promotionInFlight ? 'A promotion PR is open and auto-merging — wait for it to land or cancel it before changing the phase' : undefined}
                     className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'phase' ? '…' : '→ stabilize'}
@@ -766,7 +774,8 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 ) : (
                   <button
                     onClick={() => handleSetPhase('build')}
-                    disabled={actionLoading !== null}
+                    disabled={actionLoading !== null || promotionInFlight}
+                    title={promotionInFlight ? 'A promotion PR is open and auto-merging — wait for it to land or cancel it before changing the phase' : undefined}
                     className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-blue-500/40 text-blue-400 hover:bg-blue-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'phase' ? '…' : '→ build'}
@@ -775,11 +784,17 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 {cv.phase === 'stabilize' && (
                   <button
                     onClick={handleQualify}
-                    disabled={actionLoading !== null}
+                    disabled={actionLoading !== null || promotionInFlight}
+                    title={promotionInFlight ? 'A promotion PR is open and auto-merging — wait for it to land or cancel it before re-qualifying' : undefined}
                     className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'qualify' ? '…' : 'Run Qualify'}
                   </button>
+                )}
+                {promotionInFlight && (
+                  <span data-testid="promotion-in-flight-note" className="text-[10px] text-emerald-300 italic">
+                    Promotion PR{cv.qualification_state?.promotion_pr_number ? ` #${cv.qualification_state.promotion_pr_number}` : ''} open & auto-merging — qualify & phase locked until it lands or is canceled
+                  </span>
                 )}
                 {cuttingVersion ? (
                   <div className="flex flex-col gap-1 w-full">

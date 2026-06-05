@@ -200,11 +200,20 @@ async def activate_eligible_staged_directions(
     only after the version that was OPEN when it was staged has promoted. The
     per-direction ``staged_for_version`` marker records that version number.
 
-    This flips to ``active`` every staged direction whose
+    This flips to ``active`` staged directions whose
     ``staged_for_version <= promoted_version_number``, clears the
     ``staged_for_version`` marker, and stamps ``staged_activated_at``. It is the
     single shared activation entry point used by BOTH the version-open promotion
     hook and the reaper durability backstop, so the two paths can never diverge.
+
+    Active-direction cap (genuine ceiling): activation never pushes the project
+    past ``runtime_config["max_active_directions"]`` — the SAME limit the manual
+    path (``routers/directions.py``) hard-rejects with a 409. When more staged
+    directions are eligible than there are free slots, the overflow stays
+    ``staged`` with its ``staged_for_version`` marker intact and is drained by
+    subsequent sweeps as active slots free, so deferred-but-approved work is
+    never stranded. Scarce slots go to higher-priority then older-``staged_at``
+    (FIFO) directions first.
 
     Idempotency / gating guarantees:
       - Activating an already-``active`` direction is a no-op (only ``staged``
@@ -226,22 +235,50 @@ async def activate_eligible_staged_directions(
     """
     # Lazy imports: task_locking imports directions_repo (sync_directions), so a
     # module-level import here would create a cycle. strategic_events is only
-    # needed for the post-commit broadcast.
+    # needed for the post-commit broadcast. runtime_config carries the
+    # active-direction cap (mirrors the lazy import in routers/directions.py).
     from app.task_locking import with_directions_locked
     from app.strategic_events import (
         STRATEGIC_KIND_DIRECTIONS,
         emit_strategic_updated,
     )
+    from app.shared_state import runtime_config as _runtime_config
 
     # Bound notes the same way every other direction note writer does, so a
     # repeatedly-staged/activated direction can't grow its notes array forever.
     from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX
+
+    # The active-direction cap is a genuine ceiling on concurrent active work —
+    # the manual path (routers/directions.py) hard-rejects with 409 at the cap,
+    # so auto-activation must respect the SAME limit rather than flipping every
+    # eligible direction at once. Overflow stays staged with its marker intact;
+    # the periodic Step 13 reaper sweep re-runs and drains it as active slots
+    # free, so deferred-but-approved work is never stranded.
+    max_active = _runtime_config.get("max_active_directions", 5)
+
+    # Scarce-slot tie-break: higher priority wins, then oldest staged_at (FIFO)
+    # so the longest-waiting approved work activates first. Unknown priority
+    # sorts as medium; a missing staged_at sorts earliest (treated as oldest).
+    _PRIORITY_RANK = {"high": 0, "medium": 1, "low": 2}
 
     activated: List[str] = []
     activated_meta: List[Dict[str, Any]] = []
     now_iso = _utcnow().isoformat()
 
     def _mutate(directions: List[Dict[str, Any]]) -> None:
+        # Count directions already active — the cap bounds the post-activation
+        # total, so only (max_active - active_count) staged directions may flip.
+        active_count = sum(1 for d in directions if d.get("status") == "active")
+        slots = max_active - active_count
+        if slots <= 0:
+            # Already at/over the ceiling: nothing activates this pass. The
+            # overflow stays staged for the next sweep to re-evaluate.
+            return
+
+        # Collect every eligible staged direction (target version promoted, or
+        # fail-open on an unparseable marker) before flipping, so we can apply
+        # the scarce-slot ordering deterministically across the whole set.
+        eligible: List[Dict[str, Any]] = []
         for d in directions:
             if d.get("status") != "staged":
                 continue
@@ -256,6 +293,16 @@ async def activate_eligible_staged_directions(
                 # Staged during the version that just opened — its target
                 # version has not promoted yet; leave it staged.
                 continue
+            eligible.append(d)
+
+        eligible.sort(
+            key=lambda d: (
+                _PRIORITY_RANK.get(d.get("priority"), 1),
+                str(d.get("staged_at") or ""),
+            )
+        )
+
+        for d in eligible[:slots]:
             d["status"] = "active"
             d.pop("staged_for_version", None)
             d["staged_activated_at"] = now_iso

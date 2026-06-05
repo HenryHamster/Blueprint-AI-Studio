@@ -295,6 +295,32 @@ describe('useDeploymentState', () => {
     );
   });
 
+  it('handleRollback ignores a second concurrent call while in flight', async () => {
+    // Gate the first fetch on a promise we control so the call is still
+    // in flight when the second handleRollback fires.
+    let releaseFirst: () => void = () => {};
+    const firstResponse = {
+      ok: true,
+      json: vi.fn().mockResolvedValue({ from_sha: 'abcdef1234567890', to_sha: '98765432abcdef' }),
+    };
+    fetchSpy.mockImplementationOnce(
+      () => new Promise((resolve) => { releaseFirst = () => resolve(firstResponse); }),
+    );
+    const addToast = vi.fn();
+    const { result } = renderHook(() =>
+      useDeploymentState(addToast, makeUser(), { current: vi.fn() }),
+    );
+
+    const firstCall = result.current.handleRollback();
+    // Second call while the first is still pending — must be a no-op.
+    await result.current.handleRollback();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    releaseFirst();
+    await firstCall;
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
   it('handleRollback shows error toast on failure', async () => {
     fetchSpy.mockResolvedValue({
       ok: false,

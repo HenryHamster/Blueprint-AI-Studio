@@ -280,12 +280,31 @@ async def trigger_rollback(
         rollback_error = str(e)[:500]
         logger.error(f"[ADMIN] Rollback command failed: {e}", exc_info=True)
 
-    # Update deployment state regardless of gcloud result
+    # Update deployment state regardless of gcloud result.
+    # The ROLLED_BACK guard above makes this a real status transition every time
+    # we reach here, so the rollback_count increment and capacity snapshot are
+    # taken exactly once per rollback (a re-entrant call is rejected by the guard).
+    from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle at module load
+
     state.status = DeploymentStatus.ROLLED_BACK
     state.rolled_back_from_sha = state.current_sha
     state.rollback_reason = f"Manual rollback: {analysis_reason}"
     state.rollback_count += 1
-    state.pre_pause_max_vms = runtime_config["max_concurrent_vms"]
+    # Idempotent capacity snapshot: only capture the genuine pre-pause capacity
+    # if no prior pause already saved it. Rolling back an already-paused pipeline
+    # (manual or auto) leaves live capacity at zero, so an unconditional snapshot
+    # would clobber the real value and a later resume would restore the wrong
+    # concurrency. Mirror the manual-pause guard in pause_pipeline.
+    if state.pre_pause_max_vms is None:
+        state.pre_pause_max_vms = (
+            runtime_config["max_concurrent_vms"]
+            or state.runtime_max_concurrent_vms
+        )
+    # Mark the pause window on the pause clock so pause-aware task timers
+    # (CI backstop, queued-age, pre-claim reaper) subtract the rollback-induced
+    # downtime. mark_paused is idempotent: if the pipeline was already paused it
+    # preserves the existing paused_at/paused_kind rather than restarting the window.
+    pause_clock.mark_paused(state, pause_clock.PAUSED_KIND_AUTO)
     session.add(state)
     await session.commit()
 
