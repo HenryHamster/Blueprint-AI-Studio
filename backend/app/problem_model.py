@@ -436,6 +436,28 @@ the durable model stays round-trippable. Set ~10KB under the 100KB cap to leave
 headroom for the revision-log entry appended in the same write."""
 
 
+CAPABILITIES_DURABLE_MAX = 200
+"""Hard cap on the durable ``capabilities`` collection.
+
+Capabilities are merged non-destructively every cycle (see
+:func:`_merge_capabilities`), so on a mature project they accumulate without an
+intrinsic bound and — once read-side skeletonization is removed — a
+capability-heavy model can exceed the strategic payload budget and be dropped
+whole. This cap is the write-side backstop: generous (far above the advisory
+:data:`MODEL_SIZE_HEALTHY_CAPABILITIES`) but finite. Eviction is restricted to
+``planned`` capabilities (terminal/low-value — described but not yet built);
+live ``working``/``partial`` capabilities are never evicted, so an all-live
+collection may legitimately remain above this cap."""
+
+
+FRICTION_DURABLE_MAX = 200
+"""Hard cap on the durable ``friction`` collection — see
+:data:`CAPABILITIES_DURABLE_MAX`. Eviction is restricted to terminal
+``resolved`` then ``mitigated`` friction (reference-only, like archived gaps);
+``active`` friction is live high-value state and is never evicted, so an
+all-active collection may legitimately remain above this cap."""
+
+
 class SelfReflectionEntry(BaseModel):
     """Agent-written reflection about what was hard this cycle.
 
@@ -529,25 +551,123 @@ def _serialized_model_bytes(model: ProblemModel) -> int:
     return len(json.dumps(model.model_dump(), default=str))
 
 
+def _is_evictable_capability(cap: Capability) -> bool:
+    """A capability the byte GC may evict: ``planned`` only — described but not
+    yet built, so terminal/low-value. ``working``/``partial`` are live
+    high-value state the agent owns and are never evicted."""
+    return cap.status == "planned"
+
+
+def _is_evictable_friction(fric: Friction) -> bool:
+    """Friction the byte GC may evict: ``resolved`` or ``mitigated`` —
+    terminal/reference-only, like an archived gap. ``active`` friction is live
+    high-value state and is never evicted."""
+    return fric.status in ("resolved", "mitigated")
+
+
+def _evict_one_terminal_capfriction(
+    model: ProblemModel,
+) -> tuple[str, str] | None:
+    """Evict the single most-disposable terminal capability/friction entry,
+    mutating ``model`` in place.
+
+    Priority (most disposable first): ``resolved`` friction, then ``mitigated``
+    friction, then ``planned`` capabilities — friction before any capability,
+    mirroring how archived gaps are the first reference-only state to roll off.
+    Within a status, oldest-first (list order, the merge-insertion order). Live
+    state (``working``/``partial`` capabilities, ``active`` friction) is never
+    touched. Returns ``(kind, identifier)`` of what was evicted —
+    ``("friction", id)`` or ``("capability", name)`` — or ``None`` when nothing
+    is evictable."""
+    for i, fric in enumerate(model.friction):
+        if fric.status == "resolved":
+            model.friction.pop(i)
+            return ("friction", fric.id)
+    for i, fric in enumerate(model.friction):
+        if fric.status == "mitigated":
+            model.friction.pop(i)
+            return ("friction", fric.id)
+    for i, cap in enumerate(model.capabilities):
+        if cap.status == "planned":
+            model.capabilities.pop(i)
+            return ("capability", cap.name)
+    return None
+
+
+def _cap_count_cap(model: ProblemModel) -> list[str]:
+    """Evict terminal (``planned``) capabilities oldest-first when the
+    collection exceeds :data:`CAPABILITIES_DURABLE_MAX`. Live working/partial
+    capabilities are never evicted, so the collection may remain above the cap
+    when it is all-live. Returns the evicted capability names."""
+    overage = len(model.capabilities) - CAPABILITIES_DURABLE_MAX
+    if overage <= 0:
+        return []
+    evicted: list[str] = []
+    kept: list[Capability] = []
+    for cap in model.capabilities:
+        if len(evicted) < overage and _is_evictable_capability(cap):
+            evicted.append(cap.name)
+        else:
+            kept.append(cap)
+    model.capabilities = kept
+    return evicted
+
+
+def _friction_count_cap(model: ProblemModel) -> list[str]:
+    """Evict terminal friction when the collection exceeds
+    :data:`FRICTION_DURABLE_MAX`, ``resolved`` before ``mitigated`` and
+    oldest-first within each. Active friction is never evicted, so the
+    collection may remain above the cap when it is all-active. Returns the
+    evicted friction ids (in surviving-list order)."""
+    overage = len(model.friction) - FRICTION_DURABLE_MAX
+    if overage <= 0:
+        return []
+    resolved = [i for i, f in enumerate(model.friction) if f.status == "resolved"]
+    mitigated = [i for i, f in enumerate(model.friction) if f.status == "mitigated"]
+    evict_idx = set((resolved + mitigated)[:overage])
+    evicted: list[str] = []
+    kept: list[Friction] = []
+    for i, fric in enumerate(model.friction):
+        if i in evict_idx:
+            evicted.append(fric.id)
+        else:
+            kept.append(fric)
+    model.friction = kept
+    return evicted
+
+
 def _byte_evictable(model: ProblemModel) -> bool:
     """Whether the byte pass can actually bring ``model`` under the budget.
 
-    The byte pass only touches reference-only history — ``archived_gaps``, the
-    ``rejected_agent_edits`` ledger, and the oldest active-gap append-only tails.
-    If the live/active state alone (everything that survives once those are
-    reduced to their durable floor) already exceeds the budget, evicting that
-    history cannot get the model under the cap; doing so would be futile
-    destruction of re-fetchable reference state on every mature project (a
-    healthy within-caps model carries enough active gaps/history to exceed the
-    budget on its own). So gate eviction on it actually being achievable:
-    measure the floor with the evictable collections cleared and active tails
-    trimmed, restore the model, and only let the caller evict when that floor
-    fits. The legitimate target — a model whose individual archived/ledger
-    entries are large enough to blow the cap despite a small active core — still
-    has a sub-budget floor and is GC'd normally."""
+    The byte pass touches only reference-only / terminal state — ``archived_gaps``,
+    the ``rejected_agent_edits`` ledger, the oldest active-gap append-only tails,
+    and terminal capabilities/friction (``planned`` capabilities, ``resolved``/
+    ``mitigated`` friction). If the live/active state alone (everything that
+    survives once those are reduced to their durable floor) already exceeds the
+    budget, evicting that history cannot get the model under the cap; doing so
+    would be futile destruction of re-fetchable reference state on every mature
+    project (a healthy within-caps model carries enough active gaps/history to
+    exceed the budget on its own). So gate eviction on it actually being
+    achievable: measure the floor with the evictable collections cleared and
+    active tails trimmed, restore the model, and only let the caller evict when
+    that floor fits. The legitimate target — a model whose archived/ledger/
+    terminal cap/friction bulk is large enough to blow the cap despite a small
+    live core — still has a sub-budget floor and is GC'd normally.
+
+    Crucially, the floor must drop terminal capabilities/friction too: without
+    that, a model whose bulk IS its ``planned`` capabilities or ``resolved``/
+    ``mitigated`` friction would measure an over-budget floor and the gate would
+    wrongly skip — leaving it oversized in the durable store (the precise gap
+    this backstop closes)."""
     floor_model = model.model_copy(deep=True)
     floor_model.archived_gaps = []
     floor_model.rejected_agent_edits = []
+    floor_model.capabilities = [
+        c for c in floor_model.capabilities if not _is_evictable_capability(c)
+    ]
+    floor_model.friction = [
+        f for f in floor_model.friction if not _is_evictable_friction(f)
+    ]
     for gap in sorted(floor_model.gaps, key=_active_gap_recency_key):
         _trim_gap_append_only_tail(gap)
     floor_bytes = _serialized_model_bytes(floor_model)
@@ -561,42 +681,51 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
     summary of what was evicted (empty dict when nothing was dropped, so the
     caller can keep the diff/output byte-identical on the no-op path).
 
-    Two passes, both touching ONLY history/reference-only state:
+    Two passes, both touching ONLY history/reference-only/terminal state:
 
-    1. **Count cap** — bounds ``archived_gaps`` (the only durable collection
-       that grows without limit) at :data:`ARCHIVED_GAPS_DURABLE_MAX`, evicting
-       the oldest entries by ``closed``/``opened`` timestamp.
-    2. **Byte cap** — after the count cap, measures the serialized model and,
+    1. **Count cap** — bounds the durable collections that grow without limit:
+       ``archived_gaps`` at :data:`ARCHIVED_GAPS_DURABLE_MAX` (evicting the oldest
+       by ``closed``/``opened`` timestamp), and ``capabilities`` / ``friction``
+       at :data:`CAPABILITIES_DURABLE_MAX` / :data:`FRICTION_DURABLE_MAX`. The
+       cap/friction count caps evict ONLY terminal entries — ``planned``
+       capabilities and ``resolved``/``mitigated`` friction — oldest-first, so an
+       all-live collection may legitimately remain above the cap (live state is
+       never dropped to satisfy a count).
+    2. **Byte cap** — after the count caps, measures the serialized model and,
        while it exceeds :data:`PROBLEM_MODEL_BYTE_BUDGET` (set safely under the
        100KB write cap), evicts the oldest archived gaps, then trims the oldest
-       rejected-agent-edits ledger entries, and finally trims the oldest active
-       gaps' append-only tails until the model fits. This guards models whose
-       individual entries are large enough to blow the cap despite being under
-       the count caps, so the durable model stays writable back through the
-       strategic op endpoint. The byte pass is gated on :func:`_byte_evictable`:
-       it runs ONLY when emptying the evictable reference-only collections and
-       reducing active tails to the durable floor could actually bring the model
-       under budget. A healthy within-caps model can carry enough active
-       gaps/history to exceed the budget on its own, and the byte pass cannot
-       touch that live state — so evicting archived history there is futile
-       destruction and is skipped, leaving such a model bounded by the count cap
-       alone.
+       rejected-agent-edits ledger entries, then trims the oldest active gaps'
+       append-only tails, and finally — as a last resort — evicts terminal
+       capabilities/friction (``resolved``/``mitigated`` friction first, then
+       ``planned`` capabilities) until the model fits. This guards models whose
+       bulk is large individual entries or accumulated terminal cap/friction
+       despite being under the count caps, so the durable model stays writable
+       back through the strategic op endpoint. The byte pass is gated on
+       :func:`_byte_evictable`: it runs ONLY when emptying the evictable
+       reference-only/terminal collections and reducing active tails to the
+       durable floor could actually bring the model under budget. A healthy
+       within-caps model can carry enough live state to exceed the budget on its
+       own, and the byte pass cannot touch that live state — so evicting
+       reference history there is futile destruction and is skipped.
 
-    It deliberately does NOT touch active gaps, capabilities, friction, or
-    pending confirmations — those are live, semantically meaningful state that
-    the agent owns and merges non-destructively; a structural cap there could
-    drop entries the agent never saw. ``archived_gaps`` is pure history
-    (closed/abandoned, reference-only, re-fetchable by id) and
-    ``rejected_agent_edits`` is agent-readable bookkeeping, so oldest-first
-    eviction of either is safe.
+    It deliberately does NOT touch active gaps, live capabilities
+    (``working``/``partial``), active friction, or pending confirmations — those
+    are live, semantically meaningful state that the agent owns and merges
+    non-destructively; dropping them could lose entries the agent never saw.
+    ``archived_gaps`` is pure history (closed/abandoned, reference-only,
+    re-fetchable by id), ``rejected_agent_edits`` is agent-readable bookkeeping,
+    and terminal capabilities/friction are reference-only (the work is done or
+    abandoned) — so oldest-first eviction of any of these is safe.
 
     Returns a dict like ``{"archived_gaps_evicted": ["g-x"],
-    "rejected_agent_edits_trimmed": 2}`` recording what rolled off, suitable for
-    folding into the revision-log diff.
+    "rejected_agent_edits_trimmed": 2, "friction_evicted": ["f-y"]}`` recording
+    what rolled off, suitable for folding into the revision-log diff.
     """
     summary: dict[str, Any] = {}
     evicted_ids: list[str] = []
     active_gap_tails_trimmed: list[dict[str, Any]] = []
+    capabilities_evicted: list[str] = []
+    friction_evicted: list[str] = []
 
     if len(model.archived_gaps) > ARCHIVED_GAPS_DURABLE_MAX:
         # Stable sort newest-last by recency, then keep the most-recent N.
@@ -605,6 +734,10 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
         kept = ordered[-ARCHIVED_GAPS_DURABLE_MAX:]
         model.archived_gaps = kept
         evicted_ids.extend(g.id for g in evicted)
+
+    # Terminal-only count caps for the two non-destructively-merged collections.
+    capabilities_evicted.extend(_cap_count_cap(model))
+    friction_evicted.extend(_friction_count_cap(model))
 
     # Byte cap: only re-order/evict when we are genuinely over budget so the
     # no-op path leaves the model byte-identical (no spurious archived re-sort).
@@ -629,6 +762,18 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
                 break
             if trimmed := _trim_gap_append_only_tail(gap):
                 active_gap_tails_trimmed.append(trimmed)
+        # Last resort: evict terminal capabilities/friction. Live state
+        # (working/partial caps, active friction) is never reached because
+        # _evict_one_terminal_capfriction only ever returns terminal entries.
+        while _serialized_model_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET:
+            ev = _evict_one_terminal_capfriction(model)
+            if ev is None:
+                break
+            kind, ident = ev
+            if kind == "capability":
+                capabilities_evicted.append(ident)
+            else:
+                friction_evicted.append(ident)
 
     if evicted_ids:
         summary["archived_gaps_evicted"] = evicted_ids
@@ -636,6 +781,10 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
         summary["rejected_agent_edits_trimmed"] = ledger_trimmed
     if active_gap_tails_trimmed:
         summary["active_gap_tails_trimmed"] = active_gap_tails_trimmed
+    if capabilities_evicted:
+        summary["capabilities_evicted"] = capabilities_evicted
+    if friction_evicted:
+        summary["friction_evicted"] = friction_evicted
 
     return summary
 
@@ -899,6 +1048,10 @@ def _diff_summary(diff: dict[str, Any]) -> str:
         parts.append(f"GC trimmed {trimmed} rejected-edit ledger entry(ies)")
     if tails := diff.get("active_gap_tails_trimmed"):
         parts.append(f"GC trimmed {len(tails)} active gap tail(s)")
+    if caps_evicted := diff.get("capabilities_evicted"):
+        parts.append(f"GC evicted {len(caps_evicted)} terminal capability(ies)")
+    if friction_evicted := diff.get("friction_evicted"):
+        parts.append(f"GC evicted {len(friction_evicted)} terminal friction")
     return "; ".join(parts) if parts else "no structural changes"
 
 

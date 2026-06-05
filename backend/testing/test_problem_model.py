@@ -12,6 +12,8 @@ from pydantic import ValidationError
 
 from app.problem_model import (
     ARCHIVED_GAPS_DURABLE_MAX,
+    CAPABILITIES_DURABLE_MAX,
+    FRICTION_DURABLE_MAX,
     PROBLEM_MODEL_BYTE_BUDGET,
     GAP_HISTORY_DURABLE_MAX,
     GAP_PAST_MOVES_DURABLE_MAX,
@@ -742,6 +744,205 @@ def test_apply_agent_update_under_budget_no_byte_gc():
     assert "archived_gaps_evicted" not in diff
     assert "rejected_agent_edits_trimmed" not in diff
     assert {g["id"] for g in new_raw["archived_gaps"]} == {"g-a"}
+
+
+# ---------------------------------------------------------------------------
+# Byte-aware GC — bound capabilities/friction (non-destructively merged, so
+# unbounded on mature projects) without ever dropping live high-value state.
+# ---------------------------------------------------------------------------
+
+
+def test_gc_problem_model_byte_aware_evicts_excess_capabilities():
+    """A capabilities-heavy model over the byte budget is GC'd to fit by evicting
+    terminal (``planned``) capabilities; live working/partial capabilities within
+    budget survive untouched."""
+    big = "x" * 4_000
+    planned = [
+        Capability(name=f"planned-{i}", status="planned", notes=big)
+        for i in range(30)
+    ]
+    live = [
+        Capability(name="cap-working", status="working"),
+        Capability(name="cap-partial", status="partial"),
+    ]
+    model = ProblemModel(capabilities=planned + live)
+    assert _serialized_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET
+
+    summary = gc_problem_model(model)
+
+    assert _serialized_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET
+    assert summary["capabilities_evicted"]  # at least one planned cap evicted
+    surviving = {c.name for c in model.capabilities}
+    # Live high-value capabilities are never evicted.
+    assert {"cap-working", "cap-partial"} <= surviving
+    # Everything evicted was a terminal planned capability.
+    assert all(name.startswith("planned-") for name in summary["capabilities_evicted"])
+
+
+def test_gc_problem_model_byte_aware_evicts_excess_friction_resolved_first():
+    """When friction must be evicted to fit, resolved/mitigated (terminal) entries
+    go first and active friction is preserved."""
+    big = "y" * 4_000
+    resolved = [
+        Friction(id=f"f-res-{i}", name=f"res {i}", status="resolved", description=big)
+        for i in range(15)
+    ]
+    mitigated = [
+        Friction(id=f"f-mit-{i}", name=f"mit {i}", status="mitigated", description=big)
+        for i in range(15)
+    ]
+    active = [Friction(id="f-active", name="live blocker", status="active")]
+    model = ProblemModel(friction=resolved + mitigated + active)
+    assert _serialized_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET
+
+    summary = gc_problem_model(model)
+
+    assert _serialized_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET
+    surviving = {f.id for f in model.friction}
+    # Active friction always survives.
+    assert "f-active" in surviving
+    # Resolved friction is evicted before any mitigated entry: if any mitigated
+    # was evicted, every resolved must already be gone.
+    evicted = set(summary["friction_evicted"])
+    if any(fid.startswith("f-mit-") for fid in evicted):
+        assert all(f"f-res-{i}" in evicted for i in range(15))
+    assert all(fid != "f-active" for fid in evicted)
+
+
+def test_gc_problem_model_byte_aware_runs_when_capfriction_are_bulk():
+    """Regression: an oversized model whose BULK is terminal capabilities/friction
+    is GC'd to fit — the byte pass no longer skips because the live floor (after
+    clearing terminal cap/friction) now fits under budget."""
+    big = "z" * 3_000
+    model = ProblemModel(
+        gaps=[Gap(id="g-live", name="live", status="active")],
+        capabilities=[
+            Capability(name=f"planned-{i}", status="planned", notes=big)
+            for i in range(20)
+        ],
+        friction=[
+            Friction(id=f"f-{i}", name=f"res {i}", status="resolved", description=big)
+            for i in range(20)
+        ],
+    )
+    assert _serialized_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET
+
+    summary = gc_problem_model(model)
+
+    assert _serialized_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET
+    # The byte pass actually fired (rather than being futilely gated off).
+    assert summary.get("capabilities_evicted") or summary.get("friction_evicted")
+    # The live gap is untouched.
+    assert {g.id for g in model.gaps} == {"g-live"}
+
+
+def test_gc_problem_model_caps_capabilities_and_friction_count():
+    """Count caps evict terminal entries down to the durable max even when the
+    model is under the byte budget; live entries are never dropped to satisfy a
+    count, so an all-live collection may remain above the cap."""
+    # Small entries so the byte budget is not the trigger — exercise the count cap.
+    planned = [
+        Capability(name=f"planned-{i}", status="planned")
+        for i in range(CAPABILITIES_DURABLE_MAX + 5)
+    ]
+    working = [Capability(name="cap-working", status="working")]
+    resolved = [
+        Friction(id=f"f-{i}", name=f"res {i}", status="resolved")
+        for i in range(FRICTION_DURABLE_MAX + 7)
+    ]
+    active = [Friction(id="f-active", name="live", status="active")]
+    model = ProblemModel(
+        capabilities=planned + working, friction=resolved + active
+    )
+    assert _serialized_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET  # count, not byte
+
+    summary = gc_problem_model(model)
+
+    # Capability count brought down to the cap; the working cap survives.
+    assert len(model.capabilities) == CAPABILITIES_DURABLE_MAX
+    assert "cap-working" in {c.name for c in model.capabilities}
+    assert len(summary["capabilities_evicted"]) == 6  # 5 overage + working kept
+    # Friction count brought down to the cap; active friction survives.
+    assert len(model.friction) == FRICTION_DURABLE_MAX
+    assert "f-active" in {f.id for f in model.friction}
+    assert len(summary["friction_evicted"]) == 8
+
+
+def test_gc_problem_model_count_cap_never_evicts_all_live():
+    """An all-live collection above the durable max is left intact — the count
+    cap only evicts terminal entries, never live ones, to honor the invariant."""
+    working = [
+        Capability(name=f"cap-{i}", status="working")
+        for i in range(CAPABILITIES_DURABLE_MAX + 10)
+    ]
+    active = [
+        Friction(id=f"f-{i}", name=f"live {i}", status="active")
+        for i in range(FRICTION_DURABLE_MAX + 10)
+    ]
+    model = ProblemModel(capabilities=working, friction=active)
+
+    summary = gc_problem_model(model)
+
+    # No live entry evicted even though both collections exceed their caps.
+    assert summary == {}
+    assert len(model.capabilities) == CAPABILITIES_DURABLE_MAX + 10
+    assert len(model.friction) == FRICTION_DURABLE_MAX + 10
+
+
+def test_apply_agent_update_byte_gc_bounds_capfriction_roundtrippable():
+    """End-to-end: an oversized capability/friction-heavy model write-back lands
+    under the durable byte budget, records the eviction in the diff + revision
+    log, and round-trips; live gaps/pending state is untouched."""
+    big = "w" * 3_500
+    current = {
+        "revision": 4,
+        "capabilities": (
+            [
+                {"name": f"planned-{i}", "status": "planned", "notes": big}
+                for i in range(20)
+            ]
+            + [{"name": "cap-working", "status": "working"}]
+        ),
+        "friction": (
+            [
+                {
+                    "id": f"f-res-{i}",
+                    "name": f"res {i}",
+                    "status": "resolved",
+                    "description": big,
+                }
+                for i in range(20)
+            ]
+            + [{"id": "f-active", "name": "live blocker", "status": "active"}]
+        ),
+        "gaps": [{"id": "g-live", "name": "live", "status": "active"}],
+        "pending_user_confirmation": [
+            {"id": "p-1", "type": "access_needed", "proposal": "grant access"}
+        ],
+    }
+    proposed = {"gaps": [{"id": "g-live", "name": "live", "status": "active"}]}
+
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+
+    persisted = ProblemModel.model_validate(new_raw)
+    assert _serialized_bytes(persisted) <= PROBLEM_MODEL_BYTE_BUDGET
+    assert diff.get("capabilities_evicted") or diff.get("friction_evicted")
+    # Live high-value state survives.
+    assert "cap-working" in {c["name"] for c in new_raw["capabilities"]}
+    assert "f-active" in {f["id"] for f in new_raw["friction"]}
+    assert {g["id"] for g in new_raw["gaps"]} == {"g-live"}
+    assert {p["id"] for p in new_raw["pending_user_confirmation"]} == {"p-1"}
+    # Observable in the revision log.
+    last_entry = new_raw["revision_log"][-1]
+    assert "GC evicted" in last_entry["summary"]
+
+    # Round-trips cleanly back through another write-back.
+    round_tripped, _ = apply_agent_update(
+        new_raw, proposed, "2026-04-21T12:05:00"
+    )
+    assert _serialized_bytes(ProblemModel.model_validate(round_tripped)) <= (
+        PROBLEM_MODEL_BYTE_BUDGET
+    )
 
 
 def test_apply_agent_update_detects_new_gaps():
