@@ -683,6 +683,79 @@ describe('TaskCard BLOCKED status', () => {
   });
 });
 
+describe('TaskCard merge verification badge', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('shows Verified badge for a COMPLETED task with pr_url and no unmerged signals', () => {
+    const task = makeTask({
+      status: 'COMPLETED',
+      pr_url: 'https://github.com/owner/repo/pull/123',
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText('Verified')).toBeInTheDocument();
+    expect(screen.getByTitle('Merge verified by tests')).toBeInTheDocument();
+  });
+
+  it('shows Unverified badge when unverified_merge_reason is present', () => {
+    const task = makeTask({
+      status: 'COMPLETED',
+      pr_url: 'https://github.com/owner/repo/pull/123',
+      unverified_merge_reason: 'no_ci_gate_skip_ratio',
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText('Unverified')).toBeInTheDocument();
+    expect(screen.queryByText('Verified')).toBeNull();
+  });
+
+  it('shows Closed badge when landed_on_integration is false', () => {
+    const task = makeTask({
+      status: 'COMPLETED',
+      pr_url: 'https://github.com/owner/repo/pull/123',
+      context: { landed_on_integration: false },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText('Closed')).toBeInTheDocument();
+    expect(screen.getByTitle('PR closed without merge')).toBeInTheDocument();
+    expect(screen.queryByText('Verified')).toBeNull();
+  });
+
+  it('shows Closed badge when _non_merge_unblock_reason is present', () => {
+    const task = makeTask({
+      status: 'COMPLETED',
+      pr_url: 'https://github.com/owner/repo/pull/123',
+      context: { _non_merge_unblock_reason: 'change_landed_elsewhere' },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText('Closed')).toBeInTheDocument();
+    expect(screen.getByTitle('Completed without merge: change_landed_elsewhere')).toBeInTheDocument();
+    expect(screen.queryByText('Verified')).toBeNull();
+  });
+
+  it('prioritizes unverified_merge_reason over closed signals', () => {
+    const task = makeTask({
+      status: 'COMPLETED',
+      pr_url: 'https://github.com/owner/repo/pull/123',
+      unverified_merge_reason: 'no_ci_gate_skip_ratio',
+      context: { landed_on_integration: false },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText('Unverified')).toBeInTheDocument();
+    expect(screen.queryByText('Closed')).toBeNull();
+  });
+
+  it('does not show badge for COMPLETED task without pr_url', () => {
+    const task = makeTask({
+      status: 'COMPLETED',
+      pr_url: undefined,
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.queryByText('Verified')).toBeNull();
+    expect(screen.queryByText('Closed')).toBeNull();
+  });
+});
+
 describe('TaskCard evaluation verdict pill', () => {
   beforeEach(() => {
     vi.clearAllMocks();

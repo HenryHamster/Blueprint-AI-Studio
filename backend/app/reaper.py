@@ -893,6 +893,7 @@ from app.reaper_sweeps import (  # noqa: E402
     sweep_unblock_blocked_tasks,
     sweep_activate_staged_directions,
     sweep_stale_staged_directions,
+    sweep_merge_gate_verification_degradation,
     sweep_converge_linked_bug_messages,
     sweep_converge_duplicate_foundations,
     sweep_resolve_open_owned_bug_messages,
@@ -3832,6 +3833,21 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Stale-staged-direction sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Fleet merge-gate verification degradation alerting — surface
+                # systemic claim-verification erosion (PRs landing UNVERIFIED at
+                # scale) proactively instead of only on the dashboard. Alerting
+                # only — never influences a merge decision.
+                _mark_reaper_progress()
+                try:
+                    await sweep_merge_gate_verification_degradation(session)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Merge-gate degradation sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

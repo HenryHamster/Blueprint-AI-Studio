@@ -9888,3 +9888,104 @@ async def test_open_owned_one_bad_row_does_not_abort_batch(reaper_db):
     await reaper_db.refresh(good)
     assert bad.status == "open"
     assert good.status == "resolved"
+
+
+# ── sweep_merge_gate_verification_degradation (fleet-wide alert) ──────────────
+
+
+async def _make_gate_project(db, *, outcomes):
+    """Persist a project carrying merge_gate_runtime.recent_outcomes."""
+    project = Project(
+        name="gate-unit",
+        user_id="user1",
+        merge_gate_runtime={"recent_outcomes": outcomes},
+    )
+    db.add(project)
+    await db.commit()
+    await db.refresh(project)
+    return project
+
+
+def _outcome(verified, reason=None):
+    return {"at": _utcnow().isoformat(), "verified": verified, "reason": reason}
+
+
+@pytest.mark.asyncio
+async def test_merge_gate_degradation_sweep_alerts_when_rate_collapses(
+    reaper_db, mocker
+):
+    mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    # 3 degraded projects, 12 recent merges, only 3 verified -> rate 0.25 < 0.5.
+    projects = []
+    for _ in range(3):
+        p = await _make_gate_project(
+            reaper_db,
+            outcomes=[
+                _outcome(True),
+                _outcome(False, "verify_setup_failed"),
+                _outcome(False, "verify_setup_failed"),
+                _outcome(False, "verify_setup_failed"),
+            ],
+        )
+        projects.append(p)
+
+    created = await _rs.sweep_merge_gate_verification_degradation(reaper_db)
+    assert created == 3
+
+    from app.alert_dispatch import _MERGE_GATE_DEGRADATION_ALERT_TITLE
+
+    alerts = (
+        (
+            await reaper_db.execute(
+                _select(Alert).where(
+                    Alert.title == _MERGE_GATE_DEGRADATION_ALERT_TITLE
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 3
+    # Dominant reason is a degraded-environment failure -> ERROR severity.
+    assert all(a.severity == AlertSeverity.ERROR for a in alerts)
+    assert all("could not be run" in a.message for a in alerts)
+
+    # Second sweep dedups on the stable title — no new alerts.
+    again = await _rs.sweep_merge_gate_verification_degradation(reaper_db)
+    assert again == 0
+
+
+@pytest.mark.asyncio
+async def test_merge_gate_degradation_sweep_silent_when_healthy(reaper_db, mocker):
+    mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    # Healthy fleet: ample sample, high verification rate, no degraded projects.
+    for _ in range(3):
+        await _make_gate_project(
+            reaper_db,
+            outcomes=[_outcome(True), _outcome(True), _outcome(True), _outcome(True)],
+        )
+
+    created = await _rs.sweep_merge_gate_verification_degradation(reaper_db)
+    assert created == 0
+
+
+@pytest.mark.asyncio
+async def test_merge_gate_degradation_sweep_ignores_tiny_sample(reaper_db, mocker):
+    mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    # Rate is terrible (0%) but only 2 samples — below min_samples, so no alert.
+    await _make_gate_project(
+        reaper_db,
+        outcomes=[
+            _outcome(False, "verify_setup_failed"),
+            _outcome(False, "verify_setup_failed"),
+        ],
+    )
+
+    created = await _rs.sweep_merge_gate_verification_degradation(reaper_db)
+    assert created == 0

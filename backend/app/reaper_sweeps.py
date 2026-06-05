@@ -1755,6 +1755,81 @@ async def sweep_stale_staged_directions(session) -> int:
     return total_alerts
 
 
+async def sweep_merge_gate_verification_degradation(session) -> int:
+    """Alert fleet-wide when the no-CI merge-gate verification rate degrades.
+
+    Computes the fleet's recent-window merge-gate health
+    (:func:`digest_metrics.compute_merge_gate_fleet_health`) and, when the
+    verification rate has collapsed and/or too many projects are degraded over a
+    meaningful sample, broadcasts a deduplicated operator alert. A systemically
+    broken gate merges 'done' PRs UNVERIFIED at scale while each project looks
+    individually unremarkable; today an operator only catches that by chance on
+    the dashboard. This raises the proactive alert every other fleet-level signal
+    already has. Alerting only — it never influences a merge decision.
+
+    Trigger (over the recent window, gated on a minimum sample so a single
+    fall-open never fires): verification rate below ``merge_gate_degradation_min_rate``
+    OR at least ``merge_gate_degradation_min_degraded_projects`` projects degraded.
+    Severity escalates to ERROR when the dominant fall-open reason is a degraded
+    environment/setup failure (reusing ``_severity_for_unverified_reason``), else
+    WARNING. Returns the number of NEW alerts created across the fleet.
+    """
+    from app.alert_dispatch import (
+        _maybe_create_merge_gate_degradation_alerts,
+        _severity_for_unverified_reason,
+    )
+    from app.digest_metrics import compute_merge_gate_fleet_health
+    from app.models import AlertSeverity
+    from app.shared_state import runtime_config
+
+    window_days = int(runtime_config.get("merge_gate_degradation_window_days", 7))
+    min_samples = int(runtime_config.get("merge_gate_degradation_min_samples", 10))
+    min_rate = float(runtime_config.get("merge_gate_degradation_min_rate", 0.5))
+    min_degraded = int(
+        runtime_config.get("merge_gate_degradation_min_degraded_projects", 3)
+    )
+
+    window_start = _utcnow() - timedelta(days=window_days)
+    health = await compute_merge_gate_fleet_health(session, window_start=window_start)
+
+    total = health["verified_count"] + health["fell_open_count"]
+    if total < min_samples:
+        return 0
+    rate = health["verification_rate"]
+    degraded = health["degraded_project_count"]
+    rate_is_low = rate is not None and rate < min_rate
+    too_many_degraded = degraded >= min_degraded
+    if not (rate_is_low or too_many_degraded):
+        return 0
+
+    reason = health["most_common_reason"]
+    severity = (
+        _severity_for_unverified_reason(reason) if reason else AlertSeverity.WARNING
+    )
+    created = await _maybe_create_merge_gate_degradation_alerts(
+        session,
+        verification_rate=rate,
+        verified_count=health["verified_count"],
+        fell_open_count=health["fell_open_count"],
+        degraded_project_count=degraded,
+        project_count=health["project_count"],
+        most_common_reason=reason,
+        severity=severity,
+    )
+    if created:
+        await session.commit()
+        logger.info(
+            "[REAPER] raised fleet merge-gate degradation alert on %d project(s) "
+            "(rate=%s, degraded=%d/%d, reason=%s)",
+            created,
+            rate,
+            degraded,
+            health["project_count"],
+            reason,
+        )
+    return created
+
+
 # ── Step 15: linked bug-class message convergence / resurfacing sweep ────────
 #
 # A BUG_REPORT or BLOCKER message placed in 'linked' state has a durable forward

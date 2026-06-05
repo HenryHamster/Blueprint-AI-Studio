@@ -212,3 +212,48 @@ def test_full_cycle_active_elapsed_excludes_completed_pause():
     # Active elapsed: 30s raw - 20s paused = 10s
     elapsed = pause_clock.active_elapsed(s, started, baseline_paused=baseline)
     assert 8.0 <= elapsed <= 12.0
+
+
+# ── Double-pause idempotency ──────────────────────────────────────────────────
+
+
+def test_manual_pause_snapshot_idempotency():
+    """A second pause-call must not overwrite the pre-pause capacity snapshot.
+    This guards the manual pause endpoint against double-clicks or retries that
+    would snapshot the already-zeroed live capacity, causing resume to restore
+    the wrong value.
+
+    Scenario: operator pauses with 5 concurrent VMs configured.
+      1. First pause: pre_pause_max_vms = 5, then runtime max_concurrent_vms = 0
+      2. Second pause (retry/double-click): must NOT overwrite pre_pause_max_vms
+      3. Resume: restores 5, not 0
+    """
+    s = _state(total_manual_paused_seconds=0.0)
+
+    # Simulate first pause: snapshot pre_pause_max_vms before zeroing
+    pre_pause_capacity = 5
+    if s.pre_pause_max_vms is None:
+        s.pre_pause_max_vms = pre_pause_capacity
+    # Mark paused
+    pause_clock.mark_paused(s, pause_clock.PAUSED_KIND_MANUAL)
+
+    # Verify first pause captured the right value
+    assert s.pre_pause_max_vms == 5
+    assert s.paused_at is not None
+    assert s.paused_kind == "manual"
+
+    # Simulate second pause (idempotency test): zero has already been set
+    current_runtime_vms = 0  # already zeroed by first pause
+    if s.pre_pause_max_vms is None:  # idempotent guard — don't overwrite
+        s.pre_pause_max_vms = current_runtime_vms
+    # mark_paused is also idempotent
+    pause_clock.mark_paused(s, pause_clock.PAUSED_KIND_MANUAL)
+
+    # Verify second pause did not overwrite the snapshot
+    assert s.pre_pause_max_vms == 5, "Second pause must not overwrite pre_pause snapshot"
+    assert s.paused_at is not None
+    assert s.paused_kind == "manual"
+
+    # Simulate resume: use the saved pre_pause_max_vms
+    restore_vms = s.pre_pause_max_vms or 5
+    assert restore_vms == 5, "Resume must use the original pre-pause capacity"

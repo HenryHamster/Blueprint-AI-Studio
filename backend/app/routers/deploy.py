@@ -44,7 +44,9 @@ async def pause_pipeline(
         state.status = DeploymentStatus.PAUSED
         state.pause_reason = "Manual pause via admin"
         pause_clock.mark_paused(state, pause_clock.PAUSED_KIND_MANUAL)
-        state.pre_pause_max_vms = runtime_config["max_concurrent_vms"]
+        # Idempotent: only snapshot pre-pause capacity if not already paused
+        if state.pre_pause_max_vms is None:
+            state.pre_pause_max_vms = runtime_config["max_concurrent_vms"]
         state.runtime_max_concurrent_vms = runtime_config["max_concurrent_vms"]
         session.add(state)
         await session.commit()

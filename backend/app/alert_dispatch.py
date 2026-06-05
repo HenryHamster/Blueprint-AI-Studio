@@ -388,6 +388,111 @@ def _severity_for_unverified_reason(reason: str) -> AlertSeverity:
     return _UNVERIFIED_REASON_SEVERITY.get(reason, AlertSeverity.WARNING)
 
 
+# Stable title for the fleet-wide merge-gate degradation alert. Kept CONSTANT
+# (the drifting rate/reason live in the message) so a degradation that persists
+# across reaper ticks dedups to exactly ONE alert per project.
+_MERGE_GATE_DEGRADATION_ALERT_TITLE = (
+    "Fleet merge-gate verification degraded — PRs landing UNVERIFIED"
+)
+
+
+async def _maybe_create_merge_gate_degradation_alerts(
+    session: AsyncSession,
+    *,
+    verification_rate: "float | None",
+    verified_count: int,
+    fell_open_count: int,
+    degraded_project_count: int,
+    project_count: int,
+    most_common_reason: "str | None",
+    severity: AlertSeverity = AlertSeverity.WARNING,
+) -> int:
+    """Broadcast a deduplicated fleet-wide alert when the no-CI merge gate's
+    verification rate has degraded — i.e. 'done' PRs are increasingly landing
+    without their tests actually being exercised.
+
+    Every other fleet-level health signal (rollbacks, halts, warm-pool payoff,
+    stale staged directions, single unverified merges) raises a proactive alert;
+    this closes that gap for systemic claim-verification erosion. Computed from
+    the already-aggregated :func:`digest_metrics.compute_merge_gate_fleet_health`.
+
+    Mirrors the fleet-broadcast convention of :func:`_create_rollback_alerts`:
+    creates one alert per project (so it surfaces in every operator's Alerts
+    banner) and deduplicates on a STABLE title so a degradation that persists
+    across reaper ticks raises exactly ONE alert per project. The drifting
+    numbers (rate, degraded-project count, dominant fall-open reason) live in the
+    MESSAGE so a moving metric never defeats dedup. Caller owns the commit.
+
+    Returns the number of NEW alerts created across the fleet.
+    """
+    reason_label = (
+        _UNVERIFIED_REASON_LABELS.get(most_common_reason, most_common_reason)
+        if most_common_reason
+        else "no dominant reason recorded"
+    )
+    rate_pct = (
+        f"{verification_rate * 100:.0f}%" if verification_rate is not None else "n/a"
+    )
+    title = _MERGE_GATE_DEGRADATION_ALERT_TITLE
+    msg = (
+        f"Fleet-wide no-CI merge-gate verification has degraded: {verified_count} "
+        f"of {verified_count + fell_open_count} recent merges actually ran tests "
+        f"({rate_pct} verified), and {degraded_project_count} of {project_count} "
+        f"projects are degraded. Dominant fall-open reason: {reason_label}. "
+        f"'Done' PRs are increasingly merging without their claims being exercised."
+    )[:1000]
+
+    global_limit = _runtime_config.get("project_broadcast_limit", 1000)
+    rows = (
+        await session.execute(
+            select(Project.id, Project.design_doc).limit(global_limit)
+        )
+    ).all()
+    project_ids = [pid for pid, doc in rows if _get_broadcast_limit(doc) > 0]
+    if len(rows) == global_limit:
+        logger.warning(
+            "_maybe_create_merge_gate_degradation_alerts: project_ids capped at %d",
+            global_limit,
+        )
+    existing_rows = (
+        (
+            await session.execute(
+                select(Alert.project_id).where(
+                    Alert.project_id.in_(project_ids),
+                    Alert.task_id.is_(None),
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == title,
+                )
+            )
+        ).all()
+        if project_ids
+        else []
+    )
+    projects_with_alert = {row[0] for row in existing_rows}
+    created = 0
+    for pid in project_ids:
+        if pid in projects_with_alert:
+            continue
+        alert = Alert(
+            project_id=pid,
+            severity=severity,
+            title=title,
+            message=msg,
+        )
+        session.add(alert)
+        created += 1
+        await broadcast_to_project(
+            str(pid),
+            "alert_created",
+            {
+                "alert_id": str(alert.id),
+                "severity": severity.value,
+                "title": alert.title,
+            },
+        )
+    return created
+
+
 async def _maybe_create_unverified_merge_alert(
     task: "Task",
     session: AsyncSession,
