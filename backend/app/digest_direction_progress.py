@@ -12,6 +12,7 @@ from typing import Any, Dict, List
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.direction_outcomes import verified_merged_count
 from app.models import Project, Task, TaskStatus
 from app.time_utils import _to_naive_utc, _coerce_naive_utc
 
@@ -110,6 +111,10 @@ async def compute_direction_progress(
 
         # Single pass over research_history: aggregate PR/scope/product/type/taxonomy
         prs_merged = 0
+        # Verification-aware merge count (verified + benign-unverified, excluding
+        # degraded-unverified) — drives conversion_rate so a merge that never
+        # actually verified does not inflate the operator-read rate.
+        verified_prs_merged = 0
         autonomous_prs_merged = 0
         assisted_prs_merged = 0
         operator_action_count = 0
@@ -148,6 +153,7 @@ async def compute_direction_progress(
                 continue
             if entry_ts >= window_start:
                 prs_merged += entry.get("prs_merged") or 0
+                verified_prs_merged += verified_merged_count(entry)
                 # Legacy fallback: pre-attribution entries lack autonomous_prs_merged.
                 autonomous_prs_merged += (
                     entry.get("autonomous_prs_merged", entry.get("prs_merged")) or 0
@@ -384,6 +390,12 @@ async def compute_direction_progress(
         lifetime_prs_merged = sum(h.get("prs_merged", 0) for h in _history_all) + (
             _agg.get("total_prs_merged") or 0
         )
+        # Verification-aware lifetime merge count for lifetime_conversion_rate:
+        # window entries via verified_merged_count, aggregate via the folded
+        # total_verified_prs_merged (legacy fallback to total_prs_merged).
+        lifetime_verified_prs_merged = sum(
+            verified_merged_count(h) for h in _history_all
+        ) + (_agg.get("total_verified_prs_merged", _agg.get("total_prs_merged")) or 0)
         lifetime_prs_rejected = sum(h.get("prs_rejected", 0) for h in _history_all) + (
             _agg.get("total_prs_rejected") or 0
         )
@@ -394,7 +406,7 @@ async def compute_direction_progress(
             _agg.get("total_tasks_failed") or 0
         )
         lifetime_conversion_rate = (
-            round(lifetime_prs_merged / lifetime_tasks_created, 3)
+            round(lifetime_verified_prs_merged / lifetime_tasks_created, 3)
             if lifetime_tasks_created > 0
             else None
         )
@@ -418,10 +430,12 @@ async def compute_direction_progress(
             if merge_time_values
             else None
         )
-        # Conversion rate: prs_merged / PR-eligible tasks (exclude non-PR task types)
+        # Conversion rate: verified merges / PR-eligible tasks (exclude non-PR
+        # task types). Verification-aware so degraded-unverified merges don't
+        # inflate it, matching the per-task outcome layer.
         pr_eligible_tasks = findings_tasks_created - pr_ineligible_tasks_created
         conversion_rate = (
-            round(prs_merged / pr_eligible_tasks, 3)
+            round(verified_prs_merged / pr_eligible_tasks, 3)
             if pr_eligible_tasks > 0
             else None
         )

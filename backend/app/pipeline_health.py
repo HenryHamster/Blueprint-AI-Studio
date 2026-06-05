@@ -21,6 +21,7 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.direction_outcomes import verified_merged_count
 from app.landed_signal import is_merged_completion, merge_verification_status
 from app.models import (
     Task,
@@ -398,6 +399,7 @@ async def compute_pipeline_health_summary(
                 continue
 
             prs_merged = 0
+            verified_merged = 0
             prs_rejected = 0
             tasks_created_total = 0
             sd_totals: Dict[str, int] = {}
@@ -408,6 +410,7 @@ async def compute_pipeline_health_summary(
                     )
                     if entry_ts >= window_start:
                         prs_merged += entry.get("prs_merged") or 0
+                        verified_merged += verified_merged_count(entry)
                         prs_rejected += entry.get("prs_rejected") or 0
                         tasks_created_total += entry.get("tasks_created") or 0
                         for k, v in (entry.get("stage_dropout") or {}).items():
@@ -415,8 +418,10 @@ async def compute_pipeline_health_summary(
                 except (ValueError, TypeError):
                     pass
 
+            # Conversion is verification-aware: degraded-unverified merges are
+            # excluded (verified_merged) to agree with the per-task layer.
             dir_conversion_rate = (
-                round(prs_merged / tasks_created_total, 3)
+                round(verified_merged / tasks_created_total, 3)
                 if tasks_created_total > 0
                 else None
             )
@@ -455,7 +460,7 @@ async def compute_pipeline_health_summary(
         if _safe_ts_in_window(entry.get("timestamp"), window_start)
     )
     _pipeline_total_merged = sum(
-        entry.get("prs_merged") or 0
+        verified_merged_count(entry)
         for d in (project.directions or [] if project else [])
         for entry in (d.get("research_history") or [])
         if _safe_ts_in_window(entry.get("timestamp"), window_start)

@@ -2021,6 +2021,64 @@ async def test_conversion_rate_excludes_non_pr_task_types(
 
 
 @pytest.mark.asyncio
+async def test_conversion_rate_excludes_degraded_unverified_merges(
+    client: AsyncClient, db_session
+):
+    """Conversion (window + lifetime) excludes degraded-unverified merges.
+
+    3 PRs merged from 4 created, but only 2 verified (1 degraded-unverified).
+    conversion_rate must be 2/4=0.5, not 3/4=0.75 — matching the per-task layer.
+    The raw prs_merged count stays 3 (back-compat).
+    """
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-degraded",
+                "text": "Direction with a degraded-unverified merge",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": (
+                            datetime.now(timezone.utc) - timedelta(hours=5)
+                        ).isoformat(),
+                        "prs_merged": 3,
+                        "verified_prs_merged": 2,
+                        "tasks_created": 4,
+                    }
+                ],
+                "history_aggregate": {
+                    "total_cycles": 1,
+                    "total_prs_merged": 3,
+                    "total_verified_prs_merged": 2,
+                    "total_tasks_created": 4,
+                },
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-degraded"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    dp = response.json()["direction_progress"][0]
+    assert dp["prs_merged"] == 3
+    assert dp["conversion_rate"] == 0.5  # 2 verified / 4 created
+    assert dp["lifetime_conversion_rate"] == 0.5  # window + aggregate verified
+
+
+@pytest.mark.asyncio
 async def test_retirement_critiques_returns_critiques(client: AsyncClient, db_session):
     """Critiques stored in StrategicCycle.cycle_metadata are returned, newest cycle first."""
     from app.models import StrategicCycle

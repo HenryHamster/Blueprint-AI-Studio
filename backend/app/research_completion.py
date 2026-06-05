@@ -206,6 +206,38 @@ def _reconcile_verification_basis(
     return True
 
 
+def _staleness_provenance_warning(
+    finding: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Return a provenance warning when deferred findings need HEAD revalidation."""
+    if finding.get("needs_revalidation") is not True:
+        return None
+    if (
+        finding.get("needs_revalidation_reason")
+        == "cited_files_changed_since_generation"
+    ):
+        return {"cited_files_changed_since_generation": True}
+    return None
+
+
+def _merge_provenance_warnings(
+    finding: Dict[str, Any],
+    *warnings: Optional[Dict[str, Any]],
+) -> None:
+    """Merge provenance warnings onto a finding, preserving existing signals."""
+    merged: Dict[str, Any] = {}
+    existing = finding.get("_provenance_warnings")
+    if isinstance(existing, dict):
+        merged.update(existing)
+    for warning in warnings:
+        if warning:
+            merged.update(warning)
+    if merged:
+        finding["_provenance_warnings"] = merged
+    else:
+        finding.pop("_provenance_warnings", None)
+
+
 def _trim_finding_for_memo(finding: Dict[str, Any]) -> Dict[str, Any]:
     """Trim a dropped finding to a bounded dict for embedding in a MemoPayload.
 
@@ -1120,12 +1152,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         )
         if _ungrounded is not None:
             _f["_ungrounded_claim_count"] = _ungrounded["ungrounded_claim_count"]
-        # Merge file-citation and symbol grounding warnings into one provenance
-        # blob propagated to child task context.
-        if _broken_provenance and _ungrounded:
-            _f["_provenance_warnings"] = {**_broken_provenance, **_ungrounded}
-        elif _broken_provenance or _ungrounded:
-            _f["_provenance_warnings"] = _broken_provenance or _ungrounded
+        # Merge file-citation, symbol grounding, and any already-known staleness
+        # warnings into the provenance blob propagated to child task context.
+        _merge_provenance_warnings(
+            _f,
+            _broken_provenance,
+            _ungrounded,
+            _staleness_provenance_warning(_f),
+        )
         if _broken_provenance or _ungrounded:
             _broken_citation_findings += 1
         # Reconcile the self-reported verification_basis against the validation
@@ -1289,6 +1323,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if _changed is True:
                 f["needs_revalidation"] = True
                 f["needs_revalidation_reason"] = "cited_files_changed_since_generation"
+            _merge_provenance_warnings(f, _staleness_provenance_warning(f))
         if prior_actionable:
             logger.info(
                 f"[RESEARCH] Prepending {len(prior_actionable)} deferred finding(s) from previous cycle "

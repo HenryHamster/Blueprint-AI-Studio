@@ -1392,6 +1392,51 @@ class TestProvenanceWarningsAttachment:
     """End-to-end: validate_source_refs + summarize_broken_refs flow used by
     research_completion to attach provenance to findings."""
 
+    async def _spawn_deferred_child(self, db_session, mocker, *, direction_id, deferred):
+        from test_autonomous_research import _make_finding, _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(
+            db_session, direction_id
+        )
+        task.context = {
+            **(task.context or {}),
+            "prior_deferred_findings": [deferred],
+        }
+        db_session.add(task)
+        await db_session.commit()
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[
+                _make_finding(title="Fresh sentinel", direction_id=direction["id"])
+            ],
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+        for path, value in (
+            ("app.research_completion.resolve_branch_verification_context", {}),
+            ("app.research_completion.resolve_head_commit", None),
+            ("app.research_completion.cited_paths_changed_since", True),
+            ("app.research_completion._summarize_ungrounded_claims_grounded", None),
+        ):
+            mocker.patch(path, new=AsyncMock(return_value=value))
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return next(c for c in children if c.title == deferred["title"])
+
     async def test_clean_finding_has_no_provenance_key(self, monkeypatch):
         from app import source_ref_validation as srv
 
@@ -1455,6 +1500,56 @@ class TestProvenanceWarningsAttachment:
         finding["_provenance_warnings"] = prov
         assert finding["_provenance_warnings"]["broken_source_ref_count"] == 5
         assert set(finding["_provenance_warnings"]["broken_refs"]) == broken_paths
+
+    @_pytest.mark.asyncio
+    async def test_prior_deferred_finding_with_changed_cited_files_gets_staleness_signal(
+        self, db_session, mocker
+    ):
+        """A prior deferred finding surfaces HEAD-staleness through the real recovery flow."""
+        from test_autonomous_research import _make_finding
+
+        deferred = _make_finding(
+            title="Deferred finding with changed cites", direction_id="d-prov-stale01"
+        )
+        deferred["generated_head_sha"] = "deadbeef"
+        deferred["sources"] = [{"type": "file", "ref": "backend/app/foo.py"}]
+        deferred_child = await self._spawn_deferred_child(
+            db_session,
+            mocker,
+            direction_id="d-prov-stale01",
+            deferred=deferred,
+        )
+        assert (deferred_child.context or {}).get("_provenance_warnings") == {
+            "cited_files_changed_since_generation": True
+        }
+
+    @_pytest.mark.asyncio
+    async def test_prior_deferred_finding_merges_staleness_with_existing_broken_refs(
+        self, db_session, mocker
+    ):
+        """Deferred recovery preserves earlier provenance warnings and adds staleness."""
+        from test_autonomous_research import _make_finding
+
+        deferred = _make_finding(
+            title="Deferred finding with prior warnings", direction_id="d-prov-stale02"
+        )
+        deferred["generated_head_sha"] = "deadbeef"
+        deferred["sources"] = [{"type": "file", "ref": "backend/app/missing.py"}]
+        deferred["_provenance_warnings"] = {
+            "broken_source_ref_count": 1,
+            "broken_refs": ["backend/app/missing.py"],
+        }
+        deferred_child = await self._spawn_deferred_child(
+            db_session,
+            mocker,
+            direction_id="d-prov-stale02",
+            deferred=deferred,
+        )
+        assert (deferred_child.context or {}).get("_provenance_warnings") == {
+            "broken_source_ref_count": 1,
+            "broken_refs": ["backend/app/missing.py"],
+            "cited_files_changed_since_generation": True,
+        }
 
 
 class TestQueryFindingsIndex:
