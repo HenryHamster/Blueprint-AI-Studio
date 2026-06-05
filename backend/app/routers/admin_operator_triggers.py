@@ -91,10 +91,44 @@ async def trigger_self_audit(
     """Enqueue a self_audit task for this project.
 
     Members and above can trigger a maturity audit. Returns the new task_id.
+    Rejects with 409 if a self_audit is already in flight for this project.
     """
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
+
+    # In-flight guard: never spawn a second self_audit when one is already running.
+    # Two concurrent audits produce duplicate findings and waste VM budget.
+    active_audits = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                            TaskStatus.EVALUATING,
+                        ]
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for audit_task in active_audits:
+        audit_payload = audit_task.first_payload
+        if audit_payload.get("type") == "self_audit":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Self-audit is already in progress for this project "
+                    f"(task {str(audit_task.id)[:8]}, status {audit_task.status}). "
+                    f"Wait for it to complete before starting another."
+                ),
+            )
 
     payload_dict: dict = {
         "type": "self_audit",

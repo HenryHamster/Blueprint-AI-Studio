@@ -9775,6 +9775,131 @@ class TestTriggerRollup:
         assert "dual-head" in (task.latest_status_message or "").lower()
 
 
+class TestTriggerSelfAudit:
+    @pytest.mark.asyncio
+    async def test_self_audit_409_when_audit_in_flight(
+        self, client: AsyncClient, db_session
+    ):
+        """The self-audit trigger must refuse to spawn a second audit when one is
+        already in flight — two concurrent audits produce duplicate findings and
+        waste VM budget. Returns 409 with the existing task id."""
+        project = await _make_project(db_session)
+
+        # Create an in-flight self_audit task
+        in_flight = Task(
+            project_id=project.id,
+            title="Self audit",
+            payloads=[{"type": "self_audit", "base_branch": "main"}],
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(in_flight)
+        await db_session.commit()
+
+        # Attempt to trigger a second self_audit — should be rejected
+        resp = await client.post(f"/api/admin/projects/{project.id}/self-audit")
+        assert resp.status_code == 409, resp.text
+        assert "in progress" in resp.text.lower()
+        assert str(in_flight.id)[:8] in resp.text
+
+    @pytest.mark.asyncio
+    async def test_self_audit_rejects_queued_and_provisioning_states(
+        self, client: AsyncClient, db_session
+    ):
+        """Guard blocks QUEUED and PROVISIONING states as well, not just IN_PROGRESS."""
+        project = await _make_project(db_session)
+
+        # Test QUEUED
+        queued_audit = Task(
+            project_id=project.id,
+            title="Self audit",
+            payloads=[{"type": "self_audit", "base_branch": "main"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(queued_audit)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/self-audit")
+        assert resp.status_code == 409, resp.text
+
+        # Delete the queued audit
+        await db_session.delete(queued_audit)
+        await db_session.commit()
+
+        # Test PROVISIONING
+        provisioning_audit = Task(
+            project_id=project.id,
+            title="Self audit",
+            payloads=[{"type": "self_audit", "base_branch": "main"}],
+            status=TaskStatus.PROVISIONING,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(provisioning_audit)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/self-audit")
+        assert resp.status_code == 409, resp.text
+
+    @pytest.mark.asyncio
+    async def test_self_audit_allowed_after_terminal_state(
+        self, client: AsyncClient, db_session
+    ):
+        """After an audit reaches a terminal state (COMPLETED/FAILED), a new
+        trigger is allowed."""
+        project = await _make_project(db_session)
+
+        # Create a completed self_audit task
+        completed_audit = Task(
+            project_id=project.id,
+            title="Self audit",
+            payloads=[{"type": "self_audit", "base_branch": "main"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(completed_audit)
+        await db_session.commit()
+
+        # A new trigger should succeed
+        resp = await client.post(f"/api/admin/projects/{project.id}/self-audit")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert "task_id" in data
+
+    @pytest.mark.asyncio
+    async def test_self_audit_independent_per_project(
+        self, client: AsyncClient, db_session
+    ):
+        """In-flight guard is per-project; blocking a different project doesn't
+        prevent triggers on the current project."""
+        project1 = await _make_project(db_session, name="Project 1")
+        project2 = await _make_project(db_session, name="Project 2")
+
+        # Create an in-flight self_audit on project 1
+        in_flight = Task(
+            project_id=project1.id,
+            title="Self audit",
+            payloads=[{"type": "self_audit", "base_branch": "main"}],
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(in_flight)
+        await db_session.commit()
+
+        # Trigger on project 1 should fail
+        resp = await client.post(f"/api/admin/projects/{project1.id}/self-audit")
+        assert resp.status_code == 409, resp.text
+
+        # Trigger on project 2 should succeed
+        resp = await client.post(f"/api/admin/projects/{project2.id}/self-audit")
+        assert resp.status_code == 200, resp.text
+
+
 class TestGetProjectFindings:
     @pytest.mark.asyncio
     async def test_returns_empty_list_when_no_findings(
