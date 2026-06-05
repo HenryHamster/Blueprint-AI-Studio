@@ -6954,6 +6954,50 @@ class TestCutVersion:
         assert abandoned["abandoned_at"]
 
     @pytest.mark.asyncio
+    async def test_version_cut_idempotent_on_repeat_key(
+        self, client: AsyncClient, db_session
+    ):
+        """A repeat cut carrying the same idempotency key returns the original
+        cut's result and does NOT open a further version."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="stabilize")
+
+        first = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json={"reason": "pivot", "idempotency_key": "cut-abc"},
+        )
+        assert first.status_code == 200
+        first_data = first.json()
+        assert first_data["abandoned_version"]["version_number"] == 1
+        assert first_data["new_version"]["version_number"] == 2
+
+        # Replay with the same key: same result, no second cut.
+        second = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json={"reason": "pivot", "idempotency_key": "cut-abc"},
+        )
+        assert second.status_code == 200
+        second_data = second.json()
+        assert second_data["abandoned_version"]["version_number"] == 1
+        assert second_data["new_version"]["version_number"] == 2
+
+        # Only v2 is open; no v3 was opened by the retry.
+        rows = (
+            (
+                await db_session.execute(
+                    select(ReleaseVersion).where(
+                        ReleaseVersion.project_id == project.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert sorted(v.version_number for v in rows) == [1, 2]
+        open_rows = [v for v in rows if v.status == "open"]
+        assert [v.version_number for v in open_rows] == [2]
+
+    @pytest.mark.asyncio
     async def test_version_cut_no_open_version_returns_404(
         self, client: AsyncClient, db_session
     ):

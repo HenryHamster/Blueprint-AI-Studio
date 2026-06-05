@@ -1641,7 +1641,31 @@ describe('classifyTestExecution — all-skipped (no real tests executed)', () =>
     )).toBe('all_skipped');
   });
 
+  it('Mocha all-pending (passing == 0, pending == total) → all_skipped', () => {
+    expect(classifyTestExecution(
+      '0 passing\n5 pending\n0 failing',
+    )).toBe('all_skipped');
+  });
+
+  it('Mocha all-pending on one line (0 passing, 5 pending) → all_skipped', () => {
+    expect(classifyTestExecution(
+      '0 passing (5ms), 5 pending',
+    )).toBe('all_skipped');
+  });
+
   // ── Conservative invariant: any real pass/fail keeps it a real 'ran' ──
+  it('Mocha mixed pass-with-pending ("5 passing, 1500 pending") → ran', () => {
+    expect(classifyTestExecution(
+      '5 passing (120ms)\n1500 pending\n0 failing',
+    )).toBe('ran');
+  });
+
+  it('Mocha with failure ("2 passing, 3 pending, 1 failing") → ran', () => {
+    expect(classifyTestExecution(
+      '2 passing (45ms)\n3 pending\n1 failing',
+    )).toBe('ran');
+  });
+
   it('pytest mixed pass-with-skips ("5 passed, 1500 skipped") → ran', () => {
     expect(classifyTestExecution(
       '===== 5 passed, 1500 skipped in 4.20s =====',
@@ -1766,6 +1790,30 @@ describe('extractTestCoverage — pass/skip/total parsing', () => {
   });
 
   describe('aggregate families (single summary line)', () => {
+    it('Mocha passing/pending/failing → passed + pending + failing = total', () => {
+      expect(extractTestCoverage('5 passing (120ms)\n3 pending\n0 failing')).toEqual({
+        passed: 5, skipped: 3, total: 8,
+      });
+    });
+
+    it('Mocha all-pending (0 passing, 5 pending, 0 failing)', () => {
+      expect(extractTestCoverage('0 passing\n5 pending\n0 failing')).toEqual({
+        passed: 0, skipped: 5, total: 5,
+      });
+    });
+
+    it('Mocha with failures (3 passing, 2 pending, 1 failing)', () => {
+      expect(extractTestCoverage('3 passing\n2 pending\n1 failing')).toEqual({
+        passed: 3, skipped: 2, total: 6,
+      });
+    });
+
+    it('Mocha on single line "5 passing (125ms), 3 pending"', () => {
+      expect(extractTestCoverage('5 passing (125ms), 3 pending, 0 failing')).toEqual({
+        passed: 5, skipped: 3, total: 8,
+      });
+    });
+
     it('RSpec examples/pending → derives passed from total', () => {
       expect(extractTestCoverage('5 examples, 0 failures, 3 pending')).toEqual({
         passed: 2, skipped: 3, total: 5,
@@ -1843,6 +1891,18 @@ describe('extractTestCoverage — pass/skip/total parsing', () => {
 
     it('Go non-verbose pass (no counts) → null', () => {
       expect(extractTestCoverage('ok  example.com/pkg 0.5s')).toBeNull();
+    });
+
+    it('Mocha only passing (no pending token) → null', () => {
+      expect(extractTestCoverage('5 passing')).toBeNull();
+    });
+
+    it('Mocha only pending (no passing token) → null', () => {
+      expect(extractTestCoverage('3 pending')).toBeNull();
+    });
+
+    it('Mocha zero total (0 passing, 0 pending) → null', () => {
+      expect(extractTestCoverage('0 passing\n0 pending')).toBeNull();
     });
 
     it('inconsistent aggregate (skipped > total) → null', () => {

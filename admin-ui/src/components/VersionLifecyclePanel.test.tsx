@@ -427,7 +427,7 @@ describe('VersionLifecyclePanel', () => {
       });
 
       await waitFor(() => {
-        expect(cutVersionMock).toHaveBeenCalledWith('proj-1', undefined);
+        expect(cutVersionMock).toHaveBeenCalledWith('proj-1', undefined, expect.any(String));
       });
 
       expect(mockRefresh).toHaveBeenCalled();
@@ -459,7 +459,7 @@ describe('VersionLifecyclePanel', () => {
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
 
       await waitFor(() => {
-        expect(cutVersionMock).toHaveBeenCalledWith('proj-1', 'stalled in build');
+        expect(cutVersionMock).toHaveBeenCalledWith('proj-1', 'stalled in build', expect.any(String));
       });
     });
 
@@ -510,6 +510,44 @@ describe('VersionLifecyclePanel', () => {
       await waitFor(() => {
         expect(screen.getByText('Cut v5 → opened v6')).toBeInTheDocument();
       });
+    });
+
+    it('reuses the same idempotency key when a failed cut is retried', async () => {
+      const cutVersionMock = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('network blip'))
+        .mockResolvedValueOnce({
+          abandoned_version: { version_number: 1, status: 'abandoned' },
+          new_version: { version_number: 2, phase: 'build', goal: null, opened_at: '2026-01-02T00:00:00Z' },
+        });
+      vi.mocked(api.cutVersion).mockImplementation(cutVersionMock);
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+      mockConfirm.mockReturnValue(true);
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ version_number: 1 }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
+      fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
+      await waitFor(() => expect(cutVersionMock).toHaveBeenCalledTimes(1));
+
+      // Retry after the failure (the cut UI stays open on error).
+      fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
+      await waitFor(() => expect(cutVersionMock).toHaveBeenCalledTimes(2));
+
+      // Both calls carried the SAME generated key (a lost-response retry must
+      // not advance the version a second time on the backend).
+      const firstKey = cutVersionMock.mock.calls[0][2];
+      const secondKey = cutVersionMock.mock.calls[1][2];
+      expect(typeof firstKey).toBe('string');
+      expect(firstKey).toBeTruthy();
+      expect(secondKey).toBe(firstKey);
     });
   });
 

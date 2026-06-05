@@ -69,11 +69,73 @@ describe('detectProvisioningSteps', () => {
     expect(steps[0].declared).toBeUndefined();
   });
 
-  it('does NOT auto-provision when a lockfile or requirements.txt is present', () => {
+  it('does NOT auto-provision pyproject-only when a poetry.lock is present', () => {
+    // poetry.lock signals Poetry manages deps — pyproject-only pip install . must not fire.
+    // No requirements.txt either, so the requirements.txt branch also stays silent.
+    mockFs.existsSync.mockImplementation((p: string) =>
+      p === `${WORKSPACE}/pyproject.toml` || p === `${WORKSPACE}/poetry.lock`,
+    );
+    expect(detectProvisioningSteps(undefined)).toHaveLength(0);
+  });
+
+  // requirements.txt auto-provision: a Python repo without a pyproject.toml (or with one)
+  // but with a requirements.txt should provision before probes run.
+  it('auto-provisions a requirements.txt project with pip install -r requirements.txt', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/requirements.txt`);
+    const steps = detectProvisioningSteps(undefined);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].cmd).toBe('pip');
+    expect(steps[0].args).toEqual(['install', '-r', 'requirements.txt']);
+    expect(steps[0].cwd).toBe(WORKSPACE);
+    expect(steps[0].declared).toBeUndefined();
+  });
+
+  it('provisions via requirements-dev.txt when requirements.txt is absent', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/requirements-dev.txt`);
+    const steps = detectProvisioningSteps(undefined);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].cmd).toBe('pip');
+    expect(steps[0].args).toEqual(['install', '-r', 'requirements-dev.txt']);
+    expect(steps[0].cwd).toBe(WORKSPACE);
+  });
+
+  it('provisions via requirements/base.txt when top-level requirements files are absent', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/requirements/base.txt`);
+    const steps = detectProvisioningSteps(undefined);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].cmd).toBe('pip');
+    expect(steps[0].args).toEqual(['install', '-r', 'requirements/base.txt']);
+    expect(steps[0].cwd).toBe(WORKSPACE);
+  });
+
+  it('prefers requirements.txt over requirements-dev.txt (requirements file priority)', () => {
+    mockFs.existsSync.mockImplementation((p: string) =>
+      p === `${WORKSPACE}/requirements.txt` || p === `${WORKSPACE}/requirements-dev.txt`,
+    );
+    const steps = detectProvisioningSteps(undefined);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].args).toEqual(['install', '-r', 'requirements.txt']);
+  });
+
+  it('emits requirements.txt step (not pyproject pip install .) when both are present', () => {
+    // pyproject-only branch is suppressed because requirements.txt exists;
+    // requirements.txt branch fires instead.
     mockFs.existsSync.mockImplementation((p: string) =>
       p === `${WORKSPACE}/pyproject.toml` || p === `${WORKSPACE}/requirements.txt`,
     );
-    expect(detectProvisioningSteps(undefined)).toHaveLength(0);
+    const steps = detectProvisioningSteps(undefined);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].args).toEqual(['install', '-r', 'requirements.txt']);
+  });
+
+  it('declared install_cmd suppresses the requirements.txt fallback for the same dir', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/requirements.txt`);
+    const buildConfig: BuildConfig = {
+      directories: [{ path: '', type: 'python', install_cmd: 'pip install -r requirements.txt --no-deps' }],
+    };
+    const steps = detectProvisioningSteps(buildConfig);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].declared).toBe(true);
   });
 
   it('declared install_cmd suppresses the pyproject-only fallback for the same dir', () => {

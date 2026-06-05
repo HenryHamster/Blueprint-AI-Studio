@@ -682,6 +682,34 @@ export function detectProvisioningSteps(buildConfig?: BuildConfig): Provisioning
   // Repo root covers the auto-detected (no build_config) case.
   addPyprojectAuto(WORKSPACE, 'root');
 
+  // 2b) requirements.txt Python auto-provision. A project that declares its
+  //     dependencies via requirements.txt (and common variants: requirements-dev.txt,
+  //     requirements/base.txt) has no existing pre-provisioning path — the only
+  //     requirements.txt install in the codebase fires inside the per-runner test-suite
+  //     loop, which is never reached for the cheap goal-level probes or when the suite
+  //     is absent/thin. Without this, the documented-command probe runs unprovisioned,
+  //     hits an ImportError, and classifies as "could not run" — silently falling open.
+  //     First matching requirements file wins; a dir with a declared install_cmd is
+  //     skipped (operator's command wins); deduped by cwd like the other auto steps.
+  const REQ_FILES = ['requirements.txt', 'requirements-dev.txt', 'requirements/base.txt'];
+  const addRequirementsTxtAuto = (absDir: string, label: string): void => {
+    if (declaredCwds.has(absDir)) return;
+    for (const reqFile of REQ_FILES) {
+      if (exists(`${absDir}/${reqFile}`)) {
+        add({ cmd: 'pip', args: ['install', '-r', reqFile], cwd: absDir, label: `pip install -r ${reqFile} (${label})` });
+        return;
+      }
+    }
+  };
+  if (buildConfig?.directories) {
+    for (const dir of buildConfig.directories) {
+      if (dir.type !== 'python') continue;
+      addRequirementsTxtAuto(dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE, dir.path || 'root');
+    }
+  }
+  // Repo root covers the auto-detected (no build_config) case.
+  addRequirementsTxtAuto(WORKSPACE, 'root');
+
   // 3) Extra-ecosystem auto-provision (Ruby/Gradle/Maven/Elixir/PHP). The suite
   //    detector LAUNCHES these runners (detectExtraFamilyRunner) but their test
   //    commands (`bundle exec rake test`, `./gradlew test`, `mvn test`,
@@ -1474,6 +1502,18 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' | 'all
     /^--- PASS:/.test(line)                  // Go verbose per-test pass marker
   ));
   if (!hasRealFailureEvidence && !hasRealPassEvidence) {
+    // Mocha/Jasmine: "N passing, M pending" where N=0 and M>0 is all-skipped.
+    // Check this before standalone skip patterns since pending is the skip token.
+    // May be on the same line or separate lines.
+    {
+      const passingM = trimmedLines.find(line => /\b(\d+)\s+passing\b/i.test(line))?.match(/\b(\d+)\s+passing\b/i);
+      const pendingM = trimmedLines.find(line => /\b(\d+)\s+pending\b/i.test(line))?.match(/\b(\d+)\s+pending\b/i);
+      if (passingM && pendingM) {
+        const passing = Number(passingM[1]);
+        const pending = Number(pendingM[1]);
+        if (passing === 0 && pending > 0) return 'all_skipped';
+      }
+    }
     // Standalone skip tokens: the family reports any passing test as its OWN
     // "N passed" / "Passed: N" / "--- PASS:" token (already excluded above), so
     // a non-zero skip/deselect/ignore/filter count here is decisive.
@@ -1506,6 +1546,7 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' | 'all
       [/\bTotal:\s*(\d+)/i, /Skipped:\s*(\d+)/i],
       // PHPUnit: "OK, but incomplete, skipped, or risky tests!" → "Tests: 5, .., Skipped: 5"
       [/\bTests:\s*(\d+)/i, /Skipped:\s*(\d+)/i],
+      // NOTE: Mocha/Jasmine is handled separately above via the special "0 passing, N pending" check.
     ];
     // Compare the total and skip counts on the SAME line across all aggregate
     // families; `cmp` selects all-skip (===) vs has-passes (>).
@@ -1605,10 +1646,28 @@ export function extractTestCoverage(
     return 0;
   };
 
+  // ── Mocha/Jasmine special handling (passing + pending + failing = total) ────
+  // Mocha reports "N passing, M pending, K failing" where passing/pending/failing
+  // are the COUNTS of each category, not a total. So we need explicit addition.
+  // Tokens may be on the same line or separate lines.
+  {
+    const passingM = trimmedLines.find(line => /\b(\d+)\s+passing\b/i.test(line))?.match(/\b(\d+)\s+passing\b/i);
+    const pendingM = trimmedLines.find(line => /\b(\d+)\s+pending\b/i.test(line))?.match(/\b(\d+)\s+pending\b/i);
+    const failingM = trimmedLines.find(line => /\b(\d+)\s+failing\b/i.test(line))?.match(/\b(\d+)\s+failing\b/i);
+    if (passingM && pendingM) {
+      const passed = Number(passingM[1]);
+      const skipped = Number(pendingM[1]);
+      const failed = failingM ? Number(failingM[1]) : 0;
+      const total = passed + skipped + failed;
+      if (total > 0) return { passed, skipped, total };
+    }
+  }
+
   // ── Aggregate families (single summary line carrying a TOTAL) ──────────────
   // Each entry is [totalRe, skipRe]; mirrors AGGREGATE_FAMILIES in
   // classifyTestExecution. A family fires only on lines carrying BOTH tokens,
   // and counts are summed across all such lines (one per class/project).
+  // NOTE: Mocha/Jasmine is handled separately above via mochaMatch, not here.
   const AGGREGATE_FAMILIES: Array<[RegExp, RegExp]> = [
     [/\b(\d+)\s+examples?\b/i, /\b(\d+)\s+pending\b/i],            // Ruby/RSpec
     [/\b(\d+)\s+runs?\b/i, /\b(\d+)\s+skips\b/i],                  // Ruby/Minitest
@@ -1617,7 +1676,7 @@ export function extractTestCoverage(
     [/\bTotal:\s*(\d+)/i, /Skipped:\s*(\d+)/i],                    // .NET
     [/\bTests:\s*(\d+)/i, /Skipped:\s*(\d+)/i],                    // PHPUnit
   ];
-  const failPatterns = [/\b(?:Failures?|Failed):\s*(\d+)\b/i, /\b(\d+)\s+failures?\b/i];
+  const failPatterns = [/\b(?:Failures?|Failed):\s*(\d+)\b/i, /\b(\d+)\s+(?:failures?|failing)\b/i];
   const errPatterns = [/\bErrors?:\s*(\d+)\b/i, /\b(\d+)\s+errors?\b/i];
   const aggregateResults: Array<{ passed: number; skipped: number; total: number }> = [];
   for (const [totalRe, skipRe] of AGGREGATE_FAMILIES) {

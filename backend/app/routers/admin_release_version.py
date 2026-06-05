@@ -384,6 +384,11 @@ async def set_version_goal(
 
 class _AbandonVersionBody(BaseModel):
     reason: str | None = _Field(default=None, max_length=500)
+    # Client-generated idempotency key. When supplied, a repeat cut (double-click
+    # / lost-response retry) carrying the same key returns the original cut's
+    # result instead of abandoning the freshly-opened next version a second time,
+    # mirroring the message and direction composers.
+    idempotency_key: str | None = _Field(default=None, max_length=255)
 
 
 @router.post("/projects/{project_id}/version-cut")
@@ -414,6 +419,7 @@ async def cut_version(
             project_id,
             reason=payload.reason,
             operator_id=operator_id,
+            idempotency_key=payload.idempotency_key,
         )
     except _release_version.VersionCutBlockedByPromotion as exc:
         detail = (

@@ -1209,10 +1209,14 @@ export interface CutVersionResponse {
 export async function cutVersion(
   projectId: string,
   reason?: string,
+  idempotencyKey?: string,
 ): Promise<CutVersionResponse> {
   const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/version-cut`, {
     method: 'POST',
-    body: JSON.stringify({ reason: reason ?? '' }),
+    body: JSON.stringify({
+      reason: reason ?? '',
+      ...(idempotencyKey ? { idempotency_key: idempotencyKey } : {}),
+    }),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {

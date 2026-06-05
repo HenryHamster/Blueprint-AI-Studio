@@ -573,12 +573,60 @@ async def _resolve_integration_head_sha(
         return None
 
 
+async def _find_cut_by_idempotency_key(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    idempotency_key: str,
+) -> tuple[ReleaseVersion, ReleaseVersion | None] | None:
+    """Return the ``(abandoned, successor)`` pair from a prior cut using ``key``.
+
+    The operator idempotency key is stamped into the abandoned version's
+    ``last_qualification`` provenance, so a repeated cut carrying the same key
+    can be replayed: this finds the version already abandoned under ``key`` and
+    pairs it with the next-numbered version that cut opened. Returns ``None`` when
+    no prior cut used this key (the caller then performs a fresh cut).
+    """
+    prior = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "abandoned",
+                    ReleaseVersion.last_qualification["idempotency_key"].astext
+                    == idempotency_key,
+                )
+                .order_by(ReleaseVersion.version_number.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if prior is None:
+        return None
+    successor = (
+        (
+            await session.execute(
+                select(ReleaseVersion).where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.version_number == prior.version_number + 1,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    return prior, successor
+
+
 async def abandon_current_version(
     session: AsyncSession,
     project_id: uuid.UUID,
     *,
     reason: str | None = None,
     operator_id: str,
+    idempotency_key: str | None = None,
 ) -> tuple[ReleaseVersion | None, ReleaseVersion | None]:
     """Operator-initiated version cut: abandon the open version, open the next.
 
@@ -609,8 +657,32 @@ async def abandon_current_version(
     notification are all best-effort and isolated so a failure there can NEVER
     abort the abandon (mirroring the promotion path).
 
+    **Idempotency** — when ``idempotency_key`` is supplied, a repeat request
+    carrying the same key (a double-click or a lost-response retry that arrives
+    AFTER the first cut committed) is replayed: the prior cut's
+    ``(abandoned, next_version)`` pair is returned instead of cutting again, so
+    the version number is not advanced a second time. The key is recorded in the
+    abandoned row's ``last_qualification`` provenance — no schema change. When
+    no key is supplied, behavior is byte-identical to before.
+
     Caller is responsible for committing the session.
     """
+    # Idempotency replay: a repeat cut carrying a key already used for a prior
+    # cut returns that cut's result rather than abandoning the freshly-opened
+    # successor. Mirrors the pre-insert dedup in create_message.
+    idem_key = (idempotency_key or "").strip() or None
+    if idem_key:
+        replay = await _find_cut_by_idempotency_key(session, project_id, idem_key)
+        if replay is not None:
+            logger.info(
+                "[RELEASE_VERSION] abandon: idempotent replay for key=%s project=%s "
+                "(operator=%s) — returning prior cut, no second cut",
+                idem_key,
+                project_id,
+                operator_id,
+            )
+            return replay
+
     # Re-read + re-lock the open row.  with_for_update serializes concurrent
     # cuts; the status re-check below is the double-cut guard.
     locked = (
@@ -656,6 +728,8 @@ async def abandon_current_version(
     record["reason"] = truncated_reason
     record["operator"] = operator_id
     record["abandoned_at"] = now.isoformat()
+    if idem_key:
+        record["idempotency_key"] = idem_key
     locked.last_qualification = record
     flag_modified(locked, "last_qualification")
 

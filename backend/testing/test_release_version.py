@@ -1186,6 +1186,49 @@ async def test_abandon_without_reason_still_cuts(db_session):
 
 
 @pytest.mark.asyncio
+async def test_abandon_idempotent_replay_same_key_does_not_open_further_version(
+    db_session,
+):
+    """A repeated cut carrying the same idempotency key replays the original
+    cut's result (does NOT abandon the freshly-opened next version) so the
+    version number is not advanced a second time."""
+    project = await _make_project(db_session)
+    await _make_open_version_row(db_session, project, version_number=7)
+
+    abandoned, new_version = await rv.abandon_current_version(
+        db_session,
+        project.id,
+        reason="pivot",
+        operator_id="op@example.com",
+        idempotency_key="cut-key-1",
+    )
+    await db_session.commit()
+    assert abandoned.version_number == 7
+    assert new_version.version_number == 8
+    # The key is stamped into the abandoned row's provenance (no schema change).
+    assert abandoned.last_qualification["idempotency_key"] == "cut-key-1"
+
+    # Repeat with the SAME key: returns the original pair, no second cut.
+    replay_abandoned, replay_new = await rv.abandon_current_version(
+        db_session,
+        project.id,
+        reason="pivot",
+        operator_id="op@example.com",
+        idempotency_key="cut-key-1",
+    )
+    await db_session.commit()
+    assert replay_abandoned.version_number == 7
+    assert replay_new.version_number == 8
+
+    # v8 is still open and was NOT abandoned; no v9 was opened.
+    current = await rv.current_open_version(db_session, project.id)
+    assert current.version_number == 8
+    assert current.status == "open"
+    all_rows = await rv.recent_closed_versions(db_session, project.id, limit=10)
+    assert [v.version_number for v in all_rows] == [7]
+
+
+@pytest.mark.asyncio
 async def test_abandon_activates_staged_directions(db_session):
     """An abandon counts as the awaited version resolving: staged directions
     gated on the abandoned version are activated, not orphaned."""

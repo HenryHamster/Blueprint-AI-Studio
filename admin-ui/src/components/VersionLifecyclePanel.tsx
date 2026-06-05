@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
   cutVersion,
   fetchQualificationVerdicts,
@@ -20,6 +20,15 @@ import {
   type QualificationState,
 } from '../api';
 import { timeAgo } from '../utils/time';
+
+// Generate a client idempotency key for a version cut. Prefers the native UUID
+// generator and falls back to a timestamp+random token for older runtimes (and
+// JSDOM, where crypto.randomUUID may be absent). Mirrors MessagesPanel.
+function generateIdempotencyKey(): string {
+  const c = typeof globalThis !== 'undefined' ? globalThis.crypto : undefined;
+  if (c && typeof c.randomUUID === 'function') return c.randomUUID();
+  return `idem-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
 
 const QUAL_VERDICT_COLOR: Record<string, string> = {
   pending: 'text-blue-400',
@@ -315,6 +324,9 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   const [promotionEnabledOverride, setPromotionEnabledOverride] = useState<boolean | null>(null);
   const [cuttingVersion, setCuttingVersion] = useState<boolean>(false);
   const [cutReason, setCutReason] = useState<string>('');
+  // One idempotency key per confirmed cut: generated on confirm, reused across
+  // a lost-response retry, cleared on success so the next cut gets a fresh key.
+  const cutIdempotencyKeyRef = useRef<string | null>(null);
   useEffect(() => {
     if (!projectId) { setVerdicts([]); return; }
     fetchQualificationVerdicts(projectId, 10).then(r => setVerdicts(r.verdicts)).catch(() => {});
@@ -454,11 +466,15 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
     if (!window.confirm(msg)) return;
     setActionLoading('cut');
     setActionMsg(null);
+    if (!cutIdempotencyKeyRef.current) {
+      cutIdempotencyKeyRef.current = generateIdempotencyKey();
+    }
     try {
-      const result = await cutVersion(projectId, cutReason || undefined);
+      const result = await cutVersion(projectId, cutReason || undefined, cutIdempotencyKeyRef.current);
       setActionMsg(`Cut v${result.abandoned_version.version_number} → opened v${result.new_version.version_number}`);
       setCuttingVersion(false);
       setCutReason('');
+      cutIdempotencyKeyRef.current = null;
       onRefresh();
     } catch (error) {
       setActionMsg(error instanceof Error ? error.message : 'Request failed');
