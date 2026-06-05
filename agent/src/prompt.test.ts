@@ -4455,7 +4455,7 @@ describe('writeMessagesHelper', () => {
     expect(script).toContain('_post_strategic()');
     expect(script).toContain('if ! response=$(curl $CURL_OPTS -X POST "$API/api/agent/strategic"');
     expect(script).toContain("-w '\\n%{http_code}'");
-    expect(script).toContain('printf \'%s\\\\n\' "$body" >&2');
+    expect(script).toContain('printf \'%s\\n\' "$body" >&2');
     expect(script).toContain('[ERROR] messages $OP failed (HTTP $http_code)');
     expect(script).not.toContain('curl -f -sS');
 
