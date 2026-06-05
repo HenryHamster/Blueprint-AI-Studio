@@ -3,6 +3,7 @@ import { ChevronDown, ChevronUp, FolderKanban, GitBranch, Compass, UserPlus, Plu
 import type { Task } from './TaskCard';
 import { formatAbsolute, parseTimestamp } from '../utils/time';
 import { projectStatusBadge } from '../utils/projectStatus';
+import { humanizeUnverifiedReason } from '../utils/unverifiedReasonLabels';
 import { ProjectApprovalGateSection } from './ProjectApprovalGateSection';
 import { ComputeJobsPanel } from './ComputeJobsPanel';
 import { fetchApprovalGateConfig, updateApprovalGateConfig, deleteProject, resetProject, setProjectPaused, archiveProject, unarchiveProject, fetchArchivedProjects, type ApprovalGateConfigResponse } from '../api';
@@ -65,17 +66,13 @@ function getTaskCounts(tasks: Task[], projectId: string) {
   };
 }
 
-function humanizeMergeGateReason(reason: string): string {
-  return reason.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
-}
-
 function getMergeGateBadge(project: Project) {
   const verdict = project.merge_verification_verdict ?? { state: 'ci_checks' as const, test_commands: [] };
   const buildConfig = project.build_config ?? null;
   const runtime = project.merge_gate_runtime ?? null;
   const lastVerifiedAt = runtime?.executed_real_tests && runtime.last_run_at ? parseTimestamp(runtime.last_run_at) : null;
   const lastUnverifiedAt = runtime?.last_unverified_at ? parseTimestamp(runtime.last_unverified_at) : null;
-  const lastUnverifiedReason = runtime?.last_unverified_reason ? humanizeMergeGateReason(runtime.last_unverified_reason) : null;
+  const lastUnverifiedReason = runtime?.last_unverified_reason ? humanizeUnverifiedReason(runtime.last_unverified_reason) : null;
   const runtimeMismatch = verdict.state === 'tests_gated' && Boolean(lastUnverifiedAt && (!lastVerifiedAt || lastUnverifiedAt.getTime() > lastVerifiedAt.getTime()));
 
   if (

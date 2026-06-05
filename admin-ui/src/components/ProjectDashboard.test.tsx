@@ -244,7 +244,7 @@ describe('ProjectDashboard', () => {
             last_run_at: '2026-04-24T11:00:00Z',
             executed_real_tests: true,
             last_unverified_at: '2026-04-24T11:30:00Z',
-            last_unverified_reason: 'no_test_command_detected',
+            last_unverified_reason: 'no_detectable_test_command',
           },
         })]}
         tasks={[]}
@@ -256,7 +256,7 @@ describe('ProjectDashboard', () => {
     const badge = screen.getByText('Tests gated?');
     expect(badge).toHaveAttribute('data-runtime-state', 'unverified-fallback');
     expect(badge).toHaveAttribute('title', expect.stringContaining('UNVERIFIED'));
-    expect(badge).toHaveAttribute('title', expect.stringContaining('no test command detected'));
+    expect(badge).toHaveAttribute('title', expect.stringContaining('no runnable test command could be detected'));
   });
 
   it('counts paused projects from the paused flag in the summary strip', () => {

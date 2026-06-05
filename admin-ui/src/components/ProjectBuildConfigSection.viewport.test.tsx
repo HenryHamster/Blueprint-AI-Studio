@@ -187,7 +187,7 @@ describe('ProjectBuildConfigSection — viewport regression', () => {
               last_run_at: '2026-04-24T11:30:00Z',
               executed_real_tests: true,
               last_unverified_at: '2026-04-24T11:50:00Z',
-              last_unverified_reason: 'no_test_command_detected',
+              last_unverified_reason: 'no_detectable_test_command',
             }}
           />,
         );

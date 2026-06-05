@@ -367,6 +367,7 @@ _UNVERIFIED_REASON_SEVERITY = {
     "undetected_runtime": AlertSeverity.ERROR,
     "suite_all_skipped": AlertSeverity.ERROR,
     "probe_could_not_run": AlertSeverity.ERROR,
+    "probe_no_artifact": AlertSeverity.ERROR,
     "documented_command_could_not_run": AlertSeverity.ERROR,
     # WARNING (benign): no verification expected or only positive signals obtained
     "no_detectable_test_command": AlertSeverity.WARNING,

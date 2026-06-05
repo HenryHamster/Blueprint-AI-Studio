@@ -8404,3 +8404,58 @@ def test_unverified_reason_labels_frontend_backend_parity():
         "frontend reason-label map missing canonical keys: "
         f"{sorted(_UNVERIFIED_REASON_KEYS - frontend_keys)}"
     )
+
+
+# Canonical set of degraded no-CI reasons that escalate to ERROR severity.
+# These are environment/setup failures where verification was expected but
+# could not proceed due to infrastructure/tooling issues.
+_DEGRADED_REASON_KEYS = frozenset(
+    {
+        "verify_setup_failed",
+        "undetected_runtime",
+        "suite_all_skipped",
+        "probe_could_not_run",
+        "probe_no_artifact",
+        "documented_command_could_not_run",
+    }
+)
+
+
+def test_unverified_reason_severity_covers_all_keys():
+    """The severity map must classify every canonical emitted fall-open reason key.
+
+    Without this guard, a new reason key can be added with a label but no severity
+    entry and will silently default to WARNING, potentially downgrading degraded
+    environment/setup failures (which should be ERROR) to benign warnings. This test
+    ensures that is impossible: every canonical key must have an explicit severity.
+    """
+    from app.alert_dispatch import _UNVERIFIED_REASON_SEVERITY
+
+    missing = _UNVERIFIED_REASON_KEYS - set(_UNVERIFIED_REASON_SEVERITY)
+    assert not missing, (
+        "no-CI reason severity map (_UNVERIFIED_REASON_SEVERITY in "
+        "app/alert_dispatch.py) is missing severity entries for emitted reason keys: "
+        f"{sorted(missing)}. Every canonical reason must have an explicit severity "
+        "classification (ERROR for degraded environment/setup failures, WARNING for benign)."
+    )
+
+
+def test_unverified_reason_severity_degraded_are_error():
+    """Known degraded reasons (environment/setup failures) must be classified ERROR.
+
+    Degraded reasons represent cases where verification was expected but could not
+    proceed due to infrastructure/tooling issues (setup failures, suite collection
+    failures, build artifacts missing, etc.). These escalate to ERROR to alert the
+    operator loudly. This test ensures no degraded reason accidentally downgrades
+    to WARNING, either by missing from the map (caught by the prior test) or by
+    being mis-classified.
+    """
+    from app.alert_dispatch import _UNVERIFIED_REASON_SEVERITY, AlertSeverity
+
+    for reason in _DEGRADED_REASON_KEYS:
+        severity = _UNVERIFIED_REASON_SEVERITY.get(reason)
+        assert severity == AlertSeverity.ERROR, (
+            f"no-CI degraded reason '{reason}' must be classified ERROR in "
+            "_UNVERIFIED_REASON_SEVERITY (app/alert_dispatch.py), but got {severity}. "
+            "Degraded environment/setup failures must escalate loudly to ERROR, not WARNING."
+        )
