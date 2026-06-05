@@ -722,6 +722,82 @@ async def test_spawn_verify_tests_creates_task_and_bypasses_cap(db_session, mock
     assert task2.id == task.id
 
 
+@pytest.mark.asyncio
+async def test_idempotency_collision_with_raced_out_task_does_not_raise(db_session, mocker):
+    """Regression: when a same-key spawn collides on the ux_task_active_idempotency_key
+    partial unique index but the colliding task has raced OUT of the active-status
+    window (e.g. QUEUED -> BLOCKED on a file-conflict lock) so the active-only
+    recovery lookup misses it, _spawn_pipeline_task must fall back to a
+    status-agnostic lookup and return the existing task — NOT re-raise the
+    IntegrityError (which previously surfaced to operators as a bogus 'CI check
+    error' and wedged the whole review chain)."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    # Force the active-status lookup to always miss — simulates the colliding
+    # task leaving the active window between the failed INSERT and the re-query.
+    # This makes BOTH the pre-check (so we reach the INSERT) and the recovery
+    # active-only lookup (so we reach the broadened fallback) return None.
+    mocker.patch(
+        "app.review_pipeline._get_active_pipeline_task_by_key",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 222,
+                "branch": "feat/x",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 99, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    # First spawn: pre-check mocked to None, so the INSERT succeeds and a real
+    # task with the computed idempotency_key now exists in an active status.
+    task1, created1 = await _spawn_pipeline_task(
+        source_task, "verify_tests", db_session,
+        pr_number=222, branch="feat/x", base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert created1 is True
+    assert task1 is not None
+    assert task1.idempotency_key  # key was assigned, so a re-spawn will collide
+
+    # Second spawn: pre-check (mocked) misses → INSERT collides on the unique
+    # index → recovery active-only lookup (mocked) also misses → the broadened
+    # status-agnostic re-query must still find task1. Pre-fix this re-raised.
+    task2, created2 = await _spawn_pipeline_task(
+        source_task, "verify_tests", db_session,
+        pr_number=222, branch="feat/x", base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert created2 is False
+    assert task2 is not None
+    assert task2.id == task1.id
+
+
 # ── _spawn_pipeline_task: iteration cap ───────────────────────────────────────
 
 
