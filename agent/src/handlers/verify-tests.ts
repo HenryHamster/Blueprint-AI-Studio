@@ -5,11 +5,11 @@ import {
   persistAndPostStatus, resolveBaseBranch, execFileAsync,
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
-import { DEFAULT_CLONE_DEPTH, TEST_BASELINE_TIMEOUT } from '../constants.js';
+import { DEFAULT_CLONE_DEPTH, GENERIC_PROBE_TIMEOUT, DECLARED_BUILD_TIMEOUT, TEST_RUNNER_TIMEOUT } from '../constants.js';
 import { resolveBuildConfig } from '../build-config.js';
 import {
   detectTestRunners, detectAutoTestRunners, describeRunnerDirectory,
-  detectAcceptanceProbes, classifyProbeOutcome,
+  detectAcceptanceProbes, classifyProbeOutcome, detectProvisioningSteps,
   type BuildConfig, type TestRunner, type AcceptanceProbe,
 } from '../utils/test-runners.js';
 import { testFixLoop } from '../utils/test-fix-loop.js';
@@ -114,10 +114,10 @@ async function runVerifyLoop(
 }
 
 // ── Cheap acceptance probe (goal-level fall-open signal) ─────────────────────
-// Each probe runs under the bounded baseline timeout the suite-baseline run uses
-// so the gate stays cheap (seconds, not a full build pipeline). A small per-run
-// budget caps total probe processes.
-const ACCEPTANCE_PROBE_TIMEOUT = TEST_BASELINE_TIMEOUT;
+// Generic ecosystem probes (tsc, compileall, etc.) run under the cheap baseline
+// so the gate stays fast. Declared build commands get a larger budget to allow
+// realistic builds (bundling, compiling non-trivial binaries) to complete.
+// A small per-run budget caps total probe processes.
 const MAX_ACCEPTANCE_PROBES = 4;
 
 // Run the detected acceptance probe(s) for the cloned workspace and reduce them
@@ -139,8 +139,9 @@ async function runAcceptanceProbe(
   for (const probe of probes) {
     let outcome: 'pass' | 'fail' | 'could_not_run';
     let output = '';
+    const timeoutMs = probe.declared ? DECLARED_BUILD_TIMEOUT : GENERIC_PROBE_TIMEOUT;
     try {
-      await execFileAsync(probe.cmd, probe.args, { cwd: probe.cwd, timeoutMs: ACCEPTANCE_PROBE_TIMEOUT });
+      await execFileAsync(probe.cmd, probe.args, { cwd: probe.cwd, timeoutMs });
       outcome = 'pass';
     } catch (err: unknown) {
       const e = err as Error & { stdout?: string; stderr?: string; code?: string; status?: number | null };
@@ -278,6 +279,71 @@ async function recoverFromStaleCommand(
   };
 }
 
+// ── Dependency provisioning (run before the suite AND the build probe) ───────
+// Each install step runs under the bounded suite-runner timeout (deps install
+// can take longer than a cheap compile probe but must stay bounded). A failure
+// is retried the same bounded number of times the suite-setup path uses, then
+// surfaced so the caller routes it through the EXISTING setup-failure path.
+const PROVISION_TIMEOUT = TEST_RUNNER_TIMEOUT;
+
+// Provision the project's declared / auto-detected dependencies into the cloned
+// workspace BEFORE the detected suite and the declared build probe run. Returns
+// a failure summary when provisioning could not complete (so the caller emits a
+// setup failure — NEVER a silent pass / code-fix), or null on success / no-op.
+async function provisionDependencies(
+  ws: WebSocket | null,
+  statusRef: { value: string },
+  buildConfig: BuildConfig | undefined,
+): Promise<string | null> {
+  const steps = detectProvisioningSteps(buildConfig);
+  if (steps.length === 0) return null;
+  for (const step of steps) {
+    for (let attempt = 0; ; attempt++) {
+      statusRef.value = `Provisioning dependencies (${step.label})...`;
+      sendLog(ws, `Provisioning dependencies: ${step.label}\n`);
+      try {
+        await execFileAsync(step.cmd, step.args, { cwd: step.cwd, timeoutMs: PROVISION_TIMEOUT });
+        break;
+      } catch (err: unknown) {
+        const e = err as Error & { stdout?: string; stderr?: string };
+        const msg = [e.stdout, e.stderr, e.message].filter(Boolean).join('\n');
+        if (attempt < MAX_VERIFY_SETUP_RETRIES) {
+          sendLog(ws, `Dependency provisioning failed (${step.label}) — retrying (${attempt + 1}/${MAX_VERIFY_SETUP_RETRIES})...\n`);
+          continue;
+        }
+        return `Dependency provisioning failed: [${step.label}]\n${msg}`;
+      }
+    }
+  }
+  return null;
+}
+
+// Emit the canonical setup-failure verdict (FAILED + setupFailed marker). Shared
+// shape with the suite/replacement setup-failure paths so a provisioning failure
+// flows through the SAME merge-gate retry-before-fall-open semantics.
+async function postVerifySetupFailure(
+  taskId: string, owner: string, repo: string,
+  ws: WebSocket | null, summary: string,
+): Promise<void> {
+  const setupResult: VerifyTestsResult = {
+    detected: false, passed: false, setupFailed: true, tests: [],
+    output: summary.slice(-VERIFY_TESTS_OUTPUT_LIMIT),
+  };
+  const setupResultPath = `/tmp/verify_tests_result_${taskId}.json`;
+  try {
+    fs.writeFileSync(setupResultPath, JSON.stringify(setupResult, null, 2));
+  } catch (e) {
+    sendLog(ws, `[WARNING] Could not write ${setupResultPath}: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+  await persistAndPostStatus(taskId, {
+    task_id: taskId,
+    status: 'FAILED',
+    artifact_type: 'MERGE_TEST_RESULT',
+    logs: sanitize(JSON.stringify(setupResult)),
+    repo_url: `https://github.com/${owner}/${repo}`,
+  });
+}
+
 // ── Handler: Verify Tests (run the repo's detected suite on a PR head) ───────
 // Repo-side half of the no-CI merge gate. Clones the PR head branch, reuses the
 // EXISTING test-runner detection (detectTestRunners) and execution+verdict
@@ -309,6 +375,19 @@ export async function handleVerifyTests(
   });
 
   const buildConfig = resolveBuildConfig(task);
+
+  // Provision declared / auto-detected dependencies BEFORE the suite and the
+  // declared build probe so both run against a real environment. A provisioning
+  // failure is an environment/setup failure: route it through the EXISTING
+  // setup-failure path (FAILED + setupFailed marker → merge-gate retry), NOT the
+  // code-fix loop and NEVER a silent pass.
+  const provisionFailure = await provisionDependencies(ws, statusRef, buildConfig);
+  if (provisionFailure) {
+    sendLog(ws, `\nDependency provisioning failed after bounded retries — reporting FAILED so the merge gate retries the gate before falling open.\n`);
+    await postVerifySetupFailure(taskId, owner, repo, ws, provisionFailure);
+    return;
+  }
+
   const runners = detectTestRunners(buildConfig);
 
   let result: VerifyTestsResult;

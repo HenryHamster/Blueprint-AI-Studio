@@ -543,4 +543,28 @@ describe('handleVerifyTests', () => {
     const opts = vi.mocked(testFixLoop).mock.calls[0].at(-1) as { maxFixAttempts: number };
     expect(opts.maxFixAttempts).toBe(0);
   });
+
+  it('declared build_cmd probe runs under larger timeout than generic probes', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([]);
+    // Return both a generic probe and a declared probe to verify different timeouts
+    const genericProbe = { ...PY_PROBE };
+    const declaredProbe = { ...DECLARED_PROBE };
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([genericProbe, declaredProbe]);
+
+    // Track calls to execFileAsync to verify timeout values
+    const callsWithTimeouts: Array<{ timeoutMs?: number }> = [];
+    vi.mocked(execFileAsync).mockImplementation((_cmd: unknown, _args: unknown, opts?: unknown) => {
+      callsWithTimeouts.push(opts as { timeoutMs?: number });
+      return Promise.resolve('');
+    });
+
+    await handleVerifyTests('timeout1', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    // Should have 2 calls to execFileAsync (one generic, one declared)
+    expect(callsWithTimeouts).toHaveLength(2);
+    // The generic Python probe should use the smaller timeout (TEST_BASELINE_TIMEOUT = 60_000)
+    expect(callsWithTimeouts[0].timeoutMs).toBe(60_000);
+    // The declared build probe should use the larger timeout (TEST_RUNNER_TIMEOUT = 180_000)
+    expect(callsWithTimeouts[1].timeoutMs).toBe(180_000);
+  });
 });

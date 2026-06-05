@@ -564,6 +564,89 @@ export function detectAutoTestRunners(): TestRunner[] {
   return detectTestRunners(undefined);
 }
 
+// ── Dependency provisioning (no-CI verify gate) ──────────────────────────────
+// Before the no-CI verify gate runs the detected suite OR the declared build
+// probe, the project's dependencies must be installed — otherwise both fail to
+// RUN for environment reasons and the gate falls open UNVERIFIED even though the
+// code is fine. A provisioning step is a single install command run under a
+// bounded timeout; a failure routes through the EXISTING setup-failure path.
+export interface ProvisioningStep {
+  cmd: string;
+  args: string[];
+  cwd: string;
+  label: string;
+  // True when this step runs the operator's OWN declared ``install_cmd`` rather
+  // than an auto-detected fallback (currently the pyproject-only ``pip install .``).
+  declared?: boolean;
+}
+
+/**
+ * Detect dependency-provisioning steps the no-CI verify gate must run BEFORE the
+ * detected suite and the declared build probe, so both execute against a
+ * provisioned environment instead of a missing-dependency one.
+ *
+ * Two sources, in precedence order:
+ *  1) The operator's declared ``install_cmd`` per build_config directory — the
+ *     authoritative provisioning step. Wrapped exactly like ``test_cmd``
+ *     (bash -c for shell operators, quote-aware tokenize otherwise) and run via
+ *     execFile (no shell interpolation).
+ *  2) A pyproject.toml-only Python project (no committed ``poetry.lock`` and no
+ *     ``requirements.txt``) — the common modern layout the per-runner hardcoded
+ *     installs (poetry.lock / requirements.txt) miss entirely. Provisioned with
+ *     ``pip install .`` so the declared package + its dependencies are present
+ *     before pytest collects. A directory that already declares its own
+ *     ``install_cmd`` is NOT given this fallback (the operator's command wins).
+ *
+ * Deduped by ``cwd``; inspects ONLY the local filesystem (zero GitHub-API cost).
+ */
+export function detectProvisioningSteps(buildConfig?: BuildConfig): ProvisioningStep[] {
+  const exists = (p: string): boolean => {
+    try { return fs.existsSync(p); } catch { return false; }
+  };
+  const steps: ProvisioningStep[] = [];
+  const seenCwds = new Set<string>();
+  const add = (step: ProvisioningStep): void => {
+    if (seenCwds.has(step.cwd)) return;
+    seenCwds.add(step.cwd);
+    steps.push(step);
+  };
+
+  // 1) Operator-declared install commands take precedence.
+  const declaredCwds = new Set<string>();
+  if (buildConfig?.directories) {
+    for (const dir of buildConfig.directories) {
+      const installCmd = (dir.install_cmd || '').trim();
+      if (!installCmd) continue;
+      const abs = dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE;
+      declaredCwds.add(abs);
+      const runner = runnerFromTestCmd(installCmd, abs);
+      add({ cmd: runner.cmd, args: runner.args, cwd: abs, label: `${installCmd} (${dir.path || 'root'})`, declared: true });
+    }
+  }
+
+  // 2) pyproject-only Python auto-provision. Only when no lockfile/requirements.txt
+  //    is present (those are handled by the per-runner installs) and the directory
+  //    did not already declare its own install_cmd.
+  const pyprojectOnly = (absDir: string): boolean =>
+    exists(`${absDir}/pyproject.toml`) &&
+    !exists(`${absDir}/poetry.lock`) &&
+    !exists(`${absDir}/requirements.txt`);
+  const addPyprojectAuto = (absDir: string, label: string): void => {
+    if (declaredCwds.has(absDir) || !pyprojectOnly(absDir)) return;
+    add({ cmd: 'pip', args: ['install', '.'], cwd: absDir, label: `pip install . (${label})` });
+  };
+  if (buildConfig?.directories) {
+    for (const dir of buildConfig.directories) {
+      if (dir.type !== 'python') continue;
+      addPyprojectAuto(dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE, dir.path || 'root');
+    }
+  }
+  // Repo root covers the auto-detected (no build_config) case.
+  addPyprojectAuto(WORKSPACE, 'root');
+
+  return steps;
+}
+
 // ── Cheap acceptance probe (no-CI merge gate goal-level check) ───────────────
 // When the no-CI merge gate finds no unit suite (or the suite is thin / fully
 // skipped), the PR ships with ZERO execution signal. The acceptance probe is a

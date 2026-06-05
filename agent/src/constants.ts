@@ -140,6 +140,14 @@ export const TEST_RUNNER_DOCKER_TIMEOUT = 600_000;
 export const TEST_BASELINE_TIMEOUT = 60_000;
 export const TEST_BASELINE_DOCKER_TIMEOUT = 600_000;
 
+// Acceptance probe timeouts
+// Generic ecosystem probes (tsc/compileall/go build/cargo check) use the baseline.
+export const GENERIC_PROBE_TIMEOUT = TEST_BASELINE_TIMEOUT;
+// Declared build commands (operator's authoritative build_cmd) get more time.
+// Comparable to test runners but not Docker (a real build > cheap compile-check,
+// but < full suite with sidecar overhead). Allows realistic builds to complete.
+export const DECLARED_BUILD_TIMEOUT = TEST_RUNNER_TIMEOUT;
+
 // Self-review loop
 export const MAX_SELF_REVIEW_ATTEMPTS = 2;
 
