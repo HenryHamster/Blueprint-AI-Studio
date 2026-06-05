@@ -18,13 +18,21 @@ vi.mock('fs', () => ({
   },
 }));
 
-const mockFs = fs as unknown as { existsSync: ReturnType<typeof vi.fn> };
+const mockFs = fs as unknown as {
+  existsSync: ReturnType<typeof vi.fn>;
+  readdirSync: ReturnType<typeof vi.fn>;
+};
 const WORKSPACE = process.env.AGENT_WORKSPACE || '/tmp/workspace';
 
 describe('detectProvisioningSteps', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockFs.existsSync.mockReturnValue(false);
+    // readdirSync drives the glob-based .NET detector; reset its implementation
+    // each test (clearAllMocks does not clear mockImplementation) so a per-test
+    // readdir stub never leaks into the next test.
+    mockFs.readdirSync.mockReset();
+    mockFs.readdirSync.mockReturnValue([]);
   });
 
   it('emits the operator-declared install_cmd as an authoritative step', () => {
@@ -102,6 +110,33 @@ describe('detectProvisioningSteps', () => {
     expect(steps[0].args).toEqual(args);
     expect(steps[0].cwd).toBe(WORKSPACE);
     expect(steps[0].declared).toBeUndefined();
+  });
+
+  // .NET is glob-detected (*.sln / *.csproj), not a fixed manifest name, so it
+  // keys off readdirSync rather than existsSync like the other extra families.
+  it('auto-provisions a .NET project (*.csproj) with dotnet restore', () => {
+    const mockReaddir = fs.readdirSync as unknown as ReturnType<typeof vi.fn>;
+    mockReaddir.mockImplementation((p: string) =>
+      p === WORKSPACE ? ['App.csproj', 'Program.cs'] : [],
+    );
+    const steps = detectProvisioningSteps(undefined);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].cmd).toBe('dotnet');
+    expect(steps[0].args).toEqual(['restore']);
+    expect(steps[0].cwd).toBe(WORKSPACE);
+    expect(steps[0].declared).toBeUndefined();
+  });
+
+  it('declared install_cmd suppresses the .NET restore fallback for the same dir', () => {
+    const mockReaddir = fs.readdirSync as unknown as ReturnType<typeof vi.fn>;
+    mockReaddir.mockImplementation((p: string) => (p === WORKSPACE ? ['Sln.sln'] : []));
+    const buildConfig: BuildConfig = {
+      directories: [{ path: '', type: 'other', install_cmd: 'dotnet restore --no-cache' }],
+    };
+    const steps = detectProvisioningSteps(buildConfig);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].declared).toBe(true);
+    expect(steps[0].args).toEqual(['restore', '--no-cache']);
   });
 
   it('declared install_cmd suppresses the extra-ecosystem fallback for the same dir', () => {

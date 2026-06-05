@@ -573,6 +573,21 @@ export function detectAutoTestRunners(): TestRunner[] {
   return detectTestRunners(undefined);
 }
 
+// True when the directory contains any *.sln / *.csproj — the glob signal the
+// .NET suite detector (detectExtraFamilyRunner) keys off. The project file name
+// is arbitrary, so the directory listing is globbed name-based rather than
+// checking a fixed manifest. Defensive against fs errors (treated as "absent").
+function hasDotnetProject(absDir: string): boolean {
+  try {
+    const entries = fs.readdirSync(absDir) as unknown as string[];
+    return Array.isArray(entries) && entries.some(
+      n => typeof n === 'string' && (n.endsWith('.sln') || n.endsWith('.csproj')),
+    );
+  } catch {
+    return false;
+  }
+}
+
 // ── Dependency provisioning (no-CI verify gate) ──────────────────────────────
 // Before the no-CI verify gate runs the detected suite OR the declared build
 // probe, the project's dependencies must be installed — otherwise both fail to
@@ -704,6 +719,15 @@ export function detectProvisioningSteps(buildConfig?: BuildConfig): Provisioning
       add({ cmd: 'mix', args: ['deps.get'], cwd: absDir, label: `mix deps.get (${label})` });
       return;
     }
+    // .NET: any *.sln / *.csproj at this dir → `dotnet restore`. The project file
+    // name is arbitrary, so glob the directory listing (name-based, like the suite
+    // detector's detectExtraFamilyRunner) rather than checking a fixed manifest.
+    // Without a restore step the suite/probe run against an unprovisioned NuGet
+    // cache and fail on first-run dependency resolution.
+    if (hasDotnetProject(absDir)) {
+      add({ cmd: 'dotnet', args: ['restore'], cwd: absDir, label: `dotnet restore (${label})` });
+      return;
+    }
     // PHP: composer.json → `composer install`.
     if (exists(`${absDir}/composer.json`)) {
       add({ cmd: 'composer', args: ['install'], cwd: absDir, label: `composer install (${label})` });
@@ -783,7 +807,7 @@ export interface AcceptanceProbe {
   // display label). ``'build'`` is the catch-all for an operator-declared
   // ``build_cmd`` whose directory ``type`` is none of python/node/go/rust
   // (e.g. ``other``).
-  ecosystem: 'python' | 'node' | 'go' | 'rust' | 'build';
+  ecosystem: 'python' | 'node' | 'go' | 'rust' | 'dotnet' | 'gradle' | 'maven' | 'elixir' | 'build';
   label: string;
   // True when this probe runs the project's OWN declared ``build_cmd`` (the
   // operator's authoritative "does this deliverable build" claim) rather than a
@@ -956,6 +980,57 @@ export function detectAcceptanceProbes(buildConfig?: BuildConfig): AcceptancePro
         label: `cargo check (${label})`,
       });
     }
+    // .NET → `dotnet build` (compiles every project without running tests).
+    // Glob-detected (*.sln/*.csproj) like the suite detector, since the project
+    // file name is arbitrary. `--nologo` keeps output terse for the classifier.
+    if (hasDotnetProject(absDir)) {
+      add({
+        ecosystem: 'dotnet',
+        cmd: 'dotnet',
+        args: ['build', '--nologo'],
+        cwd: absDir,
+        label: `dotnet build (${label})`,
+      });
+    }
+    // Compiled extra-family ecosystems the suite detector also launches. Each
+    // runs the CHEAPEST compile-only task (compile/classes, not a full build or
+    // test run), keyed off the same manifest the suite detector + provisioning
+    // use. A genuine compile error classifies as a real FAILURE; a missing
+    // toolchain / unprovisioned deps degrades to could_not_run (fall-open).
+    //
+    // Gradle: build.gradle[.kts] → `./gradlew classes` (compile main sources,
+    // no tests, no daemon — matches the provisioning step's `--no-daemon`).
+    if (has(absDir, 'build.gradle') || has(absDir, 'build.gradle.kts')) {
+      add({
+        ecosystem: 'gradle',
+        cmd: './gradlew',
+        args: ['classes', '--no-daemon'],
+        cwd: absDir,
+        label: `gradlew classes (${label})`,
+      });
+    }
+    // Maven: pom.xml → `mvn -o -B test-compile` (offline compile of main+test
+    // sources; -o never hits the network so unfetched deps fall open, not block).
+    if (has(absDir, 'pom.xml')) {
+      add({
+        ecosystem: 'maven',
+        cmd: 'mvn',
+        args: ['-o', '-B', 'test-compile'],
+        cwd: absDir,
+        label: `mvn -o test-compile (${label})`,
+      });
+    }
+    // Elixir: mix.exs → `mix compile` (compiles the project without running the
+    // ExUnit suite).
+    if (has(absDir, 'mix.exs')) {
+      add({
+        ecosystem: 'elixir',
+        cmd: 'mix',
+        args: ['compile'],
+        cwd: absDir,
+        label: `mix compile (${label})`,
+      });
+    }
   };
 
   // 1) Stored build_config directories carry an explicit language type hint.
@@ -1053,6 +1128,10 @@ export function classifyProbeOutcome(
     'error ts',           // tsc: "error TS2322: ..."
     'error[e',            // rustc: "error[E0425]: ..."
     'undefined:',         // go build: "undefined: Foo"
+    'error cs',           // C# (dotnet build): "error CS0103: ..."
+    'compilation error',  // Maven javac / Gradle-Kotlin: "COMPILATION ERROR"
+    'compilation failed', // Gradle javac: "Compilation failed; see the compiler error output"
+    'compileerror',       // Elixir: "** (CompileError) ..."
   ];
   if (failureSignatures.some(sig => lower.includes(sig))) return 'fail';
 

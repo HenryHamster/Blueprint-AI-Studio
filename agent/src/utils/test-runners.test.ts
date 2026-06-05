@@ -2274,6 +2274,48 @@ describe('detectAcceptanceProbes', () => {
     expect(rust).toEqual(expect.objectContaining({ cmd: 'cargo', args: ['check', '--quiet'], cwd: WORKSPACE }));
   });
 
+  it('*.csproj present → dotnet build probe (glob-detected)', () => {
+    mockFs.readdirSync.mockImplementation((p: string) =>
+      p === WORKSPACE ? ['App.csproj', 'Program.cs'] : [],
+    );
+    const probes = detectAcceptanceProbes(undefined);
+    const dotnet = probes.find(p => p.ecosystem === 'dotnet');
+    expect(dotnet).toEqual(expect.objectContaining({ cmd: 'dotnet', args: ['build', '--nologo'], cwd: WORKSPACE }));
+  });
+
+  it('*.sln present → dotnet build probe (glob-detected)', () => {
+    mockFs.readdirSync.mockImplementation((p: string) => (p === WORKSPACE ? ['Solution.sln'] : []));
+    const probes = detectAcceptanceProbes(undefined);
+    expect(probes.find(p => p.ecosystem === 'dotnet')?.cmd).toBe('dotnet');
+  });
+
+  it('build.gradle present → gradlew classes probe (compile-only)', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/build.gradle`);
+    const probes = detectAcceptanceProbes(undefined);
+    const gradle = probes.find(p => p.ecosystem === 'gradle');
+    expect(gradle).toEqual(expect.objectContaining({ cmd: './gradlew', args: ['classes', '--no-daemon'], cwd: WORKSPACE }));
+  });
+
+  it('build.gradle.kts present → gradlew classes probe (Kotlin DSL)', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/build.gradle.kts`);
+    const probes = detectAcceptanceProbes(undefined);
+    expect(probes.find(p => p.ecosystem === 'gradle')?.cmd).toBe('./gradlew');
+  });
+
+  it('pom.xml present → mvn offline test-compile probe', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/pom.xml`);
+    const probes = detectAcceptanceProbes(undefined);
+    const maven = probes.find(p => p.ecosystem === 'maven');
+    expect(maven).toEqual(expect.objectContaining({ cmd: 'mvn', args: ['-o', '-B', 'test-compile'], cwd: WORKSPACE }));
+  });
+
+  it('mix.exs present → mix compile probe', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/mix.exs`);
+    const probes = detectAcceptanceProbes(undefined);
+    const elixir = probes.find(p => p.ecosystem === 'elixir');
+    expect(elixir).toEqual(expect.objectContaining({ cmd: 'mix', args: ['compile'], cwd: WORKSPACE }));
+  });
+
   it('plain-JS package (package.json, no tsconfig) → no node probe (nothing cheap+safe to compile)', () => {
     mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/package.json`);
     const probes = detectAcceptanceProbes(undefined);
@@ -2391,6 +2433,41 @@ describe('classifyProbeOutcome', () => {
   it('go build "undefined: Foo" → fail', () => {
     const err = Object.assign(new Error('failed'), { status: 1 });
     expect(classifyProbeOutcome('./main.go:5:2: undefined: Foo', err)).toBe('fail');
+  });
+
+  it('C# compile error (error CS0103) → fail', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome("Program.cs(5,9): error CS0103: The name 'foo' does not exist in the current context", err)).toBe('fail');
+  });
+
+  it('.NET missing toolchain (dotnet not installed) → could_not_run, not a hard block', () => {
+    const err = Object.assign(new Error('failed'), { status: 127 });
+    expect(classifyProbeOutcome('dotnet: command not found', err)).toBe('could_not_run');
+  });
+
+  it('Maven compile error (COMPILATION ERROR) → fail', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome('[ERROR] COMPILATION ERROR :\n[ERROR] /src/Foo.java:[5,1] cannot find symbol', err)).toBe('fail');
+  });
+
+  it('Gradle compile error (Compilation failed) → fail', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome("> Task :compileJava FAILED\nCompilation failed; see the compiler error output for details.", err)).toBe('fail');
+  });
+
+  it('Elixir compile error (** (CompileError)) → fail', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome('** (CompileError) lib/foo.ex:5: undefined function bar/0', err)).toBe('fail');
+  });
+
+  it('Maven offline missing deps → conservative could_not_run (fall open, not a hard block)', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome('[ERROR] Cannot access central in offline mode and the artifact has not been downloaded', err)).toBe('could_not_run');
+  });
+
+  it('Gradle missing toolchain (gradlew absent) → could_not_run', () => {
+    const err = Object.assign(new Error('spawn ./gradlew ENOENT'), { code: 'ENOENT' });
+    expect(classifyProbeOutcome('', err)).toBe('could_not_run');
   });
 
   it('spawn ENOENT (missing tool) → could_not_run', () => {
