@@ -2751,11 +2751,12 @@ async def test_unresolved_prerequisite_blocks_dependent(db_session, mocker):
 
 
 @_pytest.mark.asyncio
-async def test_deferred_sibling_prerequisite_blocks_dependent(db_session, mocker):
-    """If a prerequisite sibling is deferred and not spawned, the dependent
-    must be held instead of spawning runnable with an empty depends_on list."""
+async def test_deferred_sibling_prerequisite_co_defers_dependent(db_session, mocker):
+    """When a prerequisite sibling is deferred THIS cycle (not spawned), the
+    dependent must NOT be left as a live blocked task stranded behind dormant
+    data. It is co-deferred with its prerequisite: the live task is cancelled and
+    both findings are shelved in deferred_findings so they re-surface as a unit."""
     from app.research_completion import _finding_hash
-    from app.task_blocked import get_blocker_metadata
     from test_autonomous_research import _make_finding, _patch_research_externals
 
     _project, direction, task = await _grader_project_and_task(db_session, "d-prq05")
@@ -2771,6 +2772,7 @@ async def test_deferred_sibling_prerequisite_blocks_dependent(db_session, mocker
     )
 
     await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
 
     children = (
         (
@@ -2781,43 +2783,34 @@ async def test_deferred_sibling_prerequisite_blocks_dependent(db_session, mocker
         .scalars()
         .all()
     )
-    blocked_children = [
-        c
-        for c in children
-        if c.title == dependent["title"] and c.status == TaskStatus.BLOCKED
-    ]
-    assert len(blocked_children) == 1
-    assert not any(
-        c.title == dependent["title"] and c.status != TaskStatus.BLOCKED
-        for c in children
+    dependent_children = [c for c in children if c.title == dependent["title"]]
+    # The dependent must never be left LIVE-blocked behind its deferred prereq.
+    assert not any(c.status == TaskStatus.BLOCKED for c in dependent_children), (
+        "a dependent must not sit live-blocked behind a same-cycle-deferred prereq"
     )
-    child = blocked_children[0]
-    assert child.status == TaskStatus.BLOCKED
-    assert not (child.depends_on or [])
-    blocker = get_blocker_metadata(child)
-    expected_hash = _finding_hash(prereq["title"], prereq["description"])
-    assert blocker.get("need") == {
-        "kind": "task",
-        "ref": expected_hash,
-        "label": prereq["title"],
-    }
-    unresolved = (child.context or {}).get("unresolved_prerequisite", [])
-    assert any(
-        u.get("finding_hash") == expected_hash and u.get("title") == prereq["title"]
-        for u in (unresolved if isinstance(unresolved, list) else [unresolved])
-    )
+    assert all(
+        c.status == TaskStatus.CANCELLED for c in dependent_children
+    ), "the co-deferred dependent's live task must be cancelled"
+
+    # Both the deferred prerequisite and the co-deferred dependent are shelved so
+    # the next cycle re-surfaces them together.
+    deferred = (task.context or {}).get("deferred_findings", [])
+    prereq_hash = _finding_hash(prereq["title"], prereq["description"])
+    dependent_hash = _finding_hash(dependent["title"], dependent["description"])
+    by_hash = {f.get("finding_hash"): f for f in deferred}
+    assert prereq_hash in by_hash, "the deferred prerequisite must be shelved"
+    assert dependent_hash in by_hash, "the co-deferred dependent must be shelved"
+    assert by_hash[dependent_hash]["deferred_reason"] == "prereq_deferred_same_cycle"
 
 
 @_pytest.mark.asyncio
-async def test_two_deferred_sibling_prerequisites_both_recorded_as_needs(
+async def test_two_deferred_sibling_prerequisites_co_defer_dependent(
     db_session, mocker
 ):
-    """A finding declaring TWO unspawned sibling prerequisites is BLOCKED with
-    BOTH recorded as needs — not just the first. Gating on only the first lets the
-    dependent resume (and rebuild the second foundation) the moment the first one
-    lands; recording the full set keeps it gated until ALL prerequisites resolve."""
+    """A finding declaring TWO unspawned (deferred-this-cycle) sibling
+    prerequisites is co-deferred — its live task cancelled — rather than left
+    blocked behind two dormant findings. All three findings re-surface together."""
     from app.research_completion import _finding_hash
-    from app.task_blocked import get_blocker_needs
     from test_autonomous_research import _make_finding, _patch_research_externals
 
     _project, direction, task = await _grader_project_and_task(db_session, "d-prq06")
@@ -2835,6 +2828,7 @@ async def test_two_deferred_sibling_prerequisites_both_recorded_as_needs(
     )
 
     await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
 
     children = (
         (
@@ -2845,43 +2839,31 @@ async def test_two_deferred_sibling_prerequisites_both_recorded_as_needs(
         .scalars()
         .all()
     )
-    blocked = [
-        c
-        for c in children
-        if c.title == dependent["title"] and c.status == TaskStatus.BLOCKED
-    ]
-    assert len(blocked) == 1
-    child = blocked[0]
-    assert not (child.depends_on or [])
-    needs = get_blocker_needs(child)
+    dependent_children = [c for c in children if c.title == dependent["title"]]
+    assert not any(c.status == TaskStatus.BLOCKED for c in dependent_children), (
+        "a dependent on multiple deferred siblings must not be left live-blocked"
+    )
+    assert all(c.status == TaskStatus.CANCELLED for c in dependent_children)
+
+    deferred = (task.context or {}).get("deferred_findings", [])
+    hashes = {f.get("finding_hash") for f in deferred}
     hash_a = _finding_hash(prereq_a["title"], prereq_a["description"])
     hash_b = _finding_hash(prereq_b["title"], prereq_b["description"])
-    refs = {n["ref"] for n in needs}
-    assert refs == {hash_a, hash_b}, (
-        "both unspawned sibling prerequisites must be recorded as needs"
+    dependent_hash = _finding_hash(dependent["title"], dependent["description"])
+    assert {hash_a, hash_b, dependent_hash} <= hashes, (
+        "both deferred prerequisites and the co-deferred dependent must re-surface together"
     )
-    # Backward-compat: the legacy single 'need' mirror still equals needs[0].
-    from app.task_blocked import get_blocker_metadata
-
-    assert get_blocker_metadata(child).get("need") == needs[0]
-    # Both unresolved prerequisites are stamped for operator visibility.
-    unresolved = (child.context or {}).get("unresolved_prerequisite", [])
-    unresolved_hashes = {
-        u.get("finding_hash")
-        for u in (unresolved if isinstance(unresolved, list) else [unresolved])
-    }
-    assert {hash_a, hash_b} <= unresolved_hashes
 
 
 @_pytest.mark.asyncio
-async def test_missing_sibling_and_explicit_prerequisite_both_recorded(
+async def test_co_deferred_dependent_retains_explicit_prerequisite(
     db_session, mocker
 ):
-    """A finding declaring a missing sibling prerequisite AND an explicit
-    {kind, ref} prerequisite is BLOCKED with BOTH recorded — the explicit one is
-    no longer dropped by the sibling branch's short-circuit ``continue``."""
+    """A dependent declaring a deferred sibling prerequisite AND an explicit
+    {kind, ref} prerequisite is co-deferred (sibling deferred this cycle). The
+    shelved finding retains BOTH declarations so the next cycle reconstructs the
+    full need set — the explicit prerequisite is not dropped on the way out."""
     from app.research_completion import _finding_hash
-    from app.task_blocked import get_blocker_needs
     from test_autonomous_research import _make_finding, _patch_research_externals
 
     _project, direction, task = await _grader_project_and_task(db_session, "d-prq07")
@@ -2898,6 +2880,7 @@ async def test_missing_sibling_and_explicit_prerequisite_both_recorded(
     )
 
     await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
 
     children = (
         (
@@ -2908,21 +2891,59 @@ async def test_missing_sibling_and_explicit_prerequisite_both_recorded(
         .scalars()
         .all()
     )
-    blocked = [
-        c
-        for c in children
-        if c.title == dependent["title"] and c.status == TaskStatus.BLOCKED
-    ]
-    assert len(blocked) == 1
-    child = blocked[0]
-    assert not (child.depends_on or [])
-    needs = get_blocker_needs(child)
-    sibling_hash = _finding_hash(prereq["title"], prereq["description"])
-    refs = {n["ref"] for n in needs}
-    assert sibling_hash in refs, "the missing sibling prerequisite must be recorded"
-    assert "nonexistent-foundation-id" in refs, (
-        "the explicit prerequisite must be recorded (not dropped by the sibling branch)"
+    dependent_children = [c for c in children if c.title == dependent["title"]]
+    assert not any(c.status == TaskStatus.BLOCKED for c in dependent_children), (
+        "the dependent must be co-deferred, not left live-blocked"
     )
+    assert all(c.status == TaskStatus.CANCELLED for c in dependent_children)
+
+    deferred = (task.context or {}).get("deferred_findings", [])
+    dependent_hash = _finding_hash(dependent["title"], dependent["description"])
+    shelved = next(
+        (f for f in deferred if f.get("finding_hash") == dependent_hash), None
+    )
+    assert shelved is not None, "the co-deferred dependent must be shelved"
+    assert shelved.get("depends_on_indices") == [0], (
+        "the sibling prerequisite declaration must survive co-deferral"
+    )
+    assert shelved.get("prerequisite") == {
+        "kind": "task",
+        "ref": "nonexistent-foundation-id",
+    }, "the explicit prerequisite must not be dropped on the way out"
+
+
+@_pytest.mark.asyncio
+async def test_independent_deferred_finding_keeps_throttle(db_session, mocker):
+    """A deferred finding with NO live dependent keeps the existing throttle: it is
+    shelved under its own (low_actionability) reason and is NOT re-tagged as a
+    co-deferred prerequisite. Co-deferral must only couple genuine dependents."""
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq08")
+    # Two unrelated LOW findings — neither depends on the other.
+    low_a = _make_finding(title="Tidy log line A", direction_id=direction["id"])
+    low_a["actionability_grade"] = "LOW"
+    low_b = _make_finding(title="Tidy log line B", direction_id=direction["id"])
+    low_b["actionability_grade"] = "LOW"
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[low_a, low_b],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    deferred = (task.context or {}).get("deferred_findings", [])
+    by_hash = {f.get("finding_hash"): f for f in deferred}
+    for f in (low_a, low_b):
+        h = _finding_hash(f["title"], f["description"])
+        assert h in by_hash, f"{f['title']} must be shelved"
+        assert by_hash[h]["deferred_reason"] == "low_actionability", (
+            "an independent deferred finding keeps its own throttle reason"
+        )
 
 
 @_pytest.mark.asyncio
@@ -3103,3 +3124,319 @@ class TestFindingHeadProvenance:
 
         assert await cited_paths_changed_since("sha", []) is None
         assert await cited_paths_changed_since("sha", ["not a path"]) is None
+
+
+class TestSiblingPrerequisiteIndexValidation:
+    """Prerequisite-need construction with negative/out-of-range index validation."""
+
+    async def test_negative_index_in_depends_on_is_skipped(self, mocker, db_session):
+        """Finding with negative index in depends_on_indices is skipped with log warning."""
+        from test_autonomous_research import _make_finding, _patch_research_externals, _active_direction, _make_research_task
+
+        # Create a minimal project
+        direction = _active_direction("d-index-val", "Index validation")
+        project = _Project(
+            name="Index Validation Test",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[direction],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = await _make_research_task(project, direction, db_session)
+
+        findings = [
+            _make_finding(title="Finding A"),
+            {
+                **_make_finding(title="Finding B (depends on A with negative index)"),
+                "depends_on_indices": [-1],  # Negative index — should be skipped
+            },
+        ]
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=findings,
+        )
+        log_mock = mocker.patch("app.research_completion.logger")
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # Both findings should spawn because the negative index is skipped
+        assert len(children) == 2
+        # Check that a warning was logged for the negative index
+        warning_calls = [
+            call for call in log_mock.warning.call_args_list
+            if "out-of-range" in str(call)
+        ]
+        assert len(warning_calls) > 0
+
+    async def test_out_of_range_positive_index_is_skipped(self, mocker, db_session):
+        """Finding with out-of-range positive index in depends_on_indices is skipped."""
+        from test_autonomous_research import _make_finding, _patch_research_externals, _active_direction, _make_research_task
+
+        # Create a minimal project
+        direction = _active_direction("d-out-range", "Out of range test")
+        project = _Project(
+            name="Out of Range Test",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[direction],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = await _make_research_task(project, direction, db_session)
+
+        findings = [
+            _make_finding(title="Finding A"),
+            {
+                **_make_finding(title="Finding B (depends on nonexistent index 99)"),
+                "depends_on_indices": [99],  # Out of range — should be skipped
+            },
+        ]
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=findings,
+        )
+        log_mock = mocker.patch("app.research_completion.logger")
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # Both findings should spawn because the out-of-range index is skipped
+        assert len(children) == 2
+        # Check that a warning was logged for the out-of-range index
+        warning_calls = [
+            call for call in log_mock.warning.call_args_list
+            if "out-of-range" in str(call)
+        ]
+        assert len(warning_calls) > 0
+
+    async def test_valid_index_in_depends_on_co_defers_dependent(self, mocker, db_session):
+        """A valid sibling index pointing at a same-cycle-deferred finding IS
+        recognized and produces a prerequisite need — but because the prerequisite
+        was deferred this cycle, the dependent is co-deferred (its live task
+        cancelled and its finding shelved) rather than left live-blocked behind
+        dormant data (see #8278). The co-deferral itself is the proof that the
+        valid index created a need; a skipped index (negative/out-of-range) leaves
+        the dependent free to spawn normally."""
+        from app.research_completion import _finding_hash
+        from test_autonomous_research import _make_finding, _patch_research_externals, _active_direction, _make_research_task
+
+        # Create a minimal project
+        direction = _active_direction("d-valid-idx", "Valid index test")
+        project = _Project(
+            name="Valid Index Test",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[direction],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = await _make_research_task(project, direction, db_session)
+
+        finding_a = {**_make_finding(title="Finding A (deferred)"), "actionability_grade": "LOW"}
+        finding_b = {
+            **_make_finding(title="Finding B (depends on A)"),
+            "actionability_grade": "HIGH",
+            "depends_on_indices": [0],
+        }
+        findings = [finding_a, finding_b]
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=findings,
+        )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # B's live task must be co-deferred (cancelled), never left live-blocked
+        # behind its same-cycle-deferred prerequisite.
+        b_children = [c for c in children if c.title.startswith("Finding B")]
+        assert b_children, "the dependent must exist as a (cancelled) child task"
+        assert not any(c.status == TaskStatus.BLOCKED for c in b_children), (
+            "a valid index onto a deferred sibling must co-defer, not live-block"
+        )
+        assert all(c.status == TaskStatus.CANCELLED for c in b_children)
+        # The dependent finding is shelved with the co-deferral reason so it
+        # re-surfaces alongside its foundation next cycle.
+        deferred = (task.context or {}).get("deferred_findings", [])
+        b_hash = _finding_hash(finding_b["title"], finding_b["description"])
+        shelved = next((f for f in deferred if f.get("finding_hash") == b_hash), None)
+        assert shelved is not None, "the co-deferred dependent must be shelved"
+        assert shelved.get("deferred_reason") == "prereq_deferred_same_cycle"
+
+
+class TestDuplicateNeedDeduplication:
+    """Prerequisite-need deduplication: duplicate needs are recorded once."""
+
+    async def test_duplicate_sibling_index_co_defers_once(self, mocker, db_session):
+        """Duplicate indices in depends_on_indices ([0, 0]) collapse to a single
+        prerequisite need (deduped by (kind, ref) — research_completion.py:2954),
+        so the dependent on a same-cycle-deferred sibling is co-deferred exactly
+        ONCE: a single cancelled live task and a single shelved finding, never a
+        double-shelving from the repeated index."""
+        from app.research_completion import _finding_hash
+        from test_autonomous_research import _make_finding, _patch_research_externals, _active_direction, _make_research_task
+
+        # Create a minimal project
+        direction = _active_direction("d-dup-need", "Duplicate need test")
+        project = _Project(
+            name="Duplicate Need Test",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[direction],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = await _make_research_task(project, direction, db_session)
+
+        finding_a = {**_make_finding(title="Finding A (deferred)"), "actionability_grade": "LOW"}
+        finding_b = {
+            **_make_finding(title="Finding B (depends on A twice)"),
+            "actionability_grade": "HIGH",
+            "depends_on_indices": [0, 0],  # Duplicate reference to same finding
+        }
+        findings = [finding_a, finding_b]
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=findings,
+        )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # B is co-deferred: a single cancelled live task, never live-blocked.
+        b_children = [c for c in children if c.title.startswith("Finding B")]
+        assert len(b_children) == 1, "the duplicate index must not double-spawn B"
+        assert not any(c.status == TaskStatus.BLOCKED for c in b_children)
+        assert b_children[0].status == TaskStatus.CANCELLED
+        # The duplicate index collapses to a single shelved dependent (deduped),
+        # which retains its declaration verbatim for next-cycle reconstruction.
+        deferred = (task.context or {}).get("deferred_findings", [])
+        b_hash = _finding_hash(finding_b["title"], finding_b["description"])
+        b_shelved = [f for f in deferred if f.get("finding_hash") == b_hash]
+        assert len(b_shelved) == 1, "duplicate indices must shelve the dependent once"
+        assert b_shelved[0].get("depends_on_indices") == [0, 0]
+
+    async def test_co_deferred_dependent_retains_both_declarations(self, mocker, db_session):
+        """A dependent that names BOTH a sibling-index prerequisite AND an explicit
+        {kind, ref} prerequisite is co-deferred (its sibling foundation was deferred
+        this cycle). Neither declaration may be dropped on the way out: the shelved
+        finding retains both ``depends_on_indices`` and ``prerequisite`` so the next
+        cycle reconstructs the full (deduplicated) need set."""
+        from app.research_completion import _finding_hash
+        from test_autonomous_research import _make_finding, _patch_research_externals, _active_direction, _make_research_task
+
+        # Create a minimal project
+        direction = _active_direction("d-explicit-sib", "Explicit sibling test")
+        project = _Project(
+            name="Explicit Sibling Test",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[direction],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = await _make_research_task(project, direction, db_session)
+
+        # Sibling finding that provides a capability
+        finding_a = {
+            **_make_finding(title="Finding A (provides capability)"),
+            "actionability_grade": "LOW",
+            "provides_capability": "shared-foundation",
+        }
+        finding_b = {
+            **_make_finding(title="Finding B (depends on same via both methods)"),
+            "actionability_grade": "HIGH",
+            "depends_on_indices": [0],  # Sibling dependency
+            "prerequisite": {"kind": "capability", "ref": "shared-foundation"},
+        }
+        findings = [finding_a, finding_b]
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=findings,
+        )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # B is co-deferred (cancelled), not left live-blocked.
+        b_children = [c for c in children if c.title.startswith("Finding B")]
+        assert b_children, "the dependent must exist as a (cancelled) child task"
+        assert not any(c.status == TaskStatus.BLOCKED for c in b_children)
+        assert all(c.status == TaskStatus.CANCELLED for c in b_children)
+        # Both prerequisite declarations survive co-deferral on the shelved finding.
+        deferred = (task.context or {}).get("deferred_findings", [])
+        b_hash = _finding_hash(finding_b["title"], finding_b["description"])
+        shelved = next((f for f in deferred if f.get("finding_hash") == b_hash), None)
+        assert shelved is not None, "the co-deferred dependent must be shelved"
+        assert shelved.get("depends_on_indices") == [0], (
+            "the sibling prerequisite declaration must survive co-deferral"
+        )
+        assert shelved.get("prerequisite") == {
+            "kind": "capability",
+            "ref": "shared-foundation",
+        }, "the explicit prerequisite must not be dropped on co-deferral"

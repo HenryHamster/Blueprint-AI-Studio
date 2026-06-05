@@ -47,6 +47,14 @@ _RECUT_CONFLICT_ESCALATION_THRESHOLD = 3
 # operator-facing message reads clearly and dedups on (task_id, title).
 _RECUT_CONFLICT_BLOCKER_KIND = "cross-base re-cut conflict"
 
+# A deleted/absent base (or head) branch (HTTP 404) is a PERMANENT condition, not
+# a transient error. Unlike a genuine conflict (which is retried up to the
+# consecutive-conflict bound on the chance it is later resolved), a missing base
+# can NEVER recover by retrying the merge, so it escalates IMMEDIATELY on the
+# first occurrence under its own blocker_kind rather than being held silently and
+# retried on a backoff that never terminates.
+_RECUT_MISSING_BASE_BLOCKER_KIND = "cross-base re-cut base missing"
+
 
 # ---------------------------------------------------------------------------
 # Genuine-code vs ordering-only dependency policy
@@ -555,7 +563,7 @@ async def _clear_recut_accounting(dependent: Task, session: AsyncSession) -> Non
 async def _record_recut_failure(
     dependent: Task, outcome: str, session: AsyncSession
 ) -> None:
-    """Persist a failed re-cut attempt and escalate a PERSISTENT true conflict.
+    """Persist a failed re-cut attempt and escalate a PERSISTENT / PERMANENT one.
 
     Records, in a distinct ``_recut_*`` context namespace (never colliding with
     the reaper's ``_blocked_recheck_attempts`` counter):
@@ -563,16 +571,27 @@ async def _record_recut_failure(
       * ``_recut_recheck_attempts`` — consecutive failures, driving the backed-off
         recheck schedule (reusing ``_next_recheck_delay`` / ``recheck_after``).
       * ``_recut_conflict_attempts`` — consecutive GENUINE conflicts. A transient
-        ``"error"`` resets this to 0, so only a persistent true conflict ever
-        reaches the escalation bound.
-      * ``_recut_last_outcome`` — ``"conflict"`` vs ``"error"`` for observability.
+        ``"error"`` (and a permanent ``"missing"``) reset this to 0, so only a
+        persistent true conflict ever reaches the consecutive-conflict bound.
+      * ``_recut_last_outcome`` — ``"conflict"`` / ``"error"`` / ``"missing"`` for
+        observability.
 
-    On reaching ``_RECUT_CONFLICT_ESCALATION_THRESHOLD`` consecutive conflicts the
-    dependent is escalated EXACTLY ONCE via the same deduplicated machinery the
-    blocked-task escalation uses (``_maybe_create_blocked_escalation_alert``,
-    deduped on ``(task_id, title)``), and an observable ``latest_status_message``
-    plus a ``_recut_escalated`` context marker are stamped so the stuck state is
-    no longer invisible.
+    Escalation policy by outcome:
+
+      * ``"conflict"`` — on reaching ``_RECUT_CONFLICT_ESCALATION_THRESHOLD``
+        consecutive conflicts, escalate EXACTLY ONCE (the conflict may yet be
+        resolved, so it is retried up to the bound first).
+      * ``"missing"``  — a deleted/absent base or head branch (HTTP 404) is a
+        PERMANENT condition that can NEVER recover by retrying the merge, so it
+        escalates IMMEDIATELY on the first occurrence (no bound) under its own
+        blocker_kind and stamps a durable ``_recut_base_missing`` marker.
+      * ``"error"``    — a transient class; NEVER escalates, just retries.
+
+    Escalation goes through the same deduplicated machinery the blocked-task
+    escalation uses (``_maybe_create_blocked_escalation_alert``, deduped on
+    ``(task_id, title)``), and an observable ``latest_status_message`` plus a
+    ``_recut_escalated`` context marker are stamped so the stuck state is no
+    longer invisible.
     """
     from app.reaper_sweeps import _next_recheck_delay
 
@@ -586,8 +605,9 @@ async def _record_recut_failure(
         conflict_attempts = int(ctx.get("_recut_conflict_attempts", 0) or 0) + 1
         ctx["_recut_conflict_attempts"] = conflict_attempts
     else:
-        # A transient error breaks the consecutive-conflict streak: keep retrying
-        # with backoff, but NEVER escalate a transient class.
+        # A transient error (or a permanent missing-branch) breaks the
+        # consecutive-conflict streak: it is classified separately, never on the
+        # conflict bound.
         ctx["_recut_conflict_attempts"] = 0
 
     delay = _next_recheck_delay(recheck_attempts)
@@ -598,18 +618,40 @@ async def _record_recut_failure(
     # blocked-recheck backoff — both are the same backoff family).
     dependent.recheck_after = due
 
-    escalate = (
+    base_label = (dependent.first_payload or {}).get("base_branch") or "(default)"
+    escalate_conflict = (
         outcome == "conflict"
         and conflict_attempts >= _RECUT_CONFLICT_ESCALATION_THRESHOLD
         and not ctx.get("_recut_escalated")
     )
+    # A missing base is permanent — escalate on the FIRST occurrence, not after a
+    # retry bound, so the dependent never parks silently and indefinitely.
+    escalate_missing = outcome == "missing" and not ctx.get("_recut_escalated")
+
     detail = ""
-    if escalate:
+    blocker_kind = _RECUT_CONFLICT_BLOCKER_KIND
+    if escalate_missing:
+        ctx["_recut_escalated"] = True
+        ctx["_recut_base_missing"] = True
+        blocker_kind = _RECUT_MISSING_BASE_BLOCKER_KIND
+        detail = (
+            f"Cross-base base re-cut cannot proceed: the dependent's base branch "
+            f"{base_label!r} (or the integration head it merges from) no longer "
+            "exists on GitHub (HTTP 404). A deleted base is a PERMANENT "
+            "condition — typically the staging branch was cleaned up after its "
+            "rollup merged. Retrying can never succeed; the dependent must be "
+            "re-homed onto integration or cancelled by an operator."
+        )
+        dependent.latest_status_message = (
+            f"Held: cross-base base re-cut base {base_label!r} is missing "
+            "(deleted/404, permanent) — escalated to operator"
+        )
+    elif escalate_conflict:
         ctx["_recut_escalated"] = True
         detail = (
             f"Cross-base base re-cut has conflicted on {conflict_attempts} "
             f"consecutive attempts merging integration into base "
-            f"{(dependent.first_payload or {}).get('base_branch') or '(default)'}. "
+            f"{base_label}. "
             "The dependent cannot dispatch against a base missing its landed "
             "dependency code; a conflict resolution / fix task or operator "
             "action is required."
@@ -624,13 +666,13 @@ async def _record_recut_failure(
     session.add(dependent)
     await session.commit()
 
-    if escalate:
+    if escalate_missing or escalate_conflict:
         from app.alert_dispatch import _maybe_create_blocked_escalation_alert
 
         await _maybe_create_blocked_escalation_alert(
             dependent,
             session,
-            blocker_kind=_RECUT_CONFLICT_BLOCKER_KIND,
+            blocker_kind=blocker_kind,
             detail=detail,
         )
 
@@ -658,6 +700,12 @@ async def ensure_dependent_base_recut(
       * ``"error"``    — a TRANSIENT GitHub/credential error: record a backed-off
                          recheck, reset the consecutive-conflict streak, NEVER
                          escalate, and return False (retry next cycle).
+      * ``"missing"``  — a PERMANENT deleted/absent base or head branch (404):
+                         escalate IMMEDIATELY (first occurrence, no retry bound)
+                         under the missing-base blocker_kind with an observable
+                         status message + durable ``_recut_base_missing`` marker,
+                         so the dependent never parks silently forever. Returns
+                         False.
       * ``"conflict"`` — a GENUINE merge conflict: record it; after
                          ``_RECUT_CONFLICT_ESCALATION_THRESHOLD`` consecutive
                          conflicts escalate exactly once (deduplicated) with an

@@ -1240,9 +1240,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             )
         prior_actionable = _fresh_actionable
         # Decay: discard findings that have been deferred repeatedly for outcome-blind
-        # reasons (ultra_low_confidence / degradation_gate / low_actionability).
-        # Retrying them unchanged wastes a findings slot each cycle. batch_cap deferrals
-        # are pure capacity constraints and are not decayed.
+        # reasons (ultra_low_confidence / degradation_gate / low_actionability /
+        # prereq_deferred_same_cycle). Retrying them unchanged wastes a findings slot
+        # each cycle. batch_cap deferrals are pure capacity constraints and are not
+        # decayed.
         _decayed: list[dict] = []
         _kept: list[dict] = []
         for f in prior_actionable:
@@ -1253,6 +1254,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             elif _reason == "degradation_gate" and _count >= 3:
                 _decayed.append(f)
             elif _reason == "low_actionability" and _count >= 3:
+                _decayed.append(f)
+            elif _reason == "prereq_deferred_same_cycle" and _count >= 3:
+                # Co-deferred dependent whose foundation never re-surfaced in time:
+                # give up after 3 cycles (its deferred foundation has typically
+                # decayed by then too) rather than retrying the coupled pair forever.
                 _decayed.append(f)
             else:
                 _kept.append(f)
@@ -2823,6 +2829,23 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     from app.task_blocked import build_need, enter_blocked_state  # noqa: PLC0415
 
     _prereq_candidates = list(existing_tasks) + list(child_tasks)
+    # Identities (kind, ref) that a finding deferred THIS cycle would satisfy. A
+    # dependent blocked on one of these sits live-blocked behind dormant data: the
+    # deferred foundation is not a real task, so nothing can satisfy the need until
+    # it is both re-surfaced AND re-spawned in some future cycle. If that re-surface
+    # keeps getting throttled (decay / capacity), the dependent exhausts its bounded
+    # blocked re-evaluation budget and is auto-cancelled, discarding researched
+    # work. Such a dependent is co-deferred with its prerequisite (below) so the two
+    # re-surface as a unit instead of being left live.
+    _deferred_identities: set[tuple] = set()
+    for _df in _all_deferred:
+        _dfh = _df.get("finding_hash")
+        if _dfh:
+            _deferred_identities.add(("task", _dfh))
+        _dcap = _df.get("_provides_capability")
+        if isinstance(_dcap, str) and _dcap.strip():
+            _deferred_identities.add(("capability", _dcap.strip()))
+    _codeferred_findings: list[dict] = []
     for ci, ct in enumerate(child_tasks):
         fi = finding_indices[ci]
         finding_title = findings[fi].get("title", f"#{fi}")
@@ -2846,9 +2869,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         dep_indices = findings[fi].get("depends_on_indices", [])
         missing_dep_indices = [j for j in dep_indices if j not in finding_to_child]
         for missing_fi in missing_dep_indices:
-            missing_finding = (
-                findings[missing_fi] if missing_fi < len(findings) else {}
-            )
+            if not (0 <= missing_fi < len(findings)):
+                logger.warning(
+                    "[RESEARCH] Finding '%s' depends_on_indices contains out-of-range "
+                    "index %d (valid range: 0..%d); skipping",
+                    finding_title,
+                    missing_fi,
+                    len(findings) - 1,
+                )
+                continue
+            missing_finding = findings[missing_fi]
             missing_title = missing_finding.get("title", f"#{missing_fi}")
             missing_hash = _finding_hash(
                 str(missing_title),
@@ -2921,7 +2951,47 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     unresolved_entries.append(prereq)
             # foundation == ct itself (self-prerequisite): neither edge nor need.
 
+        # Deduplicate needs by (kind, ref) to avoid recording duplicate entries.
+        # When a dependent names the same missing sibling more than once, or an
+        # explicit prerequisite that coincides with a missing sibling, we should
+        # record only one need for that (kind, ref) pair.
+        if needs:
+            seen_keys = set()
+            deduped_needs = []
+            for need in needs:
+                key = (need.get("kind"), need.get("ref"))
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    deduped_needs.append(need)
+            needs = deduped_needs
+
         if not needs:
+            continue
+
+        # Co-defer a dependent whose foundation was deferred THIS cycle. Leaving it
+        # live-blocked strands it behind dormant data (see _deferred_identities):
+        # shelve its finding alongside the deferred prerequisite so the two
+        # re-surface as a unit next cycle, and cancel the live task so it cannot
+        # expire its blocked re-evaluation budget. Independent deferred findings
+        # (no live dependent) keep the existing capacity/actionability throttle.
+        if _deferred_identities and any(
+            (n.get("kind"), n.get("ref")) in _deferred_identities for n in needs
+        ):
+            _codeferred_findings.append(
+                _stamp_deferral(findings[fi], "prereq_deferred_same_cycle")
+            )
+            ct.status = TaskStatus.CANCELLED
+            ct.latest_status_message = (
+                f"Co-deferred with same-cycle-deferred prerequisite: finding "
+                f"'{finding_title}' shelved to re-surface with its foundation"
+            )[:500]
+            session.add(ct)
+            logger.warning(
+                "[RESEARCH] Co-deferring dependent '%s' with its same-cycle-deferred "
+                "prerequisite (cancelled task %s; both re-surface next cycle)",
+                finding_title,
+                ct.id,
+            )
             continue
 
         # Block the dependent ONCE on the FULL set of unresolved prerequisites.
@@ -2959,6 +3029,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             len(needs),
             ", ".join(f"{n['kind']}:{n['ref']}" for n in needs),
         )
+
+    # Persist co-deferred dependents into the same deferred_findings list as their
+    # prerequisites so autonomous_research re-injects the coupled set next cycle.
+    if _codeferred_findings:
+        _cd_ctx = dict(task.context or {})
+        _cd_ctx["deferred_findings"] = (
+            list(_cd_ctx.get("deferred_findings") or []) + _codeferred_findings
+        )
+        task.context = _cd_ctx
+        flag_modified(task, "context")
+        session.add(task)
 
     # Chain auto-decomposed siblings: when a finding is split into N sub-tasks
     # by cochange/path clustering, run them serially rather than in parallel.
