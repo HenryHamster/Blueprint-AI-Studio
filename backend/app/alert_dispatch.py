@@ -357,6 +357,10 @@ _UNVERIFIED_REASON_LABELS = {
         "no unit suite ran; a command the PR introduced/documented was "
         "executed and passed"
     ),
+    "documented_command_no_artifact": (
+        "a build command the PR introduced/documented exited cleanly but "
+        "produced no artifact (possible no-op build) -- claim unverified"
+    ),
 }
 
 # Severity escalation for no-CI UNVERIFIED-merge reasons: degraded environment/setup
@@ -369,6 +373,7 @@ _UNVERIFIED_REASON_SEVERITY = {
     "probe_could_not_run": AlertSeverity.ERROR,
     "probe_no_artifact": AlertSeverity.ERROR,
     "documented_command_could_not_run": AlertSeverity.ERROR,
+    "documented_command_no_artifact": AlertSeverity.ERROR,
     # WARNING (benign): no verification expected or only positive signals obtained
     "no_detectable_test_command": AlertSeverity.WARNING,
     "kill_switch_off": AlertSeverity.WARNING,

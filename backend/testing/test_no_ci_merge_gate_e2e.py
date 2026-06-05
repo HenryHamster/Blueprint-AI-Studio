@@ -1258,6 +1258,63 @@ async def test_no_ci_documented_command_passing_proceeds_to_merge(db_session, mo
 
 
 @pytest.mark.asyncio
+async def test_no_ci_documented_build_no_artifact_falls_open_with_distinct_reason(
+    db_session, mocker
+):
+    """A BUILD-INTENT documented command that exits 0 yet writes NO artifact
+    (``wrote_no_artifact`` true) must NOT block — it still falls open
+    ('undetected') — but records the distinct ``documented_command_no_artifact``
+    reason instead of the confident ``documented_command_passed``, mirroring the
+    declared-build ``probe_no_artifact`` refinement so an operator can see the
+    result-producing command produced no result."""
+    _patch_github(mocker)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", return_value={"merged": True}
+    )
+
+    noop_verdict = {
+        "detected": False,
+        "noTestsReason": "no_suite",
+        "documentedCommands": {
+            "ran": True,
+            "outcome": "pass",
+            "passed": True,
+            "could_not_run": False,
+            "output": "",
+            "label": "make build",
+            "wrote_no_artifact": True,
+        },
+    }
+    outcome, detail = classify_merge_test_verdict(noop_verdict)
+    # A no-op build is informational only — it never blocks the merge.
+    assert outcome == "undetected" and detail == ""
+    _, reason_key = classify_unverified_fall_open_reason(noop_verdict)
+    assert reason_key == "documented_command_no_artifact"
+
+    ci_result = build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "success"
+
+    project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    parent = await db_session.get(Task, parent.id)
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    merge_mock.assert_called_once()  # a no-artifact documented build does NOT block
+
+    await _record_gate_runtime(
+        db_session, project, outcome=outcome, unverified_reason=reason_key
+    )
+    runtime = merge_gate_runtime_block(project)
+    assert runtime["executed_real_tests"] is False
+    assert runtime["last_unverified_reason"] == "documented_command_no_artifact"
+
+
+@pytest.mark.asyncio
 async def test_no_ci_documented_command_could_not_run_falls_open_with_distinct_reason(
     db_session, mocker
 ):
@@ -1426,6 +1483,7 @@ async def test_unverified_merge_alert_severity_degraded_vs_benign(db_session, mo
         "suite_all_skipped",
         "probe_could_not_run",
         "documented_command_could_not_run",
+        "documented_command_no_artifact",
     ]:
         project = await _make_no_ci_project(db_session, with_test_cmd=False)
         parent = _make_parent_task(db_session, project)

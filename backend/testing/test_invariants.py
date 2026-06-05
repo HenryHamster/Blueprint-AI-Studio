@@ -8346,7 +8346,8 @@ class TestAgentTestRunnerParseHelpers:
 #   verify_setup_failed        -> app/orchestrator.py no-CI gate
 #   undetected_runtime / suite_all_skipped / probe_passed / probe_could_not_run /
 #   probe_no_artifact / documented_command_could_not_run /
-#   documented_command_passed  -> ci_resolution.classify_unverified_fall_open_reason
+#   documented_command_passed / documented_command_no_artifact
+#                              -> ci_resolution.classify_unverified_fall_open_reason
 _UNVERIFIED_REASON_KEYS = frozenset(
     {
         "no_detectable_test_command",
@@ -8360,6 +8361,7 @@ _UNVERIFIED_REASON_KEYS = frozenset(
         "probe_no_artifact",
         "documented_command_could_not_run",
         "documented_command_passed",
+        "documented_command_no_artifact",
     }
 )
 
@@ -8438,6 +8440,7 @@ _DEGRADED_REASON_KEYS = frozenset(
         "probe_could_not_run",
         "probe_no_artifact",
         "documented_command_could_not_run",
+        "documented_command_no_artifact",
     }
 )
 

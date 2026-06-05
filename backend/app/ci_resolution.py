@@ -820,9 +820,13 @@ def classify_unverified_fall_open_reason(
     ``documentedCommands`` block is present (a command the PR INTRODUCES or
     DOCUMENTS), surface DISTINCT operator-visible reason keys —
     ``documented_command_could_not_run`` when missing deps / unprovisioned setup
-    degraded it (the claim went unverified), or ``documented_command_passed``
-    when the documented command was the positive execution evidence (no unit
-    suite ran but the documented command executed and passed). This signal takes
+    degraded it (the claim went unverified), ``documented_command_no_artifact``
+    when a BUILD-INTENT documented command exited 0 yet (per the agent's
+    ``wrote_no_artifact`` observation) wrote no output to the fresh PR-head clone
+    (a likely no-op build — mirroring the declared-build ``probe_no_artifact``
+    refinement), or ``documented_command_passed`` when the documented command was
+    the positive execution evidence (no unit suite ran but the documented command
+    executed and passed). This signal takes
     precedence over the acceptance-probe / all-skipped phrasing because a command
     the PR itself introduced is the most specific claim we can speak to. A CLEAR
     documented-command failure never reaches here — it blocks via
@@ -846,6 +850,25 @@ def classify_unverified_fall_open_reason(
                 )
                 return (phrase, "documented_command_could_not_run")
             if documented.get("passed") is True:
+                # Honest refinement mirroring the declared-build ``probe_no_artifact``
+                # path: a BUILD-INTENT documented/PR-introduced command that exited 0
+                # but — per the agent's ``wrote_no_artifact`` observation — wrote
+                # NOTHING to the fresh PR-head clone is a likely no-op build/generate.
+                # A result-producing command that produced no result does not honestly
+                # verify the claim, so surface a DISTINCT reason instead of the
+                # confident ``documented_command_passed``. The agent sets the flag ONLY
+                # for a build-intent command whose tree it confidently observed; an
+                # absent / false flag (lint/test command, older agent, unobservable
+                # tree) keeps today's ``documented_command_passed`` byte-for-byte.
+                if documented.get("wrote_no_artifact") is True:
+                    phrase = (
+                        f"a PR-introduced/documented build ran but emitted no artifact "
+                        f"({label}) — possible no-op build"
+                        if label
+                        else "a PR-introduced/documented build ran but emitted no "
+                        "artifact (possible no-op build)"
+                    )
+                    return (phrase, "documented_command_no_artifact")
                 phrase = (
                     f"a PR-introduced/documented command was executed and passed ({label})"
                     if label

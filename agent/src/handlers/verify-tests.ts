@@ -124,6 +124,16 @@ interface VerifyTestsResult {
     could_not_run: boolean;
     output: string;
     label: string;
+    // ADDITIVE honesty signal mirroring ``probe.wrote_no_artifact`` for the
+    // declared-build path: set ONLY for a PASSED, BUILD-INTENT documented command
+    // (the discovery layer's ``heavy`` flag) whose working tree we could
+    // confidently observe before AND after the run — true when the command exited
+    // 0 yet wrote NO new output (a likely no-op build/generate). Left UNSET for
+    // non-build commands (lint/test/typecheck correctly produce no artifact), when
+    // the tree was unobservable, and on every other outcome — so the backend
+    // degrades to ``documented_command_passed`` rather than emitting the no-op
+    // reason on uncertainty.
+    wrote_no_artifact?: boolean;
   };
   // Diff-aware VISIBILITY signal for the inverse anti-pattern of the documented-
   // command probe: a PR that makes a red suite green by DISABLING tests rather
@@ -415,10 +425,23 @@ async function runDocumentedCommandsProbe(
   sendLog(ws, `Documented-command probe: running ${discovered.length} PR-introduced/documented command(s): ${discovered.map(d => d.label).join(', ')}\n`);
 
   let firstPass: DocumentedCommand | null = null;
+  // The no-op observation for the winning PASS command: undefined = not
+  // confidently observed (degrade to documented_command_passed); boolean =
+  // observed. Only a BUILD-INTENT (``heavy``) command can set it.
+  let firstPassWroteNoArtifact: boolean | undefined;
   let firstCouldNotRun: DocumentedCommand | null = null;
   for (const cmd of discovered) {
     const runner = runnerFromCommand(cmd.command, cmd.cwd);
     const timeoutMs = cmd.heavy ? DECLARED_BUILD_TIMEOUT : GENERIC_PROBE_TIMEOUT;
+    // For a BUILD-INTENT command that could still WIN the verdict (no earlier
+    // pass yet), snapshot the tree BEFORE it runs so a clean exit that wrote
+    // nothing is distinguishable from a real build — mirroring the declared-build
+    // no-op detection. Non-build commands (``heavy`` false: lint/test/typecheck/
+    // ``--help``) correctly produce no artifact and are NEVER snapshotted. A
+    // failed snapshot leaves the observation unavailable (flag stays unset).
+    const before = cmd.heavy && firstPass === null
+      ? await snapshotWorkingTree(runner.cwd)
+      : null;
     let outcome: 'pass' | 'fail' | 'could_not_run';
     let output = '';
     try {
@@ -440,13 +463,30 @@ async function runDocumentedCommandsProbe(
         label: `PR-introduced command failed: ${cmd.label}`,
       };
     }
-    if (outcome === 'pass' && firstPass === null) firstPass = cmd;
+    if (outcome === 'pass' && firstPass === null) {
+      firstPass = cmd;
+      // Only a BUILD-INTENT command with BOTH snapshots observed yields a
+      // confident no-op signal; anything else leaves the flag unset.
+      if (cmd.heavy && before !== null) {
+        const after = await snapshotWorkingTree(runner.cwd);
+        if (after !== null) {
+          const wroteSomething = buildWroteNewOutput(before, after);
+          firstPassWroteNoArtifact = !wroteSomething;
+          if (!wroteSomething) {
+            sendLog(ws, `Documented-command probe [${cmd.label}]: build command exited cleanly but wrote no new output — possible no-op build.\n`);
+          }
+        }
+      }
+    }
     if (outcome === 'could_not_run' && firstCouldNotRun === null) firstCouldNotRun = cmd;
   }
   if (firstPass !== null) {
     return {
       ran: true, outcome: 'pass', passed: true, could_not_run: false,
       output: '', label: `PR-introduced command passed: ${firstPass.label}`,
+      ...(firstPassWroteNoArtifact !== undefined
+        ? { wrote_no_artifact: firstPassWroteNoArtifact }
+        : {}),
     };
   }
   const cnr = firstCouldNotRun as DocumentedCommand;
@@ -478,7 +518,9 @@ async function attachDocumentedCommandsProbe(
   if (block.outcome === 'fail') {
     note = `Documented/PR-introduced command probe FAILED — ${block.label}; blocking the merge.`;
   } else if (block.outcome === 'pass') {
-    note = `Documented/PR-introduced command probe passed — ${block.label} (cheap goal-level signal).`;
+    note = block.wrote_no_artifact === true
+      ? `Documented/PR-introduced command probe ran but wrote no artifact — ${block.label}; possible no-op build (cheap goal-level signal; not confident verification).`
+      : `Documented/PR-introduced command probe passed — ${block.label} (cheap goal-level signal).`;
   } else {
     note = `Documented/PR-introduced command probe could not run — ${block.label}; falling open without a block.`;
   }

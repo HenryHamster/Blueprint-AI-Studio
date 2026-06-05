@@ -95,6 +95,30 @@ describe('detectProvisioningSteps', () => {
     expect(steps[0].cmd).toBe('poetry');
   });
 
+  it('auto-provisions Pipenv with pipenv install --system when Pipfile is present', () => {
+    // Pipfile signals Pipenv manages deps — auto-provision with pipenv install --system
+    // (--system installs to ambient interpreter, not a virtualenv).
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/Pipfile`);
+    const steps = detectProvisioningSteps(undefined);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].cmd).toBe('pipenv');
+    expect(steps[0].args).toEqual(['install', '--system']);
+    expect(steps[0].cwd).toBe(WORKSPACE);
+    expect(steps[0].declared).toBeUndefined();
+  });
+
+  it('declared install_cmd suppresses Pipenv auto-provision for the same dir', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/Pipfile`);
+    const buildConfig: BuildConfig = {
+      directories: [{ path: '', type: 'python', install_cmd: 'pipenv install --system --skip-lock' }],
+    };
+    const steps = detectProvisioningSteps(buildConfig);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].declared).toBe(true);
+    expect(steps[0].cmd).toBe('pipenv');
+    expect(steps[0].args).toEqual(['install', '--system', '--skip-lock']);
+  });
+
   it('auto-provisions a bare setup.py repo with pip install .', () => {
     // setup.py without pyproject.toml, poetry.lock, or requirements.txt → pip install .
     mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/setup.py`);
@@ -126,6 +150,17 @@ describe('detectProvisioningSteps', () => {
     expect(steps[0].cmd).toBe('pip');
     expect(steps[0].args).toEqual(['install', '.']);
     // This is from pyproject-only (no poetry.lock, no requirements.txt)
+  });
+
+  it('does NOT auto-provision bare setup.py when Pipfile is present', () => {
+    // Pipfile takes precedence over bare setup.py (Pipenv branch fires instead)
+    mockFs.existsSync.mockImplementation((p: string) =>
+      p === `${WORKSPACE}/Pipfile` || p === `${WORKSPACE}/setup.py`,
+    );
+    const steps = detectProvisioningSteps(undefined);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].cmd).toBe('pipenv');
+    expect(steps[0].args).toEqual(['install', '--system']);
   });
 
   // requirements.txt auto-provision: a Python repo without a pyproject.toml (or with one)

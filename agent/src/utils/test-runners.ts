@@ -731,7 +731,28 @@ export function detectProvisioningSteps(buildConfig?: BuildConfig): Provisioning
   // Repo root covers the auto-detected (no build_config) case.
   addPoetryAuto(WORKSPACE, 'root');
 
-  // 2d) Bare setup.py/setup.cfg Python auto-provision. A project with setup.py or
+  // 2d) Pipenv Python auto-provision. A project with a Pipfile must run
+  //     `pipenv install --system` before tests/probes to install dependencies
+  //     into the ambient interpreter (not a virtualenv). Without this, the
+  //     documented-command probe runs unprovisioned, hits missing-dependency or
+  //     command-not-found, and classifies as "could not run" — silently falling
+  //     open. Skipped when a declared install_cmd is present (operator's command
+  //     wins); deduped by cwd like the other auto steps.
+  const addPipenvAuto = (absDir: string, label: string): void => {
+    if (declaredCwds.has(absDir)) return;
+    if (!exists(`${absDir}/Pipfile`)) return;
+    add({ cmd: 'pipenv', args: ['install', '--system'], cwd: absDir, label: `pipenv install --system (${label})` });
+  };
+  if (buildConfig?.directories) {
+    for (const dir of buildConfig.directories) {
+      if (dir.type !== 'python') continue;
+      addPipenvAuto(dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE, dir.path || 'root');
+    }
+  }
+  // Repo root covers the auto-detected (no build_config) case.
+  addPipenvAuto(WORKSPACE, 'root');
+
+  // 2e) Bare setup.py/setup.cfg Python auto-provision. A project with setup.py or
   //     setup.cfg but NO pyproject.toml must run `pip install .` before tests/probes to
   //     install dependencies AND the project's own package (with console-script entrypoints).
   //     Without this, the documented-command probe runs unprovisioned, hits missing-dependency
@@ -744,6 +765,7 @@ export function detectProvisioningSteps(buildConfig?: BuildConfig): Provisioning
     !exists(`${absDir}/requirements-dev.txt`) &&
     !exists(`${absDir}/requirements/base.txt`) &&
     !exists(`${absDir}/poetry.lock`) &&
+    !exists(`${absDir}/Pipfile`) &&
     (exists(`${absDir}/setup.py`) || exists(`${absDir}/setup.cfg`));
   const addBareSetupAuto = (absDir: string, label: string): void => {
     if (declaredCwds.has(absDir) || !bareSetupPy(absDir)) return;
@@ -771,7 +793,7 @@ export function detectProvisioningSteps(buildConfig?: BuildConfig): Provisioning
   //    any cwd already provisioned above (deduped by `add`). First match wins per
   //    dir; mirrors detectExtraFamilyRunner's detection order. A provisioning
   //    FAILURE flows through the existing setup-failure path exactly like a failed
-  //    declared install or pip/poetry install — never a blocking test failure.
+  //    declared install, pipenv/poetry install, or pip install — never a blocking test failure.
   const addExtraFamilyAuto = (absDir: string, label: string): void => {
     if (declaredCwds.has(absDir)) return;
     // Ruby: Gemfile → `bundle install`.

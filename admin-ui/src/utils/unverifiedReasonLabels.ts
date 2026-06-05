@@ -24,6 +24,7 @@ export const UNVERIFIED_REASON_LABELS: Record<string, string> = {
   probe_no_artifact: 'no unit suite ran; the declared build command exited cleanly but produced no artifact (possible no-op build) — not real verification',
   documented_command_could_not_run: 'a command the PR introduced/documented could not be run (missing deps/unprovisioned setup) -- claim unverified',
   documented_command_passed: 'no unit suite ran; a command the PR introduced/documented was executed and passed',
+  documented_command_no_artifact: 'no unit suite ran; a build command the PR introduced/documented exited cleanly but produced no artifact (possible no-op build) — not real verification',
 };
 
 /**

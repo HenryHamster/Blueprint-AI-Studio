@@ -34,11 +34,16 @@ vi.mock('../utils/test-runners.js', async (importOriginal) => {
   // detectAcceptanceProbes is mocked so the fall-open paths never scan the real
   // filesystem; classifyProbeOutcome stays REAL so the probe verdict reflects the
   // actual signature classification of the mocked execFileAsync error.
+  // discoverDocumentedCommands is mocked so the documented-command probe tests
+  // can drive a specific discovered command (build-intent vs lint) without a real
+  // filesystem/diff scan. runnerFromCommand stays REAL so the mocked command
+  // string is tokenized into the actual {cmd,args} the probe executes.
   return {
     ...actual,
     detectTestRunners: vi.fn(),
     detectAutoTestRunners: vi.fn(),
     detectAcceptanceProbes: vi.fn(),
+    discoverDocumentedCommands: vi.fn(),
   };
 });
 
@@ -55,7 +60,7 @@ vi.mock('fs', () => ({
 
 import { handleVerifyTests } from './verify-tests.js';
 import { persistAndPostStatus, execFileAsync } from '../index.js';
-import { detectTestRunners, detectAutoTestRunners, detectAcceptanceProbes } from '../utils/test-runners.js';
+import { detectTestRunners, detectAutoTestRunners, detectAcceptanceProbes, discoverDocumentedCommands } from '../utils/test-runners.js';
 import { testFixLoop } from '../utils/test-fix-loop.js';
 
 const PY_PROBE = {
@@ -113,6 +118,10 @@ describe('handleVerifyTests', () => {
     // Default: no probeable ecosystem, so the existing fall-open tests carry no
     // probe field and behave exactly as before. Probe tests override this.
     vi.mocked(detectAcceptanceProbes).mockReturnValue([]);
+    // Default: the PR introduces/documents no runnable command, so the
+    // documented-command probe is a no-op and existing tests are unaffected.
+    // The no-op-build tests override this per-case.
+    vi.mocked(discoverDocumentedCommands).mockReturnValue([]);
     vi.mocked(execFileAsync).mockResolvedValue('');
   });
 
@@ -680,6 +689,113 @@ describe('handleVerifyTests', () => {
     expect(callsWithTimeouts[0].timeoutMs).toBe(60_000);
     // The declared build probe should use the larger timeout (TEST_RUNNER_TIMEOUT = 180_000)
     expect(callsWithTimeouts[1].timeoutMs).toBe(180_000);
+  });
+
+  // ── Documented/PR-introduced build command no-op detection ──────────────────
+  describe('documentedCommands wrote_no_artifact (no-op build) detection', () => {
+    type DocCmds = {
+      ran: boolean; outcome: string; passed: boolean; could_not_run: boolean;
+      output: string; label: string; wrote_no_artifact?: boolean;
+    };
+    function docVerdict(): { documentedCommands?: DocCmds; output: string } {
+      return JSON.parse(lastPostedPayload().logs as string) as { documentedCommands?: DocCmds; output: string };
+    }
+    // A build-intent (heavy) documented command and a non-build (lint) one.
+    const DOC_BUILD = {
+      command: 'npm run build', cwd: '/tmp/workspace',
+      source: 'package.json scripts.build', label: 'npm run build (package.json)', heavy: true,
+    };
+    const DOC_LINT = {
+      command: 'npm run lint', cwd: '/tmp/workspace',
+      source: 'package.json scripts.lint', label: 'npm run lint (package.json)', heavy: false,
+    };
+    // Drive the PR-diff git passes (return one changed file so the probe runs)
+    // and the before/after `git status` snapshots around the documented build.
+    function mockDocBuildTree(before: string, after: string): void {
+      let statusCalls = 0;
+      vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
+        if (cmd === 'git') {
+          const a = args as string[];
+          if (a.includes('--name-only')) return Promise.resolve('package.json');
+          if (a.includes('status')) {
+            statusCalls += 1;
+            return Promise.resolve(statusCalls === 1 ? before : after);
+          }
+          return Promise.resolve(''); // the --unified=0 diff
+        }
+        return Promise.resolve(''); // the documented build exits 0
+      });
+    }
+    function sawGitStatus(): boolean {
+      return vi.mocked(execFileAsync).mock.calls.some(
+        c => c[0] === 'git' && Array.isArray(c[1]) && c[1].includes('status'),
+      );
+    }
+
+    beforeEach(() => {
+      vi.mocked(detectTestRunners).mockReturnValue([]); // no unit suite
+    });
+
+    it('no-op documented build (passes, wrote NOTHING) → wrote_no_artifact true + no-op wording', async () => {
+      vi.mocked(discoverDocumentedCommands).mockReturnValue([DOC_BUILD]);
+      mockDocBuildTree('!! node_modules/\n', '!! node_modules/\n'); // before === after
+
+      await handleVerifyTests('doc-noop', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+      const verdict = docVerdict();
+      expect(verdict.documentedCommands?.passed).toBe(true);
+      expect(verdict.documentedCommands?.wrote_no_artifact).toBe(true);
+      expect(verdict.output).toContain('wrote no artifact');
+    });
+
+    it('real documented build (passes, wrote output) → wrote_no_artifact false, normal wording', async () => {
+      vi.mocked(discoverDocumentedCommands).mockReturnValue([DOC_BUILD]);
+      mockDocBuildTree('!! node_modules/\n', '!! node_modules/\n?? dist/bundle.js\n');
+
+      await handleVerifyTests('doc-real', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+      const verdict = docVerdict();
+      expect(verdict.documentedCommands?.passed).toBe(true);
+      expect(verdict.documentedCommands?.wrote_no_artifact).toBe(false);
+      expect(verdict.output).toContain('command probe passed');
+      expect(verdict.output).not.toContain('wrote no artifact');
+    });
+
+    it('documented LINT command (not build-intent) → never snapshotted, never flagged', async () => {
+      vi.mocked(discoverDocumentedCommands).mockReturnValue([DOC_LINT]);
+      mockDocBuildTree('!! node_modules/\n', '!! node_modules/\n'); // tree static, but irrelevant
+
+      await handleVerifyTests('doc-lint', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+      const verdict = docVerdict();
+      expect(verdict.documentedCommands?.passed).toBe(true);
+      // A clean lint correctly produces no artifact — it must NOT be flagged and
+      // the tree must never have been snapshotted for it.
+      expect(verdict.documentedCommands?.wrote_no_artifact).toBeUndefined();
+      expect(sawGitStatus()).toBe(false);
+      expect(verdict.output).toContain('command probe passed');
+    });
+
+    it('no-op build but tree unobservable (git status fails) → flag unset', async () => {
+      vi.mocked(discoverDocumentedCommands).mockReturnValue([DOC_BUILD]);
+      vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
+        if (cmd === 'git') {
+          const a = args as string[];
+          if (a.includes('--name-only')) return Promise.resolve('package.json');
+          if (a.includes('status')) return Promise.reject(new Error('not a git repository'));
+          return Promise.resolve('');
+        }
+        return Promise.resolve(''); // build exits 0
+      });
+
+      await handleVerifyTests('doc-unobs', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+      const verdict = docVerdict();
+      expect(verdict.documentedCommands?.passed).toBe(true);
+      // Observation unavailable → flag UNSET so the backend keeps documented_command_passed.
+      expect(verdict.documentedCommands?.wrote_no_artifact).toBeUndefined();
+      expect(verdict.output).toContain('command probe passed');
+    });
   });
 
   // ── Newly-disabled-tests visibility probe (diff-aware, never blocks) ────────
