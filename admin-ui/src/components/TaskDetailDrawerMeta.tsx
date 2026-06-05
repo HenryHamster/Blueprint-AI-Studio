@@ -13,6 +13,12 @@ import { TaskDiagnosticsPanel, TaskErrorLogsPanel, getLogEntryColor } from './Ta
 import { FailureDetailPanel } from './TaskDetailDrawerFailureDetail';
 import type { PanelReviewIssue, PanelReviewVerdict, Task, TaskEvaluationSummary } from '../types/task';
 import { humanizeUnverifiedReason } from '../utils/unverifiedReasonLabels';
+import {
+  parseMergeTestVerdict,
+  deriveMergeTestOutcome,
+  type MergeTestVerdict,
+  type MergeTestResult,
+} from '../utils/mergeTestVerdict';
 
 function CopyableId({ value }: { value: string }) {
   const [copied, setCopied] = useState(false);
@@ -500,7 +506,7 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
       .catch(() => {});
   }, [task.project_id, provenanceDirectionId]);
 
-  const { prArtifacts, commitArtifacts, investigationArtifacts, mergeTestVerdict, unverifiedMergeReason } = useMemo(() => {
+  const { prArtifacts, commitArtifacts, investigationArtifacts, mergeTestVerdict, mergeTestResult, unverifiedMergeReason } = useMemo(() => {
     const artifacts = task.artifacts ?? [];
     // Surface the no-CI merge gate's verdict. The verify_tests handler posts a
     // MERGE_TEST_RESULT artifact whose `logs` carry the JSON verdict
@@ -510,27 +516,22 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
     // (classify_merge_test_verdict in ci_resolution.py): detected=false →
     // undetected; passed truthy → pass; otherwise → fail.
     const mergeTestArtifacts = artifacts.filter(a => a.artifact_type === 'MERGE_TEST_RESULT' && a.logs);
-    // The cheap goal-level acceptance probe the agent attaches on a no-suite
-    // fall-open ("does the changed code still compile/build"). Surfaced next to
-    // the suite verdict, consistent with the Evaluation Summary section.
-    type ProbeBlock = { ran?: boolean; ecosystem?: string; passed?: boolean; could_not_run?: boolean };
-    let mergeTestVerdict: { outcome: 'pass' | 'fail' | 'undetected'; output: string; probe: ProbeBlock | null } | null = null;
+    // Parse the latest MERGE_TEST_RESULT artifact and derive the top-line gate
+    // verdict via the shared helper, which mirrors the backend gate's actual
+    // merge decision (classify_merge_test_verdict in ci_resolution.py). This
+    // surfaces documented-command / partial-setup / acceptance-probe blocks the
+    // detected+passed-only derivation could not — and never reads as a clean
+    // "Passed" / "No suite detected" when the gate actually blocked.
+    let mergeTestVerdict: MergeTestVerdict | null = null;
+    let mergeTestResult: MergeTestResult | null = null;
     if (mergeTestArtifacts.length > 0) {
       const latest = mergeTestArtifacts.reduce((a, b) => ((b.iteration ?? 1) >= (a.iteration ?? 1) ? b : a));
       try {
-        const parsed = JSON.parse(latest.logs as string) as { detected?: boolean; passed?: boolean; output?: string; probe?: ProbeBlock };
-        const outcome: 'pass' | 'fail' | 'undetected' = parsed.detected === false
-          ? 'undetected'
-          : parsed.passed
-            ? 'pass'
-            : 'fail';
-        mergeTestVerdict = {
-          outcome,
-          output: typeof parsed.output === 'string' ? parsed.output : '',
-          probe: parsed.probe && typeof parsed.probe === 'object' ? parsed.probe : null,
-        };
+        mergeTestVerdict = parseMergeTestVerdict(JSON.parse(latest.logs as string));
+        mergeTestResult = mergeTestVerdict ? deriveMergeTestOutcome(mergeTestVerdict) : null;
       } catch {
         mergeTestVerdict = null;
+        mergeTestResult = null;
       }
     }
     return {
@@ -538,6 +539,7 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
       commitArtifacts: artifacts.filter(a => a.artifact_type === 'GIT_COMMIT'),
       investigationArtifacts: artifacts.filter(a => a.artifact_type === 'INVESTIGATION_REPORT'),
       mergeTestVerdict,
+      mergeTestResult,
       unverifiedMergeReason: typeof task.unverified_merge_reason === 'string' ? task.unverified_merge_reason : null,
     };
   }, [task.artifacts, task.unverified_merge_reason]);
@@ -991,8 +993,8 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         );
       })() : null}
 
-      {(mergeTestVerdict || unverifiedMergeReason) && (() => {
-        const config: Record<'pass' | 'fail' | 'undetected' | 'unverified', { label: string; badge: string; note: string }> = {
+      {(mergeTestResult || unverifiedMergeReason) && (() => {
+        const config: Record<'pass' | 'fail' | 'blocked' | 'undetected' | 'unverified', { label: string; badge: string; note: string }> = {
           pass: {
             label: 'Passed',
             badge: 'text-emerald-400 bg-emerald-950/30 border-emerald-800/40',
@@ -1002,6 +1004,12 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
             label: 'Failed',
             badge: 'text-red-400 bg-red-950/30 border-red-800/40',
             note: "The repository's own test suite ran on the PR head and failed — the merge gate blocked the merge.",
+          },
+          blocked: {
+            label: 'Blocked',
+            badge: 'text-red-400 bg-red-950/30 border-red-800/40',
+            // Reason-specific note set below; this is the generic fallback.
+            note: 'The merge gate blocked the merge on a verification failure.',
           },
           undetected: {
             label: 'No suite detected',
@@ -1019,15 +1027,46 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         // opens this section and selects the UNVERIFIED verdict. When both an
         // artifact verdict and a reason are present, the reason takes precedence
         // for the verdict label/note while any captured test output still shows.
-        const outcome: 'pass' | 'fail' | 'undetected' | 'unverified' =
-          unverifiedMergeReason || !mergeTestVerdict ? 'unverified' : mergeTestVerdict.outcome;
+        const outcome: 'pass' | 'fail' | 'blocked' | 'undetected' | 'unverified' =
+          unverifiedMergeReason || !mergeTestResult ? 'unverified' : mergeTestResult.outcome;
         const v = config[outcome];
         const reasonLabel = unverifiedMergeReason
           ? humanizeUnverifiedReason(unverifiedMergeReason)
           : null;
+        // Reason-specific note for a gate BLOCK (documented-command /
+        // partial-setup / probe failure), so the operator sees WHY the gate
+        // blocked rather than the generic suite-failed wording.
+        const blockedNote = (() => {
+          if (outcome !== 'blocked' || !mergeTestResult) return null;
+          switch (mergeTestResult.reason) {
+            case 'documented_command_failed':
+              return 'A command this PR introduced or documented was executed and failed — the gate blocked the merge with higher precedence than the unit suite.';
+            case 'partial_setup_failed':
+              return 'One or more test runners could not run their suite (environment/setup error) — the suite is only partially verified, so the gate blocked the merge.';
+            case 'declared_build_failed':
+              return "The project's own declared build command failed — the gate blocked the merge.";
+            case 'probe_failed':
+              return 'The acceptance probe failed: the changed code does not compile/build — the gate blocked the merge.';
+            default:
+              return v.note;
+          }
+        })();
         const note = reasonLabel
           ? `The merge bypassed test verification — ${reasonLabel}.`
-          : v.note;
+          : blockedNote ?? v.note;
+        // Documented / PR-introduced command probe — runs regardless of suite
+        // detection. Surface its honest outcome (label + pass / fail /
+        // could-not-run) whenever it ran.
+        const documented = mergeTestVerdict?.documentedCommands?.ran ? mergeTestVerdict.documentedCommands : null;
+        const documentedState = documented
+          ? (documented.passed ? 'passed' : documented.could_not_run ? 'could not run' : 'failed')
+          : null;
+        const documentedStateClass = documented
+          ? (documented.passed ? 'text-emerald-400' : documented.could_not_run ? 'text-neutral-400' : 'text-red-400')
+          : '';
+        const documentedLabel = (documented?.label ?? '').trim();
+        const documentedFailed = documented ? documented.passed === false && !documented.could_not_run : false;
+        const documentedOutput = (documented?.output ?? '').trim();
         // The acceptance probe runs only on a no-suite fall-open. Render its
         // honest outcome (ecosystem + passed / could-not-run / failed) next to
         // the suite verdict, mirroring the Evaluation Summary section.
@@ -1039,6 +1078,25 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
           ? (probe.passed ? 'text-emerald-400' : probe.could_not_run ? 'text-neutral-400' : 'text-red-400')
           : '';
         const probeEcosystem = (probe?.ecosystem ?? '').trim();
+        // declared=true means it ran the operator's OWN declared build command
+        // (vs a generic ecosystem compile check); attribute it explicitly.
+        const probeKind = probe?.declared ? 'declared build' : 'generic check';
+        // A PASSED declared build that wrote no output is a possible no-op build.
+        const probeNoArtifact = Boolean(probe?.declared && probe.passed && probe.wrote_no_artifact);
+        // Stale-command self-heal: the stored test command was stale and
+        // auto-detection replaced it with a real suite that actually ran.
+        const recovered = mergeTestVerdict?.recovered ? mergeTestVerdict : null;
+        const recoveredDirs = recovered?.recovered_directories ?? [];
+        // Choose the most relevant output to surface in the scrollable block:
+        // the failing documented-command output (already shown above) is not
+        // repeated; a probe/partial-setup BLOCK shows the block detail;
+        // otherwise the captured suite output.
+        const suiteOutput = (mergeTestVerdict?.output ?? '').trim();
+        const testOutput = documentedFailed && documentedOutput
+          ? ''
+          : outcome === 'blocked' && mergeTestResult
+            ? mergeTestResult.detail.trim()
+            : suiteOutput;
         return (
           <>
             <SectionHeader>Merge Test Gate</SectionHeader>
@@ -1049,19 +1107,58 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
                   {v.label}
                 </span>
               </div>
+              {documentedState && (
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-xs text-neutral-500 w-28 shrink-0">Documented command</span>
+                  <span className={`text-xs font-semibold ${documentedStateClass}`}>
+                    {documentedLabel ? `${documentedLabel}: ` : ''}{documentedState}
+                  </span>
+                </div>
+              )}
               {probeState && (
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
                   <span className="text-xs text-neutral-500 w-28 shrink-0">Acceptance probe</span>
                   <span className={`text-xs font-semibold ${probeStateClass}`}>
                     {probeEcosystem ? `${probeEcosystem}: ` : ''}{probeState}
                   </span>
+                  <span className="text-xs text-neutral-500">({probeKind})</span>
+                </div>
+              )}
+              {probeNoArtifact && (
+                <p className="text-xs text-amber-400 break-words">
+                  ⚠ The declared build exited cleanly but wrote no output — possible no-op build (not real verification).
+                </p>
+              )}
+              {recovered && (
+                <div className="flex items-start gap-2">
+                  <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Recovered suite</span>
+                  <div className="text-xs text-neutral-300 min-w-0 flex-1">
+                    <p className="break-words">The stored test command was stale; auto-detection ran a replacement suite.</p>
+                    {recoveredDirs.length > 0 && (
+                      <ul className="mt-1 space-y-0.5">
+                        {recoveredDirs.map((d, i) => (
+                          <li key={i} className="break-words">
+                            <span className="font-mono text-blue-300">{d.path || '.'}</span>
+                            {d.type ? <span className="text-neutral-500"> ({d.type})</span> : null}
+                            {d.test_cmd ? <span className="font-mono text-neutral-400"> — {d.test_cmd}</span> : null}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
                 </div>
               )}
               <p className="text-xs text-neutral-400 break-words">{note}</p>
-              {mergeTestVerdict?.output && (
+              {documentedFailed && documentedOutput && (
+                <div className="flex items-start gap-2">
+                  <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Command Output</span>
+                  <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-neutral-800 font-mono min-w-0 flex-1">{documentedOutput}</pre>
+                </div>
+              )}
+              {testOutput && (
                 <div className="flex items-start gap-2">
                   <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Test Output</span>
-                  <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-neutral-800 font-mono min-w-0 flex-1">{mergeTestVerdict.output}</pre>
+                  <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-neutral-800 font-mono min-w-0 flex-1">{testOutput}</pre>
                 </div>
               )}
             </div>

@@ -146,6 +146,152 @@ describe('DetailsTab — Merge Test Gate', () => {
     expect(screen.getByText('python: could not run')).toBeInTheDocument();
   });
 
+  it('blocks (not Passed) when a documented command failed despite a passing unit suite', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({
+        detected: true,
+        passed: true,
+        tests: [],
+        output: '',
+        documentedCommands: {
+          ran: true, outcome: 'fail', passed: false, could_not_run: false,
+          output: 'lint: 3 problems', label: 'npm run lint',
+        },
+      })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Blocked')).toBeInTheDocument();
+    expect(screen.queryByText('Passed')).toBeNull();
+    expect(screen.getByText('Documented command')).toBeInTheDocument();
+    expect(screen.getByText('npm run lint: failed')).toBeInTheDocument();
+    expect(screen.getByText('Command Output')).toBeInTheDocument();
+    expect(screen.getByText(/3 problems/)).toBeInTheDocument();
+  });
+
+  it('renders a passing documented-command row', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({
+        detected: true,
+        passed: true,
+        tests: [],
+        output: '',
+        documentedCommands: {
+          ran: true, outcome: 'pass', passed: true, could_not_run: false,
+          output: '', label: 'make smoke',
+        },
+      })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Passed')).toBeInTheDocument();
+    expect(screen.getByText('make smoke: passed')).toBeInTheDocument();
+  });
+
+  it('renders a could-not-run documented-command row without blocking', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({
+        detected: true,
+        passed: true,
+        tests: [],
+        output: '',
+        documentedCommands: {
+          ran: true, outcome: 'could_not_run', passed: false, could_not_run: true,
+          output: '', label: 'make smoke',
+        },
+      })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Passed')).toBeInTheDocument();
+    expect(screen.getByText('make smoke: could not run')).toBeInTheDocument();
+  });
+
+  it('blocks on a partial-setup failure', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({
+        detected: true,
+        passed: true,
+        tests: [],
+        output: 'npm ci failed for the TS runner',
+        partialSetupFailed: true,
+      })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Blocked')).toBeInTheDocument();
+    expect(screen.getByText(/only partially verified/)).toBeInTheDocument();
+  });
+
+  it('blocks and attributes a failed declared build', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({
+        detected: false,
+        passed: false,
+        tests: [],
+        output: '',
+        probe: {
+          ran: true, ecosystem: 'node', outcome: 'fail', passed: false, could_not_run: false,
+          declared: true, output: 'build exited 1', label: 'npm run build',
+        },
+      })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Blocked')).toBeInTheDocument();
+    expect(screen.getByText('(declared build)')).toBeInTheDocument();
+    expect(screen.getByText(/declared build command failed/)).toBeInTheDocument();
+  });
+
+  it('attributes a generic-check probe distinctly from a declared build', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({
+        detected: false,
+        passed: false,
+        tests: [],
+        output: '',
+        probe: { ran: true, ecosystem: 'node', outcome: 'pass', passed: true, could_not_run: false, declared: false },
+      })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('node: passed')).toBeInTheDocument();
+    expect(screen.getByText(/generic check/)).toBeInTheDocument();
+  });
+
+  it('warns when a declared build passed but wrote no artifact (possible no-op build)', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({
+        detected: false,
+        passed: false,
+        tests: [],
+        output: '',
+        probe: {
+          ran: true, ecosystem: 'node', outcome: 'pass', passed: true, could_not_run: false,
+          declared: true, wrote_no_artifact: true, label: 'npm run build',
+        },
+      })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText(/possible no-op build/)).toBeInTheDocument();
+  });
+
+  it('shows the stale-command recovery and the replacement directories that ran', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({
+        detected: true,
+        passed: true,
+        tests: [],
+        output: '',
+        recovered: true,
+        recovered_directories: [
+          { path: 'packages/api', type: 'node', test_cmd: 'npm test' },
+          { path: 'svc', type: 'python', test_cmd: 'pytest' },
+        ],
+      })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Recovered suite')).toBeInTheDocument();
+    expect(screen.getByText(/stored test command was stale/)).toBeInTheDocument();
+    expect(screen.getByText('packages/api')).toBeInTheDocument();
+    expect(screen.getByText(/npm test/)).toBeInTheDocument();
+    expect(screen.getByText('svc')).toBeInTheDocument();
+  });
+
   it('maps the probe_passed reason to an accurate, non-misleading label', () => {
     const task = makeTask({ unverified_merge_reason: 'probe_passed' });
     render(<DetailsTab task={task} />);
