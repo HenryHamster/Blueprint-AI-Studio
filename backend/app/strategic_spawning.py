@@ -251,6 +251,18 @@ _FLOOR_SHRINK_LEVELS: tuple[tuple[str, ...], ...] = (
 )
 _GAP_PRIORITY_RANK = {"critical": 3, "high": 2, "medium": 1, "low": 0}
 
+# When gap-shrinking alone cannot reach the floor (a model whose bulk lives in
+# capabilities/friction rather than gaps), these sections are reduced to a
+# minimal name+status skeleton, lowest-value first. The dropped detail (notes,
+# backing paths, descriptions, seen-in, mitigations-tried, source provenance)
+# is recoverable via the strategic problem_model fetch endpoint, so the shrink
+# is non-destructive to the durable model.
+_CAP_SKELETON_KEEP = ("name", "status")
+_FRICTION_SKELETON_KEEP = ("id", "name", "status")
+# Higher rank keeps its detail longer (reduced last); lowest-value first.
+_CAP_KEEP_RANK = {"working": 2, "partial": 1, "planned": 0}
+_FRICTION_KEEP_RANK = {"active": 2, "mitigated": 1, "resolved": 0}
+
 
 def _serialized_bytes(value: Any) -> int:
     """Serialized JSON byte length using the project-standard ``default=str``
@@ -269,6 +281,45 @@ def _gap_floor_keep_rank(g: dict) -> tuple:
     )
 
 
+def _skeletonize_caps_friction(trimmed: dict, target: int) -> dict:
+    """Reduce ``capabilities`` and ``friction`` to a minimal name+status
+    skeleton, lowest-value first, until *trimmed* serializes under *target*
+    (or both sections are exhausted). The full detail (notes, backing paths,
+    descriptions, seen-in, mitigations-tried, source provenance) is recoverable
+    via the strategic problem_model fetch endpoint, so this is non-destructive.
+
+    Returns the count of entries reduced per section. Copies the section lists
+    and entries before mutating so the durable model (which *trimmed* only
+    shallow-copies) is never touched."""
+    counts = {"capabilities": 0, "friction": 0}
+    worklist: list[tuple[int, str, int]] = []
+    sections: dict[str, tuple[list, tuple[str, ...]]] = {}
+    for section_key, keep_fields, rank_map in (
+        ("capabilities", _CAP_SKELETON_KEEP, _CAP_KEEP_RANK),
+        ("friction", _FRICTION_SKELETON_KEEP, _FRICTION_KEEP_RANK),
+    ):
+        items = trimmed.get(section_key)
+        if not isinstance(items, list) or not items:
+            continue
+        copied = [dict(it) if isinstance(it, dict) else it for it in items]
+        trimmed[section_key] = copied
+        sections[section_key] = (copied, keep_fields)
+        for idx, item in enumerate(copied):
+            if isinstance(item, dict):
+                worklist.append((rank_map.get(item.get("status"), 1), section_key, idx))
+    worklist.sort(key=lambda t: t[0])
+    for _rank, section_key, idx in worklist:
+        if _serialized_bytes(trimmed) <= target:
+            break
+        copied, keep_fields = sections[section_key]
+        item = copied[idx]
+        skeleton = {k: item[k] for k in keep_fields if k in item}
+        if skeleton != item:
+            copied[idx] = skeleton
+            counts[section_key] += 1
+    return counts
+
+
 def _shrink_pm_to_floor(trimmed: dict) -> dict:
     """Progressively shrink *trimmed* (an already ``_agent_view_problem_model``-
     trimmed model) until it serializes under :data:`_AGENT_VIEW_FLOOR_BYTES`,
@@ -277,29 +328,61 @@ def _shrink_pm_to_floor(trimmed: dict) -> dict:
     if _serialized_bytes(trimmed) <= _AGENT_VIEW_FLOOR_BYTES:
         return trimmed
     target = _AGENT_VIEW_FLOOR_BYTES - _FLOOR_MARKER_RESERVE
+    stripped: list[str] = []
+    gaps = trimmed.get("gaps")
+    if isinstance(gaps, list) and gaps:
+        for level in _FLOOR_SHRINK_LEVELS:
+            gaps = [
+                {k: v for k, v in g.items() if k not in level}
+                if isinstance(g, dict)
+                else g
+                for g in gaps
+            ]
+            trimmed["gaps"] = gaps
+            stripped.extend(level)
+            if _serialized_bytes(trimmed) <= target:
+                trimmed["_agent_view_floor_applied"] = {
+                    "floor_bytes": _AGENT_VIEW_FLOOR_BYTES,
+                    "stripped_gap_fields": stripped,
+                    "dropped_gaps": 0,
+                }
+                return trimmed
+    # Gap-shrinking alone did not reach the floor (a capability/friction-heavy
+    # model, or a pathological active-gap count). Reduce capabilities and
+    # friction to a name+status skeleton, lowest-value first, before resorting
+    # to dropping live gaps — their detail is the recoverable bulk.
+    reduced = _skeletonize_caps_friction(trimmed, target)
+    if _serialized_bytes(trimmed) <= target:
+        trimmed["_agent_view_floor_applied"] = {
+            "floor_bytes": _AGENT_VIEW_FLOOR_BYTES,
+            "stripped_gap_fields": stripped,
+            "dropped_gaps": 0,
+            "summarized_capabilities": reduced["capabilities"],
+            "summarized_friction": reduced["friction"],
+        }
+        return trimmed
+    # Still over floor. Drop the lowest-value gaps (keeping the highest-value),
+    # summarizing the rest as a count, so the model is delivered not dropped.
     gaps = trimmed.get("gaps")
     if not isinstance(gaps, list) or not gaps:
+        # No gaps to drop (a caps/friction-only model already skeletonized).
+        still_over = _serialized_bytes(trimmed) > _AGENT_VIEW_FLOOR_BYTES
+        if still_over:
+            logger.warning(
+                "[STRATEGIC] agent-view problem_model still exceeds the %d-byte "
+                "floor after skeletonizing capabilities/friction — shipping anyway "
+                "with a loud marker so the strategist is never silently deprived",
+                _AGENT_VIEW_FLOOR_BYTES,
+            )
+        trimmed["_agent_view_floor_applied"] = {
+            "floor_bytes": _AGENT_VIEW_FLOOR_BYTES,
+            "stripped_gap_fields": stripped,
+            "dropped_gaps": 0,
+            "summarized_capabilities": reduced["capabilities"],
+            "summarized_friction": reduced["friction"],
+            "still_over_floor": still_over,
+        }
         return trimmed
-    stripped: list[str] = []
-    for level in _FLOOR_SHRINK_LEVELS:
-        gaps = [
-            {k: v for k, v in g.items() if k not in level}
-            if isinstance(g, dict)
-            else g
-            for g in gaps
-        ]
-        trimmed["gaps"] = gaps
-        stripped.extend(level)
-        if _serialized_bytes(trimmed) <= target:
-            trimmed["_agent_view_floor_applied"] = {
-                "floor_bytes": _AGENT_VIEW_FLOOR_BYTES,
-                "stripped_gap_fields": stripped,
-                "dropped_gaps": 0,
-            }
-            return trimmed
-    # Every gap is now a skeleton and the model is STILL over floor (a
-    # pathological active-gap count). Keep the highest-value gaps that fit,
-    # summarizing the rest as a count, so the model is delivered not dropped.
     base = dict(trimmed)
     base["gaps"] = []
     running = _serialized_bytes(base)
@@ -330,6 +413,8 @@ def _shrink_pm_to_floor(trimmed: dict) -> dict:
         "floor_bytes": _AGENT_VIEW_FLOOR_BYTES,
         "stripped_gap_fields": stripped,
         "dropped_gaps": dropped,
+        "summarized_capabilities": reduced["capabilities"],
+        "summarized_friction": reduced["friction"],
         "still_over_floor": still_over,
     }
     return trimmed

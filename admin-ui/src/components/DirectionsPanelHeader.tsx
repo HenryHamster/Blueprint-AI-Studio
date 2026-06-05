@@ -1,5 +1,5 @@
 import { X, Zap } from 'lucide-react';
-import type { ProblemModel } from '../types';
+import type { ProblemModel, ProblemModelSizeHealth } from '../types';
 import type { Project } from '../types/project';
 
 export type DirectionsTab = 'directions' | 'problem-model' | 'running-update' | 'design-doc';
@@ -12,6 +12,7 @@ export interface DirectionsPanelHeaderProps {
   activeTab: DirectionsTab;
   setActiveTab: (tab: DirectionsTab) => void;
   problemModel: ProblemModel;
+  sizeHealth?: ProblemModelSizeHealth | null;
   designDoc: Record<string, unknown>;
   runningUpdate: string | null;
   triggerCycle: (phase: 'design_doc' | 'strategic_review' | 'full') => void;
@@ -29,10 +30,25 @@ export function DirectionsPanelHeader({
   activeTab,
   setActiveTab,
   problemModel,
+  sizeHealth,
   designDoc,
   runningUpdate,
   triggerCycle,
 }: DirectionsPanelHeaderProps) {
+  const getStatusColor = (status?: string) => {
+    switch (status) {
+      case 'healthy':
+        return 'bg-green-950/60 text-green-400 border-green-900/50';
+      case 'growing':
+        return 'bg-yellow-950/60 text-yellow-400 border-yellow-900/50';
+      case 'large':
+        return 'bg-orange-950/60 text-orange-400 border-orange-900/50';
+      case 'oversized':
+        return 'bg-red-950/60 text-red-400 border-red-900/50';
+      default:
+        return 'bg-neutral-950/60 text-neutral-400 border-neutral-900/50';
+    }
+  };
   return (
     <>
       {/* Header */}
@@ -108,6 +124,11 @@ export function DirectionsPanelHeader({
             const gapCount = (problemModel.gaps ?? []).length;
             return gapCount > 0 ? <span className="ml-1.5 text-xs text-neutral-500">({gapCount})</span> : null;
           })()}
+          {sizeHealth && (
+            <span className={`ml-1.5 align-middle text-[10px] px-1.5 py-0.5 rounded border font-semibold whitespace-nowrap ${getStatusColor(sizeHealth.model_size_status)}`}>
+              {sizeHealth.model_size_status} · {Math.round(sizeHealth.serialized_bytes / 1024)}KB
+            </span>
+          )}
         </button>
         <button
           onClick={() => setActiveTab('running-update')}

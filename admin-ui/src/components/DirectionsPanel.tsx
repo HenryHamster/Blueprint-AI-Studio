@@ -238,6 +238,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
           activeTab={activeTab}
           setActiveTab={setActiveTab}
           problemModel={data.problemModel}
+          sizeHealth={data.problemModelSizeHealth}
           designDoc={data.designDoc}
           runningUpdate={data.runningUpdate}
           triggerCycle={data.triggerCycle}

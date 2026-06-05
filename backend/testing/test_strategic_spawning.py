@@ -8852,6 +8852,121 @@ def test_agent_view_problem_model_packed_shrinks_under_floor():
     assert len(packed["gaps"]) >= _FLOOR_MIN_GAPS
 
 
+def _caps_friction_heavy_problem_model(
+    n_caps: int = 120, n_friction: int = 120
+) -> dict:
+    """A problem_model whose bulk lives in capabilities and friction (verbose
+    free-text bodies), with few/no gaps — so gap-shrinking alone cannot reach
+    the floor."""
+    big = "y" * 800
+    caps = []
+    for i in range(n_caps):
+        caps.append(
+            {
+                "name": f"cap {i}",
+                "status": "working" if i % 2 == 0 else "planned",
+                "notes": big,
+                "source": {"kind": "pr", "ref": big},
+                "backing_paths": [f"backend/app/mod_{i}_{j}.py" for j in range(8)],
+            }
+        )
+    friction = []
+    for i in range(n_friction):
+        friction.append(
+            {
+                "id": f"f-{i}",
+                "name": f"friction {i}",
+                "status": "active" if i % 2 == 0 else "resolved",
+                "description": big,
+                "seen_in": [f"d-{i}-{j}" for j in range(8)],
+                "mitigations_tried": [big],
+                "source": {"kind": "agent_observation", "ref": big},
+            }
+        )
+    return {"gaps": [], "capabilities": caps, "friction": friction}
+
+
+def test_floor_shrinks_caps_and_friction_when_gaps_are_not_the_bulk():
+    """A capability/friction-heavy model (few/no gaps) is shrunk under the floor
+    by reducing capabilities and friction to a name+status skeleton, and is
+    delivered with an honest summarized-section marker — never dropped."""
+    pm = _caps_friction_heavy_problem_model()
+    packed = _agent_view_problem_model_packed(pm)
+
+    serialized = len(json.dumps(packed, default=str).encode())
+    assert serialized <= _AGENT_VIEW_FLOOR_BYTES, (
+        f"caps/friction-heavy model must be shrunk under {_AGENT_VIEW_FLOOR_BYTES} "
+        f"bytes, got {serialized}"
+    )
+    marker = packed.get("_agent_view_floor_applied")
+    assert marker is not None, "shrink must leave a loud, visible marker"
+    assert marker["summarized_capabilities"] > 0, "capabilities must be reduced"
+    assert marker["summarized_friction"] > 0, "friction must be reduced"
+    # Reduced entries are name+status skeletons — detail fields are gone.
+    cap = packed["capabilities"][0]
+    assert "notes" not in cap and "backing_paths" not in cap and "source" not in cap
+    assert {"name", "status"} <= set(cap.keys())
+    fric = packed["friction"][0]
+    assert "description" not in fric and "seen_in" not in fric
+    assert "mitigations_tried" not in fric and "source" not in fric
+    assert {"id", "name", "status"} <= set(fric.keys())
+
+
+def test_floor_leaves_caps_friction_untouched_when_gaps_are_the_bulk():
+    """Regression: when gap-shrinking alone reaches the floor, capabilities and
+    friction are NOT touched and no summarized-section marker is recorded — the
+    gap-only shrink path is unchanged."""
+    # Gaps whose bulk is the (strippable) append-only history; stripping the
+    # first floor level brings the model under the floor without dropping gaps.
+    big = "z" * 1200
+    gaps = [
+        {
+            "id": f"g-{i}",
+            "name": f"gap {i}",
+            "status": "active",
+            "priority": "high",
+            "opened": "2026-01-01T00:00:00Z",
+            "history": [{"ts": "2026-01-01T00:00:00Z", "event": big}],
+            "past_moves": [big],
+        }
+        for i in range(30)
+    ]
+    pm = {
+        "gaps": gaps,
+        "capabilities": [
+            {"name": "keep me", "status": "working", "notes": "n", "backing_paths": ["a.py"]}
+        ],
+        "friction": [
+            {"id": "f-keep", "name": "keep", "status": "active", "description": "d"}
+        ],
+    }
+    packed = _agent_view_problem_model_packed(pm)
+
+    marker = packed["_agent_view_floor_applied"]
+    assert marker["dropped_gaps"] == 0, "field-stripping should reach the floor"
+
+    marker = packed["_agent_view_floor_applied"]
+    assert "summarized_capabilities" not in marker
+    assert "summarized_friction" not in marker
+    # Detail-bearing capability/friction entries survive intact.
+    assert packed["capabilities"][0]["notes"] == "n"
+    assert packed["friction"][0]["description"] == "d"
+
+
+def test_floor_no_pressure_path_is_byte_identical():
+    """A model that already fits the floor is returned byte-identical — no
+    marker, no reordering, no shrink."""
+    pm = {
+        "gaps": [{"id": "g1", "name": "g", "status": "active", "priority": "high"}],
+        "capabilities": [{"name": "c", "status": "working", "notes": "n"}],
+        "friction": [{"id": "f1", "name": "f", "status": "active", "description": "d"}],
+    }
+    packed = _agent_view_problem_model_packed(pm)
+    assert "_agent_view_floor_applied" not in packed
+    assert packed["capabilities"][0]["notes"] == "n"
+    assert packed["friction"][0]["description"] == "d"
+
+
 def test_pathological_problem_model_is_delivered_not_dropped():
     """Regression: the strategist must never be silently deprived of its
     problem_model. Even when the trimmed model exceeds the remaining budget,

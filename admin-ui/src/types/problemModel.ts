@@ -104,6 +104,15 @@ export interface RevisionLogEntry {
   changes?: Record<string, unknown>;
 }
 
+export interface ProblemModelSizeHealth {
+  active_gap_count: number;
+  capability_count: number;
+  active_friction_count: number;
+  estimated_token_footprint: number;
+  serialized_bytes: number;
+  model_size_status: 'healthy' | 'growing' | 'large' | 'oversized';
+}
+
 export interface ProblemModel {
   revision?: number;
   last_updated?: string | null;
@@ -117,6 +126,7 @@ export interface ProblemModel {
   friction?: Friction[];
   pending_user_confirmation?: PendingConfirmation[];
   revision_log?: RevisionLogEntry[];
+  _size_health?: ProblemModelSizeHealth;
 }
 
 // Running update — a single markdown document the strategic agent rewrites
@@ -157,6 +167,7 @@ export interface DirectionsEndpointResponse {
   vision: Record<string, unknown>;
   design_doc: Record<string, unknown>;
   problem_model: ProblemModel;
+  problem_model_size_health?: ProblemModelSizeHealth | null;
   running_update: string | null;
   running_update_acknowledged_at: string | null;
   running_update_reconciliation: RunningUpdateReconciliation | null;

@@ -3,7 +3,7 @@ import { apiFetch, fetchVersionLifecycle } from '../api';
 import { useDirectionForm } from './useDirectionForm';
 import { useAutonomousConfig } from './useAutonomousConfig';
 import type { Direction } from '../components/DirectionsPanel';
-import type { ProblemModel, RunningUpdateReconciliation } from '../types';
+import type { ProblemModel, ProblemModelSizeHealth, RunningUpdateReconciliation } from '../types';
 
 interface UseDirectionsDataDeps {
   selectedProjectId: string | null;
@@ -29,6 +29,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
   const [activeTasks, setActiveTasks] = useState<Record<string, Array<{ id: string; status: string; title: string; latest_status_message?: string }>>>({});
   const [designDoc, setDesignDoc] = useState<Record<string, unknown>>({});
   const [problemModel, setProblemModel] = useState<ProblemModel>({});
+  const [problemModelSizeHealth, setProblemModelSizeHealth] = useState<ProblemModelSizeHealth | null>(null);
   const [runningUpdate, setRunningUpdate] = useState<string | null>(null);
   const [runningUpdateAckAt, setRunningUpdateAckAt] = useState<string | null>(null);
   const [runningUpdateReconciliation, setRunningUpdateReconciliation] =
@@ -95,6 +96,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       setAutonomousEnabled(data.autonomous_enabled ?? false);
       setDesignDoc(data.design_doc ?? {});
       setProblemModel(data.problem_model ?? {});
+      setProblemModelSizeHealth(data.problem_model_size_health ?? null);
       setRunningUpdate(typeof data.running_update === 'string' ? data.running_update : null);
       setRunningUpdateAckAt(data.running_update_acknowledged_at ?? null);
       setRunningUpdateReconciliation(data.running_update_reconciliation ?? null);
@@ -429,6 +431,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     designDoc,
     problemModel,
     setProblemModel,
+    problemModelSizeHealth,
     runningUpdate,
     setRunningUpdate,
     runningUpdateAckAt,

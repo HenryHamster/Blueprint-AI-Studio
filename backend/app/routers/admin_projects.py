@@ -38,6 +38,7 @@ from app.ci_resolution import (
     compute_merge_verification_verdict,
     merge_gate_runtime_block,
 )
+from app.problem_model import compute_model_size_signal, ProblemModel
 
 router = APIRouter(
     prefix="/api/admin",
@@ -169,6 +170,14 @@ async def get_project(
     if row is None:
         raise HTTPException(status_code=404, detail="Project not found")
     project, role = row
+    problem_model_dict = project.problem_model or {}
+    size_health = None
+    if problem_model_dict:
+        try:
+            pm = ProblemModel(**problem_model_dict)
+            size_health = compute_model_size_signal(pm)
+        except Exception:
+            pass
     return {
         "id": str(project.id),
         "name": project.name,
@@ -180,7 +189,8 @@ async def get_project(
         "directions": project.directions,
         "vision": project.vision or {},
         "design_doc": project.design_doc or {},
-        "problem_model": project.problem_model or {},
+        "problem_model": problem_model_dict,
+        "problem_model_size_health": size_health,
         "running_update": project.running_update,
         "running_update_acknowledged_at": (
             project.running_update_acknowledged_at.isoformat()
