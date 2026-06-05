@@ -1003,3 +1003,87 @@ def test_fall_open_reason_no_probe_keeps_all_skipped():
         {"detected": False, "noTestsReason": "all_skipped"}
     )
     assert key == "suite_all_skipped"
+
+
+# ── Declared build_cmd probe: operator-visible wording (key unchanged) ────────
+def test_fall_open_reason_declared_build_passed_wording():
+    phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+        {
+            "detected": False,
+            "probe": {
+                "ran": True,
+                "passed": True,
+                "could_not_run": False,
+                "declared": True,
+                "label": "npm run build (admin-ui)",
+            },
+        }
+    )
+    # Key stays backward-compatible; only the human phrase distinguishes declared.
+    assert key == "probe_passed"
+    assert "declared build command passed" in phrase
+    assert "npm run build (admin-ui)" in phrase
+
+
+def test_fall_open_reason_declared_build_could_not_run_wording():
+    phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+        {
+            "detected": False,
+            "probe": {
+                "ran": True,
+                "passed": False,
+                "could_not_run": True,
+                "declared": True,
+                "label": "make build (root)",
+            },
+        }
+    )
+    assert key == "probe_could_not_run"
+    assert "declared build command could not run" in phrase
+    assert "make build (root)" in phrase
+
+
+def test_fall_open_reason_generic_probe_unchanged_when_not_declared():
+    # A generic probe (no declared marker) keeps the original phrasing.
+    phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+        {"detected": False, "probe": {"ran": True, "passed": True, "could_not_run": False}}
+    )
+    assert key == "probe_passed"
+    assert phrase == "acceptance probe passed (changed code compiles/builds)"
+
+
+def test_classify_verdict_declared_build_fail_carries_declared_detail():
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": False,
+            "probe": {
+                "ran": True,
+                "passed": False,
+                "could_not_run": False,
+                "declared": True,
+                "label": "npm run build (admin-ui)",
+                "output": "webpack: build error in module foo",
+            },
+        }
+    )
+    assert outcome == "fail"
+    assert "Declared build command `npm run build (admin-ui)` failed" in detail
+    assert "webpack: build error in module foo" in detail
+
+
+def test_classify_verdict_declared_build_fail_blank_output_fallback():
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": False,
+            "probe": {
+                "ran": True,
+                "passed": False,
+                "could_not_run": False,
+                "declared": True,
+                "label": "make (root)",
+                "output": "",
+            },
+        }
+    )
+    assert outcome == "fail"
+    assert "Declared build command `make (root)` failed" in detail

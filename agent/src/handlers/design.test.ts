@@ -42,7 +42,8 @@ vi.mock('fs', () => ({
 }));
 
 // ── Imports under test ────────────────────────────────────────────────────────
-import { handleDesign } from './design.js';
+import fs from 'fs';
+import { handleDesign, groundDesignCitations } from './design.js';
 import { runClaudeCode, persistAndPostStatus, readHandlerOutput } from '../index.js';
 import { configureAgentPermissions } from '../prompt.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
@@ -147,5 +148,63 @@ describe('handleDesign', () => {
     expect(payload.status).toBe('FAILED');
     expect(payload.failure_category).toBe('claude_code_failed');
     expect(payload.artifact_type).toBe('ERROR_LOG');
+  });
+
+  it('stamps _citation_grounding on the emitted document for the backend gate', async () => {
+    // existsSync false (module default) → file citation resolves to nothing.
+    vi.mocked(readHandlerOutput).mockReturnValue({ ...VALID_DOCUMENT });
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design how X should work' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    const payload = lastPostedPayload();
+    const parsed = JSON.parse(payload.logs as string) as Record<string, unknown>;
+    expect(parsed._citation_grounding).toEqual({
+      file_citations: 1, grounded: 0, checked: true,
+    });
+  });
+});
+
+describe('groundDesignCitations', () => {
+  it('grounds every file citation that resolves against the working tree', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    const doc: Record<string, unknown> = {
+      source_citations: ['file:backend/app/a.py', 'agent/src/b.ts'],
+    };
+    groundDesignCitations(doc, '/tmp/workspace');
+    expect(doc._citation_grounding).toEqual({
+      file_citations: 2, grounded: 2, checked: true,
+    });
+  });
+
+  it('reports zero grounded when no file citation resolves', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    const doc: Record<string, unknown> = {
+      source_citations: ['file:made/up/path.py', 'hallucinated/x.ts'],
+    };
+    groundDesignCitations(doc, '/tmp/workspace');
+    expect(doc._citation_grounding).toEqual({
+      file_citations: 2, grounded: 0, checked: true,
+    });
+  });
+
+  it('ignores web URLs and accepts a real+proposed mix (>=1 grounded)', () => {
+    vi.mocked(fs.existsSync).mockImplementation(
+      (p) => String(p).includes('real.py'),
+    );
+    const doc: Record<string, unknown> = {
+      source_citations: [
+        'https://example.com/ref',
+        'file:backend/real.py',
+        'backend/proposed/new.py',
+      ],
+    };
+    groundDesignCitations(doc, '/tmp/workspace');
+    // The web URL is not counted; one of two file refs resolves.
+    expect(doc._citation_grounding).toEqual({
+      file_citations: 2, grounded: 1, checked: true,
+    });
   });
 });

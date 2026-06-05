@@ -1941,6 +1941,79 @@ describe('detectAcceptanceProbes', () => {
     } as BuildConfig);
     expect(probes.filter(p => p.ecosystem === 'python' && p.cwd === WORKSPACE)).toHaveLength(1);
   });
+
+  // ── declared build_cmd probes ──────────────────────────────────────────────
+  it('build_config dir with build_cmd → declared probe (plain command tokenized)', () => {
+    const probes = detectAcceptanceProbes({
+      directories: [{ path: 'admin-ui', type: 'node', build_cmd: 'npm run build' }],
+    } as BuildConfig);
+    const declared = probes.find(p => p.declared);
+    expect(declared).toBeDefined();
+    expect(declared?.cmd).toBe('npm');
+    expect(declared?.args).toEqual(['run', 'build']);
+    expect(declared?.cwd).toBe(`${WORKSPACE}/admin-ui`);
+    expect(declared?.ecosystem).toBe('node');
+    expect(declared?.label).toBe('npm run build (admin-ui)');
+  });
+
+  it('build_cmd with shell operators → bash -c wrapped declared probe', () => {
+    const probes = detectAcceptanceProbes({
+      directories: [{ path: '', type: 'rust', build_cmd: 'make && cargo build --features x' }],
+    } as BuildConfig);
+    const declared = probes.find(p => p.declared);
+    expect(declared).toBeDefined();
+    expect(declared?.cmd).toBe('bash');
+    expect(declared?.args).toEqual(['-c', 'make && cargo build --features x']);
+    expect(declared?.cwd).toBe(WORKSPACE);
+    expect(declared?.label).toBe('make && cargo build --features x (root)');
+  });
+
+  it('build_cmd on a dir type without a language bucket → ecosystem "build"', () => {
+    const probes = detectAcceptanceProbes({
+      directories: [{ path: 'svc', type: 'other', build_cmd: 'make release' }],
+    } as BuildConfig);
+    const declared = probes.find(p => p.declared);
+    expect(declared?.ecosystem).toBe('build');
+  });
+
+  it('declared build_cmd is preferred over the generic probe for the same dir', () => {
+    // Same dir declares both a build_cmd AND a python type hint: only the
+    // declared probe is emitted — no competing generic compileall probe.
+    const probes = detectAcceptanceProbes({
+      directories: [{ path: 'backend', type: 'python', build_cmd: 'make build', test_cmd: 'pytest' }],
+    } as BuildConfig);
+    const forBackend = probes.filter(p => p.cwd === `${WORKSPACE}/backend`);
+    expect(forBackend).toHaveLength(1);
+    expect(forBackend[0].declared).toBe(true);
+    expect(forBackend[0].cmd).toBe('make');
+    expect(probes.some(p => p.cmd === 'python3' && p.cwd === `${WORKSPACE}/backend`)).toBe(false);
+  });
+
+  it('declared build_cmd suppresses the depth-1 auto-scan generic probe for that cwd', () => {
+    // Auto-scan would otherwise also see pyproject.toml at the declared dir.
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/pyproject.toml`);
+    const probes = detectAcceptanceProbes({
+      directories: [{ path: '', type: 'python', build_cmd: 'make build' }],
+    } as BuildConfig);
+    const atRoot = probes.filter(p => p.cwd === WORKSPACE);
+    expect(atRoot).toHaveLength(1);
+    expect(atRoot[0].declared).toBe(true);
+  });
+
+  it('a dir with only test_cmd (no build_cmd) still emits the generic probe', () => {
+    const probes = detectAcceptanceProbes({
+      directories: [{ path: 'backend', type: 'python', test_cmd: 'pytest' }],
+    } as BuildConfig);
+    expect(probes.some(p => p.declared)).toBe(false);
+    expect(probes.find(p => p.ecosystem === 'python')?.cmd).toBe('python3');
+  });
+
+  it('empty/whitespace build_cmd is ignored (no declared probe)', () => {
+    const probes = detectAcceptanceProbes({
+      directories: [{ path: 'backend', type: 'python', build_cmd: '   ', test_cmd: 'pytest' }],
+    } as BuildConfig);
+    expect(probes.some(p => p.declared)).toBe(false);
+  });
 });
 
 // ── classifyProbeOutcome ─────────────────────────────────────────────────────
@@ -1995,6 +2068,36 @@ describe('classifyProbeOutcome', () => {
   });
 
   it('unrecognized non-zero exit → conservative could_not_run', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome('some unexpected error blob', err)).toBe('could_not_run');
+  });
+
+  // ── declared-aware classification ──────────────────────────────────────────
+  it('declared + unrecognized non-zero exit → fail (operator build is authoritative)', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome('webpack build error: chunk too large', err, true)).toBe('fail');
+  });
+
+  it('declared + missing-tool signature → still could_not_run (must fall open)', () => {
+    const err = Object.assign(new Error('failed'), { status: 127 });
+    expect(classifyProbeOutcome('bash: make: command not found', err, true)).toBe('could_not_run');
+  });
+
+  it('declared + missing-dependency signature → still could_not_run (must fall open)', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome("Error: Cannot find module 'webpack'", err, true)).toBe('could_not_run');
+  });
+
+  it('declared + spawn ENOENT → still could_not_run', () => {
+    const err = Object.assign(new Error('spawn make ENOENT'), { code: 'ENOENT' });
+    expect(classifyProbeOutcome('', err, true)).toBe('could_not_run');
+  });
+
+  it('declared + exit 0 → pass', () => {
+    expect(classifyProbeOutcome('', null, true)).toBe('pass');
+  });
+
+  it('two-arg call (declared defaulted false) keeps conservative could_not_run', () => {
     const err = Object.assign(new Error('failed'), { status: 1 });
     expect(classifyProbeOutcome('some unexpected error blob', err)).toBe('could_not_run');
   });

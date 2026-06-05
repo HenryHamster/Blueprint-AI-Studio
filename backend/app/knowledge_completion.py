@@ -179,6 +179,39 @@ def _keywords(text: str) -> set[str]:
     }
 
 
+def _design_grounding_miss(document: dict[str, Any]) -> str | None:
+    """Return an operator-readable reason when a DESIGN document is ungrounded.
+
+    A ``design`` document's entire value is that it is GROUNDED in the actual
+    code: its file-reference citations must name real repository paths. The
+    design agent already has the repo cloned, so it resolves each file citation
+    against its working tree before emitting and stamps the result under
+    ``_citation_grounding`` (``{"file_citations", "grounded", "checked"}``).
+
+    This gate fails ONLY the clear case — the agent checked, the document
+    carries file-reference citations, and NONE of them resolve to a real path —
+    an ungrounded "design" that is not codebase-internal at all. It preserves
+    the conservative errs-toward-acceptance posture everywhere else: a missing
+    or unchecked stamp (older agent / web-only doc), zero file citations
+    (web-URL-only), or AT LEAST ONE grounded citation all pass — so a design
+    that legitimately also references not-yet-created files is NOT failed by a
+    single unresolved citation. ``web_research`` docs never carry this stamp and
+    are completely unaffected.
+    """
+    grounding = document.get("_citation_grounding")
+    if not isinstance(grounding, dict) or not grounding.get("checked"):
+        return None
+    file_citations = int(grounding.get("file_citations") or 0)
+    grounded = int(grounding.get("grounded") or 0)
+    if file_citations > 0 and grounded <= 0:
+        return (
+            "output is not grounded in the codebase: all "
+            f"{file_citations} file citation(s) resolve to paths absent from "
+            "the repository"
+        )
+    return None
+
+
 def _topic_responsiveness_miss(task: Task, document: dict[str, Any]) -> str | None:
     """Return an operator-readable reason on a CLEAR topical miss, else ``None``.
 
@@ -490,6 +523,25 @@ async def _handle_knowledge_document_completion(
             kind,
         )
         return
+
+    # Codebase-grounding probe (design only): a design document whose file
+    # citations resolve to ZERO real repository paths is not codebase-internal
+    # design and must not ship as an authoritative artifact. Distinct from the
+    # "no usable citation" gate above (the citations are well-shaped) and the
+    # topical-miss gate below (the document is on-topic). Errs toward acceptance
+    # — a single broken citation among several never fails a grounded design.
+    if kind == "design":
+        grounding_miss = _design_grounding_miss(document)
+        if grounding_miss is not None:
+            await _fail_gate(
+                task,
+                EvaluationVerdict(
+                    False, f"{kind} {grounding_miss}", "forward-quality"
+                ),
+                session,
+                kind,
+            )
+            return
 
     # Goal-level acceptance probe: a cheap, deterministic check that the
     # document is actually responsive to the asked topic/prompt before it is

@@ -600,6 +600,31 @@ def test_summary_compute_experiment_without_result_is_none():
     assert build_task_evaluation_summary(task) is None
 
 
+def test_summary_compute_experiment_surfaces_met_goal():
+    # A completed experiment that declared and met a goal shows it as a Goal item
+    # so the operator can distinguish goal-met from merely-completed.
+    task = _make_task(
+        "compute_experiment",
+        status=TaskStatus.COMPLETED,
+        plan_output={
+            "compute_result": {
+                "outcome": "SUCCESS",
+                "final_cost_usd": 1.0,
+                "criterion": {
+                    "metric": "accuracy",
+                    "operator": ">=",
+                    "threshold": 0.9,
+                    "value": 0.95,
+                    "met": True,
+                },
+            }
+        },
+    )
+    summary = build_task_evaluation_summary(task)
+    goal_items = [e for e in summary["evidence"] if e["label"] == "Goal"]
+    assert goal_items == [{"label": "Goal", "value": "met: accuracy >= 0.9 (measured 0.95)"}]
+
+
 def test_summary_web_research_recorded():
     task = _make_web_research_task(_knowledge_mirror())
     summary = build_task_evaluation_summary(task)

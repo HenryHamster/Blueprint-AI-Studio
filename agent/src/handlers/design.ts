@@ -1,4 +1,5 @@
 import fs from 'fs';
+import path from 'path';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, readHandlerOutput,
@@ -29,6 +30,43 @@ export function readDesignProgress(taskId: string): string | undefined {
     }
   } catch { /* ignore */ }
   return undefined;
+}
+
+// Ground a design document's FILE-reference citations against the cloned
+// working tree before emitting, so the backend completion gate can reject an
+// ungrounded design (one whose file citations all point at paths absent from
+// the repo). The design agent already has the repo on disk, so this resolution
+// is cheap and authoritative. Web-URL citations (http/https) are external and
+// ignored here. A `file:` scheme prefix is stripped and a trailing `:line` /
+// `#symbol` locator is dropped before the existence check; only path-like
+// references (containing a `/`) are counted as file citations. Stamps a
+// `_citation_grounding` summary {file_citations, grounded, checked} onto the
+// document in place and returns it. web_research never calls this, so its
+// external URL citations are completely unaffected.
+export function groundDesignCitations(
+  document: Record<string, unknown>, workspace: string = WORKSPACE,
+): Record<string, unknown> {
+  const cites = Array.isArray(document.source_citations)
+    ? document.source_citations
+    : [];
+  let fileCitations = 0;
+  let grounded = 0;
+  for (const raw of cites) {
+    if (typeof raw !== 'string') continue;
+    const text = raw.trim();
+    if (!text || /^https?:\/\//i.test(text)) continue; // external URL — skip
+    let ref = text.replace(/^file:/i, '').trim();
+    ref = ref.split('#')[0].split(':')[0].trim(); // drop #symbol / :line locator
+    if (!ref || !ref.includes('/')) continue; // not a path-like file reference
+    fileCitations += 1;
+    try {
+      if (fs.existsSync(path.join(workspace, ref))) grounded += 1;
+    } catch { /* unreadable path — treat as ungrounded */ }
+  }
+  document._citation_grounding = {
+    file_citations: fileCitations, grounded, checked: true,
+  };
+  return document;
 }
 
 // ── Handler: Design (codebase-internal design, terminal knowledge doc) ────────
@@ -133,18 +171,28 @@ ${DEFAULT_TOOL_GUIDANCE}`;
   // fall back to parsing a JSON object with the required document keys from the
   // final result text or the full transcript.
   let logs = '';
+  let document: Record<string, unknown> | null = null;
   const documentFromFile = readHandlerOutput(taskId, 'design_document', ws);
   if (documentFromFile !== null && typeof documentFromFile === 'object' && !Array.isArray(documentFromFile)) {
-    logs = sanitize(JSON.stringify(documentFromFile));
+    document = documentFromFile as Record<string, unknown>;
     sendLog(ws, `Read design document from ${documentPath}\n`);
   }
-  if (!logs) {
+  if (!document) {
     const source = (lastResultText && lastResultText.includes('"title"')) ? lastResultText : allOutput;
     const docObj = extractJsonObjectDetailed(source, 'title', 'summary', 'body');
     if (!docObj.ok) {
       sendLog(ws, `[WARNING] Could not extract design document JSON: ${describeJsonExtractionResult(docObj)}\n`);
+    } else {
+      document = docObj.value;
     }
-    logs = sanitize(docObj.ok ? JSON.stringify(docObj.value) : (lastResultText || allOutput.slice(-50_000)));
+  }
+  if (document) {
+    // Ground file-reference citations against the cloned working tree before
+    // emitting so the backend gate can reject an ungrounded design.
+    groundDesignCitations(document);
+    logs = sanitize(JSON.stringify(document));
+  } else {
+    logs = sanitize(lastResultText || allOutput.slice(-50_000));
   }
 
   const finalStatus = exitCode === 0 ? 'COMPLETED' : 'FAILED';

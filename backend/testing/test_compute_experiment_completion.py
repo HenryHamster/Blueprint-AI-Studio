@@ -269,6 +269,63 @@ async def test_compute_completion_unparseable_fails_gate(
     assert task.context["evaluation_gate"]["strategy"] == "metric"
 
 
+async def _make_compute_task_with_criterion(db_session, metric, op, threshold) -> Task:
+    task = await _make_compute_task(db_session)
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "success_criterion": {
+                "metric": metric,
+                "operator": op,
+                "threshold": threshold,
+            },
+        }
+    ]
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_compute_completion_met_criterion_completes_and_records_goal(
+    db_session, _quiet_compute_io
+):
+    """A declared criterion the result meets PASSES the gate, completes the task,
+    and records the goal outcome on the durable compute_result for the summary."""
+    task = await _make_compute_task_with_criterion(db_session, "accuracy", ">=", 0.9)
+
+    await _handle_compute_experiment_completion(
+        task, _result_artifact(accuracy=0.95), db_session
+    )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    criterion = task.plan_output["compute_result"]["criterion"]
+    assert criterion["met"] is True
+    assert criterion["metric"] == "accuracy"
+    assert criterion["value"] == pytest.approx(0.95)
+
+
+@pytest.mark.asyncio
+async def test_compute_completion_unmet_criterion_fails_gate(
+    db_session, _quiet_compute_io
+):
+    """An experiment that finishes but misses its declared goal FAILS the gate
+    honestly with an operator-readable reason, rather than completing clean."""
+    task = await _make_compute_task_with_criterion(db_session, "accuracy", ">=", 0.9)
+
+    await _handle_compute_experiment_completion(
+        task, _result_artifact(accuracy=0.5), db_session
+    )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert task.context["evaluation_gate"]["passed"] is False
+    assert "not met" in task.context["evaluation_gate"]["reason"]
+
+
 # ── Full lifecycle: substrate kill → task completion ────────────────────────
 
 

@@ -30,9 +30,10 @@ from __future__ import annotations
 
 import json
 import logging
+import operator
 import uuid
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -196,7 +197,7 @@ class MetricStrategy:
 
     def evaluate(self, task: Task, artifact_text: str | None) -> EvaluationVerdict:
         if _task_type_of(task) == "compute_experiment":
-            return self._evaluate_compute_experiment(artifact_text)
+            return self._evaluate_compute_experiment(task, artifact_text)
         measurement = _extract_measurement(artifact_text)
         if measurement is None:
             return EvaluationVerdict(
@@ -211,7 +212,7 @@ class MetricStrategy:
         )
 
     def _evaluate_compute_experiment(
-        self, artifact_text: str | None
+        self, task: Task, artifact_text: str | None
     ) -> EvaluationVerdict:
         result = _extract_compute_measurement(artifact_text)
         if result is None:
@@ -222,12 +223,26 @@ class MetricStrategy:
                 self.key,
             )
         outcome, cost = result
-        return EvaluationVerdict(
-            True,
+
+        # Goal-level acceptance probe: when the experiment declared WHAT success
+        # means, check the reported result against it. A declared-but-unmet goal
+        # fails the gate honestly; no declared criterion preserves the
+        # presence-based pass above.
+        criterion = evaluate_compute_success_criterion(task, artifact_text)
+        if criterion is not None and not criterion["met"]:
+            return EvaluationVerdict(False, _format_unmet_criterion(criterion), self.key)
+
+        reason = (
             f"compute experiment reached terminal outcome {outcome!r} "
-            f"at measured cost ${cost}",
-            self.key,
+            f"at measured cost ${cost}"
         )
+        if criterion is not None:
+            reason += (
+                f"; declared success criterion met "
+                f"({criterion['metric']} {criterion['operator']} "
+                f"{criterion['threshold']})"
+            )
+        return EvaluationVerdict(True, reason, self.key)
 
 
 class StructuredVerdictStrategy:
@@ -406,6 +421,91 @@ def _extract_compute_measurement(
     if cost is None:
         return None
     return outcome.strip(), cost
+
+
+# Closed, bounded set of comparison operators a compute success criterion may
+# declare — no general expression framework, just a single numeric/threshold
+# goal. Mirrors the ``Literal`` operator set on ``ComputeSuccessCriterion``.
+_CRITERION_OPS: dict[str, Callable[[float, float], bool]] = {
+    ">=": operator.ge,
+    "<=": operator.le,
+    ">": operator.gt,
+    "<": operator.lt,
+    "==": operator.eq,
+    "!=": operator.ne,
+}
+
+
+def _declared_success_criterion(task: Task) -> tuple[str, str, float] | None:
+    """Read a compute_experiment's declared success criterion from its payload.
+
+    Returns ``(metric, operator, threshold)`` only when the payload carries a
+    well-formed ``success_criterion`` (a non-empty metric name, a recognized
+    comparison operator, and a numeric threshold). Returns ``None`` when no
+    criterion is declared OR the declared shape is malformed — in both cases the
+    gate keeps its presence-based behavior rather than fail a task on a
+    criterion it cannot interpret.
+    """
+    payload = task.first_payload or {}
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("success_criterion")
+    if not isinstance(raw, dict):
+        return None
+    metric = raw.get("metric")
+    op = raw.get("operator")
+    threshold = _coerce_number(raw.get("threshold"))
+    if not isinstance(metric, str) or not metric.strip():
+        return None
+    if op not in _CRITERION_OPS or threshold is None:
+        return None
+    return metric.strip(), op, threshold
+
+
+def evaluate_compute_success_criterion(
+    task: Task, artifact_text: str | None
+) -> dict | None:
+    """Evaluate a compute_experiment's declared success criterion against its result.
+
+    Returns a small operator-readable dict
+    ``{metric, operator, threshold, value, met}`` describing whether the
+    reported result met the declared goal, or ``None`` when no criterion is
+    declared (callers then fall back to presence-based behavior). ``value`` is
+    the numeric metric read by name out of the terminal result object; ``met``
+    is False when the metric is absent/non-numeric (fail-closed) or when the
+    comparison does not hold.
+    """
+    criterion = _declared_success_criterion(task)
+    if criterion is None:
+        return None
+    metric, op, threshold = criterion
+    obj = _extract_json_object(artifact_text) or {}
+    value = _coerce_number(obj.get(metric))
+    met = value is not None and _CRITERION_OPS[op](value, threshold)
+    return {
+        "metric": metric,
+        "operator": op,
+        "threshold": threshold,
+        "value": value,
+        "met": met,
+    }
+
+
+def _format_unmet_criterion(criterion: dict) -> str:
+    """Operator-readable reason for a compute success criterion that was not met."""
+    metric = criterion["metric"]
+    op = criterion["operator"]
+    threshold = criterion["threshold"]
+    value = criterion["value"]
+    if value is None:
+        return (
+            f"declared success criterion not evaluable: result carries no "
+            f"numeric {metric!r} metric to check against {op} {threshold}"
+        )
+    return (
+        f"declared success criterion not met: {metric}={value} "
+        f"(required {op} {threshold})"
+    )
 
 
 def _extract_json_object(artifact_text: str | None) -> dict | None:

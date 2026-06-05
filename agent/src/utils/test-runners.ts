@@ -577,8 +577,18 @@ export interface AcceptanceProbe {
   cmd: string;
   args: string[];
   cwd: string;
-  ecosystem: 'python' | 'node' | 'go' | 'rust';
+  // The ecosystem bucket the probe belongs to (used for dedup + the operator
+  // display label). ``'build'`` is the catch-all for an operator-declared
+  // ``build_cmd`` whose directory ``type`` is none of python/node/go/rust
+  // (e.g. ``other``).
+  ecosystem: 'python' | 'node' | 'go' | 'rust' | 'build';
   label: string;
+  // True when this probe runs the project's OWN declared ``build_cmd`` (the
+  // operator's authoritative "does this deliverable build" claim) rather than a
+  // generic per-ecosystem compile check. A declared build is classified
+  // authoritatively (a clean non-zero exit is a real FAILURE, see
+  // ``classifyProbeOutcome``); generic probes stay conservative (fall-open).
+  declared?: boolean;
 }
 
 // Hard cap on probes emitted so a large monorepo cannot fan out an unbounded
@@ -611,6 +621,10 @@ export function detectAcceptanceProbes(buildConfig?: BuildConfig): AcceptancePro
   const { existsSync, readdirSync } = fs;
   const probes: AcceptanceProbe[] = [];
   const seen = new Set<string>();
+  // Directories whose own declared ``build_cmd`` ran as the authoritative probe.
+  // The generic ecosystem probe(s) and the depth-1 auto-scan are suppressed for
+  // these cwds so the operator's declared build is the preferred goal-level check.
+  const declaredCwds = new Set<string>();
 
   const has = (absDir: string, name: string): boolean => {
     try { return existsSync(`${absDir}/${name}`); } catch { return false; }
@@ -623,9 +637,51 @@ export function detectAcceptanceProbes(buildConfig?: BuildConfig): AcceptancePro
     probes.push(probe);
   };
 
+  // Map a build_config directory ``type`` to its probe ecosystem bucket. A type
+  // with no dedicated language bucket (``other`` / unknown) collapses to the
+  // ``'build'`` catch-all — the probe still runs the declared command verbatim.
+  const ecosystemForType = (type?: string): AcceptanceProbe['ecosystem'] => {
+    switch (type) {
+      case 'python': return 'python';
+      case 'node': return 'node';
+      case 'go': return 'go';
+      case 'rust': return 'rust';
+      default: return 'build';
+    }
+  };
+
+  // 0) Operator-declared build commands take precedence. Any build_config
+  //    directory that declares its own ``build_cmd`` runs THAT as the
+  //    authoritative goal-level probe (the operator's "does this deliverable
+  //    build" claim), and suppresses the generic ecosystem probe(s) for the same
+  //    directory. Commands may carry shell features (`&&`, `--features x`,
+  //    quotes) so they are wrapped exactly like ``test_cmd`` (bash -c for shell
+  //    operators, quote-aware tokenize otherwise) and run via execFile — no shell
+  //    interpolation.
+  if (buildConfig?.directories) {
+    for (const dir of buildConfig.directories) {
+      const buildCmd = (dir.build_cmd || '').trim();
+      if (!buildCmd) continue;
+      const abs = dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE;
+      const runner = runnerFromTestCmd(buildCmd, abs);
+      add({
+        ecosystem: ecosystemForType(dir.type),
+        cmd: runner.cmd,
+        args: runner.args,
+        cwd: abs,
+        label: `${buildCmd} (${dir.path || 'root'})`,
+        declared: true,
+      });
+      declaredCwds.add(abs);
+    }
+  }
+
   // Emit every ecosystem probe a directory supports. ``typeHint`` is the stored
   // build_config directory ``type`` (python|node|go|rust|other) when available.
   const probeDir = (absDir: string, label: string, typeHint?: string): void => {
+    // A directory with its own declared build_cmd already emitted the
+    // authoritative probe above — never add a competing generic probe for it.
+    if (declaredCwds.has(absDir)) return;
     if (
       typeHint === 'python' ||
       has(absDir, 'pyproject.toml') || has(absDir, 'setup.py') ||
@@ -705,15 +761,25 @@ export function detectAcceptanceProbes(buildConfig?: BuildConfig): AcceptancePro
  * ``exitErr`` is null when the probe exited 0 (``pass``). Otherwise it is the
  * rejected ``execFileAsync`` error (carrying ``.code`` / ``.stdout`` / etc.).
  *
- * CONSERVATIVE BY DESIGN — to avoid false merge blocks, a non-zero exit maps to
- * ``fail`` ONLY on an unambiguous compile/build-error signature. Spawn/timeout
- * failures, missing-tool / missing-dependency / unprovisioned-setup signatures,
- * and any unrecognized non-zero exit all degrade to ``could_not_run`` so the
- * gate falls open rather than hard-blocking.
+ * CONSERVATIVE BY DESIGN — to avoid false merge blocks, a GENERIC probe's
+ * non-zero exit maps to ``fail`` ONLY on an unambiguous compile/build-error
+ * signature. Spawn/timeout failures, missing-tool / missing-dependency /
+ * unprovisioned-setup signatures, and any unrecognized non-zero exit all degrade
+ * to ``could_not_run`` so the gate falls open rather than hard-blocking.
+ *
+ * ``declared`` widens step (3) ONLY: when the probe runs the project's OWN
+ * declared ``build_cmd``, the operator declared it authoritative, so a CLEAN
+ * non-zero exit (NOT one of the missing-tool/dep/setup signatures and NOT a
+ * spawn/timeout) is a REAL build FAILURE → ``fail`` (block the merge). The
+ * missing-tool/dep/setup degrades (step 1) and the spawn/timeout degrades still
+ * map to ``could_not_run`` for declared commands too — a build that needs
+ * uninstalled deps must fall open, not block. Generic-probe semantics
+ * (``declared=false``, the default) are byte-for-byte unchanged.
  */
 export function classifyProbeOutcome(
   output: string,
   exitErr: (Error & { code?: string; status?: number | null }) | null,
+  declared = false,
 ): 'pass' | 'fail' | 'could_not_run' {
   if (exitErr == null) return 'pass';
   // Spawn / timeout / OOM — the probe could not execute to a verdict.
@@ -758,10 +824,13 @@ export function classifyProbeOutcome(
   ];
   if (failureSignatures.some(sig => lower.includes(sig))) return 'fail';
 
-  // (3) Non-zero exit we cannot positively attribute to a clean compile error →
-  //     CONSERVATIVE default: could_not_run, so an unrecognized environment
-  //     failure never hard-blocks a merge.
-  return 'could_not_run';
+  // (3) Non-zero exit we cannot positively attribute to a clean compile error.
+  //     - GENERIC probe: CONSERVATIVE default could_not_run, so an unrecognized
+  //       environment failure never hard-blocks a merge.
+  //     - DECLARED build_cmd: the operator declared this build authoritative, so
+  //       a clean non-zero exit (not a missing-tool/dep/setup or spawn/timeout
+  //       degrade above) is a REAL build FAILURE → fail (block the merge).
+  return declared ? 'fail' : 'could_not_run';
 }
 
 /**

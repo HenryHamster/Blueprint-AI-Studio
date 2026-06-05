@@ -177,6 +177,39 @@ def test_compute_experiment_payload_tolerates_extra_benchmark_fields():
     assert result["dataset_shards"] == [1, 2, 3]
 
 
+def test_compute_experiment_payload_accepts_success_criterion():
+    # A well-formed goal-level acceptance criterion round-trips through the schema.
+    raw = {
+        "type": "compute_experiment",
+        "command": "run-eval",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 600,
+        "success_criterion": {
+            "metric": "accuracy",
+            "operator": ">=",
+            "threshold": 0.9,
+        },
+    }
+    result = _valid(raw)
+    assert result["success_criterion"]["metric"] == "accuracy"
+    assert result["success_criterion"]["operator"] == ">="
+    assert result["success_criterion"]["threshold"] == 0.9
+
+
+def test_compute_experiment_payload_rejects_unknown_criterion_operator():
+    # The operator is a closed Literal set — an unrecognized operator is rejected.
+    raw = {
+        "type": "compute_experiment",
+        "command": "run-eval",
+        "success_criterion": {
+            "metric": "accuracy",
+            "operator": "approx",
+            "threshold": 0.9,
+        },
+    }
+    _invalid(raw)
+
+
 def test_verify_tests_payload_with_branch_and_pr_number():
     raw = {
         "type": "verify_tests",

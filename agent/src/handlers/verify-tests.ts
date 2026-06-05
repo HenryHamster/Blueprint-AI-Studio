@@ -69,6 +69,10 @@ interface VerifyTestsResult {
     could_not_run: boolean;
     output: string;
     label: string;
+    // True when the probe ran the project's OWN declared ``build_cmd`` (the
+    // operator's authoritative build) rather than a generic ecosystem compile
+    // check. The backend surfaces declared-vs-generic wording from this flag.
+    declared?: boolean;
   };
 }
 
@@ -141,7 +145,9 @@ async function runAcceptanceProbe(
     } catch (err: unknown) {
       const e = err as Error & { stdout?: string; stderr?: string; code?: string; status?: number | null };
       output = [e.stdout, e.stderr, e.message].filter(Boolean).join('\n');
-      outcome = classifyProbeOutcome(output, e);
+      // Declared build commands are classified authoritatively: a clean non-zero
+      // exit is a real build FAILURE (block), not a conservative could-not-run.
+      outcome = classifyProbeOutcome(output, e, probe.declared);
     }
     sendLog(ws, `Acceptance probe [${probe.label}]: ${outcome}\n`);
     if (outcome === 'fail') {
@@ -149,6 +155,7 @@ async function runAcceptanceProbe(
         ran: true, ecosystem: probe.ecosystem, outcome,
         passed: false, could_not_run: false,
         output: output.slice(-VERIFY_TESTS_OUTPUT_LIMIT), label: probe.label,
+        declared: Boolean(probe.declared),
       };
     }
     if (outcome === 'pass' && firstPass === null) firstPass = probe;
@@ -158,12 +165,14 @@ async function runAcceptanceProbe(
     return {
       ran: true, ecosystem: firstPass.ecosystem, outcome: 'pass',
       passed: true, could_not_run: false, output: '', label: firstPass.label,
+      declared: Boolean(firstPass.declared),
     };
   }
   const cnr = firstCouldNotRun as AcceptanceProbe;
   return {
     ran: true, ecosystem: cnr.ecosystem, outcome: 'could_not_run',
     passed: false, could_not_run: true, output: '', label: cnr.label,
+    declared: Boolean(cnr.declared),
   };
 }
 
@@ -179,7 +188,16 @@ async function attachAcceptanceProbe(
   const probe = await runAcceptanceProbe(ws, buildConfig);
   if (!probe) return base;
   let note: string;
-  if (probe.outcome === 'fail') {
+  if (probe.declared) {
+    // Declared-build wording: we ran the operator's OWN declared build command.
+    if (probe.outcome === 'fail') {
+      note = `We ran your declared build command \`${probe.label}\` and it FAILED — the declared build did not succeed; blocking the merge.`;
+    } else if (probe.outcome === 'pass') {
+      note = `We ran your declared build command \`${probe.label}\` and it passed — your declared build succeeds (cheap goal-level signal; unit suite still absent/thin).`;
+    } else {
+      note = `We ran your declared build command \`${probe.label}\` but it could not run — missing deps / unprovisioned setup; falling open without a probe block.`;
+    }
+  } else if (probe.outcome === 'fail') {
     note = `Acceptance probe FAILED (${probe.ecosystem}: ${probe.label}) — the changed code does not compile/build; blocking the merge.`;
   } else if (probe.outcome === 'pass') {
     note = `Acceptance probe passed (${probe.ecosystem}: ${probe.label}) — the changed code still compiles/builds (cheap goal-level signal; unit suite still absent/thin).`;

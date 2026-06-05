@@ -634,8 +634,29 @@ def _build_compute_experiment_summary(
     cost = result.get("final_cost_usd")
     if cost is not None:
         evidence.append(_summary_item("Final cost", f"${cost}"))
+    # When the experiment declared a goal-level success criterion, show whether
+    # it was met so the operator can distinguish goal-met from merely-completed.
+    goal = _compute_criterion_label(result.get("criterion"))
+    if goal is not None:
+        evidence.append(_summary_item("Goal", goal))
     highlights = [_summary_item("Outcome", outcome)]
     return _summary_dict(task, verdict, evidence, highlights)
+
+
+def _compute_criterion_label(criterion: Any) -> str | None:
+    """Render a compute success criterion as a goal-met/missed operator label."""
+    if not isinstance(criterion, dict):
+        return None
+    metric = criterion.get("metric")
+    op = criterion.get("operator")
+    threshold = criterion.get("threshold")
+    if not metric or not op:
+        return None
+    goal = f"{metric} {op} {threshold}"
+    status = "met" if criterion.get("met") else "missed"
+    value = criterion.get("value")
+    measured = f" (measured {value})" if value is not None else ""
+    return f"{status}: {goal}{measured}"
 
 
 _PANEL_REVIEW_LENS_LABELS = {

@@ -299,6 +299,91 @@ def test_metric_compute_experiment_does_not_use_perf_array_path():
     assert v.passed is False
 
 
+# ── MetricStrategy: compute_experiment success criterion ────────────────────
+
+
+def _criterion_task(metric: str, op: str, threshold: float) -> Task:
+    return Task(
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "success_criterion": {
+                    "metric": metric,
+                    "operator": op,
+                    "threshold": threshold,
+                },
+            }
+        ]
+    )
+
+
+def test_compute_criterion_met_passes_with_reason():
+    """A declared criterion that the reported metric satisfies PASSES and the
+    verdict reason names the satisfied goal."""
+    artifact = _compute_result(accuracy=0.95)
+    v = MetricStrategy().evaluate(_criterion_task("accuracy", ">=", 0.9), artifact)
+    assert v.passed is True
+    assert "criterion met" in v.reason
+    assert "accuracy >= 0.9" in v.reason
+
+
+def test_compute_criterion_unmet_fails_with_operator_readable_reason():
+    """A declared criterion the reported metric misses FAILS the gate honestly."""
+    artifact = _compute_result(accuracy=0.5)
+    v = MetricStrategy().evaluate(_criterion_task("accuracy", ">=", 0.9), artifact)
+    assert v.passed is False
+    assert "not met" in v.reason
+    assert "accuracy=0.5" in v.reason
+    assert ">= 0.9" in v.reason
+
+
+def test_compute_criterion_missing_metric_fails_closed():
+    """A declared criterion whose metric is absent from the result fails closed —
+    an unmeasurable goal must not pass on presence alone."""
+    artifact = _compute_result()  # no 'accuracy' key
+    v = MetricStrategy().evaluate(_criterion_task("accuracy", ">=", 0.9), artifact)
+    assert v.passed is False
+    assert "not evaluable" in v.reason
+
+
+def test_compute_criterion_can_gate_on_cost_metric():
+    """The criterion reads any numeric result key by name, including cost."""
+    artifact = _compute_result(final_cost_usd=10.0)
+    v = MetricStrategy().evaluate(
+        _criterion_task("final_cost_usd", "<=", 5.0), artifact
+    )
+    assert v.passed is False
+    assert "final_cost_usd=10.0" in v.reason
+
+
+def test_compute_no_criterion_preserves_presence_based_pass():
+    """With no declared criterion, the gate keeps its presence-based behavior."""
+    v = MetricStrategy().evaluate(_task("compute_experiment"), _compute_result())
+    assert v.passed is True
+    assert "criterion" not in v.reason
+
+
+def test_compute_malformed_criterion_is_ignored():
+    """A malformed criterion (unknown operator) is not interpretable, so the gate
+    falls back to presence-based behavior rather than failing the task."""
+    task = Task(
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "success_criterion": {
+                    "metric": "accuracy",
+                    "operator": "approx",
+                    "threshold": 0.9,
+                },
+            }
+        ]
+    )
+    v = MetricStrategy().evaluate(task, _compute_result(accuracy=0.5))
+    assert v.passed is True
+
+
 # ── StructuredVerdictStrategy ───────────────────────────────────────────────
 
 

@@ -41,6 +41,7 @@ from app.task_capabilities import WRITE_TASK_TYPES
 from app.task_evaluators import (
     EvaluationVerdict,
     _extract_compute_measurement,
+    evaluate_compute_success_criterion,
     evaluate_terminal_output,
     record_failed_gate,
 )
@@ -1772,7 +1773,13 @@ async def _handle_compute_experiment_completion(
     plan_output = dict(plan_output)
     if measurement is not None:
         outcome, cost = measurement
-        plan_output["compute_result"] = {"outcome": outcome, "final_cost_usd": cost}
+        compute_result: dict = {"outcome": outcome, "final_cost_usd": cost}
+        # The gate passed, so a declared success criterion (if any) was met —
+        # surface it on the durable result for the operator-visible summary.
+        criterion = evaluate_compute_success_criterion(task, logs)
+        if criterion is not None:
+            compute_result["criterion"] = criterion
+        plan_output["compute_result"] = compute_result
         task.latest_status_message = (
             f"Compute experiment terminal: outcome={outcome}, "
             f"final_cost=${cost}"

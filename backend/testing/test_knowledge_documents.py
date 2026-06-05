@@ -619,6 +619,104 @@ async def test_design_completion_sets_source_kind(db_session, _quiet_broadcast):
     assert task.status == TaskStatus.COMPLETED
 
 
+# ── design codebase-grounding probe (file citations resolve to real paths) ──
+#
+# A design document's value is that it is grounded in the ACTUAL code. The
+# design agent resolves its file-reference citations against the cloned working
+# tree and stamps the result under ``_citation_grounding``; the completion gate
+# fails ONLY the clear case where file citations resolve to ZERO real paths,
+# erring toward acceptance otherwise. web_research docs carry no such stamp and
+# are unaffected.
+
+
+@pytest.mark.asyncio
+async def test_design_all_file_citations_resolve_passes(
+    db_session, _quiet_broadcast
+):
+    """A design doc whose file citations ALL resolve to real paths is grounded:
+    the probe accepts and persists exactly one KnowledgeDocument."""
+    project, task = await _make_design_task(db_session, project_name="DSGNgrounded")
+
+    document = {
+        "title": "Design for the X subsystem",
+        "summary": "A codebase-internal design grounded in real file references.",
+        "body": "# X\n\nGrounded design rationale referencing real modules.",
+        "citations": ["backend/app/models.py", "file:backend/app/reaper.py"],
+        "tags": ["design"],
+        "topic": "X",
+        "_citation_grounding": {
+            "file_citations": 2, "grounded": 2, "checked": True
+        },
+    }
+    await _handle_design_completion(task, json.dumps(document), db_session)
+
+    assert len(await _docs_for(db_session, task.id)) == 1
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_design_ungrounded_citations_fail_with_distinct_reason(
+    db_session, _quiet_broadcast
+):
+    """A design doc whose file citations resolve to NOTHING real is not
+    codebase-internal: the grounding probe fails the gate with a reason distinct
+    from the 'no usable citation' and 'not responsive' reasons; no doc persists."""
+    project, task = await _make_design_task(db_session, project_name="DSGNungrounded")
+
+    document = {
+        "title": "Design for the X subsystem",
+        "summary": "Looks grounded but cites only hallucinated paths.",
+        "body": "# X\n\nDesign referencing files that do not exist in the repo.",
+        "citations": ["backend/app/made_up.py", "file:agent/src/hallucinated.ts"],
+        "tags": ["design"],
+        "topic": "X",
+        "_citation_grounding": {
+            "file_citations": 2, "grounded": 0, "checked": True
+        },
+    }
+    await _handle_design_completion(task, json.dumps(document), db_session)
+
+    assert await _docs_for(db_session, task.id) == []
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    reason = task.context["evaluation_gate"]["reason"]
+    assert "not grounded in the codebase" in reason
+    assert "no usable source citation" not in reason
+    assert "not responsive" not in reason
+
+
+@pytest.mark.asyncio
+async def test_design_mix_of_real_and_proposed_paths_passes(
+    db_session, _quiet_broadcast
+):
+    """A realistic design legitimately references not-yet-created files alongside
+    real ones: a single grounded citation among proposed paths is enough — the
+    probe errs toward acceptance and persists the document."""
+    project, task = await _make_design_task(db_session, project_name="DSGNmix")
+
+    document = {
+        "title": "Design for the X subsystem",
+        "summary": "Grounded in real modules, proposing a new one.",
+        "body": "# X\n\nExtends backend/app/reaper.py with a new sweep module.",
+        "citations": [
+            "backend/app/reaper.py",
+            "backend/app/new_sweep_module.py",
+            "backend/app/another_proposed.py",
+        ],
+        "tags": ["design"],
+        "topic": "X",
+        "_citation_grounding": {
+            "file_citations": 3, "grounded": 1, "checked": True
+        },
+    }
+    await _handle_design_completion(task, json.dumps(document), db_session)
+
+    assert len(await _docs_for(db_session, task.id)) == 1
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+
 # ── forward-quality grader escalation + resume (flag ON) ────────────────────
 #
 # web_research's honest quality gate has two tiers: the cheap synchronous

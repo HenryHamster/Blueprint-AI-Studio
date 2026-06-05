@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -327,6 +327,24 @@ class MemoPayload(BasePayload):
     prompt: str | None = None
 
 
+class ComputeSuccessCriterion(BaseModel):
+    """A cheap, machine-checkable acceptance criterion for a compute_experiment.
+
+    Declares WHAT success means for the experiment: a numeric ``metric`` (a key
+    read by name out of the terminal COMPUTE_RESULT artifact), one of a small,
+    closed set of comparison ``operator`` values, and a numeric ``threshold``.
+    Deliberately minimal — no expression framework, just enough to express a
+    single numeric/threshold goal the metric gate can check at completion. When
+    absent, the gate keeps its presence-only behavior (terminal outcome + cost).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    metric: str
+    operator: Literal[">=", "<=", ">", "<", "==", "!="]
+    threshold: float
+
+
 class ComputeExperimentPayload(_SystemPopulated):
     """Reference compute-heavy task (benchmark/evaluation style).
 
@@ -356,6 +374,11 @@ class ComputeExperimentPayload(_SystemPopulated):
     experiment: str | None = None
     benchmark: str | None = None
     metric: str | None = None
+    # Optional goal-level acceptance criterion. When declared, the metric gate
+    # checks the reported result against it at completion (a compute artifact
+    # that finishes but misses its declared goal fails the gate honestly);
+    # when absent, the gate preserves presence-based behavior.
+    success_criterion: ComputeSuccessCriterion | None = None
 
 
 class WebResearchPayload(BasePayload):

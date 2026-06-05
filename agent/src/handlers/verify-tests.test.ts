@@ -62,6 +62,12 @@ const PY_PROBE = {
   cmd: 'python3', args: ['-m', 'compileall', '-q', '/tmp/workspace'],
   cwd: '/tmp/workspace', ecosystem: 'python' as const, label: 'python3 -m compileall (root)',
 };
+// An operator-declared build command probe (build_cmd).
+const DECLARED_PROBE = {
+  cmd: 'npm', args: ['run', 'build'],
+  cwd: '/tmp/workspace/admin-ui', ecosystem: 'node' as const,
+  label: 'npm run build (admin-ui)', declared: true,
+};
 
 const RUNNER = { cmd: 'npm', args: ['test'], cwd: '/tmp/workspace', label: 'npm test (root)' };
 // A stored runner pointing at a now-stale command (e.g. a dropped Makefile target).
@@ -80,6 +86,7 @@ function lastPostedPayload(): Record<string, unknown> {
 type Probe = {
   ran: boolean; ecosystem: string; outcome: string;
   passed: boolean; could_not_run: boolean; output: string; label: string;
+  declared?: boolean;
 };
 function parsedVerdict(): {
   detected: boolean; passed: boolean; tests: unknown[]; output: string;
@@ -454,6 +461,61 @@ describe('handleVerifyTests', () => {
     expect(verdict.noTestsReason).toBe('all_skipped');
     expect(verdict.probe?.passed).toBe(false);
     expect(verdict.probe?.could_not_run).toBe(false);
+  });
+
+  // ── Declared build_cmd probe on the fall-open paths ───────────────────────
+  it('no suite + declared build PASSES → fall-open carries declared probe + wording', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([]);
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([DECLARED_PROBE]);
+    vi.mocked(execFileAsync).mockResolvedValue(''); // npm run build exits 0
+
+    await handleVerifyTests('d1', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(false);
+    expect(verdict.probe?.ran).toBe(true);
+    expect(verdict.probe?.passed).toBe(true);
+    expect(verdict.probe?.declared).toBe(true);
+    expect(verdict.output).toContain('declared build command `npm run build (admin-ui)`');
+  });
+
+  it('no suite + declared build FAILS (clean non-zero) → probe.passed=false (backend blocks)', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([]);
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([DECLARED_PROBE]);
+    // A clean build error with no missing-tool/dep signature → fail for declared.
+    const err = Object.assign(new Error('Command failed: npm run build\nwebpack: build error'), {
+      stdout: '', stderr: 'webpack: build error in module foo', status: 1, code: undefined,
+    });
+    vi.mocked(execFileAsync).mockRejectedValue(err);
+
+    await handleVerifyTests('d2', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(false);
+    expect(verdict.probe?.ran).toBe(true);
+    expect(verdict.probe?.passed).toBe(false);
+    expect(verdict.probe?.could_not_run).toBe(false);
+    expect(verdict.probe?.outcome).toBe('fail');
+    expect(verdict.probe?.declared).toBe(true);
+    expect(verdict.output).toContain('declared build command `npm run build (admin-ui)` and it FAILED');
+  });
+
+  it('no suite + declared build CANNOT RUN (missing tool) → could_not_run, no block', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([]);
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([DECLARED_PROBE]);
+    const err = Object.assign(new Error('failed'), {
+      stdout: '', stderr: 'bash: npm: command not found', status: 127, code: undefined,
+    });
+    vi.mocked(execFileAsync).mockRejectedValue(err);
+
+    await handleVerifyTests('d3', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(false);
+    expect(verdict.probe?.could_not_run).toBe(true);
+    expect(verdict.probe?.outcome).toBe('could_not_run');
+    expect(verdict.probe?.declared).toBe(true);
+    expect(verdict.output).toContain('could not run');
   });
 
   it('detected real pass → no probe run (probe only runs on fall-open)', async () => {

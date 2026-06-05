@@ -334,6 +334,22 @@ def classify_merge_test_verdict(
         if _probe_is_clear_failure(verdict.get("probe")):
             probe = verdict["probe"]
             output = str(probe.get("output") or "").strip()
+            if probe.get("declared"):
+                # The operator's OWN declared build command failed — surface that
+                # explicitly so the spawned fix task knows the authoritative build
+                # (not a generic compile probe) is what broke.
+                label = str(probe.get("label") or "").strip()
+                prefix = (
+                    f"Declared build command `{label}` failed: "
+                    if label
+                    else "Declared build command failed: "
+                )
+                return (
+                    "fail",
+                    (prefix + output)
+                    if output
+                    else (prefix + "the declared build did not succeed."),
+                )
             return (
                 "fail",
                 output
@@ -444,12 +460,35 @@ def classify_unverified_fall_open_reason(
     if isinstance(verdict, dict):
         probe = verdict.get("probe")
         if isinstance(probe, dict) and probe.get("ran"):
+            # A declared probe ran the project's OWN ``build_cmd`` — surface
+            # declared-build wording (with the command label) instead of the
+            # generic compile-probe phrasing. The stable KEY is unchanged
+            # (``probe_passed`` / ``probe_could_not_run``) so the operator
+            # label maps and the no-CI fall-open invariant stay intact; only the
+            # human phrase distinguishes declared from generic. An older agent
+            # that emits no ``declared`` marker keeps the generic phrase.
+            declared = bool(probe.get("declared"))
+            label = str(probe.get("label") or "").strip()
             if probe.get("could_not_run"):
+                if declared:
+                    phrase = (
+                        f"declared build command could not run ({label})"
+                        if label
+                        else "declared build command could not run (missing deps/unprovisioned setup)"
+                    )
+                    return (phrase, "probe_could_not_run")
                 return (
                     "acceptance probe could not run (missing deps/unprovisioned setup)",
                     "probe_could_not_run",
                 )
             if probe.get("passed") is True:
+                if declared:
+                    phrase = (
+                        f"declared build command passed ({label})"
+                        if label
+                        else "declared build command passed (deliverable builds)"
+                    )
+                    return (phrase, "probe_passed")
                 return (
                     "acceptance probe passed (changed code compiles/builds)",
                     "probe_passed",
