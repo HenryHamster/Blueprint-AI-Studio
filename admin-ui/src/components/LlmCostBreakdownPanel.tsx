@@ -12,6 +12,16 @@ function fmtShare(share: number | null): string {
   return share != null ? `${Math.round(share * 100)}%` : '—';
 }
 
+function fmtMergeRate(rate: number | null): string {
+  return rate != null ? `${Math.round(rate * 100)}%` : '—';
+}
+
+// Cost-per-merge is null for unpriced (understated cost) or zero-merge buckets;
+// render an em-dash there rather than a confident-but-misleading dollar figure.
+function fmtCostPerMerge(cost: number | null): string {
+  return cost != null ? `$${cost.toFixed(2)}` : '—';
+}
+
 /**
  * Per-model LLM token-spend breakdown for the selected project, over a rolling
  * window (default 7 days). Surfaces which model drives token cost and warns when
@@ -79,10 +89,20 @@ export function LlmCostBreakdownPanel({
     </div>
   );
 
+  const fallbackWarning = totals.fallback_task_count > 0 && (
+    <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[10px] text-amber-300">
+      <span className="font-semibold">
+        {totals.fallback_task_count} fallback {totals.fallback_task_count === 1 ? 'task' : 'tasks'}
+      </span>
+      {' — '}ran on a different provider/model than the intended routing (${totals.fallback_cost_usd.toFixed(2)} of spend), so by-model attribution folds these into the resolved model rather than the configured one.
+    </div>
+  );
+
   return (
     <section>
       {Header}
       {coverageWarning}
+      {fallbackWarning}
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
         {/* Mobile: stacked card layout */}
         <div className="sm:hidden divide-y divide-neutral-800/30">
@@ -100,6 +120,8 @@ export function LlmCostBreakdownPanel({
                 <span>Share: <span className="text-neutral-300 tabular-nums">{fmtShare(row.share_of_total_cost)}</span></span>
                 <span>Cost: <span className="text-neutral-300 font-mono tabular-nums">${row.total_cost_usd.toFixed(2)}</span></span>
                 <span>$/Task: <span className="text-neutral-300 font-mono tabular-nums">${row.mean_cost_per_task.toFixed(3)}</span></span>
+                <span>Merged: <span className="text-neutral-300 tabular-nums">{row.merged_count}/{row.task_count} ({fmtMergeRate(row.merge_rate)})</span></span>
+                <span>$/Merge: <span className="text-neutral-300 font-mono tabular-nums">{fmtCostPerMerge(row.cost_per_merge)}</span></span>
               </div>
             </div>
           ))}
@@ -112,6 +134,8 @@ export function LlmCostBreakdownPanel({
               <th className="text-right px-3 py-2 font-medium">In / Out Tokens</th>
               <th className="text-right px-3 py-2 font-medium">Cost</th>
               <th className="text-right px-3 py-2 font-medium">$/Task</th>
+              <th className="text-right px-3 py-2 font-medium">Merged</th>
+              <th className="text-right px-3 py-2 font-medium">$/Merge</th>
               <th className="text-right px-3 py-2 font-medium">Share</th>
             </tr>
           </thead>
@@ -131,6 +155,12 @@ export function LlmCostBreakdownPanel({
                 </td>
                 <td className="text-right px-3 py-2 text-neutral-300 font-mono tabular-nums">
                   ${row.mean_cost_per_task.toFixed(3)}
+                </td>
+                <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">
+                  {row.merged_count}/{row.task_count} ({fmtMergeRate(row.merge_rate)})
+                </td>
+                <td className="text-right px-3 py-2 text-neutral-300 font-mono tabular-nums">
+                  {fmtCostPerMerge(row.cost_per_merge)}
                 </td>
                 <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">
                   {fmtShare(row.share_of_total_cost)}

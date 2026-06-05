@@ -834,6 +834,22 @@ def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
 _UNPRICED_COMBOS_CAP = 10
 
 
+def _task_ran_on_fallback(t: Task) -> bool:
+    """True when the task's runtime selection diverged from its intended routing.
+
+    Reads the markers stamped by max_plan_pool's selection path:
+    ``routing_fallback`` (cross-provider / synthetic no-account) and
+    ``model_fallback`` (same-provider preview→GA downgrade). Either marker means
+    the resolved provider/model the cost breakdown attributes to is NOT
+    necessarily the routing the operator configured, so the bucket should be
+    caveated.
+    """
+    ctx = getattr(t, "context", None) or {}
+    if not isinstance(ctx, dict):
+        return False
+    return bool(ctx.get("routing_fallback") or ctx.get("model_fallback"))
+
+
 def _llm_attempt_nonnegative_int(value: Any) -> int:
     return int(value) if isinstance(value, (int, float)) and value >= 0 else 0
 
@@ -882,6 +898,15 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
     ``unpriced_coverage_fraction`` but contribute ``0.0`` cost. Cost values
     are rounded to 6 decimals and shares to 4 decimals, matching the rest of
     this module.
+
+    Each provider/model row also carries the merge outcome of its tasks:
+    ``merged_count`` (tasks landed on the integration branch per
+    :func:`is_merged_completion`), ``merge_rate`` (``merged_count /
+    task_count``, ``None`` only when the bucket has no tasks), and
+    ``cost_per_merge`` (``cost_usd / merged_count``). ``cost_per_merge`` is
+    deliberately ``None`` for unpriced buckets (cost is understated, so the
+    figure would mislead) and for zero-merge buckets (no divide-by-zero, reads
+    as "0 of N merged" via ``merged_count``/``merge_rate`` instead).
     """
     from collections import defaultdict
 
@@ -891,6 +916,7 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             "output_tokens": 0,
             "llm_call_count": 0,
             "task_count": 0,
+            "merged_count": 0,
             "cost_usd": 0.0,
         }
     )
@@ -900,19 +926,34 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             "output_tokens": 0,
             "llm_call_count": 0,
             "task_count": 0,
+            "merged_count": 0,
             "cost_usd": 0.0,
         }
     )
     priced_combos: set[tuple[str, str]] = set()
+    unpriced_providers: set[str] = set()
     unpriced_combos: list[str] = []
     priced_task_count = 0
     unpriced_task_count = 0
+    fallback_task_count = 0
+    fallback_cost_usd = 0.0
     total_input = 0
     total_output = 0
     total_cost = 0.0
     total_task_count = 0
+    total_merged_count = 0
 
     for t in tasks:
+        merged = is_merged_completion(t)
+        is_fallback = _task_ran_on_fallback(t)
+        # Tokens/cost/task_count accumulate per attempt-row (automain
+        # convention), but a task's merge is a single TASK-level outcome: it
+        # must be credited at most ONCE per distinct bucket it touched, never
+        # once per attempt-row. Collect the distinct buckets this task
+        # contributed a row to, then credit the merge after the attempt loop.
+        task_model_keys: set[tuple[str, str]] = set()
+        task_provider_keys: set[str] = set()
+        task_contributed = False
         for provider, model, input_tokens, output_tokens, call_count in _task_llm_attempts(t):
             if input_tokens <= 0 and output_tokens <= 0:
                 continue
@@ -932,12 +973,18 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             else:
                 cost = 0.0
                 unpriced_task_count += 1
+                unpriced_providers.add(provider)
                 combo = f"{provider}:{model}"
                 if (
                     combo not in unpriced_combos
                     and len(unpriced_combos) < _UNPRICED_COMBOS_CAP
                 ):
                     unpriced_combos.append(combo)
+
+            # fallback_cost_usd is per-attempt (each fallback attempt's spend
+            # counts); fallback_task_count is per-task, credited once below.
+            if is_fallback:
+                fallback_cost_usd += cost
 
             mb = model_buckets[key]
             mb["input_tokens"] += int(input_tokens)
@@ -958,10 +1005,43 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             total_cost += cost
             total_task_count += 1
 
+            task_model_keys.add(key)
+            task_provider_keys.add(provider)
+            task_contributed = True
+
+        # Credit the task's merge once per distinct bucket it touched, and once
+        # to the grand total — so multi-attempt and multi-model merged tasks
+        # never inflate merged_count beyond the actual merged-task count.
+        if merged and task_contributed:
+            for key in task_model_keys:
+                model_buckets[key]["merged_count"] += 1
+            for provider in task_provider_keys:
+                provider_buckets[provider]["merged_count"] += 1
+            total_merged_count += 1
+
+        # Count each fallback task once (cost already accumulated per-attempt).
+        if is_fallback and task_contributed:
+            fallback_task_count += 1
+
     def _share(cost: float) -> Optional[float]:
         if total_cost <= 0:
             return None
         return round(cost / total_cost, 4)
+
+    def _merge_rate(merged: float, count: float) -> Optional[float]:
+        if count <= 0:
+            return None
+        return round(merged / count, 4)
+
+    def _cost_per_merge(
+        cost: float, merged: float, priced: bool
+    ) -> Optional[float]:
+        # Only present a confident cost-per-merge when cost is fully known.
+        # Unpriced buckets understate cost, so the figure would mislead; a
+        # zero-merge bucket would divide by zero.
+        if not priced or merged <= 0:
+            return None
+        return round(cost / merged, 6)
 
     by_provider = [
         {
@@ -975,6 +1055,12 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             "share_of_total_cost": _share(pb["cost_usd"]),
             "task_count": int(pb["task_count"]),
             "llm_call_count": int(pb["llm_call_count"]),
+            "merged_count": int(pb["merged_count"]),
+            "merge_rate": _merge_rate(pb["merged_count"], pb["task_count"]),
+            "priced": provider not in unpriced_providers,
+            "cost_per_merge": _cost_per_merge(
+                pb["cost_usd"], pb["merged_count"], provider not in unpriced_providers
+            ),
         }
         for provider, pb in sorted(
             provider_buckets.items(), key=lambda kv: kv[1]["cost_usd"], reverse=True
@@ -993,7 +1079,14 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             "share_of_total_cost": _share(mb["cost_usd"]),
             "task_count": int(mb["task_count"]),
             "llm_call_count": int(mb["llm_call_count"]),
+            "merged_count": int(mb["merged_count"]),
+            "merge_rate": _merge_rate(mb["merged_count"], mb["task_count"]),
             "priced": (provider, model) in priced_combos,
+            "cost_per_merge": _cost_per_merge(
+                mb["cost_usd"],
+                mb["merged_count"],
+                (provider, model) in priced_combos,
+            ),
         }
         for (provider, model), mb in sorted(
             model_buckets.items(), key=lambda kv: kv[1]["cost_usd"], reverse=True
@@ -1011,9 +1104,15 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             "total_output_tokens": total_output,
             "total_cost_usd": round(total_cost, 6),
             "task_count": total_task_count,
+            "merged_count": total_merged_count,
+            "merge_rate": round(total_merged_count / total_task_count, 4)
+            if total_task_count
+            else None,
             "priced_task_count": priced_task_count,
             "unpriced_task_count": unpriced_task_count,
             "unpriced_coverage_fraction": unpriced_coverage_fraction,
+            "fallback_task_count": fallback_task_count,
+            "fallback_cost_usd": round(fallback_cost_usd, 6),
         },
         "unpriced_combos": unpriced_combos,
     }

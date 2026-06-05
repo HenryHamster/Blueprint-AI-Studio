@@ -862,3 +862,128 @@ def test_runtime_fallback_seam_no_circular_import_and_identical_symbols():
         "openai": "gpt-5.4",
         "gemini": "gemini-2.5-pro",
     }
+
+
+@pytest.mark.asyncio
+async def test_select_llm_runtime_records_cross_provider_fallback(clean_runtime_pool):
+    """When the most-preferred provider has no usable account and selection
+    lands on a later-preference provider, the divergence is stamped on
+    task.context.routing_fallback (best-effort, doesn't change the choice)."""
+    idle_openai = {
+        "id": "acct-openai",
+        "user_id": _TEST_USER,
+        "name": "openai",
+        "provider": "openai",
+        "auth_mode": "api_key",
+        "runtime_secret": "sk-test",
+        "runtime_ready": True,
+        "enabled": True,
+        "active_tasks": 0,
+    }
+    _max_plan_pools.setdefault(_TEST_USER, []).append(idle_openai)
+    _account_by_id[idle_openai["id"]] = idle_openai
+
+    runtime_config = {
+        "provider_selection_mode": "preferred",
+        "provider_tier_model_map": {
+            "anthropic": {
+                "opus": "claude-opus-4-7",
+                "sonnet": "claude-sonnet-4-6",
+                "haiku": "claude-haiku-4-5-20251001",
+            },
+            "openai": {
+                "opus": "gpt-5.4",
+                "sonnet": "gpt-5.3-codex",
+                "haiku": "gpt-5.4-mini",
+            },
+        },
+        "task_type_provider_preference": {"create": ["anthropic", "openai"]},
+    }
+
+    task = _task(payload={"type": "create", "quality_tier": "opus"})
+    result = await select_llm_runtime_for_task(
+        user_id=_TEST_USER, task=task, runtime_config=runtime_config
+    )
+
+    assert result is not None
+    assert result.provider == "openai"
+    assert result.account_id == "acct-openai"
+    marker = task.context["routing_fallback"]
+    assert marker["reason"] == "cross_provider"
+    assert marker["intended_provider"] == "anthropic"
+    assert marker["effective_provider"] == "openai"
+
+
+@pytest.mark.asyncio
+async def test_select_llm_runtime_records_no_account_fallback(clean_runtime_pool):
+    """When no account can be reserved at all, the synthetic result is stamped
+    with a no_account routing_fallback so the empty-pool dispatch is visible."""
+    runtime_config = {
+        "provider_selection_mode": "exclusive",
+        "provider_tier_model_map": {
+            "anthropic": {
+                "opus": "claude-opus-4-7",
+                "sonnet": "claude-sonnet-4-6",
+                "haiku": "claude-haiku-4-5-20251001",
+            },
+        },
+        "task_type_provider_preference": {"create": ["anthropic"]},
+    }
+
+    task = _task(payload={"type": "create", "quality_tier": "opus"})
+    result = await select_llm_runtime_for_task(
+        user_id=_TEST_USER, task=task, runtime_config=runtime_config
+    )
+
+    assert result is not None
+    assert result.account is None
+    marker = task.context["routing_fallback"]
+    assert marker["reason"] == "no_account"
+    assert marker["effective_provider"] == "anthropic"
+
+
+@pytest.mark.asyncio
+async def test_select_llm_runtime_no_fallback_marker_on_intended_provider(
+    clean_runtime_pool,
+):
+    """The intended provider having a usable account leaves context clean — no
+    routing_fallback marker so the cost-analytics caveat stays uncluttered."""
+    anthropic = {
+        "id": "acct-anthropic",
+        "user_id": _TEST_USER,
+        "name": "anthropic",
+        "provider": "anthropic",
+        "auth_mode": "oauth",
+        "oauth_token": "sk-ant-test",
+        "runtime_ready": True,
+        "enabled": True,
+        "active_tasks": 0,
+    }
+    _max_plan_pools.setdefault(_TEST_USER, []).append(anthropic)
+    _account_by_id[anthropic["id"]] = anthropic
+
+    runtime_config = {
+        "provider_selection_mode": "preferred",
+        "provider_tier_model_map": {
+            "anthropic": {
+                "opus": "claude-opus-4-7",
+                "sonnet": "claude-sonnet-4-6",
+                "haiku": "claude-haiku-4-5-20251001",
+            },
+            "openai": {
+                "opus": "gpt-5.4",
+                "sonnet": "gpt-5.3-codex",
+                "haiku": "gpt-5.4-mini",
+            },
+        },
+        "task_type_provider_preference": {"create": ["anthropic", "openai"]},
+    }
+
+    task = _task(payload={"type": "create", "quality_tier": "opus"})
+    result = await select_llm_runtime_for_task(
+        user_id=_TEST_USER, task=task, runtime_config=runtime_config
+    )
+
+    assert result is not None
+    assert result.provider == "anthropic"
+    assert "routing_fallback" not in task.context

@@ -35,7 +35,7 @@
     "routers/agent_status.py": 3850,
     "autonomous_research.py": 2850,
     "autonomous_research_residual.py": 600,
-    "efficiency_snapshot.py": 1980,
+    "efficiency_snapshot.py": 2300,
     "research_completion.py": 3350,
     "findings_index.py": 350,
     "strategic_completion.py": 3200,

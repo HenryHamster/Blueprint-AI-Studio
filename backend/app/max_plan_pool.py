@@ -1548,6 +1548,52 @@ def _record_model_fallback(
         )
 
 
+def _record_routing_fallback(
+    task: Any,
+    *,
+    intended_provider: str | None,
+    intended_model: str | None,
+    effective_provider: str,
+    effective_model: str | None,
+    reason: str,
+) -> None:
+    """Record a provider/tier routing divergence on task.context.
+
+    Companion to :func:`_record_model_fallback` (same-provider preview→GA
+    downgrade). Covers the cross-provider fallback (the intended provider had no
+    usable account, so selection landed on a later-preference provider) and the
+    synthetic no-account path (no account could be reserved at all). Keeps the
+    divergence visible so downstream cost-by-model attribution can caveat that
+    the spend reflects a fallback rather than the intended routing.
+
+    Best-effort — never raises and never changes which account is chosen.
+
+    Shape:
+        context.routing_fallback = {
+            "intended_provider": "anthropic", "intended_model": "claude-opus-4-8",
+            "effective_provider": "openai", "effective_model": "gpt-...",
+            "reason": "cross_provider" | "no_account",
+            "at": "2026-06-05T...",
+        }
+    """
+    try:
+        ctx = dict(getattr(task, "context", {}) or {})
+        ctx["routing_fallback"] = {
+            "intended_provider": intended_provider,
+            "intended_model": intended_model,
+            "effective_provider": effective_provider,
+            "effective_model": effective_model,
+            "reason": reason,
+            "at": _utcnow().isoformat(),
+        }
+        task.context = ctx
+    except Exception:
+        logger.exception(
+            "[LLM_SELECT] Failed to record routing_fallback on task %s",
+            getattr(task, "id", "?"),
+        )
+
+
 def resolve_task_quality_tier(task: Any, runtime_config: Mapping[str, Any]) -> str:
     ctx = _task_context(task)
     payloads = getattr(task, "payloads", None) or []
@@ -1940,6 +1986,16 @@ async def select_llm_runtime_for_task(
         # first configured provider only until mappings are updated.
         provider_preference = provider_preference[:1]
 
+    # The intended routing is the most-preferred provider and its tier/explicit
+    # model. Captured here (after provider_preference is finalized) so every
+    # selection outcome below can be compared against it to detect a fallback.
+    intended_provider = provider_preference[0] if provider_preference else explicit_provider
+    intended_model = explicit_model
+    if intended_model is None and intended_provider:
+        intended_model = get_provider(intended_provider).tier_to_model(
+            quality_tier, runtime_config
+        )
+
     # Balanced mode: pool all listed providers' accounts and pick globally by
     # (health, -load). An explicit per-task provider/model still pins the
     # selection (handled above via trimmed provider_preference), so this only
@@ -1970,6 +2026,15 @@ async def select_llm_runtime_for_task(
             )
             if balanced_result is not None:
                 account, provider_name, chosen_model = balanced_result
+                if intended_provider and provider_name != intended_provider:
+                    _record_routing_fallback(
+                        task,
+                        intended_provider=intended_provider,
+                        intended_model=intended_model,
+                        effective_provider=provider_name,
+                        effective_model=chosen_model,
+                        reason="cross_provider",
+                    )
                 return LLMSelectionResult(
                     provider=provider_name,
                     auth_mode=_normalize_auth_mode(account.get("auth_mode"))
@@ -2014,6 +2079,15 @@ async def select_llm_runtime_for_task(
             task_type=routing_task_type,
         )
         if account:
+            if intended_provider and provider_name != intended_provider:
+                _record_routing_fallback(
+                    task,
+                    intended_provider=intended_provider,
+                    intended_model=intended_model,
+                    effective_provider=provider_name,
+                    effective_model=model,
+                    reason="cross_provider",
+                )
             return LLMSelectionResult(
                 provider=provider_name,
                 auth_mode=_normalize_auth_mode(account.get("auth_mode"))
@@ -2070,6 +2144,14 @@ async def select_llm_runtime_for_task(
                 )
 
     if explicit_provider and explicit_model:
+        _record_routing_fallback(
+            task,
+            intended_provider=intended_provider,
+            intended_model=intended_model,
+            effective_provider=explicit_provider,
+            effective_model=explicit_model,
+            reason="no_account",
+        )
         return LLMSelectionResult(
             provider=explicit_provider,
             auth_mode=get_task_llm_auth_mode(task) or LLMAuthMode.OAUTH.value,
@@ -2086,6 +2168,14 @@ async def select_llm_runtime_for_task(
         provider = get_provider(fallback_provider)
         fallback_model = explicit_model or provider.tier_to_model(
             quality_tier, runtime_config
+        )
+        _record_routing_fallback(
+            task,
+            intended_provider=intended_provider,
+            intended_model=intended_model,
+            effective_provider=fallback_provider,
+            effective_model=fallback_model,
+            reason="no_account",
         )
         return LLMSelectionResult(
             provider=fallback_provider,
