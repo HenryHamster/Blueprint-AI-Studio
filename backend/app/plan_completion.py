@@ -193,6 +193,68 @@ def _inject_build_on_deps(subtasks: List[Dict], label: str = "PLAN") -> List[tup
     return added
 
 
+def _resolve_injected_cycles(
+    subtasks: List[Dict], explicit_deps: Dict[int, List[int]], label: str = "PLAN"
+) -> List[Dict]:
+    """Break dependency cycles by dropping only the INJECTED conflict-prevention
+    edges that close a cycle, preserving explicit declarations and as many
+    injected serialization edges as possible.
+
+    The old behaviour wholesale-discarded EVERY injected edge (same-file
+    chaining + build-on) the moment any combination cycled, so unrelated
+    same-base siblings lost their serialization and could dispatch in parallel
+    and conflict at merge. Instead, we rebuild the graph on top of the explicit
+    declarations and greedily re-add each injected edge; an injected edge is
+    dropped only if adding it would (re)introduce a cycle. Explicit edges are
+    never touched (they are the agent's own declaration, not conflict
+    prevention).
+
+    Returns a list of dropped-edge records (successor/predecessor indices and
+    titles) so the caller can record WHICH edges were removed and WHY, beyond a
+    bare error log.
+    """
+    # Injected edges = whatever the injection passes added on top of explicit.
+    injected: List[tuple] = []
+    for successor, st in enumerate(subtasks):
+        explicit = set(explicit_deps.get(successor, []))
+        for predecessor in st.get("depends_on_indices", []):
+            if predecessor not in explicit:
+                injected.append((successor, predecessor))
+
+    # Reset to the explicit-only baseline, then greedily re-add injected edges.
+    for i, st in enumerate(subtasks):
+        if explicit_deps.get(i):
+            st["depends_on_indices"] = list(explicit_deps[i])
+        else:
+            st.pop("depends_on_indices", None)
+
+    dropped: List[Dict] = []
+    for successor, predecessor in injected:
+        existing = subtasks[successor].setdefault("depends_on_indices", [])
+        if predecessor in existing:
+            continue
+        existing.append(predecessor)
+        if _validate_plan_dependencies(subtasks):
+            continue
+        # This injected edge closes a cycle — drop it and record why.
+        existing.remove(predecessor)
+        if not existing:
+            subtasks[successor].pop("depends_on_indices", None)
+        record = {
+            "successor_index": successor,
+            "predecessor_index": predecessor,
+            "successor": subtasks[successor].get("title", f"#{successor}"),
+            "predecessor": subtasks[predecessor].get("title", f"#{predecessor}"),
+        }
+        dropped.append(record)
+        logger.warning(
+            f"[{label}] Dropped conflict-prevention edge "
+            f"{record['predecessor']!r} → {record['successor']!r}: it would "
+            f"close a dependency cycle with the plan's explicit declarations."
+        )
+    return dropped
+
+
 async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     """Parse plan output and create child tasks with dependency tracking."""
     from app.alert_dispatch import _maybe_create_failure_alert
@@ -269,10 +331,72 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     subtasks = plan_data["subtasks"]
 
     if len(subtasks) > 10:
-        subtasks = subtasks[:10]
-        logger.info(
-            f"[PLAN] Capped subtask count from {len(plan_data['subtasks'])} to 10"
+        dropped_count = len(subtasks) - 10
+        dropped_subtasks = subtasks[10:]
+        dropped_titles = [st.get("title", f"#{10 + i}") for i, st in enumerate(dropped_subtasks)]
+
+        # Check if any of the kept subtasks depend on a dropped subtask
+        broken_deps = []
+        for i in range(min(10, len(subtasks))):
+            for dep_idx in subtasks[i].get("depends_on_indices", []):
+                if dep_idx >= 10:
+                    broken_deps.append({
+                        "subtask_index": i,
+                        "subtask_title": subtasks[i].get("title", f"#{i}"),
+                        "broken_dep_index": dep_idx,
+                        "broken_dep_title": (
+                            subtasks[dep_idx].get("title", f"#{dep_idx}")
+                            if dep_idx < len(subtasks)
+                            else f"#{dep_idx}"
+                        ),
+                    })
+
+        task.latest_status_message = (
+            f"Plan exceeds 10-subtask limit: {len(subtasks)} subtasks provided, "
+            f"dropped {dropped_count} (indices 10-{len(subtasks)-1}). "
+            f"Kept subtasks have {len(broken_deps)} unsatisfiable "
+            f"dependency/dependencies on dropped subtasks."
+        )[:500]
+        task.status = TaskStatus.FAILED
+        from app.failure_classification import (
+            classify_failure,
+            persist_failure_category,
         )
+        from app.routers.agent_status import record_task_result
+
+        _fc = classify_failure(task)
+        persist_failure_category(task, _fc)
+        record_task_result(
+            success=False,
+            failure_class=_fc,
+            task_id=str(task.id),
+            task_type=task.first_payload.get("type", ""),
+        )
+        ctx = dict(task.context or {})
+        ctx["subtask_cap_exceeded"] = {
+            "total_subtasks": len(subtasks),
+            "limit": 10,
+            "dropped_count": dropped_count,
+            "dropped_indices": list(range(10, len(subtasks))),
+            "dropped_titles": dropped_titles,
+            "broken_dependencies": broken_deps,
+        }
+        task.context = ctx
+        session.add(task)
+        await _maybe_create_failure_alert(
+            task, session, task.latest_status_message
+        )
+        await session.commit()
+        logger.error(
+            "[PLAN] Plan %s failed — decomposition exceeded 10-subtask cap: "
+            "%d subtasks provided, dropped %d. Kept subtasks have %d unsatisfiable "
+            "dependencies on dropped subtasks.",
+            task.id,
+            len(subtasks),
+            dropped_count,
+            len(broken_deps),
+        )
+        return
 
     if not _validate_plan_dependencies(subtasks):
         task.latest_status_message = "Plan has circular dependencies"
@@ -521,14 +645,20 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     _inject_build_on_deps(subtasks, "PLAN")
 
     if not _validate_plan_dependencies(subtasks):
+        # A cycle formed once injected serialization edges combined with the
+        # plan's explicit declarations. Remove only the minimal injected edges
+        # that close a cycle — keep the rest of the conflict-prevention
+        # serialization rather than wholesale-discarding all of it.
+        dropped_edges = _resolve_injected_cycles(subtasks, original_deps, "PLAN")
         logger.error(
-            "[PLAN] Circular dependency after dependency injection — reverting to explicit deps only"
+            "[PLAN] Circular dependency after dependency injection — dropped "
+            f"{len(dropped_edges)} conflict-prevention edge(s) to restore "
+            "acyclicity, preserved the remaining serialization"
         )
-        for i, st in enumerate(subtasks):
-            if original_deps.get(i):
-                st["depends_on_indices"] = original_deps[i]
-            else:
-                st.pop("depends_on_indices", None)
+        ctx = dict(task.context or {})
+        ctx["dropped_serialization_edges"] = dropped_edges
+        task.context = ctx
+        session.add(task)
 
     for i, subtask_def in enumerate(subtasks):
         if child_tasks[i] is None:

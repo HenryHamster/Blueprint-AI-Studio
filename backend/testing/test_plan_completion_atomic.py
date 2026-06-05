@@ -459,3 +459,317 @@ async def test_dependent_on_skipped_producer_fails_plan(
         f"No children should spawn when plan fails due to unsatisfiable dependency, "
         f"got {len(children)}"
     )
+
+
+@pytest.mark.asyncio
+async def test_plan_exceeding_subtask_cap_fails_with_record(
+    db_session, mocker, _quiet_mocks
+):
+    """A plan with more than 10 subtasks fails with a durable record of what was dropped.
+
+    Rather than silently truncating at 10 and losing the remaining subtasks,
+    the plan must FAIL and persist a subtask_cap_exceeded record containing:
+    - The total subtask count
+    - The dropped indices and titles
+    - Any unsatisfiable dependencies on dropped subtasks
+    """
+    # Create 12 subtasks to exceed the cap.
+    subtasks_list = [
+        {"title": f"Step {i}", "prompt": f"do step {i}", "scope": "small"}
+        for i in range(12)
+    ]
+    plan_logs = json.dumps({"subtasks": subtasks_list})
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    await db_session.refresh(task)
+
+    # Plan must FAIL due to exceeding the subtask cap.
+    assert task.status == TaskStatus.FAILED, (
+        f"Plan should FAIL when exceeding subtask cap, got status {task.status}"
+    )
+
+    # Error message should mention the cap and dropped count.
+    assert "exceed" in (task.latest_status_message or "").lower(), (
+        f"Expected 'exceed' in error message, got {task.latest_status_message!r}"
+    )
+    assert "12" in (task.latest_status_message or ""), (
+        f"Expected total count '12' in error message, got {task.latest_status_message!r}"
+    )
+    assert "2" in (task.latest_status_message or ""), (
+        f"Expected dropped count '2' in error message, got {task.latest_status_message!r}"
+    )
+
+    # Context must record dropped subtasks durably.
+    cap_record = (task.context or {}).get("subtask_cap_exceeded")
+    assert cap_record, f"subtask_cap_exceeded must be recorded on task.context, got {cap_record!r}"
+    assert cap_record.get("total_subtasks") == 12, (
+        f"Record must capture total subtask count, got {cap_record.get('total_subtasks')!r}"
+    )
+    assert cap_record.get("dropped_count") == 2, (
+        f"Record must capture dropped count, got {cap_record.get('dropped_count')!r}"
+    )
+    assert cap_record.get("dropped_indices") == [10, 11], (
+        f"Record must list dropped indices [10, 11], got {cap_record.get('dropped_indices')!r}"
+    )
+
+    # No children should have been spawned.
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 0, (
+        f"No children should spawn when plan exceeds subtask cap, got {len(children)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_kept_subtask_depending_on_dropped_subtask_fails_plan(
+    db_session, mocker, _quiet_mocks
+):
+    """A kept subtask with a broken dependency on a dropped subtask causes plan failure.
+
+    This catches the scenario where a subtask references a dropped subtask in its
+    depends_on_indices. The plan must FAIL rather than silently removing the dependency
+    edge (which would cause premature dispatch). The broken dependency must be recorded
+    in the context.
+    """
+    # Create 11 subtasks: steps 0-9 kept, step 10 dropped.
+    # Step 8 depends on step 10 (which will be dropped).
+    subtasks_list = [
+        {"title": "Step 0", "prompt": "step 0", "scope": "small"},
+        {"title": "Step 1", "prompt": "step 1", "scope": "small"},
+        {"title": "Step 2", "prompt": "step 2", "scope": "small"},
+        {"title": "Step 3", "prompt": "step 3", "scope": "small"},
+        {"title": "Step 4", "prompt": "step 4", "scope": "small"},
+        {"title": "Step 5", "prompt": "step 5", "scope": "small"},
+        {"title": "Step 6", "prompt": "step 6", "scope": "small"},
+        {"title": "Step 7", "prompt": "step 7", "scope": "small"},
+        {
+            "title": "Step 8",
+            "prompt": "step 8 depends on dropped",
+            "scope": "small",
+            "depends_on_indices": [10],  # Broken: index 10 will be dropped
+        },
+        {"title": "Step 9", "prompt": "step 9", "scope": "small"},
+        {"title": "Step 10 (dropped)", "prompt": "step 10", "scope": "small"},
+    ]
+    plan_logs = json.dumps({"subtasks": subtasks_list})
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    await db_session.refresh(task)
+
+    # Plan must FAIL due to exceeding subtask cap + broken dependency.
+    assert task.status == TaskStatus.FAILED, (
+        f"Plan should FAIL when cap exceeded with broken dependencies, "
+        f"got status {task.status}"
+    )
+
+    # Error message should mention unsatisfiable dependencies.
+    msg = task.latest_status_message or ""
+    assert "unsatisfiable" in msg.lower() or "exceed" in msg.lower(), (
+        f"Expected 'unsatisfiable' or 'exceed' in error message, got {msg!r}"
+    )
+
+    # Context must record both the cap exceeded and the broken dependencies.
+    cap_record = (task.context or {}).get("subtask_cap_exceeded")
+    assert cap_record, f"subtask_cap_exceeded must be recorded, got {cap_record!r}"
+
+    # The broken dependency must be documented.
+    broken_deps = cap_record.get("broken_dependencies", [])
+    assert len(broken_deps) >= 1, (
+        f"Must record at least one broken dependency, got {broken_deps!r}"
+    )
+
+    # Verify the broken dependency record details.
+    step_8_dep = next(
+        (d for d in broken_deps if d.get("subtask_title") == "Step 8"),
+        None,
+    )
+    assert step_8_dep, (
+        f"Step 8's broken dependency must be recorded, got {broken_deps!r}"
+    )
+    assert step_8_dep.get("broken_dep_index") == 10, (
+        f"Broken dependency should reference dropped index 10, "
+        f"got {step_8_dep.get('broken_dep_index')!r}"
+    )
+    assert step_8_dep.get("broken_dep_title") == "Step 10 (dropped)", (
+        f"Broken dependency should reference dropped title, "
+        f"got {step_8_dep.get('broken_dep_title')!r}"
+    )
+
+    # No children should have been spawned.
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 0, (
+        f"No children should spawn when broken dependencies exist, got {len(children)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_kept_subtask_depending_on_out_of_range_index_fails_gracefully(
+    db_session, mocker, _quiet_mocks
+):
+    """A kept subtask depending on an index beyond the array must not crash.
+
+    Regression: a plausible LLM miscount can produce a depends_on_indices entry
+    that points past the end of the subtasks list (e.g. [12] in a 12-subtask
+    plan). The cap path's broken-dependency title lookup must NOT IndexError on
+    such an entry — doing so would abort _handle_plan_completion before the
+    FAILED status and subtask_cap_exceeded record commit, leaving the plan stuck.
+    The dependency is still unsatisfiable, so it must be recorded (with a safe
+    fallback title) and the plan must FAIL cleanly.
+    """
+    # 12 subtasks: steps 0-9 kept, steps 10-11 dropped. Step 0 declares a
+    # dependency on index 12, which is beyond the end of the 12-element list.
+    subtasks_list = [
+        {
+            "title": "Step 0",
+            "prompt": "step 0 depends on out-of-range index",
+            "scope": "small",
+            "depends_on_indices": [12],  # Out of range: len(subtasks) == 12
+        },
+    ]
+    for i in range(1, 12):
+        subtasks_list.append(
+            {"title": f"Step {i}", "prompt": f"step {i}", "scope": "small"}
+        )
+    plan_logs = json.dumps({"subtasks": subtasks_list})
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    # Must not raise IndexError.
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    await db_session.refresh(task)
+
+    # Plan must FAIL cleanly (not stuck) due to exceeding the cap.
+    assert task.status == TaskStatus.FAILED, (
+        f"Plan should FAIL cleanly when cap exceeded with out-of-range dep, "
+        f"got status {task.status}"
+    )
+
+    # The cap record and the broken dependency must still be committed.
+    cap_record = (task.context or {}).get("subtask_cap_exceeded")
+    assert cap_record, f"subtask_cap_exceeded must be recorded, got {cap_record!r}"
+
+    broken_deps = cap_record.get("broken_dependencies", [])
+    step_0_dep = next(
+        (d for d in broken_deps if d.get("subtask_title") == "Step 0"),
+        None,
+    )
+    assert step_0_dep, (
+        f"Step 0's out-of-range dependency must be recorded, got {broken_deps!r}"
+    )
+    assert step_0_dep.get("broken_dep_index") == 12, (
+        f"Broken dependency should reference index 12, "
+        f"got {step_0_dep.get('broken_dep_index')!r}"
+    )
+    # Safe fallback title for the out-of-range index.
+    assert step_0_dep.get("broken_dep_title") == "#12", (
+        f"Out-of-range dependency should use safe fallback title '#12', "
+        f"got {step_0_dep.get('broken_dep_title')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_injection_cycle_drops_only_offending_edge_keeps_rest(
+    db_session, mocker, _quiet_mocks
+):
+    """Post-injection cycle removes only the offending injected edge.
+
+    Subtask A explicitly declares a forward dependency on subtask B, and A and B
+    share a file — so file-overlap injection adds B→A, forming a 2-cycle with
+    A→B. A second, UNRELATED same-file pair (C, D) gets its own conflict-
+    prevention edge D→C that has nothing to do with the cycle.
+
+    The old behaviour wholesale-discarded EVERY injected edge, so D→C was lost
+    and C/D could dispatch in parallel and conflict. The fix must drop ONLY the
+    cycle-closing injected edge (B→A) while preserving the unrelated D→C
+    serialization, and record what was dropped on task.context.
+    """
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "A",
+                    "prompt": "edit shared foo",
+                    "scope": "small",
+                    "related_files": ["foo.py"],
+                    "depends_on_indices": [1],  # explicit forward reference to B
+                },
+                {
+                    "title": "B",
+                    "prompt": "edit shared foo too",
+                    "scope": "small",
+                    "related_files": ["foo.py"],  # shared with A → injects B→A
+                },
+                {
+                    "title": "C",
+                    "prompt": "edit shared bar",
+                    "scope": "small",
+                    "related_files": ["bar.py"],
+                },
+                {
+                    "title": "D",
+                    "prompt": "edit shared bar too",
+                    "scope": "small",
+                    "related_files": ["bar.py"],  # shared with C → injects D→C
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 4
+    by_title = {c.title: c for c in children}
+    a, b, c, d = (by_title["A"], by_title["B"], by_title["C"], by_title["D"])
+
+    # Explicit edge A→B survives; cycle-closing injected edge B→A is dropped.
+    assert a.depends_on == [str(b.id)], (
+        f"Explicit A→B must survive, got {a.depends_on!r}"
+    )
+    assert (b.depends_on or []) == [], (
+        f"Cycle-closing injected B→A must be dropped, got {b.depends_on!r}"
+    )
+
+    # Unrelated conflict-prevention edge D→C must be PRESERVED (not wholesale-dropped).
+    assert (c.depends_on or []) == [], (
+        f"C should have no deps, got {c.depends_on!r}"
+    )
+    assert d.depends_on == [str(c.id)], (
+        f"Unrelated injected D→C must survive the cycle break, got {d.depends_on!r}"
+    )
+
+    # Resolution is observable beyond a bare error log.
+    await db_session.refresh(task)
+    dropped = (task.context or {}).get("dropped_serialization_edges")
+    assert dropped, f"Dropped edges must be recorded on task.context, got {dropped!r}"
+    assert any(
+        e["successor"] == "B" and e["predecessor"] == "A" for e in dropped
+    ), f"Dropped record must name the B→A edge, got {dropped!r}"
