@@ -7061,6 +7061,7 @@ async def test_version_lifecycle_with_open_version(client: AsyncClient, db_sessi
             },
             "blocker": None,
             "finalized_at": "2026-01-01T00:00:00",
+            "candidate_sha": "abc1234567",
         },
     )
     db_session.add(version)
@@ -7085,6 +7086,9 @@ async def test_version_lifecycle_with_open_version(client: AsyncClient, db_sessi
     assert qual["ci_resolution"]["state"] == "green"
     assert qual["ci_resolution"]["resolved_sha"] == "abc1234567"
     assert qual["blocker"] is None
+    # The evaluated candidate commit is surfaced so the UI can detect when the
+    # latest audit's findings were computed against a different (older) commit.
+    assert qual["candidate_sha"] == "abc1234567"
 
     assert data["recent_versions"] == []
 

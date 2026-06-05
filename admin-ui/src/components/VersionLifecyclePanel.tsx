@@ -74,17 +74,67 @@ const FINDING_SEVERITY_STYLE: Record<string, string> = {
 };
 const FINDING_SEVERITY_ORDER = ['critical', 'high', 'medium', 'low'];
 
-function AuditFindingsList({ audit }: { audit: LatestAudit }) {
+// Provenance + staleness header for the audit findings. Shows which commit the
+// audit ran against and how long ago, and flags when that commit differs from the
+// version's most-recently-evaluated candidate (currentCandidateSha) — i.e. the
+// integration branch advanced and some findings may already be fixed.
+function AuditProvenance({
+  audit,
+  currentCandidateSha,
+}: {
+  audit: LatestAudit;
+  currentCandidateSha?: string | null;
+}) {
+  const sha = audit.candidate_sha;
+  const isStale = !!(sha && currentCandidateSha && sha !== currentCandidateSha);
+  if (!sha && !audit.created_at) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {sha && (
+        <span className="text-[10px] text-neutral-500 font-mono" title={sha}>
+          @{sha.slice(0, 7)}
+        </span>
+      )}
+      {audit.created_at && (
+        <span className="text-[10px] text-neutral-600">ran {timeAgo(audit.created_at)}</span>
+      )}
+      {isStale && (
+        <span
+          className="text-[10px] px-1.5 py-0.5 rounded border bg-amber-950/40 text-amber-400 border-amber-900/50"
+          title={`audit commit ${(sha ?? '').slice(0, 7)} differs from evaluated candidate ${(currentCandidateSha ?? '').slice(0, 7)}`}
+        >
+          findings from an older commit — branch advanced
+        </span>
+      )}
+    </div>
+  );
+}
+
+function AuditFindingsList({
+  audit,
+  currentCandidateSha,
+}: {
+  audit: LatestAudit;
+  currentCandidateSha?: string | null;
+}) {
   if (!audit.report) {
     return (
-      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20">
-        audit crashed — no report
-      </span>
+      <div className="space-y-0.5">
+        <AuditProvenance audit={audit} currentCandidateSha={currentCandidateSha} />
+        <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20">
+          audit crashed — no report
+        </span>
+      </div>
     );
   }
   const findings: AuditFinding[] = audit.report.findings ?? [];
   if (findings.length === 0) {
-    return <span className="text-[10px] text-neutral-500 italic">audit: no findings</span>;
+    return (
+      <div className="space-y-0.5">
+        <AuditProvenance audit={audit} currentCandidateSha={currentCandidateSha} />
+        <span className="text-[10px] text-neutral-500 italic">audit: no findings</span>
+      </div>
+    );
   }
   const sorted = [...findings].sort((a, b) => {
     const ai = FINDING_SEVERITY_ORDER.indexOf(a.severity?.toLowerCase() ?? '');
@@ -94,6 +144,7 @@ function AuditFindingsList({ audit }: { audit: LatestAudit }) {
   return (
     <div className="space-y-0.5">
       <p className="text-[10px] text-neutral-500 uppercase tracking-wide">Audit Findings</p>
+      <AuditProvenance audit={audit} currentCandidateSha={currentCandidateSha} />
       {sorted.map((f, i) => (
         <div key={i} className={`flex items-start gap-1.5 text-[10px] px-1.5 py-0.5 rounded border ${FINDING_SEVERITY_STYLE[f.severity?.toLowerCase() ?? ''] ?? 'bg-neutral-800/50 text-neutral-400 border-neutral-700/50'}`}>
           <span className="font-semibold shrink-0">{f.severity ?? '?'}</span>
@@ -572,7 +623,12 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
             )}
             {cv.last_qualification && (
               <div className="pl-2 border-l border-neutral-700/50 space-y-0.5">
-                <QualSummary q={cv.last_qualification} />
+                <div className="flex flex-wrap items-center gap-2">
+                  <QualSummary q={cv.last_qualification} />
+                  {cv.last_qualification.finalized_at && (
+                    <span className="text-[10px] text-neutral-600">as of {timeAgo(cv.last_qualification.finalized_at)}</span>
+                  )}
+                </div>
                 {(cv.last_qualification.sub_scores || cv.last_qualification.ci_resolution) && (
                   <div className="flex flex-wrap gap-x-2 gap-y-0.5 text-[10px] text-neutral-500">
                     {cv.last_qualification.sub_scores && (
@@ -616,7 +672,10 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
             )}
             {cv.latest_audit && (
               <div className="pl-2 border-l border-neutral-700/50">
-                <AuditFindingsList audit={cv.latest_audit} />
+                <AuditFindingsList
+                  audit={cv.latest_audit}
+                  currentCandidateSha={cv.last_qualification?.candidate_sha}
+                />
               </div>
             )}
             {projectId && (

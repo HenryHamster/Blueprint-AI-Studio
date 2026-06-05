@@ -698,4 +698,97 @@ describe('VersionLifecyclePanel', () => {
       });
     });
   });
+
+  describe('audit findings provenance + staleness', () => {
+    function makeQualification(overrides: Partial<api.VersionQualification> = {}): api.VersionQualification {
+      return {
+        status: 'not_promoted',
+        confidence: 0.89,
+        threshold: 0.9,
+        sub_scores: null,
+        ci_resolution: null,
+        blocker: null,
+        finalized_at: '2026-01-01T00:00:00Z',
+        ...overrides,
+      };
+    }
+
+    function makeLatestAudit(overrides: Partial<api.LatestAudit> = {}): api.LatestAudit {
+      return {
+        audit_task_id: 'task-1',
+        task_status: 'completed',
+        candidate_sha: 'abcdef1234567890',
+        created_at: '2026-01-01T00:00:00Z',
+        report: { findings: [{ severity: 'medium', summary: 'unverified finding' }] },
+        ...overrides,
+      };
+    }
+
+    it('renders the audit candidate SHA and run-age provenance', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              latest_audit: makeLatestAudit({ candidate_sha: 'abcdef1234567890' }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByText('@abcdef1')).toBeInTheDocument();
+      expect(screen.getByText(/^ran /)).toBeInTheDocument();
+    });
+
+    it('shows a stale badge when the audit commit differs from the evaluated candidate', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({ candidate_sha: 'fed9876543210000' }),
+              latest_audit: makeLatestAudit({ candidate_sha: 'abcdef1234567890' }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByText(/findings from an older commit/)).toBeInTheDocument();
+    });
+
+    it('does not show a stale badge when the audit commit matches the evaluated candidate', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({ candidate_sha: 'abcdef1234567890' }),
+              latest_audit: makeLatestAudit({ candidate_sha: 'abcdef1234567890' }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByText(/findings from an older commit/)).not.toBeInTheDocument();
+    });
+
+    it('renders an "as of" freshness label beside the qualification summary', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({ finalized_at: '2026-01-01T00:00:00Z' }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByText(/^as of /)).toBeInTheDocument();
+    });
+  });
 });

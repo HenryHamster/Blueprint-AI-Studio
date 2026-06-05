@@ -1028,6 +1028,9 @@ export interface VersionQualification {
   ci_resolution: CiResolution | null;
   blocker: string | null;
   finalized_at: string | null;
+  // The candidate commit this qualification was evaluated against. Used to detect
+  // when the latest audit's findings were computed against a different commit.
+  candidate_sha?: string | null;
   // Infra-failure context (populated only when status=infra_failure).
   error?: string | null;
   consecutive_infra_errors?: number | null;

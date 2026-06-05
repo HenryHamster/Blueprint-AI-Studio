@@ -103,6 +103,10 @@ def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
         "ci_resolution": qual.get("ci_resolution"),
         "blocker": qual.get("blocker"),
         "finalized_at": qual.get("finalized_at"),
+        # The candidate commit this qualification was evaluated against. Lets the
+        # operator UI detect when the latest release_audit's findings were computed
+        # against a different (older) commit than the version's evaluated candidate.
+        "candidate_sha": qual.get("candidate_sha"),
         # Infra-failure context (populated only when status=infra_failure).
         "error": qual.get("error"),
         "consecutive_infra_errors": qual.get("consecutive_infra_errors"),
