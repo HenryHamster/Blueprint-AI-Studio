@@ -10610,3 +10610,121 @@ class TestIsVerificationOnlyRejection:
             )
             is True
         )
+
+
+@pytest.mark.asyncio
+async def test_already_merged_skip_completes_stranded_leaf_origin(db_session, mocker):
+    """A leaf write-task reaped mid-run with an open PR is parked EVALUATING and
+    handed a review to drive it to completion (reaper open-PR handoff). If the PR
+    then merges out-of-band BEFORE that review runs, _spawn_pipeline_task's
+    already-merged guard skips the review — and must COMPLETE the stranded
+    originating task, or it sits EVALUATING forever and wedges its rollup parent.
+    Regression for the merged-but-stuck strand (task 233d0287, 2026-06-05)."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_db_project(db_session)
+
+    # Leaf 'create' task: reaped mid-run, parked EVALUATING, PR merged out-of-band.
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "plan/abc"}],
+        context={"scope": "small", "pr_merged": True},
+    )
+    db_session.add(original_task)
+    # The review task the reaper spawned to drive the reaped task to completion.
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 8064,
+                "branch": "blueprint/task-x",
+                "base_branch": "plan/abc",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=8064,
+        branch="blueprint/task-x",
+        base_branch="plan/abc",
+        original_task_id=str(original_task.id),
+    )
+
+    assert result is None and created is False, (
+        "Review spawn must be skipped for an already-merged PR"
+    )
+    await db_session.refresh(original_task)
+    assert original_task.status == TaskStatus.COMPLETED, (
+        "Stranded leaf originating task must be COMPLETED on the already-merged "
+        f"skip, got {original_task.status}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_already_merged_skip_leaves_rollup_parent_evaluating(db_session, mocker):
+    """The already-merged completion is gated to leaf write-tasks: a rollup-chain
+    source must NOT be force-completed here — its intermediate-vs-terminal landing
+    is decided by classify_rollup_merge_outcome. It stays EVALUATING."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_db_project(db_session)
+
+    rollup_parent = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "plan", "prompt": "rollup", "base_branch": "research/abc"}],
+        # _is_rollup_review marks a rollup-chain source (_is_rollup_chain_source).
+        context={"scope": "small", "pr_merged": True, "_is_rollup_review": True},
+    )
+    db_session.add(rollup_parent)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 8088,
+                "branch": "plan/abc",
+                "base_branch": "research/abc",
+                "original_task_id": str(rollup_parent.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 0, "original_task_id": str(rollup_parent.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(rollup_parent)
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=8088,
+        branch="plan/abc",
+        base_branch="research/abc",
+        original_task_id=str(rollup_parent.id),
+    )
+
+    assert result is None and created is False
+    await db_session.refresh(rollup_parent)
+    assert rollup_parent.status == TaskStatus.EVALUATING, (
+        "A rollup-chain source must NOT be force-completed by the already-merged "
+        f"skip; got {rollup_parent.status}"
+    )

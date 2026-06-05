@@ -1074,6 +1074,26 @@ async def _spawn_pipeline_task(
             )
             _set_spawn_reason(source_task, SPAWN_REASON_ALREADY_MERGED)
             session.add(source_task)
+            # Finalize a stranded originating task. A leaf write-task reaped
+            # mid-run with an open PR is parked EVALUATING and handed a review to
+            # drive it to completion (reaper.py open-PR handoff). If the PR then
+            # merges out-of-band BEFORE that review runs, the review is skipped
+            # here — but the originating task would otherwise sit EVALUATING
+            # forever (its merge never reconciled back), wedging its rollup
+            # parent. Its PR has merged (pr_merged is set), so complete it now.
+            # Gated to non-rollup-chain sources: a rollup parent's
+            # intermediate-vs-terminal landing is decided by
+            # classify_rollup_merge_outcome elsewhere, not here.
+            if (
+                orig_task.status == TaskStatus.EVALUATING
+                and not _is_rollup_chain_source(orig_task)
+            ):
+                orig_task.status = TaskStatus.COMPLETED
+                orig_task.latest_status_message = (
+                    f"PR #{pr_number} merged out-of-band; completed on "
+                    f"already-merged review skip"
+                )
+                session.add(orig_task)
             return (None, False)
     except Exception:  # noqa: BLE001
         logger.debug(
