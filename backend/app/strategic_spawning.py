@@ -1325,6 +1325,42 @@ def _build_operator_steering_directive(
     )
 
 
+async def _fetch_open_messages(
+    project_id: uuid.UUID, session: AsyncSession
+) -> list[dict]:
+    """Fetch currently-open messages for the strategic agent.
+
+    Returns ALL currently-open messages (status=='open'), bounded to a sane cap
+    (50) but independent of any recency cap, ordered oldest-first. This ensures
+    the strategist can see ALL open BUG_REPORT and BLOCKER items regardless of
+    thread age, and can resolve them by id.
+
+    Replaces the prior pattern of filtering open messages from a 15-row
+    conversation-thread snapshot, which silently aged out messages older than
+    the 15 most recent rows of ANY status.
+    """
+    result = await session.execute(
+        select(ProjectMessage)
+        .where(
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.status == "open",
+        )
+        .order_by(ProjectMessage.created_at.asc())
+        .limit(50)
+    )
+    return [
+        {
+            "id": str(m.id),
+            "type": m.message_type,
+            "content": m.content,
+            "context": m.context,
+            "from": m.from_type,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+        }
+        for m in result.scalars().all()
+    ]
+
+
 def _summarize_conversation_thread(thread: list) -> list:
     """Keep the most recent N conversation messages."""
     if (
@@ -2489,26 +2525,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     )
 
     # Fetch open messages for the design doc agent
-    open_msgs_result = await session.execute(
-        select(ProjectMessage)
-        .where(
-            ProjectMessage.project_id == project.id,
-            ProjectMessage.status == "open",
-        )
-        .order_by(ProjectMessage.created_at.asc())
-        .limit(50)
-    )
-    open_msgs = [
-        {
-            "id": str(m.id),
-            "type": m.message_type,
-            "content": m.content,
-            "context": m.context,
-            "from": m.from_type,
-            "created_at": m.created_at.isoformat() if m.created_at else None,
-        }
-        for m in open_msgs_result.scalars().all()
-    ]
+    open_msgs = await _fetch_open_messages(project.id, session)
 
     # Build shipped_changes_manifest: tasks merged since the last arch review
     shipped_changes_manifest = await _build_shipped_changes_manifest(project, session)
@@ -2916,8 +2933,10 @@ async def _spawn_strategic_review(
         }
         for m in all_thread_msgs
     ]
-    # Executor still needs a flat list of open messages for resolve operations
-    open_msgs = [msg for msg in conversation_thread if msg["status"] == "open"]
+    # Fetch open messages from a dedicated query (status-filtered, independent of
+    # recency cap) so the strategist sees ALL open BUG_REPORT/BLOCKER items,
+    # not just those within the 15-message conversation-thread window.
+    open_msgs = await _fetch_open_messages(project.id, session)
 
     # When did the user last engage? Last ProjectMessage from_type='user'.
     # The strategic agent uses this to frame its running_update "since last

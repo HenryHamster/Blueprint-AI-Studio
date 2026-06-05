@@ -8604,3 +8604,72 @@ async def test_arm_operator_refresh_persists_excerpt_and_replaces_on_coalesce(
     assert marker2.get("excerpt") == "newer steering content wins"
     # Coalesced into the same single slot (not stacked into a second marker).
     assert marker2.get("count") == 2
+
+
+@pytest.mark.asyncio
+async def test_open_bug_report_older_than_thread_cap_appears_in_open_messages(
+    db_session,
+):
+    """Open BUG_REPORT created before 15+ newer messages still appears in payload.
+
+    Regression test for: strategist's open-message feed survives the 15-msg
+    thread cap. The conversation_thread is capped at 15 recent messages of ANY
+    status, but open_messages must come from a dedicated query so open
+    BUG_REPORT/BLOCKER items older than the thread cap are NOT aged out of view.
+    """
+    project = _make_project(
+        vision={"purpose": "test project"},
+        problem_model={},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create an old open BUG_REPORT (will be older than the 15-message cap).
+    old_bug_content = "Ancient bug that needs fixing"
+    old_bug = ProjectMessage(
+        project_id=project.id,
+        from_type="system",
+        message_type=MessageType.BUG_REPORT,
+        content=old_bug_content,
+        status="open",
+    )
+    db_session.add(old_bug)
+    await db_session.commit()
+
+    # Create 20+ newer messages to push the old bug out of the 15-message
+    # conversation_thread window.
+    for i in range(20):
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                from_type="system" if i % 2 == 0 else "user",
+                message_type=MessageType.NOTE if i % 3 == 0 else MessageType.FEEDBACK,
+                content=f"Recent message {i}",
+                status="resolved" if i % 5 == 0 else "open",
+            )
+        )
+    await db_session.commit()
+
+    # Spawn the strategic review; the old bug should still appear in open_messages.
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    assert len(tasks) == 1
+    payload = tasks[0].payloads[0]
+
+    # The old bug should be in open_messages despite being aged out of
+    # conversation_thread (which is capped at 15 most recent rows).
+    open_msg_contents = [m["content"] for m in payload["open_messages"]]
+    assert old_bug_content in open_msg_contents, (
+        "Old open BUG_REPORT aged out of conversation_thread must still appear "
+        "in open_messages via dedicated status-filtered query"
+    )
+
+    # Verify the old bug is NOT in conversation_thread (proves it aged out).
+    thread_contents = [m["content"] for m in payload["conversation_thread"]]
+    assert old_bug_content not in thread_contents, (
+        "Old bug aged out of 15-message thread cap as expected"
+    )
