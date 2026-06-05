@@ -1085,11 +1085,21 @@ export interface PromotionReadiness {
   thresholds: Record<string, number>;
 }
 
+export interface StagedDirection {
+  id: string | null;
+  text: string | null;
+  priority: string | null;
+  staged_for_version: number | null;
+  staged_at: string | null;
+  staged_age_days: number | null;
+}
+
 export interface VersionLifecycleResponse {
   current_version: CurrentVersion | null;
   recent_versions: RecentVersion[];
   promotion_enabled?: boolean;
   promotion_readiness?: PromotionReadiness | null;
+  staged_directions?: StagedDirection[];
 }
 
 export async function fetchVersionLifecycle(projectId: string): Promise<VersionLifecycleResponse> {
@@ -1824,4 +1834,7 @@ export interface StrategicRefreshMarker {
   excerpt?: string;
   /** Timestamp when a prior marker was consumed by the strategic loop (receipt field). */
   last_fired_at?: string;
+  /** Origin of the last consumed marker ('operator' or 'qualification'). Lets the UI
+   *  attribute receipts correctly — only operator-origin consumes show 'Steer picked up'. */
+  last_fired_origin?: string;
 }

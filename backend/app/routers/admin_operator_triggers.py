@@ -566,6 +566,33 @@ async def trigger_rollup(
     }
 
 
+@router.post("/projects/{project_id}/cancel-strategic-refresh")
+async def cancel_strategic_refresh_endpoint(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Retract a pending (armed) strategic steer for this project.
+
+    Clears the operator-armed strategic-refresh marker so the next strategic
+    cycle will NOT be woken by it — the operator's lever to undo a steer they
+    sent by mistake or immediately reconsidered. Members and above (same level
+    as the other manual operator triggers).
+
+    Safe to retry: cancelling when nothing is armed is an idempotent no-op
+    (``cleared=False``), not an error, so a duplicate or late client retry is
+    harmless. Returns ``cleared`` — ``True`` when an armed marker was removed.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    from app.strategic_trigger import cancel_strategic_refresh
+
+    cleared = await cancel_strategic_refresh(session, project_id)
+    await session.commit()
+    return {"cleared": cleared}
+
+
 @router.get("/projects/{project_id}/findings")
 async def get_project_findings(
     project_id: uuid.UUID,

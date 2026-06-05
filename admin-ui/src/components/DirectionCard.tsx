@@ -792,12 +792,10 @@ function DirectionCardImpl({
                   )}
                   {(d.remediation_attempts ?? 0) > 0 && (() => {
                     const attempts = d.remediation_attempts ?? 0;
-                    const result = d.last_remediation_result;
-                    const color = result === 'merged' ? 'emerald' : result === 'failed' ? 'red' : 'amber';
-                    const label = result === 'merged' ? 'merged' : result === 'failed' ? 'failed' : 'pending';
+                    const resultMeta = remediationResultMeta(d.last_remediation_result);
                     return (
-                      <span className={`inline-block text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}>
-                        Remediation {attempts}× · {label}
+                      <span className={`inline-block text-[10px] px-1.5 py-0.5 rounded border font-medium ${resultMeta.badgeClass}`}>
+                        Remediation {attempts}× · {resultMeta.resultLabel}
                       </span>
                     );
                   })()}
@@ -1019,8 +1017,8 @@ function DirectionCardImpl({
                 </>
               );
             })()}
-            {/* Cooldown badge */}
-            {key === 'active' && (() => {
+            {/* Cooldown badge — suppressed when direction is held */}
+            {key === 'active' && !d.held && (() => {
               const cooldownStatus = getCooldownStatus(d, cooldownMinutes);
               if (cooldownStatus === 'cooling') {
                 return (

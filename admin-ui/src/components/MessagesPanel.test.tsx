@@ -3658,4 +3658,33 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
     expect(el.textContent).not.toContain('Strategic cycle pending');
     expect(el.textContent).toContain('Strategist working');
   });
+
+  test('Cancel button posts to cancel-strategic-refresh and clears the badge', async () => {
+    const el = await renderPanel({
+      _strategic_refresh: { requested_at: new Date(Date.now() - 60_000).toISOString(), origin: 'steering' },
+    });
+    const cancelBtn = Array.from(el.querySelectorAll('button')).find(b => b.textContent === 'Cancel');
+    expect(cancelBtn).toBeTruthy();
+
+    // After cancel, the project GET returns no marker so the badge clears.
+    _mockWithVision({});
+    await act(async () => { cancelBtn!.click(); });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+
+    const mock = apiFetch as ReturnType<typeof vi.fn>;
+    const calledCancel = mock.mock.calls.some(([url, init]) =>
+      String(url).includes('/cancel-strategic-refresh') && (init as RequestInit | undefined)?.method === 'POST');
+    expect(calledCancel).toBe(true);
+    expect(el.textContent).not.toContain('Strategic cycle pending');
+  });
+
+  test('no Cancel button on the receipt (non-pending) state', async () => {
+    const el = await renderPanel({
+      _strategic_refresh_last_fired_at: new Date(Date.now() - 60_000).toISOString(),
+      _strategic_refresh_last_fired_origin: 'operator',
+    });
+    expect(el.textContent).toContain('Steer picked up');
+    const cancelBtn = Array.from(el.querySelectorAll('button')).find(b => b.textContent === 'Cancel');
+    expect(cancelBtn).toBeFalsy();
+  });
 });

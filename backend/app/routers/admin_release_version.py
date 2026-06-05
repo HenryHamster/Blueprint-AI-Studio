@@ -128,10 +128,18 @@ async def get_version_lifecycle(
         compute_promotion_readiness,
         get_latest_release_audit_report,
     )
+    from app.models import Project  # noqa: PLC0415
+    from app.strategic_spawning import (  # noqa: PLC0415
+        _build_staged_directions_summary,
+    )
 
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, min_role="viewer"
     )
+
+    project_row = (
+        await session.execute(select(Project).where(Project.id == project_id))
+    ).scalar_one_or_none()
 
     open_row = (
         (
@@ -151,8 +159,6 @@ async def get_version_lifecycle(
 
     current_version_out: Optional[Dict[str, Any]] = None
     if open_row is not None:
-        from app.models import Project  # noqa: PLC0415
-
         merged_count = await count_merged_since(session, project_id, open_row.opened_at)
         qual = open_row.last_qualification or {}
         # Surface the latest release_audit's actual findings/score so a verdict
@@ -161,11 +167,6 @@ async def get_version_lifecycle(
         latest_audit = await get_latest_release_audit_report(session, project_id)
 
         # Fetch live current_focus from the project's problem_model
-        project_row = (
-            await session.execute(
-                select(Project).where(Project.id == project_id)
-            )
-        ).scalar_one_or_none()
         live_current_focus = None
         if project_row and project_row.problem_model:
             intent = project_row.problem_model.get("intent", {})
@@ -226,6 +227,12 @@ async def get_version_lifecycle(
         ],
         "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
         "promotion_readiness": promotion_readiness,
+        # Directions deliberately queued (status=staged) to begin only after the
+        # current version promotes. Surfaced read-only so an operator can confirm
+        # staged work is queued and spot items rotting past their target version.
+        "staged_directions": (
+            _build_staged_directions_summary(project_row) if project_row else []
+        ),
     }
 
 

@@ -277,13 +277,14 @@ describe('VersionLifecyclePanel', () => {
           loading={false}
           projectId="proj-1"
           onRefresh={mockRefresh}
+          userRole="admin"
         />
       );
 
       fireEvent.click(screen.getByRole('button', { name: /Enable/ }));
 
       await waitFor(() => {
-        expect(window.confirm).toHaveBeenCalledWith('Enable live promotion? Passing qualify runs will push to main.');
+        expect(window.confirm).toHaveBeenCalledWith('Enable live promotion for ALL PROJECTS? Passing qualify runs will push to main fleet-wide.');
       });
       await waitFor(() => {
         expect(patchAdminSettingsMock).toHaveBeenCalledWith({ promotion_enabled: true });
@@ -302,6 +303,7 @@ describe('VersionLifecyclePanel', () => {
           loading={false}
           projectId="proj-1"
           onRefresh={mockRefresh}
+          userRole="admin"
         />
       );
 
@@ -446,6 +448,46 @@ describe('VersionLifecyclePanel', () => {
       await waitFor(() => {
         expect(screen.getByText('Cut v5 → opened v6')).toBeInTheDocument();
       });
+    });
+  });
+
+  describe('staged directions summary', () => {
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    it('renders staged directions with target version and age from live data', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            staged_directions: [
+              { id: 'd-1', text: 'Rework packer budget', priority: 'high', staged_for_version: 6, staged_at: '2026-05-01T00:00:00Z', staged_age_days: 35 },
+            ],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.getByTestId('staged-directions')).toBeInTheDocument();
+      expect(screen.getByText('Staged for next version (1)')).toBeInTheDocument();
+      expect(screen.getByText('Rework packer budget')).toBeInTheDocument();
+      expect(screen.getByText('→v6')).toBeInTheDocument();
+      expect(screen.getByText('35d staged')).toBeInTheDocument();
+    });
+
+    it('omits the staged section when no directions are staged', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ staged_directions: [] })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.queryByTestId('staged-directions')).not.toBeInTheDocument();
     });
   });
 });

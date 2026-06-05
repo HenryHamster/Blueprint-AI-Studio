@@ -184,6 +184,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // operator steering arms a cycle, cleared backend-side once the autonomous loop
   // consumes it. Drives the "strategic cycle pending" badge until then.
   const [strategicRefresh, setStrategicRefresh] = useState<StrategicRefreshMarker | null>(null);
+  // In-flight guard for the "cancel armed steer" affordance on the pending badge.
+  const [cancellingRefresh, setCancellingRefresh] = useState(false);
   const [muteWindow, setMuteWindow] = useState<MuteWindow | null>(() => loadMuteWindow(auth.currentUser?.email, selectedProjectId));
   const [tempMutes, setTempMutes] = useState<TemporaryMutes>(() =>
     loadTemporaryMutes(auth.currentUser?.email, selectedProjectId),
@@ -656,20 +658,21 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       } catch { /* ignore */ }
       // Pending strategic-refresh marker — surfaced as a "strategic cycle pending"
       // badge until the autonomous loop consumes it (when it clears backend-side).
-      // After consumption, shows a receipt via last_fired_at.
+      // After consumption, shows a receipt via last_fired_at only if it was operator-origin.
       // Non-critical: errors leave the prior marker state untouched.
       try {
         const visRes = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}`);
         if (visRes.ok) {
-          const proj = await visRes.json() as { vision?: { _strategic_refresh?: StrategicRefreshMarker | null; _strategic_refresh_last_fired_at?: string } };
+          const proj = await visRes.json() as { vision?: { _strategic_refresh?: StrategicRefreshMarker | null; _strategic_refresh_last_fired_at?: string; _strategic_refresh_last_fired_origin?: string } };
           const marker = proj.vision?._strategic_refresh;
           const lastFiredAt = proj.vision?._strategic_refresh_last_fired_at;
-          // Build marker state: include pending marker if present, or add last_fired_at receipt
+          const lastFiredOrigin = proj.vision?._strategic_refresh_last_fired_origin;
+          // Build marker state: include pending marker if present, or add receipt if it was operator-origin
           if (marker && typeof marker === 'object') {
             setStrategicRefresh(marker);
-          } else if (lastFiredAt && typeof lastFiredAt === 'string') {
-            // No pending marker, but show receipt of prior consumption
-            setStrategicRefresh({ last_fired_at: lastFiredAt });
+          } else if (lastFiredAt && typeof lastFiredAt === 'string' && lastFiredOrigin === 'operator') {
+            // No pending marker, but show receipt of prior operator-origin consumption
+            setStrategicRefresh({ last_fired_at: lastFiredAt, last_fired_origin: lastFiredOrigin });
           } else {
             setStrategicRefresh(null);
           }
@@ -805,6 +808,26 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     } finally {
       submittingRef.current = false;
       setSubmitting(false);
+    }
+  }
+
+  // Retract an armed-but-not-yet-fired strategic steer. Idempotent server-side
+  // (cancelling when nothing is armed is a no-op), so a late/duplicate click is
+  // harmless. Clears the local pending marker immediately, then refetches to
+  // confirm the badge cleared.
+  async function handleCancelStrategicRefresh() {
+    if (!selectedProjectId || cancellingRefresh) return;
+    setCancellingRefresh(true);
+    try {
+      const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}/cancel-strategic-refresh`, { method: 'POST' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setStrategicRefresh(null);
+      addToast('Strategic steer cancelled', 'success');
+      await fetchMessages();
+    } catch {
+      addToast('Failed to cancel strategic steer', 'error');
+    } finally {
+      setCancellingRefresh(false);
     }
   }
 
@@ -1056,6 +1079,17 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
               </>
             )}
           </span>
+          {strategicRefresh.requested_at && (
+            <button
+              type="button"
+              onClick={() => { void handleCancelStrategicRefresh(); }}
+              disabled={cancellingRefresh}
+              className="ml-auto text-xs font-medium text-amber-300 hover:text-amber-100 underline underline-offset-2 disabled:opacity-50 disabled:no-underline"
+              title="Retract this armed steer so the strategist will not run it"
+            >
+              {cancellingRefresh ? 'Cancelling…' : 'Cancel'}
+            </button>
+          )}
         </div>
       )}
 

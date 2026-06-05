@@ -7136,6 +7136,98 @@ class TestVersionLifecycleInfraFailureFields:
         assert lq["audit_missing_reason"] is None
 
 
+class TestVersionLifecycleStagedDirections:
+    """GET /version-lifecycle surfaces staged directions for the next version."""
+
+    @pytest.mark.asyncio
+    async def test_staged_directions_surfaced_with_target_and_age(
+        self, client: AsyncClient, db_session
+    ):
+        """A staged direction appears in staged_directions with its target
+        version; active/proposed directions are excluded."""
+        project = await _make_project(db_session)
+        project.directions = [
+            {
+                "id": "d-staged",
+                "text": "Rework packer budget",
+                "priority": "high",
+                "status": "staged",
+                "staged_for_version": 6,
+                "staged_at": "2026-05-01T00:00:00",
+            },
+            {"id": "d-active", "text": "active work", "status": "active"},
+        ]
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=5,
+            phase="build",
+            status="open",
+        )
+        db_session.add_all([project, version])
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.get_latest_release_audit_report",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        staged = resp.json()["staged_directions"]
+        assert len(staged) == 1
+        assert staged[0]["id"] == "d-staged"
+        assert staged[0]["staged_for_version"] == 6
+        assert staged[0]["staged_age_days"] is not None
+
+    @pytest.mark.asyncio
+    async def test_staged_directions_empty_when_none_staged(
+        self, client: AsyncClient, db_session
+    ):
+        """No staged directions yields an empty staged_directions list."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.get_latest_release_audit_report",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["staged_directions"] == []
+
+
 class TestQualificationVerdictsAuditMissingReason:
     """GET /api/admin/projects/{id}/qualification-verdicts exposes audit_missing_reason."""
 
@@ -8964,6 +9056,42 @@ class TestClearWaveDeps:
 
         await db_session.refresh(dependent)
         assert dependent.depends_on == [str(live_foundation.id)]
+
+
+class TestCancelStrategicRefresh:
+    @pytest.mark.asyncio
+    async def test_cancel_clears_armed_marker(
+        self, client: AsyncClient, db_session
+    ):
+        """Cancelling an armed steer clears the pending marker (cleared=True)."""
+        from app import strategic_trigger as st
+
+        project = await _make_project(db_session)
+        await st.request_strategic_refresh(
+            db_session, project.id, "operator_steering", origin=st.ORIGIN_OPERATOR
+        )
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/cancel-strategic-refresh"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["cleared"] is True
+
+        await db_session.refresh(project)
+        assert st.strategic_refresh_pending(project.vision) is False
+
+    @pytest.mark.asyncio
+    async def test_cancel_idempotent_noop_when_nothing_armed(
+        self, client: AsyncClient, db_session
+    ):
+        """Cancelling with nothing armed is a harmless no-op (cleared=False, 200)."""
+        project = await _make_project(db_session)
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/cancel-strategic-refresh"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["cleared"] is False
 
 
 class TestBulkApprove:

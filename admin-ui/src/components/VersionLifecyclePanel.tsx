@@ -12,6 +12,7 @@ import {
   type CurrentVersion,
   type LatestAudit,
   type QualificationVerdictRecord,
+  type StagedDirection,
   type VersionLifecycleResponse,
   type VersionQualification,
   type PromotionReadiness,
@@ -164,7 +165,32 @@ function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadines
   );
 }
 
-export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: { data: VersionLifecycleResponse | null; loading: boolean; projectId: string | null; onRefresh: () => void }) {
+function StagedDirectionsSummary({ staged }: { staged: StagedDirection[] }) {
+  if (!staged.length) return null;
+  return (
+    <div data-testid="staged-directions">
+      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">
+        Staged for next version ({staged.length})
+      </p>
+      <div className="space-y-0.5">
+        {staged.map((s, i) => (
+          <div key={s.id ?? i} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] pl-2 border-l-2 border-neutral-700/40">
+            {s.staged_for_version != null && (
+              <span className="font-mono text-neutral-500 shrink-0">→v{s.staged_for_version}</span>
+            )}
+            {s.priority && <span className="text-neutral-600">{s.priority}</span>}
+            <span className="text-neutral-300 truncate max-w-[220px]" title={s.text ?? undefined}>{s.text ?? '(no description)'}</span>
+            {s.staged_age_days != null && (
+              <span className="text-neutral-600">{s.staged_age_days}d staged</span>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, userRole }: { data: VersionLifecycleResponse | null; loading: boolean; projectId: string | null; onRefresh: () => void; userRole?: 'admin' | 'user' | null }) {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   const [verdicts, setVerdicts] = useState<QualificationVerdictRecord[]>([]);
@@ -259,7 +285,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
 
   const handleTogglePromotionEnabled = async () => {
     const nextValue = !optimisticPromotionEnabled;
-    if (nextValue && !window.confirm('Enable live promotion? Passing qualify runs will push to main.')) return;
+    if (nextValue && !window.confirm('Enable live promotion for ALL PROJECTS? Passing qualify runs will push to main fleet-wide.')) return;
     setActionLoading('promotion');
     setActionMsg(null);
     setPromotionEnabledOverride(nextValue);
@@ -301,19 +327,25 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
         <div className="flex flex-wrap items-center gap-2">
           {data.promotion_enabled !== undefined && (
             <>
-              <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${optimisticPromotionEnabled ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-neutral-500/10 border-neutral-500/30 text-neutral-400'}`}>
-                {optimisticPromotionEnabled ? 'LIVE' : 'DRY-RUN'}
-              </span>
-              {projectId && (
-                // eslint-disable-next-line viewport/min-touch-target
-                <button
-                  onClick={handleTogglePromotionEnabled}
-                  disabled={actionLoading !== null}
-                  className="text-[10px] px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  {actionLoading === 'promotion' ? '…' : optimisticPromotionEnabled ? 'Disable' : 'Enable'}
-                </button>
-              )}
+              <div className="flex flex-col gap-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${optimisticPromotionEnabled ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-neutral-500/10 border-neutral-500/30 text-neutral-400'}`} title="Fleet-wide setting (all projects)">
+                    {optimisticPromotionEnabled ? 'LIVE' : 'DRY-RUN'}
+                  </span>
+                  {projectId && userRole === 'admin' && (
+                    // eslint-disable-next-line viewport/min-touch-target
+                    <button
+                      onClick={handleTogglePromotionEnabled}
+                      disabled={actionLoading !== null}
+                      className="text-[10px] px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                      title="Changes promotion mode for all projects"
+                    >
+                      {actionLoading === 'promotion' ? '…' : optimisticPromotionEnabled ? 'Disable' : 'Enable'}
+                    </button>
+                  )}
+                </div>
+                <span className="text-[9px] text-neutral-600">Fleet-wide setting</span>
+              </div>
             </>
           )}
         </div>
@@ -544,6 +576,9 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: {
           </div>
         )}
         {readiness !== undefined && <PromotionReadinessSummary readiness={readiness} />}
+        {data.staged_directions && data.staged_directions.length > 0 && (
+          <StagedDirectionsSummary staged={data.staged_directions} />
+        )}
         {verdicts.length > 0 && (
           <div data-testid="verdict-history">
             <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Verdict History</p>

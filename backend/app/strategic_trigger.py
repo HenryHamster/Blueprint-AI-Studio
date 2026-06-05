@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 # _pending_strategic_review — all strategic-loop state lives in project.vision).
 _REFRESH_KEY = "_strategic_refresh"
 _LAST_FIRED_KEY = "_strategic_refresh_last_fired_at"
+_LAST_FIRED_ORIGIN_KEY = "_strategic_refresh_last_fired_origin"
 
 DEFAULT_MIN_INTERVAL_SECONDS = 120
 
@@ -375,6 +376,16 @@ def strategic_refresh_notified(vision: dict | None) -> bool:
     return isinstance(marker, dict) and bool(marker.get("notified"))
 
 
+def strategic_refresh_last_fired_origin(vision: dict | None) -> str | None:
+    """Origin of the most recently consumed refresh marker, or ``None`` when never fired.
+
+    Allows the UI to distinguish whether a steer receipt is from operator intent or
+    an automated trigger like qualification. Only operator-origin consumes show the
+    'Steer picked up' receipt.
+    """
+    return (vision or {}).get(_LAST_FIRED_ORIGIN_KEY)
+
+
 def mark_strategic_refresh_notified(vision: dict) -> None:
     """Stamp the pending marker as notified (mutate-fn for ``with_vision_locked``).
 
@@ -414,13 +425,60 @@ def strategic_refresh_due(
     return True
 
 
+async def cancel_strategic_refresh(session, project_id) -> bool:
+    """Operator retract: clear a pending refresh marker so it will NOT wake the strategist.
+
+    Idempotent — cancelling when nothing is armed is a harmless no-op returning
+    ``False`` (no marker was pending); ``True`` when an armed marker was removed.
+
+    Unlike :func:`clear_strategic_refresh` (the loop's *consume* path), this does
+    NOT stamp ``_strategic_refresh_last_fired_at`` / ``_LAST_FIRED_ORIGIN_KEY``: a
+    retracted steer never ran, so it must leave no 'Steer picked up' receipt and
+    must not advance the min-interval floor. Routes the write through
+    ``with_vision_locked`` (bounded blocking acquire, matching the operator-steering
+    arm path) so it serializes with concurrent arming. Best-effort under
+    contention — a momentarily-locked row surfaces as ``False`` rather than raising.
+    Does NOT commit — the caller owns the transaction.
+    """
+    cleared = {"marker": False}
+
+    def _clear(vision: dict) -> None:
+        if vision.pop(_REFRESH_KEY, None) is not None:
+            cleared["marker"] = True
+
+    try:
+        await with_vision_locked(
+            session, project_id, _clear, skip_locked=False, timeout=1.0
+        )
+    except OperationalError:
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        logger.exception(
+            "[STRATEGIC] cancel refresh for project %s failed — row contended",
+            project_id,
+        )
+        return False
+    except Exception:
+        logger.exception(
+            "[STRATEGIC] cancel_strategic_refresh failed for project %s", project_id
+        )
+        return False
+    return cleared["marker"]
+
+
 def clear_strategic_refresh(vision: dict, now: datetime) -> None:
     """Consume the marker and stamp the fire time (mutate-fn for ``with_vision_locked``).
 
     Called from the loop's strategic-spawn record path: any successful strategic
     spawn satisfies an owed refresh. Stamps ``_strategic_refresh_last_fired_at``
+    and the origin of the consumed marker (``_strategic_refresh_last_fired_origin``)
     only when a marker was actually cleared, so the min-interval floor measures
-    refresh-driven fires (not ordinary cadence spawns).
+    refresh-driven fires (not ordinary cadence spawns) and the UI can attribute
+    receipts correctly (only operator-origin consumes show 'Steer picked up').
     """
-    if vision.pop(_REFRESH_KEY, None) is not None:
+    marker = vision.pop(_REFRESH_KEY, None)
+    if marker is not None:
         vision[_LAST_FIRED_KEY] = now.isoformat()
+        if isinstance(marker, dict):
+            origin = marker.get("origin") or ORIGIN_QUALIFICATION
+            vision[_LAST_FIRED_ORIGIN_KEY] = origin

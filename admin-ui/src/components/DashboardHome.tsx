@@ -87,6 +87,7 @@ export interface DashboardHomeProps {
   onConfigureTargets?: () => void;
   onSpawnOrphanFix?: (pr: OpenPR) => void;
   onPanelReviewPr?: (pr: OpenPR) => void;
+  userRole?: 'admin' | 'user' | null;
 }
 
 // ---------- component ----------
@@ -99,7 +100,7 @@ const WINDOW_OPTIONS = [
   { label: '7d', value: 168 },
 ];
 
-export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, onDirectionClick, onCategoryClick, onScopeClick, onConfigureTargets, onSpawnOrphanFix, onPanelReviewPr }: DashboardHomeProps) {
+export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, onDirectionClick, onCategoryClick, onScopeClick, onConfigureTargets, onSpawnOrphanFix, onPanelReviewPr, userRole }: DashboardHomeProps) {
   const [digest, setDigest] = useState<DigestData | null>(null);
   const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
   const [openPRsIntegrationBranch, setOpenPRsIntegrationBranch] = useState<string | null>(null);
@@ -522,7 +523,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       {selectedProjectId && <ViewportDebtPanel projectId={selectedProjectId} />}
 
       {/* Version Lifecycle */}
-      {selectedProjectId && <VersionLifecyclePanel data={versionLifecycle} loading={loading} projectId={selectedProjectId} onRefresh={refreshVersionLifecycle} />}
+      {selectedProjectId && <VersionLifecyclePanel data={versionLifecycle} loading={loading} projectId={selectedProjectId} onRefresh={refreshVersionLifecycle} userRole={userRole} />}
 
       {/* Pipeline Efficiency */}
       <PipelineEfficiencyPanel projectId={selectedProjectId} />
