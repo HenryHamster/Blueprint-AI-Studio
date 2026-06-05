@@ -2729,6 +2729,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # already building it — in-flight or a sibling — instead of each dependent
     # rebuilding the foundation. Conservative: explicit references only (see
     # resolve_prerequisite_task); never overwrites the explicit_deps above.
+    # Any edge is acyclicity-checked with the SAME predicate the runtime
+    # need-resolution path applies (blocked_need_resolution._would_create_cycle),
+    # so a declared prerequisite that would close a depends_on cycle is refused at
+    # the structural source rather than deferred to the dispatch-time cycle breaker.
+    from app.blocked_need_resolution import _would_create_cycle  # noqa: PLC0415
+
     _prereq_candidates = list(existing_tasks) + list(child_tasks)
     for ci, ct in enumerate(child_tasks):
         fi = finding_indices[ci]
@@ -2757,6 +2763,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     prereq.get("kind"),
                     prereq.get("ref"),
                 )
+            continue
+        if _would_create_cycle(ct, foundation, _prereq_candidates):
+            logger.warning(
+                "[RESEARCH] Finding '%s' prerequisite %s:%s resolved to foundation %s "
+                "but the edge would close a depends_on cycle — refused at spawn (no edge)",
+                findings[fi].get("title", f"#{fi}"),
+                prereq.get("kind"),
+                prereq.get("ref"),
+                foundation.id,
+            )
             continue
         foundation_id = str(foundation.id)
         existing_dep = list(ct.depends_on or [])

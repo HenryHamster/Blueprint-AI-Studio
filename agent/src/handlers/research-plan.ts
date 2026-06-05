@@ -1833,6 +1833,8 @@ implementation findings. Add metadata alongside them when relevant.
   "verification_basis": "code_verified|path_verified|pattern_inferred|deduced",
   "related_files": ["path/to/file.py"],
   "depends_on_indices": [],
+  "prerequisite": null,
+  "provides_capability": null,
   "direction_id": "d-xxx or null",
   "effort": "high|medium|low|null",
   "claims": ["short factual assertion backed by your investigation (omit when synthesizing)"],
@@ -1843,6 +1845,10 @@ implementation findings. Add metadata alongside them when relevant.
 **claims** (optional): Short factual assertions that back this finding — one sentence each, verifiable (e.g. 'backend/app/task_completion.py:_handle_research_completion stores findings in task.plan_output'). Omit the field when synthesizing across many observations with no single traceable origin.
 
 **sources** (optional, provenance only): Cite a specific origin when you have one. type 'file': a file you read, 'pr': a merged PR number, 'log': a pipeline log line, 'message': a user message. Omit the field when synthesizing. excerpt is optional — include only a directly relevant short quote.
+
+**prerequisite** (optional, default null): Declare a FOUNDATION this finding depends on that is being (or was) built OUTSIDE this batch — an earlier or concurrently-in-flight cycle, or a named capability. Shape: \`{"kind": "task", "ref": "<task-id or finding-hash>"}\` to gate on a specific in-flight/queued task, or \`{"kind": "capability", "ref": "<capability-name>"}\` to gate on whichever task advertises that capability. When it resolves to a real foundation the dependent is structurally gated (depends_on edge) so it does not run against a base missing the foundation or duplicate it; when it does not resolve the dependent still spawns, with the unmet prerequisite recorded. Use ONLY for cross-cycle / cross-batch foundations or named capabilities — for ordering findings WITHIN this batch, use depends_on_indices instead (NOT prerequisite). Omit (or null) when there is no external foundation.
+
+**provides_capability** (optional, default null): A short capability name this finding's task advertises (e.g. "payment-core"), so a sibling finding declaring \`{"kind": "capability", "ref": "payment-core"}\` can depend on it. Omit unless another finding needs to gate on this one by capability.
 
 **actionability_grade rubric** (required on every finding):
 - HIGH: problem statement is clear, desired outcome is clear, related files identified, no major unknowns blocking implementation.

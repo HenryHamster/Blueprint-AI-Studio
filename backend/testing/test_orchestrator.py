@@ -2783,6 +2783,81 @@ class TestWarmVMSkipProvision:
             await _orch_module.orchestrator_worker()
 
     @pytest.mark.asyncio
+    async def test_failed_foundation_dependent_cancelled_on_zero_slot_cycle(
+        self, orch_warm_db, mocker
+    ):
+        """Slot-independent dependency recovery runs even when no dispatch
+        slots are free (auto-paused, max_concurrent_vms=0): a stale QUEUED
+        dependent of a FAILED foundation is cascade-cancelled in the same
+        cycle, instead of piling up until a slot frees. Regression guard for
+        the idle/saturated short-circuit that used to skip ALL dependency
+        recovery."""
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        # Force the zero-slots / paused short-circuit: cap = 0 so
+        # slots_available == 0 and the loop takes the idle branch.
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+        _orch_module._runtime_config["max_concurrent_vms"] = 0
+        # Open the deadlock-scan throttle so the recovery runs this cycle.
+        _orch_module._last_deadlock_check = 0.0
+        prov_mock = mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+
+        stale = self._naive_utcnow() - timedelta(minutes=15)
+        async with orch_warm_db() as session:
+            project = make_project(name="Zero-Slot Recovery", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            foundation = make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                payloads=[{"type": "create", "prompt": "foundation"}],
+                created_at=stale,
+            )
+            session.add(foundation)
+            await session.commit()
+            await session.refresh(foundation)
+
+            dependent = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "create", "prompt": "dependent"}],
+                depends_on=[str(foundation.id)],
+                created_at=stale,
+            )
+            session.add(dependent)
+            await session.commit()
+            await session.refresh(dependent)
+            dep_id = dependent.id
+
+        await self._run_one_cycle(mocker)
+
+        # No slot was free, so nothing was dispatched...
+        prov_mock.assert_not_called()
+        # ...but the failed foundation's dependent was still reclaimed.
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == dep_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            assert row.status == TaskStatus.CANCELLED, (
+                "Dependent of a FAILED foundation must be cascade-cancelled on "
+                f"a zero-slots/paused cycle, got {row.status}"
+            )
+
+    @pytest.mark.asyncio
     async def test_warm_pin_with_recent_heartbeat_skips_provision(
         self, orch_warm_db, mocker
     ):
@@ -4175,6 +4250,93 @@ class TestClassifyStuckTasksSharedPolicy:
         # A genuine A<->B cycle: both members cleared-and-dispatched.
         assert sorted(reason for _, reason in out) == ["cycle", "cycle"]
         assert {tid for tid, _ in out} == {a.id, b.id}
+
+    @pytest.mark.asyncio
+    async def test_parked_blocked_foundation_strands_dependent(self, db_session):
+        from app.orchestrator_health import _classify_stuck_tasks
+
+        project = make_project(name="StuckParked", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Foundation is BLOCKED *and* escalated-and-parked (recovery exhausted).
+        foundation = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "foundation"}],
+            status=TaskStatus.BLOCKED,
+            context={"_blocked_escalated": True},
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        stuck = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "stuck"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(foundation.id)],
+        )
+        db_session.add(stuck)
+        await db_session.commit()
+        await db_session.refresh(stuck)
+
+        out = await _classify_stuck_tasks(
+            [stuck],
+            {stuck.id: {foundation.id}},
+            {foundation.id: foundation},
+            {stuck.id},
+            db_session,
+            self._noop_verify,
+        )
+        # Parked foundation strands the dependent → surface for escalation, never
+        # silently waiting and never cleared-and-dispatched.
+        assert out == [(stuck.id, "stranded_parked")]
+
+    @pytest.mark.asyncio
+    async def test_recovering_blocked_foundation_keeps_dependent_waiting(
+        self, db_session
+    ):
+        from app.orchestrator_health import _classify_stuck_tasks
+
+        project = make_project(name="StuckRecovering", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Foundation is BLOCKED but still being actively rechecked/resumed — NOT
+        # escalated-and-parked, so it must NOT strand the dependent.
+        foundation = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "foundation"}],
+            status=TaskStatus.BLOCKED,
+            context={"_blocked_recheck_attempts": 1},
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        stuck = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "stuck"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(foundation.id)],
+        )
+        db_session.add(stuck)
+        await db_session.commit()
+        await db_session.refresh(stuck)
+
+        out = await _classify_stuck_tasks(
+            [stuck],
+            {stuck.id: {foundation.id}},
+            {foundation.id: foundation},
+            {stuck.id},
+            db_session,
+            self._noop_verify,
+        )
+        # Still-recovering BLOCKED foundation is a normal in-flight wait — the
+        # dependent keeps waiting unchanged, not stranded.
+        assert out == []
 
 
 # ── BLOCKED tasks are undispatchable on the normal queue path ────────────────

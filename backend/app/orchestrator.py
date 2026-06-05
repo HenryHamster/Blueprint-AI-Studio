@@ -829,6 +829,72 @@ async def _cascade_cancel_dependent(task_id, project_id, broadcast_to_project) -
     return cancelled_count
 
 
+async def _escalate_stranded_dependent(
+    dependent, session, broadcast_to_project, scan_label=""
+) -> bool:
+    """Surface a dependent stranded behind an escalated-and-parked BLOCKED
+    foundation.
+
+    The dependent is gated on a foundation that automatic recovery has given up
+    on (parked in BLOCKED). BLOCKED is non-terminal, so the normal dependency
+    gate would keep the dependent QUEUED forever with no operator signal. Move it
+    into BLOCKED+escalated, naming the parked foundation, and raise ONE
+    deduplicated operator alert so the whole stuck chain becomes a single
+    actionable item instead of waiting silently. Returns ``True`` when escalated.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.alert_dispatch import _maybe_create_blocked_escalation_alert
+    from app.orchestrator_health import find_parked_blocked_foundation
+    from app.reaper_sweeps import _BLOCKED_ESCALATED_PARK
+    from app.task_blocked import build_need, enter_blocked_state
+
+    foundation = await find_parked_blocked_foundation(dependent, session)
+    if foundation is None:
+        return False
+    label = foundation.title or str(foundation.id)
+    detail = (
+        f"Stranded behind parked foundation '{label}' ({foundation.id}): automatic "
+        f"recovery has given up on that blocked prerequisite, so this dependent can "
+        f"never dispatch until an operator intervenes (requeue / re-point / cancel "
+        f"the foundation){scan_label}."
+    )
+    enter_blocked_state(
+        dependent,
+        waiting_on=f"parked foundation {label}",
+        reason=detail,
+        source="system",
+        blocker_kind="upstream_dependency",
+        recheck_in_seconds=None,
+        escalated=True,
+        need=build_need("task", str(foundation.id), label=foundation.title),
+    )
+    ctx = dict(dependent.context or {})
+    ctx["_blocked_escalated"] = True
+    dependent.context = ctx
+    dependent.recheck_after = _utcnow() + _BLOCKED_ESCALATED_PARK
+    flag_modified(dependent, "context")
+    session.add(dependent)
+    logger.error(
+        f"[ORCHESTRATOR] Stranded dependent {dependent.id} escalated — parked "
+        f"foundation {foundation.id}{scan_label}"
+    )
+    # Fires (and commits) one deduplicated ERROR alert per stranded dependent.
+    await _maybe_create_blocked_escalation_alert(
+        dependent, session, blocker_kind="upstream_dependency", detail=detail
+    )
+    await broadcast_to_project(
+        str(dependent.project_id),
+        "task_updated",
+        {
+            "task_id": str(dependent.id),
+            "status": TaskStatus.BLOCKED,
+            "message": detail,
+        },
+    )
+    return True
+
+
 async def _apply_deadlock_classification(
     classified, broadcast_to_project, eligible_ids, scan_label=""
 ) -> int:
@@ -852,6 +918,14 @@ async def _apply_deadlock_classification(
             if reason == "cascade_cancel":
                 if fix_task:
                     cancels.append((task_id, fix_task.project_id))
+                    acted += 1
+                continue
+            if reason == "stranded_parked":
+                # Stranded behind an escalated-and-parked BLOCKED foundation:
+                # escalate the dependent (do NOT clear deps / dispatch it).
+                if fix_task and await _escalate_stranded_dependent(
+                    fix_task, fix_session, broadcast_to_project, scan_label
+                ):
                     acted += 1
                 continue
             if fix_task:
@@ -883,6 +957,93 @@ async def _apply_deadlock_classification(
     for task_id, project_id in cancels:
         await _cascade_cancel_dependent(task_id, project_id, broadcast_to_project)
     return acted
+
+
+async def _recover_stale_dependency_deadlocks(
+    session,
+    *,
+    exclude_task_ids: set[uuid.UUID] | None = None,
+    eligible_ids: list[uuid.UUID] | None = None,
+    scan_label: str = " (broad scan)",
+) -> int:
+    """Slot-independent dependency recovery over stale QUEUED tasks.
+
+    Scans QUEUED tasks older than 10 min that carry a ``depends_on`` edge and
+    applies the shared dependency-death policy: cascade-cancel the dependents
+    of a foundation that genuinely FAILED/CANCELLED, and break/release
+    ``depends_on`` cycles or satisfied-dead deps. None of this consumes a VM
+    slot, so it can run even when the fleet is saturated or auto-paused.
+
+    Returns the number of tasks acted on.
+    """
+    from app.rollup_management import _verify_pr_merged
+    from app.broadcast import broadcast_to_project
+
+    exclude_task_ids = exclude_task_ids or set()
+    eligible_ids = eligible_ids if eligible_ids is not None else []
+
+    ten_min_ago = _utcnow() - timedelta(minutes=10)
+    # Full rows (no load_only): the shared dependency-death policy reads
+    # first_payload / context on both the stuck task and its deps, so a
+    # partial projection would trip an async lazy-load.
+    broad_stmt = (
+        select(Task)
+        .where(
+            Task.status == TaskStatus.QUEUED,
+            Task.created_at < ten_min_ago,
+            Task.requires_approval.is_(False),
+            Task.depends_on.isnot(None),
+        )
+        .limit(100)
+    )
+    broad_stuck = (await session.execute(broad_stmt)).scalars().all()
+    broad_stuck = [
+        t
+        for t in broad_stuck
+        if (t.depends_on or [])
+        and t.id not in eligible_ids
+        and t.id not in exclude_task_ids
+    ]
+    if not broad_stuck:
+        return 0
+
+    broad_stuck_ids = {t.id for t in broad_stuck}
+    # Batch all dependency UUIDs for the scan into one query
+    all_dep_ids_broad: set[uuid.UUID] = set()
+    broad_task_dep_uuids: dict = {}
+    for stask in broad_stuck:
+        dep_uuids_b: set[uuid.UUID] = set()
+        for d in stask.depends_on or []:
+            try:
+                dep_uuids_b.add(uuid.UUID(d))
+            except (ValueError, AttributeError):
+                continue
+        broad_task_dep_uuids[stask.id] = dep_uuids_b
+        all_dep_ids_broad.update(dep_uuids_b)
+
+    broad_dep_tasks_by_id: dict = {}
+    if all_dep_ids_broad:
+        broad_dep_rows = await session.execute(
+            select(Task).where(Task.id.in_(all_dep_ids_broad))
+        )
+        broad_dep_tasks_by_id = {
+            dt.id: dt for dt in broad_dep_rows.scalars().all()
+        }
+
+    broad_classified = await _classify_stuck_tasks(
+        broad_stuck,
+        broad_task_dep_uuids,
+        broad_dep_tasks_by_id,
+        broad_stuck_ids,
+        session,
+        _verify_pr_merged,
+    )
+    return await _apply_deadlock_classification(
+        broad_classified,
+        broadcast_to_project,
+        eligible_ids,
+        scan_label=scan_label,
+    )
 
 
 async def _mark_unblocked_dependents(completed_task: Task, verify_pr_merged) -> int:
@@ -1492,6 +1653,30 @@ async def orchestrator_worker():
                         logger.exception(
                             "[ORCHESTRATOR] Monitoring checks failed during idle cycle"
                         )
+                    # Dependency-recovery bookkeeping needs no free slot: a failed
+                    # foundation's queued dependents must still be cascade-cancelled
+                    # and depends_on deadlocks broken while the fleet is saturated or
+                    # auto-paused (max_concurrent_vms=0). Without this the work piles
+                    # up until a slot frees, which under a long pause may be never.
+                    # Honor the same 60s throttle as the in-dispatch deadlock scan.
+                    global _last_deadlock_check
+                    _idle_now = time.time()
+                    if _idle_now - _last_deadlock_check > 60:
+                        _last_deadlock_check = _idle_now
+                        try:
+                            _idle_broken = await _recover_stale_dependency_deadlocks(
+                                session
+                            )
+                            if _idle_broken:
+                                logger.warning(
+                                    "[ORCHESTRATOR] Idle-cycle dependency recovery: "
+                                    f"{_idle_broken} dependent(s)/deadlock(s) resolved "
+                                    "with no dispatch slots available"
+                                )
+                        except Exception:
+                            logger.exception(
+                                "[ORCHESTRATOR] Idle-cycle dependency recovery failed"
+                            )
                     await asyncio.sleep(5)
                     continue
 
@@ -2059,7 +2244,7 @@ async def orchestrator_worker():
                                 )
 
                 # Step 2.4: Deadlock detection — break circular deps among stuck QUEUED tasks
-                global _last_deadlock_check
+                # (_last_deadlock_check declared global in the idle-cycle branch above)
                 now = time.time()
                 if now - _last_deadlock_check > 60:
                     _last_deadlock_check = now
@@ -2113,70 +2298,14 @@ async def orchestrator_worker():
                             classified, broadcast_to_project, eligible_ids
                         )
 
-                    # Broader scan: check QUEUED tasks older than 10 min with deps (not just candidate batch)
-                    ten_min_ago = _utcnow() - timedelta(minutes=10)
-                    # Full rows (no load_only): the shared dependency-death policy
-                    # reads first_payload / context on both the stuck task and its
-                    # deps, so a partial projection would trip an async lazy-load.
-                    broad_stmt = (
-                        select(Task)
-                        .where(
-                            Task.status == TaskStatus.QUEUED,
-                            Task.created_at < ten_min_ago,
-                            Task.requires_approval.is_(False),
-                            Task.depends_on.isnot(None),
-                        )
-                        .limit(100)
+                    # Broader scan: check QUEUED tasks older than 10 min with
+                    # deps (not just candidate batch). Slot-independent — shared
+                    # with the idle/paused-cycle recovery pass above.
+                    broad_broken = await _recover_stale_dependency_deadlocks(
+                        session,
+                        exclude_task_ids={t.id for t in candidate_tasks},
+                        eligible_ids=eligible_ids,
                     )
-                    broad_stuck = (await session.execute(broad_stmt)).scalars().all()
-                    candidate_task_ids = {t.id for t in candidate_tasks}
-                    broad_stuck = [
-                        t
-                        for t in broad_stuck
-                        if (t.depends_on or [])
-                        and t.id not in eligible_ids
-                        and t.id not in candidate_task_ids
-                    ]
-                    broad_broken = 0
-                    if broad_stuck:
-                        broad_stuck_ids = {t.id for t in broad_stuck}
-
-                        # Batch all dependency UUIDs for broad scan into one query
-                        all_dep_ids_broad: set[uuid.UUID] = set()
-                        broad_task_dep_uuids: dict = {}
-                        for stask in broad_stuck:
-                            dep_uuids_b: set[uuid.UUID] = set()
-                            for d in stask.depends_on or []:
-                                try:
-                                    dep_uuids_b.add(uuid.UUID(d))
-                                except (ValueError, AttributeError):
-                                    continue
-                            broad_task_dep_uuids[stask.id] = dep_uuids_b
-                            all_dep_ids_broad.update(dep_uuids_b)
-
-                        broad_dep_tasks_by_id: dict = {}
-                        if all_dep_ids_broad:
-                            broad_dep_rows = await session.execute(
-                                select(Task).where(Task.id.in_(all_dep_ids_broad))
-                            )
-                            broad_dep_tasks_by_id = {
-                                dt.id: dt for dt in broad_dep_rows.scalars().all()
-                            }
-
-                        broad_classified = await _classify_stuck_tasks(
-                            broad_stuck,
-                            broad_task_dep_uuids,
-                            broad_dep_tasks_by_id,
-                            broad_stuck_ids,
-                            session,
-                            _verify_pr_merged,
-                        )
-                        broad_broken += await _apply_deadlock_classification(
-                            broad_classified,
-                            broadcast_to_project,
-                            eligible_ids,
-                            scan_label=" (broad scan)",
-                        )
 
                     total_broken = narrow_broken + broad_broken
                     if total_broken > 0:

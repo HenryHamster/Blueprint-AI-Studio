@@ -1095,6 +1095,42 @@ async def sweep_unblock_blocked_tasks(
             )
             continue
 
+        # Foundation already landed: if the need is satisfied by completed/merged
+        # work, requeue with no edge (the work is already done). Reuses the same
+        # exact-match check as the parked-resume path, never a fuzzy guess.
+        from app.task_blocked import get_blocker_metadata
+        from app.blocked_need_resolution import need_satisfied_by_completed
+
+        need = get_blocker_metadata(task).get("need")
+        if isinstance(need, dict) and not task.depends_on:
+            completed = completed_cache.get(task.project_id)
+            if completed is None:
+                completed = await _fetch_completed_candidates(
+                    session, task.project_id
+                )
+                completed_cache[task.project_id] = completed
+            if need_satisfied_by_completed(task, need, completed):
+                _clear_blocked_fields(task, preserve_first_blocked=False)
+                task.status = TaskStatus.QUEUED
+                task.latest_status_message = (
+                    "Unblocked — need satisfied by completed work, requeued"
+                )
+                flag_modified(task, "context")
+                session.add(task)
+                requeued += 1
+                changed = True
+                pending_broadcasts.append(
+                    (
+                        str(task.project_id),
+                        {
+                            "task_id": str(task.id),
+                            "status": "QUEUED",
+                            "message": task.latest_status_message,
+                        },
+                    )
+                )
+                continue
+
         state = await _blocked_precondition_state(task, session, verify_pr_merged)
         if state == "clear":
             blocker_meta = (task.context or {}).get("blocker") or {}

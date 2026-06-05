@@ -140,6 +140,49 @@ def _find_cycle_members(adj: Dict[str, list]) -> set:
     return members
 
 
+def is_parked_blocked_foundation(task: Task) -> bool:
+    """True when *task* is a BLOCKED prerequisite that automatic recovery has
+    GIVEN UP on (escalated-and-parked), not one still being actively retried.
+
+    The reaper's blocked-escalation path stamps ``context['_blocked_escalated']``
+    when it exhausts recovery and parks the row (recheck pushed far out). Only
+    such a genuinely parked foundation strands its dependents — a foundation that
+    is merely BLOCKED but still being rechecked/resumed must NOT trip this, so a
+    foundation that later resumes never leaves its dependents wrongly escalated.
+    """
+    if task.status != TaskStatus.BLOCKED:
+        return False
+    return bool((task.context or {}).get("_blocked_escalated"))
+
+
+async def find_parked_blocked_foundation(
+    dependent: Task, session: AsyncSession
+) -> Task | None:
+    """Return the first escalated-and-parked BLOCKED dependency of *dependent*.
+
+    Used by the dispatch deadlock-breaker to name the parked foundation in the
+    operator-facing escalation it raises for a stranded dependent. Returns
+    ``None`` when no dependency is currently parked.
+    """
+    dep_uuids = []
+    for d in dependent.depends_on or []:
+        try:
+            dep_uuids.append(uuid.UUID(str(d)))
+        except (ValueError, AttributeError, TypeError):
+            continue
+    if not dep_uuids:
+        return None
+    rows = (
+        (await session.execute(select(Task).where(Task.id.in_(dep_uuids))))
+        .scalars()
+        .all()
+    )
+    for r in rows:
+        if is_parked_blocked_foundation(r):
+            return r
+    return None
+
+
 async def _classify_stuck_tasks(
     stuck, dep_map, dep_tasks_by_id, stuck_ids, session, verify_pr_merged
 ) -> list:
@@ -153,6 +196,11 @@ async def _classify_stuck_tasks(
       - ``'dead_deps'``      — every dependency is terminal and satisfied/non-blocking
                                (e.g. SCOPE_EMPTY or a merged completion). Safe to clear
                                depends_on and dispatch.
+      - ``'stranded_parked'`` — a dependency has been escalated-and-parked in BLOCKED
+                               (automatic recovery exhausted). BLOCKED is non-terminal,
+                               so the in-flight wait below would strand this dependent
+                               forever and the dead-deps breaker (terminal-only) never
+                               fires. Surface it so the caller escalates the dependent.
 
     Dependency-death semantics are delegated to :func:`_check_candidate_task_deps`
     so this deadlock-breaker and the main dispatch loop share ONE source of truth:
@@ -175,6 +223,19 @@ async def _classify_stuck_tasks(
             continue
         if str(t.id) in cycle_m:
             out.append((t.id, "cycle"))
+            continue
+        # A dependency that has been escalated-and-parked in BLOCKED (automatic
+        # recovery has given up on it) is non-terminal, so the in-flight skip
+        # below would leave this dependent waiting forever and the dead-deps
+        # breaker — which only fires when EVERY dep is terminal — would never
+        # act either. Surface it so the caller escalates the stranded dependent.
+        # Conservative: only a genuinely parked foundation trips this; a still-
+        # recovering BLOCKED dep falls through to the normal in-flight wait.
+        if any(
+            d in dep_tasks_by_id and is_parked_blocked_foundation(dep_tasks_by_id[d])
+            for d in deps
+        ):
+            out.append((t.id, "stranded_parked"))
             continue
         # Still waiting on a resolvable (stuck) or in-flight (non-terminal)
         # dependency — not a deadlock. Leave it for a later cycle, exactly as the

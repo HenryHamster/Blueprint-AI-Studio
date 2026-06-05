@@ -7463,6 +7463,55 @@ async def test_unblock_sweep_unresolvable_capability_need_falls_through_to_retry
 
 
 @pytest.mark.asyncio
+async def test_unblock_sweep_resumes_when_need_satisfied_by_completed_work(
+    reaper_db, mocker
+):
+    """A blocked task whose need is already satisfied by completed/merged work
+    resumes promptly on the routine sweep with no dependency edge — reusing the
+    same conservative exact-match check as the parked-resume path."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    # The foundation has already completed (landed) before the recheck fires.
+    foundation = Task(
+        project_id=project.id, title="foundation", description="x",
+        status=TaskStatus.COMPLETED, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}], context={}, status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+    # Task blocked on that foundation, but the need hasn't resolved to an edge yet
+    # because the foundation completed before the sweep ran.
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: waiting on foundation",
+        depends_on=[],  # no edge yet
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "foundation",
+                "reason": "BLOCKER: waiting on foundation",
+                "need": {"kind": "task", "ref": str(foundation.id)},
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),  # due now
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    # No edge wired (the work is already done, not in-flight).
+    assert not (t.depends_on or [])
+    # Blocker metadata cleared on requeue.
+    assert "blocker" not in (t.context or {})
+    assert "completed work" in (t.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
 async def test_unblock_sweep_does_not_resolve_when_dep_edge_already_present(
     reaper_db, mocker
 ):

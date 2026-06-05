@@ -2697,3 +2697,52 @@ async def test_unresolved_prerequisite_recorded_on_task(db_session, mocker):
         u.get("kind") == "task" and u.get("ref") == "nonexistent-task-id"
         for u in (unresolved if isinstance(unresolved, list) else [unresolved])
     ), "unresolved prerequisite details must be in context"
+
+
+@_pytest.mark.asyncio
+async def test_cyclic_prerequisite_refused_at_spawn(db_session, mocker):
+    """Two findings each declaring the other as a capability prerequisite would
+    close a depends_on cycle. The acyclicity check refuses the edge that would
+    close it, so no full cycle is persisted — consistent with the runtime
+    need-resolution path rather than deferring to the dispatch-time breaker."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq05")
+
+    finding_a = _make_finding(title="Build cap A surface", direction_id=direction["id"])
+    finding_a["provides_capability"] = "cap-a"
+    finding_a["prerequisite"] = {"kind": "capability", "ref": "cap-b"}
+    finding_b = _make_finding(title="Build cap B surface", direction_id=direction["id"])
+    finding_b["provides_capability"] = "cap-b"
+    finding_b["prerequisite"] = {"kind": "capability", "ref": "cap-a"}
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding_a, finding_b],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 2
+    by_id = {str(c.id): c for c in children}
+    # At most one of the two mutual edges may be wired — the other is refused so
+    # the depends_on graph never closes a cycle.
+    edge_count = sum(1 for c in children if c.depends_on)
+    assert edge_count <= 1, "the cycle-closing edge must be refused at spawn"
+    # Verify no actual cycle: no child both depends on another AND is depended on.
+    for c in children:
+        for dep in c.depends_on or []:
+            other = by_id.get(str(dep))
+            assert other is None or str(c.id) not in (other.depends_on or []), (
+                "a mutual depends_on cycle must never be persisted"
+            )
