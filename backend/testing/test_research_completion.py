@@ -2659,11 +2659,14 @@ async def test_finding_without_prerequisite_spawns_with_no_extra_deps(
 
 
 @_pytest.mark.asyncio
-async def test_unresolved_prerequisite_recorded_on_task(db_session, mocker):
+async def test_unresolved_prerequisite_blocks_dependent(db_session, mocker):
     """When a finding declares a prerequisite that does not resolve to any
-    candidate, it is recorded on the spawned task's context so duplication
-    risk is detectable rather than silent."""
+    candidate, the dependent is transitioned into the BLOCKED state carrying the
+    unresolved prerequisite as its machine-resolvable need (no depends_on edge),
+    so the blocked-resume sweep gates it instead of letting it duplicate the
+    foundation."""
     from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.task_blocked import get_blocker_metadata
 
     _project, direction, task = await _grader_project_and_task(db_session, "d-prq04")
     finding = _make_finding(title="Add login endpoint", direction_id=direction["id"])
@@ -2688,15 +2691,24 @@ async def test_unresolved_prerequisite_recorded_on_task(db_session, mocker):
     )
     assert len(children) == 1
     child = children[0]
+    assert child.status == TaskStatus.BLOCKED, (
+        "an unresolved prerequisite must transition the dependent into BLOCKED"
+    )
     assert not (child.depends_on or []), (
         "unresolved prerequisite must not create a depends_on edge"
     )
+    # The unresolved prerequisite is persisted as the canonical machine-resolvable
+    # need under context['blocker']['need'] for the blocked-resume sweep.
+    need = get_blocker_metadata(child).get("need")
+    assert need == {"kind": "task", "ref": "nonexistent-task-id"}, (
+        "unresolved prerequisite must be carried as the blocked need"
+    )
+    # Still stamped on context for operator visibility, in addition to BLOCKED.
     unresolved = (child.context or {}).get("unresolved_prerequisite", [])
-    assert unresolved, "unresolved prerequisite must be recorded on task context"
     assert any(
         u.get("kind") == "task" and u.get("ref") == "nonexistent-task-id"
         for u in (unresolved if isinstance(unresolved, list) else [unresolved])
-    ), "unresolved prerequisite details must be in context"
+    ), "unresolved prerequisite details must remain in context for visibility"
 
 
 @_pytest.mark.asyncio

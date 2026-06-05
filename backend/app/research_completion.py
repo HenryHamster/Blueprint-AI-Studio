@@ -2734,6 +2734,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # so a declared prerequisite that would close a depends_on cycle is refused at
     # the structural source rather than deferred to the dispatch-time cycle breaker.
     from app.blocked_need_resolution import _would_create_cycle  # noqa: PLC0415
+    from app.task_blocked import build_need, enter_blocked_state  # noqa: PLC0415
 
     _prereq_candidates = list(existing_tasks) + list(child_tasks)
     for ci, ct in enumerate(child_tasks):
@@ -2743,11 +2744,27 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             continue
         foundation = resolve_prerequisite_task(prereq, _prereq_candidates)
         if foundation is None or foundation.id == ct.id:
-            # Record the unresolved prerequisite on the task context so it is
-            # visible and operators can detect duplication risk. When a
-            # declared prerequisite fails to resolve to any candidate, the
-            # dependent spawns with no depends_on edge — this persistence
-            # makes the gap detectable rather than silent.
+            # Unresolved prerequisite: a finding declared an explicit {kind, ref}
+            # foundation it must build on, but no in-flight or sibling task
+            # matched. Rather than spawn the dependent as immediately-runnable
+            # (which lets it rebuild the very foundation it declared it needs —
+            # the "blocked dependents duplicating foundations" failure), block it
+            # on the normalized prerequisite as a machine-resolvable NEED and let
+            # the mature blocked-resume sweep gate it: the sweep wires a real
+            # depends_on edge the moment a matching foundation appears in flight
+            # (reaper_sweeps._resolve_need_into_dep_edge), resumes it with no edge
+            # when the foundation has already landed as completed/merged work
+            # (need_satisfied_by_completed), and escalates loudly to the operator
+            # if the foundation never appears within the deadline.
+            #
+            # Policy: BOTH prerequisite kinds (task, capability) trigger blocking.
+            # Prereq kinds are a subset of NEED_KINDS, so the normalized
+            # prerequisite is already a valid need. A kind=capability ref could in
+            # principle already be satisfied by code that was never a task; the
+            # escalation/auto-resume path is the backstop that clears genuinely-
+            # independent or already-satisfied work rather than parking it forever.
+            # We still stamp context['unresolved_prerequisite'] for operator
+            # visibility in addition to entering BLOCKED.
             if foundation is None:
                 ctx = dict(ct.context or {})
                 unresolved = ctx.get("unresolved_prerequisite") or {}
@@ -2755,10 +2772,30 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 unresolved_list.append(prereq)
                 ctx["unresolved_prerequisite"] = unresolved_list
                 ct.context = ctx
+                need = build_need(
+                    prereq.get("kind"),
+                    prereq.get("ref"),
+                    label=prereq.get("label"),
+                )
+                if need:
+                    enter_blocked_state(
+                        ct,
+                        waiting_on=f"foundation {need['kind']}:{need['ref']}",
+                        reason=(
+                            f"Finding '{findings[fi].get('title', f'#{fi}')}' declared "
+                            f"prerequisite {need['kind']}:{need['ref']} but no candidate "
+                            f"matched at spawn; blocked until the foundation appears or "
+                            f"the operator escalation fires."
+                        ),
+                        source="research_prerequisite",
+                        blocker_kind="upstream_dependency",
+                        need=need,
+                    )
                 session.add(ct)
                 logger.warning(
                     "[RESEARCH] Finding '%s' declared prerequisite %s:%s but no candidate matched; "
-                    "dependent spawned with no depends_on edge (duplication risk)",
+                    "dependent BLOCKED on the unresolved need (blocked-resume sweep will wire "
+                    "the edge or escalate)",
                     findings[fi].get("title", f"#{fi}"),
                     prereq.get("kind"),
                     prereq.get("ref"),

@@ -7512,6 +7512,103 @@ async def test_unblock_sweep_resumes_when_need_satisfied_by_completed_work(
 
 
 @pytest.mark.asyncio
+async def test_unblock_sweep_wires_edge_for_research_prerequisite_blocker(
+    reaper_db, mocker
+):
+    """A research-spawned dependent BLOCKED on an unresolved finding prerequisite
+    (source='research_prerequisite', carrying the prereq as its need) is wired
+    into a real depends_on edge onto the matching foundation the moment it
+    appears in flight, then requeued — closing the spawn-time seam through the
+    existing blocked-resume sweep."""
+    from app.task_blocked import enter_blocked_state
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    foundation = Task(
+        project_id=project.id, title="shared foundation", description="x",
+        status=TaskStatus.IN_PROGRESS, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}], context={}, status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+    # Build the dependent exactly the way research_completion does at spawn time.
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        depends_on=[],
+        context={},
+    )
+    enter_blocked_state(
+        t,
+        waiting_on=f"foundation task:{foundation.id}",
+        reason="Finding declared prerequisite task that did not resolve at spawn",
+        source="research_prerequisite",
+        blocker_kind="upstream_dependency",
+        need={"kind": "task", "ref": str(foundation.id)},
+    )
+    t.recheck_after = now - timedelta(minutes=1)
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    assert str(foundation.id) in (t.depends_on or [])
+    assert "blocker" not in (t.context or {})
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_resumes_research_prerequisite_when_foundation_landed(
+    reaper_db, mocker
+):
+    """A research-spawned dependent BLOCKED on a prerequisite that has ALREADY
+    landed as completed/merged work resumes with no edge — the foundation is
+    done, so it requeues directly instead of waiting on an in-flight task."""
+    from app.task_blocked import enter_blocked_state
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    foundation = Task(
+        project_id=project.id, title="landed foundation", description="x",
+        status=TaskStatus.COMPLETED, created_by="u", requires_approval=False,
+        payloads=[{"type": "create"}], context={}, status_log=[],
+    )
+    reaper_db.add(foundation)
+    await reaper_db.commit()
+    await reaper_db.refresh(foundation)
+    t = await _blocked_task(
+        reaper_db, project,
+        blocker_kind="upstream_dependency",
+        depends_on=[],
+        context={},
+    )
+    enter_blocked_state(
+        t,
+        waiting_on=f"foundation task:{foundation.id}",
+        reason="Finding declared prerequisite task that did not resolve at spawn",
+        source="research_prerequisite",
+        blocker_kind="upstream_dependency",
+        need={"kind": "task", "ref": str(foundation.id)},
+    )
+    t.recheck_after = now - timedelta(minutes=1)
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    assert not (t.depends_on or [])
+    assert "blocker" not in (t.context or {})
+
+
+@pytest.mark.asyncio
 async def test_unblock_sweep_does_not_resolve_when_dep_edge_already_present(
     reaper_db, mocker
 ):
