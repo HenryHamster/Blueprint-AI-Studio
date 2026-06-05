@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.direction_outcomes import verified_merged_count
+from app.digest_direction_progress import pr_ineligible_created_in_entry
 from app.landed_signal import is_merged_completion, merge_verification_status
 from app.models import (
     Task,
@@ -402,6 +403,7 @@ async def compute_pipeline_health_summary(
             verified_merged = 0
             prs_rejected = 0
             tasks_created_total = 0
+            pr_ineligible_total = 0
             sd_totals: Dict[str, int] = {}
             for entry in d.get("research_history") or []:
                 try:
@@ -413,16 +415,18 @@ async def compute_pipeline_health_summary(
                         verified_merged += verified_merged_count(entry)
                         prs_rejected += entry.get("prs_rejected") or 0
                         tasks_created_total += entry.get("tasks_created") or 0
+                        pr_ineligible_total += pr_ineligible_created_in_entry(entry)
                         for k, v in (entry.get("stage_dropout") or {}).items():
                             sd_totals[k] = sd_totals.get(k, 0) + (v or 0)
                 except (ValueError, TypeError):
                     pass
 
-            # Conversion is verification-aware: degraded-unverified merges are
-            # excluded (verified_merged) to agree with the per-task layer.
+            # Conversion is verification-aware (verified_merged) and uses PR-eligible
+            # denominator (excludes non-PR task types) to agree with pipeline-level rate.
+            pr_eligible_total = tasks_created_total - pr_ineligible_total
             dir_conversion_rate = (
-                round(verified_merged / tasks_created_total, 3)
-                if tasks_created_total > 0
+                round(verified_merged / pr_eligible_total, 3)
+                if pr_eligible_total > 0
                 else None
             )
             acceptance_denom = prs_merged + prs_rejected
@@ -452,9 +456,17 @@ async def compute_pipeline_health_summary(
 
         direction_stats.sort(key=lambda x: x["cycles"], reverse=True)
 
-    # Pipeline-level conversion rate: total prs_merged / total tasks_created across all directions
+    # Pipeline-level conversion rate: total prs_merged / total PR-eligible tasks
+    # created across all directions. The denominator excludes PR-ineligible task
+    # types (research/audit/memo/investigate) so it is not diluted by non-PR work.
     _pipeline_total_created = sum(
         entry.get("tasks_created") or 0
+        for d in (project.directions or [] if project else [])
+        for entry in (d.get("research_history") or [])
+        if _safe_ts_in_window(entry.get("timestamp"), window_start)
+    )
+    _pipeline_total_ineligible = sum(
+        pr_ineligible_created_in_entry(entry)
         for d in (project.directions or [] if project else [])
         for entry in (d.get("research_history") or [])
         if _safe_ts_in_window(entry.get("timestamp"), window_start)
@@ -465,9 +477,10 @@ async def compute_pipeline_health_summary(
         for entry in (d.get("research_history") or [])
         if _safe_ts_in_window(entry.get("timestamp"), window_start)
     )
+    _pipeline_eligible_created = _pipeline_total_created - _pipeline_total_ineligible
     pipeline_conversion_rate = (
-        round(_pipeline_total_merged / _pipeline_total_created, 3)
-        if _pipeline_total_created > 0
+        round(_pipeline_total_merged / _pipeline_eligible_created, 3)
+        if _pipeline_eligible_created > 0
         else None
     )
 

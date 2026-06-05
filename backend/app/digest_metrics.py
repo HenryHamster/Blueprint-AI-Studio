@@ -2101,12 +2101,15 @@ def compute_digest_cost_economics(
         if _pipeline_total_decided > 0
         else None
     )
-    _pipeline_total_created_d = sum(
-        d.get("tasks_created") or 0 for d in direction_progress_list
+    # Conversion rate denominator is PR-eligible tasks (excludes research/audit/
+    # memo/investigate types that never open a PR), matching the per-direction
+    # conversion_rate so the headline figure is not diluted by non-PR work.
+    _pipeline_total_eligible_d = sum(
+        d.get("pr_eligible_tasks_created") or 0 for d in direction_progress_list
     )
     pipeline_conversion_rate = (
-        round(_pipeline_total_merged_d / _pipeline_total_created_d, 3)
-        if _pipeline_total_created_d > 0
+        round(_pipeline_total_merged_d / _pipeline_total_eligible_d, 3)
+        if _pipeline_total_eligible_d > 0
         else None
     )
     pipeline_autonomous_prs_merged = sum(

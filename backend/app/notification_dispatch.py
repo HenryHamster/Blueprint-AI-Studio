@@ -2266,10 +2266,10 @@ async def post_version_promotion_readiness_message(
     Does NOT commit — the caller owns the transaction.
     """
     summary = (
-        f"v{version_number} qualifier track record supports autonomous promotion: "
-        f"{consecutive_clean_passes} consecutive clean passes, "
-        f"{would_promote_rate:.0%} would-promote rate "
-        f"({verdicts_evaluated} dry-run verdict(s)). "
+        f"v{version_number} qualifier self-approval streak clears thresholds: "
+        f"{would_promote_rate:.0%} self-approval rate ({verdicts_evaluated} dry-run verdict(s)), "
+        f"{consecutive_clean_passes} consecutive clean passes. "
+        f"NOTE: this is the qualifier's own approval rate with no post-promotion outcome recorded. "
         f"Enable promotion in settings to unlock automain→main autonomy."
     )
     msg = await post_event_message(

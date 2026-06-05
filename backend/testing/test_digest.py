@@ -4045,6 +4045,8 @@ async def test_digest_remediation_funnel(client: AsyncClient, db_session):
             "diagnosis_task_id": str(inv_done.id),
             "direction_id": "d1",
             "trigger_failure_class": "CODE_ERROR",
+            "pr_merged": True,
+            "landed_on_integration": True,
         },
         status_log=[{"t": rem_completed.isoformat(), "status": "completed"}],
     )
@@ -4056,7 +4058,12 @@ async def test_digest_remediation_funnel(client: AsyncClient, db_session):
         status=TaskStatus.COMPLETED,
         payloads=[{"type": "create"}],
         created_at=now - timedelta(hours=2),
-        context={"diagnosis_task_id": str(inv_fallback.id), "direction_id": "d1"},
+        context={
+            "diagnosis_task_id": str(inv_fallback.id),
+            "direction_id": "d1",
+            "pr_merged": True,
+            "landed_on_integration": True,
+        },
         status_log=[{"t": rem_completed.isoformat(), "status": "completed"}],
     )
     rem_failed = make_task(
@@ -4163,12 +4170,29 @@ async def test_compute_remediation_funnel_helper_direct(db_session):
             "diagnosis_task_id": str(inv_done.id),
             "direction_id": "d1",
             "trigger_failure_class": "CODE_ERROR",
+            "pr_merged": True,
+            "landed_on_integration": True,
         },
         status_log=[
             {"t": (now - timedelta(hours=1)).isoformat(), "status": "completed"}
         ],
     )
-    db_session.add(rem_merged)
+    # COMPLETED remediation whose PR never landed on the integration branch:
+    # spawned, but NOT merged. It must inflate "spawned" without inflating
+    # "merged" (the name-vs-definition mismatch this test guards).
+    rem_completed_not_landed = make_task(
+        project_id=project.id,
+        title="remediation A2 (completed, not landed)",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(hours=2),
+        context={
+            "diagnosis_task_id": str(inv_done.id),
+            "direction_id": "d1",
+            "trigger_failure_class": "CODE_ERROR",
+        },
+    )
+    db_session.add_all([rem_merged, rem_completed_not_landed])
     await db_session.commit()
 
     sentinel_residual = {"spawned": 7, "marker": "residual-stays-here"}
@@ -4183,7 +4207,9 @@ async def test_compute_remediation_funnel_helper_direct(db_session):
     assert funnel["investigations_completed"] == 1
     assert funnel["investigations_with_diagnosis"] == 1
     assert funnel["active_investigations"] == 1
-    assert funnel["remediations_spawned"] == 1
+    # Both completed remediations are spawned, but only the one that actually
+    # landed on the integration branch counts as merged.
+    assert funnel["remediations_spawned"] == 2
     assert funnel["remediations_merged"] == 1
     assert funnel["remediations_failed"] == 0
     assert funnel["merged_remediations_by_trigger_class"] == {"CODE_ERROR": 1}

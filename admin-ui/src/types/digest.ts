@@ -185,6 +185,47 @@ export interface EffortModelEfficiency {
   };
 }
 
+// Dependency/foundation-resolution observability (read-only). Mirrors the
+// backend `compute_dependency_health_signals` return shape: parked blockers
+// (BLOCKED/held tasks pushed off the recovery queue), duplicate-foundation
+// candidates (two tasks independently building the same files), and
+// unresumable cancellations (blocked dependents given up on). Each block
+// carries a total plus a capped list for operator drill-down.
+export interface ParkedBlockerTask {
+  task_id: string;
+  title: string;
+  project_id: string | null;
+  blocker_kind: string | null;
+  blocked_reason: string | null;
+  blocked_at: string | null;
+  recheck_after: string | null;
+  direction_id?: string | null;
+}
+export interface DuplicateFoundationCandidate {
+  task_ids: string[];
+  overlap_ratio: number;
+  shared_files: string[];
+}
+export interface UnresumableCancellationTask {
+  task_id: string;
+  title: string;
+  project_id: string | null;
+  give_up_class: string;
+  need?: string | null;
+  direction_id?: string | null;
+  at: string | null;
+}
+export interface DependencyHealthSignals {
+  parked_blockers: { total: number; tasks: ParkedBlockerTask[] };
+  duplicate_foundation_candidates: { total: number; candidates: DuplicateFoundationCandidate[] };
+  unresumable_cancellations: {
+    total: number;
+    by_class?: Record<string, number>;
+    by_direction?: Record<string, number>;
+    tasks: UnresumableCancellationTask[];
+  };
+}
+
 export interface DigestData<DP = unknown> {
   // ----- core contract (validated by assertDigestContract) -----
   failed_count: number;
@@ -304,6 +345,7 @@ export interface DigestData<DP = unknown> {
 
   // ----- operational health (catch-up) -----
   merge_gate_fleet_health?: MergeGateFleetHealth | null;
+  dependency_health_signals?: DependencyHealthSignals | null;
   migration_health?: {
     current_schema_revision: string | null;
     migration_tasks_in_window: number;

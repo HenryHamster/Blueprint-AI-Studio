@@ -510,6 +510,61 @@ async def test_conversion_rate_excludes_degraded_unverified_merges():
 
 
 @pytest.mark.asyncio
+async def test_conversion_rate_excludes_pr_ineligible_task_types():
+    """conversion_rate denominator drops research/audit/memo tasks (which never open a PR).
+
+    research_history records 6 tasks_created but type_breakdown shows 4 of them are
+    PR-ineligible (research/audit), leaving 2 PR-eligible. With 1 PR merged the
+    direction conversion_rate AND the headline pipeline_conversion_rate must be
+    1/2 = 0.5, not 1/6 = 0.167.
+    """
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    direction_id = str(uuid.uuid4())
+
+    project = make_project(
+        directions=[
+            {
+                "id": direction_id,
+                "status": "active",
+                "text": "Mixed task-type direction",
+                "research_history": [
+                    {
+                        "timestamp": (now - timedelta(hours=5)).isoformat(),
+                        "prs_merged": 1,
+                        "tasks_created": 6,
+                        "type_breakdown": {
+                            "research": {"created": 3},
+                            "audit": {"created": 1},
+                            "create": {"created": 2},
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+    tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": direction_id},
+            created_at=now - timedelta(hours=4),
+        ),
+    ]
+    session = _make_mock_session(tasks=tasks, project=project)
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    stats = result["direction_stats"]
+    assert len(stats) == 1
+    # 1 merged / (6 created - 4 PR-ineligible) = 1/2
+    assert stats[0]["conversion_rate"] == 0.5
+    # Headline pipeline rate uses the same PR-eligible denominator.
+    assert result["pipeline_conversion_rate"] == 0.5
+
+
+@pytest.mark.asyncio
 async def test_direction_with_zero_cycles_excluded():
     """Active direction with no completed research cycles in window is excluded from stats."""
     now = _utcnow()

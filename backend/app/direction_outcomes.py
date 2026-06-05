@@ -392,11 +392,10 @@ async def _update_direction_research_outcomes(
     )
     # BLOCKED tasks are counted separately from FAILED — they are parked on an
     # absent precondition, not failures, and the auto-unblock sweep is expected
-    # to return them to QUEUED. Surfacing the count keeps them out of the
-    # failure tally while still being visible to operators/analytics.
-    entry["tasks_blocked"] = sum(
-        1 for ct in child_tasks_rows if ct.status == TaskStatus.BLOCKED
-    )
+    # to return them to QUEUED.
+    # Retired: tasks_blocked. Was claimed to be visible to operators/analytics
+    # but has no named consumer (grep: no backend module, analytics, or admin-ui
+    # component reads it). Retired 2026-06-05.
     entry["prs_merged"] = sum(
         1
         for ct in child_tasks_rows
@@ -464,24 +463,9 @@ async def _update_direction_research_outcomes(
     entry["preventive_context_tasks_failed"] = sum(
         1 for ct in _prev_rows if _counts_as_failure(ct)
     )
-    # Remediation tasks: spawned from a diagnosis or auto-remediation. Tracked
-    # separately so research agents can see the remediation burden — a
-    # direction merging emergency fixes is not the same as one merging features.
-    _remediation_rows = [
-        ct
-        for ct in child_tasks_rows
-        if (ct.context or {}).get("diagnosis_task_id")
-        or (ct.context or {}).get("auto_remediation") is True
-    ]
-    entry["remediation_tasks_created"] = len(_remediation_rows)
-    entry["remediation_tasks_merged"] = sum(
-        1
-        for ct in _remediation_rows
-        if is_merged_completion(ct)
-    )
-    entry["remediation_tasks_failed"] = sum(
-        1 for ct in _remediation_rows if _counts_as_failure(ct)
-    )
+    # Retired: remediation_tasks_created, remediation_tasks_merged, remediation_tasks_failed.
+    # Were intended to track remediation burden but have no named consumer (grep: no backend
+    # module, analytics, or admin-ui component reads them). Retired 2026-06-05.
     # Collect changed files from merged PRs for co-change index update
     merged_files_lists = [
         (ct.context or {}).get("_pr_changed_files", [])
@@ -569,57 +553,10 @@ async def _update_direction_research_outcomes(
         if merge_durations
         else None
     )
-    # avg_implementation_hours: time the agent spent producing a PR
-    # (vm_stopped_at - created_at) across ALL completed children, not
-    # just merged ones. Pairs with avg_review_hours below to split
-    # avg_time_to_merge_hours into implementation vs review-pipeline time.
-    impl_durations = [
-        (_to_naive_utc(ct.vm_stopped_at) - _to_naive_utc(ct.created_at)).total_seconds()
-        / 3600
-        for ct in child_tasks_rows
-        if ct.status == TaskStatus.COMPLETED
-        and ct.vm_stopped_at is not None
-        and ct.created_at is not None
-    ]
-    entry["avg_implementation_hours"] = (
-        round(sum(impl_durations) / len(impl_durations), 2) if impl_durations else None
-    )
-    # avg_review_hours: time from implementation finish to PR merge.
-    # PR merge timestamp isn't stored; approximate via the matching
-    # review child's vm_stopped_at (latest if multiple iterations),
-    # falling back to the merged task's updated_at.
-    review_end_by_pr: dict = {}
-    for ct in child_tasks_rows:
-        if (ct.first_payload or {}).get("type") != "review":
-            continue
-        if ct.vm_stopped_at is None:
-            continue
-        pr_num = (ct.context or {}).get("pr_number")
-        if pr_num is None:
-            continue
-        prev = review_end_by_pr.get(pr_num)
-        if prev is None or ct.vm_stopped_at > prev:
-            review_end_by_pr[pr_num] = ct.vm_stopped_at
-    review_durations = []
-    for ct in child_tasks_rows:
-        if not (
-            is_merged_completion(ct)
-            and ct.vm_stopped_at is not None
-        ):
-            continue
-        pr_num = (ct.context or {}).get("pr_number")
-        end_ts = review_end_by_pr.get(pr_num) if pr_num is not None else None
-        if end_ts is None:
-            end_ts = ct.updated_at
-        end_ts_n = _to_naive_utc(end_ts)
-        vm_stop_n = _to_naive_utc(ct.vm_stopped_at)
-        if end_ts_n is not None and vm_stop_n is not None and end_ts_n >= vm_stop_n:
-            review_durations.append((end_ts_n - vm_stop_n).total_seconds() / 3600)
-    entry["avg_review_hours"] = (
-        round(sum(review_durations) / len(review_durations), 2)
-        if review_durations
-        else None
-    )
+    # Retired: avg_implementation_hours, avg_review_hours. These split avg_time_to_merge_hours
+    # into implementation vs review-pipeline time for research-agent consumption, but have
+    # no named consumer (grep: no backend module, analytics, or admin-ui component reads them).
+    # Retired 2026-06-05.
     # Review iteration counts per child task — lets research agents see
     # prompt-quality outcomes (fewer iterations = clearer prompt).
     review_iters = [
@@ -738,7 +675,8 @@ async def _update_direction_research_outcomes(
     entry["product_ratio"] = (
         round(product_count / total_typed, 2) if total_typed > 0 else 0.0
     )
-    entry["structural_count"] = structural_count
+    # Retired: structural_count. Raw count stored but never read; product_ratio (derived
+    # from this) IS consumed by digest_direction_progress.py. Retired 2026-06-05.
 
     # Track per-scope merge rates so research agents can calibrate scope assignments.
     # calibrated_in: tasks calibrated INTO this scope from a larger one (counted at the

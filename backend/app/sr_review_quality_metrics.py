@@ -226,7 +226,7 @@ def _compute_fresh_reviewer_effectiveness(
     terminal_tasks: List[Task],
 ) -> "Dict[str, Any]":
     """Compute fresh-reviewer pass effectiveness: approval rate lift and per-category
-    hit rate (did human confirm what fresh-reviewer flagged?). Always returns a dict
+    hit rate (did reviewer-LLM confirm what fresh-reviewer flagged?). Always returns a dict
     so callers can check sample_size before trusting rates.
     """
     code_change_tasks = [
@@ -269,7 +269,7 @@ def _compute_fresh_reviewer_effectiveness(
     for t in tasks_with_both:
         ctx = t.context or {}
         findings = ctx.get("_self_review_outcome", {}).get("reviewer_findings") or []
-        human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
+        reviewer_confirmed_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
         check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
         agent_failed = _author_sr_failed_categories(check_results)
         for finding in findings:
@@ -277,9 +277,9 @@ def _compute_fresh_reviewer_effectiveness(
             if not cat:
                 continue
             cat_flagged[cat] = cat_flagged.get(cat, 0) + 1
-            if cat in human_cats:
+            if cat in reviewer_confirmed_cats:
                 cat_confirmed[cat] = cat_confirmed.get(cat, 0) + 1
-            if cat not in agent_failed and cat in human_cats:
+            if cat not in agent_failed and cat in reviewer_confirmed_cats:
                 cat_added_value[cat] = cat_added_value.get(cat, 0) + 1
 
     return {

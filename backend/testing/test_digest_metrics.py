@@ -1109,6 +1109,39 @@ def test_compute_digest_cost_economics_excludes_non_merge_unblocks():
     assert by_type["create"]["merged_count"] == 1
 
 
+def test_pipeline_conversion_rate_uses_pr_eligible_denominator():
+    """Headline pipeline_conversion_rate divides merges by PR-eligible tasks only.
+
+    direction_progress_list entries carry both tasks_created (all task rows) and
+    pr_eligible_tasks_created (excludes research/audit/memo/investigate). The
+    pipeline conversion rate must use the eligible count so non-PR work does not
+    dilute the rate: 3 merged / 5 eligible = 0.6, not 3 / 12 created.
+    """
+    now = _utcnow()
+    result = compute_digest_cost_economics(
+        all_tasks=[],
+        direction_progress_list=[
+            {
+                "estimated_cost_usd": 0.0,
+                "prs_merged": 2,
+                "tasks_created": 7,
+                "pr_eligible_tasks_created": 3,
+            },
+            {
+                "estimated_cost_usd": 0.0,
+                "prs_merged": 1,
+                "tasks_created": 5,
+                "pr_eligible_tasks_created": 2,
+            },
+        ],
+        window_start=now - timedelta(hours=24),
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+    )
+    # 3 merged / 5 PR-eligible tasks = 0.6 (NOT 3 / 12 created = 0.25)
+    assert result["pipeline_conversion_rate"] == 0.6
+
+
 def test_first_review_approval_breakdowns_exclude_non_merge_unblocks():
     """Review-eligible merge analytics require an integration-landing signal."""
     now = _utcnow()
@@ -1142,6 +1175,7 @@ def test_compute_digest_cost_economics_pipeline_aggregates():
             "prs_merged": 3,
             "prs_rejected": 1,
             "tasks_created": 10,
+            "pr_eligible_tasks_created": 8,
             "autonomous_prs_merged": 2,
             "assisted_prs_merged": 1,
             "operator_action_count": 4,
@@ -1159,6 +1193,7 @@ def test_compute_digest_cost_economics_pipeline_aggregates():
             "prs_merged": 1,
             "prs_rejected": 1,
             "tasks_created": 5,
+            "pr_eligible_tasks_created": 4,
             "autonomous_prs_merged": 1,
             "assisted_prs_merged": 0,
             "operator_action_count": 1,
@@ -1178,9 +1213,9 @@ def test_compute_digest_cost_economics_pipeline_aggregates():
         now=now,
         daily_cost_ceiling_usd=0.0,
     )
-    # merged=4, rejected=2 → 4/6 = 0.667; created=15 → 4/15 = 0.267.
+    # merged=4, rejected=2 → 4/6 = 0.667; PR-eligible=8+4=12 → 4/12 = 0.333.
     assert result["pipeline_acceptance_rate"] == 0.667
-    assert result["pipeline_conversion_rate"] == 0.267
+    assert result["pipeline_conversion_rate"] == 0.333
     assert result["pipeline_autonomous_prs_merged"] == 3
     assert result["pipeline_assisted_prs_merged"] == 1
     assert result["pipeline_operator_action_count"] == 5

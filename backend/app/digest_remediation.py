@@ -394,7 +394,13 @@ async def compute_remediation_funnel(
         )
     )
     remediations_spawned = len(_rem_tasks)
-    remediations_merged = sum(1 for t in _rem_tasks if t.status == TaskStatus.COMPLETED)
+    # "merged" must mean the PR actually landed on the integration branch, not
+    # merely that the task reached a terminal COMPLETED status (a remediation can
+    # close completed without merging). Use the canonical landed-signal predicate
+    # — the same one the CI auto-remediation tally below uses — so "merged" means
+    # merged everywhere in the funnel, and the success rate (merged / spawned)
+    # the admin UI derives reflects real merges.
+    remediations_merged = sum(1 for t in _rem_tasks if is_merged_completion(t))
     remediations_failed = sum(1 for t in _rem_tasks if t.status == TaskStatus.FAILED)
 
     _held_projects_q = select(Project).options(
@@ -490,7 +496,10 @@ async def compute_remediation_funnel(
 
     merged_remediations_by_trigger_class: Dict[str, int] = {}
     for r in _rem_tasks:
-        if r.status != TaskStatus.COMPLETED:
+        # "merged" here means the same thing as the headline remediations_merged
+        # count and the CI auto-remediation tally: the PR actually landed, not
+        # merely that the task reached COMPLETED.
+        if not is_merged_completion(r):
             continue
         trigger_cls = (r.context or {}).get("trigger_failure_class")
         if not trigger_cls:
@@ -522,9 +531,12 @@ async def compute_remediation_funnel(
         bucket = remediation_success_by_confidence.setdefault(
             conf, {"merged": 0, "failed": 0}
         )
-        if r.status == TaskStatus.COMPLETED:
+        # Consistent with the rest of the funnel: only a landed PR counts as
+        # "merged". A completed-but-not-landed remediation is neither a merge nor
+        # a hard failure, so it inflates neither arm of the success ratio.
+        if is_merged_completion(r):
             bucket["merged"] += 1
-        else:
+        elif r.status == TaskStatus.FAILED:
             bucket["failed"] += 1
 
     _completed_inv = [

@@ -51,6 +51,7 @@ import { OpenResidualCasesSection } from './OpenResidualCasesSection';
 import { RejectionPatternSummary } from './RejectionPatternSummary';
 import { RecentMergesTimeline } from './RecentMergesTimeline';
 import { MergeGateFleetHealthCard } from './MergeGateFleetHealthCard';
+import { DependencyHealthCard } from './DependencyHealthCard';
 import type { Task } from '../types/task';
 import type { Project } from '../types/project';
 import { assertDigestContract, type DigestData as DigestDataBase, type FailureGroup } from '../types/digest';
@@ -769,6 +770,13 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           {digest?.merge_gate_fleet_health && digest.merge_gate_fleet_health.project_count > 0 && (
             <div className="mt-4">
               <MergeGateFleetHealthCard data={digest.merge_gate_fleet_health} />
+            </div>
+          )}
+
+          {/* Dependency/foundation-resolution health (read-only) */}
+          {digest?.dependency_health_signals && (
+            <div className="mt-4">
+              <DependencyHealthCard data={digest.dependency_health_signals} />
             </div>
           )}
 

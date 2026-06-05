@@ -272,7 +272,13 @@ def _categorize_review_issues(
 
 
 def resolve_sr_miss_human_truth(ctx: dict) -> set[str]:
-    """Return the best available set of human-flagged review categories for a task."""
+    """Return the best available set of reviewer-LLM-confirmed review categories for a task.
+
+    The ground truth is the reviewer LLM verdict history (NOT human labels):
+    a category is confirmed when some reviewer iteration rejected the work for it.
+    Prefers the all-iterations superset (_all_iterations_rejection_categories) and
+    falls back to the first-attempt set (_first_attempt_rejection_categories).
+    """
     stored_all_iter = ctx.get("_all_iterations_rejection_categories") or {}
     if stored_all_iter:
         return set(stored_all_iter.keys())

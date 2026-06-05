@@ -16,6 +16,24 @@ from app.direction_outcomes import verified_merged_count
 from app.models import Project, Task, TaskStatus
 from app.time_utils import _to_naive_utc, _coerce_naive_utc
 
+# Task types that never open a PR. These are excluded from the
+# conversion_rate denominator so the metric means the same thing on every
+# surface: merged PRs / PR-eligible tasks created (NOT / all tasks created).
+PR_INELIGIBLE_TASK_TYPES = ("research", "investigate", "audit", "memo")
+
+
+def pr_ineligible_created_in_entry(entry: Dict[str, Any]) -> int:
+    """Number of PR-ineligible tasks created in one research_history entry.
+
+    Sourced from the entry's ``type_breakdown`` so every consumer computes the
+    conversion-rate denominator (merged PRs / PR-eligible tasks) identically.
+    """
+    type_breakdown = entry.get("type_breakdown") or {}
+    return sum(
+        (type_breakdown.get(ttype) or {}).get("created", 0) or 0
+        for ttype in PR_INELIGIBLE_TASK_TYPES
+    )
+
 
 async def compute_direction_progress(
     session: AsyncSession,
@@ -176,10 +194,7 @@ async def compute_direction_progress(
                 findings_tasks_created += entry.get("tasks_created") or 0
                 # Count tasks of types that never open PRs (research, investigate, audit, memo)
                 # to calculate PR-eligible denominator for conversion_rate
-                for ttype in ("research", "investigate", "audit", "memo"):
-                    pr_ineligible_tasks_created += (
-                        entry.get("type_breakdown", {}).get(ttype, {}).get("created", 0) or 0
-                    )
+                pr_ineligible_tasks_created += pr_ineligible_created_in_entry(entry)
                 dir_findings_produced += entry.get("findings_produced") or 0
                 dir_batch_cap_applied += entry.get("batch_cap_applied") or 0
                 for _fk, _fv in (entry.get("filter_breakdown") or {}).items():
@@ -613,6 +628,7 @@ async def compute_direction_progress(
                 "outcome_kind_breakdown": dir_outcome_kind_breakdown or None,
                 "acceptance_rate": acceptance_rate,
                 "conversion_rate": conversion_rate,
+                "pr_eligible_tasks_created": pr_eligible_tasks,
                 "avg_time_to_merge_hours": avg_time_to_merge_hours,
                 "possibly_saturated": bool(d.get("possibly_saturated", False)),
                 "possibly_complete": bool(d.get("possibly_complete", False)),
