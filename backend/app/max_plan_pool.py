@@ -297,10 +297,22 @@ def _ensure_migrated(runtime_config: Mapping[str, Any]) -> Mapping[str, Any]:
     return _migrate_legacy_provider_config(dict(runtime_config))
 
 
-def resolve_task_routing(
-    task: Any, runtime_config: Mapping[str, Any]
+def _resolve_routing_core(
+    payload: Any,
+    context: Any,
+    task_type: str,
+    runtime_config: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Resolve ``{providers, effort}`` for a task, most-specific first.
+    """Core layered routing resolution over already-extracted projected fields.
+
+    Operates purely on ``(payload, context, task_type)`` so callers can drive
+    it from SQL-projected fields (the first payload dict, the context dict, and
+    the task type) without touching ``task.payloads`` — which would trigger a
+    deferred JSONB load under the digest's ``load_only`` projection.
+
+    :func:`resolve_task_routing` (the task-driven entry point) and
+    :func:`resolve_effective_effort` (the projection-safe effort-only entry
+    point) both delegate here, so the two can never drift.
 
     Order:
       1. payload.provider_preference / payload.effort — per-task explicit
@@ -317,12 +329,8 @@ def resolve_task_routing(
     providers: list[str] | None = None
     effort: str | None = None
 
-    ctx = _task_context(task)
-    payloads = getattr(task, "payloads", None) or []
-    payload = payloads[0] if payloads else {}
-
     # Layer 1+2: per-task payload/context — payload wins.
-    for source in (payload if isinstance(payload, Mapping) else None, ctx):
+    for source in (payload if isinstance(payload, Mapping) else None, context):
         if not isinstance(source, Mapping):
             continue
         if providers is None:
@@ -333,8 +341,6 @@ def resolve_task_routing(
             raw = source.get("effort")
             if isinstance(raw, str) and raw.strip():
                 effort = raw.strip()
-
-    task_type = _task_type(task)
 
     # Layer 3: task_type_routing[task_type]
     task_routing_all = runtime_config.get("task_type_routing", {}) or {}
@@ -364,6 +370,49 @@ def resolve_task_routing(
         "providers": providers if providers is not None else list(ALL_PROVIDERS),
         "effort": effort if effort is not None else DEFAULT_EFFORT_LEVEL,
     }
+
+
+def resolve_task_routing(
+    task: Any, runtime_config: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Resolve ``{providers, effort}`` for a task, most-specific first.
+
+    Thin wrapper: extracts ``(payload, context, task_type)`` from the task and
+    delegates to :func:`_resolve_routing_core`. Reads ``task.payloads`` — use
+    :func:`resolve_effective_effort` instead on the digest projection path,
+    where ``task.payloads`` is deferred.
+    """
+    ctx = _task_context(task)
+    payloads = getattr(task, "payloads", None) or []
+    payload = payloads[0] if payloads else {}
+    task_type = _task_type(task)
+    return _resolve_routing_core(payload, ctx, task_type, runtime_config)
+
+
+def resolve_effective_effort(
+    payload: Any,
+    context: Any,
+    task_type: Any,
+    runtime_config: Mapping[str, Any],
+) -> str:
+    """Resolve the EFFECTIVE routing effort from already-projected fields.
+
+    This is the projection-safe counterpart to :func:`resolve_task_routing`:
+    it takes the first payload dict, the context dict, and the task type
+    directly (callers read them from SQL-projected fields) and reuses the same
+    :func:`_resolve_routing_core` layered fall-through, so the resolved effort
+    is identical to what the dispatcher would compute — without ever touching
+    ``task.payloads``.
+
+    ``task_type`` falls back to ``"create"`` (the dispatcher's default) when
+    absent, matching :func:`_task_type`.
+    """
+    tt = (
+        task_type.strip()
+        if isinstance(task_type, str) and task_type.strip()
+        else "create"
+    )
+    return _resolve_routing_core(payload, context, tt, runtime_config)["effort"]
 
 
 def resolve_task_provider_preference(

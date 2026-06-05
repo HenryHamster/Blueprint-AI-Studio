@@ -956,7 +956,8 @@ async def _compute_digest(
     # earns its money in landed PRs. Reuses the shared LLM pricing so its totals
     # reconcile with the per-model cost surface.
     effort_model_efficiency = compute_effort_model_efficiency(
-        completed_tasks + failed_tasks + cancelled_tasks
+        completed_tasks + failed_tasks + cancelled_tasks,
+        runtime_config=_runtime_config,
     )
 
     # --- Scope mismatch diagnostics ---

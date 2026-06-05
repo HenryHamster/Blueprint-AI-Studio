@@ -2858,6 +2858,7 @@ def test_compute_foundation_convergence_actions_multiple_pairs():
 def _eff_task(
     *,
     effort=None,
+    task_type="create",
     provider="anthropic",
     model="claude-opus-4-8",
     input_tokens=0,
@@ -2877,7 +2878,7 @@ def _eff_task(
     llm_input_tokens/llm_output_tokens/llm_call_count) feeds the per-attempt
     cost split that ``_task_llm_attempts`` reads.
     """
-    payload = {"type": "create"}
+    payload = {"type": task_type}
     if effort is not None:
         payload["effort"] = effort
     ctx = dict(context or {})
@@ -3204,16 +3205,75 @@ def test_effort_model_efficiency_surfaces_fallback_divergence():
     assert resolved[0]["run_count"] == 1
 
 
-def test_effort_model_efficiency_missing_effort_buckets_unspecified():
-    """Tasks with no declared effort fall into the 'unspecified' bucket rather
-    than being dropped."""
+def test_effort_model_efficiency_missing_effort_resolves_to_default_tier():
+    """A task with no explicit payload effort and no routing config resolves to
+    the dispatcher's DEFAULT_EFFORT_LEVEL ('medium'), not 'unspecified' — its
+    effective routing effort is what selected the model and drove cost."""
+    from app.max_plan_pool import DEFAULT_EFFORT_LEVEL
+
     tasks = [
         _eff_task(effort=None, model="claude-opus-4-8",
                   input_tokens=100, output_tokens=100, landed=True),
     ]
-    result = compute_effort_model_efficiency(tasks)
+    # Empty runtime_config -> no payload/context/type/category effort -> default.
+    result = compute_effort_model_efficiency(tasks, runtime_config={})
     efforts = {r["effort"] for r in result["by_effort"]}
-    assert efforts == {"unspecified"}
+    assert efforts == {DEFAULT_EFFORT_LEVEL}
+
+
+def test_effort_model_efficiency_buckets_by_resolved_routing_effort():
+    """Tasks with NO explicit payload effort (review/strategic_review/ops types)
+    land in their CATEGORY routing tier — the effort that actually selected the
+    model — instead of collapsing into 'unspecified'."""
+    runtime_config = {
+        "task_type_categories": {
+            "review": ["review", "strategic_review"],
+            "strategic": ["strategic"],
+            "ops": ["deps"],
+        },
+        "category_routing": {
+            "review": {"effort": "high"},
+            "strategic": {"effort": "max"},
+            "ops": {"effort": "low"},
+            "_default": {"effort": "medium"},
+        },
+    }
+    tasks = [
+        _eff_task(effort=None, task_type="review", model="claude-opus-4-8",
+                  input_tokens=100, output_tokens=100, landed=False),
+        _eff_task(effort=None, task_type="strategic_review",
+                  model="claude-opus-4-8",
+                  input_tokens=100, output_tokens=100, landed=False),
+        _eff_task(effort=None, task_type="strategic", model="claude-opus-4-8",
+                  input_tokens=100, output_tokens=100, landed=False),
+        _eff_task(effort=None, task_type="deps", model="claude-haiku-4-5",
+                  input_tokens=100, output_tokens=100, landed=False),
+    ]
+    result = compute_effort_model_efficiency(tasks, runtime_config=runtime_config)
+    by_effort = {r["effort"]: r for r in result["by_effort"]}
+    assert "unspecified" not in by_effort
+    # review + strategic_review both resolve to the 'review' category -> high.
+    assert by_effort["high"]["run_count"] == 2
+    assert by_effort["max"]["run_count"] == 1
+    assert by_effort["low"]["run_count"] == 1
+
+
+def test_effort_model_efficiency_explicit_payload_effort_wins():
+    """Explicit payload effort is the most-specific layer and overrides the
+    category routing config — so previously-bucketed tasks are unaffected."""
+    runtime_config = {
+        "task_type_categories": {"review": ["review"]},
+        "category_routing": {"review": {"effort": "high"}},
+    }
+    tasks = [
+        # type=review would resolve to 'high' by category, but explicit 'low'
+        # in the payload wins.
+        _eff_task(effort="low", task_type="review", model="claude-opus-4-8",
+                  input_tokens=100, output_tokens=100, landed=False),
+    ]
+    result = compute_effort_model_efficiency(tasks, runtime_config=runtime_config)
+    efforts = {r["effort"] for r in result["by_effort"]}
+    assert efforts == {"low"}
 
 
 def test_effort_model_efficiency_empty_input():

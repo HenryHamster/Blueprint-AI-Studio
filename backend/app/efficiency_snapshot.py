@@ -1326,11 +1326,26 @@ def _finalize_efficiency_bucket(b: Dict[str, Any], **extra: Any) -> Dict[str, An
     return out
 
 
-def compute_effort_model_efficiency(tasks: list[Task]) -> Dict[str, Any]:
+def compute_effort_model_efficiency(
+    tasks: list[Task],
+    runtime_config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
     """Per-effort-tier and per-actual-model efficiency rollup over finished tasks.
 
-    Pure function — no DB calls. For each task it reads the REQUESTED effort from
-    ``task.first_payload["effort"]``, then splits the task across its banked
+    Pure function — no DB calls. For each task it resolves the EFFECTIVE routing
+    effort — the same effort the dispatcher resolves to select the model — via
+    :func:`max_plan_pool.resolve_effective_effort`, reading the SQL-projected
+    ``task.first_payload`` (type + payload effort) and ``task.context`` (never
+    ``task.payloads``, which is deferred under the digest projection). This
+    attributes EVERY terminal task to the tier that actually drove its cost —
+    not just the scope-aware implementation types that stamp an explicit payload
+    effort — so review/strategic (opus) and ops (haiku) tasks land in their
+    category tier instead of collapsing into ``unspecified``. Explicit payload
+    effort still wins as the most-specific layer, so previously-bucketed tasks
+    are unaffected. ``runtime_config`` defaults to the shared
+    :data:`shared_state.runtime_config` (mirrors :func:`estimate_pool_hit_rate`).
+
+    It then splits the task across its banked
     attempt history (:func:`_task_llm_attempts`) so each attempt's tokens are
     priced at the (provider, model) that attempt actually ran on — exactly as
     :func:`compute_llm_cost_breakdown` does. A task that retried on a different
@@ -1345,8 +1360,9 @@ def compute_effort_model_efficiency(tasks: list[Task]) -> Dict[str, Any]:
     multi-attempt task never inflates run/landed counts.
 
     Returns a dict with:
-      - ``by_effort``: rows keyed by requested effort tier (low->max, then
-        ``unspecified``). Each row carries run count, landed count + rate,
+      - ``by_effort``: rows keyed by effective routing effort tier (low->max,
+        then ``unspecified`` for tasks with no projected first payload at all).
+        Each row carries run count, landed count + rate,
         verified landed count + rate, priced LLM cost, cost-per-merge (over the
         verified count), token volume, priced/unpriced coverage, and a
         ``resolved_models`` breakdown exposing which actual models that requested
@@ -1361,6 +1377,13 @@ def compute_effort_model_efficiency(tasks: list[Task]) -> Dict[str, Any]:
         (requested != effective resolved model), with a capped per-combo list.
     """
     from collections import defaultdict  # noqa: PLC0415
+
+    from app import max_plan_pool  # noqa: PLC0415
+
+    if runtime_config is None:
+        from app.shared_state import runtime_config as _rc  # noqa: PLC0415
+
+        runtime_config = _rc
 
     effort_buckets: Dict[str, Dict[str, Any]] = defaultdict(_new_efficiency_bucket)
     # effort -> (provider, model) -> {run_count, landed_count}
@@ -1399,8 +1422,20 @@ def compute_effort_model_efficiency(tasks: list[Task]) -> Dict[str, Any]:
     for t in tasks:
         landed = is_merged_completion(t)
         verified = is_verified_merge(t)
-        effort_raw = (t.first_payload or {}).get("effort")
-        effort = str(effort_raw) if effort_raw else _EFFORT_UNSPECIFIED
+        # Bucket by the EFFECTIVE routing effort the dispatcher resolves (the
+        # tier that actually selected the model and drove cost), not just the
+        # explicit payload effort that only scope-aware types carry. Read the
+        # SQL-projected first payload + context — never t.payloads (deferred
+        # under the digest load_only projection). 'unspecified' now holds only
+        # genuinely unresolvable tasks: those with no projected first payload.
+        first_payload = t.first_payload or {}
+        if first_payload:
+            effort_resolved = max_plan_pool.resolve_effective_effort(
+                first_payload, t.context, first_payload.get("type"), runtime_config
+            )
+            effort = str(effort_resolved) if effort_resolved else _EFFORT_UNSPECIFIED
+        else:
+            effort = _EFFORT_UNSPECIFIED
         eff_bucket = effort_buckets[effort]
 
         # Distinct model buckets this task contributed a token-bearing row to.

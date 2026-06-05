@@ -108,11 +108,15 @@ type SubTableRow = EfficiencyBucket & {
 
 function EfficiencySubTable({
   title,
+  caption,
   rows,
   label,
   renderExpansion,
 }: {
   title: string;
+  // Optional one-line help text shown beneath the title (e.g. clarifying what
+  // the tier label actually measures).
+  caption?: string;
   rows: SubTableRow[];
   label: string;
   // Optional per-row reveal rendered beneath the row (e.g. a tier's resolved
@@ -123,6 +127,9 @@ function EfficiencySubTable({
   return (
     <div className="mb-3 last:mb-0">
       <h3 className="text-[10px] font-semibold text-neutral-500 uppercase tracking-wider mb-1 px-1">{title}</h3>
+      {caption && (
+        <p className="text-[9px] text-neutral-600 mb-1 px-1 normal-case tracking-normal">{caption}</p>
+      )}
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
         {/* Mobile: stacked card layout */}
         <div className="sm:hidden divide-y divide-neutral-800/30">
@@ -256,7 +263,8 @@ export function EffortEfficiencyPanel({ data }: { data: EffortModelEfficiency | 
       )}
 
       <EfficiencySubTable
-        title="By Effort Tier"
+        title="By Effective Effort Tier"
+        caption="Effective routing effort the dispatcher resolved to select the model (payload → context → task-type → category), not just effort explicitly requested in the payload — so every task type is attributed to the tier that drove its cost."
         label="Effort"
         rows={effortRows(by_effort ?? [])}
         renderExpansion={(row) => {
