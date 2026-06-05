@@ -378,6 +378,9 @@ _READ_ONLY_EVALUATORS: dict[str, Callable[[Task], TaskOutcome]] = {
     "compute_experiment": _evaluate_compute_experiment,
     "panel_review": _evaluate_panel_review,
     "web_research": _evaluate_web_research,
+    # design produces the same durable KnowledgeDocument mirror as web_research,
+    # so it shares the knowledge-document outcome evaluator.
+    "design": _evaluate_web_research,
 }
 
 
@@ -794,6 +797,8 @@ SUMMARY_BUILDERS: dict[str, Callable[[Task, SummaryContext], dict[str, Any] | No
     "release_audit": _build_findings_summary,
     "compute_experiment": _build_compute_experiment_summary,
     "web_research": _build_web_research_summary,
+    # design renders from the same knowledge-document mirror as web_research.
+    "design": _build_web_research_summary,
     "panel_review": _build_panel_review_summary,
 }
 

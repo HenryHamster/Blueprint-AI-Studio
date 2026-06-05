@@ -38,6 +38,7 @@ class TaskType(str, Enum):
     verify_tests = "verify_tests"
     compute_experiment = "compute_experiment"
     web_research = "web_research"
+    design = "design"
 
 
 AgentMode = Literal["write", "read_only"]
@@ -555,6 +556,26 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         evaluation_strategy="forward_quality",
         cost_ceiling_usd=4.0,
         completion_handler="web_research",
+        evaluation="forward-quality",
+    ),
+    TaskCapability(
+        TaskType.design,
+        "Design",
+        "read_only",
+        default_category="strategic",
+        user_launchable=True,
+        description=(
+            "Codebase-internal design work: ground a design question in the "
+            "actual code and produce a durable, queryable design document (with "
+            "file-reference citations) into the knowledge-document store. Unlike "
+            "web_research it sources from the repo, not the web."
+        ),
+        output_kind="knowledge",
+        requires_code=True,
+        requires_web=False,
+        evaluation_strategy="forward_quality",
+        cost_ceiling_usd=4.0,
+        completion_handler="design",
         evaluation="forward-quality",
     ),
 )

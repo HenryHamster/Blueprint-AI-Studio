@@ -60,6 +60,7 @@ EXPECTED_TYPES = {
     "verify_tests",
     "compute_experiment",
     "web_research",
+    "design",
 }
 
 

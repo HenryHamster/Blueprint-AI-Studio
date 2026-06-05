@@ -73,6 +73,7 @@ def test_evaluation_declarations_match_expected_assignment():
         "verify_tests": "none",
         "compute_experiment": "metric",
         "web_research": "forward-quality",
+        "design": "forward-quality",
     }
 
 

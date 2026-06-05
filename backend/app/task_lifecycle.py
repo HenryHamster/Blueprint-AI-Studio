@@ -364,7 +364,10 @@ async def _resolve_quality_grader_completion(
     )
     from app.research_completion import _handle_research_completion
     from app.task_completion import _handle_security_audit_completion
-    from app.knowledge_completion import _handle_web_research_completion
+    from app.knowledge_completion import (
+        _handle_design_completion,
+        _handle_web_research_completion,
+    )
 
     completed = payload.status == TaskStatus.COMPLETED
     grader_logs = payload.logs or grader.latest_status_message or ""
@@ -424,6 +427,7 @@ async def _resolve_quality_grader_completion(
         "research": _handle_research_completion,
         "security_audit": _handle_security_audit_completion,
         "web_research": _handle_web_research_completion,
+        "design": _handle_design_completion,
     }
     source_type = (source.first_payload or {}).get("type")
     cap = get_task_capability(source_type)
@@ -517,7 +521,10 @@ async def _process_post_commit(
         _record_strategic_task_failure,
     )
     from app.research_completion import _handle_research_completion
-    from app.knowledge_completion import _handle_web_research_completion
+    from app.knowledge_completion import (
+        _handle_design_completion,
+        _handle_web_research_completion,
+    )
 
     factory = _session_factory or AsyncSessionLocal
     async with factory() as session:
@@ -4054,6 +4061,7 @@ async def _process_post_commit(
                     "self_audit": _handle_self_audit_completion,
                     "memo": _handle_memo_completion,
                     "web_research": _handle_web_research_completion,
+                    "design": _handle_design_completion,
                 }
                 _capability = get_task_capability(task_type)
                 _handler_name = (

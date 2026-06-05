@@ -193,6 +193,15 @@ export const TASK_CAPABILITIES = [
     synthetic: false,
   },
   {
+    id: 'design',
+    label: 'Design',
+    description: 'Codebase-internal design document',
+    userLaunchable: true,
+    providerConfigurable: true,
+    filterVisible: true,
+    synthetic: false,
+  },
+  {
     id: 'rollup',
     label: 'Rollup',
     description: 'Rollup PR aggregation',

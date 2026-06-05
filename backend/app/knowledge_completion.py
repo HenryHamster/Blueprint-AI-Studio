@@ -1,10 +1,17 @@
-"""Completion handler for the ``web_research`` task type.
+"""Completion handlers for the knowledge-document task types (``web_research``
+and ``design``).
 
-A ``web_research`` task runs read-only with web access and emits a structured
-knowledge document (title / summary / body / citations / tags / topic). This
-handler is the WRITE PATH into the durable knowledge-document store: it gates
-the agent's output through the forward-quality evaluator and, on a passing
-grade, persists exactly ONE :class:`~app.models.KnowledgeDocument` row.
+A ``web_research`` task runs read-only with web access; a ``design`` task runs
+read-only over a clone of the repo. Both emit a structured knowledge document
+(title / summary / body / citations / tags / topic) and share ONE write path
+into the durable knowledge-document store: the shared
+:func:`_handle_knowledge_document_completion` seam gates the agent's output
+through the forward-quality evaluator and, on a passing grade, persists exactly
+ONE :class:`~app.models.KnowledgeDocument` row. The only per-kind differences are
+the log tag and the default citation modality (web URLs for ``web_research``,
+file references for ``design``); the structural contract
+(title/summary/body + at least one usable citation) is identical, so the
+parsing / persistence / citation helpers are NOT duplicated.
 
 It is modeled closely on ``task_completion._handle_memo_completion`` — a
 terminal read-only handler that marks the task COMPLETED/FAILED directly
@@ -50,8 +57,39 @@ logger = logging.getLogger(__name__)
 # Context key under which the parsed-but-not-yet-persisted document is stashed
 # when the task escalates to an independent grader. The re-entrant resume pass
 # reads the document back from here (the reconstructed ``logs`` it is handed
-# carry the grader's output, not the original document).
+# carry the grader's output, not the original document). Shared by both
+# knowledge-document kinds — a task is only ever one type, so a single key is
+# unambiguous; the historic ``_web_research`` name is kept for back-compat.
 _PENDING_DOCUMENT_KEY = "_web_research_document"
+
+# Per-kind presentation/phrasing for the shared knowledge-document producer.
+# Keyed by task-type value. ``tag`` is the log prefix; ``citation_hint`` is the
+# human phrasing appended to a citation-less gate failure (the default modality
+# differs: web URLs for web_research, file references for design).
+_KIND_META: dict[str, dict[str, str]] = {
+    "web_research": {
+        "tag": "WEB_RESEARCH",
+        "citation_hint": "at least one web URL or file reference is required",
+    },
+    "design": {
+        "tag": "DESIGN",
+        "citation_hint": "at least one file reference (or web URL) is required",
+    },
+}
+
+
+def _kind_tag(kind: str) -> str:
+    meta = _KIND_META.get(kind)
+    return meta["tag"] if meta else kind.upper()
+
+
+def _citation_hint(kind: str) -> str:
+    meta = _KIND_META.get(kind)
+    return (
+        meta["citation_hint"]
+        if meta
+        else "at least one web URL or file reference is required"
+    )
 
 # Required structural keys for a knowledge document. tags / topic are optional
 # and normalized to safe defaults. At least one *usable* source citation is
@@ -182,7 +220,9 @@ def _normalize_document(obj: dict[str, Any], task: Task) -> dict[str, Any]:
     }
 
 
-async def _fail_gate(task: Task, verdict: EvaluationVerdict, session: AsyncSession):
+async def _fail_gate(
+    task: Task, verdict: EvaluationVerdict, session: AsyncSession, kind: str = "web_research"
+):
     """Mark ``task`` FAILED on a failing forward-quality verdict and broadcast."""
     record_failed_gate(task, verdict)
     session.add(task)
@@ -193,7 +233,8 @@ async def _fail_gate(task: Task, verdict: EvaluationVerdict, session: AsyncSessi
         {"task_id": str(task.id), "status": TaskStatus.FAILED},
     )
     logger.info(
-        "[WEB_RESEARCH] Task %s did not clear the forward-quality gate: %s",
+        "[%s] Task %s did not clear the forward-quality gate: %s",
+        _kind_tag(kind),
         task.id,
         verdict.reason,
     )
@@ -204,6 +245,7 @@ async def _persist_document(
     document: dict[str, Any],
     verdict_record: dict[str, Any],
     session: AsyncSession,
+    kind: str = "web_research",
 ) -> None:
     """Persist exactly one KnowledgeDocument, mirror a compact copy, mark COMPLETED."""
     normalized = _normalize_document(document, task)
@@ -256,16 +298,21 @@ async def _persist_document(
         {"task_id": str(task.id), "status": TaskStatus.COMPLETED},
     )
     logger.info(
-        "[WEB_RESEARCH] Persisted knowledge document %s for task %s", doc.id, task.id
+        "[%s] Persisted knowledge document %s for task %s",
+        _kind_tag(kind),
+        doc.id,
+        task.id,
     )
 
 
-async def _handle_web_research_completion(
-    task: Task, logs: str, session: AsyncSession
+async def _handle_knowledge_document_completion(
+    task: Task, logs: str, session: AsyncSession, *, kind: str
 ) -> None:
-    """Gate a web-research task's output and persist a KnowledgeDocument on pass.
+    """Gate a knowledge-document task's output and persist on pass.
 
-    Two entry modes:
+    Shared seam for the ``web_research`` and ``design`` task types: both produce
+    the same structured knowledge document and write into the same store; only
+    the ``kind`` (log tag + default citation modality) differs. Two entry modes:
       * FIRST pass (no grader verdict in context): run the cheap synchronous
         forward-quality gate; on pass, optionally escalate to an independent
         grader (parking EVALUATING), otherwise persist the document.
@@ -286,6 +333,7 @@ async def _handle_web_research_completion(
                     "forward-quality",
                 ),
                 session,
+                kind,
             )
             return
         document = ctx.get(_PENDING_DOCUMENT_KEY) or _parse_web_research_document(logs)
@@ -298,6 +346,7 @@ async def _handle_web_research_completion(
                     "forward-quality",
                 ),
                 session,
+                kind,
             )
             return
         # Defense-in-depth: a graded document must still carry a usable citation.
@@ -306,20 +355,21 @@ async def _handle_web_research_completion(
                 task,
                 EvaluationVerdict(
                     False,
-                    "web_research output has no usable source citation "
-                    "(at least one web URL or file reference is required)",
+                    f"{kind} output has no usable source citation "
+                    f"({_citation_hint(kind)})",
                     "forward-quality",
                 ),
                 session,
+                kind,
             )
             return
-        await _persist_document(task, document, grader_verdict, session)
+        await _persist_document(task, document, grader_verdict, session, kind)
         return
 
     # ---- FIRST pass: run the cheap synchronous structural gate. --------------
     verdict = evaluate_terminal_output(task, logs)
     if not verdict.passed:
-        await _fail_gate(task, verdict, session)
+        await _fail_gate(task, verdict, session, kind)
         return
 
     document = _parse_web_research_document(logs)
@@ -330,27 +380,29 @@ async def _handle_web_research_completion(
             task,
             EvaluationVerdict(
                 False,
-                "web_research output is not a parseable knowledge document "
+                f"{kind} output is not a parseable knowledge document "
                 "(missing title/summary/body)",
                 "forward-quality",
             ),
             session,
+            kind,
         )
         return
 
-    # A web_research document MUST be grounded: at least one usable source
-    # citation (web URL or file reference). Enforce BEFORE grader escalation or
+    # A knowledge document MUST be grounded: at least one usable source citation
+    # (web URL or file reference). Enforce BEFORE grader escalation or
     # persistence so an ungrounded summary never parks for grading nor persists.
     if not _usable_citations(document):
         await _fail_gate(
             task,
             EvaluationVerdict(
                 False,
-                "web_research output has no usable source citation "
-                "(at least one web URL or file reference is required)",
+                f"{kind} output has no usable source citation "
+                f"({_citation_hint(kind)})",
                 "forward-quality",
             ),
             session,
+            kind,
         )
         return
 
@@ -375,8 +427,9 @@ async def _handle_web_research_completion(
         )
         if grader is not None:
             logger.info(
-                "[WEB_RESEARCH] Task %s parked awaiting forward-quality grade "
+                "[%s] Task %s parked awaiting forward-quality grade "
                 "(grader %s) before persisting knowledge document",
+                _kind_tag(kind),
                 task.id,
                 grader.id,
             )
@@ -390,4 +443,20 @@ async def _handle_web_research_completion(
         "strategy": verdict.strategy,
         "grader_task_id": None,
     }
-    await _persist_document(task, document, verdict_record, session)
+    await _persist_document(task, document, verdict_record, session, kind)
+
+
+async def _handle_web_research_completion(
+    task: Task, logs: str, session: AsyncSession
+) -> None:
+    """Completion handler for the ``web_research`` task type (web-grounded doc)."""
+    await _handle_knowledge_document_completion(
+        task, logs, session, kind="web_research"
+    )
+
+
+async def _handle_design_completion(
+    task: Task, logs: str, session: AsyncSession
+) -> None:
+    """Completion handler for the ``design`` task type (codebase-grounded doc)."""
+    await _handle_knowledge_document_completion(task, logs, session, kind="design")

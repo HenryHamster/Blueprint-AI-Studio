@@ -44,6 +44,7 @@ const FIXTURE_READ_ONLY: ReadonlySet<string> = new Set([
   'verify_tests',
   'compute_experiment',
   'web_research',
+  'design',
 ]);
 
 /** Build a complete, valid capability contract covering every agent task type. */

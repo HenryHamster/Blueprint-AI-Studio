@@ -375,6 +375,25 @@ class WebResearchPayload(BasePayload):
     project_name: str | None = None
 
 
+class DesignPayload(BasePayload):
+    """Payload for a codebase-internal design task that produces a design doc.
+
+    Modeled on :class:`WebResearchPayload`: the task runs read-only over a clone
+    of the repo and emits a structured knowledge document
+    (title/summary/body/citations/tags/topic) grounded in the actual code. The
+    forward-quality gate grades it before it is persisted as a
+    ``KnowledgeDocument``. ``prompt`` is the design question; the remaining
+    fields are optional routing/labeling context. Extra-field tolerant
+    (``extra='allow'`` via BasePayload) per the registry convention.
+    """
+
+    prompt: str | None = None
+    topic: str | None = None
+    tags: list[str] | None = None
+    direction_id: str | None = None
+    project_name: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
@@ -404,6 +423,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.verify_tests: VerifyTestsPayload,
     TaskType.compute_experiment: ComputeExperimentPayload,
     TaskType.web_research: WebResearchPayload,
+    TaskType.design: DesignPayload,
 }
 
 
