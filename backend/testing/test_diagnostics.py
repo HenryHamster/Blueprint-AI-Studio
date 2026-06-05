@@ -1132,7 +1132,34 @@ def test_trim_verdict_floor_takes_precedence_over_summarized():
     assert v["status"] == "floor"
     assert v["floor"]["dropped_gaps"] == 3
     assert v["floor"]["stripped_gap_fields"] == ["history", "evidence"]
+    assert v["floor"]["summarized_capabilities_count"] == 0
+    assert v["floor"]["summarized_friction_count"] == 0
     assert v["floor"]["still_over_floor"] is True
+
+
+def test_trim_verdict_floor_surfaces_skeletonized_sections():
+    """Floor verdict includes how many capabilities and friction entries were
+    skeletonized so operators can tell the strategist saw a reduced model."""
+    payload = {
+        "problem_model": {
+            "gaps": [],
+            "_agent_view_floor_applied": {
+                "floor_bytes": 32768,
+                "stripped_gap_fields": [],
+                "dropped_gaps": 0,
+                "summarized_capabilities": 1,
+                "summarized_friction": 1,
+            },
+        },
+        "_packer_meta": {"trimmed": [{"key": "problem_model"}], "dropped": []},
+    }
+    floor = payload["problem_model"]["_agent_view_floor_applied"]
+    assert isinstance(floor["summarized_capabilities"], int)
+    assert isinstance(floor["summarized_friction"], int)
+    v = _build_problem_model_trim_verdict(payload)
+    assert v["status"] == "floor"
+    assert v["floor"]["summarized_capabilities_count"] == 1
+    assert v["floor"]["summarized_friction_count"] == 1
 
 
 def test_trim_verdict_dropped_carries_reason():

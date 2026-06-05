@@ -324,6 +324,235 @@ def test_floor_full_value_ships_when_budget_allows():
     assert out["_packer_meta"]["trimmed"] == []
 
 
+def test_floor_equal_to_full_value_reserves_whole_value_off_the_top():
+    """When the ``floor`` callback returns the FULL value (identity floor), the
+    packer reserves the whole value's bytes off the top of the budget — so the
+    full value ships intact (un-summarized) while higher-volume siblings that
+    sort ahead must yield first.
+
+    This is the reworked strategic ``problem_model`` guarantee: the floor equals
+    the full agent-view model, so the model ordinarily ships WHOLE and recoverable
+    siblings degrade/drop before it is ever reduced. The summarize callback (which
+    would shrink the model) must NOT fire on this path.
+    """
+    full_model = {"gaps": ["g"] * 300}  # big, sorts last in the high tier
+    summarize_calls = []
+
+    def summarize(v):
+        summarize_calls.append(v)
+        return {"gaps": v["gaps"][:1], "floored": True}
+
+    payload = {
+        "model": full_model,
+        "sibling_a": "a" * 1500,
+        "sibling_b": "b" * 1500,
+    }
+    schema = {
+        # Identity floor: reserve the WHOLE value (mirrors the production
+        # _agent_view_problem_model_floor returning the full agent-view model).
+        "model": {
+            "priority": "high",
+            "summarize": summarize,
+            "floor": lambda v: v,
+        },
+        "sibling_a": {"priority": "high"},
+        "sibling_b": {"priority": "high"},
+    }
+    model_bytes = len(json.dumps(full_model, default=str).encode())
+    # Budget fits the whole model plus only ONE ~1.5KB sibling — the other must
+    # yield because the model's full bytes are reserved off the top.
+    out = pack_under_budget(payload, schema, budget=model_bytes + 1800)
+
+    # The WHOLE value shipped (not the floored/summarized 1-gap form).
+    assert out["model"] == full_model, "the full value must ship, un-summarized"
+    assert summarize_calls == [], "summarize must NOT fire when the full value fits"
+    assert out["_packer_meta"]["trimmed"] == []
+    # A higher-volume sibling yielded first.
+    dropped_keys = {d["key"] for d in out["_packer_meta"]["dropped"]}
+    assert "model" not in dropped_keys
+    assert "sibling_a" in dropped_keys or "sibling_b" in dropped_keys, (
+        "a higher-volume sibling must drop before the reserved full model"
+    )
+
+
+def test_full_model_floor_does_not_starve_critical_keys(caplog):
+    """When the full-model floor reservation fits the budget on its own but the
+    model PLUS the always-critical identity/vision keys would not, the packer
+    must drop the floor guarantee (so the model's summarize fires) rather than
+    starve a critical key into a hard PayloadTooLargeError.
+
+    Reproduces the near-budget band: model ~fits-alone, model+vision overflows.
+    The floor reservation is ``reserved_remaining <= budget`` (guarantee kept by
+    the old condition), yet ``vision`` (critical, no summarize/floor) sorts first
+    and would see ``remaining = budget - reserved`` too small to fit. The fix
+    accounts for non-floored critical keys' full bytes in the drop condition, so
+    the model degrades loudly via summarize and the critical key still ships.
+    """
+    big_model = {"gaps": ["g"] * 4000}
+    model_bytes = len(json.dumps(big_model, default=str).encode())
+    vision = "v" * 4000
+    vision_bytes = len(json.dumps(vision, default=str).encode())
+    summarize_calls = []
+
+    def summarize(v):
+        summarize_calls.append(v)
+        return {"gaps": v["gaps"][:1], "_agent_view_floor_applied": {"floored": True}}
+
+    payload = {"vision": vision, "model": big_model}
+    schema = {
+        "vision": {"priority": "critical"},
+        "model": {
+            "priority": "high",
+            "summarize": summarize,
+            "floor": lambda v: v,  # identity floor: reserves the WHOLE model
+        },
+    }
+    # Budget fits the model alone (reservation <= budget) but NOT model+vision.
+    budget = model_bytes + vision_bytes - 50
+    with caplog.at_level(logging.WARNING):
+        out = pack_under_budget(payload, schema, budget=budget)
+
+    # Critical key shipped — no PayloadTooLargeError.
+    assert out["vision"] == vision
+    # Floor guarantee was dropped, so the model degraded via summarize (loudly).
+    assert summarize_calls, "summarize must fire when the floor guarantee is dropped"
+    assert out["model"].get("_agent_view_floor_applied"), (
+        "the degraded model must carry the loud floor-applied marker"
+    )
+    assert {"key": "model", "kind": "summarized"} in out["_packer_meta"]["trimmed"]
+    assert any(
+        "exceed budget" in rec.message and "critical" in rec.message
+        for rec in caplog.records
+    ), "the floor-drop must log that critical headroom forced the drop"
+
+
+def test_degraded_floor_reservation_survives_mixed_high_contention():
+    """If the full-floor reservation must be dropped to preserve critical keys,
+    a smaller summarized reservation still protects the key from same-tier
+    siblings consuming the rest of the budget first.
+
+    Regression for the mixed critical/high band: the old fallback cleared
+    ``floors`` entirely, so two smaller high-priority siblings packed ahead of
+    ``problem_model`` and left too little room for even its summarized form,
+    silently dropping it. The packer must instead reserve the degraded form so
+    the model ships loudly summarized and at least one sibling yields first.
+    """
+    problem_model = {"gaps": ["g" * 200 for _ in range(20)]}
+
+    def summarize(v):
+        return {
+            "gaps": v["gaps"][:1],
+            "_agent_view_floor_applied": {"floored": True},
+        }
+
+    summarized_model = summarize(problem_model)
+    sibling_a = {"body": "a" * 220}
+    sibling_b = {"body": "b" * 220}
+    vision = {"purpose": "v" * 600}
+
+    summarized_size = _size(summarized_model)
+    sibling_a_size = _size(sibling_a)
+    sibling_b_size = _size(sibling_b)
+    critical_size = _size("strategic_review") + _size(vision)
+
+    budget = critical_size + summarized_size + sibling_a_size + sibling_b_size - 1
+    assert budget < critical_size + _size(problem_model), (
+        "fixture must force the full-floor reservation to overflow with critical keys"
+    )
+
+    payload = {
+        "type": "strategic_review",
+        "vision": vision,
+        "sibling_a": sibling_a,
+        "sibling_b": sibling_b,
+        "problem_model": problem_model,
+    }
+    schema = {
+        "type": {"priority": "critical"},
+        "vision": {"priority": "critical"},
+        "sibling_a": {"priority": "high"},
+        "sibling_b": {"priority": "high"},
+        "problem_model": {
+            "priority": "high",
+            "summarize": summarize,
+            "floor": lambda v: v,
+        },
+    }
+
+    out = pack_under_budget(payload, schema, budget=budget)
+
+    assert "problem_model" in out, "degraded reservation must keep problem_model delivered"
+    assert out["problem_model"] == summarized_model
+    assert {"key": "problem_model", "kind": "summarized"} in out["_packer_meta"]["trimmed"]
+    dropped_keys = {d["key"] for d in out["_packer_meta"]["dropped"]}
+    assert "problem_model" not in dropped_keys, f"problem_model dropped: {out['_packer_meta']['dropped']}"
+    assert {"sibling_a", "sibling_b"} & dropped_keys, (
+        "at least one same-tier sibling must yield before the degraded reservation"
+    )
+
+
+def test_degraded_reservation_preserves_floor_without_summarize(caplog):
+    """When the full-floor reservation must be dropped to preserve critical keys,
+    a floored key with NO usable summarized candidate still keeps a reservation
+    for its actual floor value rather than being cleared and silently dropped.
+
+    Regression for the degraded-reservation branch: it previously only reserved
+    ``_compute_summarized_candidate(p)``. A key with a valid floor but no usable
+    summarized form (no summarize_fn here) produced no degraded candidate, so
+    with both floored keys lacking summarizers ``degraded_floors`` stayed empty
+    and ``floors`` was cleared entirely — dropping a floor that fits within
+    ``budget - critical_full``. The fallback must reserve the floor value itself
+    when that is the only viable degraded form.
+    """
+    model_a = {"gaps": ["a" * 200 for _ in range(20)]}
+    model_b = {"gaps": ["b" * 200 for _ in range(20)]}
+    floor_a = {"floored": "a"}
+    floor_b = {"floored": "b"}
+    vision = "v" * 600
+
+    fa_size = _size(floor_a)
+    fb_size = _size(floor_b)
+    critical_size = _size("strategic_review") + _size(vision)
+
+    # Branch fires: full-floor reservations (fa + fb) plus the critical keys
+    # exceed budget by 1. degraded_budget = budget - critical_size = fa + fb - 1,
+    # so model_a's floor fits but model_b's does not (greedy boundary).
+    budget = critical_size + fa_size + fb_size - 1
+    assert fa_size + fb_size + critical_size > budget, (
+        "fixture must force the full-floor reservation to overflow with critical keys"
+    )
+
+    payload = {
+        "type": "strategic_review",
+        "vision": vision,
+        "model_a": model_a,
+        "model_b": model_b,
+    }
+    schema = {
+        "type": {"priority": "critical"},
+        "vision": {"priority": "critical"},
+        # Both floored keys lack a summarize_fn: the floor value is the ONLY
+        # viable degraded reservation form.
+        "model_a": {"priority": "high", "floor": lambda v: floor_a},
+        "model_b": {"priority": "high", "floor": lambda v: floor_b},
+    }
+
+    with caplog.at_level(logging.WARNING):
+        out = pack_under_budget(payload, schema, budget=budget)
+
+    # Critical keys shipped — no PayloadTooLargeError.
+    assert out["vision"] == vision
+    # model_a kept its floor reservation and shipped the floor value (loudly),
+    # instead of being cleared and dropped for lack of a summarized candidate.
+    assert out["model_a"] == floor_a, "floored key must ship its floor value"
+    assert {"key": "model_a", "kind": "floored"} in out["_packer_meta"]["trimmed"]
+    dropped_keys = {d["key"] for d in out["_packer_meta"]["dropped"]}
+    assert "model_a" not in dropped_keys, f"model_a dropped: {out['_packer_meta']['dropped']}"
+    assert any(
+        "preserving degraded reservations" in rec.message for rec in caplog.records
+    ), "the degraded pass must log that it preserved a floor reservation"
+
+
 def test_summarize_returning_larger_value_falls_back_to_original(caplog):
     """If summarize_fn returns something larger (caller bug), use original.
 
@@ -647,12 +876,15 @@ def test_gcd_problem_model_round_trips_under_single_pass_budget():
 
 def test_problem_model_survives_bloated_real_payload_with_many_high_sections():
     """The real strategic payload path: when MANY high-tier sections are present
-    together and collectively blow the budget, the problem_model is still
-    delivered in-payload (floored, never dropped) while other recoverable
-    high-tier context degrades or drops first.
+    together and collectively blow the budget, the WHOLE problem_model is still
+    delivered in-payload (intact, never floored, never dropped) while other
+    recoverable high-tier context degrades or drops first.
 
-    This exercises the production ``_STRATEGIC_REVIEW_SCHEMA`` + default budget,
-    not isolated unit inputs — the guarantee must hold under real bloat.
+    The floor reservation equals the whole agent-view model, so a healthy mature
+    model (well under the 120KB budget) ships in full and its recoverable siblings
+    yield first — the skeletonizing fallback never fires. This exercises the
+    production ``_STRATEGIC_REVIEW_SCHEMA`` + default budget, not isolated unit
+    inputs — the guarantee must hold under real bloat.
     """
     from app.problem_model import gc_problem_model
     from app.strategic_spawning import (
@@ -686,13 +918,21 @@ def test_problem_model_survives_bloated_real_payload_with_many_high_sections():
         "problem_model was dropped under real multi-high-section budget pressure"
     )
     dropped_keys = {d["key"] for d in out["_packer_meta"]["dropped"]}
+    trimmed_keys = {t["key"] for t in out["_packer_meta"]["trimmed"]}
     assert "problem_model" not in dropped_keys, (
         f"problem_model dropped by the packer: {out['_packer_meta']['dropped']}"
+    )
+    # The WHOLE model shipped — not the floored/skeletonized fallback.
+    assert "problem_model" not in trimmed_keys, (
+        f"problem_model was degraded instead of shipping whole: {out['_packer_meta']['trimmed']}"
+    )
+    assert "_agent_view_floor_applied" not in out["problem_model"], (
+        "a healthy mature model must ship whole, without the floored marker"
     )
     # The delivered model is a meaningful working set (still carries live gaps).
     assert out["problem_model"].get("gaps"), "delivered problem_model lost its gaps"
     # Other recoverable context degraded first — at least one high sibling dropped.
-    assert dropped_keys, "expected recoverable siblings to drop before the floor"
+    assert dropped_keys, "expected recoverable siblings to drop before the reserved model"
     assert out["_packer_meta"]["budget_used"] <= 120 * 1024
 
 

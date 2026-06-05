@@ -23,6 +23,7 @@ from app.payload_schemas import (
     validate_internal_payload,
     ALL_TASK_TYPES,
     PayloadTooLargeError,
+    _MAX_PAYLOAD_BYTES,
 )
 import app.shared_state as _shared_state
 from app.shared_state import (
@@ -1148,13 +1149,14 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 .first()
             )
             if not existing_alert:
+                max_kb = _MAX_PAYLOAD_BYTES // 1024
                 session.add(
                     Alert(
                         project_id=project.id,
                         severity=AlertSeverity.WARNING,
                         title="Strategic review skipped: payload too large",
                         message=(
-                            f"Strategic spawn payload exceeds the 256 KB limit "
+                            f"Strategic spawn payload exceeds the {max_kb} KB limit "
                             f"({e.size} bytes, top contributors: "
                             f"{', '.join(f'{k}={n}B' for k, n in e.top_keys[:3])}). "
                             "Tactical research continues, but strategic refresh is paused "

@@ -4,6 +4,9 @@ import { API_BASE_URL, authHeaders, apiFetch } from '../api';
 import { secondsUntil, parseTimestamp } from '../utils/time';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 
+// Matches _MAX_PAYLOAD_BYTES from backend/app/payload_schemas.py
+const MAX_PAYLOAD_KB = 190;
+
 interface ProjectAutonomousStatus {
   project_id: string;
   project_name: string;
@@ -97,6 +100,8 @@ interface ProblemModelTrim {
     floor_bytes?: number | null;
     stripped_gap_fields?: string[];
     dropped_gaps?: number;
+    summarized_capabilities_count?: number;
+    summarized_friction_count?: number;
     still_over_floor?: boolean;
   };
   dropped_reason?: string;
@@ -468,7 +473,7 @@ function PayloadBloatIndicator({ skip }: { skip: PayloadBloatSkip }) {
         )}
       </div>
       <p className="text-[11px] leading-tight text-amber-300 mt-1">
-        Assembled payload{sizeKb != null ? ` (${sizeKb} KB)` : ''} exceeds the 256 KB cap, so strategic refresh is frozen.
+        Assembled payload{sizeKb != null ? ` (${sizeKb} KB)` : ''} exceeds the {MAX_PAYLOAD_KB} KB cap, so strategic refresh is frozen.
         Compact{' '}
         {contributors.length > 0
           ? contributors.map((c) => c.key).join(', ')
@@ -505,6 +510,19 @@ function ProblemModelTrimIndicator({ trim }: { trim: ProblemModelTrim }) {
   }
   const floor = trim.floor;
   const droppedGaps = floor?.dropped_gaps ?? 0;
+  const summarizedCapabilities = floor?.summarized_capabilities_count ?? 0;
+  const summarizedFriction = floor?.summarized_friction_count ?? 0;
+  const skeletonizedSummaryParts: string[] = [];
+  if (summarizedCapabilities > 0) {
+    skeletonizedSummaryParts.push(
+      `${summarizedCapabilities} ${summarizedCapabilities === 1 ? 'capability' : 'capabilities'}`,
+    );
+  }
+  if (summarizedFriction > 0) {
+    skeletonizedSummaryParts.push(
+      `${summarizedFriction} ${summarizedFriction === 1 ? 'friction item' : 'friction items'}`,
+    );
+  }
   const stripped = floor?.stripped_gap_fields ?? [];
   return (
     <div className="rounded-md bg-amber-500/10 border border-amber-500/30 px-2.5 py-2">
@@ -521,6 +539,7 @@ function ProblemModelTrimIndicator({ trim }: { trim: ProblemModelTrim }) {
         {trim.status === 'dropped' && (trim.dropped_reason ? ` ${trim.dropped_reason}.` : ' It was omitted entirely.')}
         {trim.status === 'floor' && droppedGaps > 0 && ` Dropped ${droppedGaps} low-priority gap${droppedGaps === 1 ? '' : 's'}.`}
         {trim.status === 'floor' && stripped.length > 0 && ` Stripped per-gap ${stripped.join(', ')}.`}
+        {trim.status === 'floor' && skeletonizedSummaryParts.length > 0 && ` Skeletonized ${skeletonizedSummaryParts.join(' and ')}.`}
         {floor?.still_over_floor && ' Still over the floor after trimming.'}
       </p>
     </div>

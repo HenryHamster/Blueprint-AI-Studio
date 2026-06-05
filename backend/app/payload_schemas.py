@@ -575,6 +575,78 @@ def pack_under_budget(
         )
     )
 
+    def _compute_summarized_candidate(part: dict) -> dict[str, Any] | None:
+        """Compute and cache the summarized form for *part* once.
+
+        The cached candidate is reused both for degraded-floor reservations and
+        for the normal packing path so summarize callbacks are deterministic and
+        warnings are emitted at most once per key.
+        """
+        if part.get("_summarize_computed"):
+            return part.get("_summarize_candidate")
+        part["_summarize_computed"] = True
+
+        summarize_fn = part.get("summarize")
+        if summarize_fn is None:
+            part["_summarize_candidate"] = None
+            return None
+
+        try:
+            trimmed_value = summarize_fn(part["value"])
+        except Exception as exc:  # noqa: BLE001 — summarize fns must not crash the packer
+            logger.warning(
+                "pack_under_budget: summarize for key %r raised %s — dropping",
+                part["key"],
+                exc,
+            )
+            part["_summarize_candidate"] = None
+            return None
+
+        try:
+            trimmed_size = _serialized_size(trimmed_value)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "pack_under_budget: trimmed value for key %r not serializable (%s) — dropping",
+                part["key"],
+                exc,
+            )
+            part["_summarize_candidate"] = None
+            return None
+
+        size = part["size"]
+        assert size is not None
+        trimmed_size_int = trimmed_size
+        # Defensive: never grow the payload by trimming. If a caller's
+        # summarize_fn returns a larger value (caller bug), revert to original
+        # and proceed with the original-size check.
+        if trimmed_size_int > size:
+            logger.warning(
+                "pack_under_budget: summarize for key %r grew value (%d > %d) — using original",
+                part["key"],
+                trimmed_size_int,
+                size,
+            )
+            trimmed_value = part["value"]
+            trimmed_size_int = size
+
+        if isinstance(part["value"], list) and isinstance(trimmed_value, list):
+            trimmed_meta: dict[str, Any] = {
+                "key": part["key"],
+                "kind": "list_trimmed",
+                "shown": len(trimmed_value),
+                "total": len(part["value"]),
+            }
+        else:
+            trimmed_meta = {"key": part["key"], "kind": "summarized"}
+
+        candidate = {
+            "value": trimmed_value,
+            "size": trimmed_size_int,
+            "meta": trimmed_meta,
+        }
+        part["_summarize_candidate"] = candidate
+        return candidate
+
     # Floor reservations: keys whose schema declares a ``floor`` callback are
     # GUARANTEED to ship at least their floored representation. We reserve that
     # many bytes off the top of the budget so other sections — even same- or
@@ -598,20 +670,105 @@ def pack_under_budget(
                 exc,
             )
             continue
-        floors[p["key"]] = {"value": floored, "size": floored_size}
+        floors[p["key"]] = {"value": floored, "size": floored_size, "source": "floor"}
     reserved_remaining = sum(f["size"] for f in floors.values())
-    # If the floor reservations alone exceed the budget we cannot honor them all;
-    # abandon the reservation guarantee (floored keys then pack best-effort)
-    # rather than starve the critical-tier identity keys into a hard failure.
-    if reserved_remaining > budget:
+    # Critical-tier keys without their own floor reservation (e.g. identity /
+    # vision) MUST ship at full size — they raise PayloadTooLargeError rather
+    # than drop. They are not protected by the reservation mechanism, so they
+    # compete against ``budget - reserved_remaining``. If the floor reservations
+    # leave no room for them, honoring the floor guarantee would starve a
+    # critical key into a hard failure. Account for their full bytes here so we
+    # can drop the guarantee BEFORE that happens.
+    critical_full = sum(
+        p["size"]
+        for p in parts
+        if p["priority"] == "critical"
+        and not p["unserializable"]
+        and p["size"] is not None
+        and p["key"] not in floors
+    )
+    # If the full-floor reservations alone — or those reservations plus the
+    # non-floored critical keys' full bytes — exceed the budget we cannot honor
+    # them all. Before dropping reservations wholesale, try a degraded
+    # reservation pass that reserves each floored key's summarized form (when
+    # smaller) so same-tier siblings cannot still starve it into a silent drop.
+    # This preserves the strategic problem_model's "degrade loudly, don't
+    # disappear" contract even in the mixed critical/high contention band.
+    if reserved_remaining + critical_full > budget:
         logger.warning(
-            "pack_under_budget: floor reservations (%d) exceed budget (%d) — "
-            "dropping the floor guarantee for this pack",
+            "pack_under_budget: floor reservations (%d) + critical keys (%d) "
+            "exceed budget (%d) — attempting degraded reservations",
             reserved_remaining,
+            critical_full,
             budget,
         )
-        floors = {}
-        reserved_remaining = 0
+        degraded_budget = budget - critical_full
+        degraded_floors: dict[str, dict] = {}
+        degraded_reserved = 0
+        if degraded_budget > 0:
+            for p in parts:
+                if p["key"] not in floors:
+                    continue
+                # Viable degraded reservations for this key, smallest first. The
+                # floor value is ALWAYS available — it is exactly what
+                # ``floors[key]`` holds — so it is the guaranteed fallback form.
+                # The summarized candidate is added only when usable AND strictly
+                # smaller than the full value. Reserving the SMALLEST viable form
+                # leaves the most room for the other floored keys under the tight
+                # degraded budget; whichever we reserve, the packing loop can
+                # still opportunistically ship a richer form if free bytes remain.
+                #
+                # Falling back to the floor value here is essential: a key may
+                # have a valid floor but no usable summarized candidate (no
+                # summarize_fn, the summarizer raised, or it was not smaller).
+                # Without this fallback such a key would be excluded from
+                # ``degraded_floors`` and — if it were the only floored key —
+                # ``floors`` would be cleared entirely, dropping a floor that
+                # would have fit within ``budget - critical_full`` and breaking
+                # the packer's floor guarantee outside the summarize happy path.
+                floor_entry = floors[p["key"]]
+                degraded_candidates = [
+                    {
+                        "value": floor_entry["value"],
+                        "size": floor_entry["size"],
+                        "source": "floor",
+                        "meta": {"key": p["key"], "kind": "floored"},
+                    }
+                ]
+                summarized = _compute_summarized_candidate(p)
+                if summarized is not None and summarized["size"] < (p["size"] or 0):
+                    degraded_candidates.append(
+                        {
+                            "value": summarized["value"],
+                            "size": summarized["size"],
+                            "source": "summarized",
+                            "meta": summarized["meta"],
+                        }
+                    )
+                best = min(degraded_candidates, key=lambda c: c["size"])
+                if degraded_reserved + best["size"] > degraded_budget:
+                    continue
+                degraded_floors[p["key"]] = {
+                    "value": best["value"],
+                    "size": best["size"],
+                    "source": best["source"],
+                    "meta": best["meta"],
+                }
+                degraded_reserved += best["size"]
+
+        if degraded_floors:
+            floors = degraded_floors
+            reserved_remaining = degraded_reserved
+            logger.warning(
+                "pack_under_budget: preserving degraded reservations for keys %s",
+                sorted(degraded_floors.keys()),
+            )
+        else:
+            logger.warning(
+                "pack_under_budget: no degraded reservations fit — dropping the floor guarantee for this pack"
+            )
+            floors = {}
+            reserved_remaining = 0
 
     packed: dict = {}
     used = 0
@@ -636,56 +793,20 @@ def pack_under_budget(
             used += size
             continue
         included = False
-        if p["summarize"] is not None:
-            try:
-                trimmed_value = p["summarize"](p["value"])
-            except Exception as exc:  # noqa: BLE001 — summarize fns must not crash the packer
-                logger.warning(
-                    "pack_under_budget: summarize for key %r raised %s — dropping",
-                    key,
-                    exc,
-                )
-            else:
-                try:
-                    trimmed_size = _serialized_size(trimmed_value)
-                except (TypeError, ValueError) as exc:
-                    logger.warning(
-                        "pack_under_budget: trimmed value for key %r not serializable (%s) — dropping",
-                        key,
-                        exc,
-                    )
-                    trimmed_size = None
-                if trimmed_size is not None:
-                    trimmed_size_int = trimmed_size
-                    # Defensive: never grow the payload by trimming. If a caller's
-                    # summarize_fn returns a larger value (caller bug), revert to
-                    # original and proceed with the normal fits/drops decision.
-                    if trimmed_size_int > size:
-                        logger.warning(
-                            "pack_under_budget: summarize for key %r grew value (%d > %d) — using original",
-                            key,
-                            trimmed_size_int,
-                            size,
-                        )
-                        trimmed_value = p["value"]
-                        trimmed_size_int = size
-                    if trimmed_size_int <= remaining:
-                        packed[key] = trimmed_value
-                        used += trimmed_size_int
-                        if isinstance(p["value"], list) and isinstance(
-                            trimmed_value, list
-                        ):
-                            trimmed.append(
-                                {
-                                    "key": key,
-                                    "kind": "list_trimmed",
-                                    "shown": len(trimmed_value),
-                                    "total": len(p["value"]),
-                                }
-                            )
-                        else:
-                            trimmed.append({"key": key, "kind": "summarized"})
-                        included = True
+        candidate = floors.get(key)
+        if candidate is not None and candidate.get("source") == "summarized":
+            if candidate["size"] <= remaining:
+                packed[key] = candidate["value"]
+                used += candidate["size"]
+                trimmed.append(candidate["meta"])
+                included = True
+        if not included:
+            summarized = _compute_summarized_candidate(p)
+            if summarized is not None and summarized["size"] <= remaining:
+                packed[key] = summarized["value"]
+                used += summarized["size"]
+                trimmed.append(summarized["meta"])
+                included = True
         if not included:
             if floor is not None:
                 # Guaranteed-floor fallback: ship the floored value, which is

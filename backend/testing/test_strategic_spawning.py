@@ -9090,66 +9090,230 @@ def test_floor_no_pressure_path_is_byte_identical():
     assert packed["friction"][0]["description"] == "d"
 
 
-def test_pathological_problem_model_is_delivered_not_dropped():
-    """Regression: the strategist must never be silently deprived of its
-    problem_model — even in a REALISTICALLY CONTENDED mature-project payload.
+def test_pathological_problem_model_degrades_loudly_when_it_cannot_fit():
+    """The GENUINELY EXCEPTIONAL case: a problem_model so large it cannot fit the
+    packer budget even on its own. The floor reservation now equals the WHOLE
+    agent-view model, so an oversized model's reservation exceeds the budget and
+    the packer drops the floor guarantee — at which point the ``summarize``
+    callback (_agent_view_problem_model_packed -> _shrink_pm_to_floor) degrades
+    the model LOUDLY rather than silently: it ships a bounded floored skeleton
+    carrying the ``_agent_view_floor_applied`` marker, recorded in
+    ``_packer_meta['trimmed']`` so the agent's problemModelRecovery resolves to
+    'fetch'. This is the visibly-exceptional fallback, never the normal mode.
 
-    The earlier version of this test packed the oversized model against only an
-    essentially-empty ``vision`` and tiny scalars, so the budget was never
-    contended and the model trivially fit — false confidence. This builds a
-    payload where the high-priority siblings (large vision, directions_summary,
-    cycle_start_reconciliation, running_update, open_messages) genuinely
-    compete for the budget; without the per-key reservation the floored
-    problem_model would be crowded out and dropped. The reservation makes its
-    delivery a guarantee: present, carrying its floor marker, NOT in the
-    dropped list — and the tiny model_health signal ships alongside it."""
-    big = "y" * 50_000
-    pm = _pathological_problem_model()
+    Siblings are kept modest here so the degradation is clearly attributable to
+    the model's own size — the normal/contended whole-model guarantee (where the
+    model fits and siblings yield first) is exercised separately in
+    ``test_strategic_review_ships_whole_problem_model_under_contention``."""
+    pm = _pathological_problem_model()  # ~MBs of active-gap bulk, >> 120KB budget
     payload = {
         "type": "strategic_review",
         "project_name": "p",
         "base_branch": "main",
         "model": "claude-opus-4-8",
         "effort": "medium",
-        # Large critical + high-priority siblings that, together, would exhaust
-        # the 120KB budget before a last-sorted (largest-full-size) problem_model
-        # is ever reached.
-        "vision": {"purpose": big},
-        "cycle_start_reconciliation": {"summary": big},
-        "running_update": big,
-        "directions_summary": [
-            {"id": f"d-{i}", "text": "z" * 1000, "priority": "high"}
-            for i in range(40)
-        ],
-        "open_messages": [
-            {"id": f"m-{i}", "type": "NOTE", "content": "w" * 1000}
-            for i in range(40)
-        ],
+        "vision": {"purpose": "small"},
         "problem_model": pm,
-        "model_health": {"model_size_status": "large", "gap_count": 400},
+        "model_health": {"model_size_status": "oversized", "gap_count": 400},
     }
     packed = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA)
 
     meta = packed["_packer_meta"]
     dropped_keys = {d["key"] for d in meta["dropped"]}
-    # The scenario must be genuinely contended: at least one high-priority
-    # sibling is squeezed out. Otherwise this is not exercising the guarantee.
-    assert dropped_keys, (
-        "expected real budget contention (some section dropped); "
-        f"meta={meta}"
-    )
 
+    # The model is DELIVERED (degraded), never silently dropped.
     assert "problem_model" in packed, (
-        "problem_model must be DELIVERED under contention, never silently dropped"
+        "problem_model must be delivered degraded, never silently dropped"
     )
     assert "problem_model" not in dropped_keys, (
         f"problem_model was dropped: {meta['dropped']}"
     )
-    # Delivered as its guaranteed-small floor.
-    assert "_agent_view_floor_applied" in packed["problem_model"]
-    # The tiny size/health signal ships alongside it in the same contended cycle.
+    # Degraded loudly: the floored skeleton carries the marker so the agent
+    # knows it must ./fetch the full model.
+    assert "_agent_view_floor_applied" in packed["problem_model"], (
+        "an oversized model must ship floored with a loud marker"
+    )
+    serialized = len(json.dumps(packed["problem_model"], default=str).encode())
+    assert serialized <= _AGENT_VIEW_FLOOR_BYTES, (
+        f"floored model must fit the {_AGENT_VIEW_FLOOR_BYTES}-byte floor, got {serialized}"
+    )
+    # Recorded in _packer_meta['trimmed'] (kind=summarized) so problemModelRecovery
+    # becomes 'fetch'. This is the agent's single fetch-decision channel.
+    trimmed_pm = [t for t in meta["trimmed"] if t["key"] == "problem_model"]
+    assert trimmed_pm, (
+        f"the degraded model must be recorded in _packer_meta['trimmed']: {meta['trimmed']}"
+    )
+    assert trimmed_pm[0]["kind"] == "summarized"
+    # The tiny size/health signal still ships alongside it.
     assert "model_health" in packed
     assert "model_health" not in dropped_keys
+
+
+def _mature_agent_view_problem_model() -> dict:
+    """A realistic, mature-but-healthy agent-view problem_model that fits well
+    under the 120KB packer budget while carrying full per-entry detail.
+
+    Sized at the healthy thresholds (12 gaps / 20 capabilities / 8 friction) with
+    substantial — but not pathological — free-text bodies, so the WHOLE model is
+    expected to ship inline under normal cycle sizes (the floor never fires)."""
+    gap_body = "g" * 1600
+    gaps = [
+        {
+            "id": f"g-{i}",
+            "name": f"gap {i}: concrete delta between intent and capability {i}",
+            "description": gap_body,
+            "evidence": gap_body,
+            "priority": "high" if i % 2 == 0 else "medium",
+            "status": "active",
+            "opened": f"2026-02-{(i % 27) + 1:02d}T00:00:00Z",
+            "history": [{"ts": "2026-02-01T00:00:00Z", "event": "opened"}],
+            "past_moves": [f"d-{i}-{j}" for j in range(3)],
+        }
+        for i in range(12)
+    ]
+    cap_notes = "c" * 1400
+    capabilities = [
+        {
+            "name": f"cap {i}: registry-derived subsystem {i}",
+            "status": "working" if i % 2 == 0 else "partial",
+            "notes": cap_notes,
+            "source": {"type": "shipped_change", "pr_number": 7000 + i},
+            "backing_paths": [f"backend/app/mod_{i}.py", f"backend/testing/test_mod_{i}.py"],
+        }
+        for i in range(20)
+    ]
+    fric_body = "f" * 1400
+    friction = [
+        {
+            "id": f"f-{i}",
+            "name": f"friction {i}: recurring blocker observed across moves",
+            "status": "active",
+            "description": fric_body,
+            "seen_in": [f"d-{i}", f"d-{i + 1}"],
+            "mitigations_tried": [f"tried approach {k}" for k in range(3)],
+        }
+        for i in range(8)
+    ]
+    return {"gaps": gaps, "capabilities": capabilities, "friction": friction}
+
+
+def test_strategic_review_ships_whole_problem_model_under_contention():
+    """The NORMAL operating mode: a realistic mature problem_model ships WHOLE
+    inline even when recoverable siblings genuinely contend for the budget.
+
+    Because the floor reservation now equals the whole agent-view model, its
+    bytes are reserved off the top of the budget, so the recoverable siblings
+    (directions_summary, conversation_thread, self_reflection_log, …) degrade or
+    drop FIRST while the model keeps its full capabilities and friction detail.
+    The skeletonizing path (_skeletonize_caps_friction / _shrink_pm_to_floor)
+    must NOT fire: no ``_agent_view_floor_applied`` marker, full per-entry detail
+    preserved, and the model is neither in the dropped nor the trimmed list."""
+    pm = _mature_agent_view_problem_model()
+    model_bytes = len(json.dumps(pm, default=str).encode())
+    # Sanity: the realistic model is comfortably under the 120KB budget so the
+    # whole-model guarantee is the expected outcome (not the floored fallback).
+    assert model_bytes < 120 * 1024
+
+    payload = {
+        "type": "strategic_review",
+        "research_mode": "strategic",
+        "project_name": "p",
+        "base_branch": "main",
+        "model": "claude-opus-4-8",
+        "effort": "medium",
+        "vision": {"purpose": "x" * 8000},
+        "problem_model": pm,
+        "model_health": {"model_size_status": "healthy", "gap_count": 12},
+        # Recoverable, summarizable siblings sized to genuinely contend so the
+        # reservation is what protects the model — not slack budget.
+        "directions_summary": [
+            {"id": f"d-{i}", "text": "z" * 1100, "priority": "high"} for i in range(50)
+        ],
+        "conversation_thread": [
+            {"id": f"m-{i}", "role": "user", "content": "w" * 1100} for i in range(40)
+        ],
+        "self_reflection_log": [{"what_was_hard": "s" * 1100} for _ in range(20)],
+    }
+    packed = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA)
+
+    meta = packed["_packer_meta"]
+    dropped_keys = {d["key"] for d in meta["dropped"]}
+    trimmed_keys = {t["key"] for t in meta["trimmed"]}
+
+    # Genuine contention: at least one recoverable sibling degraded or dropped.
+    assert (dropped_keys | trimmed_keys) - {"problem_model"}, (
+        f"expected recoverable siblings to yield first; meta={meta}"
+    )
+
+    # The WHOLE model shipped inline — present, not dropped, not trimmed.
+    assert "problem_model" in packed
+    assert "problem_model" not in dropped_keys, f"model dropped: {meta['dropped']}"
+    assert "problem_model" not in trimmed_keys, f"model trimmed: {meta['trimmed']}"
+
+    shipped = packed["problem_model"]
+    # The skeletonizing floor path did NOT fire.
+    assert "_agent_view_floor_applied" not in shipped, (
+        "the whole model must ship without the floored/skeletonized marker"
+    )
+    # Full per-entry detail survived — capabilities/friction were NOT collapsed
+    # to name+status skeletons.
+    assert len(shipped["capabilities"]) == 20
+    assert len(shipped["friction"]) == 8
+    assert len(shipped["gaps"]) == 12
+    assert shipped["capabilities"][0].get("notes"), "capability detail was collapsed"
+    assert shipped["capabilities"][0].get("backing_paths"), "capability detail collapsed"
+    assert shipped["friction"][0].get("description"), "friction detail was collapsed"
+
+
+def test_strategic_review_degrades_loudly_in_near_budget_band():
+    """The NEAR-BUDGET band: a problem_model that fits the budget on its OWN, but
+    whose bytes plus the always-critical identity/vision keys exceed it. The
+    full-model floor reservation is ``<= budget`` (so the old drop condition kept
+    the guarantee), yet the critical ``vision`` key sorts first and would be
+    starved into a hard PayloadTooLargeError. The reworked packer accounts for
+    non-floored critical keys' bytes and drops the floor guarantee, so the model
+    degrades LOUDLY via summarize (marker + _packer_meta record) and the cycle
+    still runs — it must NOT raise or silently drop the model."""
+    pm = _mature_agent_view_problem_model()
+    model_bytes = len(json.dumps(pm, default=str).encode())
+    # A large but load-bearing critical vision. model alone fits the budget;
+    # model + vision does not.
+    vision = {"purpose": "p" * 12000}
+    vision_bytes = len(json.dumps(vision, default=str).encode())
+    # Budget fits the model alone (reservation <= budget) but NOT model + vision.
+    budget = model_bytes + vision_bytes - 2000
+    assert model_bytes <= budget < model_bytes + vision_bytes
+
+    payload = {
+        "type": "strategic_review",
+        "research_mode": "strategic",
+        "project_name": "p",
+        "base_branch": "main",
+        "model": "claude-opus-4-8",
+        "effort": "medium",
+        "vision": vision,
+        "problem_model": pm,
+        "model_health": {"model_size_status": "healthy", "gap_count": 12},
+    }
+    # Must NOT raise PayloadTooLargeError — the cycle still runs.
+    packed = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA, budget=budget)
+
+    # The critical vision shipped intact.
+    assert packed["vision"] == vision
+    meta = packed["_packer_meta"]
+    dropped_keys = {d["key"] for d in meta["dropped"]}
+
+    # The model is delivered DEGRADED (floored), never silently dropped.
+    assert "problem_model" in packed
+    assert "problem_model" not in dropped_keys, f"model dropped: {meta['dropped']}"
+    assert "_agent_view_floor_applied" in packed["problem_model"], (
+        "the degraded model must carry the loud floor-applied marker"
+    )
+    # Recorded in _packer_meta['trimmed'] so problemModelRecovery resolves to 'fetch'.
+    trimmed_pm = [t for t in meta["trimmed"] if t["key"] == "problem_model"]
+    assert trimmed_pm and trimmed_pm[0]["kind"] == "summarized", (
+        f"the degraded model must be recorded as summarized: {meta['trimmed']}"
+    )
 
 
 # ── design_doc compact index in the strategic payload ─────────────────────────

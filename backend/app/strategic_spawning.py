@@ -554,38 +554,39 @@ def _agent_view_problem_model_packed(pm: dict | None) -> dict:
 
 
 def _agent_view_problem_model_floor(pm: dict | None) -> dict:
-    """Dead-simple, can't-fail ``floor`` callback for the ``problem_model``.
+    """``floor`` callback for the ``problem_model`` payload key.
 
-    Returns a minimal skeleton with only essential always-present fields:
-    - Empty gaps list (indicates model is floored, agent can fetch full list)
-    - Empty capabilities (lowest-value section after gaps)
-    - Empty friction
-    - No history, past_moves, or elaborate detail
+    Reserves and returns the WHOLE agent-view model handed to it, so the packer
+    reserves the full model's bytes off the top of the budget. Every other
+    recoverable sibling (design_doc index, playbook indices, outcome_evaluation,
+    conversation_thread, directions_summary overflow, …) must therefore degrade
+    or drop BEFORE the problem_model is ever reduced. Under normal cycle sizes
+    the whole model ships intact via the packer's direct fit-path and the
+    skeletonizing ``summarize`` callback never fires.
 
-    This floor function is independent of the elaborate summarize callback
-    (_agent_view_problem_model_packed) so a failure in the summarize path
-    does NOT abandon the floor reservation and cause the model to be silently
-    dropped. The floor is guaranteed to be delivered to the strategist every
-    cycle, with a marker showing it was floored so the agent can fetch fuller
-    detail via the problem_model fetch endpoint.
+    Only genuinely exceptional overflow degrades the model: when the full model
+    cannot fit at all, this floor's reservation alone exceeds the budget, the
+    packer drops the floor guarantee wholesale, and the ``summarize`` callback
+    (:func:`_agent_view_problem_model_packed` → :func:`_shrink_pm_to_floor`)
+    takes over — stamping the loud ``_agent_view_floor_applied`` marker, shipping
+    a bounded floored skeleton, and recording the trim in ``_packer_meta`` so the
+    agent's ``problemModelRecovery`` resolves to ``'fetch'``. The degraded path
+    is the visibly exceptional case, never the normal operating mode.
+
+    Deliberately INDEPENDENT of the summarize callback and defensively coded: a
+    failure in the summarize path never abandons this reservation, and the floor
+    itself never crashes the packer (which already wraps it in try/except). It
+    only ever returns the value handed to it — already an
+    ``_agent_view_problem_model``-trimmed copy whose durable source is never
+    mutated — or a minimal empty skeleton for a missing/garbage model.
     """
     if not pm or not isinstance(pm, dict):
         return {"gaps": [], "capabilities": [], "friction": []}
-    # Build the floor from always-present top-level keys (gaps, caps, friction
-    # are optional and may be missing, but the floor always includes them as
-    # empty containers so the agent sees a consistent structure).
-    floor = {
-        "gaps": [],
-        "capabilities": [],
-        "friction": [],
-    }
-    # Stamp the floor indicator so the agent knows this is a skeleton.
-    floor["_agent_view_floor_applied"] = {
-        "floor_bytes": _AGENT_VIEW_FLOOR_BYTES,
-        "stripped_gap_fields": [],
-        "dropped_gaps": 0,
-    }
-    return floor
+    # Reserve the WHOLE agent-view model. The value handed to this callback is
+    # the same trimmed agent-view dict already placed in the payload, so the
+    # reservation equals the full shipped value's byte size — no other section
+    # can claim those bytes ahead of the problem_model.
+    return pm
 
 
 # Maximum operator-override entries surfaced to the next strategic cycle, and
@@ -1918,12 +1919,16 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "problem_model": {
         "priority": "high",
         "summarize": _agent_view_problem_model_packed,
-        # Floor reservation: the packer reserves the floored model's bytes off
-        # the top of the budget so the strategist's working set is GUARANTEED
-        # in-payload every cycle — other recoverable sections degrade before the
-        # problem_model is ever dropped entirely. The floor function is a simple,
-        # independent callback that cannot fail, so the floor reservation is
-        # honored even if the summarize callback raises an exception.
+        # Floor reservation = the WHOLE agent-view model. The packer reserves the
+        # full model's bytes off the top of the budget so every other recoverable
+        # sibling degrades or drops BEFORE the problem_model is ever reduced —
+        # under normal cycle sizes the whole model ships intact and the
+        # skeletonizing summarize path never fires. Only when the full model
+        # cannot fit at all does the reservation exceed budget; the packer then
+        # drops the floor guarantee and the summarize callback degrades the model
+        # loudly (marker + _packer_meta record). The floor callback is a simple,
+        # independent function that cannot fail, so the reservation is honored
+        # even if the summarize callback raises an exception.
         "floor": _agent_view_problem_model_floor,
     },
     # Tiny, load-bearing soft size/health signal computed from the DURABLE
@@ -2015,12 +2020,16 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     "problem_model": {
         "priority": "high",
         "summarize": _agent_view_problem_model_packed,
-        # Floor reservation: the packer reserves the floored model's bytes off
-        # the top of the budget so the strategist's working set is GUARANTEED
-        # in-payload every cycle — other recoverable sections degrade before the
-        # problem_model is ever dropped entirely. The floor function is a simple,
-        # independent callback that cannot fail, so the floor reservation is
-        # honored even if the summarize callback raises an exception.
+        # Floor reservation = the WHOLE agent-view model. The packer reserves the
+        # full model's bytes off the top of the budget so every other recoverable
+        # sibling degrades or drops BEFORE the problem_model is ever reduced —
+        # under normal cycle sizes the whole model ships intact and the
+        # skeletonizing summarize path never fires. Only when the full model
+        # cannot fit at all does the reservation exceed budget; the packer then
+        # drops the floor guarantee and the summarize callback degrades the model
+        # loudly (marker + _packer_meta record). The floor callback is a simple,
+        # independent function that cannot fail, so the reservation is honored
+        # even if the summarize callback raises an exception.
         "floor": _agent_view_problem_model_floor,
     },
     # See _STRATEGIC_REVIEW_SCHEMA: tiny, load-bearing soft size/health signal.

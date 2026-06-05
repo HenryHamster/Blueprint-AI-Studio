@@ -40,6 +40,7 @@ from app.broadcast import broadcast_to_project
 from app.admin import _get_user_project, _get_user_project_with_role
 from app.reaper import _heartbeat_stale_cutoff
 from app.task_capabilities import STRATEGIC_TASK_TYPES
+from app.payload_schemas import _MAX_PAYLOAD_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -475,11 +476,25 @@ def _build_problem_model_trim_verdict(payload: dict) -> Optional[dict]:
         "budget_used": meta.get("budget_used"),
         "gap_memory_trimmed_count": gap_trimmed_count,
     }
+
+    def _floor_count(value: object) -> int:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, list):
+            return len(value)
+        return 0
+
     if floor:
         verdict["floor"] = {
             "floor_bytes": floor.get("floor_bytes"),
             "stripped_gap_fields": floor.get("stripped_gap_fields") or [],
             "dropped_gaps": int(floor.get("dropped_gaps", 0) or 0),
+            "summarized_capabilities_count": _floor_count(
+                floor.get("summarized_capabilities")
+            ),
+            "summarized_friction_count": _floor_count(
+                floor.get("summarized_friction")
+            ),
             "still_over_floor": bool(floor.get("still_over_floor")),
         }
     if dropped_entry is not None and dropped_entry.get("reason"):
@@ -947,12 +962,13 @@ async def get_strategic_debug(
             str(c.get("key")) for c in contributors[:3] if c.get("key")
         )
         size_kb = round((payload_bloat_skip.get("size") or 0) / 1024)
+        max_kb = _MAX_PAYLOAD_BYTES // 1024
         blocking_guards.append(
             {
                 "guard": "payload_bloat_skip",
                 "reason": (
                     f"Strategic paused: assembled payload ({size_kb} KB) exceeds the "
-                    "256 KB cap"
+                    f"{max_kb} KB cap"
                     + (f" — compact {top_names}" if top_names else "")
                 ),
                 "size": payload_bloat_skip.get("size"),
