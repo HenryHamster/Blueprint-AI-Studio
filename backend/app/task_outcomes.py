@@ -512,13 +512,20 @@ def _build_verify_tests_summary(task: Task, ctx: SummaryContext) -> dict[str, An
         and not probe.get("could_not_run")
         and probe.get("passed") is False
     )
+    # A CLEAR declared-build failure (the operator's OWN build_cmd) blocks the
+    # merge regardless of suite detection — see classify_merge_test_verdict — so a
+    # green suite that also broke the declared build must NOT show a clean "pass".
+    declared_build_failed = probe_failed and isinstance(probe, dict) and probe.get("declared") is True
     if detected is False:
         # A clear acceptance-probe failure on a no-suite fall-open is a real,
         # merge-blocking verdict (the gate flips it to "fail"); reflect that here
         # so the operator summary matches the gate decision.
         verdict = "fail" if probe_failed else "undetected"
     elif passed:
-        verdict = "pass"
+        # The suite passed, but a declared-build probe that clearly failed blocks
+        # the gate — surface "fail" so the summary cannot read "pass" while the
+        # merge is blocked.
+        verdict = "fail" if declared_build_failed else "pass"
     elif detected is True:
         verdict = "fail"
 

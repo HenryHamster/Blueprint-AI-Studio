@@ -500,6 +500,68 @@ def test_summary_verify_tests_undetected_verdict():
     assert summary["verdict"] == "undetected"
 
 
+def test_summary_verify_tests_declared_build_failed_on_passing_suite_is_fail():
+    # A green unit suite that ALSO broke the operator's declared build must not
+    # show a clean "pass" — the gate blocks, so the summary verdict is "fail".
+    task = _make_task("verify_tests")
+    summary = build_task_evaluation_summary(
+        task,
+        merge_test_result={
+            "detected": True,
+            "passed": True,
+            "probe": {
+                "ran": True,
+                "passed": False,
+                "could_not_run": False,
+                "declared": True,
+                "ecosystem": "node",
+                "label": "npm run build (admin-ui)",
+                "output": "webpack: build error",
+            },
+        },
+    )
+    assert summary["verdict"] == "fail"
+
+
+def test_summary_verify_tests_declared_build_could_not_run_on_passing_suite_stays_pass():
+    # A declared build that could not run does NOT block — summary stays "pass".
+    task = _make_task("verify_tests")
+    summary = build_task_evaluation_summary(
+        task,
+        merge_test_result={
+            "detected": True,
+            "passed": True,
+            "probe": {
+                "ran": True,
+                "passed": False,
+                "could_not_run": True,
+                "declared": True,
+                "label": "npm run build (admin-ui)",
+            },
+        },
+    )
+    assert summary["verdict"] == "pass"
+
+
+def test_summary_verify_tests_generic_probe_fail_on_passing_suite_stays_pass():
+    # A GENERIC (non-declared) probe failure does not block a passing suite.
+    task = _make_task("verify_tests")
+    summary = build_task_evaluation_summary(
+        task,
+        merge_test_result={
+            "detected": True,
+            "passed": True,
+            "probe": {
+                "ran": True,
+                "passed": False,
+                "could_not_run": False,
+                "label": "tsc",
+            },
+        },
+    )
+    assert summary["verdict"] == "pass"
+
+
 def test_summary_memo_artifact():
     task = _make_task(
         "memo",

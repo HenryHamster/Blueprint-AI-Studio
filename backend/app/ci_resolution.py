@@ -463,13 +463,24 @@ def classify_merge_test_verdict(
     Absent / below-threshold / malformed coverage keeps the empty detail exactly
     (older agents that emit no ``coverage`` are unaffected).
 
-    Acceptance probe (``detected=false`` only): when no unit suite ran, the agent
-    may still attach a cheap goal-level ``probe`` ("does the changed code still
-    compile/build/boot"). A CLEAR probe failure — it ran, did not pass, and was
-    NOT a could-not-run degrade — maps to ``"fail"`` so the existing block-and-fix
-    path fires carrying the probe output. Every other probe state (pass /
-    could-not-run / absent / old-shape verdict) keeps today's ``"undetected"``
-    fall-open, so missing-deps / unprovisioned setup never hard-blocks a merge.
+    Declared build probe (HIGH precedence, runs regardless of suite detection):
+    when the project declares a ``build_cmd``, the agent runs it as a goal-level
+    acceptance ``probe`` (carrying ``declared=true``) on BOTH the detected=false
+    fall-open paths AND the detected=true + passed path. A CLEAR declared-build
+    failure — it ran, did not pass, and was NOT a could-not-run degrade — maps to
+    ``"fail"`` EVEN WHEN a unit suite was detected and passed, because a green
+    suite must not mask a broken declared build (bundled frontends, tests that
+    exercise source without the build step). See
+    :func:`declared_build_is_clear_failure`.
+
+    Generic acceptance probe (``detected=false`` only): when no unit suite ran, the
+    agent may attach a cheap GENERIC goal-level ``probe`` ("does the changed code
+    still compile/build/boot"). A CLEAR generic-probe failure — it ran, did not
+    pass, and was NOT a could-not-run degrade — maps to ``"fail"`` on the
+    detected=false path so the existing block-and-fix path fires carrying the probe
+    output. Every other probe state (pass / could-not-run / absent / old-shape
+    verdict) keeps today's ``"undetected"`` fall-open, so missing-deps /
+    unprovisioned setup never hard-blocks a merge.
 
     Documented-command probe (HIGH precedence, runs regardless of suite
     detection): the agent may attach a ``documentedCommands`` block describing the
@@ -558,26 +569,21 @@ def classify_merge_test_verdict(
             f"tests skipped), so the suite was made green by skipping rather "
             f"than by passing{suffix}.",
         )
+    # HIGH precedence: the operator's OWN declared build command CLEARLY failed.
+    # A green unit suite must NOT mask a broken declared build (bundled frontends,
+    # tests that exercise source without the build step), so a declared-build
+    # clear failure blocks the merge REGARDLESS of whether a suite was detected and
+    # passed. Generic (non-declared) probes keep the detected=false-only semantics
+    # below. Checked here so a passing suite cannot fall through to "pass".
+    if declared_build_is_clear_failure(verdict.get("probe")):
+        return ("fail", _declared_build_failure_detail(verdict["probe"]))
     if verdict.get("detected") is False:
         if probe_is_clear_failure(verdict.get("probe")):
+            # A declared-build clear failure was already handled at HIGH
+            # precedence above (it blocks regardless of suite detection); only a
+            # GENERIC compile/build probe failure reaches here.
             probe = verdict["probe"]
             output = str(probe.get("output") or "").strip()
-            if probe.get("declared"):
-                # The operator's OWN declared build command failed — surface that
-                # explicitly so the spawned fix task knows the authoritative build
-                # (not a generic compile probe) is what broke.
-                label = str(probe.get("label") or "").strip()
-                prefix = (
-                    f"Declared build command `{label}` failed: "
-                    if label
-                    else "Declared build command failed: "
-                )
-                return (
-                    "fail",
-                    (prefix + output)
-                    if output
-                    else (prefix + "the declared build did not succeed."),
-                )
             return (
                 "fail",
                 output
@@ -627,6 +633,44 @@ def probe_is_clear_failure(probe: Any) -> bool:
     if probe.get("could_not_run"):
         return False
     return probe.get("passed") is False
+
+
+def declared_build_is_clear_failure(probe: Any) -> bool:
+    """Whether an acceptance ``probe`` is the operator's OWN declared build that
+    CLEARLY failed — a blocking failure that fires REGARDLESS of suite detection.
+
+    Narrower than :func:`probe_is_clear_failure`: it additionally requires the
+    probe to be the project's declared ``build_cmd`` (``declared is True``). A
+    declared build that clearly failed blocks the merge even when a unit suite was
+    detected and passed, because a green suite must not mask a broken declared
+    build. A GENERIC (non-declared) compile probe is unaffected here — it keeps
+    its existing detected=false-only handling. Defensive about a missing / non-dict
+    / generic / old-shape probe (returns False).
+    """
+    if not isinstance(probe, dict):
+        return False
+    if probe.get("declared") is not True:
+        return False
+    return probe_is_clear_failure(probe)
+
+
+def _declared_build_failure_detail(probe: dict[str, Any]) -> str:
+    """Build the operator-facing ``detail`` for a CLEAR declared-build failure.
+
+    Shared by the HIGH-precedence declared-build block (which fires regardless of
+    suite detection) so the wording stays identical to the historical
+    detected=false declared-build path. Surfaces the declared command label and
+    its captured output so the spawned fix task knows the AUTHORITATIVE build (not
+    a generic compile probe) is what broke.
+    """
+    output = str(probe.get("output") or "").strip()
+    label = str(probe.get("label") or "").strip()
+    prefix = (
+        f"Declared build command `{label}` failed: "
+        if label
+        else "Declared build command failed: "
+    )
+    return (prefix + output) if output else (prefix + "the declared build did not succeed.")
 
 
 def _documented_command_is_clear_failure(documented: Any) -> bool:

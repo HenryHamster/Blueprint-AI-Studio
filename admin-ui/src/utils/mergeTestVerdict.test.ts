@@ -165,6 +165,52 @@ describe('deriveMergeTestOutcome precedence (mirrors classify_merge_test_verdict
     expect(r.detail).toContain('make build');
   });
 
+  it('detected=true + passed suite + clear declared-build probe failure BLOCKS (green suite cannot mask broken build)', () => {
+    const r = derive({
+      detected: true,
+      passed: true,
+      output: '',
+      probe: { ran: true, passed: false, could_not_run: false, declared: true, output: 'webpack: build error', label: 'npm run build (admin-ui)' },
+    });
+    expect(r.outcome).toBe('blocked');
+    expect(r.reason).toBe('declared_build_failed');
+    expect(r.detail).toContain('npm run build (admin-ui)');
+    expect(r.detail).toContain('webpack: build error');
+  });
+
+  it('detected=true + passed suite + passing declared-build probe stays pass', () => {
+    const r = derive({
+      detected: true,
+      passed: true,
+      output: '',
+      probe: { ran: true, passed: true, could_not_run: false, declared: true, label: 'npm run build (admin-ui)' },
+    });
+    expect(r.outcome).toBe('pass');
+    expect(r.reason).toBe('suite_passed');
+  });
+
+  it('detected=true + passed suite + could-not-run declared-build probe stays pass', () => {
+    const r = derive({
+      detected: true,
+      passed: true,
+      output: '',
+      probe: { ran: true, passed: false, could_not_run: true, declared: true, label: 'npm run build (admin-ui)' },
+    });
+    expect(r.outcome).toBe('pass');
+    expect(r.reason).toBe('suite_passed');
+  });
+
+  it('detected=true + passed suite + clear GENERIC probe failure does NOT block (generic is detected=false-only)', () => {
+    const r = derive({
+      detected: true,
+      passed: true,
+      output: '',
+      probe: { ran: true, passed: false, could_not_run: false, output: 'tsc error' },
+    });
+    expect(r.outcome).toBe('pass');
+    expect(r.reason).toBe('suite_passed');
+  });
+
   it('detected=false + clear generic probe failure blocks as probe', () => {
     const r = derive({
       detected: false,
