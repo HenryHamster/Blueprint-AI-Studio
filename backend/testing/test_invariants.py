@@ -7361,7 +7361,12 @@ def _extract_classifier_region(source: str) -> str:
     return source[start:end]
 
 def _extract_setup_classifier_region(source: str) -> str:
-    """Extract the classifySetupFailure function from test-runners.ts."""
+    """Extract the classifySetupFailure function from test-runners.ts.
+
+    Finds the function by its export declaration and extracts it by locating
+    the module-level closing brace. This boundary detection is robust to
+    refactoring of the final return statement.
+    """
     start = source.find("export function classifySetupFailure")
     if start == -1:
         raise ValueError(
@@ -7371,14 +7376,20 @@ def _extract_setup_classifier_region(source: str) -> str:
             "backend/testing/test_invariants.py to match."
         )
 
-    end = source.find("\n  return false;", start)
+    # Find the closing brace of the function. Since the function body is indented
+    # (2-space indent per TypeScript convention), the closing brace appears on
+    # its own line with no leading whitespace: \n}. This is more robust than
+    # looking for a specific return statement, since the final return value may
+    # change without affecting the function boundary.
+    end = source.find("\n}", start)
     if end == -1:
         raise ValueError(
-            "Could not find the terminating `return false;` of "
-            "classifySetupFailure in agent/src/utils/test-runners.ts — the "
-            "function's structure changed. Update _extract_setup_classifier_region."
+            "Could not find the closing brace of classifySetupFailure in "
+            "agent/src/utils/test-runners.ts — the function's structure changed. "
+            "Update _extract_setup_classifier_region."
         )
-    end = source.find("\n}", end) + 1
+    # Include the closing brace in the extracted region (+ 2 for \n and })
+    end = end + 2
     return source[start:end]
 
 
@@ -8039,7 +8050,7 @@ class TestAgentTestRunnerSourceParity:
             "command not found",
             "python(?:3)?|go|cargo|node|npm|pnpm|yarn|pip|poetry",
             "^(?:bash|sh):",
-            "No module named ['\\\"]pip['\\\"]",
+            """No module named ['"]pip['"]""",
         ]:
             assert required in region, (
                 "agent/src/utils/test-runners.ts classifySetupFailure no longer "
@@ -8287,10 +8298,10 @@ class TestAgentTestRunnerParseHelpers:
                 "export function classifyTestExecution(output: string) { return 'ran'; }"
             )
 
-    def test_extract_setup_classifier_region_raises_on_missing_return(self):
-        with pytest.raises(ValueError, match="return false"):
+    def test_extract_setup_classifier_region_raises_on_missing_closing_brace(self):
+        with pytest.raises(ValueError, match="closing brace"):
             _extract_setup_classifier_region(
-                "export function classifySetupFailure(output: string) { return true; }"
+                "export function classifySetupFailure(output: string) { return true;"
             )
 
     def test_classifier_region_contains_missing_command_check(self):
