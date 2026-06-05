@@ -2,6 +2,18 @@
 
 Provides the operator-facing readiness verdict (whether promotion is ready) based
 on recent dry-run qualification history, plus formatting helpers for API responses.
+
+GROUND-TRUTH CAVEAT: this signal is a *self-approval* track record, NOT a
+validated trust measurement. ``would_promote`` is the qualifier's own
+confidence >= threshold, so ``would_promote_rate`` is just the rate at which the
+qualifier approved itself. There is no recorded post-promotion outcome on
+QualificationVerdict (was the promoted candidate reverted, did main CI/regression
+follow), and no outcome-feedback code in the release_* modules — so a qualifier
+that systematically over-scores a defect class still reads ~100% here. Until such
+a ground truth is recorded and a true precision/false-positive rate is derived,
+this MUST be surfaced as "qualifier self-approval streak", never as a "trustworthy"
+or validated judgment. The returned ``ground_truth_validated`` flag (always False
+today) and ``caveat`` string exist so every consumer states this honestly.
 """
 
 from __future__ import annotations
@@ -39,6 +51,16 @@ _READINESS_RECURRING_BLOCKER_MIN = 2
 # Confidence-spread ceiling for the advisory "stable" flag (evidence only — not
 # a hard readiness gate).
 _READINESS_CONFIDENCE_STDEV_MAX = 0.15
+
+# Honest framing of what this signal can and cannot assert. ``would_promote`` is
+# the qualifier's own confidence >= threshold, so the rate is self-referential:
+# no post-promotion outcome is recorded against which a true precision could be
+# computed. Surfaced to every consumer so none of them claims "trustworthy".
+_READINESS_GROUND_TRUTH_CAVEAT = (
+    "self-approval only — no post-promotion outcome (revert / main CI / "
+    "regression) is recorded, so this is the rate at which the qualifier "
+    "approved itself, not a measured precision"
+)
 
 
 def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
@@ -106,6 +128,8 @@ def _empty_readiness(
         "recurring_blockers": {},
         "blocker_counts": {},
         "thresholds": thresholds,
+        "ground_truth_validated": False,
+        "caveat": _READINESS_GROUND_TRUTH_CAVEAT,
     }
 
 
@@ -228,9 +252,11 @@ async def compute_promotion_readiness(
     ready = not reasons
     if ready:
         reason = (
-            f"qualifier looks trustworthy: {would_promote_count}/{evaluated} "
-            f"would-promote (rate {would_promote_rate:.2f}), {consecutive_clean} "
-            f"consecutive clean passes, no recurring blockers"
+            f"qualifier self-approval streak clears thresholds: "
+            f"{would_promote_count}/{evaluated} would-promote "
+            f"(self-approval rate {would_promote_rate:.2f}), {consecutive_clean} "
+            f"consecutive clean passes, no recurring blockers. "
+            f"NOTE: {_READINESS_GROUND_TRUTH_CAVEAT}"
         )
     else:
         reason = "; ".join(reasons)
@@ -254,4 +280,6 @@ async def compute_promotion_readiness(
         "recurring_blockers": recurring_blockers,
         "blocker_counts": blocker_counts,
         "thresholds": thresholds,
+        "ground_truth_validated": False,
+        "caveat": _READINESS_GROUND_TRUTH_CAVEAT,
     }

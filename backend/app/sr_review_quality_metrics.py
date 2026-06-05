@@ -6,7 +6,6 @@ related quality signals. Imported and re-exported by digest_metrics so
 existing call sites keep working without changes.
 """
 
-import statistics
 from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
@@ -563,65 +562,6 @@ def compute_sr_prediction_accuracy(
     }
 
 
-def _compute_parallel_review_effectiveness(
-    terminal_tasks: List[Task],
-) -> Dict[str, Any] | None:
-    """Compare approval rates between parallelized and serial review tasks.
-
-    Buckets review tasks by review_was_parallelized from task.context and
-    returns per-bucket metrics. Returns None when either bucket has <3 tasks.
-    """
-    review_tasks = [
-        t
-        for t in terminal_tasks
-        if (t.first_payload or {}).get("type") == "review"
-        and (t.context or {}).get("blueprint_review_verdict") is not None
-    ]
-
-    parallel = [
-        t for t in review_tasks if (t.context or {}).get("review_was_parallelized")
-    ]
-    serial = [
-        t for t in review_tasks if not (t.context or {}).get("review_was_parallelized")
-    ]
-
-    if len(parallel) < 3 or len(serial) < 3:
-        return None
-
-    def _approval_rate(tasks):
-        approvals = sum(
-            1
-            for t in tasks
-            if (t.context or {}).get("blueprint_review_verdict") == "APPROVE"
-        )
-        return round(approvals / len(tasks), 2)
-
-    def _mean_issues(tasks):
-        # issues_count is not always stored; use 0 when absent
-        counts = [(t.context or {}).get("issues_count", 0) for t in tasks]
-        return round(statistics.mean(counts), 2)
-
-    def _mean_iterations(tasks):
-        counts = [(t.context or {}).get("iteration_count", 1) for t in tasks]
-        return round(statistics.mean(counts), 2)
-
-    return {
-        "parallel": {
-            "count": len(parallel),
-            "approval_rate": _approval_rate(parallel),
-            "mean_issues_per_iteration": _mean_issues(parallel),
-            "mean_iterations": _mean_iterations(parallel),
-        },
-        "serial": {
-            "count": len(serial),
-            "approval_rate": _approval_rate(serial),
-            "mean_issues_per_iteration": _mean_issues(serial),
-            "mean_iterations": _mean_iterations(serial),
-        },
-        "sample_sizes": {"parallel": len(parallel), "serial": len(serial)},
-    }
-
-
 def compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any]:
     """Compute self-review effectiveness, prediction accuracy, and review accuracy
     from a list of terminal tasks. Returns dict with three keys, each None when
@@ -708,9 +648,8 @@ def compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any]
     self_review_prediction_accuracy = compute_sr_prediction_accuracy(tasks_with_both)
     fresh_reviewer_effectiveness = _compute_fresh_reviewer_effectiveness(terminal_tasks)
     edges_considered_metrics = _compute_edges_considered_metrics(terminal_tasks)
-    parallel_review_effectiveness = _compute_parallel_review_effectiveness(
-        terminal_tasks
-    )
+    # Retired: parallel_review_effectiveness measured review-task parallelization,
+    # but had no consumer and two placeholder subfields never had real inputs.
 
     return {
         "self_review_effectiveness": self_review_effectiveness,
@@ -718,5 +657,4 @@ def compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any]
         "review_accuracy": review_accuracy,
         "fresh_reviewer_effectiveness": fresh_reviewer_effectiveness,
         "edges_considered_metrics": edges_considered_metrics,
-        "parallel_review_effectiveness": parallel_review_effectiveness,
     }

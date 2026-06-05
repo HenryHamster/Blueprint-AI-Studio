@@ -11421,6 +11421,43 @@ async def test_readiness_healthy_streak_ready(db_session):
 
 
 @pytest.mark.asyncio
+async def test_readiness_is_framed_as_self_approval_not_trustworthy(db_session):
+    """The ready signal must NOT claim the qualifier is 'trustworthy' — there is
+    no recorded post-promotion ground truth, so it is a self-approval rate only.
+    The verdict reason and the structured caveat fields must say so."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    for i in range(6):
+        await _seed_verdict(
+            db_session, project.id, version.id, seq=i, would_promote=True, confidence=0.95
+        )
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    assert out["ready"] is True, out["reason"]
+    # No unvalidated "trustworthy" claim; framed honestly as self-approval.
+    assert "trustworthy" not in out["reason"].lower()
+    assert "self-approval" in out["reason"].lower()
+    # Structured caveat fields are present so every consumer states it honestly.
+    assert out["ground_truth_validated"] is False
+    assert "self-approval only" in out["caveat"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_empty_carries_ground_truth_caveat(db_session):
+    """Even the no-verdicts (not-ready) summary carries the ground-truth caveat
+    fields so the UI/strategic payloads never imply a validated signal."""
+    project, _version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    assert out["verdicts_evaluated"] == 0
+    assert out["ground_truth_validated"] is False
+    assert "self-approval only" in out["caveat"]
+
+
+@pytest.mark.asyncio
 async def test_readiness_recurring_blocker_not_ready(db_session):
     """A recurring hard blocker in the history blocks readiness even when the
     most-recent streak, evaluated count and would-promote rate all clear their

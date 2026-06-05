@@ -1272,9 +1272,6 @@ async def _compute_digest(
         "fresh_reviewer_trend": fresh_reviewer_trend,
         "edges_trend": edges_trend,
         "edges_considered_metrics": _review_quality["edges_considered_metrics"],
-        "parallel_review_effectiveness": _review_quality[
-            "parallel_review_effectiveness"
-        ],
         "merge_early_exit_count": merge_early_exit_count,
         "generated_at": _utcnow().isoformat(),
         "completed_count": len(completed_tasks),

@@ -9,8 +9,13 @@ from types import SimpleNamespace
 import pytest
 
 
-def _make_task(*, context: dict | None = None, updated_at=None):
-    return SimpleNamespace(context=context or {}, updated_at=updated_at)
+def _make_task(*, context: dict | None = None, updated_at=None, payloads=None):
+    return SimpleNamespace(
+        context=context or {},
+        updated_at=updated_at,
+        payloads=payloads or [{"type": "create"}],
+        first_payload={"type": "create"},
+    )
 
 
 @pytest.mark.parametrize(
@@ -63,6 +68,69 @@ def test_reasoning_quality_scoring(reasoning, expected):
     from app.sr_catch_rate_statistics import _score_reasoning_quality
 
     assert _score_reasoning_quality(reasoning) == pytest.approx(expected)
+
+
+def test_precision_equals_one_minus_fpr_from_cat_fp_stats():
+    """precision and false_positive_rate from _compute_cat_fp_stats share one fp/tp basis."""
+    from app.sr_analytics_common import _compute_cat_fp_stats
+
+    def _sr_task(sr_failed_cats, human_cats):
+        return _make_task(context={
+            "_self_review_outcome": {
+                "check_results": {
+                    cat: {"passed": False} for cat in sr_failed_cats
+                },
+                "reviewer_findings": [],
+            },
+            "_first_attempt_rejection_categories": {c: 1 for c in human_cats},
+        })
+
+    tasks = [
+        _sr_task(["correctness"], ["correctness"]),  # TP
+        _sr_task(["correctness"], []),               # FP
+        _sr_task(["correctness"], ["correctness"]),  # TP
+        _sr_task(["correctness"], []),               # FP
+        _sr_task(["correctness"], []),               # FP
+    ]
+    cat_fp, _, _ = _compute_cat_fp_stats(tasks)
+    fp = cat_fp["correctness"]["fp"]
+    tp = cat_fp["correctness"]["tp"]
+    total = fp + tp
+    fpr = round(fp / total, 3)
+    precision = round(tp / total, 3)
+    assert abs(precision - (1.0 - fpr)) < 0.001, (
+        f"precision={precision} should equal 1 - fpr={fpr}"
+    )
+
+
+def test_stats_for_tasks_excludes_skipped_self_reviews():
+    """A deliberately-skipped SR must not count as a miss in catch-rate denominators."""
+    from app.sr_analytics_catch_rate import _stats_for_tasks
+
+    reviewed = _make_task(
+        context={
+            "_self_review_outcome": {
+                "verdict": "pass",
+                "check_results": {"correctness": {"passed": False}},
+            },
+            "_first_attempt_rejection_categories": {"correctness": 1},
+        }
+    )
+    # ./done fallback envelope: verdict=unknown + empty check_results == skip.
+    skipped = _make_task(
+        context={
+            "_self_review_outcome": {"verdict": "unknown", "check_results": {}},
+            "_first_attempt_rejection_categories": {"correctness": 1},
+        }
+    )
+
+    count, cat_stats, _, _, _, _ = _stats_for_tasks([reviewed, skipped])
+
+    # Only the reviewed task contributes; the skip is excluded entirely rather
+    # than inflating human_count with a phantom miss.
+    assert count == 1
+    assert cat_stats["correctness"]["human_count"] == 1
+    assert cat_stats["correctness"]["hit_count"] == 1
 
 
 def test_sr_catch_rate_statistics_import_seam():

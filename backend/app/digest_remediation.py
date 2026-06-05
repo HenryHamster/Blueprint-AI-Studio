@@ -259,7 +259,7 @@ async def compute_remediation_and_patterns(
                         "last_seen": _info.get("last_seen"),
                         "severity": _info.get("severity"),
                         "details": _info.get("latest_details") or "",
-                        "affected_direction_count": len(_dirs_last_24h),
+                        "affected_direction_count": len(_info.get("affected_directions", [])),
                         "suggested_action": (
                             "Investigate the upward trend before it trips the surge "
                             "threshold — check recent deploys, infra health, and "

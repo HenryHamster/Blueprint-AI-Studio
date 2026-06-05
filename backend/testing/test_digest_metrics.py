@@ -917,11 +917,11 @@ def test_compute_digest_cost_economics_empty():
     assert result["pipeline_autonomous_prs_merged"] == 0
     assert result["pipeline_assisted_prs_merged"] == 0
     assert result["pipeline_operator_action_count"] == 0
-    assert result["pipeline_generalized_successes"] == 0
-    assert result["pipeline_generalized_health_rate"] is None
-    assert result["pipeline_outcome_kind_breakdown"] == {}
     assert result["overall_type_distribution"] == {}
     assert result["pipeline_filter_funnel"] == {}
+    assert "pipeline_generalized_successes" not in result
+    assert "pipeline_generalized_health_rate" not in result
+    assert "pipeline_outcome_kind_breakdown" not in result
 
 
 def test_compute_digest_cost_economics_spot_on_demand_split():
@@ -1151,14 +1151,11 @@ def test_compute_digest_cost_economics_pipeline_aggregates():
     assert result["pipeline_autonomous_prs_merged"] == 3
     assert result["pipeline_assisted_prs_merged"] == 1
     assert result["pipeline_operator_action_count"] == 5
-    assert result["pipeline_generalized_successes"] == 6
-    assert result["pipeline_generalized_health_rate"] == 0.75
-    assert result["pipeline_outcome_kind_breakdown"] == {
-        "code_merge": {"success": 4, "neutral": 0, "failure": 2},
-        "research_quality": {"success": 2, "neutral": 0, "failure": 0},
-    }
     assert result["overall_type_distribution"] == {"create": 7, "fix": 1}
     assert result["pipeline_filter_funnel"] == {"a": 3, "b": 3}
+    assert "pipeline_generalized_successes" not in result
+    assert "pipeline_generalized_health_rate" not in result
+    assert "pipeline_outcome_kind_breakdown" not in result
 
 
 def test_compute_scope_mismatch_summary_no_calibrated_tasks():
@@ -1433,53 +1430,6 @@ def test_compute_review_quality_metrics_review_accuracy_shape():
     assert acc["overrides"] == 0
     assert acc["precision"] == 1.0
     assert acc["recall"] == 1.0
-
-
-def test_parallel_review_effectiveness_buckets_correctly():
-    """Tasks with review_was_parallelized=True/False bucket into parallel/serial."""
-
-    def _make_review(parallelized: bool, verdict: str = "APPROVE"):
-        return make_task(
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "review"}],
-            context={
-                "blueprint_review_verdict": verdict,
-                "review_was_parallelized": parallelized,
-            },
-        )
-
-    parallel_tasks = [_make_review(True) for _ in range(3)]
-    serial_tasks = [_make_review(False) for _ in range(3)]
-    result = compute_review_quality_metrics(parallel_tasks + serial_tasks)
-    pre = result["parallel_review_effectiveness"]
-    assert pre is not None
-    assert pre["sample_sizes"]["parallel"] == 3
-    assert pre["sample_sizes"]["serial"] == 3
-    assert pre["parallel"]["count"] == 3
-    assert pre["serial"]["count"] == 3
-    assert pre["parallel"]["approval_rate"] == 1.0
-    assert pre["serial"]["approval_rate"] == 1.0
-
-
-def test_parallel_review_effectiveness_none_when_insufficient_sample():
-    """Returns None when either bucket has fewer than 3 tasks."""
-
-    def _make_review(parallelized: bool):
-        return make_task(
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "review"}],
-            context={
-                "blueprint_review_verdict": "APPROVE",
-                "review_was_parallelized": parallelized,
-            },
-        )
-
-    # Only 2 parallel tasks — below threshold
-    tasks = [_make_review(True) for _ in range(2)] + [
-        _make_review(False) for _ in range(5)
-    ]
-    result = compute_review_quality_metrics(tasks)
-    assert result["parallel_review_effectiveness"] is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -613,9 +613,9 @@ describe('DashboardHome', () => {
 
       render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
 
-      const pill = await screen.findByTitle(/Cost per merged PR exceeds threshold/);
+      const pill = await screen.findByTitle(/Cost per autonomous merge exceeds threshold/);
       expect(pill).toBeInTheDocument();
-      expect(pill.textContent).toContain('$12.75/PR');
+      expect(pill.textContent).toContain('$12.75/autonomous');
       expect(pill.title).toContain('project median: $3.50');
     });
 
@@ -637,8 +637,8 @@ describe('DashboardHome', () => {
 
       render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
 
-      await screen.findByText(/\$2\.10\/PR/);
-      expect(screen.queryByTitle(/Cost per merged PR exceeds threshold/)).not.toBeInTheDocument();
+      await screen.findByText(/\$2\.10\/autonomous/);
+      expect(screen.queryByTitle(/Cost per autonomous merge exceeds threshold/)).not.toBeInTheDocument();
     });
   });
 

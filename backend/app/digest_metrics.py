@@ -60,7 +60,6 @@ from app.sr_review_quality_metrics import (  # noqa: F401
     _reviewer_caught_author_miss,
     _compute_edges_considered_metrics,
     compute_sr_prediction_accuracy,
-    _compute_parallel_review_effectiveness,
     compute_review_quality_metrics,
 )
 from app.failure_classification import (
@@ -2094,37 +2093,14 @@ def compute_digest_cost_economics(
     pipeline_operator_action_count = sum(
         d.get("operator_action_count") or 0 for d in direction_progress_list
     )
-    pipeline_generalized_successes = sum(
-        d.get("generalized_successes", d.get("prs_merged", 0)) or 0
-        for d in direction_progress_list
-    )
-    pipeline_generalized_terminal_outcomes = sum(
-        d.get("generalized_terminal_outcomes", 0) or 0 for d in direction_progress_list
-    )
-    pipeline_generalized_health_rate = (
-        round(
-            pipeline_generalized_successes / pipeline_generalized_terminal_outcomes, 3
-        )
-        if pipeline_generalized_terminal_outcomes > 0
-        else None
-    )
+    # Retired: generalized success / health / outcome-kind rollups were computed here
+    # but never surfaced to /api/admin/digest or any UI consumer.
     overall_type_distribution: Dict[str, int] = {}
     for d in direction_progress_list:
         for ttype, cnt in (d.get("type_distribution") or {}).items():
             overall_type_distribution[ttype] = (
                 overall_type_distribution.get(ttype, 0) + cnt
             )
-
-    pipeline_outcome_kind_breakdown: Dict[str, Dict[str, int]] = {}
-    for d in direction_progress_list:
-        for kind, counts in (d.get("outcome_kind_breakdown") or {}).items():
-            bucket = pipeline_outcome_kind_breakdown.setdefault(
-                kind, {"success": 0, "neutral": 0, "failure": 0}
-            )
-            if not isinstance(counts, dict):
-                continue
-            for status in ("success", "neutral", "failure"):
-                bucket[status] += counts.get(status, 0) or 0
 
     pipeline_filter_funnel: Dict[str, int] = {}
     for d in direction_progress_list:
@@ -2149,9 +2125,6 @@ def compute_digest_cost_economics(
         "pipeline_autonomous_prs_merged": pipeline_autonomous_prs_merged,
         "pipeline_assisted_prs_merged": pipeline_assisted_prs_merged,
         "pipeline_operator_action_count": pipeline_operator_action_count,
-        "pipeline_generalized_successes": pipeline_generalized_successes,
-        "pipeline_generalized_health_rate": pipeline_generalized_health_rate,
-        "pipeline_outcome_kind_breakdown": pipeline_outcome_kind_breakdown,
         "overall_type_distribution": overall_type_distribution,
         "pipeline_filter_funnel": pipeline_filter_funnel,
     }

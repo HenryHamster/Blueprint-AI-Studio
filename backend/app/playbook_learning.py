@@ -68,7 +68,6 @@ from app.playbook_sr_metrics import (  # noqa: F401
     _compute_cat_fp_stats,
     _compute_cat_severity_calibration,
     _compute_edges_stats,
-    _compute_execution_evidence_miss_rates,
     _compute_miss_latency_stats,
     _compute_reasoning_engagement,
     _format_sr_alert_title,

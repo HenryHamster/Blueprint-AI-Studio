@@ -502,17 +502,68 @@ async def _compute_sr_catch_rate_trends_impl(
         fp_data = cat_fp_stats.get(cat) or {}
         fp = fp_data.get("fp", 0)
         tp = fp_data.get("tp", 0)
+        curr_total = fp + tp
         data["fp_count"] = fp
         data["tp_count"] = tp
         data["false_positive_rate"] = (
-            round(fp / (fp + tp), 3) if (fp + tp) > 0 else None
+            round(fp / curr_total, 3) if curr_total > 0 else None
         )
+        # precision = 1 - fpr by construction (same fp/tp basis)
+        data["precision"] = round(tp / curr_total, 3) if curr_total > 0 else None
         prev_fp_data = prev_cat_fp_stats.get(cat) or {}
         prev_fp = prev_fp_data.get("fp", 0)
         prev_tp = prev_fp_data.get("tp", 0)
+        prev_total = prev_fp + prev_tp
         data["previous_fp_rate"] = (
-            round(prev_fp / (prev_fp + prev_tp), 3) if (prev_fp + prev_tp) > 0 else None
+            round(prev_fp / prev_total, 3) if prev_total > 0 else None
         )
+        prev_precision = round(prev_tp / prev_total, 3) if prev_total > 0 else None
+        # Recompute fp_trend from the same basis
+        curr_fpr = data["false_positive_rate"]
+        prev_fpr = data["previous_fp_rate"]
+        if curr_fpr is not None and prev_fpr is not None:
+            fp_delta = curr_fpr - prev_fpr
+            fp_sig = (
+                curr_total >= _MIN_SR_FINDINGS
+                and prev_total >= _MIN_SR_FINDINGS
+                and _is_trend_significant(curr_fpr, curr_total, prev_fpr, prev_total)
+            )
+            if fp_sig and fp_delta >= _TREND_DELTA_THRESHOLD:
+                data["fp_trend"] = "increasing"
+            elif fp_sig and fp_delta <= -_TREND_DELTA_THRESHOLD:
+                data["fp_trend"] = "decreasing"
+            else:
+                data["fp_trend"] = "stable"
+        else:
+            data["fp_trend"] = "stable"
+        # Recompute precision_delta and precision_recall_quadrant from consistent basis
+        precision_delta_new: Optional[float] = (
+            round(data["precision"] - prev_precision, 3)
+            if data["precision"] is not None and prev_precision is not None
+            else None
+        )
+        data["precision_delta"] = precision_delta_new
+        recall_delta = data.get("recall_delta")
+        if recall_delta is not None and precision_delta_new is not None:
+            q = _PRECISION_RECALL_QUADRANT_THRESHOLD
+            p_up = precision_delta_new >= q
+            p_down = precision_delta_new <= -q
+            r_up = recall_delta >= q
+            r_down = recall_delta <= -q
+            if p_up and r_up:
+                data["precision_recall_quadrant"] = "healthy"
+            elif p_up and r_down:
+                data["precision_recall_quadrant"] = "conservative_shift"
+            elif p_down and r_up:
+                data["precision_recall_quadrant"] = "noisy_shift"
+            elif p_down and r_down:
+                data["precision_recall_quadrant"] = "both_declining"
+            elif not p_up and not p_down and not r_up and not r_down:
+                data["precision_recall_quadrant"] = "flat"
+            else:
+                data["precision_recall_quadrant"] = "mixed"
+        else:
+            data["precision_recall_quadrant"] = data.get("precision_recall_quadrant")
 
     sev_cal = _compute_cat_severity_calibration(current_window_tasks)
     for cat, data in categories.items():

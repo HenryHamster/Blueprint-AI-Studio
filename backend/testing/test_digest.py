@@ -55,6 +55,7 @@ async def test_digest_empty_window(client: AsyncClient):
     assert data["needs_attention"] == []
     assert data["recent_failures"] == []
     assert data["recent_completions"] == []
+    assert "parallel_review_effectiveness" not in data
 
 
 @pytest.mark.asyncio
@@ -951,6 +952,61 @@ async def test_digest_recurring_patterns_remediation_status_investigating(
         assert len(patterns) == 1
         assert patterns[0]["remediation_status"] == "investigating"
         assert patterns[0]["proactive"] is True
+    finally:
+        _ss.persistent_anomalies.pop(proj_key, None)
+
+
+@pytest.mark.asyncio
+async def test_digest_early_warnings_affected_direction_count_per_class(
+    client: AsyncClient, db_session
+):
+    """early_warnings affected_direction_count reflects dirs affected by that specific warning, not global total."""
+    from app import shared_state as _ss
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    proj_key = str(project.id)
+    # Two distinct FailureRateMomentum anomalies with different affected_directions.
+    _ss.persistent_anomalies[proj_key] = {
+        "FailureRateMomentum": {
+            "first_seen": "2026-04-18T00:00:00+00:00",
+            "last_seen": "2026-04-19T00:00:00+00:00",
+            "occurrence_count": 2,
+            "severity": "medium",
+            "latest_details": "FailureRateMomentum: 10% → 20% → 30% across last 3x24h windows",
+            "affected_directions": ["dir-a", "dir-b"],
+        },
+        "FailureRateMomentum_db": {
+            "first_seen": "2026-04-18T00:00:00+00:00",
+            "last_seen": "2026-04-19T00:00:00+00:00",
+            "occurrence_count": 2,
+            "severity": "medium",
+            "latest_details": "FailureRateMomentum: 5% → 15% → 25% across last 3x24h windows",
+            "affected_directions": ["dir-c"],
+        },
+    }
+    try:
+        response = await client.get(f"/api/admin/digest?project_id={project.id}")
+        assert response.status_code == 200
+        data = response.json()
+
+        warnings = data["early_warnings"]
+        # Both FailureRateMomentum entries have occurrence_count >= 2, so both should appear.
+        assert len(warnings) == 2
+
+        # Find warnings by failure_class and verify affected_direction_count matches
+        # the actual affected_directions for each warning, not a global total.
+        warning_1 = next(w for w in warnings if w["failure_class"] == "FailureRateMomentum")
+        warning_2 = next(w for w in warnings if w["failure_class"] == "FailureRateMomentum_db")
+
+        assert warning_1["affected_direction_count"] == 2  # affects dir-a, dir-b
+        assert warning_2["affected_direction_count"] == 1  # affects dir-c only
+
+        # Ensure they have different counts (the bug was that they were the same).
+        assert warning_1["affected_direction_count"] != warning_2["affected_direction_count"]
     finally:
         _ss.persistent_anomalies.pop(proj_key, None)
 

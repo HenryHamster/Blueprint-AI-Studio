@@ -111,6 +111,9 @@ _PR_REF_RE = re.compile(r"\b(?:PR|pr)\s*#?\s*\d+\b|#\s*\d+\b")
 _SR_CODE_CHANGE_TYPES = {"create", "fix", "refactor", "migrate"}
 _EDGE_CATS = {"correctness", "error-handling"}
 
+# Retired: execution-evidence miss-rate aggregation over tests/lint/typecheck
+# outcomes had no real consumer beyond compatibility shims, so the helpers were deleted.
+
 
 def _categorize_review_issues(review_history: list) -> dict[str, list[dict]]:
     from app.review_learning import _categorize_review_issues as _impl
@@ -184,37 +187,6 @@ def _sr_skip_stats(
         return None, None
     skipped = sum(dist.values())
     return round(skipped / total, 3), dist
-
-
-def _compute_execution_evidence_miss_rates(
-    tasks: list,
-) -> dict[str, dict[str, Any]]:
-    """Aggregate miss-rates for execution-evidence SR categories."""
-    totals: dict[str, dict[str, int]] = {}
-    for t in tasks:
-        ctx = t.context or {}
-        check_results = (ctx.get("_self_review_outcome") or {}).get(
-            "check_results"
-        ) or {}
-        for cat in _EXECUTION_EVIDENCE_CATEGORIES:
-            result = check_results.get(cat)
-            if result is None:
-                continue
-            if cat not in totals:
-                totals[cat] = {"sample_count": 0, "miss_count": 0}
-            totals[cat]["sample_count"] += 1
-            if not result.get("passed", True):
-                totals[cat]["miss_count"] += 1
-    out: dict[str, dict[str, Any]] = {}
-    for cat, stats in totals.items():
-        if stats["sample_count"] == 0:
-            continue
-        out[cat] = {
-            "miss_rate": round(stats["miss_count"] / stats["sample_count"], 3),
-            "miss_count": stats["miss_count"],
-            "sample_count": stats["sample_count"],
-        }
-    return out
 
 
 def _compute_cat_fp_stats(

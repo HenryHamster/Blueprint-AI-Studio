@@ -423,63 +423,8 @@ _EXECUTION_EVIDENCE_CATEGORIES = (
     "typecheck_executed_cleanly",
 )
 
-
-async def aggregate_sr_execution_evidence_miss_rates(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    days: int,
-) -> Dict[str, Dict[str, Any]]:
-    """Aggregate miss-rates for execution-evidence SR categories from the DB.
-
-    For each task's ``_self_review_outcome.check_results``, counts presence
-    and failures for tests_executed_cleanly, lint_executed_cleanly, and
-    typecheck_executed_cleanly. Returns miss_rate, miss_count, sample_count
-    per category; omits categories with zero samples. Skipped/fallback SR
-    envelopes are excluded.
-    """
-    cutoff = _utcnow() - timedelta(days=days)
-    stmt = (
-        select(Task)
-        .where(
-            Task.project_id == project_id,
-            Task.status == TaskStatus.COMPLETED,
-            Task.created_at >= cutoff,
-        )
-        .options(load_only(Task.id, Task.context, Task.payloads, Task.created_at))
-        .order_by(Task.created_at.desc())
-        .limit(_TASK_SCAN_CAP)
-    )
-    result = await session.execute(stmt)
-    all_tasks = result.scalars().all()
-
-    totals: Dict[str, Dict[str, int]] = {}
-    for t in all_tasks:
-        ctx = t.context or {}
-        sro = ctx.get("_self_review_outcome")
-        if not sro or is_skipped_sr_outcome(sro):
-            continue
-        check_results = sro.get("check_results") or {}
-        for cat in _EXECUTION_EVIDENCE_CATEGORIES:
-            entry = check_results.get(cat)
-            if entry is None:
-                continue
-            if cat not in totals:
-                totals[cat] = {"sample_count": 0, "miss_count": 0}
-            totals[cat]["sample_count"] += 1
-            if not entry.get("passed", True):
-                totals[cat]["miss_count"] += 1
-
-    out: Dict[str, Dict[str, Any]] = {}
-    for cat, s in totals.items():
-        if s["sample_count"] == 0:
-            continue
-        out[cat] = {
-            "miss_rate": round(s["miss_count"] / s["sample_count"], 3),
-            "miss_count": s["miss_count"],
-            "sample_count": s["sample_count"],
-        }
-    return out
+# Retired: DB-backed execution-evidence miss rates over tests/lint/typecheck
+# check_results had no real consumer beyond compatibility shims.
 
 
 # Mirror playbook_learning._MIN_SR_SAMPLE — update both if the threshold changes.

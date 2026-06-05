@@ -1964,6 +1964,63 @@ async def test_digest_direction_progress_tz_aware_timestamp_counted(
 
 
 @pytest.mark.asyncio
+async def test_conversion_rate_excludes_non_pr_task_types(
+    client: AsyncClient, db_session
+):
+    """Conversion rate denominator excludes research/investigate/audit/memo tasks that never open PRs."""
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-mixed-types",
+                "text": "Direction with mixed task types",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": (
+                            datetime.now(timezone.utc) - timedelta(hours=5)
+                        ).isoformat(),
+                        "prs_merged": 3,
+                        "tasks_created": 8,
+                        # 8 total tasks: 3 create (PR-eligible), 2 research + 2 audit + 1 memo (non-PR)
+                        "type_breakdown": {
+                            "create": {"created": 3, "merged": 3, "failed": 0},
+                            "research": {"created": 2, "merged": 0, "failed": 0},
+                            "audit": {"created": 2, "merged": 0, "failed": 0},
+                            "memo": {"created": 1, "merged": 0, "failed": 0},
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-mixed-types"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert len(data["direction_progress"]) == 1
+    dp = data["direction_progress"][0]
+    # conversion_rate should be 3 merged / 3 PR-eligible (create tasks only)
+    # Not 3 / 8 (which would be the old incorrect behavior)
+    assert dp["prs_merged"] == 3
+    assert dp["conversion_rate"] == 1.0  # 3 merged / 3 PR-eligible
+
+
+@pytest.mark.asyncio
 async def test_retirement_critiques_returns_critiques(client: AsyncClient, db_session):
     """Critiques stored in StrategicCycle.cycle_metadata are returned, newest cycle first."""
     from app.models import StrategicCycle

@@ -1102,6 +1102,10 @@ export interface PromotionReadiness {
   recurring_blockers: Record<string, number>;
   blocker_counts: Record<string, number>;
   thresholds: Record<string, number>;
+  // Always false today: no post-promotion outcome is recorded, so would_promote_rate
+  // is a self-approval rate, not a validated qualifier precision. See `caveat`.
+  ground_truth_validated?: boolean;
+  caveat?: string;
 }
 
 export interface StagedDirection {
