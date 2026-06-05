@@ -1190,6 +1190,7 @@ export default function App() {
         <KnowledgeBrowser
           selectedProjectId={s.selectedProjectId}
           onClose={() => s.setShowKnowledgeBrowser(false)}
+          onLaunchWebResearchTask={s.openWebResearchTaskModal}
           onNavigateToTask={(taskId) => {
             s.setShowKnowledgeBrowser(false);
             const target = s.tasks.find(t => t.id === taskId);

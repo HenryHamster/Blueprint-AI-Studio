@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { X, Search, BookOpen, ArrowLeft, ExternalLink, Copy, Check, CheckCircle, XCircle, FileCode, Globe, HelpCircle } from 'lucide-react';
+import { X, Search, BookOpen, ArrowLeft, ExternalLink, Copy, Check, CheckCircle, XCircle, RefreshCw, FileCode, Globe, HelpCircle } from 'lucide-react';
 import { isSafeUrl } from './TaskCard';
 import { MarkdownContent } from './MarkdownContent';
 import { fetchKnowledgeDocuments, fetchKnowledgeDocument, type KnowledgeDocument } from '../api';
@@ -9,6 +9,7 @@ interface KnowledgeBrowserProps {
   selectedProjectId: string | null;
   onClose: () => void;
   onNavigateToTask?: (taskId: string) => void;
+  onLaunchWebResearchTask?: (topic?: string) => void;
 }
 
 function relativeDate(dateStr: string | null): string {
@@ -101,7 +102,7 @@ function CopyableId({ id }: { id: string }) {
   );
 }
 
-export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask }: KnowledgeBrowserProps) {
+export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask, onLaunchWebResearchTask }: KnowledgeBrowserProps) {
   const [search, setSearch] = useState('');
   const [docs, setDocs] = useState<KnowledgeDocument[]>([]);
   const [total, setTotal] = useState(0);
@@ -109,6 +110,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask 
   const [error, setError] = useState<string | null>(null);
   const [topicFilter, setTopicFilter] = useState<string | null>(null);
   const [tagFilter, setTagFilter] = useState<string | null>(null);
+  const [directionFilter, setDirectionFilter] = useState<string | null>(null);
   const [sourceKindFilter, setSourceKindFilter] = useState<string | null>(null);
   const [selected, setSelected] = useState<KnowledgeDocument | null>(null);
 
@@ -123,6 +125,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask 
         q: search.trim() || undefined,
         topic: topicFilter ?? undefined,
         tag: tagFilter ?? undefined,
+        direction: directionFilter ?? undefined,
         source_kind: sourceKindFilter ?? undefined,
       })
         .then(data => {
@@ -134,7 +137,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask 
         .finally(() => { if (!cancelled) setLoading(false); });
     }, 250);
     return () => { cancelled = true; clearTimeout(handle); };
-  }, [selectedProjectId, search, topicFilter, tagFilter, sourceKindFilter]);
+  }, [selectedProjectId, search, topicFilter, tagFilter, directionFilter, sourceKindFilter]);
 
   const openDoc = useCallback((doc: KnowledgeDocument) => {
     if (!selectedProjectId) return;
@@ -143,6 +146,11 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask 
       .then(full => setSelected(full))
       .catch(() => {/* keep summary view */});
   }, [selectedProjectId]);
+
+  const launchWebResearch = useCallback((topic?: string) => {
+    onLaunchWebResearchTask?.(topic);
+    onClose();
+  }, [onClose, onLaunchWebResearchTask]);
 
   return (
     <div className="fixed inset-0 z-50 flex">
@@ -181,6 +189,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask 
               <div className="flex items-center gap-3 flex-wrap text-[10px] text-neutral-500">
                 <CopyableId id={selected.id} />
                 <SourceKindBadge kind={selected.source_kind} />
+                {selected.direction_id && <span className="px-1.5 py-0.5 rounded bg-blue-950/40 text-blue-300">{selected.direction_id}</span>}
                 {selected.topic && <span className="px-1.5 py-0.5 rounded bg-violet-950/40 text-violet-300">{selected.topic}</span>}
                 {selected.created_at && <span>{relativeDate(selected.created_at)}</span>}
                 {selected.source_task_id && onNavigateToTask && (() => {
@@ -196,6 +205,15 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask 
                     </button>
                   );
                 })()}
+                {selected.topic && onLaunchWebResearchTask && (
+                  <button
+                    data-viewport-allow-small-target
+                    onClick={() => launchWebResearch(selected.topic ?? undefined)}
+                    className="inline-flex min-h-[44px] items-center gap-1 text-emerald-400 hover:text-emerald-300 transition-colors"
+                  >
+                    <RefreshCw className="w-3 h-3" /> refresh research
+                  </button>
+                )}
               </div>
               {(selected.tags ?? []).length > 0 && (
                 <div className="flex flex-wrap gap-1">
@@ -243,8 +261,15 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask 
           /* List view */
           <>
             <div className="px-4 py-2 border-b border-neutral-800/50 shrink-0 space-y-2">
-              {(topicFilter || tagFilter) && (
+              {(topicFilter || tagFilter || directionFilter) && (
                 <div className="flex items-center gap-1.5 flex-wrap">
+                  {directionFilter && (
+                    <span className="flex items-center gap-1 text-[10px] bg-blue-950/40 border border-blue-900/50 text-blue-300 px-2 py-0.5 rounded">
+                      direction: {directionFilter}
+                      {/* reason: clear-direction-filter chip control; w-2.5 h-2.5 icon inline in chip */}
+                      <button data-viewport-allow-small-target onClick={() => setDirectionFilter(null)} className="text-blue-500 hover:text-blue-200"><X className="w-2.5 h-2.5" /></button>
+                    </span>
+                  )}
                   {topicFilter && (
                     <span className="flex items-center gap-1 text-[10px] bg-violet-950/40 border border-violet-900/50 text-violet-300 px-2 py-0.5 rounded">
                       topic: {topicFilter}
@@ -304,7 +329,18 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask 
               {loading && docs.length === 0 && <div className="text-neutral-600 text-center py-12 text-sm">Loading…</div>}
               {error && <div className="text-red-400 text-center py-12 text-sm">{error}</div>}
               {!loading && !error && docs.length === 0 && (
-                <div className="text-neutral-600 text-center py-12 text-sm">No knowledge documents{search.trim() ? ' match your search' : ' yet'}.</div>
+                <div className="text-neutral-600 text-center py-12 text-sm space-y-3">
+                  <div>No knowledge documents{search.trim() ? ' match your search' : ' yet'}.</div>
+                  {onLaunchWebResearchTask && (
+                    <button
+                      data-viewport-allow-small-target
+                      onClick={() => launchWebResearch(search.trim() || undefined)}
+                      className="inline-flex min-h-[44px] items-center justify-center rounded-lg border border-emerald-900/60 bg-emerald-950/30 px-3 py-2 text-xs font-medium text-emerald-300 hover:bg-emerald-950/50 hover:border-emerald-800 transition-colors"
+                    >
+                      {search.trim() ? `Launch web research for "${search.trim()}"` : 'Start web research'}
+                    </button>
+                  )}
+                </div>
               )}
               {docs.map(doc => (
                 // reason: document card opener in compact results list; px-3 py-2.5 row matches list density
@@ -322,6 +358,14 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask 
                   {doc.summary && <p className="text-[11px] text-neutral-500 mt-1 line-clamp-2 leading-snug">{doc.summary}</p>}
                   <div className="flex items-center gap-1.5 flex-wrap mt-1.5">
                     <SourceKindBadge kind={doc.source_kind} />
+                    {doc.direction_id && (
+                      // reason: direction filter chip in compact card footer; text-[9px] inline control
+                      <button
+                        data-viewport-allow-small-target
+                        onClick={e => { e.stopPropagation(); setDirectionFilter(doc.direction_id); }}
+                        className="text-[9px] px-1.5 py-0.5 rounded bg-blue-950/40 text-blue-300 hover:bg-blue-900/40 transition-colors"
+                      >{doc.direction_id}</button>
+                    )}
                     {doc.topic && (
                       // reason: topic filter chip in compact card footer; text-[9px] inline control
                       <button

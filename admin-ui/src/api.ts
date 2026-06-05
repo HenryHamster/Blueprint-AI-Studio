@@ -1657,6 +1657,8 @@ export interface KnowledgeDocument {
   title: string;
   summary: string | null;
   topic: string | null;
+  /** Strategic direction key (e.g. `d-1a2b3c4d`) that motivated the producing task, or null. */
+  direction_id: string | null;
   tags: string[];
   source_citations: unknown[];
   source_task_id: string | null;
@@ -1679,12 +1681,13 @@ export interface KnowledgeDocumentsResponse {
 /** List / search a project's knowledge documents, newest-first. `q` drives full-text/tag/topic search. */
 export async function fetchKnowledgeDocuments(
   projectId: string,
-  params?: { q?: string; topic?: string; tag?: string; source_kind?: string; limit?: number; offset?: number },
+  params?: { q?: string; topic?: string; tag?: string; direction?: string; source_kind?: string; limit?: number; offset?: number },
 ): Promise<KnowledgeDocumentsResponse> {
   const sp = new URLSearchParams();
   if (params?.q) sp.set('q', params.q);
   if (params?.topic) sp.set('topic', params.topic);
   if (params?.tag) sp.set('tag', params.tag);
+  if (params?.direction) sp.set('direction', params.direction);
   if (params?.source_kind) sp.set('source_kind', params.source_kind);
   if (params?.limit !== undefined) sp.set('limit', String(params.limit));
   if (params?.offset !== undefined) sp.set('offset', String(params.offset));

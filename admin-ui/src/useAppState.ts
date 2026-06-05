@@ -161,7 +161,7 @@ export function useAppState() {
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
     launchableTaskTypeOptions,
-    openNewTaskModal, openDuplicateTaskModal, openPrefilledTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
+    openNewTaskModal, openDuplicateTaskModal, openPrefilledTaskModal, openWebResearchTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
   } = useTaskModal(defaultTaskType, addToast, fetchTasksRef, defaultTaskBranchRef, selectedProjectRepoRef, taskCapabilityContract);
 
   const {
@@ -562,7 +562,7 @@ export function useAppState() {
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
     launchableTaskTypeOptions,
     taskBranchDefaultsReady, taskBranchDefaultsLoading, taskBranchDefaultsError,
-    openNewTaskModal, openDuplicateTaskModal, openPrefilledTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
+    openNewTaskModal, openDuplicateTaskModal, openPrefilledTaskModal, openWebResearchTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
     // Defaults
     defaultTaskType, setDefaultTaskType,
     notifyOnComplete, setNotifyOnComplete,

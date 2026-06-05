@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
+import { fireEvent } from '@testing-library/react';
 import { KnowledgeBrowser } from './KnowledgeBrowser';
 import { fetchKnowledgeDocuments } from '../api';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
@@ -11,6 +12,7 @@ const sampleDocs = [
     title: 'Resilient connection pooling strategies for high-concurrency Postgres workloads',
     summary: 'A survey of pool sizing, overflow handling, and proxy-side retry behaviour under sustained concurrent load with citations.',
     topic: 'database-resilience',
+    direction_id: 'd-1a2b3c4d',
     tags: ['postgres', 'pooling', 'reliability', 'cloud-sql'],
     source_citations: [
       'https://www.postgresql.org/docs/current/runtime-config-connection.html',
@@ -27,6 +29,7 @@ const sampleDocs = [
     title: 'Exponential backoff vs fixed-delay retry under thundering-herd reconnect',
     summary: 'Comparison of reconnect strategies and their effect on recovery latency.',
     topic: 'database-resilience',
+    direction_id: null,
     tags: ['retry', 'backoff'],
     source_citations: [],
     source_task_id: null,
@@ -42,9 +45,13 @@ vi.mock('../api', () => ({
   API_BASE_URL: '',
   authGet: vi.fn(() => Promise.resolve({ ok: false, status: 503, json: () => Promise.resolve({}) })),
   authHeaders: vi.fn(() => Promise.resolve({})),
-  fetchKnowledgeDocuments: vi.fn(() =>
-    Promise.resolve({ documents: sampleDocs, total: sampleDocs.length, limit: 50, offset: 0 }),
-  ),
+  fetchKnowledgeDocuments: vi.fn((projectId: string, params?: Record<string, unknown>) => {
+    const q = typeof params?.q === 'string' ? params.q : '';
+    if (q.includes('no-match')) {
+      return Promise.resolve({ documents: [], total: 0, limit: 50, offset: 0 });
+    }
+    return Promise.resolve({ documents: sampleDocs, total: sampleDocs.length, limit: 50, offset: 0 });
+  }),
   fetchKnowledgeDocument: vi.fn(() =>
     Promise.resolve({ ...sampleDocs[0], body: '# Heading\n\nA paragraph of markdown body text with a [link](https://example.com) and a list:\n\n- one\n- two\n' }),
   ),
@@ -63,13 +70,20 @@ describe('KnowledgeBrowser — viewport regression', () => {
     if (host) { host.remove(); host = null; }
   });
 
-  async function renderList() {
+  async function renderList(onLaunchWebResearchTask = vi.fn()) {
     host = document.createElement('div');
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
     await act(async () => {
-      r.render(<KnowledgeBrowser selectedProjectId="project-test" onClose={() => {}} onNavigateToTask={() => {}} />);
+      r.render(
+        <KnowledgeBrowser
+          selectedProjectId="project-test"
+          onClose={() => {}}
+          onNavigateToTask={() => {}}
+          onLaunchWebResearchTask={onLaunchWebResearchTask}
+        />,
+      );
     });
     // let the debounced fetch (250ms) resolve and the list render
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
@@ -97,6 +111,41 @@ describe('KnowledgeBrowser — viewport regression', () => {
 
   test('interactive controls meet 44px touch target at 375px', async () => {
     await expectMinTouchTargetAt(375, async () => { await renderList(); }, { selector: 'button, a[href]' });
+  });
+
+  test('empty-state CTA launches web research for the search term at 375px', async () => {
+    const onLaunchWebResearchTask = vi.fn();
+    await expectNoOverflowAt(375, async () => {
+      await renderList(onLaunchWebResearchTask);
+      const searchInput = (host as HTMLDivElement).querySelector('input[placeholder*="Search title"]') as HTMLInputElement | null;
+      if (searchInput) {
+        await act(async () => { fireEvent.change(searchInput, { target: { value: 'no-match topic' } }); });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+      }
+      const launchButton = Array.from((host as HTMLDivElement).querySelectorAll('button')).find(b => b.textContent?.includes('Launch web research for'));
+      if (launchButton) {
+        await act(async () => { fireEvent.click(launchButton); });
+      }
+    });
+    expect(onLaunchWebResearchTask).toHaveBeenCalledWith('no-match topic');
+  });
+
+  test('detail refresh launches web research on the selected topic at 375px', async () => {
+    const onLaunchWebResearchTask = vi.fn();
+    await expectNoOverflowAt(375, async () => {
+      await renderList(onLaunchWebResearchTask);
+      const buttons = (host as HTMLDivElement).querySelectorAll('button');
+      const docButton = Array.from(buttons).find(b => b.textContent?.includes('Resilient connection pooling'));
+      if (docButton) {
+        await act(async () => { fireEvent.click(docButton); });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+      }
+      const refreshButton = Array.from((host as HTMLDivElement).querySelectorAll('button')).find(b => b.textContent?.includes('refresh research'));
+      if (refreshButton) {
+        await act(async () => { fireEvent.click(refreshButton); });
+      }
+    });
+    expect(onLaunchWebResearchTask).toHaveBeenCalledWith('database-resilience');
   });
 
   test('renders an origin badge for each document source kind', async () => {

@@ -13,6 +13,7 @@ vi.mock('../index.js', () => ({
   sanitize: (s: string) => s,
   setCurrentPromptFingerprint: vi.fn(),
   sendHeartbeatSync: vi.fn(),
+  apiGet: vi.fn().mockResolvedValue({ documents: [] }),
 }));
 
 vi.mock('../prompt.js', async (importOriginal) => {
@@ -35,7 +36,7 @@ vi.mock('fs', () => ({
 
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleWebResearch } from './web-research.js';
-import { runClaudeCode, persistAndPostStatus, readHandlerOutput } from '../index.js';
+import { runClaudeCode, persistAndPostStatus, readHandlerOutput, apiGet } from '../index.js';
 import { configureAgentPermissions } from '../prompt.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 
@@ -65,6 +66,7 @@ describe('handleWebResearch', () => {
       exitCode: 0, allOutput: '', lastResultText: '',
     } as Awaited<ReturnType<typeof runClaudeCode>>);
     vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(apiGet).mockResolvedValue({ documents: [] });
   });
 
   it('builds a web-first prompt with WebSearch/WebFetch and the document key cues', async () => {
@@ -138,6 +140,70 @@ describe('handleWebResearch', () => {
     const disallowed = vi.mocked(runClaudeCode).mock.calls[0][5] as string[];
     expect(disallowed).toContain('Write');
     expect(disallowed).toContain('Edit');
+  });
+
+  it('injects a Prior Knowledge section with prior-doc titles/ids and the build-on/cite instruction', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_DOCUMENT);
+    vi.mocked(apiGet).mockResolvedValue({
+      documents: [
+        { id: 'doc-aaa', title: 'Earlier WebAssembly survey', summary: 'A prior look at wasm.', topic: 'webassembly', tags: ['wasm'] },
+        { id: 'doc-bbb', title: 'Wasm toolchains', summary: 'Compilers and runtimes.', topic: 'webassembly', tags: ['wasm'] },
+      ],
+    });
+
+    await handleWebResearch(
+      TASK_ID, { prompt: 'Research the state of WebAssembly', topic: 'webassembly' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    // Query uses the topic (preferred over prompt) and hits the agent endpoint.
+    const calledPath = vi.mocked(apiGet).mock.calls[0][0];
+    expect(calledPath).toContain('/api/agent/knowledge-documents');
+    expect(calledPath).toContain(`q=${encodeURIComponent('webassembly')}`);
+
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('## Prior Knowledge');
+    // Each retrieved document's title, summary, and id appear.
+    expect(prompt).toContain('doc-aaa');
+    expect(prompt).toContain('Earlier WebAssembly survey');
+    expect(prompt).toContain('A prior look at wasm.');
+    expect(prompt).toContain('doc-bbb');
+    expect(prompt).toContain('Wasm toolchains');
+    // Explicit build-on / supersede / cite instruction.
+    expect(prompt).toContain('supersede');
+    expect(prompt).toContain('cite');
+  });
+
+  it('omits the Prior Knowledge section when the fetch returns no documents', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_DOCUMENT);
+    vi.mocked(apiGet).mockResolvedValue({ documents: [] });
+
+    await handleWebResearch(
+      TASK_ID, { prompt: 'Research the state of WebAssembly', topic: 'webassembly' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).not.toContain('## Prior Knowledge');
+    const payload = lastPostedPayload();
+    expect(payload.status).toBe('COMPLETED');
+  });
+
+  it('completes normally (no Prior Knowledge, no failure) when the knowledge fetch throws', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_DOCUMENT);
+    vi.mocked(apiGet).mockRejectedValue(new Error('knowledge endpoint unreachable'));
+
+    await handleWebResearch(
+      TASK_ID, { prompt: 'Research the state of WebAssembly', topic: 'webassembly' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).not.toContain('## Prior Knowledge');
+    const payload = lastPostedPayload();
+    expect(payload.status).toBe('COMPLETED');
+    const parsed = JSON.parse(payload.logs as string) as typeof VALID_DOCUMENT;
+    expect(parsed.title).toBe(VALID_DOCUMENT.title);
   });
 
   it('marks the task FAILED when the inner session exits non-zero', async () => {

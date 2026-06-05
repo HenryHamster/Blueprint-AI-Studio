@@ -41,7 +41,7 @@ export function useTaskModal(
   const [newTaskBranch, setNewTaskBranch] = useState(defaultTaskBranch ?? '');
   const [newTaskTitle, setNewTaskTitle] = useState('');
   const [newTaskPrompt, setNewTaskPrompt] = useState('');
-  const [newTaskType, setNewTaskType] = useState<UserLaunchableTaskType>('create');
+  const [newTaskType, setNewTaskType] = useState<string>('create');
   const [newTaskPrNumber, setNewTaskPrNumber] = useState('');
   const [newTaskPrBranch, setNewTaskPrBranch] = useState('');
   const [newTaskModel, setNewTaskModel] = useState('');
@@ -305,7 +305,7 @@ export function useTaskModal(
     prBranch,
     baseBranch,
   }: {
-    taskType: UserLaunchableTaskType;
+    taskType: string;
     title: string;
     prompt: string;
     prNumber?: number | string;
@@ -333,6 +333,15 @@ export function useTaskModal(
     fetchRepoOptions();
     fetchLaunchableTaskTypeOptions();
     if (repo) fetchBranchOptions(repo);
+  };
+
+  const openWebResearchTaskModal = (topic?: string) => {
+    const trimmedTopic = topic?.trim() ?? '';
+    openPrefilledTaskModal({
+      taskType: 'web_research',
+      title: trimmedTopic || 'Web research',
+      prompt: trimmedTopic || 'Research a relevant topic for this project.',
+    });
   };
 
   const openDuplicateTaskModal = (task: Task) => {
@@ -375,6 +384,6 @@ export function useTaskModal(
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
     launchableTaskTypeOptions,
-    openNewTaskModal, openDuplicateTaskModal, openPrefilledTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
+    openNewTaskModal, openDuplicateTaskModal, openPrefilledTaskModal, openWebResearchTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
   };
 }

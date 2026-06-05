@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict
 
-from fastapi import APIRouter, Depends, HTTPException, Header, Request
+from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -64,6 +64,11 @@ from app.sr_blind_spots import (
     aggregate_sr_co_failure_pairs,
 )
 from app.pipeline_health import compute_pipeline_health_summary
+from app.knowledge_query import (
+    get_knowledge_document as kq_get_knowledge_document,
+    list_knowledge_documents as kq_list_knowledge_documents,
+    serialize_knowledge_document,
+)
 from app.claim_task_helpers import (
     _has_local_cycle,  # noqa: F401 — re-exported for use in task_lifecycle_requeue
     _parse_failed_approach,
@@ -3980,3 +3985,81 @@ async def merge_operator_reviewer_findings(
         {"task_id": str(original_task_id)},
     )
     return {"status": "merged", "finding_count": len(req.reviewer_findings)}
+
+
+# ---------------------------------------------------------------------------
+# Agent-facing knowledge-document query/read API
+#
+# Closes the loop on the knowledge store: web_research tasks produce durable
+# KnowledgeDocument rows, and these endpoints let an authenticated agent query
+# and read them so accumulated knowledge can feed back into the system. The
+# project scope is derived from the AUTHENTICATED TASK (token's ``sub`` →
+# task.project_id), never from the URL/query — an agent can only ever see its
+# own project's documents. Search/serialization is shared with the operator
+# admin endpoints via ``app.knowledge_query`` so behavior is identical.
+# ---------------------------------------------------------------------------
+
+
+async def _resolve_token_project_id(
+    session: AsyncSession, token: dict
+) -> uuid.UUID:
+    """Resolve the authenticated task's project_id from the agent token.
+
+    The agent never supplies a project_id; scope is bound to the task the token
+    was minted for. A missing/unparseable task id is a 404 (the token is no
+    longer usable for project-scoped reads).
+    """
+    task_id = token.get("sub")
+    try:
+        task = await session.get(Task, uuid.UUID(str(task_id)))
+    except (ValueError, TypeError):
+        task = None
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task.project_id
+
+
+@router.get("/knowledge-documents")
+@limiter.limit("120/minute")
+async def agent_list_knowledge_documents(
+    request: Request,
+    q: str | None = Query(default=None, description="Full-text search term"),
+    topic: str | None = Query(default=None, description="Exact topic filter"),
+    tag: str | None = Query(default=None, description="Exact tag filter"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """List / search knowledge documents for the authenticated task's project.
+
+    Mirrors the operator list endpoint (``q`` over title/summary/body/topic/tags,
+    exact ``topic`` / ``tag`` filters, newest-first, limit/offset paginated) but
+    scopes to the token's task project — never a URL-supplied project — so an
+    agent cannot read another project's documents. The list shape omits the
+    markdown body; use get-by-id for the full document.
+    """
+    project_id = await _resolve_token_project_id(session, token)
+    return await kq_list_knowledge_documents(
+        session, project_id, q=q, topic=topic, tag=tag, limit=limit, offset=offset
+    )
+
+
+@router.get("/knowledge-documents/{document_id}")
+@limiter.limit("120/minute")
+async def agent_get_knowledge_document(
+    request: Request,
+    document_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return a single knowledge document (including its markdown body).
+
+    Scoped to the authenticated task's project: a document from another project
+    (or a missing id) is a 404.
+    """
+    project_id = await _resolve_token_project_id(session, token)
+    doc = await kq_get_knowledge_document(session, project_id, document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Knowledge document not found")
+    return serialize_knowledge_document(doc, include_body=True)

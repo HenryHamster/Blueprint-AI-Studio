@@ -615,7 +615,7 @@ describe('useTaskModal', () => {
     );
     await act(async () => {
       result.current.openPrefilledTaskModal({
-        taskType: 'fix',
+        taskType: 'web_research',
         title: 'Stuck orphan PR',
         prompt: 'PR #42 is open but has no active task — investigate. PR: https://github.com/acme/repo/pull/42',
         prNumber: 42,
@@ -623,7 +623,7 @@ describe('useTaskModal', () => {
       });
     });
     expect(result.current.showNewTaskModal).toBe(true);
-    expect(result.current.newTaskType).toBe('fix');
+    expect(result.current.newTaskType).toBe('web_research');
     expect(result.current.newTaskTitle).toBe('Stuck orphan PR');
     expect(result.current.newTaskPrompt).toContain('#42');
     expect(result.current.newTaskPrompt).toContain('https://github.com/acme/repo/pull/42');
@@ -730,6 +730,23 @@ describe('useTaskModal', () => {
       });
     });
     // Wait past the 500ms debounce window for draft autosave.
+    await new Promise(r => setTimeout(r, 700));
+    expect(localStorage.getItem('blueprint-admin:draft:owner/repo:title')).toBeNull();
+    expect(localStorage.getItem('blueprint-admin:draft:owner/repo:prompt')).toBeNull();
+  });
+
+  it('openWebResearchTaskModal pre-fills the modal for a web research launch without autosaving a draft', async () => {
+    const selectedProjectRepoRef = { current: 'owner/repo' };
+    const { result } = renderHook(() =>
+      useTaskModal('create', vi.fn(), { current: vi.fn() }, undefined, selectedProjectRepoRef),
+    );
+    await act(async () => {
+      result.current.openWebResearchTaskModal('Postgres pooling behavior');
+    });
+    expect(result.current.showNewTaskModal).toBe(true);
+    expect(result.current.newTaskType).toBe('web_research');
+    expect(result.current.newTaskTitle).toContain('Postgres pooling behavior');
+    expect(result.current.newTaskPrompt).toContain('Postgres pooling behavior');
     await new Promise(r => setTimeout(r, 700));
     expect(localStorage.getItem('blueprint-admin:draft:owner/repo:title')).toBeNull();
     expect(localStorage.getItem('blueprint-admin:draft:owner/repo:prompt')).toBeNull();

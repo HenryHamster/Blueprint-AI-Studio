@@ -152,7 +152,7 @@ def _quiet_broadcast(mocker):
     )
 
 
-async def _make_web_research_task(db_session, *, project_name="WR"):
+async def _make_web_research_task(db_session, *, project_name="WR", context=None):
     project = make_project(name=project_name)
     db_session.add(project)
     await db_session.commit()
@@ -167,6 +167,8 @@ async def _make_web_research_task(db_session, *, project_name="WR"):
         ],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
     )
+    if context is not None:
+        task.context = context
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
@@ -957,6 +959,72 @@ async def test_grader_resume_reconstructs_document_from_stash_body_intact(
     assert source.context[QUALITY_GRADER_VERDICT_KEY]["passed"] is True
 
 
+@pytest.mark.asyncio
+async def test_direction_id_persisted_from_task_context(
+    db_session, _quiet_broadcast
+):
+    """A direction-tagged web_research task records its direction on the
+    persisted document and mirrors it into plan_output."""
+    project, task = await _make_web_research_task(
+        db_session, project_name="WRdir", context={"direction_id": "d-abc123"}
+    )
+
+    document = {
+        "title": "Direction-grounded survey",
+        "summary": "S",
+        "body": "# Body",
+        "topic": "X",
+        "citations": ["https://example.com/x"],
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    doc = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert doc.direction_id == "d-abc123"
+    await db_session.refresh(task)
+    assert task.plan_output["knowledge_document"]["direction_id"] == "d-abc123"
+
+
+@pytest.mark.asyncio
+async def test_direction_id_null_when_context_lacks_it(
+    db_session, _quiet_broadcast
+):
+    """A web_research task with no direction in context persists a null direction."""
+    project, task = await _make_web_research_task(
+        db_session, project_name="WRnodir"
+    )
+
+    document = {
+        "title": "T",
+        "summary": "S",
+        "body": "# Body",
+        "citations": ["https://example.com/x"],
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    doc = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert doc.direction_id is None
+
+
 # ── list / search / get-by-id endpoints ─────────────────────────────────────
 
 
@@ -1074,6 +1142,33 @@ async def test_get_by_id_returns_body_and_scopes(client: AsyncClient, db_session
         f"/api/admin/projects/{proj_a.id}/knowledge-documents/{doc_b.id}"
     )
     assert cross.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_direction_filter_and_serialization(client: AsyncClient, db_session):
+    """?direction= filters to one direction; the list shape exposes direction_id."""
+    proj = await _seed_project_with_membership(db_session, "KDdir")
+    task = make_task(project_id=proj.id, status=TaskStatus.COMPLETED)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _seed_doc(
+        db_session, proj.id, task.id, title="In dir one", direction_id="d-one"
+    )
+    await _seed_doc(
+        db_session, proj.id, task.id, title="In dir two", direction_id="d-two"
+    )
+
+    resp = await client.get(
+        f"/api/admin/projects/{proj.id}/knowledge-documents",
+        params={"direction": "d-one"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 1
+    assert body["documents"][0]["title"] == "In dir one"
+    assert body["documents"][0]["direction_id"] == "d-one"
 
 
 @pytest.mark.asyncio

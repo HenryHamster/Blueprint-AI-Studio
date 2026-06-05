@@ -14,7 +14,7 @@ from typing import Optional, Dict, List, TypedDict
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import String, cast, func, or_
+from sqlalchemy import func
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,11 +27,15 @@ from app.models import (
     Project,
     DeploymentState,
     DeploymentStatus,
-    KnowledgeDocument,
     SystemMaturity,
     _utcnow,
 )
 from app.auth import get_current_user, require_admin
+from app.knowledge_query import (
+    get_knowledge_document as kq_get_knowledge_document,
+    list_knowledge_documents as kq_list_knowledge_documents,
+    serialize_knowledge_document,
+)
 from app.broadcast import broadcast_to_project
 from app.admin import _get_user_project, _get_user_project_with_role
 from app.reaper import _heartbeat_stale_cutoff
@@ -1477,37 +1481,15 @@ async def get_recent_findings(
 # ---------------------------------------------------------------------------
 
 
-def _knowledge_doc_to_dict(doc: KnowledgeDocument, *, include_body: bool) -> dict:
-    """Serialize a KnowledgeDocument into a stable JSON-safe dict.
-
-    Field set is the documented frontend contract: id, title, summary, topic,
-    tags, source_citations, source_task_id, created_at, forward_quality_verdict
-    (plus updated_at; and body only when ``include_body``).
-    """
-    out = {
-        "id": str(doc.id),
-        "title": doc.title,
-        "summary": doc.summary,
-        "source_kind": doc.source_kind,
-        "topic": doc.topic,
-        "tags": doc.tags or [],
-        "source_citations": doc.source_citations or [],
-        "source_task_id": str(doc.source_task_id) if doc.source_task_id else None,
-        "created_at": doc.created_at.isoformat() if doc.created_at else None,
-        "updated_at": doc.updated_at.isoformat() if doc.updated_at else None,
-        "forward_quality_verdict": doc.forward_quality_verdict,
-    }
-    if include_body:
-        out["body"] = doc.body
-    return out
-
-
 @router.get("/projects/{project_id}/knowledge-documents")
 async def list_knowledge_documents(
     project_id: uuid.UUID,
     q: str | None = Query(default=None, description="Full-text search term"),
     topic: str | None = Query(default=None, description="Exact topic filter"),
     tag: str | None = Query(default=None, description="Exact tag filter"),
+    direction: str | None = Query(
+        default=None, description="Exact direction-id filter"
+    ),
     source_kind: str | None = Query(
         default=None, description="Exact source-kind filter (design / web_research)"
     ),
@@ -1519,61 +1501,26 @@ async def list_knowledge_documents(
     """List / search a project's knowledge documents, newest-first, paginated.
 
     ``q`` matches title/summary/body/topic (ILIKE, trigram-backed on Postgres)
-    and the tag list. ``topic`` / ``tag`` / ``source_kind`` apply exact filters
-    (``source_kind`` scopes to a single producing task kind, e.g. ``design`` vs
-    ``web_research``). The list shape omits the markdown body — use the
-    get-by-id endpoint for the full document.
+    and the tag list. ``topic`` / ``tag`` / ``direction`` / ``source_kind``
+    apply exact filters (``source_kind`` scopes to a single producing task kind,
+    e.g. ``design`` vs ``web_research``). The list shape omits the markdown body
+    — use the get-by-id endpoint for the full document.
+
+    Search/serialization is shared with the agent-facing endpoints via
+    ``app.knowledge_query`` so behavior stays identical across surfaces.
     """
     await _get_user_project(project_id, current_user["user_id"], session)
-
-    stmt = select(KnowledgeDocument).where(
-        KnowledgeDocument.project_id == project_id
+    return await kq_list_knowledge_documents(
+        session,
+        project_id,
+        q=q,
+        topic=topic,
+        tag=tag,
+        direction=direction,
+        source_kind=source_kind,
+        limit=limit,
+        offset=offset,
     )
-    if topic:
-        stmt = stmt.where(KnowledgeDocument.topic == topic)
-    if source_kind:
-        stmt = stmt.where(KnowledgeDocument.source_kind == source_kind)
-    if tag:
-        # tags is a JSON list; match the exact element via a cast-to-text scan
-        # so it works on both Postgres (JSONB) and the SQLite test backend.
-        stmt = stmt.where(
-            cast(KnowledgeDocument.tags, String).ilike(f'%"{tag}"%')
-        )
-    if q:
-        like = f"%{q}%"
-        stmt = stmt.where(
-            or_(
-                KnowledgeDocument.title.ilike(like),
-                KnowledgeDocument.summary.ilike(like),
-                KnowledgeDocument.body.ilike(like),
-                KnowledgeDocument.topic.ilike(like),
-                cast(KnowledgeDocument.tags, String).ilike(like),
-            )
-        )
-
-    total = (
-        await session.execute(
-            select(func.count()).select_from(stmt.subquery())
-        )
-    ).scalar_one()
-
-    rows = (
-        (
-            await session.execute(
-                stmt.order_by(KnowledgeDocument.created_at.desc())
-                .offset(offset)
-                .limit(limit)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    return {
-        "documents": [_knowledge_doc_to_dict(d, include_body=False) for d in rows],
-        "total": int(total),
-        "limit": limit,
-        "offset": offset,
-    }
 
 
 @router.get("/projects/{project_id}/knowledge-documents/{document_id}")
@@ -1590,14 +1537,7 @@ async def get_knowledge_document(
     project.
     """
     await _get_user_project(project_id, current_user["user_id"], session)
-    doc = (
-        await session.execute(
-            select(KnowledgeDocument).where(
-                KnowledgeDocument.id == document_id,
-                KnowledgeDocument.project_id == project_id,
-            )
-        )
-    ).scalar_one_or_none()
+    doc = await kq_get_knowledge_document(session, project_id, document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="Knowledge document not found")
-    return _knowledge_doc_to_dict(doc, include_body=True)
+    return serialize_knowledge_document(doc, include_body=True)

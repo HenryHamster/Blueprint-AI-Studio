@@ -128,6 +128,29 @@ async def get_directions(
 
     project = await _get_user_project(project_id, current_user["user_id"], session)
     directions = project.directions or []
+
+    # Per-direction count of durable knowledge documents accumulated by
+    # web_research tasks. One grouped query, scoped to this project; keyed by
+    # the string direction id stamped on KnowledgeDocument.direction_id.
+    from app.models import KnowledgeDocument  # noqa: PLC0415
+    from sqlalchemy import func as _sa_func  # noqa: PLC0415
+
+    knowledge_counts: dict[str, int] = {}
+    count_rows = (
+        await session.execute(
+            select(
+                KnowledgeDocument.direction_id, _sa_func.count()
+            )
+            .where(
+                KnowledgeDocument.project_id == project_id,
+                KnowledgeDocument.direction_id.is_not(None),
+            )
+            .group_by(KnowledgeDocument.direction_id)
+        )
+    ).all()
+    for direction_id, count in count_rows:
+        if direction_id is not None:
+            knowledge_counts[str(direction_id)] = int(count)
     churn_threshold = int(
         _runtime_config.get("direction_churn_non_merge_threshold", 15) or 15
     )
@@ -188,6 +211,7 @@ async def get_directions(
                 else None,
                 "churn_metrics": churn_metrics,
                 "lifetime_burn_metrics": lifetime_burn_metrics,
+                "knowledge_document_count": knowledge_counts.get(d.get("id", ""), 0),
             }
         )
     return {

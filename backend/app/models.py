@@ -2785,6 +2785,14 @@ class KnowledgeDocument(SQLModel, table=True):
     # Optional free-form topic for filtering / grouping.
     topic: str | None = Field(default=None, sa_column=Column(String, nullable=True))
 
+    # The strategic direction that motivated the producing task, carried on
+    # ``task.context["direction_id"]`` (a string direction key like ``d-1a2b3c4d``,
+    # NOT a FK into a direction table). Nullable: a web_research task may run
+    # without a direction. Indexed for per-direction knowledge browse / counts.
+    direction_id: str | None = Field(
+        default=None, sa_column=Column(String, nullable=True)
+    )
+
     # Free-form tag list and citation list (web URLs plus any file refs).
     tags: List[str] = Field(
         default_factory=list,
@@ -2836,6 +2844,7 @@ class KnowledgeDocument(SQLModel, table=True):
             postgresql_ops={"body": "gin_trgm_ops"},
         ),
         Index("ix_knowledge_document_topic", "topic"),
+        Index("ix_knowledge_document_direction", "direction_id"),
     )
 
 

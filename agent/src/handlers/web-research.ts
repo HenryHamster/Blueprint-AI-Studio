@@ -3,7 +3,7 @@ import type WebSocket from 'ws';
 import {
   strVal, sanitize, sendLog, readHandlerOutput,
   persistAndPostStatus, runClaudeCode,
-  sendHeartbeatSync, setCurrentPromptFingerprint,
+  sendHeartbeatSync, setCurrentPromptFingerprint, apiGet,
 } from '../index.js';
 import {
   configureAgentPermissions, computePromptFingerprint,
@@ -27,6 +27,66 @@ export function readWebResearchProgress(taskId: string): string | undefined {
     }
   } catch { /* ignore */ }
   return undefined;
+}
+
+// A single knowledge-document summary as returned by the agent-facing list
+// endpoint (GET /api/agent/knowledge-documents). The list shape omits the
+// markdown body; only id/title/summary/topic/tags are present.
+interface PriorKnowledgeDoc {
+  id: string;
+  title: string;
+  summary: string;
+}
+
+// Cap on injected prior-knowledge docs — keep the prompt focused on the most
+// relevant handful rather than dumping the whole store.
+const PRIOR_KNOWLEDGE_LIMIT = 5;
+
+// Fetch the most relevant existing knowledge documents for this task using the
+// task's topic/prompt as the full-text search query, via the agent's
+// authenticated backend client (apiGet attaches the X-Agent-Token). Uses the
+// existing trigram/ILIKE full-text search (the `q` term) — no embeddings.
+//
+// Fail-soft by contract: any error, timeout, or empty result returns [] so the
+// caller proceeds exactly as it would with no prior knowledge. A knowledge
+// fetch must NEVER break a research run.
+async function fetchPriorKnowledge(queryText: string): Promise<PriorKnowledgeDoc[]> {
+  const q = queryText.trim();
+  if (!q) return [];
+  try {
+    const path = `/api/agent/knowledge-documents?q=${encodeURIComponent(q)}&limit=${PRIOR_KNOWLEDGE_LIMIT}`;
+    const res = await apiGet(path) as { documents?: unknown };
+    const docs = Array.isArray(res.documents) ? res.documents : [];
+    return docs
+      .filter((d): d is Record<string, unknown> => !!d && typeof d === 'object')
+      .map((d) => ({
+        id: strVal(d.id),
+        title: strVal(d.title),
+        summary: strVal(d.summary),
+      }))
+      .filter((d) => d.id && d.title)
+      .slice(0, PRIOR_KNOWLEDGE_LIMIT);
+  } catch {
+    return [];
+  }
+}
+
+// Build a clearly delimited `## Prior Knowledge` section listing each retrieved
+// document's title, summary, and id, with an explicit instruction to build on /
+// extend / supersede the prior knowledge and cite the relevant document ids
+// rather than re-deriving from scratch. Returns '' when there are no documents
+// so the prompt is byte-for-byte unchanged in the no-knowledge case.
+function buildPriorKnowledgeSection(docs: PriorKnowledgeDoc[]): string {
+  if (docs.length === 0) return '';
+  const entries = docs
+    .map((d) => `- [${d.id}] ${d.title}\n  ${d.summary || '(no summary)'}`)
+    .join('\n');
+  return `## Prior Knowledge
+The knowledge store already holds the following related document(s) for this project. Build ON this prior knowledge: extend, refine, or supersede it rather than re-deriving from scratch, and cite the relevant document id(s) (e.g. "supersedes [<id>]") where your findings update or contradict them.
+
+${entries}
+
+`;
 }
 
 // ── Handler: Web Research (web-first investigation, terminal knowledge doc) ───
@@ -67,11 +127,21 @@ export async function handleWebResearch(
   const documentPath = `/tmp/web_research_document_${taskId}.json`;
   const progressPath = `/tmp/web_research_progress_${taskId}.md`;
 
+  // Pull the most relevant existing knowledge documents (topic preferred, else
+  // the prompt) so the run builds on prior knowledge instead of starting from a
+  // blank slate. Fail-soft: an empty list yields no section and no failure.
+  const priorDocs = await fetchPriorKnowledge(topic || prompt);
+  if (priorDocs.length > 0) {
+    sendLog(ws, `Injecting ${priorDocs.length} prior knowledge document(s) into the research prompt\n`);
+  }
+  const priorKnowledgeSection = buildPriorKnowledgeSection(priorDocs);
+
   const webResearchPrompt = `${claudeMdPrefix}${retryContext}${contextPrefix}You are a web-research agent. Your job is to investigate the topic below WEB-FIRST — drive WebSearch and WebFetch to gather current, authoritative information — and produce a single structured knowledge DOCUMENT. You operate strictly read-only: you do NOT edit files, you do NOT open a pull request, and you do NOT spawn any follow-up work.
 
 ${topicLine}Investigation prompt:
 ${prompt}
 
+${priorKnowledgeSection}
 # HOW TO RESEARCH
 1. Use WebSearch to find authoritative, current sources on the topic. Use WebFetch to read the most relevant pages in depth.
 2. Cross-check claims across multiple sources. Prefer primary/official documentation over secondary commentary.

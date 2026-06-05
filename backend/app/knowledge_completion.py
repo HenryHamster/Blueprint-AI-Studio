@@ -362,9 +362,17 @@ async def _persist_document(
     """Persist exactly one KnowledgeDocument, mirror a compact copy, mark COMPLETED."""
     normalized = _normalize_document(document, task)
 
+    # The strategic direction that motivated the producing task is carried on
+    # ``task.context["direction_id"]`` (a string direction key, not a FK).
+    # Persisting it is purely additive — it never changes whether the document
+    # is stored — and lets a direction's accumulated knowledge be discovered.
+    direction_id = (task.context or {}).get("direction_id")
+    direction_id = str(direction_id) if direction_id else None
+
     doc = KnowledgeDocument(
         project_id=task.project_id,
         source_task_id=task.id,
+        direction_id=direction_id,
         source_kind=_source_kind(kind),
         title=normalized["title"],
         summary=normalized["summary"],
@@ -389,6 +397,7 @@ async def _persist_document(
         "summary": normalized["summary"],
         "topic": normalized["topic"],
         "tags": normalized["tags"],
+        "direction_id": direction_id,
         "citation_count": len(normalized["source_citations"]),
         "forward_quality_verdict": verdict_record,
     }

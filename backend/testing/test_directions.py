@@ -152,6 +152,52 @@ async def test_get_directions_returns_created(client: AsyncClient, mocker):
 
 
 @pytest.mark.asyncio
+async def test_get_directions_includes_knowledge_document_count(
+    client: AsyncClient, db_session, mocker
+):
+    """GET /directions enriches each direction with its accumulated
+    knowledge-document count, keyed by the string direction id."""
+    from app.models import KnowledgeDocument
+
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Has knowledge")
+
+    task = Task(project_id=uuid.UUID(project_id), status=TaskStatus.COMPLETED)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    for i in range(2):
+        db_session.add(
+            KnowledgeDocument(
+                project_id=uuid.UUID(project_id),
+                source_task_id=task.id,
+                direction_id=direction["id"],
+                title=f"Doc {i}",
+                summary="S",
+                body="B",
+            )
+        )
+    # A document with no direction must not be counted against this direction.
+    db_session.add(
+        KnowledgeDocument(
+            project_id=uuid.UUID(project_id),
+            source_task_id=task.id,
+            direction_id=None,
+            title="Unlinked",
+            summary="S",
+            body="B",
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp.status_code == 200
+    d = next(x for x in resp.json()["directions"] if x["id"] == direction["id"])
+    assert d["knowledge_document_count"] == 2
+
+
+@pytest.mark.asyncio
 async def test_get_directions_includes_hold_timing_fields(client: AsyncClient, mocker):
     """GET includes held/held_reason plus held_at/held_until for held directions."""
     import app.shared_state as _ss

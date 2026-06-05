@@ -1,6 +1,6 @@
 import { useState, useRef } from 'react';
 import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, CheckSquare, AlertCircle, Loader2, ChevronDown, ArrowUpDown, Wrench, Boxes } from 'lucide-react';
-import type { LaunchableTaskTypeOption, UserLaunchableTaskType } from '../taskCapabilities';
+import type { LaunchableTaskTypeOption } from '../taskCapabilities';
 
 const TASK_TYPE_OPTION_ICONS: Record<string, typeof Plus> = {
   create: Plus,
@@ -22,14 +22,14 @@ interface NewTaskModalProps {
   newTaskBranch: string;
   newTaskTitle: string;
   newTaskPrompt: string;
-  newTaskType: UserLaunchableTaskType;
+  newTaskType: string;
   newTaskPrNumber: string;
   newTaskPrBranch: string;
   setNewTaskRepo: (value: string) => void;
   setNewTaskBranch: (value: string) => void;
   setNewTaskTitle: (value: string) => void;
   setNewTaskPrompt: (value: string) => void;
-  setNewTaskType: (value: UserLaunchableTaskType) => void;
+  setNewTaskType: (value: string) => void;
   setNewTaskPrNumber: (value: string) => void;
   setNewTaskPrBranch: (value: string) => void;
   newTaskModel: string;
@@ -106,7 +106,7 @@ export function NewTaskModal({
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const prNumberRef = useRef<HTMLInputElement>(null);
 
-  const handleTaskTypeChange = (value: UserLaunchableTaskType) => {
+  const handleTaskTypeChange = (value: string) => {
     setNewTaskType(value);
     setNewTaskModel(getDefaultModelForType(value));
     setNewTaskEffort(getDefaultEffortForType(value));
@@ -239,7 +239,7 @@ export function NewTaskModal({
                   <button
                     key={opt.value}
                     type="button"
-                    onClick={() => handleTaskTypeChange(opt.value as UserLaunchableTaskType)}
+                    onClick={() => handleTaskTypeChange(opt.value)}
                     className={`min-w-0 min-h-[44px] sm:min-h-0 flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium transition-all ${
                       newTaskType === opt.value
                         ? 'bg-white/5 border-neutral-600 text-neutral-100'

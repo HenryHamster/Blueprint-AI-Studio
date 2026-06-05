@@ -872,6 +872,15 @@ function DirectionCardImpl({
                 {d.generalized_successes ?? 0} eval{typeof d.generalized_health_rate === 'number' ? ` · ${Math.round(d.generalized_health_rate * 100)}%` : ''}
               </span>
             )}
+            {/* Accumulated knowledge documents (web_research output) for this direction */}
+            {typeof d.knowledge_document_count === 'number' && d.knowledge_document_count > 0 && (
+              <span
+                title="Durable knowledge documents accumulated by this direction's web_research tasks"
+                className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-blue-950/40 border-blue-900/50 text-blue-300"
+              >
+                {d.knowledge_document_count} doc{d.knowledge_document_count !== 1 ? 's' : ''}
+              </span>
+            )}
             {/* Reactivate button for auto-paused directions */}
             {d.auto_paused && key === 'paused' && (
               // reason: inline direction action chip; text-[10px] py-0.5 matches card density

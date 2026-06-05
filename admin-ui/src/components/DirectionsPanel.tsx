@@ -124,6 +124,9 @@ export interface Direction {
   generalized_successes?: number | null;
   generalized_health_rate?: number | null;
   outcome_kind_breakdown?: OutcomeKindBreakdown | null;
+  // Count of durable knowledge documents (web_research output) accumulated by
+  // this direction, emitted by GET /directions.
+  knowledge_document_count?: number | null;
   cost_per_merged_pr?: number | null;
   cost_per_merge_exceeds_threshold?: boolean;
   // Per-(provider, model) cost breakdown for the digest window. Keys are

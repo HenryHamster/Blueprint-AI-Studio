@@ -84,6 +84,7 @@ const richDirection: Direction = {
   // the outcome-kind breakdown chip row in the dense card layout.
   generalized_successes: 12,
   generalized_health_rate: 0.8,
+  knowledge_document_count: 7,
   outcome_kind_breakdown: {
     code_merge: { success: 9, neutral: 0, failure: 1 },
     research_quality: { success: 2, neutral: 1, failure: 0 },
