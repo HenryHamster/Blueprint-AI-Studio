@@ -659,6 +659,90 @@ async def test_no_ci_detected_undetected_verdict_does_not_retry(db_session, mock
     )
 
 
+@pytest.mark.asyncio
+async def test_no_ci_setup_failed_verify_task_exhausted_retry_merges_unverified_with_setup_reason(
+    db_session, mocker
+):
+    """A FAILED verify task carrying ``setupFailed=true`` is not a real red
+    suite: once its retry budget is exhausted, the gate merges UNVERIFIED with
+    the distinct ``verify_setup_failed`` reason instead of treating it like the
+    real failing-suite path above.
+    """
+    _patch_github(mocker)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", return_value={"merged": True}
+    )
+
+    project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    verify_task, was_created = await _spawn_pipeline_task(
+        parent,
+        "verify_tests",
+        db_session,
+        PR_NUMBER,
+        BRANCH,
+        BASE,
+        original_task_id=str(parent.id),
+        suppress_warm_handoff=True,
+        attempt=_VERIFY_TESTS_MAX_RETRIES,
+    )
+    assert was_created is True and verify_task is not None
+
+    db_session.add(
+        Artifact(
+            task_id=verify_task.id,
+            artifact_type=ArtifactType.MERGE_TEST_RESULT,
+            logs=json.dumps(
+                {
+                    "detected": False,
+                    "passed": False,
+                    "setupFailed": True,
+                    "tests": [],
+                    "output": "Traceback (most recent call last):\nModuleNotFoundError: No module named 'sqlalchemy'",
+                }
+            ),
+        )
+    )
+    verify_task.status = TaskStatus.FAILED
+    db_session.add(verify_task)
+    await db_session.commit()
+
+    verdict = None  # mirrors the orchestrator: FAILED verify tasks do not feed a verdict
+    outcome, detail = classify_merge_test_verdict(verdict)
+    assert outcome == "undetected"
+    assert _is_verify_crash(outcome, verdict) is True
+
+    failed_artifact = await _latest_artifact_logs(
+        db_session, verify_task.id, ArtifactType.MERGE_TEST_RESULT
+    )
+    assert failed_artifact is not None and failed_artifact["setupFailed"] is True
+
+    ci_result = build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "success"
+    parent = await _set_unverified_reason(db_session, parent, "verify_setup_failed")
+
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+
+    assert acted is True
+    merge_mock.assert_called_once()
+    alerts = await _unverified_merge_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert "detected test suite exists but could not be run" in alerts[0].message
+
+    await _record_gate_runtime(
+        db_session, project, outcome=outcome, unverified_reason="verify_setup_failed"
+    )
+    runtime = merge_gate_runtime_block(project)
+    assert runtime is not None
+    assert runtime["executed_real_tests"] is False
+    assert runtime["last_unverified_reason"] == "verify_setup_failed"
+
+
 # ---------------------------------------------------------------------------
 # 3. No detectable tests → proceed-without-checks fallback
 # ---------------------------------------------------------------------------

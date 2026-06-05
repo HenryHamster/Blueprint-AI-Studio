@@ -3,6 +3,7 @@ import { Copy, Check, ChevronDown, ChevronRight, ExternalLink, Hash, BookOpen, C
 import { getHeartbeatStatus, isSafeUrl, useElapsedTime, linkifyStatusMessage, ResearchFindings, useDurationStats } from './TaskCard';
 import { MarkdownContent } from './MarkdownContent';
 import { formatAbsolute, parseTimestamp } from '../utils/time';
+import { formatVerdict, verdictToneBadgeClass } from '../utils/verdictFormatting';
 import { hasTransitiveCycle } from '../utils/taskGraph';
 import { authGet, API_BASE_URL, fetchComputeJobs, fetchKnowledgeDocument, type ComputeJob } from '../api';
 import { isComputeJobActive, computeJobTerminalLabel } from './ComputeJobsPanel.utils';
@@ -303,14 +304,8 @@ function EvaluationSummarySection({ summary }: { summary: TaskEvaluationSummary 
   const evidence = summary.evidence ?? [];
   const highlights = summary.highlights ?? [];
 
-  const badgeClass =
-    summary.verdict === 'pass' || summary.verdict === 'approve'
-      ? 'bg-emerald-900/40 text-emerald-300 border-emerald-800/40'
-      : summary.verdict === 'fail' || summary.verdict === 'actionable' || summary.verdict === 'request_changes'
-        ? 'bg-red-900/40 text-red-300 border-red-800/40'
-        : summary.verdict === 'undetected'
-          ? 'bg-neutral-800/50 text-neutral-300 border-neutral-700/50'
-          : 'bg-cyan-900/40 text-cyan-300 border-cyan-800/40';
+  const { label: verdictLabel, tone: verdictToneId } = formatVerdict(summary.verdict);
+  const badgeClass = verdictToneBadgeClass(verdictToneId);
 
   return (
     <>
@@ -325,7 +320,7 @@ function EvaluationSummarySection({ summary }: { summary: TaskEvaluationSummary 
         <div className="flex items-start gap-2">
           <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Verdict</span>
           <span className={`text-xs font-semibold uppercase tracking-wider px-2 py-0.5 rounded border ${badgeClass}`}>
-            {summary.verdict}
+            {verdictLabel}
           </span>
         </div>
         {evidence.length > 0 && (

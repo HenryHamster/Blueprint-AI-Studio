@@ -76,6 +76,7 @@ export interface TestRunner {
   args: string[];
   cwd: string;
   label: string;
+  installCmd?: string;
 }
 
 /** Returns true if the runner invokes Docker or the backend test shell script. */
@@ -162,25 +163,29 @@ function tokenizeCommand(cmd: string): string[] {
   return tokens;
 }
 
-/** Build a TestRunner argv from an operator-configured test command.
+/** Build a safe execFile argv from an operator-configured shell command.
  *
- *  - A command needing shell features (operators, substitutions, redirections,
+  *  - A command needing shell features (operators, substitutions, redirections,
  *    globs, backslash escapes) is wrapped as `{cmd:'bash', args:['-c', cmd]}` so
- *    the operator's own command runs verbatim under a shell. The runner is
- *    executed via execFile (NOT a shell), so the command string is passed as a
+  *    the operator's own command runs verbatim under a shell. The runner is
+  *    executed via execFile (NOT a shell), so the command string is passed as a
  *    single argv element and is never re-interpreted — injection-safe.
  *  - A plain command is tokenized quote-aware so `pytest -k "not slow"` yields
  *    `{cmd:'pytest', args:['-k','not slow']}`. Plain commands keep their
  *    historical `{cmd,args}` shape byte-for-byte, so pytest-selector targeting
  *    and family-parity invariants are unchanged. */
-function runnerFromTestCmd(testCmd: string, cwd: string): { cmd: string; args: string[]; cwd: string } {
-  if (SHELL_OPERATORS_RE.test(testCmd)) {
-    return { cmd: 'bash', args: ['-c', testCmd], cwd };
+export function runnerFromCommand(command: string, cwd: string): { cmd: string; args: string[]; cwd: string } {
+  if (SHELL_OPERATORS_RE.test(command)) {
+    return { cmd: 'bash', args: ['-c', command], cwd };
   }
-  const tokens = tokenizeCommand(testCmd);
-  if (tokens.length === 0) return { cmd: 'bash', args: ['-c', testCmd], cwd };
+  const tokens = tokenizeCommand(command);
+  if (tokens.length === 0) return { cmd: 'bash', args: ['-c', command], cwd };
   return { cmd: tokens[0], args: tokens.slice(1), cwd };
 }
+
+// Backward-compatible alias for older internal callers that still use the
+// prior helper name.
+export const runnerFromTestCmd = runnerFromCommand;
 
 export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
   const { existsSync, readFileSync, readdirSync } = fs;
@@ -191,7 +196,11 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
     for (const dir of buildConfig.directories) {
       if (dir.test_cmd) {
         const cwd = dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE;
-        runners.push({ ...runnerFromTestCmd(dir.test_cmd, cwd), label: `${dir.test_cmd} (${dir.path || 'root'})` });
+        runners.push({
+          ...runnerFromCommand(dir.test_cmd, cwd),
+          label: `${dir.test_cmd} (${dir.path || 'root'})`,
+          installCmd: dir.install_cmd,
+        });
       }
     }
   }
@@ -980,12 +989,16 @@ function runnerKindFromCmd(cmd: string): string {
  * Detect environment/infrastructure failure signatures in test runner output.
  *
  * Returns true when the output shows a setup or infrastructure failure —
- * missing shared library, Python module not installed, spawn ENOENT — rather
- * than a genuine test failure. CONSERVATIVE: returns false whenever real test
- * failure evidence is present (FAILED/error-count lines), so a test that
- * quotes an env phrase as assertion data stays a real run. Patterns are
- * checked per-line so a phrase mid-line in an assertion diff never triggers
- * a misroute.
+ * missing shared library, missing system runtime, spawn ENOENT — rather than a
+ * genuine test failure. Repo dependency / packaging regressions are
+ * intentionally EXCLUDED here: a bare `ModuleNotFoundError`, `Cannot find
+ * module`, or missing Go package/module line from the suite itself must stay on
+ * the red-suite lane so the no-CI gate blocks broken repo changes instead of
+ * downgrading them to setupFailed/UNVERIFIED. CONSERVATIVE: returns false
+ * whenever real test failure evidence is present (FAILED/error-count lines), so
+ * a test that quotes an env phrase as assertion data stays a real run.
+ * Patterns are checked per-line so a phrase mid-line in an assertion diff never
+ * triggers a misroute.
  *
  * Mirrors backend/app/failure_layer_classifier.py _AGENT_VM_PATTERNS — keep
  * the two in sync. The cross-language contract is pinned by the CI source-scan
@@ -1020,16 +1033,34 @@ export function matchesEnvironmentFailureSignature(output: string): boolean {
     /no such file or directory.*\.so\b/i.test(line) ||
     /libatk[-\w]*\.so/i.test(line) ||
     /missing.*system.*librar/i.test(line) ||
-    // Python module/dep not installed in the gate environment
-    /^ModuleNotFoundError:\s+No module named/i.test(line) ||
-    /^No module named\b/i.test(line) ||
-    /^ImportError:\s+No module named/i.test(line) ||
     // Spawn failure: binary not found (OS could not exec the process)
     /\bspawn\b.+\bENOENT\b/i.test(line) ||
     // System runtimes not on PATH (VM-level, not test-runner-level)
     /\bnode:\s+command not found/i.test(line) ||
     /\bpython3?:\s+command not found/i.test(line)
   ));
+}
+
+/**
+ * Detect bootstrap/setup failures that mean the verify VM is missing the tool
+ * needed to even attempt dependency installation or suite startup.
+ *
+ * This is deliberately narrower than repo dependency resolution: missing `pip`,
+ * `npm`, `poetry`, or the language runtime itself is infrastructure, while a
+ * missing repo package (`sqlalchemy`, `typescript`, a Go module) is a genuine
+ * project failure that must block the gate.
+ */
+export function classifySetupFailure(output: string): boolean {
+  if (!output) return false;
+  const trimmedLines = output.split(/\r?\n/).map(line => line.trim());
+  const missingToolPatterns = [
+    /^(?:bash|sh):(?:\s+line\s+\d+:)?\s*(?:python(?:3)?|go|cargo|node|npm|pnpm|yarn|pip|poetry):\s+command not found\s*$/i,
+    /^(?:python(?:3)?|go|cargo|node|npm|pnpm|yarn|pip|poetry):\s+command not found\s*$/i,
+    /^zsh:\s+command not found:\s+(?:python(?:3)?|go|cargo|node|npm|pnpm|yarn|pip|poetry)\s*$/i,
+    /^ModuleNotFoundError:\s+No module named ['"]pip['"]\s*$/i,
+    /^ImportError:\s+No module named ['"]pip['"]\s*$/i,
+  ];
+  return trimmedLines.some(line => missingToolPatterns.some(pattern => pattern.test(line)));
 }
 
 /**
@@ -1132,10 +1163,12 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' | 'all
   // Match only those line shapes so a failing suite that QUOTES the literal
   // phrase "command not found" (or that merely contains `command` and `not
   // found` elsewhere on the line) stays a real run.
+  // Runtime commands (`python3`, `go`, `cargo`, `node`) are EXCLUDED here: a
+  // missing runtime is a setup failure, not a placeholder/no-tests signal.
   const missingCommandPatterns = [
-    /^(?:bash|sh):\s+\S+:\s+command not found\s*$/i,
-    /^zsh:\s+command not found:\s+\S+\s*$/i,
-    /^error:\s+command not found:\s+\S+\s*$/i,
+    /^(?:bash|sh):\s+(?!python(?:3)?\b|go\b|cargo\b|node\b)\S+:\s+command not found\s*$/i,
+    /^zsh:\s+command not found:\s+(?!python(?:3)?\b|go\b|cargo\b|node\b)\S+\s*$/i,
+    /^error:\s+command not found:\s+(?!python(?:3)?\b|go\b|cargo\b|node\b)\S+\s*$/i,
     /^error\s+command\s+["'][^"']+["']\s+not\s+found\.?\s*$/i,
   ];
   if (!hasRealFailureEvidence && trimmedLines.some(line => missingCommandPatterns.some(pattern => pattern.test(line)))) return 'no_tests';

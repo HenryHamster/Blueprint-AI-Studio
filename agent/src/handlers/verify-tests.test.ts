@@ -183,6 +183,25 @@ describe('handleVerifyTests', () => {
     expect(verdict.output).toContain('registry timeout');
   });
 
+  it('environment-style setup failure output also posts FAILED with setupFailed=true', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+    vi.mocked(testFixLoop).mockResolvedValue({
+      passed: false,
+      testFailuresDetected: false,
+      setupFailed: true,
+      failureSummary: "Traceback (most recent call last):\nModuleNotFoundError: No module named 'sqlalchemy'",
+    });
+
+    await handleVerifyTests('t4b', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const post = lastPostedPayload();
+    expect(post.status).toBe('FAILED');
+    const verdict = parsedVerdict() as { detected: boolean; setupFailed?: boolean; output: string };
+    expect(verdict.detected).toBe(false);
+    expect(verdict.setupFailed).toBe(true);
+    expect(verdict.output).toContain("No module named 'sqlalchemy'");
+  });
+
   it('placeholder suite (failed but no real tests) → detected=false (proceed-without-checks fallback)', async () => {
     vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
     vi.mocked(testFixLoop).mockResolvedValue({

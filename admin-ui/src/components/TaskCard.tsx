@@ -2,6 +2,7 @@
 import React, { useState, useEffect, useRef, memo, forwardRef } from 'react';
 import { CheckCircle, AlertTriangle, Clock, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, ShieldCheck, Package, ArrowUpDown, Wrench, MoreHorizontal, Radio, Layers, Gauge, Compass, FileText, Copy, Check } from 'lucide-react';
 import { formatDurationMs, parseTimestamp } from '../utils/time';
+import { formatVerdict, verdictToneBadgeClass } from '../utils/verdictFormatting';
 import { authGet, API_BASE_URL } from '../api';
 import { EXIT_REASON_COLORS } from '../utils/fixLoopColors';
 import { useTaskCapabilities } from '../taskCapabilities';
@@ -733,6 +734,18 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         {(isTerminal || task.status === 'EVALUATING') && (
           <SrDivergenceBadge task={task} onClick={onOpenSelfReview} />
         )}
+        {(isTerminal || task.status === 'EVALUATING') && task.evaluation_summary?.verdict ? (() => {
+          const { label, tone } = formatVerdict(task.evaluation_summary.verdict);
+          if (!label) return null;
+          return (
+            <span
+              className={`inline-flex items-center text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border ${verdictToneBadgeClass(tone)}`}
+              title={`Evaluation verdict: ${label}`}
+            >
+              {label}
+            </span>
+          );
+        })() : null}
       </div>
 
       {isActive && heartbeat.text.startsWith('Stale') && (

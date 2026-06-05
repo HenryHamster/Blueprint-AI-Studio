@@ -682,3 +682,52 @@ describe('TaskCard BLOCKED status', () => {
     expect(onCancel).toHaveBeenCalledWith('task-1');
   });
 });
+
+describe('TaskCard evaluation verdict pill', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('renders a humanized blocking pill for a panel_review request_changes verdict', () => {
+    const task = makeTask({
+      task_type: 'panel_review',
+      evaluation_summary: {
+        status: 'COMPLETED',
+        verdict: 'request_changes',
+        evidence: [{ label: 'Decision', value: 'REQUEST_CHANGES' }],
+        highlights: [],
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    const pill = screen.getByText('Request Changes');
+    expect(pill.className).toContain('red');
+    // The raw machine token must never leak to operators.
+    expect(screen.queryByText('request_changes')).toBeNull();
+  });
+
+  it('renders a humanized positive pill for an approve verdict', () => {
+    const task = makeTask({
+      task_type: 'panel_review',
+      evaluation_summary: { status: 'COMPLETED', verdict: 'approve' },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    const pill = screen.getByText('Approve');
+    expect(pill.className).toContain('emerald');
+  });
+
+  it('renders no verdict pill when evaluation_summary is absent', () => {
+    render(<TaskCard task={makeTask()} {...baseProps} />);
+    expect(screen.queryByText('Approve')).toBeNull();
+    expect(screen.queryByText('Request Changes')).toBeNull();
+  });
+
+  it('does not render a verdict pill for a non-terminal task', () => {
+    const task = makeTask({
+      status: 'IN_PROGRESS',
+      task_type: 'panel_review',
+      evaluation_summary: { status: 'IN_PROGRESS', verdict: 'approve' },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.queryByText('Approve')).toBeNull();
+  });
+});

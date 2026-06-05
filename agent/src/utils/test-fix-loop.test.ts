@@ -62,6 +62,13 @@ const defaultExistsSync = (p: unknown): boolean =>
 const NPM_RUNNER: TestRunner = { cmd: 'npm', args: ['test'], cwd: '/tmp/workspace', label: 'npm test (root)' };
 const PLACEHOLDER_RUNNER: TestRunner = { cmd: 'npm', args: ['test'], cwd: '/tmp/workspace/packages/a', label: 'npm test (packages/a)' };
 const REAL_RUNNER: TestRunner = { cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: '/tmp/workspace/packages/b', label: 'pytest (packages/b)' };
+const INSTALL_RUNNER: TestRunner = {
+  cmd: 'python3',
+  args: ['-m', 'pytest', '-x', '-q'],
+  cwd: '/tmp/workspace/packages/c',
+  label: 'pytest (packages/c)',
+  installCmd: 'python3 -m pip install -e . && python3 -m pip check',
+};
 const statusRef = { value: '' };
 
 describe('testFixLoop — noTestsExecuted aggregation (maxFixAttempts: 0)', () => {
@@ -230,6 +237,116 @@ describe('testFixLoop — noTestsExecuted aggregation (maxFixAttempts: 0)', () =
     expect(result.passed).toBe(false);
     expect(result.testFailuresDetected).toBe(true);
     expect(result.noTestsExecuted).toBe(true);
+  });
+
+  it('declared install_cmd runs before the suite using the safe shell-wrapper path', async () => {
+    execFileAsync
+      .mockResolvedValueOnce('installed')
+      .mockResolvedValueOnce('1 passed in 0.10s');
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [INSTALL_RUNNER] },
+    );
+
+    expect(result.passed).toBe(true);
+    expect(execFileAsync).toHaveBeenNthCalledWith(
+      1,
+      'bash',
+      ['-c', 'python3 -m pip install -e . && python3 -m pip check'],
+      expect.objectContaining({ cwd: INSTALL_RUNNER.cwd }),
+    );
+    expect(execFileAsync).toHaveBeenNthCalledWith(
+      2,
+      'python3',
+      ['-m', 'pytest', '-x', '-q'],
+      expect.objectContaining({ cwd: INSTALL_RUNNER.cwd }),
+    );
+  });
+
+  it('declared install_cmd failure stays setupFailed when the VM is missing pip itself', async () => {
+    execFileAsync.mockRejectedValueOnce(
+      new Error("Command failed: bash -c python3 -m pip install -e . && python3 -m pip check\nModuleNotFoundError: No module named 'pip'"),
+    );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [INSTALL_RUNNER] },
+    );
+
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(false);
+    expect(result.setupFailed).toBe(true);
+    expect(result.failureSummary).toContain('pip install');
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+    expect(execFileAsync).toHaveBeenCalledTimes(1);
+  });
+
+  it('missing dependency output from the test command stays on the red-suite lane', async () => {
+    execFileAsync.mockRejectedValueOnce(
+      new Error(
+        'Command failed: python3 -m pytest -x -q\nTraceback (most recent call last):\nModuleNotFoundError: No module named \'sqlalchemy\'',
+      ),
+    );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [REAL_RUNNER] },
+    );
+
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(true);
+    expect(result.setupFailed).toBeFalsy();
+    expect(result.failureSummary).toContain("No module named 'sqlalchemy'");
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+  });
+
+  it('spawn-time ENOENT (missing runtime) routes to setupFailed, not the code-fix lane', async () => {
+    // A missing runtime (python3/go/cargo/node not installed) rejects at spawn
+    // time with errno ENOENT BEFORE any suite output exists — there is no shell
+    // "command not found" line for the classifier to match, so this must be
+    // recognized by errno and routed through setupFailed.
+    execFileAsync.mockRejectedValueOnce(
+      Object.assign(new Error('spawn python3 ENOENT'), { code: 'ENOENT' }),
+    );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [REAL_RUNNER] },
+    );
+
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(false);
+    expect(result.setupFailed).toBe(true);
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+  });
+
+  it('mixed real-pass + repo-failing runner → whole run stays red (no false green)', async () => {
+    // One runner executes a real suite cleanly; a second runner hits a repo
+    // dependency failure. Even though a sibling suite passed, the broken suite
+    // must still block verification instead of falling open as setupFailed.
+    const SECOND_RUNNER: TestRunner = { ...REAL_RUNNER, cwd: '/tmp/workspace/packages/d', label: 'pytest (packages/d)' };
+    execFileAsync
+      .mockResolvedValueOnce('Tests  3 passed (3)\nTest Files  1 passed (1)')
+      .mockRejectedValueOnce(
+        new Error("Command failed: python3 -m pytest -x -q\nModuleNotFoundError: No module named 'sqlalchemy'"),
+      );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [REAL_RUNNER, SECOND_RUNNER] },
+    );
+
+    expect(result.passed).toBe(false);
+    expect(result.setupFailed).toBeFalsy();
+    expect(result.testFailuresDetected).toBe(true);
+    expect(result.failureSummary).toContain("No module named 'sqlalchemy'");
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
   });
 });
 
@@ -415,7 +532,7 @@ describe('testFixLoop — non-npm pre-test dependency install (maxFixAttempts: 0
     expect(result.setupFailed).toBeFalsy();
   });
 
-  it('Python runner + requirements.txt and a failing pip install → setupErrors → setupFailed (not a code-fix failure)', async () => {
+  it('Python runner + requirements.txt and a failing pip install stays on the failure lane for repo dependency errors', async () => {
     vi.mocked(fs.existsSync).mockImplementation(
       (p: unknown) => typeof p === 'string' && p.endsWith('/requirements.txt'),
     );
@@ -436,10 +553,10 @@ describe('testFixLoop — non-npm pre-test dependency install (maxFixAttempts: 0
     expect(pipCall?.[1]).toEqual(['install', '-r', 'requirements.txt']);
     // The suite was skipped after the install failure — the runner never ran.
     expect(execFileAsync.mock.calls.some(([cmd]) => cmd === 'python3')).toBe(false);
-    // Routed to setupErrors → setupFailed, NOT to the code-fix/failures path.
-    expect(result.setupFailed).toBe(true);
+    // Repo dependency resolution must stay red instead of downgrading to setupFailed.
+    expect(result.setupFailed).toBeFalsy();
     expect(result.passed).toBe(false);
-    expect(result.testFailuresDetected).toBe(false);
+    expect(result.testFailuresDetected).toBe(true);
   });
 
   it('Go runner + go.mod and a failing `go mod download` → setupErrors → setupFailed', async () => {
@@ -472,7 +589,7 @@ describe('testFixLoop — non-npm pre-test dependency install (maxFixAttempts: 0
     expect(result.testFailuresDetected).toBe(false);
   });
 
-  it('Rust runner + Cargo.toml and a failing `cargo fetch` → setupErrors → setupFailed', async () => {
+  it('Rust runner + Cargo.toml and a bare `failed to fetch` stays a repository failure', async () => {
     vi.mocked(fs.existsSync).mockImplementation(
       (p: unknown) => typeof p === 'string' && p.endsWith('/Cargo.toml'),
     );
@@ -497,9 +614,9 @@ describe('testFixLoop — non-npm pre-test dependency install (maxFixAttempts: 0
     expect(execFileAsync.mock.calls.some(
       ([cmd, args]) => cmd === 'cargo' && Array.isArray(args) && args[0] === 'test',
     )).toBe(false);
-    expect(result.setupFailed).toBe(true);
+    expect(result.setupFailed).toBeFalsy();
     expect(result.passed).toBe(false);
-    expect(result.testFailuresDetected).toBe(false);
+    expect(result.testFailuresDetected).toBe(true);
   });
 });
 
@@ -509,7 +626,7 @@ describe('testFixLoop — in-loop environment-failure routing (maxFixAttempts: 0
     vi.mocked(fs.existsSync).mockImplementation(defaultExistsSync);
   });
 
-  it('runner exits non-zero with a ModuleNotFoundError → setupErrors → setupFailed (not a FAILED/code-fix verdict)', async () => {
+  it('runner exits non-zero with a ModuleNotFoundError → red-suite failure, not setupFailed', async () => {
     execFileAsync.mockRejectedValue(
       new Error("Command failed: python3 -m pytest -x -q\nModuleNotFoundError: No module named 'pytest'"),
     );
@@ -520,11 +637,10 @@ describe('testFixLoop — in-loop environment-failure routing (maxFixAttempts: 0
       { maxFixAttempts: 0, runnersOverride: [REAL_RUNNER] },
     );
 
-    // Env signature → skipped to setupErrors, surfaced as setupFailed. The
-    // code-fix path (testFailuresDetected) must NOT fire.
-    expect(result.setupFailed).toBe(true);
+    // Repo dependency regression must stay on the failure lane.
+    expect(result.setupFailed).toBeFalsy();
     expect(result.passed).toBe(false);
-    expect(result.testFailuresDetected).toBe(false);
+    expect(result.testFailuresDetected).toBe(true);
   });
 
   it('runner exits non-zero with a missing shared library (.so) → setupErrors → setupFailed', async () => {

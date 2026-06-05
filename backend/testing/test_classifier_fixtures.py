@@ -27,7 +27,7 @@ consumers share ONE source of truth.
 
 Fixture row schema (the shared contract, consumed by BOTH sides):
     { "name": str, "output": str, "expected": "ran"|"no_tests",
-      "category": str, "genuine_suite": bool }
+      "category": str, "genuine_suite": bool, "setup_expected"?: bool }
 """
 
 import json
@@ -35,9 +35,9 @@ import os
 
 import pytest
 
-# The five placeholder/empty phrase families the classifier recognizes — every
-# one MUST be represented in the corpus so a future change cannot drop coverage
-# for a whole category while keeping the others green.
+# The shared corpus covers both the no-tests classifier families and the setup-
+# failure families. Every category MUST be represented so a future change
+# cannot silently drop an entire behavior bucket from coverage.
 EXPECTED_CATEGORIES = frozenset(
     {
         "command-not-found",
@@ -45,13 +45,17 @@ EXPECTED_CATEGORIES = frozenset(
         "no-test-specified",
         "make-target",
         "zero-test",
+        "setup-missing-runtime",
+        "setup-missing-dependency",
     }
 )
 
 VALID_EXPECTED = frozenset({"ran", "no_tests"})
 
-# Required row fields and their types. ``genuine_suite`` is the polarity flag:
-# True  => the output is a real test run (must classify as ``ran``).
+# Required row fields and their types. ``genuine_suite`` is the
+# classifyTestExecution polarity flag:
+# True  => the output must stay in the conservative ``ran`` bucket (real suite
+#          OR setup failure that must not fall open to ``no_tests``).
 # False => the output is a placeholder / empty / missing-runner signal (must
 #          classify as ``no_tests``).
 _REQUIRED_FIELDS = {
@@ -91,8 +95,8 @@ class TestClassifierOutputFixtureShape:
 
     def test_every_row_has_valid_schema(self):
         """Each row must carry the full {name, output, expected, category,
-        genuine_suite} contract with correct types and a valid ``expected`` label.
-        Both vitest and this guard rely on these field names."""
+        genuine_suite, setup_expected?} contract with correct types and a valid
+        ``expected`` label. Both vitest and this guard rely on these field names."""
         errors = []
         seen_names = set()
         for idx, row in enumerate(CLASSIFIER_FIXTURES):
@@ -117,6 +121,11 @@ class TestClassifierOutputFixtureShape:
                     f"row {idx} ({row.get('name', '?')}): expected must be one of "
                     f"{sorted(VALID_EXPECTED)}, got {row.get('expected')!r}"
                 )
+            if "setup_expected" in row and not isinstance(row["setup_expected"], bool):
+                errors.append(
+                    f"row {idx} ({row.get('name', '?')}): setup_expected must be "
+                    f"bool when present, got {type(row['setup_expected']).__name__}"
+                )
             if not row.get("output"):
                 errors.append(
                     f"row {idx} ({row.get('name', '?')}): output must be non-empty"
@@ -125,8 +134,8 @@ class TestClassifierOutputFixtureShape:
             errors
         )
 
-    def test_all_five_categories_represented(self):
-        """Every placeholder/empty phrase family must appear in the corpus."""
+    def test_all_categories_represented(self):
+        """Every no-tests/setup-failure family must appear in the corpus."""
         present = {row["category"] for row in CLASSIFIER_FIXTURES}
         unknown = present - EXPECTED_CATEGORIES
         missing = EXPECTED_CATEGORIES - present
@@ -213,6 +222,26 @@ class TestClassifierOutputFixtureShape:
             "whose output contains a zero-test summary as data => ran) and a "
             f"genuine_suite=False row (truly empty suite => no_tests). Present "
             f"polarities: {polarities}."
+        )
+
+    def test_setup_classifier_rows_exist(self):
+        """The shared corpus must carry setup-failure rows so the agent-side
+        setup classifier stays covered alongside classifyTestExecution."""
+        setup_rows = [r for r in CLASSIFIER_FIXTURES if "setup_expected" in r]
+        assert setup_rows, (
+            "classifier_outputs.json has no setup_expected rows — the shared "
+            "setup-failure regression corpus was gutted."
+        )
+        positives = [r["name"] for r in setup_rows if r["setup_expected"] is True]
+        negatives = [r["name"] for r in setup_rows if r["setup_expected"] is False]
+        assert positives, (
+            "classifier_outputs.json has no setup_expected=true rows — missing "
+            "runtime/dependency setup failures are no longer represented."
+        )
+        assert negatives, (
+            "classifier_outputs.json has no setup_expected=false rows — the "
+            "shared corpus no longer carries a negative control against "
+            "setup-classifier false positives."
         )
 
 

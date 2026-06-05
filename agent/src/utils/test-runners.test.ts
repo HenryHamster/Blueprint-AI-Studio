@@ -11,7 +11,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import { readFile } from 'node:fs/promises';
 import {
-  detectTestRunners, detectAutoTestRunners, describeRunnerDirectory, classifyTestExecution,
+  detectTestRunners, detectAutoTestRunners, describeRunnerDirectory,
+  classifySetupFailure, classifyTestExecution,
   matchesEnvironmentFailureSignature,
   detectAcceptanceProbes, classifyProbeOutcome,
 } from './test-runners.js';
@@ -253,6 +254,20 @@ describe('detectTestRunners — bare pytest guard (C19)', () => {
     expect(runners).toHaveLength(1);
     expect(runners[0].cmd).toBe('bash');
     expect(runners[0].args).toEqual(['-c', 'go test ./... && go vet ./...']);
+  });
+
+  it('BuildConfig install_cmd is threaded onto the detected runner verbatim', () => {
+    const buildConfig: BuildConfig = {
+      directories: [{
+        path: 'svc',
+        type: 'python',
+        test_cmd: 'python3 -m pytest -x -q',
+        install_cmd: 'python3 -m pip install -e . && python3 -m pip check',
+      }],
+    };
+    const runners = detectTestRunners(buildConfig);
+    expect(runners).toHaveLength(1);
+    expect(runners[0].installCmd).toBe('python3 -m pip install -e . && python3 -m pip check');
   });
 
   it('classifyTestExecution treats Go empty-package output as no_tests', () => {
@@ -1527,6 +1542,11 @@ describe('classifyTestExecution — placeholder/empty suite detection', () => {
     expect(classifyTestExecution('2 passed in 0.50s')).toBe('ran');
   });
 
+  it('missing runtimes do not fall into the placeholder no_tests bucket', () => {
+    expect(classifyTestExecution('bash: python3: command not found')).toBe('ran');
+    expect(classifyTestExecution('zsh: command not found: go')).toBe('ran');
+  });
+
   it('empty / ambiguous output → ran (conservative default)', () => {
     expect(classifyTestExecution('')).toBe('ran');
     expect(classifyTestExecution('some unrelated output')).toBe('ran');
@@ -1699,6 +1719,40 @@ describe('classifyTestExecution — all-skipped (no real tests executed)', () =>
   });
 });
 
+describe('classifySetupFailure — bootstrap/setup infrastructure detection', () => {
+  it('detects missing runtimes and package-manager tools via line-anchored command-not-found output', () => {
+    expect(classifySetupFailure('bash: python3: command not found')).toBe(true);
+    expect(classifySetupFailure('sh: line 1: cargo: command not found')).toBe(true);
+    expect(classifySetupFailure('zsh: command not found: node')).toBe(true);
+    expect(classifySetupFailure('bash: pip: command not found')).toBe(true);
+  });
+
+  it('treats missing pip itself as setup, but generic repo dependency imports as real failures', () => {
+    expect(classifySetupFailure("ModuleNotFoundError: No module named 'pip'")).toBe(true);
+    expect(classifySetupFailure("ImportError: No module named 'pip'")).toBe(true);
+    expect(classifySetupFailure("ModuleNotFoundError: No module named 'sqlalchemy'")).toBe(false);
+    expect(classifySetupFailure("ImportError: No module named 'requests'")).toBe(false);
+    expect(classifySetupFailure("ImportError: cannot import name 'foo' from 'bar'")).toBe(false);
+  });
+
+  it('does not treat repo dependency/module resolution failures as setup infra', () => {
+    expect(classifySetupFailure('cannot find package "github.com/acme/lib" in any of:')).toBe(false);
+    expect(classifySetupFailure('no required module provides package github.com/acme/lib; to add it:')).toBe(false);
+    expect(classifySetupFailure('missing go.sum entry for module providing package github.com/acme/lib')).toBe(false);
+    expect(classifySetupFailure("Error: Cannot find module 'typescript'")).toBe(false);
+    expect(classifySetupFailure("Cannot find module '@acme/tooling' from '/tmp/workspace'")).toBe(false);
+    expect(classifySetupFailure("Error: Cannot find module './local-helper'")).toBe(false);
+  });
+
+  it('does not misclassify quoted setup-like text inside a real failure', () => {
+    expect(
+      classifySetupFailure(
+        "FAILED test_cli.py::test_help - AssertionError: expected \"bash: python3: command not found\" in stderr",
+      ),
+    ).toBe(false);
+  });
+});
+
 // Regression: the real-failure guard must recognize a genuine failure in EVERY
 // ecosystem the no-CI gate's runner detection can launch (Go, Ruby/Rake,
 // Gradle, Maven, Elixir, .NET, PHPUnit) — not just pytest/vitest/Rust. A
@@ -1774,24 +1828,6 @@ describe('classifyTestExecution — extra-family real-failure guard', () => {
 describe('matchesEnvironmentFailureSignature — env/setup failure detection', () => {
   // ── True cases: env signals without real test failure evidence ──────────────
 
-  it('ModuleNotFoundError (no module named pytest) → true', () => {
-    expect(matchesEnvironmentFailureSignature(
-      "ModuleNotFoundError: No module named 'pytest'",
-    )).toBe(true);
-  });
-
-  it('No module named (bare) → true', () => {
-    expect(matchesEnvironmentFailureSignature(
-      "No module named 'requests'",
-    )).toBe(true);
-  });
-
-  it('ImportError: No module named → true', () => {
-    expect(matchesEnvironmentFailureSignature(
-      "ImportError: No module named 'yaml'",
-    )).toBe(true);
-  });
-
   it('cannot open shared object file (.so) → true', () => {
     expect(matchesEnvironmentFailureSignature(
       'error while loading shared libraries: libssl.so.1.1: cannot open shared object file: No such file or directory',
@@ -1828,7 +1864,25 @@ describe('matchesEnvironmentFailureSignature — env/setup failure detection', (
     )).toBe(true);
   });
 
-  // ── False cases: real test failure evidence guards against misrouting ───────
+  // ── False cases: repo dependency failures and real test-failure evidence stay red ──
+
+  it('bare ModuleNotFoundError from the suite is not treated as VM infra', () => {
+    expect(matchesEnvironmentFailureSignature(
+      "ModuleNotFoundError: No module named 'pytest'",
+    )).toBe(false);
+  });
+
+  it('bare ImportError: No module named is not treated as VM infra', () => {
+    expect(matchesEnvironmentFailureSignature(
+      "ImportError: No module named 'yaml'",
+    )).toBe(false);
+  });
+
+  it('bare Cannot find module is not treated as VM infra', () => {
+    expect(matchesEnvironmentFailureSignature(
+      "Error: Cannot find module 'typescript'",
+    )).toBe(false);
+  });
 
   it('FAILED line + ModuleNotFoundError → false (real test failure, not env)', () => {
     expect(matchesEnvironmentFailureSignature(

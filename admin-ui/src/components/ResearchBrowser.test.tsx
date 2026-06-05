@@ -196,8 +196,38 @@ describe('ResearchBrowser evidence panel', () => {
     );
 
     await user.click(screen.getByText('Finding A'));
-    expect(screen.getByText('pass')).toBeInTheDocument();
+    const verdictPill = screen.getByText('Pass');
+    expect(verdictPill).toBeInTheDocument();
+    // Humanized label + positive (emerald) tone, not the raw token or always-cyan.
+    expect(verdictPill.className).toContain('emerald');
+    expect(verdictPill.className).not.toContain('cyan');
     expect(screen.getByText(/full suite green/)).toBeInTheDocument();
+  });
+
+  it('renders a request_changes verdict as a humanized blocking pill', async () => {
+    const user = userEvent.setup();
+    const implementation = makeImplementationTask({
+      task_type: 'panel_review',
+      evaluation_summary: {
+        status: 'COMPLETED',
+        verdict: 'request_changes',
+        evidence: [{ label: 'Decision', value: 'REQUEST_CHANGES' }],
+        highlights: [{ label: 'Correctness', value: 'fail' }],
+      },
+    });
+    render(
+      <ResearchBrowser
+        tasks={[makeResearchTask([makeFinding({ title: 'Finding B' })]), implementation]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+
+    await user.click(screen.getByText('Finding B'));
+    const verdictPill = screen.getByText('Request Changes');
+    expect(verdictPill).toBeInTheDocument();
+    expect(verdictPill.className).toContain('red');
+    expect(screen.queryByText('request_changes')).not.toBeInTheDocument();
   });
 });
 

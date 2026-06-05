@@ -19,7 +19,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { readFile } from 'node:fs/promises';
-import { classifyTestExecution } from './test-runners.js';
+import { classifySetupFailure, classifyTestExecution } from './test-runners.js';
 
 type ClassifierFixtureRow = {
   name: string;
@@ -27,6 +27,7 @@ type ClassifierFixtureRow = {
   expected: 'ran' | 'no_tests';
   category: string;
   genuine_suite: boolean;
+  setup_expected?: boolean;
 };
 
 const fixtures = JSON.parse(
@@ -45,6 +46,8 @@ const EXPECTED_CATEGORIES = [
   'no-test-specified',
   'make-target',
   'zero-test',
+  'setup-missing-runtime',
+  'setup-missing-dependency',
 ] as const;
 
 describe('classifyTestExecution — shared fixture corpus (behavioral net)', () => {
@@ -63,6 +66,17 @@ describe('classifyTestExecution — shared fixture corpus (behavioral net)', () 
       }
     }
     expect(mismatches).toEqual([]);
+  });
+
+  it('fixture rows with setup expectations match the setup-failure classifier', () => {
+    const rows = fixtures.filter((r) => typeof r.setup_expected === 'boolean');
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) {
+      expect(
+        classifySetupFailure(row.output),
+        `${row.name} must match setup_expected`,
+      ).toBe(row.setup_expected);
+    }
   });
 
   it('genuine suites containing placeholder-looking text still classify as "ran"', () => {

@@ -7360,6 +7360,27 @@ def _extract_classifier_region(source: str) -> str:
     end = source.find("\n}", end) + 1
     return source[start:end]
 
+def _extract_setup_classifier_region(source: str) -> str:
+    """Extract the classifySetupFailure function from test-runners.ts."""
+    start = source.find("export function classifySetupFailure")
+    if start == -1:
+        raise ValueError(
+            "Could not find `export function classifySetupFailure` anchor in "
+            "agent/src/utils/test-runners.ts — the setup classifier function "
+            "was renamed or removed. Update _extract_setup_classifier_region in "
+            "backend/testing/test_invariants.py to match."
+        )
+
+    end = source.find("\n  return false;", start)
+    if end == -1:
+        raise ValueError(
+            "Could not find the terminating `return false;` of "
+            "classifySetupFailure in agent/src/utils/test-runners.ts — the "
+            "function's structure changed. Update _extract_setup_classifier_region."
+        )
+    end = source.find("\n}", end) + 1
+    return source[start:end]
+
 
 def _extract_env_failure_region(source: str) -> str:
     """Extract the matchesEnvironmentFailureSignature function from test-runners.ts.
@@ -7392,9 +7413,9 @@ class TestAgentEnvFailureSignatureParity:
     backend/app/failure_layer_classifier.py.
 
     A pattern in the backend that is absent from the agent means a VM-level
-    failure (missing .so, ModuleNotFoundError) is misrouted to the code-fix
-    loop instead of the setup-escalation path, burning agent budget on an
-    unfixable problem.
+    failure (missing .so, runtime absent on PATH, spawn ENOENT) is misrouted to
+    the code-fix loop instead of the setup-escalation path, burning agent
+    budget on an unfixable problem.
 
     Skips in CI Docker contexts where agent/src is absent, exactly like the
     sibling ``TestAgentTestRunnerSourceParity`` class.
@@ -7456,9 +7477,6 @@ class TestAgentEnvFailureSignatureParity:
             ("shared-library load error", "error while loading shared librar"),
             ("shared-object open failure", "cannot open shared object file"),
             ("no-such-file .so", r"\.so"),
-            ("Python ModuleNotFoundError", "ModuleNotFoundError"),
-            ("Python No module named", "No module named"),
-            ("Python ImportError", "ImportError"),
             ("spawn ENOENT", "ENOENT"),
             # TS source uses regex literals: \bnode:\s+command not found
             ("node runtime missing", r"\bnode:"),
@@ -7488,8 +7506,6 @@ class TestAgentEnvFailureSignatureParity:
             _extract_env_failure_region(
                 "export function matchesEnvironmentFailureSignature(output: string) {}"
             )
-
-
 class TestAgentTestRunnerTableParity:
     """ALWAYS-ON: the backend-resident agent runner table is pinned to the shared
     fixture. Runs in plain GitHub CI (no agent/src required).
@@ -7971,6 +7987,58 @@ class TestAgentTestRunnerSourceParity:
                 "invariant to match the classifier if the signal moved."
             )
 
+    def test_setup_classifier_requires_line_anchored_patterns(self):
+        """The setup-failure classifier must stay line-anchored and pattern-based.
+
+        Loose whole-output substring scans would false-positive on a real test
+        that merely QUOTES a setup-like line ("bash: python3: command not
+        found", "ModuleNotFoundError: No module named 'pip'") in an assertion
+        body.
+        """
+        source = self._read_agent_source()
+        region = _extract_setup_classifier_region(source)
+
+        for forbidden in [
+            "output.includes(",
+            "lower.includes(",
+            "trimmedLines.some(line => line.includes(",
+        ]:
+            assert forbidden not in region, (
+                "agent/src/utils/test-runners.ts classifySetupFailure uses loose "
+                f"substring matching ({forbidden!r}); keep setup detection "
+                "line-anchored via regex patterns."
+            )
+
+        assert "missingToolPatterns" in region, (
+            "agent/src/utils/test-runners.ts classifySetupFailure must define a "
+            "missingToolPatterns set of line-anchored regexes."
+        )
+        assert "trimmedLines.some(line => missingToolPatterns.some(pattern => pattern.test(line)))" in region, (
+            "agent/src/utils/test-runners.ts classifySetupFailure must test "
+            "missingToolPatterns per line, not against the whole output."
+        )
+        for required in [
+            "command not found",
+            "python(?:3)?|go|cargo|node|npm|pnpm|yarn|pip|poetry",
+            "^(?:bash|sh):",
+            "No module named ['\\\"]pip['\\\"]",
+        ]:
+            assert required in region, (
+                "agent/src/utils/test-runners.ts classifySetupFailure no longer "
+                f"contains the setup-failure signature {required!r}; update this "
+                "invariant if the signal legitimately moved."
+            )
+        for forbidden in [
+            "/^ModuleNotFoundError:\\s+No module named ['\"][^'\"]+['\"]\\s*$/i",
+            "/^ImportError:\\s+No module named ['\"][^'\"]+['\"]\\s*$/i",
+            "/^Error:\\s+Cannot find module ['\"](?![./])[^'\"]+['\"]\\s*$/i",
+            "/^(?:go:\\s+)?missing go\\.sum entry for module providing package\\b.*$/i",
+        ]:
+            assert forbidden not in region, (
+                "agent/src/utils/test-runners.ts classifySetupFailure must not "
+                f"treat generic repo dependency failures as setup infra ({forbidden!r})."
+            )
+
     def test_classifier_real_failure_guard_covers_every_runner_family(self):
         """COUPLED INVARIANT: the no-CI gate's runner detection can launch many
         ecosystems (Go, Ruby/Rake, Gradle, Maven, Elixir, .NET, PHPUnit) beyond
@@ -8195,6 +8263,18 @@ class TestAgentTestRunnerParseHelpers:
                 "return 'no_tests'; }"
             )
 
+    def test_extract_setup_classifier_region_raises_on_missing_anchor(self):
+        with pytest.raises(ValueError, match="classifySetupFailure"):
+            _extract_setup_classifier_region(
+                "export function classifyTestExecution(output: string) { return 'ran'; }"
+            )
+
+    def test_extract_setup_classifier_region_raises_on_missing_return(self):
+        with pytest.raises(ValueError, match="return false"):
+            _extract_setup_classifier_region(
+                "export function classifySetupFailure(output: string) { return true; }"
+            )
+
     def test_classifier_region_contains_missing_command_check(self):
         """A synthetic classifier region with the correct pattern passes."""
         synthetic = (
@@ -8208,6 +8288,18 @@ class TestAgentTestRunnerParseHelpers:
         assert ".some(line => missingCommand.test(line))" in region
         assert r"\bcommand\b" in region
 
+    def test_setup_classifier_region_contains_line_anchored_patterns(self):
+        synthetic = (
+            "export function classifySetupFailure(output: string) {\n"
+            "  const trimmedLines = output.split(/\\r?\\n/).map(line => line.trim());\n"
+            "  const missingToolPatterns = [/^(?:bash|sh):(?:\\s+line\\s+\\d+:)?\\s*(?:python(?:3)?|go|cargo|node|npm|pnpm|yarn|pip|poetry):\\s+command not found\\s*$/i];\n"
+            "  if (trimmedLines.some(line => missingToolPatterns.some(pattern => pattern.test(line)))) return true;\n"
+            "  return false;\n"
+            "}\n"
+        )
+        region = _extract_setup_classifier_region(synthetic)
+        assert "missingToolPatterns" in region
+        assert ".some(line => missingToolPatterns.some(pattern => pattern.test(line)))" in region
 
 # ── No-CI UNVERIFIED-merge reason-label parity ────────────────────────────────
 # The orchestrator writes a stable reason KEY into

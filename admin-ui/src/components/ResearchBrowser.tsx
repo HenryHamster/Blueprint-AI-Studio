@@ -4,6 +4,7 @@ import type { ResearchFinding } from './TaskCard';
 import { TaskTypeBadge, isSafeUrl, FAILURE_CLASS_CONFIG } from './TaskCard';
 import { API_BASE_URL, authHeaders, fetchRecentFindings, type RecentFindingsResponse } from '../api';
 import { parseTimestamp } from '../utils/time';
+import { formatVerdict, verdictToneBadgeClass } from '../utils/verdictFormatting';
 import type { Task, TaskEvaluationSummary } from '../types/task';
 
 interface Direction {
@@ -191,13 +192,14 @@ function EvidencePanel({ finding, repoUrl }: { finding: ResearchFinding; repoUrl
 
 function OutcomeSummaryPills({ summary }: { summary: TaskEvaluationSummary }) {
   const highlights = summary.highlights ?? [];
+  const { label: verdictLabel, tone: verdictToneId } = formatVerdict(summary.verdict);
   return (
     <div className="flex flex-wrap gap-1.5 text-[10px]">
       <span className="rounded bg-neutral-800/80 px-1.5 py-0.5 text-neutral-300 uppercase tracking-wide">
         {summary.status}
       </span>
-      <span className="rounded bg-cyan-950/40 px-1.5 py-0.5 text-cyan-300 uppercase tracking-wide">
-        {summary.verdict}
+      <span className={`rounded border px-1.5 py-0.5 uppercase tracking-wide ${verdictToneBadgeClass(verdictToneId)}`}>
+        {verdictLabel}
       </span>
       {highlights.slice(0, 2).map((item, i) => (
         <span key={i} className="rounded bg-neutral-900/70 px-1.5 py-0.5 text-neutral-400 border border-neutral-800">

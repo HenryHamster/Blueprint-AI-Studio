@@ -185,7 +185,7 @@ describe('DetailsTab — Merge Test Gate', () => {
     });
     render(<DetailsTab task={task} />);
     expect(screen.getByText('Evaluation Summary')).toBeInTheDocument();
-    expect(screen.getByText('pass')).toBeInTheDocument();
+    expect(screen.getByText('Pass')).toBeInTheDocument();
     expect(screen.getByText(/verified on PR head/)).toBeInTheDocument();
     expect(screen.getByText('Merge Test Gate')).toBeInTheDocument();
   });
@@ -201,7 +201,7 @@ describe('DetailsTab — Merge Test Gate', () => {
       },
     });
     render(<DetailsTab task={task} />);
-    const badge = screen.getByText('approve');
+    const badge = screen.getByText('Approve');
     expect(badge.className).toContain('emerald');
     expect(badge.className).not.toContain('cyan');
   });
@@ -217,7 +217,7 @@ describe('DetailsTab — Merge Test Gate', () => {
       },
     });
     render(<DetailsTab task={task} />);
-    const badge = screen.getByText('request_changes');
+    const badge = screen.getByText('Request Changes');
     expect(badge.className).toContain('red');
     expect(badge.className).not.toContain('cyan');
   });
