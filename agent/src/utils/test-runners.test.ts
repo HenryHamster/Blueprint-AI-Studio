@@ -2976,4 +2976,64 @@ describe('discoverNewlyDisabledTests', () => {
     });
     expect(markers).toHaveLength(0);
   });
+
+  it('detects RSpec pending as a skip marker but not as a string/symbol/identifier', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['spec/app_spec.rb'],
+      addedLinesByFile: {
+        'spec/app_spec.rb': [
+          'pending',
+          'pending "not implemented"',
+          'pending { some_code }',
+          'pending do',
+          'status = :pending',
+          'message = "pending"',
+          'let(:pending_case) { helper }',
+          'pending_items = []',
+        ],
+      },
+    });
+    expect(markers).toHaveLength(4);
+    expect(markers.map(m => m.line)).toEqual([
+      'pending',
+      'pending "not implemented"',
+      'pending { some_code }',
+      'pending do',
+    ]);
+  });
+
+  it('does not false-positive on benign Ruby code containing the word pending', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['spec/test_spec.rb'],
+      addedLinesByFile: {
+        'spec/test_spec.rb': [
+          'expect(status).to eq("pending")',
+          'expect(status).to eq(:pending)',
+          "{ pending: false }",
+          "{ pending: true }",
+          "let(:pending_task) { Task.new }",
+          'result = thing.pending?',
+        ],
+      },
+    });
+    expect(markers).toHaveLength(0);
+  });
+
+  it('detects pending as skip in RSpec examples but avoids hash literals and symbols', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['spec/helpers_spec.rb'],
+      addedLinesByFile: {
+        'spec/helpers_spec.rb': [
+          'it "does something" do',
+          '  pending',
+          'end',
+          'it "another" do',
+          '  pending("reason for skip")',
+          'end',
+        ],
+      },
+    });
+    expect(markers).toHaveLength(2);
+    expect(markers.map(m => m.marker)).toEqual(['pending', 'pending']);
+  });
 });

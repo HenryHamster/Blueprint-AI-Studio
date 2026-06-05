@@ -109,6 +109,18 @@ type ScopeConversionRates = Record<string, { created: number; merged: number; ca
  * `DP` defaults to `unknown` so consumers that never read `direction_progress`
  * (e.g. SystemStatusCard) can use the bare `DigestData`.
  */
+// Fleet-wide no-CI merge-gate verification health (read-only observability;
+// never influences a merge decision). Mirrors the backend
+// `compute_merge_gate_fleet_health` return shape.
+export interface MergeGateFleetHealth {
+  verified_count: number;
+  fell_open_count: number;
+  verification_rate: number | null;
+  most_common_reason: string | null;
+  degraded_project_count: number;
+  project_count: number;
+}
+
 export interface DigestData<DP = unknown> {
   // ----- core contract (validated by assertDigestContract) -----
   failed_count: number;
@@ -232,6 +244,7 @@ export interface DigestData<DP = unknown> {
   } | null;
 
   // ----- operational health (catch-up) -----
+  merge_gate_fleet_health?: MergeGateFleetHealth | null;
   migration_health?: {
     current_schema_revision: string | null;
     migration_tasks_in_window: number;

@@ -2339,7 +2339,10 @@ const DISABLED_TEST_MARKERS: Array<{ kind: string; re: RegExp }> = [
   { kind: '@Disabled', re: /@Disabled\b/ },
   { kind: '@Ignore', re: /@Ignore\b/ },
   // RSpec (Ruby) — ``pending`` marks an example as not-yet-passing.
-  { kind: 'pending', re: /\bpending\b/ },
+  // Avoid false positives on string literals ("pending"), symbols (:pending),
+  // and identifiers containing "pending". Match only genuine RSpec calls:
+  // pending followed by space/paren/brace/do or end-of-line.
+  { kind: 'pending', re: /(?<!:)\bpending\b(?:\s|$|\(|\{|do\b)/ },
 ];
 
 // Whether a (trimmed) added line is a comment we should NOT scan for markers —

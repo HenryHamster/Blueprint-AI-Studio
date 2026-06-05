@@ -50,6 +50,7 @@ from app.digest_metrics import (
     _task_prompt_fingerprint,  # noqa: F401  re-exported for external importers
     compute_anomaly_adjustment_summary,  # noqa: F401  re-exported for external importers
     compute_dependency_health_signals,
+    compute_merge_gate_fleet_health,
     compute_digest_cost_economics,
     compute_digest_trend_history,  # noqa: F401  re-exported for external importers
     compute_direction_progress,
@@ -1227,6 +1228,14 @@ async def _compute_digest(
         session, project_id
     )
 
+    # --- Fleet-wide no-CI merge-gate verification health (read-only) — surfaces
+    # whether merges across the fleet actually ran real tests vs. fell open to an
+    # UNVERIFIED merge, which fall-open reason dominates, and how many projects
+    # have a degraded gate. NEVER influences a merge decision. ---
+    merge_gate_fleet_health = await compute_merge_gate_fleet_health(
+        session, project_id, window_start=window_start
+    )
+
     _review_quality = compute_review_quality_metrics(completed_tasks + failed_tasks)
     _self_review_skip_rate = _compute_sr_skip_rate(completed_tasks + failed_tasks)
     _sr_disallowed_blind_spot_rate = _compute_sr_disallowed_blind_spot_rate(
@@ -1345,6 +1354,7 @@ async def _compute_digest(
         "investigation_conversion": investigation_conversion,
         "anomaly_adjustment": anomaly_adjustment_summary,
         "dependency_health_signals": dependency_health_signals,
+        "merge_gate_fleet_health": merge_gate_fleet_health,
         "migration_health": migration_health,
         "prediction_calibration_factor": prediction_calibration["factor"]
         if prediction_calibration

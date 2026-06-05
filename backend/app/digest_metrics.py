@@ -22,10 +22,12 @@ from sqlmodel import select
 from app.landed_signal import has_landed_signal
 from app.models import (
     Alert,
+    Project,
     Task,
     TaskStatus,
     ReleaseVersion,
 )
+from app.time_utils import _coerce_naive_utc
 # Remediation funnel + recurring-failure-pattern helpers relocated to their own
 # module. Re-exported here so existing import paths are unchanged.
 from app.digest_remediation import (  # noqa: F401
@@ -1493,6 +1495,128 @@ async def compute_dependency_health_signals(
         "duplicate_foundation_candidates": compute_duplicate_foundation_signal(
             list(active)
         ),
+    }
+
+
+def _coerce_count(value: Any) -> "int | None":
+    """Best-effort int coercion for a JSONB tally value; ``None`` when the value
+    is missing or non-numeric. Lives outside the aggregation loop so the
+    per-entry try/except does not incur the PERF203 in-loop overhead."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _merge_gate_outcome_in_window(
+    outcome: Dict[str, Any], window_start: "datetime"
+) -> bool:
+    """True when a ``recent_outcomes`` entry's ``at`` timestamp is at/after
+    ``window_start``. Defensive: a missing/non-string/unparseable ``at`` is
+    treated as out-of-window (dropped) rather than raising.
+    """
+    at = outcome.get("at")
+    if not isinstance(at, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(at)
+    except (ValueError, TypeError):
+        return False
+    return _coerce_naive_utc(parsed) >= window_start
+
+
+async def compute_merge_gate_fleet_health(
+    session: AsyncSession,
+    project_id: "uuid.UUID | None" = None,
+    window_start: "datetime | None" = None,
+) -> Dict[str, Any]:
+    """Fleet-wide no-CI merge-gate verification health — a READ-ONLY observability
+    signal that NEVER influences any merge decision.
+
+    Answers the systemic question no per-project view can: across every project
+    whose no-CI merge gate has run, what fraction of merges actually ran real
+    tests vs. fell open to an UNVERIFIED merge, which fall-open reason dominates,
+    and how many projects have a degraded gate. A systemically-broken gate (e.g.
+    broken provisioning) merges UNVERIFIED at scale while each project looks
+    individually unremarkable; this surfaces that aggregate.
+
+    Data source: per-project ``Project.merge_gate_runtime`` (written by
+    ``ci_resolution.record_no_ci_gate_runtime``) which carries ``recent_outcomes``
+    (a list capped at 20 of ``{"at": iso, "verified": bool, "reason": key|None}``)
+    and the all-time ``unverified_reason_counts`` tally. When ``window_start`` is
+    provided, ``recent_outcomes`` is Python-filtered to entries at/after it (the
+    list is small, so an in-memory filter is cheap and avoids JSONB date math).
+
+    Scoped to ``project_id`` when provided, else fleet-wide. Defensive against a
+    null / legacy four-key-only / malformed ``merge_gate_runtime`` so it can never
+    raise. Returns all-zero counts and ``None`` rates/reason when no project has
+    any gate data.
+    """
+    stmt = select(Project)
+    if project_id is not None:
+        stmt = stmt.where(Project.id == project_id)
+    projects = (await session.execute(stmt)).scalars().all()
+
+    verified_count = 0
+    fell_open_count = 0
+    degraded_project_count = 0
+    project_count = 0
+    reason_histogram: Dict[str, int] = {}
+
+    for project in projects:
+        raw = getattr(project, "merge_gate_runtime", None)
+        if not isinstance(raw, dict) or not raw:
+            continue
+
+        # Aggregate the all-time per-reason fall-open tally across the fleet so
+        # the dominant fall-open reason can be surfaced regardless of window.
+        raw_counts = raw.get("unverified_reason_counts")
+        if isinstance(raw_counts, dict):
+            for reason_key, count in raw_counts.items():
+                coerced = _coerce_count(count)
+                if coerced is not None:
+                    reason_histogram[str(reason_key)] = (
+                        reason_histogram.get(str(reason_key), 0) + coerced
+                    )
+
+        raw_outcomes = raw.get("recent_outcomes")
+        if not isinstance(raw_outcomes, list):
+            # Legacy four-key-only record (no rolling history) — no window
+            # activity to count.
+            continue
+        outcomes = [o for o in raw_outcomes if isinstance(o, dict)]
+        if window_start is not None:
+            outcomes = [
+                o for o in outcomes if _merge_gate_outcome_in_window(o, window_start)
+            ]
+        if not outcomes:
+            continue
+
+        project_count += 1
+        proj_verified = sum(1 for o in outcomes if o.get("verified"))
+        proj_fell_open = len(outcomes) - proj_verified
+        verified_count += proj_verified
+        fell_open_count += proj_fell_open
+        if proj_fell_open > 0:
+            degraded_project_count += 1
+
+    total = verified_count + fell_open_count
+    verification_rate = (verified_count / total) if total > 0 else None
+    most_common_reason = None
+    if reason_histogram:
+        # Deterministic tie-break: highest count, then reason key (mirrors
+        # ci_resolution.merge_gate_runtime_block's per-project tie-break).
+        most_common_reason = sorted(
+            reason_histogram.items(), key=lambda kv: (-kv[1], kv[0])
+        )[0][0]
+
+    return {
+        "verified_count": verified_count,
+        "fell_open_count": fell_open_count,
+        "verification_rate": verification_rate,
+        "most_common_reason": most_common_reason,
+        "degraded_project_count": degraded_project_count,
+        "project_count": project_count,
     }
 
 

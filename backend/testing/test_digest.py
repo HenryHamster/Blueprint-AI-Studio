@@ -260,6 +260,148 @@ async def test_digest_migration_health(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_digest_merge_gate_fleet_health_verified(client: AsyncClient, db_session):
+    """Fleet with verified merges: verified_count matches, verification_rate is
+    correct, degraded_project_count is 0 (no fall-opens)."""
+    now_iso = _utcnow().isoformat()
+    p1 = make_project(
+        merge_gate_runtime={
+            "last_run_at": now_iso,
+            "executed_real_tests": True,
+            "recent_outcomes": [
+                {"at": now_iso, "verified": True, "reason": None},
+                {"at": now_iso, "verified": True, "reason": None},
+            ],
+        }
+    )
+    p2 = make_project(
+        merge_gate_runtime={
+            "last_run_at": now_iso,
+            "executed_real_tests": True,
+            "recent_outcomes": [
+                {"at": now_iso, "verified": True, "reason": None},
+            ],
+        }
+    )
+    db_session.add_all([p1, p2])
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    mg = response.json()["merge_gate_fleet_health"]
+    assert mg["verified_count"] == 3
+    assert mg["fell_open_count"] == 0
+    assert mg["verification_rate"] == 1.0
+    assert mg["most_common_reason"] is None
+    assert mg["degraded_project_count"] == 0
+    assert mg["project_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_digest_merge_gate_fleet_health_fell_open(client: AsyncClient, db_session):
+    """Fleet with fell-open merges: fell_open_count and most_common_reason are
+    correct, degraded_project_count reflects projects with falls."""
+    now_iso = _utcnow().isoformat()
+    # Degraded project: 1 verified + 2 fell-open (probe_passed dominates).
+    degraded = make_project(
+        merge_gate_runtime={
+            "last_run_at": now_iso,
+            "executed_real_tests": False,
+            "recent_outcomes": [
+                {"at": now_iso, "verified": True, "reason": None},
+                {"at": now_iso, "verified": False, "reason": "probe_passed"},
+                {"at": now_iso, "verified": False, "reason": "suite_all_skipped"},
+            ],
+            "unverified_reason_counts": {"probe_passed": 2, "suite_all_skipped": 1},
+        }
+    )
+    # Healthy project: all verified, contributes no fall-opens.
+    healthy = make_project(
+        merge_gate_runtime={
+            "last_run_at": now_iso,
+            "executed_real_tests": True,
+            "recent_outcomes": [
+                {"at": now_iso, "verified": True, "reason": None},
+            ],
+        }
+    )
+    db_session.add_all([degraded, healthy])
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    mg = response.json()["merge_gate_fleet_health"]
+    assert mg["verified_count"] == 2
+    assert mg["fell_open_count"] == 2
+    assert mg["verification_rate"] == 0.5
+    assert mg["most_common_reason"] == "probe_passed"
+    assert mg["degraded_project_count"] == 1
+    assert mg["project_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_digest_merge_gate_fleet_health_empty(client: AsyncClient, db_session):
+    """Empty fleet (no projects with gate data): signal is present with zero
+    counts and does not crash; legacy/malformed records are tolerated."""
+    # A project with no merge_gate_runtime at all, plus one with a legacy
+    # four-key-only record (no recent_outcomes) and one with a malformed value.
+    p_none = make_project()
+    p_legacy = make_project(
+        merge_gate_runtime={
+            "last_run_at": _utcnow().isoformat(),
+            "executed_real_tests": True,
+        }
+    )
+    p_malformed = make_project(merge_gate_runtime={"recent_outcomes": "not-a-list"})
+    db_session.add_all([p_none, p_legacy, p_malformed])
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    mg = response.json()["merge_gate_fleet_health"]
+    assert mg == {
+        "verified_count": 0,
+        "fell_open_count": 0,
+        "verification_rate": None,
+        "most_common_reason": None,
+        "degraded_project_count": 0,
+        "project_count": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_digest_merge_gate_fleet_health_window_filters_stale(
+    client: AsyncClient, db_session
+):
+    """recent_outcomes entries older than the digest window are excluded; only
+    in-window entries count toward verified/fell-open totals."""
+    now_iso = _utcnow().isoformat()
+    stale_iso = (_utcnow() - timedelta(days=30)).isoformat()
+    project = make_project(
+        merge_gate_runtime={
+            "last_run_at": now_iso,
+            "executed_real_tests": True,
+            "recent_outcomes": [
+                {"at": stale_iso, "verified": False, "reason": "probe_passed"},
+                {"at": now_iso, "verified": True, "reason": None},
+            ],
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    mg = response.json()["merge_gate_fleet_health"]
+    # The stale fell-open entry is filtered out by the window; only the recent
+    # verified entry remains.
+    assert mg["verified_count"] == 1
+    assert mg["fell_open_count"] == 0
+    assert mg["project_count"] == 1
+    assert mg["degraded_project_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_digest_aggregates_merge_retries_saved(client: AsyncClient, db_session):
     """total_merge_retries_saved sums _merge_retries_saved across completed+failed tasks;
     merge_early_exit_count counts tasks with a positive saved value."""
@@ -6064,6 +6206,7 @@ async def test_digest_top_level_schema_keys(client: AsyncClient):
         "narrative_summary",
         "total_estimated_cost_usd",
         "migration_health",
+        "merge_gate_fleet_health",
         "failure_groups",
         "recurring_error_clusters",
         "recurring_patterns",

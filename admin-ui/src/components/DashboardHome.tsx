@@ -49,6 +49,7 @@ import { ResearchYieldFunnel } from './ResearchYieldFunnel';
 import { OpenResidualCasesSection } from './OpenResidualCasesSection';
 import { RejectionPatternSummary } from './RejectionPatternSummary';
 import { RecentMergesTimeline } from './RecentMergesTimeline';
+import { MergeGateFleetHealthCard } from './MergeGateFleetHealthCard';
 import type { Task } from '../types/task';
 import type { Project } from '../types/project';
 import { assertDigestContract, type DigestData as DigestDataBase, type FailureGroup } from '../types/digest';
@@ -759,6 +760,13 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
         {/* Section 4: Recent Merge Timeline */}
         <div className="lg:col-span-1">
           <RecentMergesTimeline mergeEvents={mergeEvents} loading={loading} />
+
+          {/* Fleet-wide no-CI merge-gate verification health (read-only) */}
+          {digest?.merge_gate_fleet_health && digest.merge_gate_fleet_health.project_count > 0 && (
+            <div className="mt-4">
+              <MergeGateFleetHealthCard data={digest.merge_gate_fleet_health} />
+            </div>
+          )}
 
           {/* Direction auto-pause/recovery observability */}
           <div className="mt-4">
