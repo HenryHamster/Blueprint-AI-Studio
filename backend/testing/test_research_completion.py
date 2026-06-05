@@ -2913,6 +2913,80 @@ async def test_co_deferred_dependent_retains_explicit_prerequisite(
 
 
 @_pytest.mark.asyncio
+async def test_batch_cap_deferred_foundation_co_defers_dependent(db_session, mocker):
+    """When the per-cycle batch cap drops a foundation finding but keeps a
+    higher-priority finding that depends on it, the dependent must NOT spawn as a
+    live, foundation-less child. The cap-time index remap previously dropped the
+    dependent->foundation edge silently, spawning the dependent ungated. Instead
+    the dependent is co-deferred alongside its foundation (mirroring the same-cycle
+    prerequisite co-deferral) so the pair re-surfaces together next cycle."""
+    import app.shared_state as _ss
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-bcap01")
+    # Foundation is LOW priority so the cap ranks it out; the dependent is HIGH
+    # priority so it survives the cap and would otherwise spawn against a
+    # foundation that does not yet exist.
+    foundation = _make_finding(
+        title="Define batch-capped foundation",
+        direction_id=direction["id"],
+        priority="low",
+    )
+    dependent = _make_finding(
+        title="Build on batch-capped foundation",
+        direction_id=direction["id"],
+        priority="high",
+    )
+    dependent["depends_on_indices"] = [0]
+
+    _patch_research_externals(mocker)
+    # Force _effective_cap == 1: zero free VM slots floors _cap_by_slots to 1.
+    mocker.patch.object(_ss, "tasks_active_gauge", 999)
+    mocker.patch.object(_ss, "tasks_queued_gauge", 0)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[foundation, dependent],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    live = {
+        TaskStatus.QUEUED,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.PROVISIONING,
+        TaskStatus.EVALUATING,
+    }
+    dependent_children = [c for c in children if c.title == dependent["title"]]
+    assert not any(c.status in live for c in dependent_children), (
+        "the dependent must NOT spawn as a live, foundation-less task when its "
+        "foundation was dropped by the batch cap"
+    )
+
+    # The dependent is co-deferred (batch_cap) alongside its foundation, so both
+    # re-surface together next cycle.
+    deferred = (task.context or {}).get("deferred_findings", [])
+    by_hash = {f.get("finding_hash"): f for f in deferred}
+    foundation_hash = _finding_hash(foundation["title"], foundation["description"])
+    dependent_hash = _finding_hash(dependent["title"], dependent["description"])
+    assert foundation_hash in by_hash, "the batch-capped foundation must be shelved"
+    assert dependent_hash in by_hash, "the co-deferred dependent must be shelved"
+    assert by_hash[dependent_hash]["deferred_reason"] == "batch_cap", (
+        "the dependent must be co-deferred under the batch_cap reason, not spawned"
+    )
+
+
+@_pytest.mark.asyncio
 async def test_independent_deferred_finding_keeps_throttle(db_session, mocker):
     """A deferred finding with NO live dependent keeps the existing throttle: it is
     shelved under its own (low_actionability) reason and is NOT re-tagged as a
@@ -3440,3 +3514,43 @@ class TestDuplicateNeedDeduplication:
             "kind": "capability",
             "ref": "shared-foundation",
         }, "the explicit prerequisite must not be dropped on co-deferral"
+
+
+class TestBreakFindingDependencyCycles:
+    """_break_dependency_cycles: minimally break a cycle in declared finding
+    edges, preserving valid prerequisite chains elsewhere in the batch."""
+
+    def test_mixed_batch_keeps_valid_chain_breaks_only_cycle(self):
+        from app.plan_completion import (
+            _break_dependency_cycles,
+            _validate_plan_dependencies,
+        )
+
+        # Findings 0<->1 form a 2-cycle; findings 2->3->4 is a valid linear
+        # prerequisite chain that must survive untouched.
+        findings = [
+            {"title": "cycle-a", "depends_on_indices": [1]},
+            {"title": "cycle-b", "depends_on_indices": [0]},
+            {"title": "chain-leaf", "depends_on_indices": []},
+            {"title": "chain-mid", "depends_on_indices": [2]},
+            {"title": "chain-top", "depends_on_indices": [3]},
+        ]
+
+        dropped = _break_dependency_cycles(findings, "RESEARCH")
+
+        # The graph is now acyclic.
+        assert _validate_plan_dependencies(findings)
+        # Exactly one edge was dropped to break the 2-cycle.
+        assert len(dropped) == 1
+        # The valid chain's edges survive intact.
+        assert findings[3]["depends_on_indices"] == [2]
+        assert findings[4]["depends_on_indices"] == [3]
+        # Only one of the two mutually-cyclic edges remains; the cycle is gone.
+        remaining_cycle_edges = bool(findings[0].get("depends_on_indices")) + bool(
+            findings[1].get("depends_on_indices")
+        )
+        assert remaining_cycle_edges == 1
+        # The dropped record names the offending edge for observability.
+        rec = dropped[0]
+        assert {rec["successor_index"], rec["predecessor_index"]} == {0, 1}
+        assert rec["successor"] in {"cycle-a", "cycle-b"}

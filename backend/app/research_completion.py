@@ -115,6 +115,7 @@ from app.task_locking import (
 )
 from app.plan_completion import (
     _validate_plan_dependencies,
+    _break_dependency_cycles,
     _log_file_overlaps,
     TASK_PRIORITY_MAP,
 )
@@ -1357,8 +1358,28 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 pair[1].get("priority", "medium"), 1
             ),
         )
-        _kept_orig_indices = sorted(i for i, _ in _ranked[:_effective_cap])
-        _kept_set = set(_kept_orig_indices)
+        _kept_set = {i for i, _ in _ranked[:_effective_cap]}
+        # Co-defer any kept finding whose depends_on_indices points at a finding the
+        # cap dropped. Without this, the index remap below silently DROPS that edge
+        # (the target index is not in _old_to_new), and the dependent spawns as an
+        # ordinary child with no edge and no blocking need — dispatching against a
+        # foundation that does not exist yet. Mirror the same-cycle prerequisite
+        # co-deferral: shelve the dependent alongside its deferred foundation so the
+        # pair re-surfaces together next cycle. Iterate to a fixpoint so an entire
+        # dependent chain co-defers, never just the leaf.
+        while True:
+            _co_defer = {
+                i
+                for i in _kept_set
+                if any(
+                    0 <= d < len(findings) and d not in _kept_set
+                    for d in (findings[i].get("depends_on_indices") or [])
+                )
+            }
+            if not _co_defer:
+                break
+            _kept_set -= _co_defer
+        _kept_orig_indices = sorted(_kept_set)
         _batch_cap_deferred = [f for i, f in enumerate(findings) if i not in _kept_set]
         _old_to_new = {old: new for new, old in enumerate(_kept_orig_indices)}
         findings = [findings[i] for i in _kept_orig_indices]
@@ -1402,13 +1423,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         return
     task = relocked
 
-    # Validate dependencies if present
+    # Validate dependencies if present. On a cycle, break it MINIMALLY — drop
+    # only the edges that close a cycle (mirroring the plan path) rather than
+    # wholesale-discarding every declared edge, so valid prerequisite chains
+    # elsewhere in the batch keep gating their dependents.
     if not _validate_plan_dependencies(findings):
+        _dropped_cycle_edges = _break_dependency_cycles(findings, "RESEARCH")
         logger.warning(
-            "[RESEARCH] Findings have circular dependencies — ignoring depends_on_indices"
+            "[RESEARCH] Findings have circular dependencies — broke %d cycle-closing "
+            "edge(s), preserved the remaining declarations",
+            len(_dropped_cycle_edges),
         )
-        for f in findings:
-            f.pop("depends_on_indices", None)
+        if _dropped_cycle_edges:
+            _ctx = dict(task.context or {})
+            _ctx["dropped_finding_cycle_edges"] = _dropped_cycle_edges
+            task.context = _ctx
 
     # Query active/queued tasks for word-overlap deduplication
     existing_tasks = (

@@ -255,6 +255,55 @@ def _resolve_injected_cycles(
     return dropped
 
 
+def _break_dependency_cycles(items: List[Dict], label: str = "PLAN") -> List[Dict]:
+    """Minimally break dependency cycles in declared ``depends_on_indices`` edges.
+
+    Unlike :func:`_resolve_injected_cycles` (which distinguishes injected
+    conflict-prevention edges from explicit declarations), this treats EVERY
+    declared edge as a candidate and drops only the smallest set needed to make
+    the graph acyclic: each edge is greedily re-added on top of an empty
+    baseline and dropped only if it would close a cycle. Valid prerequisite
+    chains elsewhere in the batch survive intact instead of being collapsed by
+    one bad edge.
+
+    Mutates ``items`` in place and returns a list of dropped-edge records
+    (successor/predecessor indices and titles) so the caller can record WHICH
+    edges were removed and WHY.
+    """
+    # Snapshot declared edges, then reset to an empty baseline.
+    declared: List[tuple] = []
+    for successor, item in enumerate(items):
+        for predecessor in item.get("depends_on_indices", []) or []:
+            declared.append((successor, predecessor))
+        item.pop("depends_on_indices", None)
+
+    dropped: List[Dict] = []
+    for successor, predecessor in declared:
+        existing = items[successor].setdefault("depends_on_indices", [])
+        if predecessor in existing:
+            continue
+        existing.append(predecessor)
+        if _validate_plan_dependencies(items):
+            continue
+        # This edge closes a cycle — drop it and record why.
+        existing.remove(predecessor)
+        if not existing:
+            items[successor].pop("depends_on_indices", None)
+        record = {
+            "successor_index": successor,
+            "predecessor_index": predecessor,
+            "successor": items[successor].get("title", f"#{successor}"),
+            "predecessor": items[predecessor].get("title", f"#{predecessor}"),
+        }
+        dropped.append(record)
+        logger.warning(
+            f"[{label}] Dropped dependency edge "
+            f"{record['predecessor']!r} → {record['successor']!r}: it would "
+            f"close a dependency cycle; other declared edges preserved."
+        )
+    return dropped
+
+
 async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     """Parse plan output and create child tasks with dependency tracking."""
     from app.alert_dispatch import _maybe_create_failure_alert
