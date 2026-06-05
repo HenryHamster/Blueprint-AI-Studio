@@ -7,15 +7,15 @@ function CopyableMessageRef({ msgId }: { msgId: string }) {
   const [copied, setCopied] = useState(false);
   const shortRef = msgId.slice(0, 8);
   const copy = useCallback(() => {
-    navigator.clipboard?.writeText(shortRef).then(() => {
+    navigator.clipboard?.writeText(msgId).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     }).catch(() => {/* clipboard unavailable */});
-  }, [shortRef]);
+  }, [msgId]);
   return (
     <button
       onClick={copy}
-      title="Copy message short ref"
+      title="Copy message ref"
       className="inline-flex items-center gap-1 font-mono text-[10px] text-neutral-600 hover:text-neutral-400 transition-colors"
     >
       {copied ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}

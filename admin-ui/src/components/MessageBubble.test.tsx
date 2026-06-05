@@ -159,9 +159,9 @@ describe('MessageBubble', () => {
     const writeTextMock = vi.fn().mockResolvedValue(undefined);
     vi.spyOn(navigator.clipboard, 'writeText').mockImplementation(writeTextMock);
     render(<MessageBubble {...makeProps({ msg: makeMsg({ id: msgId }) })} />);
-    const copyBtn = screen.getByTitle('Copy message short ref');
+    const copyBtn = screen.getByTitle('Copy message ref');
     fireEvent.click(copyBtn);
-    expect(writeTextMock).toHaveBeenCalledWith('abcdef01');
+    expect(writeTextMock).toHaveBeenCalledWith('abcdef0123456789abcdef');
   });
 
   test('copy message ref shows check icon after successful copy', async () => {
@@ -169,7 +169,7 @@ describe('MessageBubble', () => {
     const writeTextMock = vi.fn().mockResolvedValue(undefined);
     vi.spyOn(navigator.clipboard, 'writeText').mockImplementation(writeTextMock);
     render(<MessageBubble {...makeProps({ msg: makeMsg({ id: msgId }) })} />);
-    const copyBtn = screen.getByTitle('Copy message short ref');
+    const copyBtn = screen.getByTitle('Copy message ref');
     fireEvent.click(copyBtn);
     expect(screen.getByTestId('message-bubble')).toBeTruthy();
   });
