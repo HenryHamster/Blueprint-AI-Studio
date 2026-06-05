@@ -12,11 +12,12 @@ import fs from 'fs';
 import { readFile } from 'node:fs/promises';
 import {
   detectTestRunners, detectAutoTestRunners, describeRunnerDirectory,
-  classifySetupFailure, classifyTestExecution,
+  classifySetupFailure, classifyTestExecution, extractTestCoverage,
   matchesEnvironmentFailureSignature,
   detectAcceptanceProbes, classifyProbeOutcome, buildWroteNewOutput,
   isSafeDocumentedCommand, isAllowlistedRunnerShape, discoverDocumentedCommands,
   MAX_DOCUMENTED_COMMANDS,
+  discoverNewlyDisabledTests, isTestFilePath, MAX_DISABLED_TEST_MARKERS,
 } from './test-runners.js';
 import type { BuildConfig, TestRunner } from './test-runners.js';
 
@@ -1721,6 +1722,135 @@ describe('classifyTestExecution — all-skipped (no real tests executed)', () =>
   });
 });
 
+// extractTestCoverage parses best-effort pass/skip/total counts from runner
+// output so a green PASS that ran only a tiny fraction of its suite ("5 passed,
+// 1500 skipped") is no longer indistinguishable from a fully exercised pass. It
+// reuses the SAME token/regex families classifyTestExecution understands and is
+// CONSERVATIVE: ambiguous / unparseable output returns null.
+describe('extractTestCoverage — pass/skip/total parsing', () => {
+  describe('standalone-token families (partial skip)', () => {
+    it('pytest "5 passed, 1500 skipped" → {5, 1500, 1505}', () => {
+      expect(extractTestCoverage('===== 5 passed, 1500 skipped in 3.45s =====')).toEqual({
+        passed: 5, skipped: 1500, total: 1505,
+      });
+    });
+
+    it('pytest deselected counted as skipped', () => {
+      expect(extractTestCoverage('===== 1 passed, 4 deselected in 0.10s =====')).toEqual({
+        passed: 1, skipped: 4, total: 5,
+      });
+    });
+
+    it('vitest summary ignores the Test Files line (no double count)', () => {
+      expect(extractTestCoverage([
+        ' Test Files  1 passed (1)',
+        '      Tests  5 passed | 1500 skipped (1505)',
+      ].join('\n'))).toEqual({ passed: 5, skipped: 1500, total: 1505 });
+    });
+
+    it('Rust ignored + filtered out both counted as skipped', () => {
+      expect(extractTestCoverage(
+        'test result: ok. 5 passed; 0 failed; 3 ignored; 0 measured; 1 filtered out; finished',
+      )).toEqual({ passed: 5, skipped: 4, total: 9 });
+    });
+
+    it('Go verbose --- PASS:/--- SKIP: markers are tallied', () => {
+      expect(extractTestCoverage([
+        '--- PASS: TestAlpha (0.00s)',
+        '--- PASS: TestBeta (0.00s)',
+        '--- SKIP: TestGamma (0.00s)',
+        'PASS',
+        'ok  example.com/pkg 0.012s',
+      ].join('\n'))).toEqual({ passed: 2, skipped: 1, total: 3 });
+    });
+  });
+
+  describe('aggregate families (single summary line)', () => {
+    it('RSpec examples/pending → derives passed from total', () => {
+      expect(extractTestCoverage('5 examples, 0 failures, 3 pending')).toEqual({
+        passed: 2, skipped: 3, total: 5,
+      });
+    });
+
+    it('Minitest runs/skips', () => {
+      expect(extractTestCoverage('5 runs, 12 assertions, 0 failures, 0 errors, 2 skips')).toEqual({
+        passed: 3, skipped: 2, total: 5,
+      });
+    });
+
+    it('ExUnit tests/skipped', () => {
+      expect(extractTestCoverage('5 tests, 0 failures, 2 skipped')).toEqual({
+        passed: 3, skipped: 2, total: 5,
+      });
+    });
+
+    it('ExUnit excluded counted as skipped', () => {
+      expect(extractTestCoverage('5 tests, 0 failures, 4 excluded')).toEqual({
+        passed: 1, skipped: 4, total: 5,
+      });
+    });
+
+    it('Surefire/Maven "Tests run:"/"Skipped:" (minus failures)', () => {
+      expect(extractTestCoverage('Tests run: 5, Failures: 1, Errors: 0, Skipped: 2')).toEqual({
+        passed: 2, skipped: 2, total: 5,
+      });
+    });
+
+    it('.NET "Total:"/"Skipped:"', () => {
+      expect(extractTestCoverage('Passed!  - Failed: 0, Passed: 0, Skipped: 5, Total: 5')).toEqual({
+        passed: 0, skipped: 5, total: 5,
+      });
+    });
+
+    it('PHPUnit "Tests:"/"Skipped:"', () => {
+      expect(extractTestCoverage('Tests: 5, Assertions: 12, Failures: 1, Skipped: 2')).toEqual({
+        passed: 2, skipped: 2, total: 5,
+      });
+    });
+  });
+
+  describe('fully-exercised runs (zero skipped)', () => {
+    it('pytest all-pass → skipped 0', () => {
+      expect(extractTestCoverage('===== 42 passed in 1.20s =====')).toEqual({
+        passed: 42, skipped: 0, total: 42,
+      });
+    });
+
+    it('Surefire all-pass → skipped 0', () => {
+      expect(extractTestCoverage('Tests run: 8, Failures: 0, Errors: 0, Skipped: 0')).toEqual({
+        passed: 8, skipped: 0, total: 8,
+      });
+    });
+  });
+
+  describe('multi-class / multi-project summation', () => {
+    it('sums Surefire counts across two class summaries', () => {
+      expect(extractTestCoverage([
+        'Tests run: 3, Failures: 0, Errors: 0, Skipped: 0',
+        'Tests run: 2, Failures: 0, Errors: 0, Skipped: 2',
+      ].join('\n'))).toEqual({ passed: 3, skipped: 2, total: 5 });
+    });
+  });
+
+  describe('unparseable / ambiguous output → null', () => {
+    it('empty string → null', () => {
+      expect(extractTestCoverage('')).toBeNull();
+    });
+
+    it('no recognizable count tokens → null', () => {
+      expect(extractTestCoverage('some unrelated build log\nDone.')).toBeNull();
+    });
+
+    it('Go non-verbose pass (no counts) → null', () => {
+      expect(extractTestCoverage('ok  example.com/pkg 0.5s')).toBeNull();
+    });
+
+    it('inconsistent aggregate (skipped > total) → null', () => {
+      expect(extractTestCoverage('Tests run: 2, Failures: 0, Errors: 0, Skipped: 5')).toBeNull();
+    });
+  });
+});
+
 describe('classifySetupFailure — bootstrap/setup infrastructure detection', () => {
   it('detects missing runtimes and package-manager tools via line-anchored command-not-found output', () => {
     expect(classifySetupFailure('bash: python3: command not found')).toBe(true);
@@ -2568,5 +2698,145 @@ describe('discoverDocumentedCommands', () => {
       workspace: WS,
     });
     expect(cmds).toHaveLength(0);
+  });
+});
+
+// ── isTestFilePath (test-file path heuristics) ───────────────────────────────
+describe('isTestFilePath', () => {
+  it('recognizes the common per-ecosystem test-file conventions', () => {
+    expect(isTestFilePath('src/foo.test.ts')).toBe(true);
+    expect(isTestFilePath('src/foo.spec.tsx')).toBe(true);
+    expect(isTestFilePath('pkg/server_test.go')).toBe(true);
+    expect(isTestFilePath('backend/test_thing.py')).toBe(true);
+    expect(isTestFilePath('backend/thing_test.py')).toBe(true);
+    expect(isTestFilePath('spec/models/user_spec.rb')).toBe(true);
+    expect(isTestFilePath('app/tests/helpers.py')).toBe(true);
+    expect(isTestFilePath('app/__tests__/util.js')).toBe(true);
+  });
+
+  it('rejects non-test source/prose paths', () => {
+    expect(isTestFilePath('src/app.ts')).toBe(false);
+    expect(isTestFilePath('README.md')).toBe(false);
+    expect(isTestFilePath('backend/app/models.py')).toBe(false);
+    expect(isTestFilePath('docs/testing.md')).toBe(false); // mentions "test" in prose, not a test file
+    expect(isTestFilePath('')).toBe(false);
+  });
+});
+
+// ── discoverNewlyDisabledTests (diff-aware newly-introduced skip markers) ─────
+describe('discoverNewlyDisabledTests', () => {
+  it('detects a newly added JS/TS it.skip in a test file', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['src/foo.test.ts'],
+      addedLinesByFile: { 'src/foo.test.ts': ['it.skip("flaky", () => {', '  expect(1).toBe(1);'] },
+    });
+    expect(markers).toHaveLength(1);
+    expect(markers[0].file).toBe('src/foo.test.ts');
+    expect(markers[0].marker).toBe('it.skip');
+    expect(markers[0].line).toBe('it.skip("flaky", () => {');
+  });
+
+  it('detects xit / xdescribe / describe.skip / test.skip variants', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['a.test.js', 'b.spec.ts'],
+      addedLinesByFile: {
+        'a.test.js': ['xit("x", () => {})', 'xdescribe("grp", () => {})'],
+        'b.spec.ts': ['describe.skip("d", () => {})', 'test.skip("t", () => {})'],
+      },
+    });
+    expect(markers.map(m => m.marker).sort()).toEqual(
+      ['describe.skip', 'test.skip', 'xdescribe', 'xit'],
+    );
+  });
+
+  it('detects Python pytest markers and unittest decorators, keeping skip vs skipif distinct', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['test_mod.py'],
+      addedLinesByFile: {
+        'test_mod.py': [
+          '@pytest.mark.skip(reason="broken")',
+          '@pytest.mark.skipif(sys.platform == "win32", reason="x")',
+          '@pytest.mark.xfail',
+          '@unittest.skip("later")',
+        ],
+      },
+    });
+    expect(markers.map(m => m.marker)).toEqual([
+      '@pytest.mark.skip',
+      '@pytest.mark.skipif',
+      '@pytest.mark.xfail',
+      '@unittest.skip',
+    ]);
+  });
+
+  it('detects Go t.Skip(, Rust #[ignore], and JUnit @Disabled/@Ignore', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['svc_test.go', 'lib/tests/mod.rs', 'src/test/java/AppTest.java'],
+      addedLinesByFile: {
+        'svc_test.go': ['\tt.Skip("not yet")'],
+        'lib/tests/mod.rs': ['#[ignore]'],
+        'src/test/java/AppTest.java': ['@Disabled', '@Ignore'],
+      },
+    });
+    expect(markers.map(m => m.marker).sort()).toEqual(
+      ['#[ignore]', '@Disabled', '@Ignore', 't.Skip()'],
+    );
+  });
+
+  it('only counts the PR\'s OWN added lines — a pre-existing skip (no added entry) is ignored', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['src/foo.test.ts'],
+      // The file changed but the skip line is pre-existing (not in added lines).
+      addedLinesByFile: { 'src/foo.test.ts': ['const x = 2;'] },
+    });
+    expect(markers).toHaveLength(0);
+  });
+
+  it('ignores skip markers added to NON-test files (path heuristic guards prose/source)', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['src/app.ts', 'README.md'],
+      addedLinesByFile: {
+        'src/app.ts': ['const describe = { skip: true };'], // not a test file
+        'README.md': ['Use it.skip to skip a test'],        // prose, not a test file
+      },
+    });
+    expect(markers).toHaveLength(0);
+  });
+
+  it('does not false-positive on commented-out marker mentions in a test file', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['foo.test.ts', 'test_x.py'],
+      addedLinesByFile: {
+        'foo.test.ts': ['// it.skip is deprecated, do not use', '* describe.skip example'],
+        'test_x.py': ['# @pytest.mark.skip is discouraged here'],
+      },
+    });
+    expect(markers).toHaveLength(0);
+  });
+
+  it('still detects a Rust #[ignore] attribute (not treated as a comment despite leading #)', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['lib/tests/mod.rs'],
+      addedLinesByFile: { 'lib/tests/mod.rs': ['#[ignore = "slow"]'] },
+    });
+    expect(markers).toHaveLength(1);
+    expect(markers[0].marker).toBe('#[ignore]');
+  });
+
+  it('caps reported markers at MAX_DISABLED_TEST_MARKERS', () => {
+    const many = Array.from({ length: MAX_DISABLED_TEST_MARKERS + 5 }, (_, i) => `it.skip("t${i}", () => {})`);
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['big.test.ts'],
+      addedLinesByFile: { 'big.test.ts': many },
+    });
+    expect(markers).toHaveLength(MAX_DISABLED_TEST_MARKERS);
+  });
+
+  it('returns nothing when no test files changed', () => {
+    const markers = discoverNewlyDisabledTests({
+      changedFiles: ['src/app.ts'],
+      addedLinesByFile: { 'src/app.ts': ['it.skip("x")'] },
+    });
+    expect(markers).toHaveLength(0);
   });
 });

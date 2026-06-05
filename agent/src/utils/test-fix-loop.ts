@@ -40,7 +40,7 @@ import {
   detectTestRunners, isDockerRunner,
   parseFailingTests, buildTargetedPytestRunners,
   classifySetupFailure, classifyTestExecution, matchesEnvironmentFailureSignature,
-  runnerFromCommand,
+  extractTestCoverage, runnerFromCommand,
 } from './test-runners.js';
 
 // Build + buffer a FixLoopEvent from one wrapper-loop iteration. Centralized
@@ -481,7 +481,7 @@ export async function testFixLoop(
   relatedFiles?: string[],
   analysisContext?: string,
   options: TestFixLoopOptions = {},
-): Promise<{ passed: boolean; testFailuresDetected: boolean; setupFailed?: boolean; partialSetupFailed?: boolean; failureSummary?: string; noTestsExecuted?: boolean; noTestsReason?: 'all_skipped' | 'no_real_tests' }> {
+): Promise<{ passed: boolean; testFailuresDetected: boolean; setupFailed?: boolean; partialSetupFailed?: boolean; failureSummary?: string; noTestsExecuted?: boolean; noTestsReason?: 'all_skipped' | 'no_real_tests'; coverage?: { passed: number; skipped: number; total: number } }> {
   let runners = options.runnersOverride ?? detectTestRunners(buildConfig);
   const targetPytestSelectors = Array.from(new Set(options.targetPytestSelectors ?? []));
 
@@ -569,6 +569,12 @@ export async function testFixLoop(
     // so the caller doesn't push unverified code.
     const setupErrors: Array<{ label: string; message: string }> = [];
     let ranAnyRunner = false;
+    // Accumulate each runner's raw combined output (pass output + real-failure
+    // output) so a best-effort pass/skip/total coverage summary can be parsed
+    // BEFORE the per-runner output is discarded. Reset per attempt so coverage
+    // reflects the run actually being reported. Setup/timeout/env errors route
+    // to setupErrors and are intentionally excluded (no real suite output).
+    const runnerOutputs: string[] = [];
     // Track whether ANY runner's output indicates a real test actually
     // executed (vs. a placeholder command or a zero-test collection). Used to
     // distinguish "a suite ran and produced a verdict" from "no real tests
@@ -724,6 +730,7 @@ export async function testFixLoop(
         const runnerTimeout = isDockerRunner(runner) ? TEST_RUNNER_DOCKER_TIMEOUT : TEST_RUNNER_TIMEOUT;
         const passOutput = await execFileAsync(runner.cmd, runArgs, { cwd: runner.cwd, timeoutMs: runnerTimeout });
         ranAnyRunner = true;
+        runnerOutputs.push(passOutput);
         // A clean exit only counts as a real verdict if real tests ran. An
         // empty/zero-test suite that exits 0 must not be recorded as a
         // verified pass.
@@ -767,6 +774,7 @@ export async function testFixLoop(
         // Non-timeout, non-env-failure, non-zero exit = the runner ran the
         // suite and at least one test failed. Record the failure.
         ranAnyRunner = true;
+        runnerOutputs.push(msg);
         // A non-zero exit from a placeholder command (e.g. the default `npm`
         // "no test specified" script) is NOT a real test failure. Only count
         // this as a real test executing when the output isn't a no-tests
@@ -791,6 +799,13 @@ export async function testFixLoop(
         }
       }
     }
+
+    // Best-effort coverage summary (pass/skip/total) parsed from the combined
+    // runner output of THIS attempt. Conservative: extractTestCoverage returns
+    // null (→ undefined here) for ambiguous/unparseable output, in which case
+    // the field is simply omitted from the verdict. Visibility only — never
+    // changes pass/fail or detected.
+    const coverage = extractTestCoverage(runnerOutputs.join('\n')) ?? undefined;
 
     // Partial-setup detection: at least one runner ran AND at least one OTHER
     // runner failed setup/environment. The failed runner's suite never
@@ -852,6 +867,7 @@ export async function testFixLoop(
       return {
         passed: true, testFailuresDetected: false, noTestsExecuted,
         noTestsReason: noTestsExecuted ? (sawAllSkipped ? 'all_skipped' : 'no_real_tests') : undefined,
+        coverage,
       };
     }
 
@@ -911,7 +927,7 @@ export async function testFixLoop(
       });
       sendLog(ws, `Test failures unchanged from previous attempt — exiting early (persistent, unfixable by Claude).\n`);
       const failureSummary = combinedFailures.slice(-8000) + setupNote;
-      return { passed: false, testFailuresDetected: true, failureSummary, partialSetupFailed: partialSetupFailed || undefined };
+      return { passed: false, testFailuresDetected: true, failureSummary, partialSetupFailed: partialSetupFailed || undefined, coverage };
     }
     fingerprintHistory.push(fingerprint);
     errorTextHistory.push(combinedFailures);
@@ -924,7 +940,7 @@ export async function testFixLoop(
       });
       sendLog(ws, `Test fix loop divergence detected (${divergence}) — abandoning to avoid wasted iterations.\n`);
       const failureSummary = combinedFailures.slice(-8000) + setupNote;
-      return { passed: false, testFailuresDetected: true, failureSummary, partialSetupFailed: partialSetupFailed || undefined };
+      return { passed: false, testFailuresDetected: true, failureSummary, partialSetupFailed: partialSetupFailed || undefined, coverage };
     }
     // On retry (attempt >= 1), record what the previous Claude call
     // actually changed + the test failures that persisted, so the next
@@ -1026,6 +1042,7 @@ export async function testFixLoop(
         passed: false, testFailuresDetected: true, failureSummary, noTestsExecuted,
         noTestsReason: noTestsExecuted ? (sawAllSkipped ? 'all_skipped' : 'no_real_tests') : undefined,
         partialSetupFailed: partialSetupFailed || undefined,
+        coverage,
       };
     }
   }

@@ -12,6 +12,7 @@ import {
   detectAcceptanceProbes, classifyProbeOutcome, detectProvisioningSteps,
   buildWroteNewOutput,
   discoverDocumentedCommands, runnerFromCommand, MAX_DOCUMENTED_COMMANDS,
+  discoverNewlyDisabledTests, MAX_DISABLED_TEST_MARKERS,
   type BuildConfig, type TestRunner, type AcceptanceProbe, type DocumentedCommand,
 } from '../utils/test-runners.js';
 import { testFixLoop } from '../utils/test-fix-loop.js';
@@ -62,6 +63,16 @@ interface VerifyTestsResult {
   // (`no_real_tests`) versus "no detectable suite" (`no_suite`). Additive: only
   // set on the detected=false fall-open paths; never changes existing behaviour.
   noTestsReason?: 'all_skipped' | 'no_real_tests' | 'no_suite';
+  // Best-effort pass/skip/total coverage summary parsed from the runner output
+  // on the path where a real suite was DETECTED and RAN (both the passed and
+  // failed branches). Lets the backend / task drawer surface a green PASS that
+  // exercised only a tiny fraction of its suite (e.g. "5 passed, 1500 skipped")
+  // instead of an indistinguishable "PASSED". ADDITIVE + visibility-only: a high
+  // skip ratio never changes detected/passed and never blocks the merge. Omitted
+  // entirely when the counts could not be reliably parsed (extractTestCoverage
+  // returned null) and on every detected=false / setup-failure path, so older
+  // consumers that ignore it are byte-for-byte unaffected.
+  coverage?: { passed: number; skipped: number; total: number };
   // Cheap goal-level acceptance probe, run ONLY on the detected=false fall-open
   // paths (no suite / thin / all-skipped). Gives the no-CI merge gate at least
   // one honest execution signal — "does the changed code still compile/build?" —
@@ -114,6 +125,31 @@ interface VerifyTestsResult {
     output: string;
     label: string;
   };
+  // Diff-aware VISIBILITY signal for the inverse anti-pattern of the documented-
+  // command probe: a PR that makes a red suite green by DISABLING tests rather
+  // than fixing them. Counts the test-skip/disable markers (``it.skip``,
+  // ``@pytest.mark.skip``, ``t.Skip(``, ``#[ignore]``, ``@Disabled`` …) the PR's
+  // OWN diff NEWLY adds to TEST files — pre-existing legitimate skips are
+  // ignored. VISIBILITY-FIRST + ADDITIVE: it NEVER changes ``passed``/the merge
+  // decision; it only surfaces "this PR disables N test(s)" to the operator.
+  // Populated ONLY when at least one newly-added marker is found; OMITTED
+  // entirely when the count is 0 OR the diff against the base ref cannot be
+  // computed — so a PR that introduces no new skips serializes byte-for-byte as
+  // today and an older backend that ignores the field is unaffected.
+  disabledTests?: {
+    count: number;
+    markers: Array<{ file: string; marker: string; line: string }>;
+  };
+}
+
+// Computed-once view of the PR head's diff against its base: changed files plus
+// the added (``+``) lines, attributed per-file. SHARED by the documented-command
+// probe and the newly-disabled-tests probe so the gate runs the `git diff`
+// passes ONCE. Null when the diff cannot be computed (base ref unavailable).
+interface PrDiff {
+  changedFiles: string[];
+  addedLines: string[];
+  addedLinesByFile: Record<string, string[]>;
 }
 
 type TestFixLoopResult = Awaited<ReturnType<typeof testFixLoop>>;
@@ -312,32 +348,25 @@ async function attachAcceptanceProbe(
 // same constant). Each runs ONCE under a bounded timeout, no retries.
 const MAX_DOCUMENTED_COMMAND_RUNS = MAX_DOCUMENTED_COMMANDS;
 
-// Compute the PR head's changed files + added lines against its base, discover
-// the small allowlisted set of commands the PR INTRODUCES/DOCUMENTS, run each
-// under a bounded timeout, and reduce to a single verdict mirroring the
-// acceptance-probe block (fail-fast: a clean command FAILURE blocks; otherwise a
-// PASS wins over a could-not-run; all-could-not-run degrades to could_not_run).
-// Returns undefined when there is nothing to run (no discovered command) or the
-// diff cannot be computed (base ref unavailable) — the field is then simply
-// absent and the gate is byte-for-byte unchanged.
-async function runDocumentedCommandsProbe(
+// Compute the PR head's changed files + added lines against its base ONCE, so
+// both diff-aware probes (documented-command + newly-disabled-tests) share a
+// single pair of `git diff` passes. Three-dot diff uses the merge-base, so only
+// the PR's own additions count. Returns null when the base ref is unavailable or
+// the diff can't be computed — callers then degrade silently (omit their field).
+async function computePrDiff(
   ws: WebSocket | null,
   baseBranch: string,
-): Promise<VerifyTestsResult['documentedCommands']> {
-  // Three-dot diff uses the merge-base, so only the PR's own additions count. If
-  // the base ref is unavailable or the diff can't be computed, degrade silently.
+): Promise<PrDiff | null> {
   const baseRef = `origin/${baseBranch}`;
-  let changedFiles: string[];
-  let addedLines: string[];
   const addedLinesByFile: Record<string, string[]> = {};
   try {
     const namesOut = await execFileAsync('git', ['diff', '--name-only', `${baseRef}...HEAD`], { cwd: WORKSPACE, timeoutMs: GENERIC_PROBE_TIMEOUT });
-    changedFiles = namesOut.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    const changedFiles = namesOut.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
     const diffOut = await execFileAsync('git', ['diff', '--unified=0', `${baseRef}...HEAD`], { cwd: WORKSPACE, timeoutMs: GENERIC_PROBE_TIMEOUT });
-    addedLines = [];
+    const addedLines: string[] = [];
     // Attribute each added (``+``) line to the file its hunk belongs to, tracked
     // by the ``+++ b/<path>`` header, so discovery can judge "newly introduced"
-    // per-manifest rather than against the whole PR's added lines.
+    // per-file rather than against the whole PR's added lines.
     let currentFile: string | null = null;
     for (const raw of diffOut.split(/\r?\n/)) {
       const header = raw.match(/^\+\+\+ (?:b\/)?(.+)$/);
@@ -352,10 +381,24 @@ async function runDocumentedCommandsProbe(
       addedLines.push(line);
       if (currentFile) (addedLinesByFile[currentFile] ??= []).push(line);
     }
+    return { changedFiles, addedLines, addedLinesByFile };
   } catch {
-    sendLog(ws, `Documented-command probe: could not compute PR diff against ${baseRef} — skipping (fall-open).\n`);
-    return undefined;
+    sendLog(ws, `Diff-aware probe: could not compute PR diff against ${baseRef} — skipping (fall-open).\n`);
+    return null;
   }
+}
+
+// Discover the small allowlisted set of commands the PR INTRODUCES/DOCUMENTS from
+// the precomputed diff, run each under a bounded timeout, and reduce to a single
+// verdict mirroring the acceptance-probe block (fail-fast: a clean command
+// FAILURE blocks; otherwise a PASS wins over a could-not-run; all-could-not-run
+// degrades to could_not_run). Returns undefined when there is nothing to run (no
+// discovered command) — the field is then simply absent and the gate unchanged.
+async function runDocumentedCommandsProbe(
+  ws: WebSocket | null,
+  diff: PrDiff,
+): Promise<VerifyTestsResult['documentedCommands']> {
+  const { changedFiles, addedLines, addedLinesByFile } = diff;
   if (changedFiles.length === 0) return undefined;
 
   const readFile = (relPath: string): string | null => {
@@ -420,11 +463,12 @@ async function runDocumentedCommandsProbe(
 async function attachDocumentedCommandsProbe(
   ws: WebSocket | null,
   base: VerifyTestsResult,
-  baseBranch: string,
+  diff: PrDiff | null,
 ): Promise<VerifyTestsResult> {
+  if (!diff) return base;
   let block: VerifyTestsResult['documentedCommands'];
   try {
-    block = await runDocumentedCommandsProbe(ws, baseBranch);
+    block = await runDocumentedCommandsProbe(ws, diff);
   } catch (e) {
     sendLog(ws, `Documented-command probe errored — skipping (fall-open): ${e instanceof Error ? e.message : String(e)}\n`);
     return base;
@@ -439,6 +483,37 @@ async function attachDocumentedCommandsProbe(
     note = `Documented/PR-introduced command probe could not run — ${block.label}; falling open without a block.`;
   }
   return { ...base, documentedCommands: block, output: [base.output, note].filter(Boolean).join('\n') };
+}
+
+// ── Diff-aware newly-disabled-tests probe (VISIBILITY-ONLY) ──────────────────
+// Surface, but NEVER block on, the inverse anti-pattern of the documented-command
+// probe: a PR that turns a red suite green by DISABLING tests. Reuses the SAME
+// precomputed diff — no extra `git diff` passes. ADDITIVE: the field is populated
+// ONLY when the PR's own added lines introduce at least one test-skip/disable
+// marker in a TEST file, and OMITTED when none are found OR the diff is
+// unavailable. It does NOT touch ``passed``/``outcome`` or the merge decision, so
+// a PR that introduces no new skips serializes byte-for-byte as today. NEVER
+// throws — any error degrades to the unchanged result.
+function attachDisabledTests(
+  ws: WebSocket | null,
+  base: VerifyTestsResult,
+  diff: PrDiff | null,
+): VerifyTestsResult {
+  if (!diff) return base;
+  let markers: ReturnType<typeof discoverNewlyDisabledTests>;
+  try {
+    markers = discoverNewlyDisabledTests({
+      changedFiles: diff.changedFiles,
+      addedLinesByFile: diff.addedLinesByFile,
+      max: MAX_DISABLED_TEST_MARKERS,
+    });
+  } catch (e) {
+    sendLog(ws, `Newly-disabled-tests probe errored — skipping: ${e instanceof Error ? e.message : String(e)}\n`);
+    return base;
+  }
+  if (markers.length === 0) return base;
+  sendLog(ws, `Newly-disabled-tests probe: PR newly disables ${markers.length} test(s) — surfacing for operator visibility (does NOT block).\n`);
+  return { ...base, disabledTests: { count: markers.length, markers } };
 }
 
 // ── Stale-command self-heal ──────────────────────────────────────────────────
@@ -507,6 +582,7 @@ async function recoverFromStaleCommand(
         status: passed ? 'pass' : 'fail',
         message: passed ? '' : message,
       })),
+      ...(loop.coverage ? { coverage: loop.coverage } : {}),
       output: passed ? '' : (loop.failureSummary ?? '').slice(-VERIFY_TESTS_OUTPUT_LIMIT),
     },
   };
@@ -735,17 +811,24 @@ export async function handleVerifyTests(
           status: passed ? 'pass' : 'fail',
           message: passed ? '' : message,
         })),
+        // On the passed branch output is intentionally discarded; coverage was
+        // parsed from the raw runner output inside the loop BEFORE it was
+        // dropped, so the partial-skip signal survives. Omitted when null.
+        ...(loop.coverage ? { coverage: loop.coverage } : {}),
         output: passed ? '' : (loop.failureSummary ?? '').slice(-VERIFY_TESTS_OUTPUT_LIMIT),
       };
     }
   }
 
-  // Diff-aware probe of commands the PR INTRODUCES or DOCUMENTS. Runs on the
+  // Diff-aware probes of what the PR's OWN diff INTRODUCES. Both run on the
   // COMPLETED path REGARDLESS of whether a unit suite was detected (the early
-  // setup-failure FAILED paths return above and are intentionally skipped). It
-  // is additive: when nothing runnable is introduced/documented, or the base ref
-  // is unavailable, the field is simply absent and the verdict is unchanged.
-  result = await attachDocumentedCommandsProbe(ws, result, baseBranch);
+  // setup-failure FAILED paths return above and are intentionally skipped). The
+  // PR diff is computed ONCE and shared by both probes. Each is additive: when
+  // the diff introduces nothing relevant, or the base ref is unavailable, the
+  // field is simply absent and the verdict is unchanged.
+  const prDiff = await computePrDiff(ws, baseBranch);
+  result = await attachDocumentedCommandsProbe(ws, result, prDiff);
+  result = attachDisabledTests(ws, result, prDiff);
 
   // Write the result file (parity with smoketest's /tmp result file — useful
   // for operator inspection); the authoritative copy is the artifact logs.

@@ -681,4 +681,79 @@ describe('handleVerifyTests', () => {
     // The declared build probe should use the larger timeout (TEST_RUNNER_TIMEOUT = 180_000)
     expect(callsWithTimeouts[1].timeoutMs).toBe(180_000);
   });
+
+  // ── Newly-disabled-tests visibility probe (diff-aware, never blocks) ────────
+  describe('disabledTests visibility field', () => {
+    type VerdictWithDisabled = {
+      detected: boolean; passed: boolean;
+      disabledTests?: { count: number; markers: Array<{ file: string; marker: string; line: string }> };
+    };
+    function verdictWithDisabled(): VerdictWithDisabled {
+      return JSON.parse(lastPostedPayload().logs as string) as VerdictWithDisabled;
+    }
+    // Drive the shared PR-diff `git diff` passes (--name-only then --unified=0)
+    // off a per-file added-lines map; every non-git call resolves empty.
+    function mockGitDiff(addedByFile: Record<string, string[]>): void {
+      const files = Object.keys(addedByFile);
+      const unified = files
+        .map(f => `diff --git a/${f} b/${f}\n--- a/${f}\n+++ b/${f}\n@@ -0,0 +1 @@\n${addedByFile[f].map(l => `+${l}`).join('\n')}`)
+        .join('\n');
+      vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
+        if (cmd === 'git') {
+          const a = args as string[];
+          if (a.includes('--name-only')) return Promise.resolve(files.join('\n'));
+          if (a.includes('--unified=0')) return Promise.resolve(unified);
+        }
+        return Promise.resolve('');
+      });
+    }
+
+    it('surfaces disabledTests with the right count when the PR newly skips tests', async () => {
+      vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+      vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
+      mockGitDiff({ 'src/foo.test.ts': ['it.skip("flaky", () => {})', 'describe.skip("grp", () => {})'] });
+
+      await handleVerifyTests('dt1', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+      const verdict = verdictWithDisabled();
+      // Visibility-only: the suite verdict is unchanged (still a clean pass).
+      expect(verdict.detected).toBe(true);
+      expect(verdict.passed).toBe(true);
+      const dt = verdict.disabledTests;
+      expect(dt).toBeDefined();
+      expect(dt?.count).toBe(2);
+      expect(dt?.markers.map(m => m.marker).sort()).toEqual(['describe.skip', 'it.skip']);
+      expect(dt?.markers[0].file).toBe('src/foo.test.ts');
+    });
+
+    it('omits disabledTests entirely when the PR introduces no new skips', async () => {
+      vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+      vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
+      mockGitDiff({ 'src/foo.test.ts': ['expect(value).toBe(1);'] });
+
+      await handleVerifyTests('dt2', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+      expect(verdictWithDisabled().disabledTests).toBeUndefined();
+    });
+
+    it('omits disabledTests when the PR diff cannot be computed (base ref unavailable)', async () => {
+      vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+      vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
+      // The shared diff fails: the --name-only pass rejects → both diff-aware
+      // probes degrade to fall-open and the field is absent.
+      vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
+        if (cmd === 'git' && (args as string[]).includes('--name-only')) {
+          return Promise.reject(new Error('unknown revision origin/main'));
+        }
+        return Promise.resolve('');
+      });
+
+      await handleVerifyTests('dt3', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+      const verdict = verdictWithDisabled();
+      expect(verdict.detected).toBe(true);
+      expect(verdict.passed).toBe(true);
+      expect(verdict.disabledTests).toBeUndefined();
+    });
+  });
 });

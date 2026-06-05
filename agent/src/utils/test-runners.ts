@@ -1472,6 +1472,109 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' | 'all
 }
 
 /**
+ * Best-effort parse of pass / skip / total counts from test-runner output.
+ *
+ * Companion to ``classifyTestExecution`` for the no-CI merge gate: where the
+ * classifier only decides ran / no_tests / all_skipped, this keeps the ACTUAL
+ * counts so a green PASS that exercised a tiny fraction of its suite (e.g.
+ * "5 passed, 1500 skipped") is no longer indistinguishable from a fully
+ * exercised pass. Reuses the SAME token/regex families the classifier
+ * understands:
+ *   - Standalone-token families (pytest, vitest, Rust, Go verbose) print
+ *     discrete "N passed" / "N skipped|deselected|ignored|filtered out" tokens
+ *     and Go verbose "--- PASS:" / "--- SKIP:" markers; counts are SUMMED across
+ *     lines / projects (one summary per class/project — exactly how the
+ *     classifier reasons about multi-class runs).
+ *   - Aggregate families (RSpec, Minitest, ExUnit, Surefire/Maven, .NET,
+ *     PHPUnit) print a single summary line carrying a TOTAL plus a skip count;
+ *     passed is derived as total - skipped - failures - errors.
+ * ``skipped`` is the UNION of skipped / deselected / ignored / filtered-out /
+ * pending / excluded — the same set the classifier folds together.
+ *
+ * CONSERVATIVE BY DESIGN: returns null when the output carries no recognizable
+ * count tokens, when a detected family's counts are internally inconsistent
+ * (skipped > total), or when two aggregate families disagree on the total.
+ * Callers treat null as "no coverage signal" and omit the field entirely, so an
+ * ambiguous parse never invents numbers.
+ */
+export function extractTestCoverage(
+  output: string,
+): { passed: number; skipped: number; total: number } | null {
+  if (!output) return null;
+  const trimmedLines = output.split(/\r?\n/).map(line => line.trim());
+
+  // First count match on a line, or 0. (RegExp.match returns only the first
+  // occurrence, which is what every per-class summary line carries.)
+  const countOnLine = (line: string, patterns: RegExp[]): number => {
+    for (const p of patterns) {
+      const m = line.match(p);
+      if (m) return Number(m[1]);
+    }
+    return 0;
+  };
+
+  // ── Aggregate families (single summary line carrying a TOTAL) ──────────────
+  // Each entry is [totalRe, skipRe]; mirrors AGGREGATE_FAMILIES in
+  // classifyTestExecution. A family fires only on lines carrying BOTH tokens,
+  // and counts are summed across all such lines (one per class/project).
+  const AGGREGATE_FAMILIES: Array<[RegExp, RegExp]> = [
+    [/\b(\d+)\s+examples?\b/i, /\b(\d+)\s+pending\b/i],            // Ruby/RSpec
+    [/\b(\d+)\s+runs?\b/i, /\b(\d+)\s+skips\b/i],                  // Ruby/Minitest
+    [/\b(\d+)\s+tests?\b/i, /\b(\d+)\s+(?:skipped|excluded)\b/i],  // Elixir/ExUnit
+    [/Tests run:\s*(\d+)/i, /Skipped:\s*(\d+)/i],                  // Surefire/Maven
+    [/\bTotal:\s*(\d+)/i, /Skipped:\s*(\d+)/i],                    // .NET
+    [/\bTests:\s*(\d+)/i, /Skipped:\s*(\d+)/i],                    // PHPUnit
+  ];
+  const failPatterns = [/\b(?:Failures?|Failed):\s*(\d+)\b/i, /\b(\d+)\s+failures?\b/i];
+  const errPatterns = [/\bErrors?:\s*(\d+)\b/i, /\b(\d+)\s+errors?\b/i];
+  const aggregateResults: Array<{ passed: number; skipped: number; total: number }> = [];
+  for (const [totalRe, skipRe] of AGGREGATE_FAMILIES) {
+    const familyLines = trimmedLines.filter(line => totalRe.test(line) && skipRe.test(line));
+    if (familyLines.length === 0) continue;
+    let total = 0, skipped = 0, failed = 0, errored = 0;
+    for (const line of familyLines) {
+      const t = line.match(totalRe);
+      const s = line.match(skipRe);
+      if (t) total += Number(t[1]);
+      if (s) skipped += Number(s[1]);
+      failed += countOnLine(line, failPatterns);
+      errored += countOnLine(line, errPatterns);
+    }
+    if (total <= 0 || skipped > total) continue; // inconsistent — ignore family
+    aggregateResults.push({ passed: Math.max(0, total - skipped - failed - errored), skipped, total });
+  }
+  if (aggregateResults.length > 0) {
+    // Ambiguous when two families disagree on the total.
+    if (new Set(aggregateResults.map(r => r.total)).size > 1) return null;
+    return aggregateResults[0];
+  }
+
+  // ── Standalone-token families (pytest / vitest / Rust / Go verbose) ────────
+  // Exclude vitest/jest FILE- or SUITE-level summary lines so their "N passed"
+  // counts (files/suites, not tests) are not double-counted into the totals.
+  const countLines = trimmedLines.filter(line => !/^Test (?:Files\b|Suites:)/i.test(line));
+  const sum = (re: RegExp): number => countLines.reduce((acc, line) => {
+    const m = line.match(re);
+    return m ? acc + Number(m[1]) : acc;
+  }, 0);
+  const passed =
+    sum(/\b(\d+)\s+passed\b/i) +
+    countLines.filter(line => /^--- PASS:/.test(line)).length;
+  const skipped =
+    sum(/\b(\d+)\s+skipped\b/i) +
+    sum(/\b(\d+)\s+deselected\b/i) +
+    sum(/\b(\d+)\s+ignored\b/i) +
+    sum(/\b(\d+)\s+filtered out\b/i) +
+    countLines.filter(line => /^--- SKIP:/.test(line)).length;
+  const failed =
+    sum(/\b(\d+)\s+failed\b/i) +
+    countLines.filter(line => /^--- FAIL:/.test(line)).length;
+  const total = passed + skipped + failed;
+  if (total <= 0) return null;
+  return { passed, skipped, total };
+}
+
+/**
  * Parse failing test identifiers from test runner output.
  * Returns a Set of stable test IDs (e.g. "path/test_foo.py::test_bar" for pytest,
  * "test description" for vitest) for baseline comparison.
@@ -2016,5 +2119,129 @@ export function discoverDocumentedCommands(
     }
   }
 
+  return out;
+}
+
+// ── Newly-introduced test-skip / disable marker discovery ────────────────────
+// The inverse of the documented-command probe: a PR can make a red suite look
+// green by DISABLING tests instead of fixing them. This is a VISIBILITY-FIRST
+// signal — it never blocks the merge — so an operator can see "this PR disables
+// N test(s)" in the merge-gate verdict.
+
+/** One newly-introduced test-skip / disable marker, enough to render a row. */
+export interface DisabledTestMarker {
+  /** Repo-relative path of the TEST file the marker was added to. */
+  file: string;
+  /** The marker kind that matched (``it.skip``, ``@pytest.mark.skip`` …). */
+  marker: string;
+  /** The trimmed offending added line. */
+  line: string;
+}
+
+// Hard cap on reported markers so a PR that mass-disables a suite cannot fan out
+// an unbounded list into the verdict artifact (subject to the payload budget).
+export const MAX_DISABLED_TEST_MARKERS = 20;
+
+// Path heuristics for "this is a TEST file" — restrict the scan so unrelated
+// prose or a non-test ``# ignore``-style comment cannot false-positive. Mirrors
+// the common ecosystem conventions: ``*.test.*`` / ``*.spec.*`` (JS/TS), Go
+// ``*_test.go``, Python ``test_*.py`` / ``*_test.py``, Ruby ``*_spec.rb``, and
+// anything under a ``tests/`` / ``__tests__/`` / ``spec/`` directory.
+const TEST_FILE_PATTERNS: RegExp[] = [
+  /\.(test|spec)\.[a-z0-9]+$/i,
+  /_test\.go$/i,
+  /(^|\/)test_[^/]*\.py$/i,
+  /_test\.py$/i,
+  /_spec\.rb$/i,
+  /(^|\/)(tests?|__tests__|spec)\//i,
+];
+
+/** Whether a repo-relative path is a TEST file by the conventions above. */
+export function isTestFilePath(relPath: string): boolean {
+  const p = (relPath || '').trim();
+  if (!p) return false;
+  return TEST_FILE_PATTERNS.some(re => re.test(p));
+}
+
+// Each marker is anchored so it matches REAL usage (``it.skip(`` …), not a
+// substring inside an identifier or a longer marker name. ``kind`` is the
+// human-facing label surfaced in the verdict.
+const DISABLED_TEST_MARKERS: Array<{ kind: string; re: RegExp }> = [
+  // JS / TS (Jest / Vitest / Mocha / Jasmine).
+  { kind: 'it.skip', re: /\bit\.skip\b/ },
+  { kind: 'test.skip', re: /\btest\.skip\b/ },
+  { kind: 'describe.skip', re: /\bdescribe\.skip\b/ },
+  { kind: 'context.skip', re: /\bcontext\.skip\b/ },
+  { kind: 'xit', re: /\bxit\s*\(/ },
+  { kind: 'xdescribe', re: /\bxdescribe\s*\(/ },
+  { kind: 'xtest', re: /\bxtest\s*\(/ },
+  // Python — pytest markers and unittest decorators.
+  { kind: '@pytest.mark.skipif', re: /@pytest\.mark\.skipif\b/ },
+  { kind: '@pytest.mark.skip', re: /@pytest\.mark\.skip\b/ },
+  { kind: '@pytest.mark.xfail', re: /@pytest\.mark\.xfail\b/ },
+  { kind: '@unittest.skip', re: /@(?:unittest\.)?skip(?:If|Unless)?\b/ },
+  // Go — testing.T skip calls.
+  { kind: 't.Skip()', re: /\b[a-zA-Z_]\w*\.Skip(?:Now)?\s*\(/ },
+  // Rust — ignored test attribute.
+  { kind: '#[ignore]', re: /#\[\s*ignore\b/ },
+  // JUnit (Java/Kotlin).
+  { kind: '@Disabled', re: /@Disabled\b/ },
+  { kind: '@Ignore', re: /@Ignore\b/ },
+  // RSpec (Ruby) — ``pending`` marks an example as not-yet-passing.
+  { kind: 'pending', re: /\bpending\b/ },
+];
+
+// Whether a (trimmed) added line is a comment we should NOT scan for markers —
+// so prose like ``// it.skip is deprecated`` does not false-positive. Careful
+// about Rust attributes: ``#[ignore]`` leads with ``#[`` and is NOT a comment,
+// whereas a Python/Ruby ``# ignore`` comment is.
+function isCommentLine(line: string): boolean {
+  if (line.startsWith('//') || line.startsWith('*') || line.startsWith('/*')) return true;
+  if (line.startsWith('#') && !line.startsWith('#[')) return true;
+  return false;
+}
+
+/** Input for {@link discoverNewlyDisabledTests}. */
+export interface DiscoverDisabledTestsInput {
+  /** PR-vs-base changed files, repo-root-relative (``git diff --name-only``). */
+  changedFiles: string[];
+  /**
+   * Added diff lines keyed by the repo-relative file they belong to. ONLY a
+   * file's OWN added lines are scanned, so a pre-existing legitimate skip (an
+   * unchanged line, or a skip in an unrelated file) is never reported.
+   */
+  addedLinesByFile: Record<string, string[]>;
+  /** Max markers to return. Defaults to {@link MAX_DISABLED_TEST_MARKERS}. */
+  max?: number;
+}
+
+/**
+ * Discover the test-skip / disable markers a PR NEWLY introduces. Scans ONLY the
+ * added lines (``+`` lines) of changed TEST files, so pre-existing skips and
+ * non-test files are ignored. Anchored, ecosystem-aware marker matching keeps
+ * prose / comments from false-positiving. Pure — no filesystem access — so it is
+ * directly unit-testable. Bounded to ``max`` markers.
+ */
+export function discoverNewlyDisabledTests(
+  input: DiscoverDisabledTestsInput,
+): DisabledTestMarker[] {
+  const max = input.max ?? MAX_DISABLED_TEST_MARKERS;
+  const out: DisabledTestMarker[] = [];
+  for (const rel of input.changedFiles) {
+    if (out.length >= max) break;
+    if (!isTestFilePath(rel)) continue;
+    // A changed test file may have no added-lines entry (binary / deletion / a
+    // change with no ``+`` lines) — guard the lookup before indexing.
+    if (!Object.prototype.hasOwnProperty.call(input.addedLinesByFile, rel)) continue;
+    const added = input.addedLinesByFile[rel];
+    if (added.length === 0) continue;
+    for (const raw of added) {
+      if (out.length >= max) break;
+      const line = (raw || '').trim();
+      if (!line || isCommentLine(line)) continue;
+      const hit = DISABLED_TEST_MARKERS.find(m => m.re.test(line));
+      if (hit) out.push({ file: rel, marker: hit.kind, line });
+    }
+  }
   return out;
 }

@@ -252,6 +252,77 @@ def test_classify_verdict_pass():
     assert detail == ""
 
 
+def test_classify_verdict_heavily_skipped_pass_surfaces_coverage_detail():
+    # A detected suite RAN and PASSED but its coverage shows almost every test
+    # was skipped (5 passed, 1500 skipped). Outcome stays a non-blocking "pass",
+    # but detail surfaces the coverage summary so the operator can tell it apart
+    # from a fully-exercised pass.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "coverage": {"passed": 5, "skipped": 1500, "total": 1505},
+        }
+    )
+    assert outcome == "pass"
+    assert detail == "passed 5, skipped 1500 of 1505"
+
+
+def test_classify_verdict_pass_low_skip_keeps_empty_detail():
+    # A fully-exercised pass (few skips) is unchanged: empty detail.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "coverage": {"passed": 1500, "skipped": 5, "total": 1505},
+        }
+    )
+    assert outcome == "pass"
+    assert detail == ""
+
+
+def test_classify_verdict_pass_below_total_floor_keeps_empty_detail():
+    # A tiny suite (total under the floor) where a couple of tests skipped is
+    # not flagged — a high ratio on a 5-test suite is meaningless.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "coverage": {"passed": 1, "skipped": 4, "total": 5},
+        }
+    )
+    assert outcome == "pass"
+    assert detail == ""
+
+
+def test_classify_verdict_pass_missing_or_malformed_coverage_is_defensive():
+    # Older agents emit no coverage; malformed coverage must not crash. All keep
+    # today's ("pass", "") behavior.
+    for verdict in (
+        {"detected": True, "passed": True},
+        {"detected": True, "passed": True, "coverage": None},
+        {"detected": True, "passed": True, "coverage": "1500 skipped"},
+        {"detected": True, "passed": True, "coverage": {"total": 0}},
+        {"detected": True, "passed": True, "coverage": {"skipped": "x", "total": 10}},
+    ):
+        assert ci_resolution.classify_merge_test_verdict(verdict) == ("pass", "")
+
+
+def test_classify_verdict_heavily_skipped_pass_still_nonblocking():
+    # The enriched detail must not flip the merge gate: a heavily-skipped pass
+    # still maps to conclusion="success" with no failed_logs.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "coverage": {"passed": 5, "skipped": 1500, "total": 1505},
+        }
+    )
+    ci_result = ci_resolution.build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "success"
+    assert ci_result["failed_logs"] == ""
+
+
 def test_classify_verdict_fail_carries_output():
     outcome, detail = ci_resolution.classify_merge_test_verdict(
         {"detected": True, "passed": False, "tests": [], "output": "2 failed"}
@@ -316,6 +387,121 @@ def test_classify_verdict_none_is_undetected():
         "undetected",
         "",
     )
+
+
+# disabled_tests_block — defensive parse of the optional VISIBILITY block an
+# agent attaches when a PR newly introduces test-skip/disable markers. Parsing
+# it NEVER changes the merge decision (visibility-only).
+
+
+def test_disabled_tests_block_parses_present_block():
+    block = ci_resolution.disabled_tests_block(
+        {
+            "detected": True,
+            "passed": True,
+            "disabledTests": {
+                "count": 2,
+                "markers": [
+                    {"file": "a.test.ts", "marker": "it.skip", "line": "it.skip('x')"},
+                    {
+                        "file": "test_b.py",
+                        "marker": "@pytest.mark.skip",
+                        "line": "@pytest.mark.skip",
+                    },
+                ],
+            },
+        }
+    )
+    assert block is not None
+    assert block["count"] == 2
+    assert len(block["markers"]) == 2
+    assert block["markers"][0] == {
+        "file": "a.test.ts",
+        "marker": "it.skip",
+        "line": "it.skip('x')",
+    }
+
+
+def test_disabled_tests_block_absent_or_malformed_is_none():
+    # Missing field, non-dict block, zero/negative/non-int count, and a non-dict
+    # verdict all degrade silently to None (older-agent compatible).
+    for verdict in (
+        {"detected": True, "passed": True},
+        {"disabledTests": None},
+        {"disabledTests": "2 disabled"},
+        {"disabledTests": {"count": 0, "markers": []}},
+        {"disabledTests": {"count": -1}},
+        {"disabledTests": {"count": "two"}},
+        None,
+        "not a dict",
+    ):
+        assert ci_resolution.disabled_tests_block(verdict) is None
+
+
+def test_disabled_tests_block_caps_markers():
+    raw_markers = [
+        {"file": f"f{i}.test.ts", "marker": "it.skip", "line": "it.skip()"}
+        for i in range(50)
+    ]
+    block = ci_resolution.disabled_tests_block(
+        {"disabledTests": {"count": 50, "markers": raw_markers}}
+    )
+    assert block is not None
+    # The reported count is preserved, but the markers list is bounded.
+    assert block["count"] == 50
+    assert len(block["markers"]) == 20
+
+
+def test_classify_verdict_disabled_tests_surfaces_on_pass_without_blocking():
+    # A passing suite whose PR newly disabled tests stays a non-blocking "pass",
+    # but detail surfaces the count so the operator can see it.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "disabledTests": {
+                "count": 3,
+                "markers": [
+                    {"file": "a.test.ts", "marker": "it.skip", "line": "it.skip()"}
+                ],
+            },
+        }
+    )
+    assert outcome == "pass"
+    assert "disables 3 test(s)" in detail
+    # Must not flip the merge gate to a block.
+    ci_result = ci_resolution.build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "success"
+    assert ci_result["failed_logs"] == ""
+
+
+def test_classify_verdict_disabled_tests_absence_changes_nothing():
+    # The SAME verdict with vs without the disabledTests field must produce the
+    # identical (outcome, detail) — absence changes nothing.
+    base = {"detected": True, "passed": True, "output": ""}
+    with_field = {
+        **base,
+        "disabledTests": {"count": 0, "markers": []},  # malformed/zero → ignored
+    }
+    assert ci_resolution.classify_merge_test_verdict(
+        base
+    ) == ci_resolution.classify_merge_test_verdict(with_field) == ("pass", "")
+
+
+def test_classify_verdict_disabled_tests_pairs_with_heavy_skip_detail():
+    # When BOTH a heavy-skip coverage summary and newly-disabled tests are
+    # present, the pass detail carries both, still non-blocking.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "coverage": {"passed": 5, "skipped": 1500, "total": 1505},
+            "disabledTests": {"count": 1, "markers": []},
+        }
+    )
+    assert outcome == "pass"
+    assert "passed 5, skipped 1500 of 1505" in detail
+    assert "disables 1 test(s)" in detail
 
 
 # ---------------------------------------------------------------------------

@@ -1083,6 +1083,17 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         const probeKind = probe?.declared ? 'declared build' : 'generic check';
         // A PASSED declared build that wrote no output is a possible no-op build.
         const probeNoArtifact = Boolean(probe?.declared && probe.passed && probe.wrote_no_artifact);
+        // Best-effort coverage summary: how many of a detected suite's tests
+        // actually executed vs. were skipped. Surfaced for visibility so a green
+        // PASSED that exercised almost nothing is not mistaken for full coverage.
+        const coverage = mergeTestVerdict?.coverage ?? null;
+        const coverageMostlySkipped = mergeTestResult?.reason === 'suite_passed_mostly_skipped';
+        // VISIBILITY-ONLY: the PR's own diff newly disabled tests. Surface it as
+        // a prominent signal so a green gate that was made green by SKIPPING is
+        // not mistaken for real coverage. Never blocks — present only when the
+        // agent found at least one newly-added skip marker.
+        const disabledTests = mergeTestVerdict?.disabledTests ?? null;
+        const disabledMarkers = (disabledTests?.markers ?? []).slice(0, 8);
         // Stale-command self-heal: the stored test command was stale and
         // auto-detection replaced it with a real suite that actually ran.
         const recovered = mergeTestVerdict?.recovered ? mergeTestVerdict : null;
@@ -1128,6 +1139,44 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
                 <p className="text-xs text-amber-400 break-words">
                   ⚠ The declared build exited cleanly but wrote no output — possible no-op build (not real verification).
                 </p>
+              )}
+              {coverage && (
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-xs text-neutral-500 w-28 shrink-0">Coverage</span>
+                  <span className={`text-xs font-semibold ${coverageMostlySkipped ? 'text-amber-400' : 'text-neutral-300'}`}>
+                    {coverage.passed} passed · {coverage.skipped} skipped · {coverage.total} total
+                  </span>
+                </div>
+              )}
+              {coverageMostlySkipped && (
+                <p className="text-xs text-amber-400 break-words">
+                  ⚠ The suite passed but most of its tests were skipped — only a small fraction actually executed (not full verification).
+                </p>
+              )}
+              {disabledTests && (
+                <div className="flex items-start gap-2">
+                  <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Disabled tests</span>
+                  <div className="text-xs min-w-0 flex-1">
+                    <p className="text-amber-400 font-semibold break-words">
+                      ⚠ This PR disables {disabledTests.count} test{disabledTests.count === 1 ? '' : 's'} — newly added skip/ignore markers (visibility only; does not block the merge).
+                    </p>
+                    {disabledMarkers.length > 0 && (
+                      <ul className="mt-1 space-y-0.5">
+                        {disabledMarkers.map((m, i) => (
+                          <li key={i} className="break-words">
+                            <span className="font-mono text-blue-300">{m.file}</span>
+                            {m.marker ? <span className="font-mono text-amber-300"> — {m.marker}</span> : null}
+                          </li>
+                        ))}
+                        {disabledTests.count > disabledMarkers.length && (
+                          <li className="text-neutral-500">
+                            …and {disabledTests.count - disabledMarkers.length} more
+                          </li>
+                        )}
+                      </ul>
+                    )}
+                  </div>
+                </div>
               )}
               {recovered && (
                 <div className="flex items-start gap-2">

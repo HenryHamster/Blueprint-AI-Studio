@@ -47,6 +47,36 @@ export interface RecoveredDirectory {
   test_cmd: string;
 }
 
+// One newly-introduced test-skip / disable marker surfaced by the agent's
+// diff-aware probe (mirrors DisabledTestMarker in test-runners.ts).
+export interface DisabledTestMarker {
+  file: string;
+  marker: string;
+  line: string;
+}
+
+// VISIBILITY-ONLY: the count + bounded list of test-skip/disable markers the
+// PR's OWN diff newly introduced. Present only when the agent found at least one
+// newly-added skip; never affects the merge outcome.
+export interface DisabledTestsBlock {
+  count: number;
+  markers: DisabledTestMarker[];
+}
+
+// Best-effort coverage summary attached when a detected suite RAN: how many of
+// its tests actually executed vs. were skipped/deselected/ignored/filtered.
+// Purely informational — never changes the merge outcome.
+export interface CoverageBlock {
+  passed: number;
+  skipped: number;
+  total: number;
+}
+
+// A passed suite is "mostly skipped" when at least this fraction of its tests
+// were skipped (and the total is non-zero). Visibility threshold only — it does
+// NOT block or alter the merge outcome.
+export const MOSTLY_SKIPPED_RATIO = 0.8;
+
 // Parsed, typed view of the MERGE_TEST_RESULT artifact JSON.
 export interface MergeTestVerdict {
   detected?: boolean;
@@ -59,6 +89,11 @@ export interface MergeTestVerdict {
   recovered: boolean;
   recovered_directories: RecoveredDirectory[];
   noTestsReason: 'all_skipped' | 'no_real_tests' | 'no_suite' | null;
+  coverage: CoverageBlock | null;
+  // VISIBILITY-ONLY signal: the PR's own diff newly disabled N test(s). null
+  // when the agent emitted no (or a zero-count / malformed) block — older
+  // artifacts render exactly as before.
+  disabledTests: DisabledTestsBlock | null;
 }
 
 // The top-line panel verdict. `blocked` distinguishes a gate BLOCK that came
@@ -74,6 +109,7 @@ export type MergeTestReason =
   | 'probe_failed'
   | 'suite_failed'
   | 'suite_passed'
+  | 'suite_passed_mostly_skipped'
   | 'undetected';
 
 export interface MergeTestResult {
@@ -92,6 +128,38 @@ function asProbe(value: unknown): ProbeBlock | null {
 
 function asDocumented(value: unknown): DocumentedCommandsBlock | null {
   return value && typeof value === 'object' ? (value as DocumentedCommandsBlock) : null;
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+// Parse the optional best-effort coverage block. Returns null unless ALL three
+// counts are finite numbers — a missing/partial/malformed block is treated as
+// absent so older artifacts and garbage values render exactly as before.
+function asCoverage(value: unknown): CoverageBlock | null {
+  if (!value || typeof value !== 'object') return null;
+  const c = value as Record<string, unknown>;
+  if (!isFiniteNumber(c.passed) || !isFiniteNumber(c.skipped) || !isFiniteNumber(c.total)) {
+    return null;
+  }
+  return { passed: c.passed, skipped: c.skipped, total: c.total };
+}
+
+// Parse the optional newly-disabled-tests block. Returns null unless count is a
+// finite, positive number — a missing / zero-count / malformed block is treated
+// as absent so older artifacts render exactly as before. Markers coerce to
+// safe strings; a non-array markers field yields an empty list.
+function asDisabledTests(value: unknown): DisabledTestsBlock | null {
+  if (!value || typeof value !== 'object') return null;
+  const d = value as Record<string, unknown>;
+  if (!isFiniteNumber(d.count) || d.count <= 0) return null;
+  const markers = Array.isArray(d.markers)
+    ? d.markers
+        .filter((m): m is Record<string, unknown> => Boolean(m) && typeof m === 'object')
+        .map(m => ({ file: asString(m.file), marker: asString(m.marker), line: asString(m.line) }))
+    : [];
+  return { count: d.count, markers };
 }
 
 function asRecoveredDirectories(value: unknown): RecoveredDirectory[] {
@@ -130,7 +198,20 @@ export function parseMergeTestVerdict(parsed: unknown): MergeTestVerdict | null 
     noTestsReason: NO_TESTS_REASONS.has(noTestsReason)
       ? (noTestsReason as MergeTestVerdict['noTestsReason'])
       : null,
+    coverage: asCoverage(v.coverage),
+    disabledTests: asDisabledTests(v.disabledTests),
   };
+}
+
+/**
+ * Whether a passed suite's coverage indicates that MOST of its tests were
+ * skipped (skip ratio >= MOSTLY_SKIPPED_RATIO, total > 0). Purely a visibility
+ * signal — never blocks or alters the merge outcome.
+ */
+export function coverageIsMostlySkipped(coverage: CoverageBlock | null): boolean {
+  if (!coverage) return false;
+  if (coverage.total <= 0) return false;
+  return coverage.skipped / coverage.total >= MOSTLY_SKIPPED_RATIO;
 }
 
 /**
@@ -221,6 +302,11 @@ export function deriveMergeTestOutcome(verdict: MergeTestVerdict): MergeTestResu
   }
   // 4. A suite was detected.
   if (verdict.passed) {
+    // Visibility only: a passing suite whose tests were mostly skipped stays a
+    // PASS, but the reason distinguishes it so the panel can flag it.
+    if (coverageIsMostlySkipped(verdict.coverage)) {
+      return { outcome: 'pass', reason: 'suite_passed_mostly_skipped', detail: '' };
+    }
     return { outcome: 'pass', reason: 'suite_passed', detail: '' };
   }
   return {

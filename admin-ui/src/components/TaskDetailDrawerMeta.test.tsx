@@ -146,6 +146,82 @@ describe('DetailsTab — Merge Test Gate', () => {
     expect(screen.getByText('python: could not run')).toBeInTheDocument();
   });
 
+  it('renders the coverage counts when a passed suite reports coverage', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({
+        detected: true,
+        passed: true,
+        tests: [],
+        output: '',
+        coverage: { passed: 100, skipped: 0, total: 100 },
+      })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Coverage')).toBeInTheDocument();
+    expect(screen.getByText('100 passed · 0 skipped · 100 total')).toBeInTheDocument();
+    expect(screen.queryByText(/most of its tests were skipped/)).toBeNull();
+  });
+
+  it('flags a heavily-skipped pass with an amber mostly-skipped note', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({
+        detected: true,
+        passed: true,
+        tests: [],
+        output: '',
+        coverage: { passed: 5, skipped: 1500, total: 1505 },
+      })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('5 passed · 1500 skipped · 1505 total')).toBeInTheDocument();
+    expect(screen.getByText(/most of its tests were skipped/)).toBeInTheDocument();
+    // Still a PASS verdict — visibility only, not a block.
+    expect(screen.getByText('Passed')).toBeInTheDocument();
+  });
+
+  it('renders no coverage row for a legacy artifact without coverage', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({ detected: true, passed: true, tests: [], output: '' })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Merge Test Gate')).toBeInTheDocument();
+    expect(screen.queryByText('Coverage')).toBeNull();
+    expect(screen.queryByText(/most of its tests were skipped/)).toBeNull();
+  });
+
+  it('surfaces a prominent disabled-tests signal when the PR newly disabled tests', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({
+        detected: true,
+        passed: true,
+        tests: [],
+        output: '',
+        disabledTests: {
+          count: 2,
+          markers: [
+            { file: 'src/foo.test.ts', marker: 'it.skip', line: "it.skip('x')" },
+            { file: 'test_bar.py', marker: '@pytest.mark.skip', line: '@pytest.mark.skip' },
+          ],
+        },
+      })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Disabled tests')).toBeInTheDocument();
+    expect(screen.getByText(/This PR disables 2 tests/)).toBeInTheDocument();
+    expect(screen.getByText('src/foo.test.ts')).toBeInTheDocument();
+    // Visibility only — the suite still reads as Passed, not Blocked.
+    expect(screen.getByText('Passed')).toBeInTheDocument();
+  });
+
+  it('renders no disabled-tests row for a legacy artifact without the field', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({ detected: true, passed: true, tests: [], output: '' })],
+    });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Merge Test Gate')).toBeInTheDocument();
+    expect(screen.queryByText('Disabled tests')).toBeNull();
+  });
+
   it('blocks (not Passed) when a documented command failed despite a passing unit suite', () => {
     const task = makeTask({
       artifacts: [mergeTestArtifact({

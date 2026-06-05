@@ -299,6 +299,45 @@ def should_run_no_ci_test_gate(project, branch: str | None, *, gate_enabled: boo
 MergeTestOutcome = Literal["pass", "fail", "undetected"]
 
 
+# Conservative threshold for flagging a PASSED suite as "heavily skipped": the
+# run reported a best-effort ``coverage`` summary in which almost every test was
+# skipped/deselected/ignored/filtered (e.g. ``5 passed, 1500 skipped``). This is
+# purely an operator-visible signal — it NEVER changes the pass/fail decision —
+# so the bar is deliberately high to avoid noise on ordinary runs that skip a
+# handful of tests. ``_HEAVY_SKIP_MIN_TOTAL`` keeps tiny suites (where a couple
+# of skips is meaningless) out of the signal; ``_HEAVY_SKIP_RATIO`` requires the
+# skip fraction to be at/above 90% of the total.
+_HEAVY_SKIP_MIN_TOTAL = 10
+_HEAVY_SKIP_RATIO = 0.9
+
+
+def _heavy_skip_coverage_summary(coverage: Any) -> str:
+    """Return a concise ``"passed N, skipped M of T"`` summary when a PASSED
+    suite's best-effort ``coverage`` block shows a heavy skip ratio, else ``""``.
+
+    ``coverage`` is the optional ``{passed, skipped, total}`` block the agent
+    attaches to a detected+passed verdict. Defensive about a missing / non-dict /
+    malformed / older-agent block (returns ``""``), and about a tiny suite or a
+    low skip ratio (returns ``""`` — behaves exactly as today). When the skip
+    fraction is at/above :data:`_HEAVY_SKIP_RATIO` and the total is at/above
+    :data:`_HEAVY_SKIP_MIN_TOTAL`, returns the human summary so the caller can
+    surface it as ``detail`` WITHOUT changing the (non-blocking) ``"pass"``.
+    """
+    if not isinstance(coverage, dict):
+        return ""
+    try:
+        total = int(coverage.get("total"))
+        skipped = int(coverage.get("skipped"))
+        passed = int(coverage.get("passed"))
+    except (TypeError, ValueError):
+        return ""
+    if total < _HEAVY_SKIP_MIN_TOTAL or skipped < 0 or total <= 0:
+        return ""
+    if skipped / total < _HEAVY_SKIP_RATIO:
+        return ""
+    return f"passed {passed}, skipped {skipped} of {total}"
+
+
 def classify_merge_test_verdict(
     verdict: dict[str, Any] | None,
 ) -> tuple[MergeTestOutcome, str]:
@@ -318,7 +357,14 @@ def classify_merge_test_verdict(
                            absent-tests repo must still progress, merging
                            UNVERIFIED.
 
-    ``detail`` is the failing-test output for ``"fail"`` and ``""`` otherwise.
+    ``detail`` is the failing-test output for ``"fail"`` and ``""`` otherwise —
+    EXCEPT a detected+passed suite whose best-effort ``coverage`` summary
+    (``{passed, skipped, total}``) shows a heavy skip ratio: there the outcome
+    stays a non-blocking ``"pass"`` but ``detail`` carries a concise
+    ``"passed N, skipped M of T"`` summary so an operator can distinguish a
+    near-empty run (e.g. ``5 passed, 1500 skipped``) from a fully-exercised pass.
+    Absent / below-threshold / malformed coverage keeps the empty detail exactly
+    (older agents that emit no ``coverage`` are unaffected).
 
     Acceptance probe (``detected=false`` only): when no unit suite ran, the agent
     may still attach a cheap goal-level ``probe`` ("does the changed code still
@@ -339,6 +385,14 @@ def classify_merge_test_verdict(
     introduced that must be exercised. Every other state (pass / could-not-run /
     absent / old-shape verdict) does NOT block — an older agent that emits no
     ``documentedCommands`` behaves exactly as before.
+
+    Newly-disabled tests (VISIBILITY-ONLY, never blocks): the agent may attach a
+    ``disabledTests`` block when the PR's own diff NEWLY introduces test-skip /
+    disable markers. It is parsed defensively via :func:`disabled_tests_block` and
+    NEVER changes the merge decision — on a non-blocking ``"pass"`` it only
+    enriches the operator-facing ``detail`` with a concise "PR newly disables N
+    test(s)" note. Absent / malformed / older-agent verdicts keep today's detail
+    byte-for-byte (the note is appended ONLY when a well-formed block is present).
     """
     if not isinstance(verdict, dict):
         return ("undetected", "")
@@ -405,7 +459,25 @@ def classify_merge_test_verdict(
             )
         return ("undetected", "")
     if verdict.get("passed"):
-        return ("pass", "")
+        # A detected suite ran and passed → non-blocking ``"pass"``. If the agent
+        # attached a best-effort ``coverage`` summary showing almost every test
+        # was skipped/deselected (a near-empty run like ``5 passed, 1500
+        # skipped``), enrich the operator-visible ``detail`` with a concise
+        # coverage summary so the gate is distinguishable from a fully-exercised
+        # pass. The OUTCOME stays ``"pass"`` — this is the conservative,
+        # stabilize-phase gate and a heavily-skipped pass never blocks a merge.
+        # Absent / below-threshold / malformed coverage keeps today's empty
+        # detail exactly (older-agent compatible).
+        detail = _heavy_skip_coverage_summary(verdict.get("coverage"))
+        # VISIBILITY-ONLY: if the PR newly disabled tests, annotate the (still
+        # non-blocking) pass so an operator can see a green suite may have been
+        # made green by skipping. Never flips the outcome; appended ONLY when a
+        # well-formed block is present, so an absent field keeps detail unchanged.
+        disabled = disabled_tests_block(verdict)
+        if disabled:
+            note = f"PR newly disables {disabled['count']} test(s)"
+            detail = f"{detail}; {note}" if detail else note
+        return ("pass", detail)
     output = str(verdict.get("output") or "").strip()
     return ("fail", output or "Detected test suite failed (no output captured).")
 
@@ -448,6 +520,52 @@ def _documented_command_is_clear_failure(documented: Any) -> bool:
     if documented.get("could_not_run"):
         return False
     return documented.get("passed") is False
+
+
+# Hard cap on disabled-test markers surfaced from a verdict, mirroring the
+# agent-side ``MAX_DISABLED_TEST_MARKERS`` so a PR that mass-disables a suite
+# cannot bloat the API response even if a malformed/oversized artifact slips in.
+_MAX_DISABLED_TEST_MARKERS = 20
+
+
+def disabled_tests_block(verdict: Any) -> dict[str, Any] | None:
+    """Defensively normalize the optional ``disabledTests`` VISIBILITY block an
+    agent may attach when a PR's own diff NEWLY introduces test-skip/disable
+    markers (``it.skip``, ``@pytest.mark.skip``, ``t.Skip(``, ``#[ignore]`` …).
+
+    Returns ``{"count": int, "markers": [{"file", "marker", "line"}, …]}`` when a
+    well-formed block with a positive count is present, else ``None``. This is a
+    pure read-side accessor — it NEVER affects the merge decision (see
+    :func:`classify_merge_test_verdict`). Defensive about a missing / non-dict /
+    malformed / older-agent block (returns ``None``) exactly like the other
+    optional-block parsers, so an agent that omits it degrades silently and the
+    gate is unchanged. Markers are bounded to :data:`_MAX_DISABLED_TEST_MARKERS`.
+    """
+    if not isinstance(verdict, dict):
+        return None
+    raw = verdict.get("disabledTests")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        count = int(raw.get("count"))
+    except (TypeError, ValueError):
+        return None
+    if count <= 0:
+        return None
+    markers: list[dict[str, str]] = []
+    raw_markers = raw.get("markers")
+    if isinstance(raw_markers, list):
+        for m in raw_markers[:_MAX_DISABLED_TEST_MARKERS]:
+            if not isinstance(m, dict):
+                continue
+            markers.append(
+                {
+                    "file": str(m.get("file") or ""),
+                    "marker": str(m.get("marker") or ""),
+                    "line": str(m.get("line") or ""),
+                }
+            )
+    return {"count": count, "markers": markers}
 
 
 def build_no_ci_gate_ci_result(
