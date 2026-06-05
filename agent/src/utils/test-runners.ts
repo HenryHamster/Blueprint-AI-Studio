@@ -564,6 +564,206 @@ export function detectAutoTestRunners(): TestRunner[] {
   return detectTestRunners(undefined);
 }
 
+// ── Cheap acceptance probe (no-CI merge gate goal-level check) ───────────────
+// When the no-CI merge gate finds no unit suite (or the suite is thin / fully
+// skipped), the PR ships with ZERO execution signal. The acceptance probe is a
+// bounded, CPU-cheap, goal-level check of the most basic claim every code
+// change makes: that the code still loads / compiles / builds. It is NOT an
+// environment fixer (that is the greenfield setup-repair direction) and NOT a
+// full build pipeline — it runs in seconds under the same bounded-timeout
+// discipline the suite already uses. Language is detected from the SAME signals
+// the suite detector uses.
+export interface AcceptanceProbe {
+  cmd: string;
+  args: string[];
+  cwd: string;
+  ecosystem: 'python' | 'node' | 'go' | 'rust';
+  label: string;
+}
+
+// Hard cap on probes emitted so a large monorepo cannot fan out an unbounded
+// set of probe processes. The handler additionally slices to a small per-run
+// budget (see verify-tests.ts).
+const ACCEPTANCE_PROBE_MAX = 6;
+
+/**
+ * Detect cheap, goal-level acceptance probes for the cloned workspace's
+ * ecosystem(s). Mirrors the suite detector's manifest signals but emits a
+ * *compile/build* command rather than a test command:
+ *
+ *   - Python → ``python3 -m compileall`` (byte-compile; never imports, so a
+ *     missing runtime dependency cannot make it fail — only a real SyntaxError
+ *     does). Vendored/build trees are excluded so a large repo stays bounded.
+ *   - Node/TS → ``npx --no-install tsc --noEmit`` (no-emit type-check), emitted
+ *     ONLY when a tsconfig.json is present. ``--no-install`` fails fast
+ *     (could-not-run) when tsc is absent instead of triggering a network
+ *     install. A plain-JS package has nothing cheap+safe to "compile" (requiring
+ *     its entrypoint could boot a server) so none is emitted.
+ *   - Go → ``go build ./...`` (compiles every package without running tests).
+ *   - Rust → ``cargo check`` (type/borrow-check without producing a binary).
+ *
+ * CONSERVATIVE + bounded: probes are deduped by ``ecosystem:cwd``, capped at
+ * ``ACCEPTANCE_PROBE_MAX``, and the auto-scan is depth-1 with the same
+ * vendored/dot-dir skip list as the suite detector. Inspects ONLY the local
+ * filesystem (zero GitHub-API cost).
+ */
+export function detectAcceptanceProbes(buildConfig?: BuildConfig): AcceptanceProbe[] {
+  const { existsSync, readdirSync } = fs;
+  const probes: AcceptanceProbe[] = [];
+  const seen = new Set<string>();
+
+  const has = (absDir: string, name: string): boolean => {
+    try { return existsSync(`${absDir}/${name}`); } catch { return false; }
+  };
+  const add = (probe: AcceptanceProbe): void => {
+    if (probes.length >= ACCEPTANCE_PROBE_MAX) return;
+    const key = `${probe.ecosystem}:${probe.cwd}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    probes.push(probe);
+  };
+
+  // Emit every ecosystem probe a directory supports. ``typeHint`` is the stored
+  // build_config directory ``type`` (python|node|go|rust|other) when available.
+  const probeDir = (absDir: string, label: string, typeHint?: string): void => {
+    if (
+      typeHint === 'python' ||
+      has(absDir, 'pyproject.toml') || has(absDir, 'setup.py') ||
+      has(absDir, 'setup.cfg') || has(absDir, 'pytest.ini')
+    ) {
+      add({
+        ecosystem: 'python',
+        cmd: 'python3',
+        // -x EXCLUDES vendored/build trees (regex over the file path). Passed as
+        // a single argv element via execFile (no shell), so no escape pass.
+        args: ['-m', 'compileall', '-q', '-x', '(\\.venv|venv|node_modules|\\.git|build|dist)', absDir],
+        cwd: absDir,
+        label: `python3 -m compileall (${label})`,
+      });
+    }
+    if (has(absDir, 'tsconfig.json')) {
+      add({
+        ecosystem: 'node',
+        cmd: 'npx',
+        args: ['--no-install', 'tsc', '--noEmit'],
+        cwd: absDir,
+        label: `tsc --noEmit (${label})`,
+      });
+    }
+    if (has(absDir, 'go.mod')) {
+      add({
+        ecosystem: 'go',
+        cmd: 'go',
+        args: ['build', './...'],
+        cwd: absDir,
+        label: `go build ./... (${label})`,
+      });
+    }
+    if (has(absDir, 'Cargo.toml')) {
+      add({
+        ecosystem: 'rust',
+        cmd: 'cargo',
+        args: ['check', '--quiet'],
+        cwd: absDir,
+        label: `cargo check (${label})`,
+      });
+    }
+  };
+
+  // 1) Stored build_config directories carry an explicit language type hint.
+  if (buildConfig?.directories) {
+    for (const dir of buildConfig.directories) {
+      const abs = dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE;
+      probeDir(abs, dir.path || 'root', dir.type);
+    }
+  }
+
+  // 2) Auto-detect at the repo root + one level of subdirectories so an external
+  //    repo with no stored build_config still gets a probe. Bounded depth-1,
+  //    capped, skipping vendored/dot dirs.
+  probeDir(WORKSPACE, 'root');
+  const SKIP_DIRS = new Set(['node_modules', 'vendor', '.venv', 'venv', 'target', 'dist', 'build']);
+  const skip = (name: string): boolean => name.startsWith('.') || SKIP_DIRS.has(name);
+  let entries: string[] = [];
+  try { entries = readdirSync(WORKSPACE) as unknown as string[]; } catch { entries = []; }
+  if (Array.isArray(entries)) {
+    let inspected = 0;
+    for (const entry of entries) {
+      if (typeof entry !== 'string' || skip(entry)) continue;
+      if (inspected >= 40 || probes.length >= ACCEPTANCE_PROBE_MAX) break;
+      inspected++;
+      probeDir(`${WORKSPACE}/${entry}`, entry);
+    }
+  }
+
+  return probes;
+}
+
+/**
+ * Classify an acceptance-probe run into ``pass`` | ``fail`` | ``could_not_run``.
+ *
+ * ``exitErr`` is null when the probe exited 0 (``pass``). Otherwise it is the
+ * rejected ``execFileAsync`` error (carrying ``.code`` / ``.stdout`` / etc.).
+ *
+ * CONSERVATIVE BY DESIGN — to avoid false merge blocks, a non-zero exit maps to
+ * ``fail`` ONLY on an unambiguous compile/build-error signature. Spawn/timeout
+ * failures, missing-tool / missing-dependency / unprovisioned-setup signatures,
+ * and any unrecognized non-zero exit all degrade to ``could_not_run`` so the
+ * gate falls open rather than hard-blocking.
+ */
+export function classifyProbeOutcome(
+  output: string,
+  exitErr: (Error & { code?: string; status?: number | null }) | null,
+): 'pass' | 'fail' | 'could_not_run' {
+  if (exitErr == null) return 'pass';
+  // Spawn / timeout / OOM — the probe could not execute to a verdict.
+  const code = exitErr.code;
+  if (code === 'ENOENT' || code === 'ETIMEDOUT' || code === 'EOOM') return 'could_not_run';
+  const lower = `${output}\n${exitErr.message}`.toLowerCase();
+
+  // (1) Missing-tool / missing-dependency / unprovisioned-setup signatures →
+  //     could_not_run (degrade to fall-open; NEVER hard-block on these). Checked
+  //     BEFORE the failure signatures so e.g. a tsc "Cannot find module" run
+  //     (TS2307, prints `error TS…`) is treated as unprovisioned deps, not a
+  //     real type failure.
+  const couldNotRunSignatures = [
+    'command not found',
+    'could not determine executable',
+    'is not recognized as an internal or external',
+    'permission denied',
+    'no module named',
+    'modulenotfounderror',
+    'cannot find module',
+    'cannot find type definition file',
+    'cannot find package',
+    'no required module provides package',
+    'missing go.sum entry',
+    'go: downloading',
+    'failed to load source',
+    'no matching package named',
+    'failed to download',
+    'spurious network error',
+    'could not find `cargo.toml`',
+  ];
+  if (couldNotRunSignatures.some(sig => lower.includes(sig))) return 'could_not_run';
+
+  // (2) Unambiguous compile/build FAILURE signatures → fail (block the gate).
+  const failureSignatures = [
+    'syntaxerror',        // python compileall
+    'indentationerror',
+    'taberror',
+    'error ts',           // tsc: "error TS2322: ..."
+    'error[e',            // rustc: "error[E0425]: ..."
+    'undefined:',         // go build: "undefined: Foo"
+  ];
+  if (failureSignatures.some(sig => lower.includes(sig))) return 'fail';
+
+  // (3) Non-zero exit we cannot positively attribute to a clean compile error →
+  //     CONSERVATIVE default: could_not_run, so an unrecognized environment
+  //     failure never hard-blocks a merge.
+  return 'could_not_run';
+}
+
 /**
  * Map a detected `TestRunner` back to a project build_config directory entry
  * (repo-root-relative path, language type, reconstructed test command) so the
@@ -639,12 +839,18 @@ function runnerKindFromCmd(cmd: string): string {
  * target does not exist) as a no-tests case so the gate falls back to
  * proceed-without-checks rather than blocking the merge on an invocation error.
  *
- * CONSERVATIVE BY DESIGN: returns 'no_tests' ONLY on a positive signature match.
- * Anything else — including a genuine failure like "1 failed" or "2 passed",
- * empty output, or an unrecognized format — defaults to 'ran' so that a real
- * verdict is never misread as "no tests".
+ * Returns 'all_skipped' for a run that COLLECTED tests but executed NONE
+ * because every test was skipped / deselected / ignored / filtered — the same
+ * honest no-real-tests-executed case as 'no_tests' (callers treat both as "not
+ * a real run"), but distinguished so the verdict can surface "suite present but
+ * every test skipped" versus "no detectable suite / zero collection".
+ *
+ * CONSERVATIVE BY DESIGN: returns 'no_tests'/'all_skipped' ONLY on a positive
+ * signature match. Anything else — including a genuine failure like "1 failed"
+ * or "2 passed", empty output, or an unrecognized format — defaults to 'ran' so
+ * that a real verdict is never misread as "no tests".
  */
-export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
+export function classifyTestExecution(output: string): 'ran' | 'no_tests' | 'all_skipped' {
   const lower = output.toLowerCase();
   const lines = output.split(/\r?\n/);
   const trimmedLines = lines.map(line => line.trim());
@@ -741,6 +947,79 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
   // vitest: "No test files found, exiting with code 1". Line-anchored so an
   // assertion quoting the bare phrase "no test files" mid-line stays a real run.
   if (!hasRealFailureEvidence && trimmedLines.some(line => /^no test files found\b/i.test(line))) return 'no_tests';
+  // ── All-skipped / fully-skipped run (collected tests but executed NONE) ──
+  // A suite that COLLECTED tests but ran NONE of them because every test was
+  // skipped / deselected / ignored / filtered (e.g. an integration suite gated
+  // on an env var or a service the cold verify VM has not provisioned)
+  // exercises ZERO real tests — the SAME honest non-verification case as a
+  // zero-collection run, and must NOT be recorded as a verified pass.
+  //
+  // STRICTLY conservative: classify all_skipped ONLY when there is zero
+  // real-pass AND zero real-failure evidence AND at least one
+  // skip/deselect/ignore/filter signal. A run where even one test passed or
+  // failed ("5 passed, 1500 skipped") keeps its real signal and stays 'ran'.
+  // hasRealPassEvidence mirrors hasRealFailureEvidence: line-anchored, non-zero.
+  const hasRealPassEvidence = trimmedLines.some(line => (
+    /\b[1-9]\d*\s+passed\b/i.test(line) ||   // pytest / vitest / Rust "N passed"
+    /\bPassed:\s+[1-9]\d*\b/i.test(line) ||  // .NET `dotnet test` "Passed: N"
+    /^--- PASS:/.test(line)                  // Go verbose per-test pass marker
+  ));
+  if (!hasRealFailureEvidence && !hasRealPassEvidence) {
+    // Standalone skip tokens: the family reports any passing test as its OWN
+    // "N passed" / "Passed: N" / "--- PASS:" token (already excluded above), so
+    // a non-zero skip/deselect/ignore/filter count here is decisive.
+    //   pytest "5 skipped" / "3 deselected"; vitest "5 skipped"; Rust "N ignored"
+    //   / "N filtered out"; Go verbose "--- SKIP:".
+    const standaloneSkip = trimmedLines.some(line => (
+      /\b[1-9]\d*\s+skipped\b/i.test(line) ||
+      /\b[1-9]\d*\s+deselected\b/i.test(line) ||
+      /\b[1-9]\d*\s+ignored\b/i.test(line) ||
+      /\b[1-9]\d*\s+filtered out\b/i.test(line) ||
+      /^\s*--- SKIP:/.test(line)
+    ));
+    // Aggregate families report a TOTAL count (not a separate pass token), so a
+    // bare "Skipped: N" could co-exist with passes counted only in the total.
+    // Classify all-skip ONLY when total === skip on the SAME line (zero pass/
+    // fail already guaranteed by the guards above), so "Tests run: 5, .., Skipped:
+    // 3" (2 passed) stays 'ran' while "Tests run: 5, .., Skipped: 5" is all-skip.
+    // The (totalRe, skipRe) family table is shared between the all-skip check
+    // (total === skip) and the multi-class pass guard (total > skip) below.
+    const AGGREGATE_FAMILIES: Array<[RegExp, RegExp]> = [
+      // Ruby/RSpec: "5 examples, 0 failures, 5 pending"
+      [/\b(\d+)\s+examples?\b/i, /\b(\d+)\s+pending\b/i],
+      // Ruby/Minitest: "5 runs, .., 0 failures, 0 errors, 5 skips"
+      [/\b(\d+)\s+runs?\b/i, /\b(\d+)\s+skips\b/i],
+      // Elixir/ExUnit: "5 tests, 0 failures, 5 skipped" / ".., 5 excluded"
+      [/\b(\d+)\s+tests?\b/i, /\b(\d+)\s+(?:skipped|excluded)\b/i],
+      // Gradle/Maven (Surefire/JUnit): "Tests run: 5, Failures: 0, Errors: 0, Skipped: 5"
+      [/Tests run:\s*(\d+)/i, /Skipped:\s*(\d+)/i],
+      // .NET: "Passed: 0, Failed: 0, Skipped: 5, Total: 5"
+      [/\bTotal:\s*(\d+)/i, /Skipped:\s*(\d+)/i],
+      // PHPUnit: "OK, but incomplete, skipped, or risky tests!" → "Tests: 5, .., Skipped: 5"
+      [/\bTests:\s*(\d+)/i, /Skipped:\s*(\d+)/i],
+    ];
+    // Compare the total and skip counts on the SAME line across all aggregate
+    // families; `cmp` selects all-skip (===) vs has-passes (>).
+    const aggregateMatch = (cmp: (total: number, skip: number) => boolean): boolean =>
+      AGGREGATE_FAMILIES.some(([totalRe, skipRe]) =>
+        trimmedLines.some(line => {
+          const t = line.match(totalRe);
+          const s = line.match(skipRe);
+          return Boolean(t && s && Number(t[1]) > 0 && cmp(Number(t[1]), Number(s[1])));
+        }),
+      );
+    const allSkipByTotal = aggregateMatch((total, skip) => total === skip);
+    // Multi-class / multi-project guard: Maven/Surefire/Gradle (and dotnet test)
+    // print ONE aggregate summary line PER class/project. A sibling class that
+    // PASSED ("Tests run: 3, .., Skipped: 0") shows total > skip on its own line
+    // but — for the Surefire family — emits NO "N passed" token, so it evades
+    // hasRealPassEvidence above. Since we are already inside !hasRealFailureEvidence
+    // (zero failures/errors anywhere), any line with total > skip means real tests
+    // passed. Treat that as pass evidence so one fully-skipped class can never
+    // short-circuit the scan and flip a run with passing siblings to all_skipped.
+    const aggregatePass = aggregateMatch((total, skip) => total > skip);
+    if ((standaloneSkip || allSkipByTotal) && !aggregatePass) return 'all_skipped';
+  }
   // Go: `go test` on an empty package reports `? pkg [no test files]`.
   // The default reporter also emits `ok pkg ...` lines when real tests ran,
   // so only classify as no_tests when every observed package line is empty or

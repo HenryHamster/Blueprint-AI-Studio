@@ -11,6 +11,10 @@ vi.mock('../index.js', async (importOriginal) => {
     sendLog: vi.fn(),
     persistAndPostStatus: vi.fn().mockResolvedValue(undefined),
     validateBranchName: vi.fn((b: string) => b),
+    // execFileAsync drives the acceptance probe; mocked so the fall-open tests
+    // never shell out. Default resolves (probe pass) but is irrelevant unless a
+    // probe is detected (detectAcceptanceProbes defaults to [] below).
+    execFileAsync: vi.fn().mockResolvedValue(''),
   };
 });
 
@@ -27,7 +31,15 @@ vi.mock('../utils/test-runners.js', async (importOriginal) => {
   // detectAutoTestRunners is mocked so the stale-command recovery path is
   // deterministic (no real filesystem scan). describeRunnerDirectory stays real
   // so recovered_directories reflects the actual cmd→type/path mapping.
-  return { ...actual, detectTestRunners: vi.fn(), detectAutoTestRunners: vi.fn() };
+  // detectAcceptanceProbes is mocked so the fall-open paths never scan the real
+  // filesystem; classifyProbeOutcome stays REAL so the probe verdict reflects the
+  // actual signature classification of the mocked execFileAsync error.
+  return {
+    ...actual,
+    detectTestRunners: vi.fn(),
+    detectAutoTestRunners: vi.fn(),
+    detectAcceptanceProbes: vi.fn(),
+  };
 });
 
 vi.mock('../utils/test-fix-loop.js', async (importOriginal) => {
@@ -42,9 +54,14 @@ vi.mock('fs', () => ({
 }));
 
 import { handleVerifyTests } from './verify-tests.js';
-import { persistAndPostStatus } from '../index.js';
-import { detectTestRunners, detectAutoTestRunners } from '../utils/test-runners.js';
+import { persistAndPostStatus, execFileAsync } from '../index.js';
+import { detectTestRunners, detectAutoTestRunners, detectAcceptanceProbes } from '../utils/test-runners.js';
 import { testFixLoop } from '../utils/test-fix-loop.js';
+
+const PY_PROBE = {
+  cmd: 'python3', args: ['-m', 'compileall', '-q', '/tmp/workspace'],
+  cwd: '/tmp/workspace', ecosystem: 'python' as const, label: 'python3 -m compileall (root)',
+};
 
 const RUNNER = { cmd: 'npm', args: ['test'], cwd: '/tmp/workspace', label: 'npm test (root)' };
 // A stored runner pointing at a now-stale command (e.g. a dropped Makefile target).
@@ -60,13 +77,19 @@ function lastPostedPayload(): Record<string, unknown> {
   return calls[calls.length - 1][1];
 }
 
+type Probe = {
+  ran: boolean; ecosystem: string; outcome: string;
+  passed: boolean; could_not_run: boolean; output: string; label: string;
+};
 function parsedVerdict(): {
   detected: boolean; passed: boolean; tests: unknown[]; output: string;
   recovered?: boolean; recovered_directories?: Array<{ path: string; type: string; test_cmd: string }>;
+  probe?: Probe;
 } {
   return JSON.parse(lastPostedPayload().logs as string) as {
     detected: boolean; passed: boolean; tests: unknown[]; output: string;
     recovered?: boolean; recovered_directories?: Array<{ path: string; type: string; test_cmd: string }>;
+    probe?: Probe;
   };
 }
 
@@ -80,6 +103,10 @@ describe('handleVerifyTests', () => {
     // placeholder/empty fall-open tests behave exactly as before. Recovery
     // tests override this per-case.
     vi.mocked(detectAutoTestRunners).mockReturnValue([]);
+    // Default: no probeable ecosystem, so the existing fall-open tests carry no
+    // probe field and behave exactly as before. Probe tests override this.
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([]);
+    vi.mocked(execFileAsync).mockResolvedValue('');
   });
 
   it('passing suite → COMPLETED with detected=true, passed=true', async () => {
@@ -351,6 +378,97 @@ describe('handleVerifyTests', () => {
     // No recovery path: testFixLoop called exactly once, detectAutoTestRunners never consulted.
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(detectAutoTestRunners)).not.toHaveBeenCalled();
+  });
+
+  // ── Acceptance probe on the detected=false fall-open paths ────────────────
+  it('no suite + probe PASSES → detected=false fall-open carries probe.passed=true', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([]);
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([PY_PROBE]);
+    vi.mocked(execFileAsync).mockResolvedValue(''); // compileall exits 0
+
+    await handleVerifyTests('p1', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    expect(lastPostedPayload().status).toBe('COMPLETED');
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(false);
+    expect(verdict.probe).toBeDefined();
+    expect(verdict.probe?.ran).toBe(true);
+    expect(verdict.probe?.passed).toBe(true);
+    expect(verdict.probe?.could_not_run).toBe(false);
+    expect(verdict.probe?.ecosystem).toBe('python');
+    expect(verdict.output).toContain('Acceptance probe passed');
+  });
+
+  it('no suite + probe FAILS (syntax error) → detected=false but probe.passed=false (backend blocks)', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([]);
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([PY_PROBE]);
+    // execFileAsync rejects with a clean compile error → classifyProbeOutcome=fail.
+    const err = Object.assign(new Error('Command failed\n  File "x.py", line 2\n    def\n       ^\nSyntaxError: invalid syntax'), {
+      stdout: '', stderr: 'SyntaxError: invalid syntax', status: 1, code: undefined,
+    });
+    vi.mocked(execFileAsync).mockRejectedValue(err);
+
+    await handleVerifyTests('p2', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    expect(lastPostedPayload().status).toBe('COMPLETED');
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(false);
+    expect(verdict.probe?.ran).toBe(true);
+    expect(verdict.probe?.passed).toBe(false);
+    expect(verdict.probe?.could_not_run).toBe(false);
+    expect(verdict.probe?.outcome).toBe('fail');
+    expect(verdict.probe?.output).toContain('SyntaxError');
+    expect(verdict.output).toContain('Acceptance probe FAILED');
+  });
+
+  it('no suite + probe CANNOT RUN (missing deps) → detected=false fall-open, probe.could_not_run=true (no block)', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([]);
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([PY_PROBE]);
+    const err = Object.assign(new Error('spawn python3 ENOENT'), { code: 'ENOENT' });
+    vi.mocked(execFileAsync).mockRejectedValue(err);
+
+    await handleVerifyTests('p3', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(false);
+    expect(verdict.probe?.ran).toBe(true);
+    expect(verdict.probe?.passed).toBe(false);
+    expect(verdict.probe?.could_not_run).toBe(true);
+    expect(verdict.probe?.outcome).toBe('could_not_run');
+    expect(verdict.output).toContain('Acceptance probe could not run');
+  });
+
+  it('all-skipped suite + probe FAILS → detected=false, all_skipped reason preserved, probe.passed=false', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+    vi.mocked(testFixLoop).mockResolvedValue({
+      passed: true, testFailuresDetected: false, noTestsExecuted: true, noTestsReason: 'all_skipped',
+    });
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([PY_PROBE]);
+    const err = Object.assign(new Error('SyntaxError: invalid syntax'), { stderr: 'SyntaxError: invalid syntax', status: 1 });
+    vi.mocked(execFileAsync).mockRejectedValue(err);
+
+    await handleVerifyTests('p4', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict() as { detected: boolean; noTestsReason?: string; probe?: Probe };
+    expect(verdict.detected).toBe(false);
+    expect(verdict.noTestsReason).toBe('all_skipped');
+    expect(verdict.probe?.passed).toBe(false);
+    expect(verdict.probe?.could_not_run).toBe(false);
+  });
+
+  it('detected real pass → no probe run (probe only runs on fall-open)', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+    vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([PY_PROBE]);
+
+    await handleVerifyTests('p5', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(true);
+    expect(verdict.probe).toBeUndefined();
+    // The probe is never even detected on a real-suite verdict.
+    expect(vi.mocked(detectAcceptanceProbes)).not.toHaveBeenCalled();
+    expect(vi.mocked(execFileAsync)).not.toHaveBeenCalled();
   });
 
   it('runs testFixLoop once with maxFixAttempts 0 (no fix loop)', async () => {

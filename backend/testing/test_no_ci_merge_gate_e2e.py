@@ -48,6 +48,7 @@ from app.ci_completion import handle_ci_completion
 from app.ci_resolution import (
     build_no_ci_gate_ci_result,
     classify_merge_test_verdict,
+    classify_unverified_fall_open_reason,
     has_detectable_tests,
     merge_gate_runtime_block,
     proceed_on_no_checks,
@@ -727,6 +728,199 @@ async def test_no_ci_no_detectable_tests_falls_back_to_proceed_without_checks(
     assert runtime["executed_real_tests"] is False
     assert runtime["last_unverified_at"] == _RUNTIME_WHEN.isoformat()
     assert runtime["last_unverified_reason"] == "no_detectable_test_command"
+
+
+@pytest.mark.asyncio
+async def test_no_ci_all_skipped_records_distinct_runtime_reason(db_session):
+    """A suite that was PRESENT but skipped every test records a DISTINCT
+    operator reason/key on merge_gate_runtime, while a genuine no-suite repo
+    keeps the generic reason — and the merge decision is identical for both."""
+    # All-skipped verdict (detected=false + the agent's distinguishing field) →
+    # distinct reason + key, but still an 'undetected' merge outcome.
+    skipped_verdict = {"detected": False, "noTestsReason": "all_skipped"}
+    skipped_outcome, skipped_detail = classify_merge_test_verdict(skipped_verdict)
+    _, skipped_key = classify_unverified_fall_open_reason(skipped_verdict)
+    assert skipped_outcome == "undetected" and skipped_detail == ""
+    assert skipped_key == "suite_all_skipped"
+
+    # Genuine no-suite verdict → unchanged generic reason, SAME merge outcome.
+    no_suite_verdict = {"detected": False}
+    no_suite_outcome, _ = classify_merge_test_verdict(no_suite_verdict)
+    _, no_suite_key = classify_unverified_fall_open_reason(no_suite_verdict)
+    assert no_suite_outcome == "undetected"
+    assert no_suite_key == "undetected_runtime"
+
+    # The merge outcome is unaffected by the reason refinement: both fall open to
+    # the SAME success ci_result (merge UNVERIFIED).
+    assert (
+        build_no_ci_gate_ci_result(skipped_outcome, skipped_detail)["conclusion"]
+        == build_no_ci_gate_ci_result(no_suite_outcome, "")["conclusion"]
+        == "success"
+    )
+
+    # Recording the all-skipped key stamps the distinct reason on the project.
+    skipped_project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    await _record_gate_runtime(
+        db_session, skipped_project, outcome=skipped_outcome, unverified_reason=skipped_key
+    )
+    skipped_runtime = merge_gate_runtime_block(skipped_project)
+    assert skipped_runtime["executed_real_tests"] is False
+    assert skipped_runtime["last_unverified_reason"] == "suite_all_skipped"
+
+    # A genuine no-suite repo still records the generic reason, unchanged.
+    no_suite_project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    await _record_gate_runtime(
+        db_session, no_suite_project, outcome=no_suite_outcome, unverified_reason=no_suite_key
+    )
+    no_suite_runtime = merge_gate_runtime_block(no_suite_project)
+    assert no_suite_runtime["last_unverified_reason"] == "undetected_runtime"
+
+
+# ---------------------------------------------------------------------------
+# 3b. Cheap acceptance probe gives an honest signal when the suite is absent
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_no_ci_probe_failure_blocks_merge_and_spawns_fix(db_session, mocker):
+    """A repo with no unit suite (detected=false) whose cheap acceptance probe
+    catches a real compile/build failure must BLOCK the merge and spawn a fix —
+    the probe-fail reuses the existing fail→fix machinery via the same gate
+    helpers the orchestrator calls."""
+    _patch_github(mocker)
+    merge_mock = mocker.patch("app.github.merge_pull_request", return_value=None)
+
+    project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    verify_task, was_created = await _spawn_pipeline_task(
+        parent, "verify_tests", db_session, PR_NUMBER, BRANCH, BASE,
+        original_task_id=str(parent.id), suppress_warm_handoff=True,
+    )
+    assert was_created is True
+
+    # Agent verdict: no unit suite ran (detected=false), but the acceptance probe
+    # byte-compiled the package and caught a SyntaxError — a clear FAIL.
+    probe_output = (
+        '  File "widget/core.py", line 12\n    def broken(\n             ^\n'
+        "SyntaxError: invalid syntax"
+    )
+    await _plant_verdict(
+        db_session, verify_task,
+        {
+            "detected": False,
+            "passed": False,
+            "tests": [],
+            "output": "No real tests executed; acceptance probe FAILED.",
+            "noTestsReason": "no_suite",
+            "probe": {
+                "ran": True,
+                "passed": False,
+                "could_not_run": False,
+                "ecosystem": "python",
+                "output": probe_output,
+                "label": "python3 -m compileall (root)",
+            },
+        },
+    )
+
+    verdict = await _latest_artifact_logs(
+        db_session, verify_task.id, ArtifactType.MERGE_TEST_RESULT
+    )
+    outcome, detail = classify_merge_test_verdict(verdict)
+    assert outcome == "fail"
+    assert "SyntaxError" in detail
+
+    ci_result = build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "failure"
+    assert "SyntaxError" in ci_result["failed_logs"]
+
+    parent = await db_session.get(Task, parent.id)
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    # The probe failure blocked the merge.
+    merge_mock.assert_not_called()
+
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars().all()
+    )
+    fix_tasks = [t for t in all_tasks if t.first_payload.get("type") == "fix"]
+    assert len(fix_tasks) == 1, "a probe failure must spawn exactly one fix task"
+    assert "SyntaxError" in fix_tasks[0].context["ci_failure_logs"]
+
+    await db_session.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED
+
+    # A real execution signal (a failing probe) ran to a FAIL verdict.
+    await _record_gate_runtime(
+        db_session, project, outcome=outcome, unverified_reason=None
+    )
+    runtime = merge_gate_runtime_block(project)
+    assert runtime["executed_real_tests"] is True
+
+
+@pytest.mark.asyncio
+async def test_no_ci_probe_could_not_run_falls_open_with_distinct_reason(
+    db_session, mocker
+):
+    """A probe that could not run (missing deps / unprovisioned setup) must NOT
+    hard-block — the merge falls open UNVERIFIED, but with a DISTINCT operator
+    reason from a genuine no-suite repo. A passing probe likewise falls open but
+    records its own positive reason."""
+    _patch_github(mocker)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", return_value={"merged": True}
+    )
+
+    # Probe could-not-run verdict → undetected (fall open), distinct reason key.
+    cnr_verdict = {
+        "detected": False,
+        "noTestsReason": "no_suite",
+        "probe": {"ran": True, "passed": False, "could_not_run": True, "ecosystem": "node"},
+    }
+    cnr_outcome, cnr_detail = classify_merge_test_verdict(cnr_verdict)
+    _, cnr_key = classify_unverified_fall_open_reason(cnr_verdict)
+    assert cnr_outcome == "undetected" and cnr_detail == ""
+    assert cnr_key == "probe_could_not_run"
+
+    # Probe-passed verdict → still undetected (no unit suite), positive reason.
+    pass_verdict = {
+        "detected": False,
+        "probe": {"ran": True, "passed": True, "could_not_run": False, "ecosystem": "python"},
+    }
+    pass_outcome, _ = classify_merge_test_verdict(pass_verdict)
+    _, pass_key = classify_unverified_fall_open_reason(pass_verdict)
+    assert pass_outcome == "undetected"
+    assert pass_key == "probe_passed"
+
+    # Both fall open to the SAME success ci_result (merge UNVERIFIED) — the probe
+    # only refines the operator reason, never the merge decision.
+    ci_result = build_no_ci_gate_ci_result(cnr_outcome, cnr_detail)
+    assert ci_result["conclusion"] == "success"
+
+    project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    parent = await db_session.get(Task, parent.id)
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    merge_mock.assert_called_once()  # probe could-not-run does NOT block
+
+    await _record_gate_runtime(
+        db_session, project, outcome=cnr_outcome, unverified_reason=cnr_key
+    )
+    runtime = merge_gate_runtime_block(project)
+    assert runtime["executed_real_tests"] is False
+    assert runtime["last_unverified_reason"] == "probe_could_not_run"
 
 
 # ---------------------------------------------------------------------------

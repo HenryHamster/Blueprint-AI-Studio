@@ -2,14 +2,15 @@ import fs from 'fs';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
-  persistAndPostStatus, resolveBaseBranch,
+  persistAndPostStatus, resolveBaseBranch, execFileAsync,
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
-import { DEFAULT_CLONE_DEPTH } from '../constants.js';
+import { DEFAULT_CLONE_DEPTH, TEST_BASELINE_TIMEOUT } from '../constants.js';
 import { resolveBuildConfig } from '../build-config.js';
 import {
   detectTestRunners, detectAutoTestRunners, describeRunnerDirectory,
-  type BuildConfig, type TestRunner,
+  detectAcceptanceProbes, classifyProbeOutcome,
+  type BuildConfig, type TestRunner, type AcceptanceProbe,
 } from '../utils/test-runners.js';
 import { testFixLoop } from '../utils/test-fix-loop.js';
 
@@ -45,6 +46,30 @@ interface VerifyTestsResult {
   // reconstructed test command) of the replacement suite that actually ran.
   // Only populated alongside recovered=true.
   recovered_directories?: Array<{ path: string; type: string; test_cmd: string }>;
+  // Machine-readable reason a detected=false verdict carries zero execution
+  // signal, so a later backend change can surface "suite present but every test
+  // skipped" (`all_skipped`) versus "detected suite ran no real tests"
+  // (`no_real_tests`) versus "no detectable suite" (`no_suite`). Additive: only
+  // set on the detected=false fall-open paths; never changes existing behaviour.
+  noTestsReason?: 'all_skipped' | 'no_real_tests' | 'no_suite';
+  // Cheap goal-level acceptance probe, run ONLY on the detected=false fall-open
+  // paths (no suite / thin / all-skipped). Gives the no-CI merge gate at least
+  // one honest execution signal — "does the changed code still compile/build?" —
+  // when the unit suite produced none. CONSERVATIVE: a probe that could not run
+  // (missing deps / unprovisioned setup) degrades to the existing fall-open and
+  // never blocks; only a clear compile/build FAILURE blocks the merge. The
+  // backend (ci_resolution.classify_merge_test_verdict) keys off
+  // ran/passed/could_not_run to decide block-vs-fall-open. Additive: absent on
+  // every detected=true verdict and the setup-failure FAILED path.
+  probe?: {
+    ran: boolean;
+    ecosystem: string;
+    outcome: 'pass' | 'fail' | 'could_not_run';
+    passed: boolean;
+    could_not_run: boolean;
+    output: string;
+    label: string;
+  };
 }
 
 type TestFixLoopResult = Awaited<ReturnType<typeof testFixLoop>>;
@@ -82,6 +107,86 @@ async function runVerifyLoop(
   }
 
   return loop;
+}
+
+// ── Cheap acceptance probe (goal-level fall-open signal) ─────────────────────
+// Each probe runs under the bounded baseline timeout the suite-baseline run uses
+// so the gate stays cheap (seconds, not a full build pipeline). A small per-run
+// budget caps total probe processes.
+const ACCEPTANCE_PROBE_TIMEOUT = TEST_BASELINE_TIMEOUT;
+const MAX_ACCEPTANCE_PROBES = 4;
+
+// Run the detected acceptance probe(s) for the cloned workspace and reduce them
+// to a single verdict. Fail-fast: a clear compile/build FAILURE on ANY probe
+// blocks (returns immediately). Otherwise a single clean PASS wins over a
+// could-not-run; an all-could-not-run set degrades to could_not_run. Returns
+// undefined when no probeable ecosystem is present (no probe signal at all).
+async function runAcceptanceProbe(
+  ws: WebSocket | null,
+  buildConfig: BuildConfig | undefined,
+): Promise<VerifyTestsResult['probe']> {
+  const probes = detectAcceptanceProbes(buildConfig).slice(0, MAX_ACCEPTANCE_PROBES);
+  if (probes.length === 0) {
+    sendLog(ws, 'Acceptance probe: no probeable ecosystem detected — no goal-level probe signal.\n');
+    return undefined;
+  }
+  let firstPass: AcceptanceProbe | null = null;
+  let firstCouldNotRun: AcceptanceProbe | null = null;
+  for (const probe of probes) {
+    let outcome: 'pass' | 'fail' | 'could_not_run';
+    let output = '';
+    try {
+      await execFileAsync(probe.cmd, probe.args, { cwd: probe.cwd, timeoutMs: ACCEPTANCE_PROBE_TIMEOUT });
+      outcome = 'pass';
+    } catch (err: unknown) {
+      const e = err as Error & { stdout?: string; stderr?: string; code?: string; status?: number | null };
+      output = [e.stdout, e.stderr, e.message].filter(Boolean).join('\n');
+      outcome = classifyProbeOutcome(output, e);
+    }
+    sendLog(ws, `Acceptance probe [${probe.label}]: ${outcome}\n`);
+    if (outcome === 'fail') {
+      return {
+        ran: true, ecosystem: probe.ecosystem, outcome,
+        passed: false, could_not_run: false,
+        output: output.slice(-VERIFY_TESTS_OUTPUT_LIMIT), label: probe.label,
+      };
+    }
+    if (outcome === 'pass' && firstPass === null) firstPass = probe;
+    if (outcome === 'could_not_run' && firstCouldNotRun === null) firstCouldNotRun = probe;
+  }
+  if (firstPass !== null) {
+    return {
+      ran: true, ecosystem: firstPass.ecosystem, outcome: 'pass',
+      passed: true, could_not_run: false, output: '', label: firstPass.label,
+    };
+  }
+  const cnr = firstCouldNotRun as AcceptanceProbe;
+  return {
+    ran: true, ecosystem: cnr.ecosystem, outcome: 'could_not_run',
+    passed: false, could_not_run: true, output: '', label: cnr.label,
+  };
+}
+
+// Run the acceptance probe and fold its verdict into a detected=false fall-open
+// result. A clear probe FAIL keeps detected=false but carries probe.passed=false
+// (the backend flips this to a merge block); pass/could-not-run leave the
+// fall-open intact, only annotating output for the operator.
+async function attachAcceptanceProbe(
+  ws: WebSocket | null,
+  buildConfig: BuildConfig | undefined,
+  base: VerifyTestsResult,
+): Promise<VerifyTestsResult> {
+  const probe = await runAcceptanceProbe(ws, buildConfig);
+  if (!probe) return base;
+  let note: string;
+  if (probe.outcome === 'fail') {
+    note = `Acceptance probe FAILED (${probe.ecosystem}: ${probe.label}) — the changed code does not compile/build; blocking the merge.`;
+  } else if (probe.outcome === 'pass') {
+    note = `Acceptance probe passed (${probe.ecosystem}: ${probe.label}) — the changed code still compiles/builds (cheap goal-level signal; unit suite still absent/thin).`;
+  } else {
+    note = `Acceptance probe could not run (${probe.ecosystem}: ${probe.label}) — missing deps / unprovisioned setup; falling open without a probe block.`;
+  }
+  return { ...base, probe, output: [base.output, note].filter(Boolean).join('\n') };
 }
 
 // ── Stale-command self-heal ──────────────────────────────────────────────────
@@ -193,12 +298,14 @@ export async function handleVerifyTests(
     // No resolvable test_cmd — the backend will fall back. This is a SUCCESS:
     // an absent-tests repo must still progress through the merge gate.
     sendLog(ws, 'No test runner detected — reporting detected=false (backend will fall back).\n');
-    result = {
+    statusRef.value = 'Running cheap acceptance probe (no suite detected)...';
+    result = await attachAcceptanceProbe(ws, buildConfig, {
       detected: false,
       passed: false,
       tests: [],
       output: 'No test runner detected for this repository; merge gate has no suite to run.',
-    };
+      noTestsReason: 'no_suite',
+    });
   } else {
     sendLog(ws, `Detected test runner(s): ${runners.map(r => r.label).join(', ')}\n`);
     statusRef.value = 'Running detected test suite...';
@@ -280,13 +387,18 @@ export async function handleVerifyTests(
         // documented proceed-without-checks fallback rather than recording a
         // hard failure (placeholder exits non-zero) or a vacuous pass (empty
         // suite exits zero).
-        sendLog(ws, 'Detected suite ran no real tests (placeholder/empty) and no replacement found — reporting detected=false (backend will fall back).\n');
-        result = {
+        const allSkipped = loop.noTestsReason === 'all_skipped';
+        sendLog(ws, `Detected suite ran no real tests (${allSkipped ? 'all tests skipped' : 'placeholder/empty'}) and no replacement found — reporting detected=false (backend will fall back).\n`);
+        statusRef.value = 'Running cheap acceptance probe (suite ran no real tests)...';
+        result = await attachAcceptanceProbe(ws, buildConfig, {
           detected: false,
           passed: false,
           tests: [],
-          output: 'Detected test command ran no real tests (placeholder or empty suite) — no real tests executed; falling back to proceed-without-checks.',
-        };
+          output: allSkipped
+            ? 'Detected test suite collected tests but executed none — every test was skipped/deselected/ignored; no real tests executed; falling back to proceed-without-checks.'
+            : 'Detected test command ran no real tests (placeholder or empty suite) — no real tests executed; falling back to proceed-without-checks.',
+          noTestsReason: allSkipped ? 'all_skipped' : 'no_real_tests',
+        });
       }
     } else {
       const passed = loop.passed;

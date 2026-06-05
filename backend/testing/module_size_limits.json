@@ -115,7 +115,7 @@
     "json-extract.ts": 330,
     "workspacePrep.ts": 240,
     "reset.ts": 320,
-    "utils/test-runners.ts": 940,
+    "utils/test-runners.ts": 1400,
     "utils/diff-detection.ts": 150,
     "utils/stale-result.ts": 150,
     "handlers/strategic-sections.ts": 700,

@@ -319,6 +319,61 @@ def test_build_ci_result_undetected_proceeds_unverified():
     assert result["failed_logs"] == ""
 
 
+# ---------------------------------------------------------------------------
+# classify_unverified_fall_open_reason — refine the operator-visible reason a
+# detected=false fall-open records on merge_gate_runtime.last_unverified_reason.
+# Purely cosmetic to operators: the pass/fail/undetected decision is unchanged.
+# ---------------------------------------------------------------------------
+def test_fall_open_reason_all_skipped_gets_distinct_key():
+    phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+        {"detected": False, "noTestsReason": "all_skipped"}
+    )
+    assert key == "suite_all_skipped"
+    assert phrase == "suite present but every test skipped"
+
+
+def test_fall_open_reason_all_skipped_case_insensitive_variants():
+    for value in ("ALL_SKIPPED", "all_tests_skipped", "every_test_skipped", "skipped"):
+        _, key = ci_resolution.classify_unverified_fall_open_reason(
+            {"detected": False, "noTestsReason": value}
+        )
+        assert key == "suite_all_skipped", value
+
+
+def test_fall_open_reason_no_suite_keeps_generic_reason():
+    # A genuine no-suite repo (no noTestsReason field) keeps today's reason.
+    phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+        {"detected": False, "passed": False, "output": "no runner"}
+    )
+    assert key == "undetected_runtime"
+    assert phrase == "no test command detectable"
+
+
+def test_fall_open_reason_unrelated_no_tests_reason_keeps_generic():
+    # An older/other-shape value (e.g. a placeholder marker) is not all-skipped.
+    _, key = ci_resolution.classify_unverified_fall_open_reason(
+        {"detected": False, "noTestsReason": "placeholder"}
+    )
+    assert key == "undetected_runtime"
+
+
+def test_fall_open_reason_missing_or_old_shape_verdict_is_defensive():
+    # An older agent that never emits the field, or a non-dict, keeps the
+    # generic reason — the merge decision is unaffected.
+    assert ci_resolution.classify_unverified_fall_open_reason(None) == (
+        "no test command detectable",
+        "undetected_runtime",
+    )
+    assert ci_resolution.classify_unverified_fall_open_reason("nope") == (
+        "no test command detectable",
+        "undetected_runtime",
+    )
+    assert ci_resolution.classify_unverified_fall_open_reason({}) == (
+        "no test command detectable",
+        "undetected_runtime",
+    )
+
+
 @pytest.mark.asyncio
 async def test_branch_head_has_checks_returns_branch_head_source(mocker):
     """Normal case: branch HEAD carries a completed green build → resolved on the
@@ -830,3 +885,121 @@ def test_override_merge_preserves_existing_requires_ci_checks_true():
         detected, {"requires_ci_checks": True}
     )
     assert merged["requires_ci_checks"] is True
+
+
+# ── Acceptance probe: classify_merge_test_verdict (detected=false fall-open) ──
+def test_classify_verdict_probe_fail_blocks_with_output():
+    # A clear acceptance-probe failure on a no-suite fall-open flips the
+    # detected=false verdict to a merge-blocking "fail" carrying the probe output.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": False,
+            "noTestsReason": "no_suite",
+            "probe": {
+                "ran": True,
+                "passed": False,
+                "could_not_run": False,
+                "ecosystem": "python",
+                "output": "SyntaxError: invalid syntax",
+            },
+        }
+    )
+    assert outcome == "fail"
+    assert "SyntaxError" in detail
+
+
+def test_classify_verdict_probe_fail_blank_output_gets_fallback():
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": False,
+            "probe": {"ran": True, "passed": False, "could_not_run": False, "output": ""},
+        }
+    )
+    assert outcome == "fail"
+    assert detail  # non-empty fallback message
+
+
+def test_classify_verdict_probe_could_not_run_stays_undetected():
+    # Missing deps / unprovisioned setup must NOT hard-block — fall open.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": False,
+            "probe": {"ran": True, "passed": False, "could_not_run": True, "output": ""},
+        }
+    )
+    assert outcome == "undetected"
+    assert detail == ""
+
+
+def test_classify_verdict_probe_pass_stays_undetected():
+    # A passing probe is a positive signal but still no unit suite — fall open
+    # (UNVERIFIED), never a hard "pass" of the test gate.
+    outcome, _ = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": False,
+            "probe": {"ran": True, "passed": True, "could_not_run": False, "output": ""},
+        }
+    )
+    assert outcome == "undetected"
+
+
+def test_classify_verdict_probe_not_ran_stays_undetected():
+    outcome, _ = ci_resolution.classify_merge_test_verdict(
+        {"detected": False, "probe": {"ran": False, "passed": False, "could_not_run": False}}
+    )
+    assert outcome == "undetected"
+
+
+def test_classify_verdict_no_probe_key_unchanged_undetected():
+    # Older agent emits no probe — behavior byte-for-byte unchanged.
+    assert ci_resolution.classify_merge_test_verdict(
+        {"detected": False, "passed": False, "output": "no runner"}
+    ) == ("undetected", "")
+
+
+def test_classify_verdict_detected_true_ignores_probe():
+    # A real suite verdict is never reinterpreted by a probe field.
+    outcome, _ = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "probe": {"ran": True, "passed": False, "could_not_run": False},
+        }
+    )
+    assert outcome == "pass"
+
+
+# ── Acceptance probe: classify_unverified_fall_open_reason ────────────────────
+def test_fall_open_reason_probe_passed_distinct_key():
+    phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+        {"detected": False, "probe": {"ran": True, "passed": True, "could_not_run": False}}
+    )
+    assert key == "probe_passed"
+    assert "probe" in phrase
+
+
+def test_fall_open_reason_probe_could_not_run_distinct_key():
+    phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+        {"detected": False, "probe": {"ran": True, "passed": False, "could_not_run": True}}
+    )
+    assert key == "probe_could_not_run"
+    assert "probe" in phrase
+
+
+def test_fall_open_reason_probe_takes_precedence_over_all_skipped():
+    _, key = ci_resolution.classify_unverified_fall_open_reason(
+        {
+            "detected": False,
+            "noTestsReason": "all_skipped",
+            "probe": {"ran": True, "passed": True, "could_not_run": False},
+        }
+    )
+    assert key == "probe_passed"
+
+
+def test_fall_open_reason_no_probe_keeps_all_skipped():
+    # Without a probe the all-skipped reason is unchanged.
+    _, key = ci_resolution.classify_unverified_fall_open_reason(
+        {"detected": False, "noTestsReason": "all_skipped"}
+    )
+    assert key == "suite_all_skipped"

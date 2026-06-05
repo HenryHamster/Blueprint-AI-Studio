@@ -319,15 +319,48 @@ def classify_merge_test_verdict(
                            UNVERIFIED.
 
     ``detail`` is the failing-test output for ``"fail"`` and ``""`` otherwise.
+
+    Acceptance probe (``detected=false`` only): when no unit suite ran, the agent
+    may still attach a cheap goal-level ``probe`` ("does the changed code still
+    compile/build/boot"). A CLEAR probe failure — it ran, did not pass, and was
+    NOT a could-not-run degrade — maps to ``"fail"`` so the existing block-and-fix
+    path fires carrying the probe output. Every other probe state (pass /
+    could-not-run / absent / old-shape verdict) keeps today's ``"undetected"``
+    fall-open, so missing-deps / unprovisioned setup never hard-blocks a merge.
     """
     if not isinstance(verdict, dict):
         return ("undetected", "")
     if verdict.get("detected") is False:
+        if _probe_is_clear_failure(verdict.get("probe")):
+            probe = verdict["probe"]
+            output = str(probe.get("output") or "").strip()
+            return (
+                "fail",
+                output
+                or "Acceptance probe failed: the changed code does not compile/build.",
+            )
         return ("undetected", "")
     if verdict.get("passed"):
         return ("pass", "")
     output = str(verdict.get("output") or "").strip()
     return ("fail", output or "Detected test suite failed (no output captured).")
+
+
+def _probe_is_clear_failure(probe: Any) -> bool:
+    """Whether an acceptance ``probe`` block represents a CLEAR, blocking failure.
+
+    True only when the probe ran, was not a could-not-run degrade, and did not
+    pass — i.e. the changed code genuinely failed to compile/build. Defensive
+    about a missing / non-dict / old-shape probe (returns False), so a verdict
+    from an older agent that emits no probe keeps the undetected fall-open.
+    """
+    if not isinstance(probe, dict):
+        return False
+    if not probe.get("ran"):
+        return False
+    if probe.get("could_not_run"):
+        return False
+    return probe.get("passed") is False
 
 
 def build_no_ci_gate_ci_result(
@@ -367,6 +400,64 @@ def build_no_ci_gate_ci_result(
         "details": [],
         "failed_logs": "",
     }
+
+
+# Values an agent's verify-tests handler may emit in the verdict's
+# ``noTestsReason`` field to mark a suite that was PRESENT and ran but skipped
+# (or deselected) every test — distinct from a genuine no-suite/placeholder
+# repo. Matched case-insensitively; tolerant of the field name not yet existing
+# on an older agent (then the generic reason is kept).
+_ALL_SKIPPED_NO_TESTS_REASONS = frozenset(
+    {"all_skipped", "all_tests_skipped", "every_test_skipped", "skipped"}
+)
+
+
+def classify_unverified_fall_open_reason(
+    verdict: dict[str, Any] | None,
+) -> tuple[str, str]:
+    """Map a detected=false MERGE_TEST_RESULT verdict to the operator-visible
+    ``(phrase, stable_key)`` for a no-CI gate fall-open to an UNVERIFIED merge.
+
+    A genuine no-suite/placeholder repo keeps today's generic
+    ``("no test command detectable", "undetected_runtime")``.  When the agent's
+    verify-tests handler marks — via the verdict's ``noTestsReason`` field — a
+    suite that was PRESENT but skipped EVERY test (e.g. an integration suite
+    that all-skips on the cold verify VM because no services are provisioned),
+    return a DISTINCT ``("suite present but every test skipped",
+    "suite_all_skipped")`` so an operator can tell the two apart on
+    ``merge_gate_runtime.last_unverified_reason``.
+
+    Acceptance probe: when the gate falls open with a probe attached (and the
+    probe was NOT a clear failure — that case blocks instead, via
+    :func:`classify_merge_test_verdict`), surface the probe's honest signal:
+    ``("acceptance probe passed (...)", "probe_passed")`` when the cheap
+    compile/build check passed, or ``("acceptance probe could not run (...)",
+    "probe_could_not_run")`` when missing deps / unprovisioned setup degraded it.
+    The probe signal takes precedence over the all-skipped phrasing because it is
+    the stronger execution evidence we have for this fall-open.
+
+    Purely a refinement of the operator-visible reason: it never changes the
+    pass/fail/undetected merge decision.  Defensive about a missing / old-shape
+    verdict (an older agent that does not emit ``noTestsReason`` keeps the
+    generic reason).
+    """
+    if isinstance(verdict, dict):
+        probe = verdict.get("probe")
+        if isinstance(probe, dict) and probe.get("ran"):
+            if probe.get("could_not_run"):
+                return (
+                    "acceptance probe could not run (missing deps/unprovisioned setup)",
+                    "probe_could_not_run",
+                )
+            if probe.get("passed") is True:
+                return (
+                    "acceptance probe passed (changed code compiles/builds)",
+                    "probe_passed",
+                )
+        no_tests_reason = str(verdict.get("noTestsReason") or "").strip().lower()
+        if no_tests_reason in _ALL_SKIPPED_NO_TESTS_REASONS:
+            return ("suite present but every test skipped", "suite_all_skipped")
+    return ("no test command detectable", "undetected_runtime")
 
 
 ResolutionSource = Literal["branch_head", "merge_sha", "unresolved"]

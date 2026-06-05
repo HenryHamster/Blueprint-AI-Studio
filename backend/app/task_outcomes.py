@@ -505,8 +505,18 @@ def _build_verify_tests_summary(task: Task, ctx: SummaryContext) -> dict[str, An
     output = _trim_summary_text(result.get("output"), 240)
     detected = result.get("detected")
     passed = result.get("passed")
+    probe = result.get("probe")
+    probe_failed = (
+        isinstance(probe, dict)
+        and probe.get("ran")
+        and not probe.get("could_not_run")
+        and probe.get("passed") is False
+    )
     if detected is False:
-        verdict = "undetected"
+        # A clear acceptance-probe failure on a no-suite fall-open is a real,
+        # merge-blocking verdict (the gate flips it to "fail"); reflect that here
+        # so the operator summary matches the gate decision.
+        verdict = "fail" if probe_failed else "undetected"
     elif passed:
         verdict = "pass"
     elif detected is True:
@@ -514,6 +524,20 @@ def _build_verify_tests_summary(task: Task, ctx: SummaryContext) -> dict[str, An
 
     if detected is not None:
         evidence.append(_summary_item("Detected suite", "yes" if detected else "no"))
+    if isinstance(probe, dict) and probe.get("ran"):
+        if probe.get("passed"):
+            probe_state = "passed"
+        elif probe.get("could_not_run"):
+            probe_state = "could not run"
+        else:
+            probe_state = "failed"
+        ecosystem = str(probe.get("ecosystem") or "").strip()
+        evidence.append(
+            _summary_item(
+                "Acceptance probe",
+                f"{ecosystem + ': ' if ecosystem else ''}{probe_state}",
+            )
+        )
     if isinstance(tests, list) and tests:
         pass_count = sum(1 for t in tests if isinstance(t, dict) and t.get("status") == "pass")
         fail_count = sum(1 for t in tests if isinstance(t, dict) and t.get("status") == "fail")

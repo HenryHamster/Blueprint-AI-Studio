@@ -5476,9 +5476,17 @@ async def orchestrator_worker():
                                             "undetected_runtime"
                                         )
                                     else:
-                                        _reason_phrase = "no test command detectable"
-                                        _unverified_merge_reason = (
-                                            "undetected_runtime"
+                                        # detected=false fall-open. Refine the
+                                        # operator-visible reason: a suite that
+                                        # was PRESENT but skipped every test (per
+                                        # the verdict's noTestsReason) gets a
+                                        # distinct key/phrase from a genuine
+                                        # no-suite repo. Decision is unchanged.
+                                        (
+                                            _reason_phrase,
+                                            _unverified_merge_reason,
+                                        ) = ci_resolution.classify_unverified_fall_open_reason(
+                                            _verdict
                                         )
                                     logger.warning(
                                         f"[CI] PR #{ci_pr_number} no-CI merge gate: "

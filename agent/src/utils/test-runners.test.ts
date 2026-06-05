@@ -12,6 +12,7 @@ import fs from 'fs';
 import { readFile } from 'node:fs/promises';
 import {
   detectTestRunners, detectAutoTestRunners, describeRunnerDirectory, classifyTestExecution,
+  detectAcceptanceProbes, classifyProbeOutcome,
 } from './test-runners.js';
 import type { BuildConfig, TestRunner } from './test-runners.js';
 
@@ -1531,6 +1532,172 @@ describe('classifyTestExecution — placeholder/empty suite detection', () => {
   });
 });
 
+// All-skipped / fully-skipped runs: the suite COLLECTED tests but executed
+// NONE because every test was skipped/deselected/ignored/filtered (e.g. an
+// integration suite gated on an env var or a service the cold verify VM has not
+// provisioned). This is the SAME honest no-real-tests case as a zero-collection
+// run — it must classify as 'all_skipped' (not 'ran') so the gate does not
+// record a vacuous verified pass. STRICTLY conservative: any run where even one
+// test actually passed or failed stays a real 'ran'.
+describe('classifyTestExecution — all-skipped (no real tests executed)', () => {
+  it('pytest all-skipped banner → all_skipped', () => {
+    expect(classifyTestExecution(
+      'collected 5 items\n\n===== 5 skipped in 0.12s =====',
+    )).toBe('all_skipped');
+  });
+
+  it('pytest all-deselected (-k filter selected nothing) → all_skipped', () => {
+    expect(classifyTestExecution(
+      'collected 5 items / 5 deselected\n\n===== 5 deselected in 0.04s =====',
+    )).toBe('all_skipped');
+  });
+
+  it('vitest all-skipped summary → all_skipped', () => {
+    expect(classifyTestExecution(
+      ' Test Files  1 skipped (1)\n      Tests  5 skipped (5)',
+    )).toBe('all_skipped');
+  });
+
+  it('Rust all-ignored summary → all_skipped', () => {
+    expect(classifyTestExecution([
+      'running 5 tests',
+      'test result: ok. 0 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out',
+    ].join('\n'))).toBe('all_skipped');
+  });
+
+  it('Rust all-filtered-out summary → all_skipped', () => {
+    expect(classifyTestExecution([
+      'running 5 tests',
+      'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out',
+    ].join('\n'))).toBe('all_skipped');
+  });
+
+  it('Go verbose all-skipped (--- SKIP, no PASS) → all_skipped', () => {
+    expect(classifyTestExecution([
+      '=== RUN   TestIntegration',
+      '    main_test.go:12: requires DATABASE_URL',
+      '--- SKIP: TestIntegration (0.00s)',
+      'ok  \texample.com/pkg\t0.004s',
+    ].join('\n'))).toBe('all_skipped');
+  });
+
+  it('RSpec all-pending (examples == pending) → all_skipped', () => {
+    expect(classifyTestExecution(
+      'Finished in 0.02 seconds\n5 examples, 0 failures, 5 pending',
+    )).toBe('all_skipped');
+  });
+
+  it('Minitest all-skips (runs == skips) → all_skipped', () => {
+    expect(classifyTestExecution(
+      '5 runs, 0 assertions, 0 failures, 0 errors, 5 skips',
+    )).toBe('all_skipped');
+  });
+
+  it('Elixir ExUnit all-excluded (tests == excluded) → all_skipped', () => {
+    expect(classifyTestExecution(
+      'Finished in 0.1 seconds\n5 tests, 0 failures, 5 excluded',
+    )).toBe('all_skipped');
+  });
+
+  it('Gradle/Maven Surefire all-skipped (Tests run == Skipped) → all_skipped', () => {
+    expect(classifyTestExecution(
+      'Tests run: 5, Failures: 0, Errors: 0, Skipped: 5',
+    )).toBe('all_skipped');
+  });
+
+  it('.NET all-skipped (Total == Skipped) → all_skipped', () => {
+    expect(classifyTestExecution(
+      'Passed!  - Failed: 0, Passed: 0, Skipped: 5, Total: 5, Duration: 1 ms',
+    )).toBe('all_skipped');
+  });
+
+  it('PHPUnit all-skipped (Tests == Skipped) → all_skipped', () => {
+    expect(classifyTestExecution(
+      'OK, but incomplete, skipped, or risky tests!\nTests: 5, Assertions: 0, Skipped: 5.',
+    )).toBe('all_skipped');
+  });
+
+  // ── Conservative invariant: any real pass/fail keeps it a real 'ran' ──
+  it('pytest mixed pass-with-skips ("5 passed, 1500 skipped") → ran', () => {
+    expect(classifyTestExecution(
+      '===== 5 passed, 1500 skipped in 4.20s =====',
+    )).toBe('ran');
+  });
+
+  it('Rust mixed pass-with-ignored ("3 passed; .. 5 ignored") → ran', () => {
+    expect(classifyTestExecution([
+      'running 8 tests',
+      'test result: ok. 3 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out',
+    ].join('\n'))).toBe('ran');
+  });
+
+  it('Maven mixed (Tests run 5, Skipped 3 → 2 passed) → ran', () => {
+    expect(classifyTestExecution(
+      'Tests run: 5, Failures: 0, Errors: 0, Skipped: 3',
+    )).toBe('ran');
+  });
+
+  it('RSpec mixed (5 examples, 3 pending → 2 passed) → ran', () => {
+    expect(classifyTestExecution(
+      '5 examples, 0 failures, 3 pending',
+    )).toBe('ran');
+  });
+
+  it('all-skipped with a real failure present → ran (failure wins)', () => {
+    expect(classifyTestExecution(
+      'FAILED test_x.py::test_a - AssertionError\n1 failed, 5 skipped in 0.30s',
+    )).toBe('ran');
+  });
+
+  // A test that merely QUOTES a skip phrase as assertion data is a real run.
+  it('failing test asserting on literal "5 skipped" → ran', () => {
+    expect(classifyTestExecution(
+      "FAILED test_report.py::test_summary - AssertionError: expected '5 skipped' in output\n1 failed in 0.05s",
+    )).toBe('ran');
+  });
+
+  it('passing test asserting on literal "Skipped: 5" → ran (real pass present)', () => {
+    expect(classifyTestExecution(
+      "test_report.py::test_summary - assert 'Skipped: 5' in out\n1 passed in 0.05s",
+    )).toBe('ran');
+  });
+
+  // Multi-class / multi-project guard: aggregate families (Maven/Surefire/
+  // Gradle, dotnet test) print ONE summary line PER class/project. A single
+  // fully-skipped class must NOT short-circuit the scan and flip a run with
+  // passing sibling classes to all_skipped. Surefire emits no "N passed" token,
+  // so the total > skip pass-evidence guard (not hasRealPassEvidence) is what
+  // keeps the run real here.
+  it('Maven multi-class (one all-skip class, sibling passing class) → ran', () => {
+    expect(classifyTestExecution([
+      'Running com.example.FooTest',
+      'Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.042 s',
+      'Running com.example.BarTest',
+      'Tests run: 2, Failures: 0, Errors: 0, Skipped: 2, Time elapsed: 0.001 s',
+      '',
+      'Results:',
+      '',
+      'Tests run: 5, Failures: 0, Errors: 0, Skipped: 2',
+    ].join('\n'))).toBe('ran');
+  });
+
+  it('Maven every class fully skipped (no passing sibling) → all_skipped', () => {
+    expect(classifyTestExecution([
+      'Tests run: 2, Failures: 0, Errors: 0, Skipped: 2',
+      'Tests run: 3, Failures: 0, Errors: 0, Skipped: 3',
+      'Results:',
+      'Tests run: 5, Failures: 0, Errors: 0, Skipped: 5',
+    ].join('\n'))).toBe('all_skipped');
+  });
+
+  it('.NET multi-project (one all-skip project, sibling passing project) → ran', () => {
+    expect(classifyTestExecution([
+      'Passed!  - Failed:     0, Passed:     3, Skipped:     0, Total:     3  - FooProj.dll',
+      'Passed!  - Failed:     0, Passed:     0, Skipped:     2, Total:     2  - BarProj.dll',
+    ].join('\n'))).toBe('ran');
+  });
+});
+
 // Regression: the real-failure guard must recognize a genuine failure in EVERY
 // ecosystem the no-CI gate's runner detection can launch (Go, Ruby/Rake,
 // Gradle, Maven, Elixir, .NET, PHPUnit) — not just pytest/vitest/Rust. A
@@ -1600,5 +1767,128 @@ describe('classifyTestExecution — extra-family real-failure guard', () => {
     expect(classifyTestExecution(
       'bash: mix: command not found\n0 tests, 0 failures',
     )).toBe('no_tests');
+  });
+});
+
+// ── detectAcceptanceProbes ───────────────────────────────────────────────────
+describe('detectAcceptanceProbes', () => {
+  beforeEach(() => {
+    mockFs.existsSync.mockReset();
+    mockFs.readFileSync.mockReset();
+    mockFs.readdirSync.mockReset();
+    mockFs.existsSync.mockReturnValue(false);
+    mockFs.readFileSync.mockReturnValue('');
+    mockFs.readdirSync.mockReturnValue([]);
+  });
+
+  it('build_config python directory → compileall probe (type hint, no manifest needed)', () => {
+    const probes = detectAcceptanceProbes({
+      directories: [{ path: 'backend', type: 'python', test_cmd: 'pytest' }],
+    } as BuildConfig);
+    const py = probes.find(p => p.ecosystem === 'python');
+    expect(py).toBeDefined();
+    expect(py?.cmd).toBe('python3');
+    expect(py?.args.slice(0, 3)).toEqual(['-m', 'compileall', '-q']);
+    expect(py?.args.at(-1)).toBe(`${WORKSPACE}/backend`);
+    expect(py?.cwd).toBe(`${WORKSPACE}/backend`);
+  });
+
+  it('tsconfig.json present → tsc --noEmit probe (no-install)', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/tsconfig.json`);
+    const probes = detectAcceptanceProbes(undefined);
+    const node = probes.find(p => p.ecosystem === 'node');
+    expect(node).toBeDefined();
+    expect(node?.cmd).toBe('npx');
+    expect(node?.args).toEqual(['--no-install', 'tsc', '--noEmit']);
+  });
+
+  it('go.mod present → go build ./... probe', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/go.mod`);
+    const probes = detectAcceptanceProbes(undefined);
+    const go = probes.find(p => p.ecosystem === 'go');
+    expect(go).toEqual(expect.objectContaining({ cmd: 'go', args: ['build', './...'], cwd: WORKSPACE }));
+  });
+
+  it('Cargo.toml present → cargo check probe', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/Cargo.toml`);
+    const probes = detectAcceptanceProbes(undefined);
+    const rust = probes.find(p => p.ecosystem === 'rust');
+    expect(rust).toEqual(expect.objectContaining({ cmd: 'cargo', args: ['check', '--quiet'], cwd: WORKSPACE }));
+  });
+
+  it('plain-JS package (package.json, no tsconfig) → no node probe (nothing cheap+safe to compile)', () => {
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/package.json`);
+    const probes = detectAcceptanceProbes(undefined);
+    expect(probes.find(p => p.ecosystem === 'node')).toBeUndefined();
+  });
+
+  it('bare repo with no recognized manifests → no probes', () => {
+    expect(detectAcceptanceProbes(undefined)).toEqual([]);
+  });
+
+  it('deduplicates by ecosystem:cwd across build_config + auto-scan', () => {
+    // build_config declares root python; auto-detect would also see pyproject at root.
+    mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/pyproject.toml`);
+    const probes = detectAcceptanceProbes({
+      directories: [{ path: '', type: 'python', test_cmd: 'pytest' }],
+    } as BuildConfig);
+    expect(probes.filter(p => p.ecosystem === 'python' && p.cwd === WORKSPACE)).toHaveLength(1);
+  });
+});
+
+// ── classifyProbeOutcome ─────────────────────────────────────────────────────
+describe('classifyProbeOutcome', () => {
+  it('null error (exit 0) → pass', () => {
+    expect(classifyProbeOutcome('', null)).toBe('pass');
+  });
+
+  it('clean python SyntaxError → fail', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome('  File "x.py", line 2\nSyntaxError: invalid syntax', err)).toBe('fail');
+  });
+
+  it('tsc type error (error TS2322) → fail', () => {
+    const err = Object.assign(new Error('failed'), { status: 2 });
+    expect(classifyProbeOutcome("src/a.ts(3,5): error TS2322: Type 'number' is not assignable to type 'string'.", err)).toBe('fail');
+  });
+
+  it('rustc error[E0425] → fail', () => {
+    const err = Object.assign(new Error('failed'), { status: 101 });
+    expect(classifyProbeOutcome('error[E0425]: cannot find value `x` in this scope', err)).toBe('fail');
+  });
+
+  it('go build "undefined: Foo" → fail', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome('./main.go:5:2: undefined: Foo', err)).toBe('fail');
+  });
+
+  it('spawn ENOENT (missing tool) → could_not_run', () => {
+    const err = Object.assign(new Error('spawn python3 ENOENT'), { code: 'ENOENT' });
+    expect(classifyProbeOutcome('', err)).toBe('could_not_run');
+  });
+
+  it('ETIMEDOUT → could_not_run', () => {
+    const err = Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' });
+    expect(classifyProbeOutcome('', err)).toBe('could_not_run');
+  });
+
+  it('python ModuleNotFoundError (missing dep) → could_not_run', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome("ModuleNotFoundError: No module named 'numpy'", err)).toBe('could_not_run');
+  });
+
+  it('tsc "Cannot find module" (TS2307, missing deps) → could_not_run, not a hard block', () => {
+    const err = Object.assign(new Error('failed'), { status: 2 });
+    expect(classifyProbeOutcome("src/a.ts(1,20): error TS2307: Cannot find module 'react'.", err)).toBe('could_not_run');
+  });
+
+  it('go missing module → could_not_run', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome('main.go:3:8: no required module provides package example.com/x', err)).toBe('could_not_run');
+  });
+
+  it('unrecognized non-zero exit → conservative could_not_run', () => {
+    const err = Object.assign(new Error('failed'), { status: 1 });
+    expect(classifyProbeOutcome('some unexpected error blob', err)).toBe('could_not_run');
   });
 });

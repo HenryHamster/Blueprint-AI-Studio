@@ -7919,6 +7919,82 @@ class TestAgentTestRunnerSourceParity:
                 "be misread as a real failure and hard-block an empty repo."
             )
 
+    def test_classifier_all_skipped_signals_cover_every_family(self):
+        """COUPLED INVARIANT (mirror of the real-failure-guard scan): a run that
+        COLLECTED tests but executed NONE because every test was skipped /
+        deselected / ignored / filtered is the SAME honest no-real-tests case as a
+        zero-collection run, and the cold no-CI gate must NOT record it as a
+        verified pass. The runner detection can launch every family below, so the
+        all-skipped classifier (returning 'all_skipped') MUST recognize each one;
+        a future edit that silently drops a family's all-skip signature re-opens
+        the false-'verified' path and fails here.
+
+        STRICTLY conservative: all_skipped is gated on a real-PASS guard
+        (hasRealPassEvidence) AND the existing real-FAILURE guard, so a run where
+        even one test passed or failed ("5 passed, 1500 skipped") stays 'ran'.
+        """
+        source = self._read_agent_source()
+        region = _extract_classifier_region(source)  # raises (loud) on parse miss
+
+        # The all_skipped verdict and its conservative real-pass guard must exist.
+        assert "all_skipped" in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution no longer "
+            "returns 'all_skipped'; an all-skipped suite would be recorded as a "
+            "vacuous verified pass. Restore the all-skip classification."
+        )
+        for guard in ["hasRealPassEvidence", "!hasRealPassEvidence"]:
+            assert guard in region, (
+                "agent/src/utils/test-runners.ts classifyTestExecution no longer "
+                f"defines/uses the real-pass guard {guard!r}. all_skipped must be "
+                "gated by a real-pass check so a mixed pass-with-skips run stays "
+                "a real 'ran' verdict."
+            )
+        # The non-zero real-pass signatures (so a zero-count pass token is never
+        # treated as a real pass that would suppress all-skip detection).
+        for pass_sig in [r"[1-9]\d*\s+passed", r"Passed:\s+[1-9]"]:
+            assert pass_sig in region, (
+                "agent/src/utils/test-runners.ts classifyTestExecution dropped the "
+                f"real-pass signature {pass_sig!r}; without it a mixed pass-with-"
+                "skips run could be misread as all_skipped."
+            )
+
+        # Per-family all-skip signatures: at least one candidate per family must
+        # be present, covering the SAME family set as the real-failure guard.
+        required_skip_signatures = [
+            ("pytest all-skipped/deselected", [r"[1-9]\d*\s+skipped", r"[1-9]\d*\s+deselected"]),
+            ("vitest all-skipped", [r"[1-9]\d*\s+skipped"]),
+            ("Rust all-ignored/filtered", [r"[1-9]\d*\s+ignored", r"[1-9]\d*\s+filtered out"]),
+            ("Go verbose --- SKIP:", [r"--- SKIP:"]),
+            ("Ruby/RSpec all-pending", [r"(\d+)\s+pending"]),
+            ("Ruby/Minitest all-skips", [r"(\d+)\s+skips"]),
+            ("Elixir/ExUnit all-excluded", [r"skipped|excluded"]),
+            ("Gradle/Maven Surefire Tests-run/Skipped", [r"Tests run:\s*(\d+)", r"Skipped:\s*(\d+)"]),
+            (".NET Total:/Skipped:", [r"Total:\s*(\d+)"]),
+            ("PHPUnit Tests:/Skipped:", [r"Tests:\s*(\d+)"]),
+        ]
+        missing = [
+            label
+            for label, candidates in required_skip_signatures
+            if not any(candidate in region for candidate in candidates)
+        ]
+        assert not missing, (
+            "agent/src/utils/test-runners.ts classifyTestExecution's all-skip "
+            "detection no longer recognizes a fully-skipped run for runner family/"
+            f"families: {missing}. The no-CI gate's runner detection can still "
+            "launch these ecosystems, so dropping their all-skip signature re-opens "
+            "the false-'verified' fall-open (an all-skipped suite recorded as a "
+            "verified pass). Restore the line-anchored all-skip signature(s)."
+        )
+
+        # The aggregate-family detection MUST compare total === skip (not a bare
+        # non-zero Skipped count), so a MIXED run ("Tests run: 5, .., Skipped: 3")
+        # with passes counted only in the total stays a real 'ran' verdict.
+        assert "allSkipByTotal" in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution dropped the "
+            "allSkipByTotal total===skip comparison; a bare non-zero 'Skipped: N' "
+            "would misclassify a mixed pass-with-skips run as all_skipped."
+        )
+
 
 class TestAgentTestRunnerParseHelpers:
     """ALWAYS-ON unit tests for the source-scan parser, driven by synthetic

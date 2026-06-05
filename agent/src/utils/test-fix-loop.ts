@@ -395,7 +395,7 @@ export async function testFixLoop(
   relatedFiles?: string[],
   analysisContext?: string,
   options: TestFixLoopOptions = {},
-): Promise<{ passed: boolean; testFailuresDetected: boolean; setupFailed?: boolean; failureSummary?: string; noTestsExecuted?: boolean }> {
+): Promise<{ passed: boolean; testFailuresDetected: boolean; setupFailed?: boolean; failureSummary?: string; noTestsExecuted?: boolean; noTestsReason?: 'all_skipped' | 'no_real_tests' }> {
   let runners = options.runnersOverride ?? detectTestRunners(buildConfig);
   const targetPytestSelectors = Array.from(new Set(options.targetPytestSelectors ?? []));
 
@@ -489,6 +489,12 @@ export async function testFixLoop(
     // executed" so the no-CI merge gate can route the latter to the documented
     // proceed-without-checks fallback instead of a hard fail / vacuous pass.
     let anyRealTestExecuted = false;
+    // Track whether any runner's output was classified as an ALL-SKIPPED run
+    // (collected tests but executed none — all skipped/deselected/ignored)
+    // vs. a plain no-real-tests case (placeholder / zero-collection), so the
+    // no-execution verdict can distinguish "suite present but every test
+    // skipped" from "no real tests".
+    let sawAllSkipped = false;
     const taskId = process.env.TASK_ID || '';
     for (const runner of runners) {
       // Setup step: ensure node_modules exist for npm runners. A failure
@@ -532,7 +538,9 @@ export async function testFixLoop(
         // A clean exit only counts as a real verdict if real tests ran. An
         // empty/zero-test suite that exits 0 must not be recorded as a
         // verified pass.
-        if (classifyTestExecution(passOutput) === 'ran') anyRealTestExecuted = true;
+        const passClass = classifyTestExecution(passOutput);
+        if (passClass === 'ran') anyRealTestExecuted = true;
+        else if (passClass === 'all_skipped') sawAllSkipped = true;
         sendLog(ws, `Tests passed [${runner.label}].\n`);
       } catch (testErr: unknown) {
         // If the runner timed out (killed by the process-group SIGTERM/SIGKILL
@@ -558,7 +566,9 @@ export async function testFixLoop(
         // "no test specified" script) is NOT a real test failure. Only count
         // this as a real test executing when the output isn't a no-tests
         // signature.
-        if (classifyTestExecution(msg) === 'ran') anyRealTestExecuted = true;
+        const failClass = classifyTestExecution(msg);
+        if (failClass === 'ran') anyRealTestExecuted = true;
+        else if (failClass === 'all_skipped') sawAllSkipped = true;
         let structuredIds: Set<string> | undefined;
         if (jsonOutputPath && fs.existsSync(jsonOutputPath)) {
           try {
@@ -602,8 +612,13 @@ export async function testFixLoop(
       });
       sendLog(ws, 'All tests passed.\n');
       // noTestsExecuted: we ran at least one runner but none of them showed a
-      // real test executing — the "pass" is vacuous (empty/zero-test suite).
-      return { passed: true, testFailuresDetected: false, noTestsExecuted: ranAnyRunner && !anyRealTestExecuted };
+      // real test executing — the "pass" is vacuous (empty/zero-test suite or
+      // an all-skipped suite). noTestsReason distinguishes the two.
+      const noTestsExecuted = ranAnyRunner && !anyRealTestExecuted;
+      return {
+        passed: true, testFailuresDetected: false, noTestsExecuted,
+        noTestsReason: noTestsExecuted ? (sawAllSkipped ? 'all_skipped' : 'no_real_tests') : undefined,
+      };
     }
 
     // Serialize each failure for operator-facing output. This same format
@@ -766,7 +781,11 @@ export async function testFixLoop(
       // (e.g. `npm` "no test specified") — no real test executed, so the
       // focused-verification fail should route to the proceed-without-checks
       // fallback rather than blocking the merge.
-      return { passed: false, testFailuresDetected: true, failureSummary, noTestsExecuted: ranAnyRunner && !anyRealTestExecuted };
+      const noTestsExecuted = ranAnyRunner && !anyRealTestExecuted;
+      return {
+        passed: false, testFailuresDetected: true, failureSummary, noTestsExecuted,
+        noTestsReason: noTestsExecuted ? (sawAllSkipped ? 'all_skipped' : 'no_real_tests') : undefined,
+      };
     }
   }
   return { passed: false, testFailuresDetected: true };
