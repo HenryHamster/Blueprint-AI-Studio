@@ -208,6 +208,54 @@ describe('handleDesignDocUpdate', () => {
     const prompt = await capturePrompt();
     expect(prompt).toContain('Current pages');
   });
+
+  // ── design_doc index shape rendering (backend ships { sections: [...] }) ─────
+  // The backend converted the inline design_doc to a compact navigation index.
+  // The handler must render the index's `sections` array as the Current pages
+  // list — surfacing the real section keys — not treat the whole payload as a
+  // flat map (which would yield one bogus page literally named `sections`).
+
+  async function capturePromptWith(payload: Record<string, unknown>): Promise<string> {
+    await handleDesignDocUpdate(
+      TASK_ID, { ...BASE_PAYLOAD, ...payload }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    return vi.mocked(runClaudeCode).mock.calls[0][0];
+  }
+
+  it('renders index sections as Current pages (real keys, not a bogus `sections` page)', async () => {
+    const prompt = await capturePromptWith({
+      design_doc: {
+        sections: [
+          { key: 'systems/sys-auth', status: 'functional', summary: 'Auth subsystem', modules: ['backend/app/auth.py'] },
+          { key: 'capabilities/testing', summary: 'Unit tests only', presence_warning: 'no integration tests' },
+          { key: 'notes/observations', summary: 'misc notes' },
+        ],
+      },
+    });
+    expect(prompt).toContain('systems/sys-auth');
+    expect(prompt).toContain('capabilities/testing');
+    expect(prompt).toContain('notes/observations');
+    expect(prompt).toContain('status: functional');
+    expect(prompt).toContain('⚠ no integration tests');
+    // 3 real sections, not a single page named `sections`
+    expect(prompt).toContain('3 pages exist');
+    expect(prompt).not.toMatch(/^\s*sections:/m);
+  });
+
+  it('advertises `./design-doc get` so the curator can read full prose before editing', async () => {
+    const prompt = await capturePromptWith({
+      design_doc: { sections: [{ key: 'systems/sys-auth', summary: 'Auth' }] },
+    });
+    expect(prompt).toContain('./design-doc get');
+  });
+
+  it('falls back to flat key->value rendering when design_doc is a legacy map', async () => {
+    const prompt = await capturePromptWith({
+      design_doc: { summary: '"proj"', 'systems/sys-auth': { status: 'functional' } },
+    });
+    expect(prompt).toContain('systems/sys-auth');
+    expect(prompt).toContain('2 pages exist');
+  });
 });
 
 describe('handleDesignDocUpdate prompt determinism', () => {

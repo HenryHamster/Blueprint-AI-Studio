@@ -94,7 +94,7 @@
     "prompts/done-helper.ts": 650,
     "prompts/done-helper.test.ts": 650,
     "handlers/research-plan.ts": 2200,
-    "handlers/strategic.ts": 800,
+    "handlers/strategic.ts": 1100,
     "handlers/research-direction-context.ts": 250,
     "prompts/thinker.ts": 650,
     "handlers/standard.ts": 1550,

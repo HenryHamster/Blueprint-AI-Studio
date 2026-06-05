@@ -276,6 +276,43 @@ export function reconcileMissingCapabilities(
 }
 
 /**
+ * Reconcile a COMPACT design-doc INDEX against the workspace file tree.
+ *
+ * The strategic payload now ships the design doc as a navigation index
+ * (`{ sections: [{ key, summary?, status?, modules?, presence_warning? }] }`,
+ * built by `_design_doc_index` in backend/app/strategic_spawning.py) instead of
+ * the full flat-keyed document. Each `systems/*` / `capabilities/*` section
+ * carries its reconciled `status` and the declared backing `modules` paths, so
+ * the same presence reconciliation can run as an optional second pass over the
+ * cloned workspace — catching entries whose backing code was reverted/never
+ * landed since the server-side grounding pass ran.
+ *
+ * Treats each section entry as a flat entry keyed by `entry.key`, reusing
+ * `reconcileEntry` (entries already carry `status`/`modules`). Conservative
+ * no-op when the index is absent/non-object, `sections` is not an array, or the
+ * root is invalid. Pure: returns a shallow copy, never mutates the input.
+ */
+export function reconcileDesignDocIndex(
+  index: Record<string, unknown> | undefined,
+  root: string,
+): Record<string, unknown> | undefined {
+  if (!index || typeof index !== 'object' || Array.isArray(index)) return index;
+  const sections = index.sections;
+  if (!Array.isArray(sections)) return index;
+  if (!isValidRoot(root)) return index;
+
+  const reconciled = (sections as unknown[]).map((entry): unknown => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry;
+    const e = entry as Record<string, unknown>;
+    const key = typeof e.key === 'string' ? e.key : '';
+    if (key.startsWith('systems/')) return reconcileEntry(e, root, 'system');
+    if (key.startsWith('capabilities/')) return reconcileEntry(e, root, 'capability');
+    return entry;
+  });
+  return { ...index, sections: reconciled };
+}
+
+/**
  * Reconcile a full flat-keyed design doc, downgrading PRESENT-but-absent
  * `systems/<id>` and `capabilities/<name>` entries. Other keys (summary,
  * architecture, risks, notes/*, playbook/*, _meta, …) are passed through

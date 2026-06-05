@@ -41,6 +41,9 @@ from app.strategic_spawning import (
     _AGENT_VIEW_FLOOR_BYTES,
     _FLOOR_MIN_GAPS,
     _STRATEGIC_REVIEW_SCHEMA,
+    _design_doc_index,
+    _summarize_design_doc_index,
+    _DESIGN_DOC_INDEX_SUMMARY_CHARS,
 )
 from app.payload_schemas import pack_under_budget
 from app.max_plan_pool import _max_plan_pools, _account_by_id
@@ -2685,6 +2688,106 @@ async def test_playbook_summary_caps_at_ten_entries(db_session, mocker):
     assert entries[0]["key"] == "auto-pattern-14"
 
 
+# ── playbook_keys_index in _spawn_strategic_review payload ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_playbook_keys_index_includes_all_entries(db_session, mocker):
+    """Compact index lists ALL playbook entries (not just strategy-relevant ones)."""
+    _patch_spawning_deps(mocker)
+    design_doc = {
+        "playbook/auto-importerror": {
+            "content": "Pattern for importerror.",
+            "source": "auto-generated",
+            "updated_at": "2026-04-15T00:00:00",
+        },
+        "playbook/review-test": {
+            "content": "Review pattern.",
+            "source": "review-extracted",
+            "updated_at": "2026-04-18T00:00:00",
+        },
+        "playbook/success-create": {
+            "content": "Success pattern.",
+            "source": "success-pattern",
+            "updated_at": "2026-04-19T00:00:00",
+        },
+    }
+    project = _make_project(vision={"purpose": "test"}, design_doc=design_doc)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    assert "playbook_keys_index" in payload
+    entries = payload["playbook_keys_index"]["entries"]
+    # All 3 entries should be listed, even the success-pattern (not strategy-relevant)
+    assert len(entries) == 3
+    keys = {e["key"] for e in entries}
+    assert keys == {"auto-importerror", "review-test", "success-create"}
+    # Each entry should have key, source, and updated_at
+    for entry in entries:
+        assert "key" in entry
+        assert "source" in entry
+        assert "updated_at" in entry
+        assert "content" not in entry  # compact index should NOT include content
+    # Sorted newest-first
+    assert entries[0]["key"] == "success-create"
+
+
+@pytest.mark.asyncio
+async def test_playbook_keys_index_absent_when_no_entries(db_session, mocker):
+    """When no playbook entries exist, keys_index is omitted."""
+    _patch_spawning_deps(mocker)
+    project = _make_project(vision={"purpose": "test"}, design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    await _spawn_strategic_review(project, db_session)
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+    assert "playbook_keys_index" not in payload
+
+
+@pytest.mark.asyncio
+async def test_playbook_keys_index_skips_pending_entries(db_session, mocker):
+    """Pending entries (mid-flight writes) are excluded from the index."""
+    _patch_spawning_deps(mocker)
+    design_doc = {
+        "playbook/completed": {
+            "content": "Completed entry.",
+            "source": "manual",
+            "updated_at": "2026-04-15T00:00:00",
+        },
+        "playbook/pending": {
+            "content": "Pending entry (in flight).",
+            "source": "manual",
+            "updated_at": "2026-04-16T00:00:00",
+            "pending_source": "task-123",  # marks it as pending
+        },
+    }
+    project = _make_project(vision={"purpose": "test"}, design_doc=design_doc)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    await _spawn_strategic_review(project, db_session)
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    assert "playbook_keys_index" in payload
+    entries = payload["playbook_keys_index"]["entries"]
+    assert len(entries) == 1
+    assert entries[0]["key"] == "completed"
+
+
 # ---------------------------------------------------------------------------
 # _agent_view_design_doc — strips agent-unused + internal keys
 # ---------------------------------------------------------------------------
@@ -2934,9 +3037,13 @@ async def test_design_doc_update_payload_omits_playbook_archive(db_session):
     tasks = result.scalars().all()
     assert len(tasks) == 1
     payload = tasks[0].payloads[0]
+    # design_doc now ships as a compact navigation index (one entry per
+    # non-internal section). playbook_archive is operator-only and excluded;
+    # the top-level "summary" section is represented by its key.
     dd = payload["design_doc"]
-    assert "playbook_archive" not in dd
-    assert dd["summary"] == "ok"
+    by_key = {e["key"]: e for e in dd["sections"]}
+    assert "playbook_archive" not in by_key
+    assert by_key["summary"]["summary"] == "ok"
 
 
 @pytest.mark.asyncio
@@ -3005,7 +3112,13 @@ async def test_spawn_design_doc_update_payload_uses_reconciled_design_doc(
     tasks = result.scalars().all()
     assert len(tasks) == 1
     payload = tasks[0].payloads[0]
-    assert payload["design_doc"] == reconciled_design_doc
+    # The reconciled status flows into the compact index, not a full inline doc.
+    by_key = {e["key"]: e for e in payload["design_doc"]["sections"]}
+    assert by_key["systems/api"]["status"] == "missing"
+    assert (
+        by_key["systems/api"]["presence_warning"]
+        == "reconciled against integration branch"
+    )
     reconcile_mock.assert_awaited_once_with(
         _agent_view_design_doc(project.design_doc), **verification_context
     )
@@ -3084,10 +3197,13 @@ async def test_spawn_design_doc_update_payload_downgrades_symbol_absent_entry(
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
     assert len(tasks) == 1
-    entry = tasks[0].payloads[0]["design_doc"]["systems/api"]
+    by_key = {e["key"]: e for e in tasks[0].payloads[0]["design_doc"]["sections"]}
+    entry = by_key["systems/api"]
     assert entry["status"] == "missing"
     assert "backend/app/api.py:deleted_func" in entry["presence_warning"]
-    assert "[reconciled:" in entry["description"]
+    # The "[reconciled: ...]" note appended to the section's description is
+    # surfaced through the bounded index summary.
+    assert "[reconciled:" in entry["summary"]
 
 
 @pytest.mark.asyncio
@@ -3153,7 +3269,8 @@ async def test_spawn_design_doc_update_symbol_indeterminate_leaves_entry(
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
     assert len(tasks) == 1
-    entry = tasks[0].payloads[0]["design_doc"]["systems/api"]
+    by_key = {e["key"]: e for e in tasks[0].payloads[0]["design_doc"]["sections"]}
+    entry = by_key["systems/api"]
     assert entry["status"] == "functional"
     assert "presence_warning" not in entry
 
@@ -3251,7 +3368,13 @@ async def test_spawn_strategic_review_payload_uses_reconciled_design_doc(
     ]
     assert len(tasks) == 1
     payload = tasks[0].payloads[0]
-    assert payload["design_doc"] == reconciled_design_doc
+    # The reconciled status flows into the compact index, not a full inline doc.
+    by_key = {e["key"]: e for e in payload["design_doc"]["sections"]}
+    assert by_key["capabilities/search"]["status"] == "missing"
+    assert (
+        by_key["capabilities/search"]["presence_warning"]
+        == "reconciled against integration branch"
+    )
     reconcile_mock.assert_awaited_once_with(
         _agent_view_design_doc(project.design_doc), **verification_context
     )
@@ -9027,3 +9150,225 @@ def test_pathological_problem_model_is_delivered_not_dropped():
     # The tiny size/health signal ships alongside it in the same contended cycle.
     assert "model_health" in packed
     assert "model_health" not in dropped_keys
+
+
+# ── design_doc compact index in the strategic payload ─────────────────────────
+# The strategic cycle ships the design doc as a COMPACT, BOUNDED navigation
+# index (key + bounded summary + reconciled presence status/modules/warning for
+# systems/capabilities) instead of full inline prose; full per-section content
+# is fetched on demand via POST /api/agent/design-doc (op:get).
+
+
+_BIG_DESIGN_PROSE = "LOREM_" + ("x" * 4000)
+
+
+def _design_doc_with_sections(prose: str) -> dict:
+    """A design doc whose section bodies carry *prose* (made large to prove the
+    index does not scale with content)."""
+    return {
+        "systems/auth": {
+            "status": "mature",
+            "description": prose,
+            "modules": ["backend/app/auth.py", "backend/app/routers/agent.py"],
+        },
+        "capabilities/login": {
+            "status": "working",
+            "notes": prose,
+            "modules": ["backend/app/auth.py"],
+        },
+        "notes/roadmap": {"title": "Roadmap", "body": prose},
+        # Operator-only / internal keys — must be excluded from the index.
+        "_meta": {"last_updated": "2026-01-01"},
+        "playbook_archive": [{"key": "x", "value": prose}],
+    }
+
+
+def test_design_doc_index_is_complete():
+    """Every non-internal section is represented by its key; operator-only and
+    underscore-prefixed keys are excluded."""
+    index = _design_doc_index(_design_doc_with_sections("short prose"))
+    keys = {e["key"] for e in index["sections"]}
+    assert keys == {"systems/auth", "capabilities/login", "notes/roadmap"}
+    assert "_meta" not in keys
+    assert "playbook_archive" not in keys
+
+
+def test_design_doc_index_excludes_proposed_changes_bookkeeping_key():
+    """proposed_changes is the reconciliation queue, shipped as its OWN top-level
+    payload field — it is not an architecture section and must not pollute the
+    index with a summary-less 'Other sections' entry."""
+    doc = _design_doc_with_sections("short prose")
+    doc["proposed_changes"] = [{"key": "systems/auth", "op": "set"}]
+    keys = {e["key"] for e in _design_doc_index(doc)["sections"]}
+    assert "proposed_changes" not in keys
+    assert keys == {"systems/auth", "capabilities/login", "notes/roadmap"}
+
+
+def test_design_doc_index_carries_reconciled_presence():
+    """systems/* and capabilities/* entries carry the reconciled presence
+    status, the declared backing modules, and any presence_warning."""
+    doc = {
+        "systems/auth": {
+            "status": "missing",
+            "description": "x",
+            "modules": ["backend/app/auth.py"],
+            "presence_warning": (
+                "claimed mature but all referenced module file(s) are absent"
+            ),
+        },
+        "capabilities/login": {
+            "status": "partial",
+            "notes": "y",
+            "modules": ["backend/app/auth.py"],
+        },
+    }
+    by_key = {e["key"]: e for e in _design_doc_index(doc)["sections"]}
+    assert by_key["systems/auth"]["status"] == "missing"
+    assert by_key["systems/auth"]["modules"] == ["backend/app/auth.py"]
+    assert by_key["systems/auth"]["presence_warning"].startswith("claimed mature")
+    assert by_key["capabilities/login"]["status"] == "partial"
+    assert by_key["capabilities/login"]["modules"] == ["backend/app/auth.py"]
+    # notes/* are not presence-reconciled — no status field.
+    assert "status" not in _design_doc_index({"notes/x": {"body": "z"}})["sections"][0]
+
+
+def test_design_doc_index_is_bounded_does_not_scale_with_prose():
+    """The index serialized size stays roughly stable when section prose grows
+    massively — per-entry summaries are bounded, so the 4000x blow-up does not
+    propagate."""
+    small = _design_doc_index(_design_doc_with_sections("short"))
+    large = _design_doc_index(_design_doc_with_sections(_BIG_DESIGN_PROSE))
+    small_bytes = len(json.dumps(small).encode())
+    large_bytes = len(json.dumps(large).encode())
+    # The big-prose variant adds at most a few bounded summaries' worth of bytes.
+    assert large_bytes - small_bytes < 3 * (_DESIGN_DOC_INDEX_SUMMARY_CHARS + 64)
+    for entry in large["sections"]:
+        if "summary" in entry:
+            assert len(entry["summary"]) <= _DESIGN_DOC_INDEX_SUMMARY_CHARS
+
+
+def test_design_doc_index_summary_truncated_with_ellipsis():
+    doc = {"notes/x": {"summary": "A" * (_DESIGN_DOC_INDEX_SUMMARY_CHARS + 500)}}
+    summary = _design_doc_index(doc)["sections"][0]["summary"]
+    assert len(summary) <= _DESIGN_DOC_INDEX_SUMMARY_CHARS
+    assert summary.endswith("…")
+
+
+def test_design_doc_index_empty_doc():
+    assert _design_doc_index(None) == {"sections": []}
+    assert _design_doc_index({}) == {"sections": []}
+
+
+def test_summarize_design_doc_index_drops_summaries_keeps_skeleton():
+    """The budget-pressure fallback drops per-entry summaries but keeps the
+    navigation skeleton (key + status + modules + presence_warning)."""
+    index = _design_doc_index(
+        {
+            "systems/auth": {
+                "status": "mature",
+                "description": "prose here",
+                "modules": ["backend/app/auth.py"],
+            }
+        }
+    )
+    assert "summary" in index["sections"][0]
+    skeleton = _summarize_design_doc_index(index)
+    entry = skeleton["sections"][0]
+    assert "summary" not in entry
+    assert entry["key"] == "systems/auth"
+    assert entry["status"] == "mature"
+    assert entry["modules"] == ["backend/app/auth.py"]
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_ships_design_doc_index_not_full_prose(
+    db_session, mocker
+):
+    """The strategic_review packed payload carries the compact design_doc index
+    (not full inline prose) for every non-internal section, with reconciled
+    presence statuses on systems/capabilities."""
+    unique = "UNIQUE_PROSE_MARKER_SR_" + ("z" * 4000)
+    design_doc = {
+        "systems/auth": {
+            "status": "mature",
+            "description": unique,
+            "modules": ["backend/app/auth.py"],
+        },
+        "capabilities/login": {
+            "status": "working",
+            "notes": unique,
+            "modules": ["backend/app/auth.py"],
+        },
+        "notes/roadmap": {"title": "Roadmap", "body": unique},
+    }
+    # Passthrough grounding so the index is built from exactly this doc and the
+    # presence statuses are deterministic (no git/GitHub dependency in tests).
+    mocker.patch(
+        "app.strategic_spawning.ground_design_doc",
+        new=AsyncMock(side_effect=lambda doc, **kw: doc),
+    )
+    project = _make_project(vision={"purpose": "p"}, design_doc=design_doc)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )
+    payload = result.scalars().all()[0].payloads[0]
+
+    dd = payload["design_doc"]
+    assert set(dd.keys()) == {"sections"}
+    by_key = {e["key"]: e for e in dd["sections"]}
+    assert set(by_key) == {"systems/auth", "capabilities/login", "notes/roadmap"}
+    assert by_key["systems/auth"]["status"] == "mature"
+    assert by_key["systems/auth"]["modules"] == ["backend/app/auth.py"]
+    # Full prose is NOT inline anywhere in the packed design_doc field.
+    assert unique not in json.dumps(dd)
+
+
+@pytest.mark.asyncio
+async def test_design_doc_update_ships_design_doc_index_not_full_prose(
+    db_session, mocker
+):
+    """The design_doc_update packed payload also carries the compact index and
+    not the full inline prose."""
+    unique = "UNIQUE_PROSE_MARKER_DDU_" + ("z" * 4000)
+    design_doc = {
+        "systems/auth": {
+            "status": "mature",
+            "description": unique,
+            "modules": ["backend/app/auth.py"],
+        },
+        "capabilities/login": {
+            "status": "working",
+            "notes": unique,
+            "modules": ["backend/app/auth.py"],
+        },
+    }
+    mocker.patch(
+        "app.strategic_spawning.ground_design_doc",
+        new=AsyncMock(side_effect=lambda doc, **kw: doc),
+    )
+    project = _make_project(vision={"purpose": "p"}, design_doc=design_doc)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )
+    payload = result.scalars().all()[0].payloads[0]
+    assert payload["type"] == "design_doc_update"
+
+    dd = payload["design_doc"]
+    assert set(dd.keys()) == {"sections"}
+    by_key = {e["key"]: e for e in dd["sections"]}
+    assert set(by_key) == {"systems/auth", "capabilities/login"}
+    assert by_key["capabilities/login"]["status"] == "working"
+    assert unique not in json.dumps(dd)

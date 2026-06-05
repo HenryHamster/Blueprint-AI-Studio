@@ -120,6 +120,130 @@ def _agent_view_design_doc(doc: dict | None) -> dict:
     }
 
 
+# Maximum length of the one-line per-entry summary carried in the design_doc
+# index. Keeps each entry navigation-level — enough to recognize a section,
+# never its full prose/specs — so the index stays bounded no matter how large
+# the underlying design doc grows. The agent pulls full content on demand via
+# ``POST /api/agent/design-doc`` (op:get).
+_DESIGN_DOC_INDEX_SUMMARY_CHARS = 200
+# Cap on backing module paths carried per systems/capabilities entry so a
+# pathological entry with hundreds of modules cannot unbound the index. The
+# declared paths are kept (capped) so the agent-side reconciliation over the
+# cloned workspace remains possible as an optional second pass.
+_DESIGN_DOC_INDEX_MODULES_KEEP = 16
+# Non-section bookkeeping keys that live inside project.design_doc but are NOT
+# architecture sections and so must NOT appear as index entries. ``proposed_changes``
+# is the operator/agent reconciliation queue — it is shipped as its OWN top-level
+# payload field (see _spawn_design_doc_update), so indexing it here would be
+# redundant noise ('Other sections' entry with no summary).
+_DESIGN_DOC_INDEX_NON_SECTION_KEYS = frozenset({"proposed_changes"})
+
+
+def _design_doc_entry_summary(value: Any) -> str | None:
+    """Derive a bounded, single-line summary for one design-doc section.
+
+    Prefers an explicit ``title``/``summary`` field, else the first prose body
+    (``description`` for systems, ``notes`` for capabilities, or any string).
+    Collapses whitespace and truncates to :data:`_DESIGN_DOC_INDEX_SUMMARY_CHARS`
+    so the index entry never carries full prose."""
+    text: str | None = None
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, dict):
+        for field in ("title", "summary", "description", "notes", "purpose"):
+            candidate = value.get(field)
+            if isinstance(candidate, str) and candidate.strip():
+                text = candidate
+                break
+    if not isinstance(text, str) or not text.strip():
+        return None
+    collapsed = " ".join(text.split())
+    if len(collapsed) > _DESIGN_DOC_INDEX_SUMMARY_CHARS:
+        return collapsed[: _DESIGN_DOC_INDEX_SUMMARY_CHARS - 1].rstrip() + "…"
+    return collapsed
+
+
+def _design_doc_index(doc: dict | None) -> dict:
+    """Build a compact, bounded navigation index over an already-grounded
+    agent-view design doc.
+
+    Replaces the full-content design_doc field in the strategic payload: instead
+    of shipping every section's full prose/specs inline (unbounded as the doc
+    grows), ships ONE entry per non-internal section carrying only navigation-
+    and architecture-level metadata:
+
+      * ``key``    — the section key (e.g. ``systems/auth``)
+      * ``summary``— a single, whitespace-collapsed, char-bounded line (when the
+        section has any prose to summarize)
+      * for ``systems/*`` and ``capabilities/*`` additionally the reconciled
+        ``status`` (presence — computed upstream by :func:`ground_design_doc`),
+        the declared ``modules`` backing paths (capped), and any
+        ``presence_warning`` the grounding pass stamped on.
+
+    The full, server-side-reconciled content of any section remains available on
+    demand via ``POST /api/agent/design-doc`` (op:get). The index size does NOT
+    scale with section prose: every text field is bounded and module lists are
+    capped, so the index stays small however large the design doc becomes.
+    """
+    if not doc:
+        return {"sections": []}
+    entries: list[dict] = []
+    for key in sorted(k for k in doc if isinstance(k, str)):
+        if (
+            key in _AGENT_UNUSED_DESIGN_DOC_KEYS
+            or key in _DESIGN_DOC_INDEX_NON_SECTION_KEYS
+            or key.startswith("_")
+        ):
+            continue
+        value = doc[key]
+        entry: dict[str, Any] = {"key": key}
+        summary = _design_doc_entry_summary(value)
+        if summary is not None:
+            entry["summary"] = summary
+        if isinstance(value, dict) and (
+            key.startswith("systems/") or key.startswith("capabilities/")
+        ):
+            status = value.get("status")
+            if isinstance(status, str) and status.strip():
+                entry["status"] = status
+            modules = value.get("modules")
+            if isinstance(modules, list):
+                module_paths = [m for m in modules if isinstance(m, str) and m.strip()][
+                    :_DESIGN_DOC_INDEX_MODULES_KEEP
+                ]
+                if module_paths:
+                    entry["modules"] = module_paths
+            warning = value.get("presence_warning")
+            if isinstance(warning, str) and warning.strip():
+                entry["presence_warning"] = warning
+        entries.append(entry)
+    return {"sections": entries}
+
+
+def _summarize_design_doc_index(index: Any) -> Any:
+    """Budget-pressure fallback for the design_doc index: drop the per-entry
+    one-line summaries, keeping only the navigation skeleton (key + reconciled
+    status + backing modules + presence_warning). The full content of any
+    section — including its prose/summary — remains fetchable on demand via the
+    design-doc op:get endpoint, so dropping summaries here is non-destructive.
+
+    The index is already compact, so this almost never fires; it exists so the
+    field degrades gracefully (skeleton) rather than vanishing wholesale under
+    genuine budget exhaustion."""
+    if not isinstance(index, dict):
+        return index
+    sections = index.get("sections")
+    if not isinstance(sections, list):
+        return index
+    skeleton = [
+        {k: v for k, v in entry.items() if k != "summary"}
+        if isinstance(entry, dict)
+        else entry
+        for entry in sections
+    ]
+    return {**index, "sections": skeleton}
+
+
 # Maximum history/past_moves entries to keep per active gap when shipping the
 # problem model to the strategic agent. Active gaps accumulate move records and
 # evidence over time; shipping the full lineage every cycle pushes the strategic
@@ -427,6 +551,41 @@ def _agent_view_problem_model_packed(pm: dict | None) -> dict:
     shrinks to a guaranteed-small floor so the model ALWAYS fits and is never
     silently dropped from the strategist's cycle payload."""
     return _shrink_pm_to_floor(_agent_view_problem_model(pm))
+
+
+def _agent_view_problem_model_floor(pm: dict | None) -> dict:
+    """Dead-simple, can't-fail ``floor`` callback for the ``problem_model``.
+
+    Returns a minimal skeleton with only essential always-present fields:
+    - Empty gaps list (indicates model is floored, agent can fetch full list)
+    - Empty capabilities (lowest-value section after gaps)
+    - Empty friction
+    - No history, past_moves, or elaborate detail
+
+    This floor function is independent of the elaborate summarize callback
+    (_agent_view_problem_model_packed) so a failure in the summarize path
+    does NOT abandon the floor reservation and cause the model to be silently
+    dropped. The floor is guaranteed to be delivered to the strategist every
+    cycle, with a marker showing it was floored so the agent can fetch fuller
+    detail via the problem_model fetch endpoint.
+    """
+    if not pm or not isinstance(pm, dict):
+        return {"gaps": [], "capabilities": [], "friction": []}
+    # Build the floor from always-present top-level keys (gaps, caps, friction
+    # are optional and may be missing, but the floor always includes them as
+    # empty containers so the agent sees a consistent structure).
+    floor = {
+        "gaps": [],
+        "capabilities": [],
+        "friction": [],
+    }
+    # Stamp the floor indicator so the agent knows this is a skeleton.
+    floor["_agent_view_floor_applied"] = {
+        "floor_bytes": _AGENT_VIEW_FLOOR_BYTES,
+        "stripped_gap_fields": [],
+        "dropped_gaps": 0,
+    }
+    return floor
 
 
 # Maximum operator-override entries surfaced to the next strategic cycle, and
@@ -1762,8 +1921,10 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
         # Floor reservation: the packer reserves the floored model's bytes off
         # the top of the budget so the strategist's working set is GUARANTEED
         # in-payload every cycle — other recoverable sections degrade before the
-        # problem_model is ever dropped entirely.
-        "floor": _agent_view_problem_model_packed,
+        # problem_model is ever dropped entirely. The floor function is a simple,
+        # independent callback that cannot fail, so the floor reservation is
+        # honored even if the summarize callback raises an exception.
+        "floor": _agent_view_problem_model_floor,
     },
     # Tiny, load-bearing soft size/health signal computed from the DURABLE
     # problem_model (honest counts, not the trimmed agent view). High priority,
@@ -1773,7 +1934,18 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # Medium priority with no summarize_fn: already capped at build time, so the
     # packer drops it whole under budget rather than trimming. Advisory.
     "prune_candidates": {"priority": "medium"},
-    "design_doc": {"priority": "medium", "summarize": _agent_view_design_doc},
+    # Compact index of all playbook keys — survives budget pressure so the
+    # strategist always knows what operational knowledge exists and can fetch
+    # entries on demand via `./fetch playbook <key>`. High priority to persist
+    # under budget pressure, even if the heavier playbook_summary is dropped.
+    "playbook_keys_index": {"priority": "high"},
+    # Compact, bounded navigation index over the grounded agent-view design doc
+    # (one entry per non-internal section: key + bounded summary + reconciled
+    # presence status/modules/warning for systems/capabilities). The full
+    # per-section content is fetched on demand via POST /api/agent/design-doc
+    # (op:get) — see _design_doc_index. The summarize fallback drops per-entry
+    # summaries to a navigation skeleton under genuine budget exhaustion.
+    "design_doc": {"priority": "medium", "summarize": _summarize_design_doc_index},
     "outcome_evaluation": {
         "priority": "medium",
         "summarize": _summarize_outcome_evaluation,
@@ -1836,15 +2008,20 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     "effort": {"priority": "critical"},
     "vision": {"priority": "critical"},
     "open_messages": {"priority": "high", "summarize": _summarize_open_messages},
-    "design_doc": {"priority": "high", "summarize": _agent_view_design_doc},
+    # Compact, bounded navigation index over the grounded agent-view design doc
+    # — see _STRATEGIC_REVIEW_SCHEMA["design_doc"] and _design_doc_index. Full
+    # per-section content is fetched on demand via POST /api/agent/design-doc.
+    "design_doc": {"priority": "high", "summarize": _summarize_design_doc_index},
     "problem_model": {
         "priority": "high",
         "summarize": _agent_view_problem_model_packed,
         # Floor reservation: the packer reserves the floored model's bytes off
         # the top of the budget so the strategist's working set is GUARANTEED
         # in-payload every cycle — other recoverable sections degrade before the
-        # problem_model is ever dropped entirely.
-        "floor": _agent_view_problem_model_packed,
+        # problem_model is ever dropped entirely. The floor function is a simple,
+        # independent callback that cannot fail, so the floor reservation is
+        # honored even if the summarize callback raises an exception.
+        "floor": _agent_view_problem_model_floor,
     },
     # See _STRATEGIC_REVIEW_SCHEMA: tiny, load-bearing soft size/health signal.
     "model_health": {"priority": "high"},
@@ -2772,6 +2949,39 @@ def _build_playbook_summary(project: Project) -> dict[str, Any] | None:
     return {"entries": candidates[:10]}
 
 
+def _build_playbook_keys_index(project: Project) -> dict[str, Any] | None:
+    """Complete index of all playbook entry keys with minimal metadata.
+
+    Lists ALL playbook entries (not just the top-N strategically relevant ones),
+    with just their keys and minimal metadata (source, updated_at). This compact
+    index survives budget pressure better than the full playbook_summary and lets
+    the strategist discover what knowledge exists in the playbook, then fetch
+    individual entries on demand via `./fetch playbook <key>`.
+
+    Returns None when no playbook entries exist so the key can be omitted.
+    """
+    doc = project.design_doc or {}
+    entries: list[dict[str, Any]] = []
+    for key, entry in doc.items():
+        if not key.startswith("playbook/") or not isinstance(entry, dict):
+            continue
+        # Skip pending entries (mid-flight writes from non-completed tasks).
+        if entry.get("pending_source"):
+            continue
+        entries.append(
+            {
+                "key": key[len("playbook/") :],
+                "source": entry.get("source"),
+                "updated_at": entry.get("updated_at"),
+            }
+        )
+    if not entries:
+        return None
+    # Sorted newest-first so the strategist sees recent changes first
+    entries.sort(key=lambda e: e.get("updated_at") or "", reverse=True)
+    return {"entries": entries}
+
+
 _IN_FLIGHT_TASK_STATUSES = (
     TaskStatus.QUEUED,
     TaskStatus.PROVISIONING,
@@ -2852,6 +3062,10 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     # it: present-but-absent systems/capabilities are downgraded so the agent
     # never sees a status the backing code can't support. Read-only/advisory —
     # the stored design_doc is untouched; reconcile operates on the agent view.
+    # The grounded doc is then reduced to a compact, bounded navigation index
+    # (key + bounded summary + reconciled presence status/modules/warning); the
+    # full per-section content stays fetchable on demand via the design-doc
+    # op:get endpoint so the field can no longer dominate the payload budget.
     reconciled_design_doc = await ground_design_doc(
         _agent_view_design_doc(project.design_doc), **verification_kwargs
     )
@@ -2859,7 +3073,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     payload: dict = pack_under_budget(
         {
             "type": "design_doc_update",
-            "design_doc": reconciled_design_doc,
+            "design_doc": _design_doc_index(reconciled_design_doc),
             "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
             "project_name": project.name,
             "vision": project.vision or {},
@@ -4119,8 +4333,14 @@ async def _spawn_strategic_review(
         {
             "type": "strategic_review",
             "research_mode": "strategic",
-            "design_doc": await ground_design_doc(
-                _agent_view_design_doc(project.design_doc), **verification_kwargs
+            # Compact, bounded navigation index over the grounded agent-view
+            # design doc (full per-section content fetched on demand via the
+            # design-doc op:get endpoint) — keeps the design doc from dominating
+            # the payload budget as it grows. See _design_doc_index.
+            "design_doc": _design_doc_index(
+                await ground_design_doc(
+                    _agent_view_design_doc(project.design_doc), **verification_kwargs
+                )
             ),
             "vision": project.vision or {},
             "problem_model": _verified_problem_model,
@@ -4172,6 +4392,11 @@ async def _spawn_strategic_review(
             **(
                 {"playbook_summary": _playbook_summary}
                 if (_playbook_summary := _build_playbook_summary(project))
+                else {}
+            ),
+            **(
+                {"playbook_keys_index": _playbook_keys_index}
+                if (_playbook_keys_index := _build_playbook_keys_index(project))
                 else {}
             ),
             "project_name": project.name,

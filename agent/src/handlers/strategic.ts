@@ -14,7 +14,7 @@ import {
 } from '../prompt.js';
 import { writeStrategicHelpers } from './strategic-helpers.js';
 import { parseBackendTimestamp } from '../utils/time.js';
-import { reconcileDesignDocPresence } from '../utils/design-doc-presence.js';
+import { reconcileDesignDocIndex } from '../utils/design-doc-presence.js';
 import {
   formatPreviousDecisionOutcomes,
   formatPastRetirementCritiques,
@@ -90,6 +90,64 @@ export function buildStagedDirectionsSection(staged: Array<Record<string, unknow
     '_These directions are STAGED — inert until the version they are waiting on promotes, then they auto-activate. Do NOT re-propose work already staged here. Staging is a decision that work belongs to the next version, not a way to defer._',
     ...lines,
   ].join('\n');
+}
+
+/**
+ * Render the compact design-doc INDEX as a clean architecture overview — NOT a
+ * raw JSON dump. The backend now ships the design doc as a navigation index
+ * (`{ sections: [{ key, summary?, status?, modules?, presence_warning? }] }`,
+ * see `_design_doc_index` in backend/app/strategic_spawning.py): one entry per
+ * non-internal section, with reconciled presence status + backing module paths
+ * for `systems/*` and `capabilities/*`. Full section prose/specs are NO LONGER
+ * inlined — the strategist pulls them on demand via `./design-doc get <key>`.
+ *
+ * Returns '' when the index has no sections so the caller can omit the section.
+ */
+export function renderDesignDocIndexOverview(index: Record<string, unknown> | undefined): string {
+  if (!index || typeof index !== 'object') return '';
+  const sections = index.sections;
+  if (!Array.isArray(sections) || sections.length === 0) return '';
+
+  const systems: string[] = [];
+  const capabilities: string[] = [];
+  const other: string[] = [];
+
+  for (const raw of sections) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const entry = raw as Record<string, unknown>;
+    const key = strVal(entry.key);
+    if (!key) continue;
+    const summary = strVal(entry.summary);
+    const status = strVal(entry.status);
+    const modules = Array.isArray(entry.modules)
+      ? (entry.modules as unknown[]).filter((m): m is string => typeof m === 'string' && !!m.trim())
+      : [];
+    const warning = strVal(entry.presence_warning);
+
+    const parts: string[] = [`- \`${key}\``];
+    if (status) parts.push(`[${status}]`);
+    if (summary) parts.push(`— ${summary}`);
+    let line = parts.join(' ');
+    if (modules.length > 0) line += `\n  - modules: ${modules.join(', ')}`;
+    if (warning) line += `\n  - ⚠ ${warning}`;
+
+    if (key.startsWith('systems/')) systems.push(line);
+    else if (key.startsWith('capabilities/')) capabilities.push(line);
+    else other.push(line);
+  }
+
+  const blocks: string[] = [];
+  if (systems.length > 0) blocks.push(['### Systems', ...systems].join('\n'));
+  if (capabilities.length > 0) blocks.push(['### Capabilities', ...capabilities].join('\n'));
+  if (other.length > 0) blocks.push(['### Other sections', ...other].join('\n'));
+  if (blocks.length === 0) return '';
+
+  blocks.push(
+    '_This is a navigation index — section statuses and backing modules only, not the full prose/specs. ' +
+      'Fetch any section\'s FULL text on demand with `./design-doc get <key>` (e.g. `./design-doc get systems/auth`), ' +
+      'and `./design-doc list` to enumerate all keys. Pull the full text whenever you need a section\'s detailed prose or specs._',
+  );
+  return blocks.join('\n\n');
 }
 
 export async function handleStrategic(
@@ -175,19 +233,24 @@ export async function handleStrategic(
       : [];
     const stagedDirectionsSection = buildStagedDirectionsSection(stagedDirections);
 
-    // Reconcile the design doc's systems/* and capabilities/* statuses against
-    // the cloned file tree BEFORE serializing into the thinker prompt: any
-    // entry marked present (mature/functional/partial / working) whose backing
-    // module files are all absent on the integration branch is downgraded to
-    // `missing` + annotated, so the strategic agent never reasons on a status
-    // the code does not back up.
-    const designDoc = reconcileDesignDocPresence(
+    // The backend now ships the design doc as a COMPACT INDEX (see
+    // `_design_doc_index` in backend/app/strategic_spawning.py): one entry per
+    // non-internal section carrying key + one-line summary, plus reconciled
+    // status + backing module paths for systems/* and capabilities/*. Full
+    // section prose/specs are pulled on demand via `./design-doc get <key>`.
+    //
+    // Run the agent-side presence reconciliation over the cloned file tree as an
+    // optional second pass: the index still carries the declared module paths,
+    // so a systems/* or capabilities/* entry claiming a present status whose
+    // backing modules are all absent on the integration branch is downgraded to
+    // `missing` + annotated — catching code reverted/never-landed since the
+    // server-side grounding pass ran. Then render as a clean architecture
+    // overview (NOT a raw JSON dump).
+    const designDocIndex = reconcileDesignDocIndex(
       payload.design_doc as Record<string, unknown> | undefined,
       WORKSPACE,
     );
-    const designDocJson = designDoc && Object.keys(designDoc).length > 0
-      ? JSON.stringify(designDoc, null, 2)
-      : '';
+    const designDocJson = renderDesignDocIndexOverview(designDocIndex);
 
     // Write strategic helper scripts (strategic, fetch, design-doc)
     const projectMetadataForFetch = task.project_metadata as Record<string, unknown> | undefined;
@@ -216,8 +279,22 @@ export async function handleStrategic(
     );
 
     // ── Running context from prior cycles (design doc notes/strategic-context) ──
-    const strategicContext = designDoc
-      ? strVal((designDoc)['notes/strategic-context'])
+    // The full prose of notes/strategic-context is NO LONGER inlined in the
+    // payload (the design_doc is now a compact index). To avoid silently losing
+    // the cross-cycle running context, surface the index's one-line summary for
+    // that section (when present) and ALWAYS append a fetch hint so the
+    // strategist can pull the full running context on demand. The section may be
+    // absent entirely on a fresh project — in that case emit nothing.
+    const designDocSections = designDocIndex && Array.isArray(designDocIndex.sections)
+      ? designDocIndex.sections as unknown[]
+      : [];
+    const strategicContextEntry = designDocSections.find(
+      (e): e is Record<string, unknown> =>
+        !!e && typeof e === 'object' && !Array.isArray(e) &&
+        strVal((e as Record<string, unknown>).key) === 'notes/strategic-context',
+    );
+    const strategicContext = strategicContextEntry
+      ? `${strVal(strategicContextEntry.summary) || '_(summary unavailable)_'}\n\n_Running context shipped as an index entry this cycle — fetch the FULL prior-cycle context with \`./design-doc get notes/strategic-context\` before relying on it._`
       : '';
 
     // ── Problem model + running update + self-reflection rendering ──
@@ -603,10 +680,19 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # need the detail — extra context hurts reasoning quality.
 ./fetch problem-model              # full durable problem_model for this project
 ./fetch direction <direction_id>   # full direction record
-./fetch playbook <key>             # single playbook entry
+./fetch playbook <key>             # single playbook entry (e.g., frontend-build)
 ./fetch gap <gap_id>               # single problem_model gap
 ./fetch message <ref>              # inspect a message by short ref (8+ hex chars) or UUID,
                                    # even one that has aged out of the live thread
+
+# Operational Knowledge (playbook)
+# You always receive a complete index of playbook keys (playbook_keys_index) —
+# just keys and minimal metadata (source, updated_at). Use this index to:
+# 1. Discover what operational knowledge exists in the playbook
+# 2. Fetch individual entries on demand via ./fetch playbook <key>
+# The full playbook_summary (with entry content) may be dropped under budget,
+# but the compact keys index survives, so you can always discover and retrieve
+# entries even if the summary was dropped.
 
 # Respond to or resolve user messages. <ref> may be a short ref (the first 8+ hex
 # chars shown in the admin UI) or a full UUID — the backend resolves it, so you do

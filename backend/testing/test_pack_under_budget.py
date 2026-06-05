@@ -348,6 +348,87 @@ def test_summarize_returning_larger_value_falls_back_to_original(caplog):
     assert any("grew" in rec.message.lower() for rec in caplog.records)
 
 
+def test_floor_survives_when_summarize_raises(caplog):
+    """Floor callback preserves a key even when summarize callback fails.
+
+    This is the critical hardening case: when the summarize callback raises
+    an exception, the packer catches it and abandons the summarize path. But
+    the floor callback is independent, so it still computes and reserves bytes
+    for the floored representation. The floored value ships to the agent with
+    a marker indicating it was floored, so the agent can fetch fuller detail.
+
+    This guarantees the problem_model is NEVER silently dropped due to a
+    failure in the elaborate summarize logic.
+    """
+
+    def broken_summarize(v):
+        """Simulate a failure in the elaborate summarize callback."""
+        raise ValueError("Elaborate summarize logic failed: X happened")
+
+    def working_floor(v):
+        """Simple, independent, can't-fail floor."""
+        return {"floored": True, "minimal": "skeleton"}
+
+    payload = {"model": {"big": "data" * 1000}}  # ~4KB
+    schema = {
+        "model": {
+            "priority": "high",
+            "summarize": broken_summarize,
+            "floor": working_floor,
+        },
+    }
+
+    # Budget is tight, forcing the summarize path. The summarize callback
+    # raises, but the floor callback succeeds and the floored value ships.
+    with caplog.at_level(logging.WARNING):
+        out = pack_under_budget(payload, schema, budget=100)
+
+    # The key is present (not dropped) and holds the floored value.
+    assert "model" in out
+    assert out["model"] == {"floored": True, "minimal": "skeleton"}
+    # The packer logged a warning about the summarize failure.
+    assert any("summarize" in rec.message.lower() and "raised" in rec.message.lower()
+               for rec in caplog.records)
+    # The floored entry is marked as floored in the metadata.
+    assert {"key": "model", "kind": "floored"} in out["_packer_meta"]["trimmed"]
+
+
+def test_floor_survives_when_both_summarize_and_floor_raise():
+    """When both summarize and floor raise, the section is silently dropped.
+
+    This is a catastrophic failure case: the floor function is expected to be
+    simple and can't-fail. If it does raise, the packer logs a warning and
+    the key is dropped entirely (there is no last-resort value to ship). This
+    test documents the boundary condition: the floor MUST be defensively coded
+    to never raise, or the inbound guarantee (model always shipped) is broken.
+    """
+
+    def broken_summarize(v):
+        raise ValueError("Summarize failed")
+
+    def broken_floor(v):
+        raise RuntimeError("Floor failed too")
+
+    payload = {"model": {"data": "x" * 1000}}
+    schema = {
+        "model": {
+            "priority": "high",
+            "summarize": broken_summarize,
+            "floor": broken_floor,
+        },
+    }
+
+    # Both callbacks fail. The section is dropped with warnings about both
+    # failures (first floor, then summarize as a fallback).
+    out = pack_under_budget(payload, schema, budget=200)
+    assert "model" not in out
+    # The packer logs warnings for both the floor and summarize failures.
+    dropped = [d for d in out["_packer_meta"]["dropped"] if d["key"] == "model"]
+    assert len(dropped) == 1
+    # When the summarize callback also fails, that message is recorded.
+    assert "exceeds remaining budget even after summarize" in dropped[0]["reason"]
+
+
 # ---------------------------------------------------------------------------
 # Invariant: a GC'd, worst-case-but-within-caps durable problem_model survives
 # the real strategic single-pass path (GC -> agent-view trim -> pack_under_budget).
