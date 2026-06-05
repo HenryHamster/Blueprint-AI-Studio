@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import type { User } from 'firebase/auth';
 import type { DeployState, OrchestratorHealth, ProviderApisHealth } from '../types/settings';
 import type { ProjectDiagnostics } from '../types/diagnostics';
@@ -94,7 +94,17 @@ export function useDeploymentState(
     }
   };
 
+  // In-flight guard: rollback is not free to repeat — a genuine double-submit
+  // (double-click) would double-count toward the consecutive-rollback HALT
+  // threshold. The ref blocks the second concurrent call before it issues a
+  // request; the state mirror drives button-disable in the UI.
+  const rollbackInFlight = useRef(false);
+  const [isRollingBack, setIsRollingBack] = useState(false);
+
   const handleRollback = async () => {
+    if (rollbackInFlight.current) return;
+    rollbackInFlight.current = true;
+    setIsRollingBack(true);
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/deploy-state/rollback`, {
         method: 'POST', headers: await authHeaders(),
@@ -109,6 +119,9 @@ export function useDeploymentState(
       fetchDeployState();
     } catch {
       addToast('Rollback failed', 'error');
+    } finally {
+      rollbackInFlight.current = false;
+      setIsRollingBack(false);
     }
   };
 
@@ -231,7 +244,7 @@ export function useDeploymentState(
   return {
     deployState, setDeployState,
     handlePausePipeline, handleResumePipeline, handleResetHealth,
-    handleRollback, handleMarkStable, handleRepairState,
+    handleRollback, isRollingBack, handleMarkStable, handleRepairState,
     zoneHealth,
     orchestratorHealth,
     detailedHealth,

@@ -257,3 +257,41 @@ def test_manual_pause_snapshot_idempotency():
     # Simulate resume: use the saved pre_pause_max_vms
     restore_vms = s.pre_pause_max_vms or 5
     assert restore_vms == 5, "Resume must use the original pre-pause capacity"
+
+
+def test_rollback_pause_snapshot_idempotency():
+    """Rolling back an already-paused pipeline must not overwrite the genuine
+    pre-pause capacity snapshot, and must preserve the existing pause window.
+
+    This mirrors the manual-pause guard for the rollback endpoint. Scenario:
+    the deploy-health watchdog auto-paused the pipeline (pre_pause_max_vms=5,
+    live capacity already zeroed, paused_at set ~300s ago). An operator then
+    triggers a rollback. The rollback must:
+      1. NOT overwrite pre_pause_max_vms with the already-zeroed live capacity.
+      2. NOT restart the pause window (preserve the original paused_at/kind),
+         so accumulated auto-pause time isn't lost.
+      3. Leave resume able to restore the operator's real capacity (5), not the
+         default fallback.
+    """
+    earlier = datetime.utcnow() - timedelta(seconds=300)
+    s = _state(
+        pre_pause_max_vms=5,
+        runtime_max_concurrent_vms=5,
+        paused_at=earlier,
+        paused_kind=pause_clock.PAUSED_KIND_AUTO,
+    )
+
+    # Simulate rollback's guarded snapshot: live capacity is already zeroed.
+    current_runtime_vms = 0
+    if s.pre_pause_max_vms is None:  # idempotent guard — don't overwrite
+        s.pre_pause_max_vms = current_runtime_vms or s.runtime_max_concurrent_vms
+    # rollback marks an AUTO pause window — idempotent, must preserve prior window
+    pause_clock.mark_paused(s, pause_clock.PAUSED_KIND_AUTO)
+
+    assert s.pre_pause_max_vms == 5, "Rollback must not overwrite pre_pause snapshot"
+    assert s.paused_at == earlier, "Rollback must preserve the existing pause window"
+    assert s.paused_kind == "auto"
+
+    # Resume restores the operator's real capacity, not the default fallback.
+    restore_vms = s.pre_pause_max_vms or s.runtime_max_concurrent_vms or 5
+    assert restore_vms == 5, "Resume must restore the genuine pre-pause capacity"
