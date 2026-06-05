@@ -259,6 +259,68 @@ describe('ProjectDashboard', () => {
     expect(badge).toHaveAttribute('title', expect.stringContaining('no runnable test command could be detected'));
   });
 
+  it('appends the merge-verification-health summary to the badge tooltip when history is present', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    render(
+      <ProjectDashboard
+        projects={[makeProject({
+          id: 'proj-tests',
+          name: 'Tests Project',
+          merge_verification_verdict: {
+            state: 'tests_gated',
+            test_commands: [{ path: 'backend/', test_cmd: 'pytest' }],
+          },
+          merge_gate_runtime: {
+            last_run_at: '2026-04-24T11:00:00Z',
+            executed_real_tests: true,
+            summary: {
+              window: 6,
+              verified_runs: 4,
+              fell_open_runs: 2,
+              total_fall_opens: 5,
+              most_common_reason: 'no_detectable_test_command',
+            },
+          },
+        })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+      />,
+    );
+
+    const badge = screen.getByText('Tests gated');
+    expect(badge).toHaveAttribute('data-runtime-state', 'verified');
+    expect(badge).toHaveAttribute('title', expect.stringContaining('verified 4 of the last 6 merges; fell open 2 times'));
+    expect(badge).toHaveAttribute('title', expect.stringContaining('most common: no runnable test command could be detected'));
+  });
+
+  it('leaves the badge tooltip unchanged for a legacy runtime with no summary', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    render(
+      <ProjectDashboard
+        projects={[makeProject({
+          id: 'proj-legacy',
+          name: 'Legacy Project',
+          merge_verification_verdict: {
+            state: 'tests_gated',
+            test_commands: [{ path: 'backend/', test_cmd: 'pytest' }],
+          },
+          merge_gate_runtime: {
+            last_run_at: '2026-04-24T11:00:00Z',
+            executed_real_tests: true,
+          },
+        })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+      />,
+    );
+
+    const badge = screen.getByText('Tests gated');
+    expect(badge).toHaveAttribute('title', expect.stringContaining("Blueprint will run the project's detected test command(s) before merging PRs."));
+    expect(badge.getAttribute('title')).not.toContain('of the last');
+  });
+
   it('counts paused projects from the paused flag in the summary strip', () => {
     localStorage.setItem('projectDashboardCollapsed', 'false');
     render(

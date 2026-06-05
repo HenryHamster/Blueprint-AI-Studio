@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
 import { MergeVerificationBanner } from './MergeVerificationBanner';
-import type { MergeVerificationVerdict } from '../types/project';
+import type { MergeGateRuntime, MergeVerificationVerdict } from '../types/project';
 
 // Read-only banner with no interactive controls — the touch-target check is
 // intentionally omitted (there are no buttons/links). Overflow and text-truncation
@@ -18,7 +18,7 @@ describe('MergeVerificationBanner — viewport regression', () => {
     if (host) { host.remove(); host = null; }
   });
 
-  function renderVerdict(verdict: MergeVerificationVerdict | null) {
+  function renderVerdict(verdict: MergeVerificationVerdict | null, runtime?: MergeGateRuntime | null) {
     return async () => {
       host = document.createElement('div');
       host.style.padding = '12px';
@@ -27,7 +27,7 @@ describe('MergeVerificationBanner — viewport regression', () => {
       const r = createRoot(host);
       root = r;
       await act(async () => {
-        r.render(<MergeVerificationBanner verdict={verdict} />);
+        r.render(<MergeVerificationBanner verdict={verdict} runtime={runtime} />);
       });
     };
   }
@@ -67,6 +67,34 @@ describe('MergeVerificationBanner — viewport regression', () => {
     await expectNoOverflowAt(375, renderVerdict({ state: 'ci_checks', test_commands: [] }));
     const banner = host!.querySelector('[data-testid="merge-verification-banner"]');
     expect(banner?.getAttribute('data-verdict-state')).toBe('ci_checks');
+  });
+
+  test('renders the merge-verification-health summary without overflow at 375px', async () => {
+    const runtime: MergeGateRuntime = {
+      last_run_at: '2026-04-24T11:00:00Z',
+      executed_real_tests: true,
+      summary: {
+        window: 6,
+        verified_runs: 4,
+        fell_open_runs: 2,
+        total_fall_opens: 5,
+        most_common_reason: 'no_detectable_test_command',
+      },
+    };
+    await expectNoOverflowAt(375, renderVerdict({ state: 'tests_gated', test_commands: [{ path: 'backend/', test_cmd: 'pytest' }] }, runtime));
+    const summary = host!.querySelector('[data-testid="merge-gate-summary"]');
+    expect(summary?.textContent).toContain('verified 4 of the last 6 merges');
+    expect(summary?.textContent).toContain('fell open 2 times');
+    expect(summary?.textContent).toContain('no runnable test command could be detected');
+  });
+
+  test('legacy runtime without summary renders no aggregate line', async () => {
+    const runtime: MergeGateRuntime = {
+      last_run_at: '2026-04-24T11:00:00Z',
+      executed_real_tests: true,
+    };
+    await renderVerdict({ state: 'tests_gated', test_commands: [{ path: 'backend/', test_cmd: 'pytest' }] }, runtime)();
+    expect(host!.querySelector('[data-testid="merge-gate-summary"]')).toBeNull();
   });
 
   test('null verdict renders nothing', async () => {

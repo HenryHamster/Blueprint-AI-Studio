@@ -1511,3 +1511,142 @@ def test_classify_verdict_declared_build_fail_blank_output_fallback():
     )
     assert outcome == "fail"
     assert "Declared build command `make (root)` failed" in detail
+
+
+# ---------------------------------------------------------------------------
+# record_no_ci_gate_runtime / merge_gate_runtime_block — rolling history,
+# per-reason tally, and the derived at-a-glance summary. These are pure
+# in-memory operations on project.merge_gate_runtime (no DB needed): the
+# recorder is best-effort and stages the project; the block normalizer reads
+# the in-memory column back.
+# ---------------------------------------------------------------------------
+
+
+def _record(project, *, verified, reason, when):
+    ci_resolution.record_no_ci_gate_runtime(
+        None,
+        project,
+        executed_real_tests=verified,
+        unverified_reason=reason,
+        when=when,
+    )
+
+
+def test_runtime_history_keeps_four_legacy_keys_and_adds_outcome():
+    project = _proj()
+    _record(project, verified=False, reason="undetected_runtime", when="2026-06-01T00:00:00")
+    block = ci_resolution.merge_gate_runtime_block(project)
+    # Legacy keys unchanged.
+    assert block["last_run_at"] == "2026-06-01T00:00:00"
+    assert block["executed_real_tests"] is False
+    assert block["last_unverified_at"] == "2026-06-01T00:00:00"
+    assert block["last_unverified_reason"] == "undetected_runtime"
+    # New rolling history present with one entry.
+    assert block["recent_outcomes"] == [
+        {"at": "2026-06-01T00:00:00", "verified": False, "reason": "undetected_runtime"}
+    ]
+    assert block["unverified_reason_counts"] == {"undetected_runtime": 1}
+
+
+def test_runtime_verified_entry_has_no_reason_and_no_tally():
+    project = _proj()
+    _record(project, verified=True, reason=None, when="2026-06-02T00:00:00")
+    block = ci_resolution.merge_gate_runtime_block(project)
+    assert block["recent_outcomes"] == [
+        {"at": "2026-06-02T00:00:00", "verified": True, "reason": None}
+    ]
+    # A verified run never creates the tally.
+    assert "unverified_reason_counts" not in block
+    assert block["summary"]["verified_runs"] == 1
+    assert block["summary"]["fell_open_runs"] == 0
+    assert block["summary"]["total_fall_opens"] == 0
+    assert block["summary"]["most_common_reason"] is None
+
+
+def test_runtime_history_bounded_at_cap_drops_oldest():
+    project = _proj()
+    # Record well past the cap; oldest must be evicted, newest retained.
+    total = ci_resolution._RECENT_OUTCOMES_CAP + 5
+    for i in range(total):
+        _record(project, verified=True, reason=None, when=f"2026-06-05T00:00:{i:02d}")
+    block = ci_resolution.merge_gate_runtime_block(project)
+    outcomes = block["recent_outcomes"]
+    assert len(outcomes) == ci_resolution._RECENT_OUTCOMES_CAP
+    # Oldest dropped, newest kept (most recent last).
+    assert outcomes[0]["at"] == f"2026-06-05T00:00:{(total - ci_resolution._RECENT_OUTCOMES_CAP):02d}"
+    assert outcomes[-1]["at"] == f"2026-06-05T00:00:{(total - 1):02d}"
+
+
+def test_runtime_tally_accumulates_per_reason_across_repeated_fall_opens():
+    project = _proj()
+    _record(project, verified=False, reason="undetected_runtime", when="2026-06-01T00:00:01")
+    _record(project, verified=False, reason="undetected_runtime", when="2026-06-01T00:00:02")
+    _record(project, verified=False, reason="suite_all_skipped", when="2026-06-01T00:00:03")
+    _record(project, verified=True, reason=None, when="2026-06-01T00:00:04")
+    block = ci_resolution.merge_gate_runtime_block(project)
+    assert block["unverified_reason_counts"] == {
+        "undetected_runtime": 2,
+        "suite_all_skipped": 1,
+    }
+    summary = block["summary"]
+    assert summary["window"] == 4
+    assert summary["verified_runs"] == 1
+    assert summary["fell_open_runs"] == 3
+    assert summary["total_fall_opens"] == 3
+    # Most-tallied reason wins the at-a-glance line.
+    assert summary["most_common_reason"] == "undetected_runtime"
+
+
+def test_runtime_total_fall_opens_can_exceed_window_after_eviction():
+    project = _proj()
+    # First fall-open of a rare reason, then flood the window with verified runs
+    # so the rare fall-open is evicted from recent_outcomes but stays tallied.
+    _record(project, verified=False, reason="suite_all_skipped", when="2026-06-05T00:00:00")
+    for i in range(1, ci_resolution._RECENT_OUTCOMES_CAP + 1):
+        _record(project, verified=True, reason=None, when=f"2026-06-05T00:01:{i:02d}")
+    block = ci_resolution.merge_gate_runtime_block(project)
+    # Evicted from the window...
+    assert all(o["reason"] != "suite_all_skipped" for o in block["recent_outcomes"])
+    assert block["summary"]["fell_open_runs"] == 0
+    # ...but the all-time tally still remembers it.
+    assert block["unverified_reason_counts"] == {"suite_all_skipped": 1}
+    assert block["summary"]["total_fall_opens"] == 1
+    assert block["summary"]["most_common_reason"] == "suite_all_skipped"
+
+
+def test_runtime_block_none_when_never_run():
+    project = _proj()
+    assert project.merge_gate_runtime is None
+    assert ci_resolution.merge_gate_runtime_block(project) is None
+
+
+def test_runtime_block_legacy_four_key_record_omits_new_fields():
+    """A record written by the old code (four keys only) normalizes without the
+    new history fields — backward compatible."""
+    project = _proj()
+    project.merge_gate_runtime = {
+        "last_run_at": "2026-06-01T00:00:00",
+        "executed_real_tests": False,
+        "last_unverified_at": "2026-06-01T00:00:00",
+        "last_unverified_reason": "undetected_runtime",
+    }
+    block = ci_resolution.merge_gate_runtime_block(project)
+    assert block["last_unverified_reason"] == "undetected_runtime"
+    assert "recent_outcomes" not in block
+    assert "unverified_reason_counts" not in block
+    assert "summary" not in block
+
+
+def test_runtime_block_malformed_history_is_defensive():
+    """Non-list recent_outcomes / non-dict tally are ignored, not raised on."""
+    project = _proj()
+    project.merge_gate_runtime = {
+        "last_run_at": "2026-06-01T00:00:00",
+        "executed_real_tests": True,
+        "recent_outcomes": "not-a-list",
+        "unverified_reason_counts": ["not", "a", "dict"],
+    }
+    block = ci_resolution.merge_gate_runtime_block(project)
+    assert "recent_outcomes" not in block
+    assert "unverified_reason_counts" not in block
+    assert "summary" not in block

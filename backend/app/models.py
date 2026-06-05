@@ -406,7 +406,15 @@ class Project(SQLModel, table=True):
     # terminal gate outcome. Shape:
     #   {"last_run_at": iso, "executed_real_tests": bool,
     #    "last_unverified_at": iso | absent,
-    #    "last_unverified_reason": str | absent}
+    #    "last_unverified_reason": str | absent,
+    #    # additive rolling history (bounded at 20, oldest dropped):
+    #    "recent_outcomes": [{"at": iso, "verified": bool,
+    #                         "reason": key | None}, ...] | absent,
+    #    # per-reason fall-open tally (incremented only on fall-opens):
+    #    "unverified_reason_counts": {reason_key: count} | absent}
+    # The history keys are purely additive — the column stays schemaless JSONB,
+    # so no migration and no type change is needed; legacy four-key-only rows
+    # upgrade transparently on the next gate run.
     # Nullable/additive: existing rows and create_all test DBs read it as None,
     # and a fresh migration (separate task) adds the column to live DBs.
     merge_gate_runtime: Dict[str, Any] | None = Field(

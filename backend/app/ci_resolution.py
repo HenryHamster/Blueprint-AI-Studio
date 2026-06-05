@@ -183,6 +183,13 @@ def compute_merge_verification_verdict(project) -> dict[str, Any]:
     return {"state": "unverified", "test_commands": []}
 
 
+# Bound on the rolling ``recent_outcomes`` history kept inside
+# ``project.merge_gate_runtime``. Small by design — operators want an
+# at-a-glance recent trend, not a full audit log — and it caps the JSONB
+# column growth (oldest entries are dropped first).
+_RECENT_OUTCOMES_CAP = 20
+
+
 def record_no_ci_gate_runtime(
     db_session,
     project,
@@ -208,6 +215,17 @@ def record_no_ci_gate_runtime(
     ``last_unverified_*`` fields — they preserve the most recent fall-open,
     which remains historically true.
 
+    Additionally maintains, additively, a bounded rolling history and a
+    per-reason tally so an operator can see a TREND rather than only the single
+    latest value:
+      - ``recent_outcomes``: list (capped at :data:`_RECENT_OUTCOMES_CAP`,
+        oldest dropped) of ``{"at": iso, "verified": bool, "reason": key|None}``
+        — one entry per terminal call (verified AND fell-open);
+      - ``unverified_reason_counts``: ``{reason_key: count}`` incremented only
+        on fall-opens.
+    Legacy four-key-only records upgrade transparently (the list starts empty,
+    the tally starts absent).
+
     Best-effort by contract: it mutates the in-memory ``project`` and stages it
     on ``db_session`` (the caller's commit persists it) but NEVER raises — a
     failure here must not block or break the merge hot path.
@@ -224,6 +242,35 @@ def record_no_ci_gate_runtime(
         if unverified_reason:
             runtime["last_unverified_at"] = when_iso
             runtime["last_unverified_reason"] = str(unverified_reason)
+
+        # Rolling history of recent terminal outcomes (additive; legacy
+        # four-key records simply start an empty list). Append one entry per
+        # terminal call and cap at the most recent ``_RECENT_OUTCOMES_CAP`` so
+        # the JSONB column cannot grow unbounded.
+        prior_outcomes = runtime.get("recent_outcomes")
+        outcomes: list[dict[str, Any]] = (
+            list(prior_outcomes) if isinstance(prior_outcomes, list) else []
+        )
+        outcomes.append(
+            {
+                "at": when_iso,
+                "verified": bool(executed_real_tests),
+                "reason": str(unverified_reason) if unverified_reason else None,
+            }
+        )
+        runtime["recent_outcomes"] = outcomes[-_RECENT_OUTCOMES_CAP:]
+
+        # Per-reason fall-open tally — incremented ONLY on fall-opens (a
+        # verified run has no reason key to count).
+        if unverified_reason:
+            prior_counts = runtime.get("unverified_reason_counts")
+            counts: dict[str, int] = (
+                dict(prior_counts) if isinstance(prior_counts, dict) else {}
+            )
+            key = str(unverified_reason)
+            counts[key] = int(counts.get(key, 0) or 0) + 1
+            runtime["unverified_reason_counts"] = counts
+
         project.merge_gate_runtime = runtime
         try:
             from sqlalchemy.orm.attributes import flag_modified
@@ -253,6 +300,17 @@ def merge_gate_runtime_block(project) -> dict[str, Any] | None:
     has never fallen open to an UNVERIFIED merge.  Defensive against a missing /
     malformed column so it can be attached to every project API response without
     raising.
+
+    When the runtime record carries the additive history fields it also surfaces:
+      - ``recent_outcomes``: the bounded rolling list (most recent last);
+      - ``unverified_reason_counts``: the per-reason fall-open tally;
+      - ``summary``: a derived at-a-glance aggregate —
+        ``window`` (entries retained), ``verified_runs`` / ``fell_open_runs``
+        (counts WITHIN that window), ``total_fall_opens`` (the all-time tally
+        sum, which can exceed the window once older entries are evicted), and
+        ``most_common_reason`` (the most-tallied fall-open reason key, or None).
+    A legacy four-key-only record or a never-ran project omits all four — the
+    response shape stays additive and backward-compatible.
     """
     raw = getattr(project, "merge_gate_runtime", None)
     if not isinstance(raw, dict) or not raw:
@@ -265,6 +323,45 @@ def merge_gate_runtime_block(project) -> dict[str, Any] | None:
         block["last_unverified_at"] = raw.get("last_unverified_at")
     if raw.get("last_unverified_reason") is not None:
         block["last_unverified_reason"] = raw.get("last_unverified_reason")
+
+    # Additive history fields. A legacy four-key-only record (no list, no tally)
+    # simply omits these — older consumers keep working unchanged.
+    raw_outcomes = raw.get("recent_outcomes")
+    outcomes = [o for o in raw_outcomes if isinstance(o, dict)] if isinstance(
+        raw_outcomes, list
+    ) else []
+    if outcomes:
+        block["recent_outcomes"] = outcomes
+
+    raw_counts = raw.get("unverified_reason_counts")
+    counts: dict[str, int] = {}
+    if isinstance(raw_counts, dict):
+        for reason_key, count in raw_counts.items():
+            try:
+                counts[str(reason_key)] = int(count)
+            except (TypeError, ValueError):
+                continue
+    if counts:
+        block["unverified_reason_counts"] = counts
+
+    # Derived at-a-glance summary over the retained window. Only emitted when
+    # there is real history to summarize (never for a legacy/never-ran record).
+    if outcomes:
+        verified_runs = sum(1 for o in outcomes if o.get("verified"))
+        fell_open_runs = len(outcomes) - verified_runs
+        most_common_reason = None
+        if counts:
+            # Deterministic tie-break: highest count, then reason key.
+            most_common_reason = sorted(
+                counts.items(), key=lambda kv: (-kv[1], kv[0])
+            )[0][0]
+        block["summary"] = {
+            "window": len(outcomes),
+            "verified_runs": verified_runs,
+            "fell_open_runs": fell_open_runs,
+            "total_fall_opens": sum(counts.values()) if counts else fell_open_runs,
+            "most_common_reason": most_common_reason,
+        }
     return block
 
 

@@ -4,6 +4,7 @@ import type { Task } from './TaskCard';
 import { formatAbsolute, parseTimestamp } from '../utils/time';
 import { projectStatusBadge } from '../utils/projectStatus';
 import { humanizeUnverifiedReason } from '../utils/unverifiedReasonLabels';
+import { formatMergeGateSummary } from '../utils/mergeGateSummary';
 import { ProjectApprovalGateSection } from './ProjectApprovalGateSection';
 import { ComputeJobsPanel } from './ComputeJobsPanel';
 import { fetchApprovalGateConfig, updateApprovalGateConfig, deleteProject, resetProject, setProjectPaused, archiveProject, unarchiveProject, fetchArchivedProjects, type ApprovalGateConfigResponse } from '../api';
@@ -74,6 +75,10 @@ function getMergeGateBadge(project: Project) {
   const lastUnverifiedAt = runtime?.last_unverified_at ? parseTimestamp(runtime.last_unverified_at) : null;
   const lastUnverifiedReason = runtime?.last_unverified_reason ? humanizeUnverifiedReason(runtime.last_unverified_reason) : null;
   const runtimeMismatch = verdict.state === 'tests_gated' && Boolean(lastUnverifiedAt && (!lastVerifiedAt || lastUnverifiedAt.getTime() > lastVerifiedAt.getTime()));
+  // At-a-glance merge-verification-health sentence appended to the badge tooltip.
+  // null (absent/legacy/never-ran runtime) leaves the tooltip exactly as before.
+  const summaryLine = formatMergeGateSummary(runtime?.summary);
+  const withSummary = (title: string) => (summaryLine ? `${title} ${summaryLine}.` : title);
 
   if (
     verdict.state === 'ci_checks' &&
@@ -83,7 +88,7 @@ function getMergeGateBadge(project: Project) {
     return {
       label: 'Stall risk',
       classes: 'bg-red-500/15 text-red-300 border-red-500/20',
-      title: 'No CI detected while required CI checks remain on. PRs will stall until the merge backstop times out.',
+      title: withSummary('No CI detected while required CI checks remain on. PRs will stall until the merge backstop times out.'),
     };
   }
 
@@ -92,7 +97,7 @@ function getMergeGateBadge(project: Project) {
       return {
         label: 'Tests gated?',
         classes: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
-        title: `Config says tests-gated, but the last live merge fell back to UNVERIFIED${lastUnverifiedAt ? ` at ${formatAbsolute(lastUnverifiedAt.getTime())}` : ''}${lastUnverifiedReason ? ` because ${lastUnverifiedReason}.` : '.'}${lastVerifiedAt ? ` Last verified real-test run: ${formatAbsolute(lastVerifiedAt.getTime())}.` : ''}`,
+        title: withSummary(`Config says tests-gated, but the last live merge fell back to UNVERIFIED${lastUnverifiedAt ? ` at ${formatAbsolute(lastUnverifiedAt.getTime())}` : ''}${lastUnverifiedReason ? ` because ${lastUnverifiedReason}.` : '.'}${lastVerifiedAt ? ` Last verified real-test run: ${formatAbsolute(lastVerifiedAt.getTime())}.` : ''}`),
         runtimeState: 'unverified-fallback',
       };
     }
@@ -100,7 +105,7 @@ function getMergeGateBadge(project: Project) {
     return {
       label: 'Tests gated',
       classes: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/20',
-      title: `Blueprint will run the project's detected test command(s) before merging PRs.${lastVerifiedAt ? ` Last verified real-test run: ${formatAbsolute(lastVerifiedAt.getTime())}.` : ''}`,
+      title: withSummary(`Blueprint will run the project's detected test command(s) before merging PRs.${lastVerifiedAt ? ` Last verified real-test run: ${formatAbsolute(lastVerifiedAt.getTime())}.` : ''}`),
       runtimeState: lastVerifiedAt ? 'verified' : (runtime ? 'unknown' : 'absent'),
     };
   }
@@ -109,7 +114,7 @@ function getMergeGateBadge(project: Project) {
     return {
       label: 'UNVERIFIED',
       classes: 'bg-yellow-500/15 text-yellow-300 border-yellow-500/30',
-      title: `No test command was detected. PRs merge without verification.${lastUnverifiedAt ? ` Last live merge fell back to UNVERIFIED at ${formatAbsolute(lastUnverifiedAt.getTime())}.${lastUnverifiedReason ? ` Reason: ${lastUnverifiedReason}.` : ''}` : ''}`,
+      title: withSummary(`No test command was detected. PRs merge without verification.${lastUnverifiedAt ? ` Last live merge fell back to UNVERIFIED at ${formatAbsolute(lastUnverifiedAt.getTime())}.${lastUnverifiedReason ? ` Reason: ${lastUnverifiedReason}.` : ''}` : ''}`),
       runtimeState: lastUnverifiedAt ? 'unverified' : (runtime ? 'unknown' : 'absent'),
     };
   }
@@ -117,7 +122,7 @@ function getMergeGateBadge(project: Project) {
   return {
     label: 'CI gated',
     classes: 'bg-blue-500/15 text-blue-300 border-blue-500/20',
-    title: "Blueprint will wait for the repository's GitHub CI checks before merging PRs.",
+    title: withSummary("Blueprint will wait for the repository's GitHub CI checks before merging PRs."),
     runtimeState: runtime ? 'unknown' : 'absent',
   };
 }

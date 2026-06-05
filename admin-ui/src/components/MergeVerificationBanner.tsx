@@ -2,6 +2,7 @@ import { AlertTriangle, CheckCircle, ShieldCheck } from 'lucide-react';
 import type { MergeGateRuntime, MergeVerificationVerdict } from '../types/project';
 import { formatAbsolute, parseTimestamp } from '../utils/time';
 import { humanizeUnverifiedReason } from '../utils/unverifiedReasonLabels';
+import { formatMergeGateSummary } from '../utils/mergeGateSummary';
 
 interface MergeVerificationBannerProps {
   /** Backend-computed verdict. Renders nothing when null/undefined (older responses). */
@@ -27,6 +28,7 @@ export function MergeVerificationBanner({ verdict, runtime, className }: MergeVe
   const verifiedAt = runtime?.executed_real_tests && runtime.last_run_at ? parseTimestamp(runtime.last_run_at) : null;
   const unverifiedAt = runtime?.last_unverified_at ? parseTimestamp(runtime.last_unverified_at) : null;
   const unverifiedReason = runtime?.last_unverified_reason ? humanizeUnverifiedReason(runtime.last_unverified_reason) : null;
+  const summaryLine = formatMergeGateSummary(runtime?.summary);
   const mismatch = verdict.state === 'tests_gated' && Boolean(unverifiedAt && (!verifiedAt || unverifiedAt.getTime() > verifiedAt.getTime()));
   const runtimeState = runtime
     ? (mismatch
@@ -55,6 +57,11 @@ export function MergeVerificationBanner({ verdict, runtime, className }: MergeVe
             <p className="text-[10px] text-neutral-400 mt-0.5">
               Blueprint will not merge a PR until the repository's required GitHub checks pass.
             </p>
+            {summaryLine ? (
+              <p className="text-[10px] text-neutral-400 mt-1 break-words" data-testid="merge-gate-summary">
+                {summaryLine}
+              </p>
+            ) : null}
           </div>
         </div>
       </div>
@@ -115,6 +122,11 @@ export function MergeVerificationBanner({ verdict, runtime, className }: MergeVe
                 Last verified real-test run: {formatAbsolute(verifiedAt.getTime())}
               </p>
             ) : null}
+            {summaryLine ? (
+              <p className="text-[10px] text-neutral-400 mt-1 break-words" data-testid="merge-gate-summary">
+                {summaryLine}
+              </p>
+            ) : null}
           </div>
         </div>
       </div>
@@ -150,6 +162,11 @@ export function MergeVerificationBanner({ verdict, runtime, className }: MergeVe
                 </p>
               ) : null}
             </div>
+          ) : null}
+          {summaryLine ? (
+            <p className="text-[10px] text-neutral-400 mt-1 break-words" data-testid="merge-gate-summary">
+              {summaryLine}
+            </p>
           ) : null}
         </div>
       </div>

@@ -63,6 +63,10 @@ export interface RecentCompletion {
   scope?: string | null;
   duration_seconds?: number | null;
   review_iterations?: number | null;
+  // No-CI merge gate fall-open reason KEY; null/undefined for verified and
+  // older merges. Rendered as a compact UNVERIFIED indicator in the Recent
+  // Merges timeline (label via humanizeUnverifiedReason).
+  unverified_merge_reason?: string | null;
 }
 
 interface LatestCycle {

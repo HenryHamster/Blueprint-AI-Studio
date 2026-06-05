@@ -2,6 +2,7 @@ import { ExternalLink, GitMerge } from 'lucide-react';
 import { Skeleton } from './DashboardMetricCards';
 import { timeAgo, formatDurationSec } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
+import { humanizeUnverifiedReason } from '../utils/unverifiedReasonLabels';
 import type { RecentCompletion } from '../types/digest';
 
 const TASK_TYPE_COLORS: Record<string, string> = {
@@ -35,6 +36,7 @@ export function RecentMergesTimeline({
             const dotColor = (ev.task_type === 'fix' || ev.task_type === 'review') ? 'bg-amber-500' : 'bg-emerald-500';
             const typeCls = TASK_TYPE_COLORS[ev.task_type ?? ''] ?? 'bg-neutral-500/20 text-neutral-400';
             const dirLabel = ev.direction_text ? ev.direction_text.slice(0, 30) + (ev.direction_text.length > 30 ? '…' : '') : null;
+            const unverifiedReason = ev.unverified_merge_reason ? ev.unverified_merge_reason.trim() : '';
             return (
               <div key={ev.task_id} className="relative pb-3">
                 <div className={`absolute -left-2.5 top-1.5 w-2 h-2 rounded-full ${dotColor} ring-2 ring-neutral-950`} />
@@ -49,6 +51,12 @@ export function RecentMergesTimeline({
                         <span>{timeAgo(ev.completed_at ?? '')}</span>
                         {ev.duration_seconds != null && <span>{formatDurationSec(ev.duration_seconds)}</span>}
                       </div>
+                      {unverifiedReason && (
+                        <div className="flex items-center gap-1.5 mt-1">
+                          <span className="px-1.5 py-0.5 rounded text-[9px] font-medium bg-amber-500/20 text-amber-400">UNVERIFIED</span>
+                          <span className="text-[9px] text-amber-400/80 truncate">{humanizeUnverifiedReason(unverifiedReason)}</span>
+                        </div>
+                      )}
                     </div>
                     {ev.pr_url && isSafeUrl(ev.pr_url) && (
                       <a href={ev.pr_url} target="_blank" rel="noopener noreferrer" className="text-neutral-500 hover:text-neutral-300 shrink-0" data-viewport-allow-small-target title="View PR on GitHub">

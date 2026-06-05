@@ -754,6 +754,13 @@ async def _compute_digest(
                 "review_iterations": (t.context or {})
                 .get("review_loop", {})
                 .get("iteration", 0),
+                # No-CI merge gate fall-open reason KEY (None for verified /
+                # older merges). Read the same way admin.py reads it so the
+                # Recent Merges timeline stays consistent with the per-task
+                # Merge Test Gate panel.
+                "unverified_merge_reason": (t.context or {})
+                .get("review_loop", {})
+                .get("unverified_merge_reason"),
             }
         )
 

@@ -127,6 +127,48 @@ async def test_digest_recent_completions_include_scope_and_review_iterations(
 
 
 @pytest.mark.asyncio
+async def test_digest_recent_completions_include_unverified_merge_reason(
+    client: AsyncClient, db_session
+):
+    """recent_completions exposes the no-CI gate fall-open reason KEY (None when verified)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    unverified_task = make_task(
+        project_id=project.id,
+        title="Unverified Merge Task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={
+            "review_loop": {"unverified_merge_reason": "no_detectable_test_command"}
+        },
+    )
+    verified_task = make_task(
+        project_id=project.id,
+        title="Verified Merge Task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"review_loop": {"iteration": 1}},
+    )
+    db_session.add(unverified_task)
+    db_session.add(verified_task)
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    by_title = {c["title"]: c for c in data["recent_completions"]}
+    assert (
+        by_title["Unverified Merge Task"]["unverified_merge_reason"]
+        == "no_detectable_test_command"
+    )
+    assert by_title["Verified Merge Task"]["unverified_merge_reason"] is None
+
+
+@pytest.mark.asyncio
 async def test_digest_with_failed_tasks(client: AsyncClient, db_session):
     """Failed tasks appear in both needs_attention (reason='failed') and recent_failures."""
     project = make_project()

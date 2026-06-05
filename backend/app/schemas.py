@@ -499,6 +499,16 @@ class MergeGateRuntime(BaseModel):
     executed_real_tests: bool = False
     last_unverified_at: str | None = None
     last_unverified_reason: str | None = None
+    # Additive history fields (bounded rolling record + per-reason tally +
+    # derived summary). All optional with safe defaults so never-ran and legacy
+    # four-key-only records remain valid and the response shape stays
+    # backward-compatible. ``recent_outcomes`` entries are
+    # ``{"at": iso, "verified": bool, "reason": key | None}``; ``summary``
+    # carries ``window`` / ``verified_runs`` / ``fell_open_runs`` /
+    # ``total_fall_opens`` / ``most_common_reason``.
+    recent_outcomes: List[Dict[str, Any]] | None = None
+    unverified_reason_counts: Dict[str, int] | None = None
+    summary: Dict[str, Any] | None = None
 
 
 class OnboardPayload(BaseModel):
