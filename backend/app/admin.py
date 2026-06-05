@@ -1231,6 +1231,12 @@ class CreateTaskPayload(BaseModel):
     )
     model: str | None = Field(default=None, min_length=1)
     effort: str | None = Field(default=None, pattern=r"^(low|medium|high|max)$")
+    # Optional client-supplied idempotency key for deduping retried requests.
+    # When provided, the endpoint returns the existing task if one with the same
+    # key already exists in an active state, instead of creating a duplicate.
+    idempotency_key: str | None = Field(
+        default=None, max_length=255, pattern=r"^[a-zA-Z0-9_.-]+$"
+    )
     # Hotfix path (Phase 5 / automain-LTS): set hotfix=True together with
     # base_branch="main" to mark a plan task as an expedited fix off main.
     # The agent handler branches hotfix/* off main and the orchestrator
@@ -1443,6 +1449,45 @@ async def create_task_manually(
             detail=f"Project has {active_count} active tasks (limit: 200)",
         )
 
+    # Idempotency check: if client supplied an idempotency_key, check for
+    # existing active task with that key and return it instead of creating a duplicate.
+    # The stored key is namespaced with the project id so a client key that collides
+    # with an active task in ANOTHER project cannot match here (the
+    # ux_task_active_idempotency_key unique index is global) — that would otherwise
+    # leak the foreign task's fields and silently skip creating the caller's task.
+    # Mirrors review_pipeline._pipeline_task_idempotency_key's project-scoping convention.
+    scoped_idempotency_key = (
+        f"admin_launcher:{project.id}:{payload.idempotency_key}"
+        if payload.idempotency_key
+        else None
+    )
+    if scoped_idempotency_key:
+        existing = (
+            await session.execute(
+                select(Task).where(
+                    Task.idempotency_key == scoped_idempotency_key,
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                            TaskStatus.EVALUATING,
+                            TaskStatus.BLOCKED,
+                        ]
+                    ),
+                )
+            )
+        ).scalars().first()
+        if existing:
+            return {
+                "id": str(existing.id),
+                "project_id": str(existing.project_id),
+                "title": existing.title,
+                "status": existing.status,
+                "vm_instance_id": existing.vm_instance_id,
+                "is_duplicate": True,
+            }
+
     new_task = Task(
         project_id=project.id,
         title=payload.title,
@@ -1453,9 +1498,42 @@ async def create_task_manually(
         created_by="USER",
         launched_by_user_id=current_user["user_id"],
         requires_approval=False,
+        idempotency_key=scoped_idempotency_key,
     )
     session.add(new_task)
-    await session.commit()
+    try:
+        await session.commit()
+    except Exception as e:
+        # Handle unique constraint race: concurrent insert with same idempotency_key.
+        # Roll back and fetch the existing task that won the race.
+        await session.rollback()
+        if scoped_idempotency_key and "ux_task_active_idempotency_key" in str(e):
+            existing = (
+                await session.execute(
+                    select(Task).where(
+                        Task.idempotency_key == scoped_idempotency_key,
+                        Task.status.in_(
+                            [
+                                TaskStatus.QUEUED,
+                                TaskStatus.PROVISIONING,
+                                TaskStatus.IN_PROGRESS,
+                                TaskStatus.EVALUATING,
+                                TaskStatus.BLOCKED,
+                            ]
+                        ),
+                    )
+                )
+            ).scalars().first()
+            if existing:
+                return {
+                    "id": str(existing.id),
+                    "project_id": str(existing.project_id),
+                    "title": existing.title,
+                    "status": existing.status,
+                    "vm_instance_id": existing.vm_instance_id,
+                    "is_duplicate": True,
+                }
+        raise
     await session.refresh(new_task)
 
     # Log history

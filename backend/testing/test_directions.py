@@ -137,6 +137,54 @@ async def test_create_direction(client: AsyncClient, mocker):
 
 
 @pytest.mark.asyncio
+async def test_create_direction_is_idempotent_with_idempotency_key(
+    client: AsyncClient, mocker
+):
+    """POST with idempotency_key returns existing direction on duplicate submit."""
+    project_id = await _deploy_project(client, mocker)
+    idem_key = "test-key-12345"
+    # First submit
+    resp1 = await client.post(
+        f"/api/admin/projects/{project_id}/directions",
+        json={
+            "text": "Improve test coverage",
+            "priority": "high",
+            "paths": ["src/"],
+            "idempotency_key": idem_key,
+        },
+    )
+    assert resp1.status_code == 200
+    d1 = resp1.json()["direction"]
+    direction_id_1 = d1["id"]
+    assert d1["idempotency_key"] == idem_key
+
+    # Duplicate submit with same key should return the existing direction
+    resp2 = await client.post(
+        f"/api/admin/projects/{project_id}/directions",
+        json={
+            "text": "Improve test coverage",
+            "priority": "high",
+            "paths": ["src/"],
+            "idempotency_key": idem_key,
+        },
+    )
+    assert resp2.status_code == 200
+    d2 = resp2.json()["direction"]
+    # Should be the same direction (same id)
+    assert d2["id"] == direction_id_1
+    assert d2["idempotency_key"] == idem_key
+    # Response should indicate it's a duplicate
+    assert resp2.json().get("status") == "duplicate"
+
+    # Verify only one direction was created (not two)
+    resp_list = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp_list.status_code == 200
+    directions = resp_list.json()["directions"]
+    assert len(directions) == 1
+    assert directions[0]["id"] == direction_id_1
+
+
+@pytest.mark.asyncio
 async def test_get_directions_returns_created(client: AsyncClient, mocker):
     """GET returns directions that were previously POSTed."""
     project_id = await _deploy_project(client, mocker)

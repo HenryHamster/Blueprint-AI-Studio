@@ -105,6 +105,15 @@ class DirectionPayload(BaseModel):
             "research-eligible active state. Requires an open version (404 if none)."
         ),
     )
+    idempotency_key: Optional[str] = Field(
+        default=None,
+        max_length=255,
+        description=(
+            "Client-generated idempotency key. When supplied, a repeat add "
+            "(double-click / network retry) carrying the same key returns the "
+            "existing direction instead of creating a duplicate."
+        ),
+    )
 
 
 @router.get("/projects/{project_id}/directions")
@@ -266,6 +275,9 @@ async def add_direction(
 
     max_active = _runtime_config.get("max_active_directions", 5)
 
+    # Normalize idempotency key: strip whitespace, treat empty as None
+    idem_key = (payload.idempotency_key or "").strip() or None
+
     # Atomic staged create: resolve and stamp the open version exactly the way
     # the staged PATCH branch (update_direction) does, so a next-version idea is
     # born staged in a single commit and never passes through a research-eligible
@@ -304,8 +316,20 @@ async def add_direction(
         )
     if payload.cost_budget_usd is not None:
         direction["cost_budget_usd"] = float(payload.cost_budget_usd)
+    if idem_key:
+        direction["idempotency_key"] = idem_key
+
+    existing_direction: list = []  # Will be populated if we find a duplicate
 
     def _mutate_add(directions: list) -> None:
+        # Idempotency: if this add carries an idempotency key and a direction
+        # with that key already exists, return the existing direction instead of
+        # creating a duplicate.
+        if idem_key:
+            for d in directions:
+                if d.get("idempotency_key") == idem_key:
+                    existing_direction.append(d)
+                    return
         # The active-direction cap counts active directions only; a staged
         # create is inert until its version promotes, so it does not consume a
         # slot (mirrors update_direction, where the cap fires only on → active).
@@ -339,6 +363,9 @@ async def add_direction(
     await session.commit()
     await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
 
+    # Return existing direction if we found one (idempotent duplicate)
+    if existing_direction:
+        return {"direction": existing_direction[0], "status": "duplicate"}
     return {"direction": direction}
 
 
