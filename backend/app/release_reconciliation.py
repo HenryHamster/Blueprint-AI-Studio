@@ -15,7 +15,12 @@ from sqlalchemy import select
 
 from app import github, release_version
 from app.database import AsyncSessionLocal
-from app.models import Project
+from app.models import (
+    DeploymentState,
+    DeploymentStatus,
+    Project,
+    QualificationVerdict,
+)
 from app.release_promotion import (
     _candidate_already_on_main,
     _idempotent_pr_url,
@@ -672,6 +677,248 @@ async def _reconcile_if_promotion_pending_timed_out(
                 logger.exception(
                     "[RELEASE_QUALIFIER] reconcile promotion_pending_timeout: "
                     "rollback failed for version %s after unexpected error",
+                    version_id,
+                )
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Post-promotion serving confirmation
+# ---------------------------------------------------------------------------
+
+
+def _to_naive_utc(dt: datetime | None) -> datetime | None:
+    """Strip tzinfo so comparisons against the naive-UTC DeploymentState match."""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt.replace(tzinfo=None)
+    return dt
+
+
+def _classify_serving_outcome(
+    ds: DeploymentState | None,
+    promoted_at: datetime | None,
+    promoted_sha: str | None,
+    deadline: datetime | None,
+    now: datetime,
+) -> tuple[str, str | None, datetime | None] | None:
+    """Derive a post-promotion serving outcome from the deploy-health signal.
+
+    Pure function (no I/O) so the decision is directly unit-testable.  Returns:
+
+      * ``None`` — no decision yet: still inside the confirmation window and no
+        new healthy revision has booted (keep waiting).
+      * ``("serving_confirmed", served_sha, served_at)`` — a new revision booted
+        AFTER ``promoted_at`` and is STABLE (and, where the deployed SHA is
+        observable, matches ``promoted_sha``).
+      * ``("deploy_failed", reason)`` (third element ``None``) — the deploy did
+        not come up healthy: a ROLLED_BACK/HALTED state arose after the promotion
+        (``reason`` ``rolled_back``/``halted``), the observed serving SHA does
+        not match the promoted SHA (``sha_mismatch``), or no new healthy revision
+        appeared by ``deadline`` (``no_new_revision``).
+    """
+    promoted_at = _to_naive_utc(promoted_at)
+    deadline = _to_naive_utc(deadline)
+    now = _to_naive_utc(now) or now
+
+    if ds is not None:
+        deployed_at = _to_naive_utc(ds.deployed_at)
+        halted_at = _to_naive_utc(getattr(ds, "halted_at", None))
+        status = ds.status
+        revision_after_promotion = (
+            deployed_at is not None
+            and promoted_at is not None
+            and deployed_at > promoted_at
+        )
+
+        # A HALT or ROLLBACK that occurred at/after the promotion is a hard
+        # failure regardless of the deadline — the deploy actively went bad.
+        if status == DeploymentStatus.HALTED:
+            ref = halted_at or deployed_at
+            if ref is not None and promoted_at is not None and ref >= promoted_at:
+                return ("deploy_failed", "halted", None)
+        if (
+            status == DeploymentStatus.ROLLED_BACK
+            and deployed_at is not None
+            and promoted_at is not None
+            and deployed_at >= promoted_at
+        ):
+            return ("deploy_failed", "rolled_back", None)
+
+        # SERVING CONFIRMED: a new revision booted after the promotion and the
+        # monitoring window passed (STABLE).  Where the deployed SHA is
+        # observable, strengthen to require it matches the promoted SHA.
+        if status == DeploymentStatus.STABLE and revision_after_promotion:
+            current_sha = ds.current_sha or None
+            if promoted_sha and current_sha and current_sha != promoted_sha:
+                return ("deploy_failed", "sha_mismatch", None)
+            return ("serving_confirmed", current_sha or promoted_sha, deployed_at)
+
+    # No confirmation yet — deploy-failed only once the bounded window elapses.
+    if deadline is not None and now >= deadline:
+        return ("deploy_failed", "no_new_revision", None)
+    return None
+
+
+async def _record_post_promotion_outcome(
+    session,
+    version: release_version.ReleaseVersion,
+    outcome: str,
+    now: datetime,
+) -> None:
+    """Best-effort: stamp ``post_promotion_outcome`` on the version's verdict row.
+
+    Records the resolved serving outcome on the immutable
+    ``QualificationVerdict`` history (the row written when the version promoted)
+    without mutating any prior immutable field.  Mirrors
+    ``_record_qualification_verdict``'s SAVEPOINT discipline: the caller's
+    already-staged ReleaseVersion mutations are flushed into the outer
+    transaction first, then the verdict update runs inside ``begin_nested`` so a
+    failure (e.g. no verdict row) rolls back only the nested savepoint and never
+    the serving-status write.
+    """
+    try:
+        verdict = (
+            (
+                await session.execute(
+                    select(QualificationVerdict)
+                    .where(
+                        QualificationVerdict.release_version_id == version.id,
+                        QualificationVerdict.terminal_status == "promoted",
+                    )
+                    .order_by(QualificationVerdict.created_at.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if verdict is None:
+            return
+        await session.flush()
+        async with session.begin_nested():
+            verdict.post_promotion_outcome = outcome
+            verdict.post_promotion_outcome_at = now
+            session.add(verdict)
+            await session.flush()
+    except Exception as exc:  # noqa: BLE001 — recording is best-effort, never fatal
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to record post-promotion outcome for v%s "
+            "(non-fatal — additive history only): %s",
+            getattr(version, "version_number", "?"),
+            exc,
+        )
+
+
+async def _confirm_serving_or_fail(
+    version_id: uuid.UUID,
+    *,
+    session_factory=None,
+    now: datetime | None = None,
+) -> bool:
+    """Resolve a provisional (``serving_status="unconfirmed"``) promotion.
+
+    For a ``promoted`` version still awaiting serving confirmation, derive the
+    outcome from the DeploymentState singleton (the existing deploy-health
+    serving signal) and either confirm it serving or land a distinct loud
+    deploy-failed state.  Runs in its own dedicated session under a row lock —
+    the same per-version isolation pattern as the reconcile loops above — so a
+    failure on one version cannot touch another's committed work.
+
+    Returns True iff the version transitioned out of ``unconfirmed`` this call.
+    """
+    factory = session_factory or AsyncSessionLocal
+    _now = now or _utcnow()
+    async with factory() as session:
+        try:
+            version: release_version.ReleaseVersion | None = (
+                (
+                    await session.execute(
+                        select(release_version.ReleaseVersion)
+                        .where(release_version.ReleaseVersion.id == version_id)
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if version is None:
+                return False
+            # Re-check under the lock: a concurrent sweep may have resolved it.
+            if version.status != "promoted":
+                return False
+            if version.serving_status != "unconfirmed":
+                return False
+
+            ds = await session.get(DeploymentState, 1)
+            outcome = _classify_serving_outcome(
+                ds,
+                version.promoted_at,
+                version.promoted_sha,
+                version.deploy_confirm_deadline,
+                _now,
+            )
+            if outcome is None:
+                return False
+
+            kind, sha_or_reason, served_at = outcome
+            if kind == "serving_confirmed":
+                version.serving_status = "serving_confirmed"
+                version.served_sha = sha_or_reason
+                version.served_at = served_at or _now
+                version.deploy_failure_reason = None
+                session.add(version)
+                await _record_post_promotion_outcome(
+                    session, version, "serving_confirmed", _now
+                )
+                await session.commit()
+                logger.info(
+                    "[RELEASE_QUALIFIER] serving confirmed for promoted v%d "
+                    "(served_sha=%s)",
+                    version.version_number,
+                    (version.served_sha or "")[:12],
+                )
+                return True
+
+            # kind == "deploy_failed"
+            version.serving_status = "deploy_failed"
+            version.deploy_failure_reason = sha_or_reason
+            session.add(version)
+            await _record_post_promotion_outcome(
+                session, version, "deploy_failed", _now
+            )
+            # Loud operator alert (ERROR), deduped via deploy_confirm_alerted_at.
+            try:
+                from app.release_stall_alerts import _alert_promotion_deploy_failed
+
+                await _alert_promotion_deploy_failed(session, version)
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] deploy-failed alert raised for v%d "
+                    "(non-fatal)",
+                    version.version_number,
+                )
+            await session.commit()
+            logger.error(
+                "[RELEASE_QUALIFIER] promotion deploy FAILED for v%d "
+                "(reason=%s) — promoted SHA never confirmed serving",
+                version.version_number,
+                sha_or_reason,
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] serving-confirmation: unexpected error for "
+                "version %s",
+                version_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] serving-confirmation: rollback failed "
+                    "for version %s",
                     version_id,
                 )
             return False

@@ -2826,9 +2826,7 @@ class KnowledgeDocument(SQLModel, table=True):
     authoring_branch: str | None = Field(
         default=None, sa_column=Column(String, nullable=True)
     )
-    head_sha: str | None = Field(
-        default=None, sa_column=Column(String, nullable=True)
-    )
+    head_sha: str | None = Field(default=None, sa_column=Column(String, nullable=True))
 
     created_at: datetime = Field(
         default_factory=_utcnow,
@@ -3266,6 +3264,51 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(Boolean, nullable=False, server_default=text("false")),
     )
 
+    # ----- Post-promotion serving confirmation -----
+    # Whether the promoted version's code is actually serving in production.
+    # ``status`` flips to "promoted" the instant the candidate merges; these
+    # columns track whether the deploy then stabilized.  All nullable so the
+    # migration is purely additive and pre-existing rows backfill naturally.
+    #   serving_status values: NULL (not-yet-promoted / NA) | "unconfirmed"
+    #     | "serving_confirmed" | "deploy_failed".
+    serving_status: str | None = Field(
+        default=None,
+        sa_column=Column(String(32), nullable=True),
+    )
+
+    # The production serving SHA captured when serving was confirmed.
+    served_sha: str | None = Field(
+        default=None,
+        sa_column=Column(String(40), nullable=True),
+    )
+
+    # When serving was confirmed.
+    served_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    # Bounded confirmation-window deadline, stamped at promotion.
+    deploy_confirm_deadline: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    # Durable deduplication anchor for the deploy-failed operator alert.
+    # Mirrors the *_alerted_at dedup convention on this model: stamped when the
+    # alert fires so the next sweep skips re-posting for the same failure.
+    deploy_confirm_alerted_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    # Short code for why confirmation failed:
+    # no_new_revision | rolled_back | halted | sha_mismatch.
+    deploy_failure_reason: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True),
+    )
+
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
@@ -3387,6 +3430,23 @@ class QualificationVerdict(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
     finalized_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    # ----- Post-promotion serving outcome -----
+    # Immutable record of how this verdict's promotion actually played out in
+    # production.  Nullable: only set for verdicts that promoted and then had
+    # their deploy confirmed/failed.
+    #   post_promotion_outcome values: "serving_confirmed" | "deploy_failed"
+    #     | "unconfirmed".
+    post_promotion_outcome: str | None = Field(
+        default=None,
+        sa_column=Column(String(32), nullable=True),
+    )
+
+    # When the post-promotion outcome was recorded.
+    post_promotion_outcome_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )

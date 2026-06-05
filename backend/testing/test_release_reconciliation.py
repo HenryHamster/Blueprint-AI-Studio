@@ -1137,3 +1137,353 @@ async def test_reconcile_promotion_pending_timeout_never_touches_main(db_session
     assert version.last_qualification["status"] == "promotion_failed"
     assert version.last_qualification["error"] == "promotion_pending_timeout"
     assert "promotion_pending" not in version.last_qualification
+
+
+# ===========================================================================
+# Post-promotion serving confirmation.
+#
+# A promotion is PROVISIONAL (serving_status="unconfirmed") until deploy_health
+# confirms the promoted SHA is actually serving.  These tests cover the pure
+# classifier and the dedicated-session confirmation sweep across all three
+# scenarios: serving-confirmed, no-new-revision deploy-failure, and a
+# rollback/halt after promotion.
+# ===========================================================================
+
+from datetime import datetime  # noqa: E402
+
+from app.models import (  # noqa: E402
+    Alert,
+    AlertSeverity,
+    DeploymentState,
+    DeploymentStatus,
+    QualificationVerdict,
+)
+from app.release_reconciliation import (  # noqa: E402
+    _classify_serving_outcome,
+    _confirm_serving_or_fail,
+)
+from sqlalchemy import select as _select  # noqa: E402
+
+_SHA_A = "a" * 40
+_SHA_B = "b" * 40
+
+
+def _ds(status, deployed_at, current_sha="", halted_at=None):
+    """Build a transient DeploymentState for the pure classifier tests."""
+    return DeploymentState(
+        id=1,
+        status=status,
+        current_sha=current_sha,
+        deployed_at=deployed_at,
+        halted_at=halted_at,
+    )
+
+
+def test_classify_serving_confirmed_new_stable_revision():
+    promoted_at = datetime(2026, 6, 5, 12, 0, 0)
+    deadline = datetime(2026, 6, 5, 13, 0, 0)
+    now = datetime(2026, 6, 5, 12, 40, 0)
+    ds = _ds(DeploymentStatus.STABLE, promoted_at.replace(minute=5), current_sha=_SHA_A)
+    out = _classify_serving_outcome(ds, promoted_at, _SHA_A, deadline, now)
+    assert out is not None
+    assert out[0] == "serving_confirmed"
+    assert out[1] == _SHA_A
+    assert out[2] == promoted_at.replace(minute=5)
+
+
+def test_classify_sha_mismatch_is_deploy_failed():
+    promoted_at = datetime(2026, 6, 5, 12, 0, 0)
+    deadline = datetime(2026, 6, 5, 13, 0, 0)
+    now = datetime(2026, 6, 5, 12, 40, 0)
+    ds = _ds(DeploymentStatus.STABLE, promoted_at.replace(minute=5), current_sha=_SHA_B)
+    out = _classify_serving_outcome(ds, promoted_at, _SHA_A, deadline, now)
+    assert out == ("deploy_failed", "sha_mismatch", None)
+
+
+def test_classify_no_new_revision_only_after_deadline():
+    promoted_at = datetime(2026, 6, 5, 12, 0, 0)
+    deadline = datetime(2026, 6, 5, 13, 0, 0)
+    # Old revision that predates the promotion never advanced; STABLE but stale.
+    ds = _ds(DeploymentStatus.STABLE, datetime(2026, 6, 5, 11, 50, 0), current_sha=_SHA_A)
+    # Within the window → no decision yet.
+    assert (
+        _classify_serving_outcome(
+            ds, promoted_at, _SHA_A, deadline, datetime(2026, 6, 5, 12, 40, 0)
+        )
+        is None
+    )
+    # Past the deadline → deploy_failed.
+    out = _classify_serving_outcome(
+        ds, promoted_at, _SHA_A, deadline, datetime(2026, 6, 5, 13, 1, 0)
+    )
+    assert out == ("deploy_failed", "no_new_revision", None)
+
+
+def test_classify_rollback_after_promotion_is_deploy_failed():
+    promoted_at = datetime(2026, 6, 5, 12, 0, 0)
+    deadline = datetime(2026, 6, 5, 13, 0, 0)
+    now = datetime(2026, 6, 5, 12, 20, 0)  # within window — rollback fails immediately
+    ds = _ds(DeploymentStatus.ROLLED_BACK, promoted_at.replace(minute=10))
+    out = _classify_serving_outcome(ds, promoted_at, _SHA_A, deadline, now)
+    assert out == ("deploy_failed", "rolled_back", None)
+
+
+def test_classify_halt_after_promotion_is_deploy_failed():
+    promoted_at = datetime(2026, 6, 5, 12, 0, 0)
+    deadline = datetime(2026, 6, 5, 13, 0, 0)
+    now = datetime(2026, 6, 5, 12, 20, 0)
+    ds = _ds(
+        DeploymentStatus.HALTED,
+        promoted_at.replace(minute=2),
+        halted_at=promoted_at.replace(minute=10),
+    )
+    out = _classify_serving_outcome(ds, promoted_at, _SHA_A, deadline, now)
+    assert out == ("deploy_failed", "halted", None)
+
+
+def test_classify_monitoring_new_revision_waits_within_window():
+    promoted_at = datetime(2026, 6, 5, 12, 0, 0)
+    deadline = datetime(2026, 6, 5, 13, 0, 0)
+    now = datetime(2026, 6, 5, 12, 15, 0)
+    # New revision booted but still MONITORING (not yet STABLE) → wait.
+    ds = _ds(DeploymentStatus.MONITORING, promoted_at.replace(minute=5), current_sha=_SHA_A)
+    assert _classify_serving_outcome(ds, promoted_at, _SHA_A, deadline, now) is None
+
+
+async def _make_promoted_unconfirmed_version(
+    db_session,
+    *,
+    promoted_at: datetime,
+    deadline: datetime,
+    promoted_sha: str = _SHA_A,
+    with_verdict: bool = True,
+):
+    """Create a self-repo project + a v1 recorded promoted/unconfirmed."""
+    project = Project(
+        name="Serving-Test",
+        user_id="serving-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+        is_self_repo=True,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    version.status = "promoted"
+    version.promoted_at = promoted_at
+    version.promoted_sha = promoted_sha
+    version.serving_status = "unconfirmed"
+    version.deploy_confirm_deadline = deadline
+    version.last_qualification = {"status": "promoted", "promoted_sha": promoted_sha}
+    db_session.add(version)
+    # Commit the version BEFORE inserting the verdict so the verdict's FK to
+    # releaseversion is satisfied (mirrors the real flow: the verdict row is
+    # written by the promotion AFTER the version exists).
+    await db_session.commit()
+    await db_session.refresh(version)
+    if with_verdict:
+        db_session.add(
+            QualificationVerdict(
+                project_id=project.id,
+                release_version_id=version.id,
+                candidate_sha=promoted_sha,
+                terminal_status="promoted",
+                would_promote=True,
+                promotion_enabled=True,
+            )
+        )
+        await db_session.commit()
+    await db_session.refresh(version)
+    return project, version
+
+
+async def _set_deploy_state(db_session, **kwargs):
+    existing = await db_session.get(DeploymentState, 1)
+    if existing is not None:
+        for k, v in kwargs.items():
+            setattr(existing, k, v)
+        db_session.add(existing)
+    else:
+        db_session.add(DeploymentState(id=1, **kwargs))
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_confirm_serving_confirmed_scenario(db_session):
+    """(a) A new healthy revision boots after promotion within the window →
+    serving_confirmed, served_sha stamped, verdict outcome recorded."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=40),
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "serving_confirmed"
+    assert version.served_sha == _SHA_A
+    assert version.served_at is not None
+    assert version.deploy_failure_reason is None
+
+    state = rv.summarize_qualification_state(
+        version.last_qualification, version.serving_status, version.deploy_failure_reason
+    )
+    assert state["state"] == "promoted"
+    assert state["serving_status"] == "serving_confirmed"
+
+    verdict = (
+        (
+            await db_session.execute(
+                _select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert verdict.post_promotion_outcome == "serving_confirmed"
+    assert verdict.post_promotion_outcome_at is not None
+
+
+@pytest.mark.asyncio
+async def test_confirm_no_new_revision_deploy_failed_scenario(db_session):
+    """(b) The live revision never advances within the window → deploy_failed,
+    a loud ERROR alert fires, a distinct state is reported, and the never-shipped
+    promotion is NOT summarized as cleanly shipped."""
+    promoted_at = _utcnow() - timedelta(hours=2)
+    deadline = promoted_at + timedelta(hours=1)  # already elapsed
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    # Stale revision predating the promotion; STABLE but never advanced.
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha="c" * 40,
+        deployed_at=promoted_at - timedelta(minutes=30),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "deploy_failed"
+    assert version.deploy_failure_reason == "no_new_revision"
+    assert version.deploy_confirm_alerted_at is not None
+
+    state = rv.summarize_qualification_state(
+        version.last_qualification, version.serving_status, version.deploy_failure_reason
+    )
+    # Distinct PROMOTION_DEPLOY_FAILED-class state — NOT a clean "promoted".
+    assert state["state"] == "promotion_deploy_failed"
+    assert state["serving_status"] == "deploy_failed"
+
+    alerts = (
+        (
+            await db_session.execute(
+                _select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    deploy_alerts = [a for a in alerts if "deploy FAILED" in a.title]
+    assert len(deploy_alerts) == 1
+    assert deploy_alerts[0].severity == AlertSeverity.ERROR
+
+    verdict = (
+        (
+            await db_session.execute(
+                _select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert verdict.post_promotion_outcome == "deploy_failed"
+
+
+@pytest.mark.asyncio
+async def test_confirm_rollback_after_promotion_deploy_failed_scenario(db_session):
+    """(c) A rollback after promotion → deploy_failed (reason rolled_back) with
+    the loud alert, even while still inside the confirmation window."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.ROLLED_BACK,
+        current_sha="c" * 40,
+        deployed_at=promoted_at + timedelta(minutes=10),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=20),
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "deploy_failed"
+    assert version.deploy_failure_reason == "rolled_back"
+
+    alerts = (
+        (
+            await db_session.execute(
+                _select(Alert).where(
+                    Alert.project_id == version.project_id,
+                    Alert.severity == AlertSeverity.ERROR,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert any("deploy FAILED" in a.title for a in alerts)
+
+
+@pytest.mark.asyncio
+async def test_confirm_within_window_no_decision_keeps_unconfirmed(db_session):
+    """A new revision still MONITORING within the window leaves the version
+    unconfirmed (no premature confirm, no premature failure)."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.MONITORING,
+        current_sha=_SHA_A,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=15),
+    )
+    assert resolved is False
+    await db_session.refresh(version)
+    assert version.serving_status == "unconfirmed"

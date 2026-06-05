@@ -29,7 +29,7 @@ unchanged.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -46,6 +46,19 @@ from app.shared_state import (
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
+
+
+# Post-promotion serving-confirmation window.  A promotion is recorded the
+# instant the candidate merges, but it stays PROVISIONAL (serving_status=
+# "unconfirmed") until deploy_health confirms the promoted SHA is actually
+# serving.  This bounds how long the confirmation sweep waits before declaring
+# the deploy failed.  It composes with the two existing backstops: it is well
+# inside the 24h promotion-pending cap and the 6h qualification-timeout, and is
+# set just past the deploy_health MONITORING→STABLE window
+# (``_DEPLOY_MONITORING_DEFER_WINDOW`` = 30 min) so a healthy new revision has
+# time to boot and stabilize before the deadline, while a boot-crashed deploy
+# surfaces as a loud failure within an hour.
+_DEPLOY_CONFIRM_WINDOW_SECONDS = 60 * 60
 
 
 # ---------------------------------------------------------------------------
@@ -1521,6 +1534,23 @@ async def _record_promotion_success(
     version.status = "promoted"
     version.promoted_at = now
     version.promoted_sha = effective_sha
+    # Post-promotion serving confirmation: the merge landed, but the promotion
+    # is PROVISIONAL until deploy_health confirms the promoted SHA is actually
+    # serving in production.  Mark it "unconfirmed" and stamp a bounded
+    # confirmation deadline; the periodic release sweep resolves it to
+    # "serving_confirmed" or "deploy_failed".  Only the self-repo's deploy is
+    # observable via the DeploymentState singleton — for other projects leave
+    # serving_status NULL (NA) so the sweep never strands them waiting on a
+    # signal it cannot read.
+    if getattr(_record_project, "is_self_repo", False):
+        version.serving_status = "unconfirmed"
+        version.served_sha = None
+        version.served_at = None
+        version.deploy_failure_reason = None
+        version.deploy_confirm_alerted_at = None
+        version.deploy_confirm_deadline = now + timedelta(
+            seconds=_DEPLOY_CONFIRM_WINDOW_SECONDS
+        )
     session.add(version)
     # Phase 4: durable verdict-history row for a successful promotion.  This
     # only ever runs with promotion enabled (the dry_run branch returns earlier).

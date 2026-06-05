@@ -988,4 +988,153 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.getByText(/frozen/)).toBeInTheDocument();
     });
   });
+
+  describe('post-promotion serving confirmation', () => {
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    it('renders a green serving-confirmed badge with served SHA and time', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promoted',
+                summary: 'Candidate was promoted AND its deploy is CONFIRMED serving.',
+                serving_status: 'serving_confirmed',
+              },
+              serving_status: 'serving_confirmed',
+              served_sha: 'abcdef1234567890',
+              served_at: '2026-01-02T00:00:00Z',
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'serving_confirmed');
+      expect(badge).toHaveTextContent(/serving confirmed/);
+      expect(badge).toHaveTextContent('@abcdef1');
+    });
+
+    it('renders an amber awaiting-confirmation badge while unconfirmed', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promoted_unconfirmed',
+                summary: 'Candidate was promoted (merged) but serving is NOT yet confirmed.',
+                serving_status: 'unconfirmed',
+              },
+              serving_status: 'unconfirmed',
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'unconfirmed');
+      expect(badge).toHaveTextContent(/awaiting deploy confirmation/);
+    });
+
+    it('renders a loud red failure badge with the reason — not a clean green promoted', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promotion_deploy_failed',
+                summary: 'Candidate merged but its deploy NEVER confirmed serving.',
+                serving_status: 'deploy_failed',
+                deploy_failure_reason: 'boot crash loop',
+              },
+              serving_status: 'deploy_failed',
+              deploy_failure_reason: 'boot crash loop',
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'deploy_failed');
+      expect(badge).toHaveTextContent(/deploy failed/);
+      expect(badge).toHaveTextContent('boot crash loop');
+      expect(badge.className).toContain('text-red-400');
+      // The deploy-failed state badge must NOT be styled like the green 'promoted'.
+      const stateBadge = screen.getByText('promotion deploy failed');
+      expect(stateBadge.className).toContain('text-red-400');
+      expect(stateBadge.className).not.toContain('emerald');
+    });
+
+    it('shows the serving failure in the History rows for a recent version', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: null,
+            recent_versions: [
+              {
+                version_number: 4,
+                status: 'promoted',
+                opened_at: '2026-01-01T00:00:00Z',
+                promoted_at: '2026-01-02T00:00:00Z',
+                qualification_attempts: 1,
+                last_qualification: null,
+                serving_status: 'deploy_failed',
+                deploy_failure_reason: 'never stabilized',
+              },
+            ],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const badge = screen.getByTestId('serving-status-badge');
+      expect(badge).toHaveAttribute('data-serving-status', 'deploy_failed');
+      expect(badge).toHaveTextContent('never stabilized');
+    });
+
+    it('reflects post_promotion_outcome in the verdict history', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [
+          {
+            id: 'v1',
+            release_version_id: 'rv1',
+            candidate_sha: 'deadbeef1234',
+            confidence: 0.95,
+            sub_scores: null,
+            blocker: null,
+            audit_missing_reason: null,
+            would_promote: true,
+            promotion_enabled: true,
+            terminal_status: 'promoted',
+            threshold: 0.9,
+            started_at: null,
+            finalized_at: '2026-01-02T00:00:00Z',
+            created_at: '2026-01-02T00:00:00Z',
+            post_promotion_outcome: 'deploy_failed',
+          },
+        ],
+        total: 1,
+      });
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const history = await screen.findByTestId('verdict-history');
+      expect(within(history).getByText(/deploy failed/)).toBeInTheDocument();
+    });
+  });
 });

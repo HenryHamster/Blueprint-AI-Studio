@@ -1078,6 +1078,13 @@ export interface QualificationState {
   promotion_pr_url?: string | null;
   error?: string | null;
   blocker?: string | null;
+  // Post-promotion serving confirmation. A 'promoted' state is provisional:
+  // serving_status is 'unconfirmed' while the deploy is still within its
+  // confirmation window, 'serving_confirmed' once the promoted SHA is live, or
+  // 'deploy_failed' (state becomes 'promotion_deploy_failed') when the deploy
+  // never stabilized. deploy_failure_reason carries the failure detail.
+  serving_status?: string | null;
+  deploy_failure_reason?: string | null;
 }
 
 export interface CurrentVersion {
@@ -1098,6 +1105,14 @@ export interface CurrentVersion {
   qualification_state?: QualificationState | null;
   last_qualification: VersionQualification | null;
   latest_audit?: LatestAudit | null;
+  // Post-promotion serving confirmation (additive). serving_status is one of
+  // 'unconfirmed' | 'serving_confirmed' | 'deploy_failed'; served_sha/served_at
+  // record the confirmed-serving commit, and deploy_failure_reason the detail
+  // when the deploy never stabilized.
+  serving_status?: string | null;
+  served_sha?: string | null;
+  served_at?: string | null;
+  deploy_failure_reason?: string | null;
 }
 
 export interface RecentVersion {
@@ -1110,6 +1125,12 @@ export interface RecentVersion {
   abandoned_at?: string | null;
   abandoned_by?: string | null;
   abandon_reason?: string | null;
+  // Post-promotion serving confirmation (additive) — see CurrentVersion.
+  qualification_state?: QualificationState | null;
+  serving_status?: string | null;
+  served_sha?: string | null;
+  served_at?: string | null;
+  deploy_failure_reason?: string | null;
 }
 
 export interface PromotionReadinessConfidence {
@@ -1309,6 +1330,10 @@ export interface QualificationVerdictRecord {
   started_at: string | null;
   finalized_at: string | null;
   created_at: string;
+  // How this verdict's promotion actually played out in production:
+  // 'serving_confirmed' | 'deploy_failed' | 'unconfirmed' (null until recorded).
+  post_promotion_outcome?: string | null;
+  post_promotion_outcome_at?: string | null;
 }
 
 export interface QualificationVerdictsInfraContext {

@@ -7517,6 +7517,75 @@ class TestQualificationVerdictsAuditMissingReason:
         assert len(verdicts) == 1
         assert verdicts[0]["audit_missing_reason"] is None
 
+    @pytest.mark.asyncio
+    async def test_post_promotion_outcome_exposed_on_verdict_row(
+        self, client: AsyncClient, db_session
+    ):
+        """post_promotion_outcome (and _at) populated on a verdict are returned."""
+        from datetime import datetime, timezone
+
+        from app.models import QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        outcome_at = datetime(2026, 1, 2, 0, 0, 0, tzinfo=timezone.utc)
+        verdict = QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="deadbeef",
+            confidence=0.95,
+            would_promote=True,
+            promotion_enabled=True,
+            terminal_status="promoted",
+            threshold=0.90,
+            post_promotion_outcome="deploy_failed",
+            post_promotion_outcome_at=outcome_at,
+        )
+        db_session.add(verdict)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/qualification-verdicts"
+        )
+        assert resp.status_code == 200, resp.text
+        verdicts = resp.json()["verdicts"]
+        assert len(verdicts) == 1
+        assert verdicts[0]["post_promotion_outcome"] == "deploy_failed"
+        assert verdicts[0]["post_promotion_outcome_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_post_promotion_outcome_null_for_unresolved_verdict(
+        self, client: AsyncClient, db_session
+    ):
+        """post_promotion_outcome is null until the serving outcome is recorded."""
+        from app.models import QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        verdict = QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="goodsha123",
+            confidence=0.95,
+            would_promote=True,
+            promotion_enabled=True,
+            terminal_status="promoted",
+            threshold=0.90,
+        )
+        db_session.add(verdict)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/qualification-verdicts"
+        )
+        assert resp.status_code == 200, resp.text
+        verdicts = resp.json()["verdicts"]
+        assert len(verdicts) == 1
+        assert verdicts[0]["post_promotion_outcome"] is None
+        assert verdicts[0]["post_promotion_outcome_at"] is None
+
 
 class TestQualificationVerdictsInfraContext:
     """GET /api/admin/projects/{id}/qualification-verdicts includes infra_context."""

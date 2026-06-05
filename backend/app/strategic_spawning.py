@@ -3771,8 +3771,13 @@ async def _spawn_strategic_review(
                             "phase": v.phase,
                             "last_qualification": v.last_qualification,
                             "qualification_state": summarize_qualification_state(
-                                v.last_qualification
+                                v.last_qualification,
+                                v.serving_status,
+                                v.deploy_failure_reason,
                             ),
+                            "serving_status": v.serving_status,
+                            "served_sha": (v.served_sha or "")[:12] or None,
+                            "deploy_failure_reason": v.deploy_failure_reason,
                         }
                         for v in _closed
                     ]
@@ -3835,8 +3840,13 @@ async def _spawn_strategic_review(
                     logger.exception(
                         "[STRATEGIC] DeploymentState read failed; continuing"
                     )
+            # Real serving SHA only — NEVER a promoted_sha stand-in.  A version's
+            # served_sha is set solely once deploy_health confirms the promotion
+            # is actually serving (serving_status="serving_confirmed"); an
+            # unconfirmed or deploy_failed promotion reports null here, so the
+            # strategist never reads a merged-but-unshipped SHA as "deployed".
             if not _deployed_sha and _promoted_v is not None:
-                _deployed_sha = _promoted_v.promoted_sha
+                _deployed_sha = _promoted_v.served_sha
             _undeployed_dirs = (
                 (recent_interventions or {}).get("undeployed_directions") or []
             )
@@ -3862,6 +3872,15 @@ async def _spawn_strategic_review(
                     (_promoted_v.promoted_sha or "")[:12] or None
                     if _promoted_v
                     else None
+                ),
+                # Post-promotion serving outcome of the latest promotion: lets
+                # the strategist see whether "promoted" actually shipped vs is
+                # still unconfirmed or failed to deploy.
+                "promoted_serving_status": (
+                    _promoted_v.serving_status if _promoted_v else None
+                ),
+                "promoted_deploy_failure_reason": (
+                    _promoted_v.deploy_failure_reason if _promoted_v else None
                 ),
                 "open_version": (
                     _open_version.version_number if _open_version else None
@@ -4060,6 +4079,8 @@ async def _spawn_strategic_review(
         # resilient to back-merge refactors of release_version.
         _promoted_when = ""
         _verdict_txt = ""
+        _prior_serving_status: str | None = None
+        _prior_deploy_reason: str | None = None
         try:
             from app.release_version import recent_closed_versions as _rcv
 
@@ -4072,32 +4093,69 @@ async def _spawn_strategic_review(
                     _conf = (_v.last_qualification or {}).get("confidence")
                     if _conf is not None:
                         _verdict_txt = f" (final qualification confidence {_conf})"
+                    _prior_serving_status = _v.serving_status
+                    _prior_deploy_reason = _v.deploy_failure_reason
                     break
         except Exception:
             logger.exception(
                 "[STRATEGIC] post-promote prior-version lookup failed; continuing"
             )
-        _post_promote_hint = (
-            f"Version handoff — READ THIS FIRST. v{_prior_n} was SUCCESSFULLY "
-            f"PROMOTED to {_target}{_promoted_when}{_verdict_txt} and is now live; "
-            f"v{_cur_n} opened from that promotion. v{_prior_n}'s mission is "
-            f"COMPLETE — do NOT plan, research, audit, or spawn work to promote, "
-            f"qualify, re-audit, or re-qualify v{_prior_n}; that is already done "
-            f"and merged to {_target} (cross-check `version_phase.recent_versions` "
-            f"and `deployment_state` — v{_prior_n} is recorded there with "
-            f"status='promoted'). The `goal` field on v{_cur_n} is a frozen "
-            f"version-open snapshot that still reads as v{_prior_n}'s promotion "
-            f"mission — treat it as STALE CARRY-OVER, not a live directive, and "
-            f"disregard its promote/qualify framing. A null "
-            f"`version_phase.last_qualification` on v{_cur_n} means this fresh "
-            f"version has not yet begun its OWN qualification (expected for a "
-            f"just-opened version) — it does NOT mean v{_prior_n}'s promotion is "
-            f"pending or failed. As your first action this cycle, set v{_cur_n}'s "
-            f"real mission: rewrite `intent.current_focus` to state what v{_cur_n} "
-            f"is for (not what v{_prior_n} achieved), retire directions v{_prior_n} "
-            f"already satisfied, and propose the directions the next milestone "
-            f"needs."
-        )
+        if _prior_serving_status == "deploy_failed":
+            # The prior promotion MERGED but never shipped — do NOT advance focus
+            # as if it succeeded.  This is the focus-advancement gate honoring the
+            # serving signal: the strategist must treat the milestone as NOT
+            # delivered and prioritize recovering the deploy.
+            _reason_txt = (
+                f" (reason={_prior_deploy_reason})" if _prior_deploy_reason else ""
+            )
+            _post_promote_hint = (
+                f"Version handoff — READ THIS FIRST. v{_prior_n} MERGED to "
+                f"{_target}{_promoted_when} but its deploy DID NOT confirm "
+                f"serving{_reason_txt}: the promotion did NOT ship and the code "
+                f"is NOT live (see `deployment_state.promoted_serving_status` = "
+                f"'deploy_failed' and `version_phase.recent_versions`). Do NOT "
+                f"treat v{_prior_n}'s mission as complete and do NOT advance "
+                f"`intent.current_focus` to the next milestone as if it shipped. "
+                f"Your TOP priority this cycle is recovering the failed deploy "
+                f"(roll forward a fix / investigate why the promoted SHA never "
+                f"served); only after it is serving should you move focus on."
+            )
+        elif _prior_serving_status == "unconfirmed":
+            _post_promote_hint = (
+                f"Version handoff — READ THIS FIRST. v{_prior_n} was promoted "
+                f"(merged) to {_target}{_promoted_when}{_verdict_txt}, but its "
+                f"deploy is NOT yet confirmed serving (see "
+                f"`deployment_state.promoted_serving_status` = 'unconfirmed') — "
+                f"it is still inside the post-promotion confirmation window. Do "
+                f"NOT yet treat the milestone as fully shipped; the sweep will "
+                f"resolve it to serving_confirmed or deploy_failed shortly. You "
+                f"may begin setting v{_cur_n}'s mission, but do not declare "
+                f"v{_prior_n} live until serving is confirmed, and do NOT "
+                f"re-promote/re-qualify v{_prior_n}."
+            )
+        else:
+            _post_promote_hint = (
+                f"Version handoff — READ THIS FIRST. v{_prior_n} was SUCCESSFULLY "
+                f"PROMOTED to {_target}{_promoted_when}{_verdict_txt} and is now "
+                f"live; v{_cur_n} opened from that promotion. v{_prior_n}'s "
+                f"mission is COMPLETE — do NOT plan, research, audit, or spawn "
+                f"work to promote, qualify, re-audit, or re-qualify v{_prior_n}; "
+                f"that is already done and merged to {_target} (cross-check "
+                f"`version_phase.recent_versions` and `deployment_state` — "
+                f"v{_prior_n} is recorded there with status='promoted'). The "
+                f"`goal` field on v{_cur_n} is a frozen version-open snapshot "
+                f"that still reads as v{_prior_n}'s promotion mission — treat it "
+                f"as STALE CARRY-OVER, not a live directive, and disregard its "
+                f"promote/qualify framing. A null "
+                f"`version_phase.last_qualification` on v{_cur_n} means this "
+                f"fresh version has not yet begun its OWN qualification (expected "
+                f"for a just-opened version) — it does NOT mean v{_prior_n}'s "
+                f"promotion is pending or failed. As your first action this "
+                f"cycle, set v{_cur_n}'s real mission: rewrite "
+                f"`intent.current_focus` to state what v{_cur_n} is for (not what "
+                f"v{_prior_n} achieved), retire directions v{_prior_n} already "
+                f"satisfied, and propose the directions the next milestone needs."
+            )
         prompt_suffix = (
             f"{prompt_suffix}\n{_post_promote_hint}"
             if prompt_suffix

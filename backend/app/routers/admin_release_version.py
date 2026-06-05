@@ -173,7 +173,9 @@ async def get_version_lifecycle(
         merged_count = await count_merged_since(session, project_id, open_row.opened_at)
         in_flight_count = await count_in_flight_tasks(session, project_id)
         qual = open_row.last_qualification or {}
-        qual_state = _release_version.summarize_qualification_state(qual)
+        qual_state = _release_version.summarize_qualification_state(
+            qual, open_row.serving_status, open_row.deploy_failure_reason
+        )
         # Surface the latest release_audit's actual findings/score so a verdict
         # is explainable (the verdict record only keeps the composite, and the
         # task API strips artifact logs — otherwise operators are blind to WHY).
@@ -208,6 +210,17 @@ async def get_version_lifecycle(
             "qualification_state": qual_state,
             "last_qualification": _format_qualification(qual) if qual else None,
             "latest_audit": latest_audit,
+            # Post-promotion serving confirmation (additive; NULL until the open
+            # version is itself promoted — normally NULL for a still-open one).
+            "serving_status": open_row.serving_status,
+            "served_sha": open_row.served_sha,
+            "served_at": open_row.served_at.isoformat()
+            if open_row.served_at
+            else None,
+            "deploy_failure_reason": open_row.deploy_failure_reason,
+            "deploy_confirm_deadline": open_row.deploy_confirm_deadline.isoformat()
+            if open_row.deploy_confirm_deadline
+            else None,
         }
 
     history_rows = (
@@ -240,6 +253,15 @@ async def get_version_lifecycle(
                 "last_qualification": _format_qualification(v.last_qualification)
                 if v.last_qualification
                 else None,
+                # Post-promotion serving confirmation — disambiguates a merged
+                # promotion from one that actually shipped (additive fields).
+                "serving_status": v.serving_status,
+                "served_sha": v.served_sha,
+                "served_at": v.served_at.isoformat() if v.served_at else None,
+                "deploy_failure_reason": v.deploy_failure_reason,
+                "qualification_state": _release_version.summarize_qualification_state(
+                    v.last_qualification, v.serving_status, v.deploy_failure_reason
+                ),
                 "abandoned_at": (
                     (v.last_qualification or {}).get("abandoned_at")
                     if v.status == "abandoned"
@@ -646,6 +668,15 @@ async def list_qualification_verdicts(
                 "started_at": v.started_at.isoformat() if v.started_at else None,
                 "finalized_at": v.finalized_at.isoformat() if v.finalized_at else None,
                 "created_at": v.created_at.isoformat(),
+                # Post-promotion serving outcome — how this verdict's promotion
+                # actually played out (serving_confirmed / deploy_failed /
+                # unconfirmed); null until recorded.
+                "post_promotion_outcome": v.post_promotion_outcome,
+                "post_promotion_outcome_at": (
+                    v.post_promotion_outcome_at.isoformat()
+                    if v.post_promotion_outcome_at
+                    else None
+                ),
             }
             for v in rows
         ],

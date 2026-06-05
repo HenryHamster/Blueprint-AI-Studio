@@ -89,9 +89,74 @@ const QUAL_STATE_STYLE: Record<string, string> = {
   promotion_failed: 'bg-red-500/10 border-red-500/30 text-red-400',
   dry_run: 'bg-blue-500/10 border-blue-500/30 text-blue-400',
   promoted: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400',
+  // Promotion is merged but serving is not yet confirmed — provisional, amber.
+  promoted_unconfirmed: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
+  // Promotion merged but the deploy never confirmed serving — loud red, NOT the
+  // clean green 'promoted' look.
+  promotion_deploy_failed: 'bg-red-500/10 border-red-500/30 text-red-400',
   not_promoted: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
   deferred_unsynced: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
 };
+
+// Distinct, operator-readable serving-confirmation badge for a promoted version.
+// Green = confirmed live; amber = still awaiting deploy confirmation; red = a
+// deploy that failed to stabilize (with the failure reason). Renders nothing
+// when there is no serving signal (e.g. a not-yet-promoted version).
+function ServingStatusBadge({
+  servingStatus,
+  servedSha,
+  servedAt,
+  deployFailureReason,
+}: {
+  servingStatus?: string | null;
+  servedSha?: string | null;
+  servedAt?: string | null;
+  deployFailureReason?: string | null;
+}) {
+  if (!servingStatus) return null;
+  if (servingStatus === 'serving_confirmed') {
+    return (
+      <span
+        data-testid="serving-status-badge"
+        data-serving-status="serving_confirmed"
+        className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-emerald-500/10 border-emerald-500/30 text-emerald-400"
+        title="The promoted commit is confirmed serving in production."
+      >
+        ✓ serving confirmed
+        {servedSha && <span className="font-mono text-emerald-500/90">@{servedSha.slice(0, 7)}</span>}
+        {servedAt && <span className="text-emerald-600/90">{timeAgo(servedAt)}</span>}
+      </span>
+    );
+  }
+  if (servingStatus === 'deploy_failed') {
+    return (
+      <span
+        data-testid="serving-status-badge"
+        data-serving-status="deploy_failed"
+        className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-red-500/10 border-red-500/40 text-red-400"
+        title={deployFailureReason ?? 'The promoted deploy never confirmed serving in production.'}
+      >
+        ⚠ deploy failed — NOT serving
+        {deployFailureReason && (
+          <span className="font-normal text-red-300 truncate max-w-[200px]">{deployFailureReason}</span>
+        )}
+      </span>
+    );
+  }
+  if (servingStatus === 'unconfirmed') {
+    return (
+      <span
+        data-testid="serving-status-badge"
+        data-serving-status="unconfirmed"
+        className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-amber-500/10 border-amber-500/30 text-amber-400"
+        title="Promoted (merged) but serving is not yet confirmed — still within the deploy confirmation window."
+      >
+        … awaiting deploy confirmation
+      </span>
+    );
+  }
+  return null;
+}
 
 // Provenance + staleness header for the audit findings. Shows which commit the
 // audit ran against and how long ago, and flags when that commit differs from the
@@ -699,6 +764,12 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${QUAL_STATE_STYLE[cv.qualification_state.state] ?? 'bg-neutral-800 text-neutral-400 border-neutral-700'}`}>
                     {cv.qualification_state.state.replace(/_/g, ' ')}
                   </span>
+                  <ServingStatusBadge
+                    servingStatus={cv.serving_status ?? cv.qualification_state.serving_status}
+                    servedSha={cv.served_sha}
+                    servedAt={cv.served_at}
+                    deployFailureReason={cv.deploy_failure_reason ?? cv.qualification_state.deploy_failure_reason}
+                  />
                 </div>
                 <p className="text-[10px] text-neutral-400">{cv.qualification_state.summary}</p>
               </div>
@@ -865,6 +936,24 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   {v.sub_scores && <span className="text-neutral-600 font-mono text-[9px]">a:{Math.round(v.sub_scores.audit * 100)} e:{Math.round(v.sub_scores.test_erosion * 100)} s:{Math.round(v.sub_scores.smoketest * 100)}</span>}
                   {v.sub_scores?.ci_resolution && <CiBadge ci={v.sub_scores.ci_resolution} />}
                   {v.blocker && <span className="text-red-400 truncate max-w-[120px]" title={v.blocker}>{v.blocker}</span>}
+                  {v.post_promotion_outcome && (
+                    <span
+                      className={`font-mono text-[9px] px-1 py-0.5 rounded border ${
+                        v.post_promotion_outcome === 'serving_confirmed'
+                          ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                          : v.post_promotion_outcome === 'deploy_failed'
+                            ? 'bg-red-500/10 border-red-500/40 text-red-400'
+                            : 'bg-amber-500/10 border-amber-500/30 text-amber-400'
+                      }`}
+                      title={`post-promotion outcome: ${v.post_promotion_outcome.replace(/_/g, ' ')}`}
+                    >
+                      {v.post_promotion_outcome === 'serving_confirmed'
+                        ? '✓ serving'
+                        : v.post_promotion_outcome === 'deploy_failed'
+                          ? '⚠ deploy failed'
+                          : 'unconfirmed'}
+                    </span>
+                  )}
                   <span className="text-neutral-700 font-mono">{v.candidate_sha.slice(0, 7)}</span>
                   {v.finalized_at && <span className="text-neutral-600">{timeAgo(v.finalized_at)}</span>}
                 </div>
@@ -880,6 +969,12 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 <div key={v.version_number} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px]">
                   <span className="text-neutral-400 font-mono w-8">v{v.version_number}</span>
                   <span className="text-neutral-500">{v.status}</span>
+                  <ServingStatusBadge
+                    servingStatus={v.serving_status ?? v.qualification_state?.serving_status}
+                    servedSha={v.served_sha}
+                    servedAt={v.served_at}
+                    deployFailureReason={v.deploy_failure_reason ?? v.qualification_state?.deploy_failure_reason}
+                  />
                   <QualSummary q={v.last_qualification} />
                   {v.status === 'abandoned' && (v.abandoned_by || v.abandon_reason || v.abandoned_at) && (
                     <span className="text-neutral-400">

@@ -14352,3 +14352,100 @@ def test_reaper_sweep_seam_reexported_from_release_qualifier():
         assert getattr(rq, name) is getattr(rqs, name), (
             f"{name} re-export must be identical to the canonical impl"
         )
+
+
+# ===========================================================================
+# Post-promotion serving confirmation — promotion-time stamping.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_record_promotion_success_stamps_unconfirmed_for_self_repo(db_session):
+    """A self-repo promotion is PROVISIONAL: serving_status='unconfirmed' and a
+    bounded deploy_confirm_deadline are stamped at promotion time."""
+    from app.release_promotion import (
+        _DEPLOY_CONFIRM_WINDOW_SECONDS,
+        _record_promotion_success,
+    )
+    from app.time_utils import _utcnow
+
+    project = Project(
+        name="Self-Repo",
+        user_id="sr-user",
+        github_owner="acme",
+        github_repo="self",
+        integration_branch="automain",
+        promotion_target="main",
+        is_self_repo=True,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    before = _utcnow()
+    result = await _record_promotion_success(
+        db_session,
+        version,
+        candidate_sha="c" * 40,
+        base_record={"confidence": 0.9, "status": "promoted"},
+        pr_url="http://pr/1",
+        promoted_sha="p" * 40,
+        lock_released=True,
+    )
+    await db_session.commit()
+
+    assert result["status"] == "promoted"
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.serving_status == "unconfirmed"
+    assert version.served_sha is None
+    assert version.deploy_confirm_deadline is not None
+    elapsed = (version.deploy_confirm_deadline - before).total_seconds()
+    # Deadline lands roughly one window from now (allow generous slack).
+    assert 0 < elapsed <= _DEPLOY_CONFIRM_WINDOW_SECONDS + 120
+
+
+@pytest.mark.asyncio
+async def test_record_promotion_success_leaves_serving_null_for_non_self_repo(
+    db_session,
+):
+    """A non-self-repo promotion leaves serving_status NULL (NA) — the deploy is
+    not observable via the DeploymentState singleton, so the sweep never strands
+    it waiting on a signal it cannot read."""
+    from app.release_promotion import _record_promotion_success
+
+    project = Project(
+        name="Other-Repo",
+        user_id="or-user",
+        github_owner="acme",
+        github_repo="other",
+        integration_branch="automain",
+        promotion_target="main",
+        is_self_repo=False,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await _record_promotion_success(
+        db_session,
+        version,
+        candidate_sha="c" * 40,
+        base_record={"confidence": 0.9, "status": "promoted"},
+        pr_url="http://pr/1",
+        promoted_sha="p" * 40,
+        lock_released=True,
+    )
+    await db_session.commit()
+
+    assert result["status"] == "promoted"
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.serving_status is None
+    assert version.deploy_confirm_deadline is None

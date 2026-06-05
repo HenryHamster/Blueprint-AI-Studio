@@ -27,6 +27,7 @@ from app.database import AsyncSessionLocal
 from app.models import Alert, AlertSeverity
 from app.release_promotion import _notify_operator
 from app.release_reconciliation import (
+    _confirm_serving_or_fail,
     _reconcile_if_pending_auto_merge_landed,
     _reconcile_if_promotion_failed_landed,
     _reconcile_if_promotion_pending_timed_out,
@@ -451,6 +452,48 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep force-failed version %s "
                 "(promotion_pending stranded past the wall-clock cap)",
+                version_id,
+            )
+
+    # Post-promotion serving confirmation.  A promoted version is PROVISIONAL
+    # (serving_status == "unconfirmed") until deploy_health confirms the
+    # promoted SHA is actually serving in production.  For each such version,
+    # derive the outcome from the DeploymentState singleton (the existing
+    # deploy-health serving signal — no new always-on monitor) in its own
+    # dedicated session, and either confirm it serving or land a distinct loud
+    # deploy-failed state.  Unlike the loops above this scans PROMOTED versions
+    # (the rest target ``open`` ones), so it runs its own narrow query.
+    unconfirmed_ids = list(
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion.id).where(
+                    release_version.ReleaseVersion.status == "promoted",
+                    release_version.ReleaseVersion.serving_status == "unconfirmed",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for version_id in unconfirmed_ids:
+        try:
+            resolved = await _confirm_serving_or_fail(
+                version_id,
+                session_factory=session_factory,
+                now=now,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: serving-confirmation check failed "
+                "for version %s",
+                version_id,
+            )
+            continue
+        if resolved:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep resolved post-promotion serving "
+                "status for version %s",
                 version_id,
             )
 

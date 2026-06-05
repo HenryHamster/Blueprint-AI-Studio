@@ -323,6 +323,8 @@ async def recent_closed_versions(
 
 def summarize_qualification_state(
     last_qualification: dict[str, Any] | None,
+    serving_status: str | None = None,
+    deploy_failure_reason: str | None = None,
 ) -> dict[str, Any] | None:
     """Disambiguate the overloaded ``last_qualification.status`` for the agent.
 
@@ -342,7 +344,15 @@ def summarize_qualification_state(
 
     Returns ``{"state", "summary", ...}`` (``state`` ∈ ``qualifying`` |
     ``promotion_in_flight`` | ``promotion_failed`` | ``not_promoted`` |
-    ``dry_run`` | ``promoted``), or ``None`` when unqualified (no verdict yet).
+    ``dry_run`` | ``promoted`` | ``promoted_unconfirmed`` |
+    ``promotion_deploy_failed``), or ``None`` when unqualified (no verdict yet).
+
+    Post-promotion serving disambiguation: when ``status == "promoted"`` the
+    optional ``serving_status`` (with ``deploy_failure_reason``) splits the bare
+    "promoted" case into serving-confirmed, unconfirmed-in-window, or a distinct
+    ``promotion_deploy_failed`` state.  This is the SINGLE summary the UI,
+    operator-control guards, and the strategic payload all read, so they agree
+    on whether a promotion actually shipped by construction.
     """
     lq = last_qualification or {}
     status = lq.get("status")
@@ -411,6 +421,41 @@ def summarize_qualification_state(
             ),
         }
     if status == "promoted":
+        if serving_status == "serving_confirmed":
+            return {
+                "state": "promoted",
+                "serving_status": "serving_confirmed",
+                "summary": (
+                    "Candidate was promoted AND its deploy is CONFIRMED serving "
+                    "in production — the version actually shipped."
+                ),
+            }
+        if serving_status == "deploy_failed":
+            return {
+                "state": "promotion_deploy_failed",
+                "serving_status": "deploy_failed",
+                "deploy_failure_reason": deploy_failure_reason,
+                "summary": (
+                    "Candidate merged to the promotion target but its deploy "
+                    "NEVER confirmed serving"
+                    + (f" ({deploy_failure_reason})" if deploy_failure_reason else "")
+                    + ". This promotion did NOT ship — the deployed code is not "
+                    "live. Treat the version as NOT shipped: investigate the "
+                    "deploy / roll forward a fix rather than advancing as if it "
+                    "succeeded."
+                ),
+            }
+        if serving_status == "unconfirmed":
+            return {
+                "state": "promoted_unconfirmed",
+                "serving_status": "unconfirmed",
+                "summary": (
+                    "Candidate was promoted (merged) but serving is NOT yet "
+                    "confirmed — the deploy is still within its confirmation "
+                    "window. Do not treat it as live-confirmed yet; the sweep "
+                    "resolves it to serving_confirmed or deploy_failed."
+                ),
+            }
         return {
             "state": "promoted",
             "summary": "Candidate was promoted — the version was cut.",
@@ -445,8 +490,14 @@ def to_phase_block(version: ReleaseVersion) -> dict[str, Any]:
         "phase_reasoning": version.phase_reasoning,
         "last_qualification": version.last_qualification,
         "qualification_state": summarize_qualification_state(
-            version.last_qualification
+            version.last_qualification,
+            version.serving_status,
+            version.deploy_failure_reason,
         ),
+        "serving_status": version.serving_status,
+        "served_sha": version.served_sha,
+        "served_at": version.served_at.isoformat() if version.served_at else None,
+        "deploy_failure_reason": version.deploy_failure_reason,
     }
 
 

@@ -351,6 +351,87 @@ async def _check_version_stabilize_stall(
     return True
 
 
+async def _alert_promotion_deploy_failed(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> bool:
+    """Emit a loud ERROR alert when a promoted version's deploy never served.
+
+    Fired by the post-promotion serving-confirmation sweep when a promotion is
+    resolved to ``serving_status="deploy_failed"`` — the candidate merged to the
+    promotion target but the deploy never came up healthy (boot crash, rollback,
+    halt, or a SHA mismatch).  Deduped via ``deploy_confirm_alerted_at`` (the
+    standard ``*_alerted_at`` anchor convention on this model): once the anchor
+    is stamped the alert is not re-posted for the same failure.  Does not commit
+    — the alert + anchor ride the caller's commit.  Returns True iff an alert
+    was posted.
+    """
+    if version.deploy_confirm_alerted_at is not None:
+        return False
+
+    reason = version.deploy_failure_reason or "unknown"
+    _reason_text = {
+        "no_new_revision": (
+            "no new healthy production revision booted within the confirmation "
+            "window"
+        ),
+        "rolled_back": "the deploy was ROLLED BACK after the promotion",
+        "halted": "the deploy was HALTED after the promotion",
+        "sha_mismatch": (
+            "the live serving SHA does not match the promoted SHA"
+        ),
+    }.get(reason, reason)
+
+    session.add(
+        Alert(
+            project_id=version.project_id,
+            severity=AlertSeverity.ERROR,
+            title=f"Release v{version.version_number} promotion deploy FAILED",
+            message=(
+                f"Release v{version.version_number} merged to the promotion "
+                f"target (promoted_sha={(version.promoted_sha or '')[:12] or '?'}) "
+                f"but its deploy is NOT serving: {_reason_text} "
+                f"(reason={reason}). The promotion did NOT ship — the version is "
+                f"flagged deploy_failed and must not be treated as live. "
+                f"Investigate the deploy / roll forward a fix."
+            ),
+        )
+    )
+    try:
+        from app.release_promotion import _notify_operator  # noqa: PLC0415
+
+        await _notify_operator(
+            session,
+            version,
+            "promotion_deploy_failed",
+            (
+                f"v{version.version_number} promoted to the production branch but "
+                f"its deploy never confirmed serving ({_reason_text}). This "
+                f"promotion did NOT ship; the version is flagged deploy_failed."
+            ),
+            extra={
+                "reason": reason,
+                "promoted_sha": version.promoted_sha,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — messaging must never break the sweep
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to post deploy-failed operator message "
+            "for v%d (non-fatal): %s",
+            version.version_number,
+            exc,
+        )
+
+    version.deploy_confirm_alerted_at = _utcnow()
+    session.add(version)
+    logger.error(
+        "[RELEASE_QUALIFIER] deploy-failed alert for v%d (reason=%s)",
+        version.version_number,
+        reason,
+    )
+    return True
+
+
 async def _check_version_auto_merge_stall(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
