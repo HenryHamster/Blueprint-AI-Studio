@@ -88,7 +88,7 @@ function buildFixLoopGuidanceSuffix(): string {
   return `\n\n${READ_THE_FAILURE_MESSAGE}\n${SIZE_GUARDRAIL_GUIDANCE}\n${PRIOR_ATTEMPT_DIVERGENCE}`;
 }
 
-function matchesTransientSetupFailure(message: string): boolean {
+export function matchesTransientSetupFailure(message: string): boolean {
   const lower = message.toLowerCase();
   const transportSignals = [
     'connection refused',
@@ -105,9 +105,7 @@ function matchesTransientSetupFailure(message: string): boolean {
     'connection reset',
   ];
   if (transportSignals.some(signature => lower.includes(signature))) return true;
-
-  const fetchOrDownloadFailure = lower.includes('failed to fetch') || lower.includes('failed to download');
-  return fetchOrDownloadFailure && transportSignals.some(signature => lower.includes(signature));
+  return false;
 }
 
 function isInfrastructureSetupFailure(

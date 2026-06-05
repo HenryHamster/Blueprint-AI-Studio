@@ -211,6 +211,12 @@ class MetricStrategy:
             if isinstance(ceiling, str) and ceiling in _PERF_SEVERITY_RANK:
                 ceiling_rank = _PERF_SEVERITY_RANK[ceiling]
                 for finding in measurement:
+                    if not isinstance(finding, dict):
+                        return EvaluationVerdict(
+                            False,
+                            "malformed perf measurement: element is not a dict",
+                            self.key,
+                        )
                     sev = str((finding or {}).get("severity") or "").strip().lower()
                     rank = _PERF_SEVERITY_RANK.get(sev)
                     if rank is None:
@@ -255,6 +261,17 @@ class MetricStrategy:
         # fails the gate honestly; no declared criterion preserves the
         # presence-based pass above.
         criterion = evaluate_compute_success_criterion(task, artifact_text)
+        if criterion is not None and not criterion["measurable"]:
+            # The criterion names an experiment-domain metric (accuracy, loss,
+            # throughput, …) that the terminal COMPUTE_RESULT structurally never
+            # carries — there is no channel from the experiment to the gate for
+            # it. Gating on it would silently bury an otherwise-successful run as
+            # FAILED forever. Surface the unenforceable criterion explicitly and
+            # let the presence-based pass stand (the run reached a terminal,
+            # costed outcome and did its measured job).
+            return EvaluationVerdict(
+                True, _format_unmeasurable_criterion(criterion, outcome, cost), self.key
+            )
         if criterion is not None and not criterion["met"]:
             return EvaluationVerdict(False, _format_unmet_criterion(criterion), self.key)
 
@@ -459,6 +476,16 @@ _CRITERION_OPS: dict[str, Callable[[float, float], bool]] = {
     "!=": operator.ne,
 }
 
+# The terminal COMPUTE_RESULT artifact (agent/src/handlers/compute-experiment.ts)
+# only ever carries these numeric, job-level fields. A success_criterion can be
+# evaluated end-to-end ONLY against one of these keys: the compute substrate has
+# no channel for experiment-domain metrics (accuracy, loss, throughput, …), so a
+# criterion naming any other metric is structurally unmeasurable and must NOT be
+# allowed to permanently fail an otherwise-successful experiment.
+_MEASURABLE_COMPUTE_METRICS: frozenset[str] = frozenset(
+    {"final_cost_usd", "accrued_cost_usd", "spend_cap_usd", "poll_attempts"}
+)
+
 
 def _declared_success_criterion(task: Task) -> tuple[str, str, float] | None:
     """Read a compute_experiment's declared success criterion from its payload.
@@ -492,12 +519,15 @@ def evaluate_compute_success_criterion(
     """Evaluate a compute_experiment's declared success criterion against its result.
 
     Returns a small operator-readable dict
-    ``{metric, operator, threshold, value, met}`` describing whether the
-    reported result met the declared goal, or ``None`` when no criterion is
-    declared (callers then fall back to presence-based behavior). ``value`` is
-    the numeric metric read by name out of the terminal result object; ``met``
-    is False when the metric is absent/non-numeric (fail-closed) or when the
-    comparison does not hold.
+    ``{metric, operator, threshold, value, met, measurable}`` describing whether
+    the reported result met the declared goal, or ``None`` when no criterion is
+    declared (callers then fall back to presence-based behavior). ``measurable``
+    is False when the metric names a field the terminal COMPUTE_RESULT can never
+    carry (an experiment-domain metric) — callers must NOT fail-close on an
+    unmeasurable metric, since doing so would permanently bury a successful run.
+    ``value`` is the numeric metric read by name out of the terminal result
+    object; ``met`` is False when the metric is absent/non-numeric (fail-closed)
+    or when the comparison does not hold.
     """
     criterion = _declared_success_criterion(task)
     if criterion is None:
@@ -512,6 +542,7 @@ def evaluate_compute_success_criterion(
         "threshold": threshold,
         "value": value,
         "met": met,
+        "measurable": metric in _MEASURABLE_COMPUTE_METRICS,
     }
 
 
@@ -529,6 +560,24 @@ def _format_unmet_criterion(criterion: dict) -> str:
     return (
         f"declared success criterion not met: {metric}={value} "
         f"(required {op} {threshold})"
+    )
+
+
+def _format_unmeasurable_criterion(criterion: dict, outcome: str, cost: float) -> str:
+    """Operator-readable reason for a PASS whose criterion names an unmeasurable metric.
+
+    The experiment reached a terminal, costed outcome (so it passes the
+    presence-based gate), but its declared criterion gates on a metric the
+    terminal COMPUTE_RESULT structurally cannot carry, so the goal could not be
+    enforced. The message names the offending metric and the measurable set so
+    the operator knows the criterion was a no-op rather than silently satisfied.
+    """
+    measurable = ", ".join(sorted(_MEASURABLE_COMPUTE_METRICS))
+    return (
+        f"compute experiment reached terminal outcome {outcome!r} at measured "
+        f"cost ${cost}; declared success criterion NOT enforced — metric "
+        f"{criterion['metric']!r} is not reported in the terminal compute result "
+        f"(measurable metrics: {measurable})"
     )
 
 

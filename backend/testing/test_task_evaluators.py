@@ -210,6 +210,24 @@ def test_metric_perf_max_severity_criterion_passes_and_fails():
     assert "high exceeds allowed medium" in v_fail.reason
 
 
+def test_metric_perf_measurement_non_dict_element_fails_cleanly():
+    """A perf measurement array containing a non-dict element (string, number, etc.)
+    is malformed and fails the gate with a clear reason, not an AttributeError."""
+    task = Task(payloads=[{"type": "perf", "base_branch": "main", "max_severity": "medium"}])
+    # Mixed array with valid dict and non-dict string element
+    v = MetricStrategy().evaluate(
+        task, json.dumps([{"severity": "low", "title": "x"}, "high"])
+    )
+    assert v.passed is False
+    assert "malformed" in v.reason.lower()
+    # Non-dict number element
+    v = MetricStrategy().evaluate(
+        task, json.dumps([3, {"severity": "low"}])
+    )
+    assert v.passed is False
+    assert "malformed" in v.reason.lower()
+
+
 # ── MetricStrategy: compute_experiment shape-awareness ──────────────────────
 
 
@@ -333,36 +351,66 @@ def _criterion_task(metric: str, op: str, threshold: float) -> Task:
 
 
 def test_compute_criterion_met_passes_with_reason():
-    """A declared criterion that the reported metric satisfies PASSES and the
-    verdict reason names the satisfied goal."""
-    artifact = _compute_result(accuracy=0.95)
-    v = MetricStrategy().evaluate(_criterion_task("accuracy", ">=", 0.9), artifact)
+    """A declared criterion on a MEASURABLE (job-level) metric that the reported
+    result satisfies PASSES, and the verdict reason names the satisfied goal.
+
+    Uses ``final_cost_usd`` — a key the REAL terminal COMPUTE_RESULT actually
+    carries — rather than injecting an experiment-domain metric the agent never
+    emits."""
+    artifact = _compute_result(final_cost_usd=0.42)
+    v = MetricStrategy().evaluate(
+        _criterion_task("final_cost_usd", "<=", 0.9), artifact
+    )
     assert v.passed is True
     assert "criterion met" in v.reason
-    assert "accuracy >= 0.9" in v.reason
+    assert "final_cost_usd <= 0.9" in v.reason
 
 
 def test_compute_criterion_unmet_fails_with_operator_readable_reason():
-    """A declared criterion the reported metric misses FAILS the gate honestly."""
-    artifact = _compute_result(accuracy=0.5)
-    v = MetricStrategy().evaluate(_criterion_task("accuracy", ">=", 0.9), artifact)
+    """A declared criterion on a measurable metric that the result misses FAILS
+    the gate honestly (a genuinely-measured-but-unmet goal still fails closed)."""
+    artifact = _compute_result(final_cost_usd=10.0)
+    v = MetricStrategy().evaluate(
+        _criterion_task("final_cost_usd", "<=", 5.0), artifact
+    )
     assert v.passed is False
     assert "not met" in v.reason
-    assert "accuracy=0.5" in v.reason
-    assert ">= 0.9" in v.reason
+    assert "final_cost_usd=10.0" in v.reason
+    assert "<= 5.0" in v.reason
 
 
-def test_compute_criterion_missing_metric_fails_closed():
-    """A declared criterion whose metric is absent from the result fails closed —
-    an unmeasurable goal must not pass on presence alone."""
-    artifact = _compute_result()  # no 'accuracy' key
-    v = MetricStrategy().evaluate(_criterion_task("accuracy", ">=", 0.9), artifact)
+def test_compute_criterion_missing_measurable_metric_fails_closed():
+    """A declared criterion on a measurable metric absent from the result fails
+    closed — a measurable-but-unreported goal must not pass on presence alone."""
+    # spend_cap_usd is a measurable key, but this result omits it.
+    artifact = json.dumps({"job_id": "j", "outcome": "SUCCESS", "final_cost_usd": 0.4})
+    v = MetricStrategy().evaluate(
+        _criterion_task("spend_cap_usd", ">=", 1.0), artifact
+    )
     assert v.passed is False
     assert "not evaluable" in v.reason
 
 
+def test_compute_criterion_unmeasurable_metric_does_not_bury_success():
+    """A criterion naming an experiment-domain metric the terminal result can
+    NEVER carry (accuracy/loss/…) must NOT permanently fail a successful run.
+    The gate passes on the terminal+costed outcome and surfaces the
+    unenforceable criterion explicitly to the operator."""
+    artifact = _compute_result()  # real shape: no 'accuracy' key, ever
+    v = MetricStrategy().evaluate(_criterion_task("accuracy", ">=", 0.9), artifact)
+    assert v.passed is True
+    assert "NOT enforced" in v.reason
+    assert "accuracy" in v.reason
+    # Even an injected domain metric does not flip the gate — the real artifact
+    # never carries it, so we never trust it.
+    injected = _compute_result(accuracy=0.5)
+    v2 = MetricStrategy().evaluate(_criterion_task("accuracy", ">=", 0.9), injected)
+    assert v2.passed is True
+    assert "NOT enforced" in v2.reason
+
+
 def test_compute_criterion_can_gate_on_cost_metric():
-    """The criterion reads any numeric result key by name, including cost."""
+    """The criterion reads any measurable numeric result key by name, incl. cost."""
     artifact = _compute_result(final_cost_usd=10.0)
     v = MetricStrategy().evaluate(
         _criterion_task("final_cost_usd", "<=", 5.0), artifact

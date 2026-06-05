@@ -292,38 +292,67 @@ async def _make_compute_task_with_criterion(db_session, metric, op, threshold) -
 async def test_compute_completion_met_criterion_completes_and_records_goal(
     db_session, _quiet_compute_io
 ):
-    """A declared criterion the result meets PASSES the gate, completes the task,
-    and records the goal outcome on the durable compute_result for the summary."""
-    task = await _make_compute_task_with_criterion(db_session, "accuracy", ">=", 0.9)
+    """A declared criterion on a MEASURABLE (job-level) metric the result meets
+    PASSES the gate, completes the task, and records the goal outcome on the
+    durable compute_result for the summary.
+
+    Uses ``final_cost_usd`` — a key the real terminal COMPUTE_RESULT actually
+    carries — rather than an experiment-domain metric the agent never emits."""
+    task = await _make_compute_task_with_criterion(
+        db_session, "final_cost_usd", "<=", 0.9
+    )
 
     await _handle_compute_experiment_completion(
-        task, _result_artifact(accuracy=0.95), db_session
+        task, _result_artifact(final_cost_usd=0.42), db_session
     )
 
     await db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
     criterion = task.plan_output["compute_result"]["criterion"]
     assert criterion["met"] is True
-    assert criterion["metric"] == "accuracy"
-    assert criterion["value"] == pytest.approx(0.95)
+    assert criterion["metric"] == "final_cost_usd"
+    assert criterion["value"] == pytest.approx(0.42)
 
 
 @pytest.mark.asyncio
 async def test_compute_completion_unmet_criterion_fails_gate(
     db_session, _quiet_compute_io
 ):
-    """An experiment that finishes but misses its declared goal FAILS the gate
-    honestly with an operator-readable reason, rather than completing clean."""
-    task = await _make_compute_task_with_criterion(db_session, "accuracy", ">=", 0.9)
+    """An experiment that finishes but misses its declared goal on a MEASURABLE
+    metric FAILS the gate honestly with an operator-readable reason, rather than
+    completing clean."""
+    task = await _make_compute_task_with_criterion(
+        db_session, "final_cost_usd", "<=", 5.0
+    )
 
     await _handle_compute_experiment_completion(
-        task, _result_artifact(accuracy=0.5), db_session
+        task, _result_artifact(final_cost_usd=10.0), db_session
     )
 
     await db_session.refresh(task)
     assert task.status == TaskStatus.FAILED
     assert task.context["evaluation_gate"]["passed"] is False
     assert "not met" in task.context["evaluation_gate"]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_compute_completion_unmeasurable_criterion_does_not_bury_success(
+    db_session, _quiet_compute_io
+):
+    """A criterion naming an experiment-domain metric the terminal result can
+    NEVER carry (accuracy/loss/…) must NOT permanently fail a successful run at
+    the lifecycle level. The gate passes on the terminal+costed outcome and the
+    durable criterion records that the goal was unmeasurable (not silently met)."""
+    task = await _make_compute_task_with_criterion(db_session, "accuracy", ">=", 0.9)
+
+    # Real terminal artifact shape: no 'accuracy' key, ever.
+    await _handle_compute_experiment_completion(task, _result_artifact(), db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    criterion = task.plan_output["compute_result"]["criterion"]
+    assert criterion["measurable"] is False
+    assert criterion["metric"] == "accuracy"
 
 
 # ── Full lifecycle: substrate kill → task completion ────────────────────────

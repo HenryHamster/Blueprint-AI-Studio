@@ -48,7 +48,7 @@ vi.mock('fs', () => ({
 }));
 
 import fs from 'fs';
-import { testFixLoop, matchesSizeBreachSignature } from './test-fix-loop.js';
+import { testFixLoop, matchesSizeBreachSignature, matchesTransientSetupFailure } from './test-fix-loop.js';
 import { runClaudeCode } from '../providers/runners.js';
 import type { TestRunner } from './test-runners.js';
 
@@ -675,6 +675,25 @@ describe('testFixLoop — in-loop environment-failure routing (maxFixAttempts: 0
     expect(result.setupFailed).toBeFalsy();
     expect(result.passed).toBe(false);
     expect(result.testFailuresDetected).toBe(true);
+  });
+});
+
+describe('matchesTransientSetupFailure', () => {
+  it('bare "failed to fetch" without transport signal is NOT transient (repository failure)', () => {
+    // A missing/renamed crate is a real repo problem, not transient infra.
+    expect(matchesTransientSetupFailure('error: failed to fetch `https://github.com/rust-lang/crates.io-index`')).toBe(false);
+    expect(matchesTransientSetupFailure('error: failed to download package')).toBe(false);
+  });
+
+  it('"failed to fetch" WITH a transport signal IS transient', () => {
+    expect(matchesTransientSetupFailure('error: failed to fetch `https://example.com` — connection refused')).toBe(true);
+    expect(matchesTransientSetupFailure('error: failed to download — timed out')).toBe(true);
+  });
+
+  it('transport signals alone (no fetch/download) are transient', () => {
+    expect(matchesTransientSetupFailure('connection refused')).toBe(true);
+    expect(matchesTransientSetupFailure('Network is unreachable')).toBe(true);
+    expect(matchesTransientSetupFailure('EAI_AGAIN')).toBe(true);
   });
 });
 
