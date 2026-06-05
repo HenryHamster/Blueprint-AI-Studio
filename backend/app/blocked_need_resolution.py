@@ -29,6 +29,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from app.finding_deduplication import prerequisite_matches_task
+from app.landed_signal import has_merge_unblock_signal
 from app.models import Task
 
 # Candidate statuses an in-flight foundation can be in. Kept here (not imported
@@ -162,27 +163,73 @@ def _match_need(need: Dict[str, Any], candidates: List[Task]) -> Optional[Task]:
     return None
 
 
+def _foundation_shipped(
+    foundation: Task, failed_parent_ids: Optional[set] = None
+) -> bool:
+    """True iff a COMPLETED foundation's work actually SHIPPED.
+
+    Aligns the blocked-resume notion of "done" with the one the respawn-dedup
+    layer keys off (:func:`finding_deduplication.build_dedup_state`): a completed
+    task only satisfies a dependent's prerequisite when its work is genuinely
+    visible to that dependent. Two completed sub-states are NOT shipped and are
+    excluded here, exactly as the dedup layer would RE-SPAWN them:
+
+      * a COMPLETED task with NO merge-unblock signal (the PR closed/superseded
+        without merging — nothing landed), and
+      * a *ghost merge* — a PR that merged into a rollup staging branch whose
+        rollup parent later FAILED/CANCELLED (or COMPLETED without merging), so
+        the code never reached the integration branch. ``failed_parent_ids`` is
+        the stranded-parent set; a foundation whose ``parent_task_id`` is in it is
+        a ghost merge.
+
+    Gate on the merge-UNBLOCK / rollup-unblock signal (``pr_merged``-equivalent,
+    via :func:`has_merge_unblock_signal`), NOT the stricter integration-LANDING
+    signal: a foundation that merged onto the SHARED staging base carries the
+    rollup-unblock bit and IS genuinely visible to a same-base dependent, so it
+    must still satisfy it. Using ``has_landed_signal`` here would wrongly park
+    those same-base staging dependents.
+    """
+    if not has_merge_unblock_signal(foundation):
+        return False
+    if failed_parent_ids and foundation.parent_task_id in failed_parent_ids:
+        return False
+    return True
+
+
 def completed_foundation_for_need(
-    task: Task, need: Dict[str, Any], completed_candidates: List[Task]
+    task: Task,
+    need: Dict[str, Any],
+    completed_candidates: List[Task],
+    failed_parent_ids: Optional[set] = None,
 ) -> Optional[Task]:
-    """Return the already-completed task that satisfies ``need``, or ``None``.
+    """Return the already-completed, SHIPPED task that satisfies ``need``, or ``None``.
 
     Same exact-match signals as the live path (task id / PR number / explicit
-    capability marker) — never a fuzzy guess. Exposed (alongside the boolean
+    capability marker) — never a fuzzy guess — but the candidate must also have
+    actually shipped (see :func:`_foundation_shipped`): a COMPLETED-but-unmerged
+    task or a ghost merge does NOT satisfy the need, mirroring the respawn-dedup
+    layer that would rebuild such a foundation. Exposed (alongside the boolean
     :func:`need_satisfied_by_completed`) so a resume path can inspect the actual
     landed foundation — e.g. to decide whether a cross-base base re-cut is
     required before the dependent leaves BLOCKED.
     """
     if not isinstance(need, dict):
         return None
-    eligible = [c for c in completed_candidates if c.id != task.id]
+    eligible = [
+        c
+        for c in completed_candidates
+        if c.id != task.id and _foundation_shipped(c, failed_parent_ids)
+    ]
     return _match_need(need, eligible)
 
 
 def need_satisfied_by_completed(
-    task: Task, need: Dict[str, Any], completed_candidates: List[Task]
+    task: Task,
+    need: Dict[str, Any],
+    completed_candidates: List[Task],
+    failed_parent_ids: Optional[set] = None,
 ) -> bool:
-    """True if ``need`` is satisfied by already-completed/merged work.
+    """True if ``need`` is satisfied by already-completed/merged work that SHIPPED.
 
     The live ``resolve_blocked_need`` path only considers active candidates, but a
     parked blocker may have outlived the foundation it waited on — the sibling
@@ -191,10 +238,19 @@ def need_satisfied_by_completed(
     simply done, so the parked task should resume and proceed with no edge.
 
     Uses the SAME exact-match signals as the live path (task id / PR number /
-    explicit capability marker) — never a fuzzy guess. ``completed_candidates`` is
-    the pre-fetched set of same-project tasks in :data:`COMPLETED_CANDIDATE_STATUSES`.
+    explicit capability marker) — never a fuzzy guess — AND the SAME "shipped"
+    gate as the respawn-dedup layer (:func:`_foundation_shipped`): a
+    COMPLETED-but-unmerged task or a ghost merge does NOT satisfy the need.
+    ``completed_candidates`` is the pre-fetched set of same-project tasks in
+    :data:`COMPLETED_CANDIDATE_STATUSES`; ``failed_parent_ids`` is the
+    stranded-parent set used to exclude ghost merges.
     """
-    return completed_foundation_for_need(task, need, completed_candidates) is not None
+    return (
+        completed_foundation_for_need(
+            task, need, completed_candidates, failed_parent_ids
+        )
+        is not None
+    )
 
 
 def need_matched_dead_foundation(

@@ -773,6 +773,18 @@ async def _classify_blocker_needs(
         dead = await _fetch_dead_candidates(session, task.project_id)
         dead_cache[task.project_id] = dead
 
+    # Stranded-parent set so a ghost-merge / unshipped foundation does NOT satisfy
+    # a completed need — mirrors the respawn-dedup layer's "shipped" notion
+    # (finding_deduplication.build_dedup_state): a foundation whose rollup parent
+    # FAILED/CANCELLED, or COMPLETED without a merge-unblock signal, never reached
+    # the integration branch and must not silently unblock its dependents.
+    from app.landed_signal import has_merge_unblock_signal
+
+    failed_parents = {c.id for c in dead}
+    failed_parents |= {
+        c.id for c in completed if not has_merge_unblock_signal(c)
+    }
+
     existing_edges = {str(d) for d in (task.depends_on or [])}
     for need in needs:
         match = resolve_blocked_need(task, need, active)
@@ -781,7 +793,10 @@ async def _classify_blocker_needs(
             if match_id not in existing_edges and match_id not in disp["edges"]:
                 disp["edges"].append(match_id)
             continue
-        if completed_foundation_for_need(task, need, completed) is not None:
+        if (
+            completed_foundation_for_need(task, need, completed, failed_parents)
+            is not None
+        ):
             disp["completed_needs"].append(need)
             continue
         if need_matched_dead_foundation(task, need, dead):
@@ -956,35 +971,69 @@ async def _fetch_completed_candidates(session, project_id) -> list:
     )
 
 
-async def _completed_foundation_base_safe(task, need, completed, session) -> bool:
-    """Re-cut a resuming dependent's base when its landed foundation is cross-base.
+async def _partition_completed_needs_base_safe(
+    task, completed_needs, completed, session
+) -> tuple[list, list]:
+    """Re-cut a resuming dependent's base over ALL its completed needs at ONCE.
 
-    A blocked dependent that resumes because its need is satisfied by ALREADY-
+    A blocked dependent that resumes because its needs are satisfied by ALREADY-
     completed work carries NO ``depends_on`` edge, so the dispatch-time re-cut
-    (which only inspects edged candidates) can never fire for it. If the completed
-    foundation that satisfied the need is a GENUINE cross-base code dependency that
+    (which only inspects edged candidates) can never fire for it. If a completed
+    foundation that satisfied a need is a GENUINE cross-base code dependency that
     has landed on integration, the dependent would otherwise dispatch against a
     staging base forked before the foundation landed — exactly the failure the
     re-cut machinery exists to prevent.
 
-    Resolve the actual landed foundation and run it through the SAME shared re-cut
-    helper the dispatch/completion paths use (``ensure_dependent_base_recut``):
+    The re-cut MUST run as a SINGLE call over every completed foundation, exactly
+    as the dispatch path does with the full ``dep_tasks`` set. Re-cutting one
+    foundation at a time is unsafe when a dependent has MULTIPLE completed needs in
+    the same tick: the ``_recut_*`` accounting (conflict counter, recheck timer,
+    escalated flag) lives in a SINGLE per-dependent namespace, so a base-safe /
+    successful re-cut for one foundation calls ``_clear_recut_accounting`` and
+    WIPES a conflicting sibling foundation's accumulating conflict counter —
+    defeating the consecutive-conflict escalation bound and parking the dependent
+    invisibly forever. One shared re-cut keeps the accounting coherent:
+    ``_has_landed_cross_base_code_dep`` is ``any(...)`` over the whole set, so a
+    single conflicting foundation holds the dependent and accumulates the conflict
+    counter, and the no-op clear only fires when NO foundation needs a re-cut.
 
-      * Same-base or ordering-only foundation → no re-cut needed → returns ``True``
-        (the dependent resumes exactly as before — no false serialization).
-      * Cross-base code foundation, re-cut succeeds → ``True`` (base now contains
-        the landed code; safe to resume).
-      * Cross-base code foundation, re-cut conflicts or hits a transient error →
-        ``False`` — the caller must HOLD the dependent (keep it blocked / re-park
-        and retry next cycle), never resume against an un-recut base.
+    Returns ``(base_safe, recut_pending)``:
+
+      * ``base_safe``     — needs whose foundation needs no re-cut (same-base /
+        ordering-only / unresolved) or whose shared re-cut succeeded; safe to drop.
+      * ``recut_pending`` — needs whose landed cross-base foundation still requires
+        a (not-yet-clean) re-cut; retained so the dependent stays BLOCKED.
     """
     from app.blocked_need_resolution import completed_foundation_for_need
-    from app.orchestrator_health import ensure_dependent_base_recut
+    from app.orchestrator_health import (
+        _has_landed_cross_base_code_dep,
+        ensure_dependent_base_recut,
+    )
 
-    foundation = completed_foundation_for_need(task, need, completed)
-    if foundation is None:  # defensive — caller already confirmed satisfaction
-        return True
-    return await ensure_dependent_base_recut(task, [foundation], session)
+    resolved = [
+        (need, completed_foundation_for_need(task, need, completed))
+        for need in completed_needs
+    ]
+    foundations = [f for _, f in resolved if f is not None]
+    # No foundation resolved (defensive) or a single shared re-cut succeeded / was
+    # a no-op → every completed need is base-safe.
+    if not foundations or await ensure_dependent_base_recut(
+        task, foundations, session
+    ):
+        return list(completed_needs), []
+    # Re-cut required but not yet clean (conflict / transient error): hold back
+    # ONLY the needs whose foundation is the unsafe landed cross-base code dep; the
+    # rest (same-base / ordering-only / unresolved) need no re-cut, stay base-safe.
+    base_safe: list = []
+    recut_pending: list = []
+    for need, foundation in resolved:
+        if foundation is not None and _has_landed_cross_base_code_dep(
+            task, [foundation]
+        ):
+            recut_pending.append(need)
+        else:
+            base_safe.append(need)
+    return base_safe, recut_pending
 
 
 async def _fetch_dead_candidates(session, project_id) -> list:
@@ -1127,36 +1176,34 @@ async def _apply_needs_disposition(
     edges = disp["edges"]
     completed_needs = disp["completed_needs"]
 
-    # 2) Verify each completed foundation is base-safe BEFORE treating it as
+    # 2) Verify the completed foundations are base-safe BEFORE treating them as
     #    accounted-for — on BOTH the partial- and full-resolution paths. A need
     #    satisfied by ALREADY-completed work carries no edge, so the dispatch-time
     #    re-cut (which only inspects edged candidates) can never fire for it; a
     #    cross-base GENUINE code foundation must have the dependent's base re-cut
-    #    from integration first. _completed_foundation_base_safe performs that
-    #    re-cut as a side effect (idempotent; once per need this tick) and returns
-    #    False when a re-cut is required but conflicts / hits a transient error.
-    #    A need whose re-cut is not yet safe is held back in ``recut_pending`` so
-    #    it is re-checked next tick rather than dropped unverified — closing the
-    #    partial-resolution gap where a cross-base completed need silently vanished
-    #    and the dependent later resumed against a stale base. Such a need DID
-    #    match a foundation (it is mid-recut, not genuinely unprovided), so it must
-    #    always HOLD and must NOT fall through to the legacy precondition machine.
+    #    from integration first. _partition_completed_needs_base_safe runs ALL the
+    #    completed foundations through ONE shared re-cut this tick (per-foundation
+    #    re-cut would let a base-safe sibling's _clear_recut_accounting wipe a
+    #    conflicting sibling's accumulating conflict counter — parking the dependent
+    #    invisibly forever). A need whose re-cut is not yet safe is held back in
+    #    ``recut_pending`` so it is re-checked next tick rather than dropped
+    #    unverified — closing the partial-resolution gap where a cross-base
+    #    completed need silently vanished and the dependent later resumed against a
+    #    stale base. Such a need DID match a foundation (it is mid-recut, not
+    #    genuinely unprovided), so it must always HOLD and must NOT fall through to
+    #    the legacy precondition machine.
     recut_pending: list = []
     if completed_needs:
         completed = completed_cache.get(task.project_id)
         if completed is None:
             completed = await _fetch_completed_candidates(session, task.project_id)
             completed_cache[task.project_id] = completed
-        base_safe: list = []
-        for need in completed_needs:
-            if await _completed_foundation_base_safe(task, need, completed, session):
-                base_safe.append(need)
-            else:
-                recut_pending.append(need)
-        completed_needs = base_safe
-        # base-safe REPLACES and COMMITS task.context with a fresh dict carrying
-        # the _recut_* escalation accounting on its False path; re-read the local
-        # ctx so the disposition branches below don't clobber that persisted state.
+        completed_needs, recut_pending = await _partition_completed_needs_base_safe(
+            task, completed_needs, completed, session
+        )
+        # The shared re-cut REPLACES and COMMITS task.context with a fresh dict
+        # carrying the _recut_* escalation accounting on its failure path; re-read
+        # the local ctx so the disposition branches below don't clobber it.
         ctx = task.context or {}
 
     progressed = bool(edges) or bool(completed_needs)
@@ -1174,11 +1221,13 @@ async def _apply_needs_disposition(
             # the unresolved set, and stay BLOCKED so the next tick re-evaluates the
             # remainder. A recut_pending need ALWAYS holds here — it matched a
             # foundation, so it must never fall through to the precondition machine.
-            # Progress resets the parked re-eval cap.
+            # Progress resets the parked re-eval cap — but ONLY when no sibling need
+            # is still stuck mid-recut. A base-safe need's progress must not erase
+            # the give-up accounting while a conflicting sibling remains unresolved.
             edged = _wire_edges(task, edges)
             _persist_residual_needs(task, unresolved)
             ctx = task.context or {}
-            if progressed:
+            if progressed and not recut_pending:
                 ctx.pop("_blocked_parked_reevals", None)
             attempts = int(ctx.get("_blocked_recheck_attempts", 0)) + 1
             ctx["_blocked_recheck_attempts"] = attempts

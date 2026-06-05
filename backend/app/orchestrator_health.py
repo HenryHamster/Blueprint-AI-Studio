@@ -716,7 +716,7 @@ async def ensure_dependent_base_recut(
     Single source of truth for the re-cut, shared by the dispatch driver
     (:func:`recut_landed_cross_base_dependents`), the completion-side warm-claim
     trigger (``orchestrator._mark_unblocked_dependents``), and the reaper resume
-    sweep (``reaper_sweeps._completed_foundation_base_safe``).
+    sweep (``reaper_sweeps._partition_completed_needs_base_safe``).
     """
     if not _has_landed_cross_base_code_dep(dependent, dep_tasks):
         # No re-cut needed. If this dependent previously accrued re-cut failures

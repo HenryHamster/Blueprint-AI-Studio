@@ -8,6 +8,7 @@ covered separately in ``test_reaper.py``.
 import uuid
 
 from app.blocked_need_resolution import (
+    completed_foundation_for_need,
     need_matched_dead_foundation,
     need_satisfied_by_completed,
     resolve_blocked_need,
@@ -16,7 +17,7 @@ from app.models import Task, TaskStatus
 
 
 def _task(*, status=TaskStatus.IN_PROGRESS, title="cand", payloads=None,
-          context=None, depends_on=None, tid=None) -> Task:
+          context=None, depends_on=None, tid=None, parent_task_id=None) -> Task:
     return Task(
         id=tid or uuid.uuid4(),
         project_id=uuid.uuid4(),
@@ -28,8 +29,15 @@ def _task(*, status=TaskStatus.IN_PROGRESS, title="cand", payloads=None,
         payloads=payloads if payloads is not None else [{"type": "create"}],
         context=context or {},
         depends_on=depends_on or [],
+        parent_task_id=parent_task_id,
         status_log=[],
     )
+
+
+def _shipped(**kwargs) -> Task:
+    """A COMPLETED foundation that carries the merge-unblock signal (shipped)."""
+    ctx = {"pr_merged": True, **(kwargs.pop("context", None) or {})}
+    return _task(status=TaskStatus.COMPLETED, context=ctx, **kwargs)
 
 
 # ── kind='task' ──────────────────────────────────────────────────────────────
@@ -214,35 +222,35 @@ def test_unknown_kind_returns_none():
 # ── need_satisfied_by_completed (parked-resume against landed work) ───────────
 
 def test_completed_task_need_satisfied_by_merged_foundation():
-    done = _task(status=TaskStatus.COMPLETED)
+    done = _shipped()
     blocked = _task(status=TaskStatus.BLOCKED)
     need = {"kind": "task", "ref": str(done.id)}
     assert need_satisfied_by_completed(blocked, need, [done]) is True
 
 
 def test_completed_finding_hash_need_satisfied_by_merged_foundation():
-    done = _task(status=TaskStatus.COMPLETED, context={"finding_hash": "f00dcafe00001234"})
+    done = _shipped(context={"finding_hash": "f00dcafe00001234"})
     blocked = _task(status=TaskStatus.BLOCKED)
     need = {"kind": "task", "ref": "f00dcafe00001234"}
     assert need_satisfied_by_completed(blocked, need, [done]) is True
 
 
 def test_completed_capability_need_satisfied_by_advertised_marker():
-    done = _task(status=TaskStatus.COMPLETED, context={"provides_capability": "auth-tokens"})
+    done = _shipped(context={"provides_capability": "auth-tokens"})
     blocked = _task(status=TaskStatus.BLOCKED)
     need = {"kind": "capability", "ref": "auth-tokens"}
     assert need_satisfied_by_completed(blocked, need, [done]) is True
 
 
 def test_completed_pr_need_satisfied_by_owning_completed_task():
-    done = _task(status=TaskStatus.COMPLETED, payloads=[{"type": "fix", "pr_number": 8123}])
+    done = _shipped(payloads=[{"type": "fix", "pr_number": 8123}])
     blocked = _task(status=TaskStatus.BLOCKED)
     need = {"kind": "pr", "ref": "8123"}
     assert need_satisfied_by_completed(blocked, need, [done]) is True
 
 
 def test_completed_need_unsatisfied_returns_false():
-    done = _task(status=TaskStatus.COMPLETED)
+    done = _shipped()
     blocked = _task(status=TaskStatus.BLOCKED)
     need = {"kind": "task", "ref": str(uuid.uuid4())}
     assert need_satisfied_by_completed(blocked, need, [done]) is False
@@ -252,10 +260,51 @@ def test_completed_need_unsatisfied_returns_false():
 
 
 def test_completed_need_never_self_satisfies():
-    blocked = _task(status=TaskStatus.BLOCKED)
+    blocked = _shipped()
     need = {"kind": "task", "ref": str(blocked.id)}
     # The blocked task itself, even if somehow in the completed set, is excluded.
     assert need_satisfied_by_completed(blocked, need, [blocked]) is False
+
+
+# ── shipped-gate: only genuinely-shipped foundations satisfy a completed need ──
+
+def test_completed_without_merge_signal_does_not_satisfy():
+    """A COMPLETED foundation with NO merge-unblock signal shipped nothing — the
+    dedup layer would re-spawn it, so it must NOT unblock its dependent."""
+    done = _task(status=TaskStatus.COMPLETED)  # no pr_merged
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": str(done.id)}
+    assert need_satisfied_by_completed(blocked, need, [done]) is False
+    assert completed_foundation_for_need(blocked, need, [done]) is None
+
+
+def test_ghost_merge_foundation_does_not_satisfy():
+    """A ghost merge (pr_merged=True but rollup parent FAILED, so code never
+    reached the integration branch) must NOT unblock its dependent — aligning
+    with the dedup layer that excludes it via the stranded-parent set."""
+    parent_id = uuid.uuid4()
+    ghost = _shipped(parent_task_id=parent_id)
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": str(ghost.id)}
+    failed_parents = {parent_id}
+    assert need_satisfied_by_completed(blocked, need, [ghost], failed_parents) is False
+    assert completed_foundation_for_need(blocked, need, [ghost], failed_parents) is None
+    # Same foundation, parent NOT stranded → genuinely shipped → still satisfies.
+    assert need_satisfied_by_completed(blocked, need, [ghost], set()) is True
+
+
+def test_staging_merge_unblock_foundation_still_satisfies():
+    """A foundation that merged onto the SHARED staging base carries the
+    rollup-unblock signal (pr_merged, landed_on_integration=False) and IS visible
+    to a same-base dependent — it MUST still resume it (the regression to avoid)."""
+    staging = _task(
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": False,
+                 "_non_merge_unblock_reason": "rollup_staging"},
+    )
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "task", "ref": str(staging.id)}
+    assert need_satisfied_by_completed(blocked, need, [staging]) is True
 
 
 # ── need_matched_dead_foundation (provably-dead foundation) ───────────────────
