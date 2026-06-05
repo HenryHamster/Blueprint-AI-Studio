@@ -215,6 +215,32 @@ describe('DetailsTab — Merge Test Gate', () => {
     expect(screen.getByText('Passed')).toBeInTheDocument();
   });
 
+  it('blocks and frames disabled tests as the cause when the PR self-suppressed the suite', () => {
+    const task = makeTask({
+      artifacts: [mergeTestArtifact({
+        detected: false,
+        passed: false,
+        noTestsReason: 'all_skipped',
+        tests: [],
+        output: '0 passed, 12 skipped',
+        disabledTests: {
+          count: 12,
+          markers: [{ file: 'test_bar.py', marker: '@pytest.mark.skip', line: '1' }],
+        },
+      })],
+    });
+    render(<DetailsTab task={task} />);
+    // The gate BLOCKED — not a clean pass / fall-open.
+    expect(screen.getByText('Blocked')).toBeInTheDocument();
+    expect(screen.queryByText('Passed')).toBeNull();
+    // The disabled-tests section frames the skips as the CAUSE of the block, not
+    // the visibility-only quarantine wording.
+    expect(screen.getByText(/this is the cause of the merge block/)).toBeInTheDocument();
+    expect(screen.queryByText(/visibility only; does not block the merge/)).toBeNull();
+    // And the blockedNote explains the self-suppression.
+    expect(screen.getByText(/rather than accept a suite made green by skipping/)).toBeInTheDocument();
+  });
+
   it('renders no disabled-tests row for a legacy artifact without the field', () => {
     const task = makeTask({
       artifacts: [mergeTestArtifact({ detected: true, passed: true, tests: [], output: '' })],

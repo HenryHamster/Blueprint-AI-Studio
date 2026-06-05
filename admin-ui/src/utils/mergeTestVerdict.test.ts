@@ -251,4 +251,78 @@ describe('deriveMergeTestOutcome precedence (mirrors classify_merge_test_verdict
     expect(r.outcome).toBe('pass');
     expect(r.reason).toBe('suite_passed');
   });
+
+  // PR-caused self-suppression: the PR's own diff disabled tests AND the suite
+  // no longer verifies anything. BLOCKS — mirrors pr_self_suppressed_suite.
+  it('all-skipped suite + PR-introduced markers => blocked self_suppressed_suite', () => {
+    const r = derive({
+      detected: false,
+      noTestsReason: 'all_skipped',
+      output: '',
+      disabledTests: { count: 2, markers: [{ file: 't.py', marker: '@pytest.mark.skip', line: '1' }] },
+    });
+    expect(r.outcome).toBe('blocked');
+    expect(r.reason).toBe('self_suppressed_suite');
+    expect(r.detail).toContain('2 test(s)');
+    expect(r.detail).toContain('@pytest.mark.skip');
+  });
+
+  it('mostly-skipped pass + PR-introduced markers => blocked self_suppressed_suite', () => {
+    const r = derive({
+      detected: true,
+      passed: true,
+      output: '',
+      coverage: { passed: 5, skipped: 1500, total: 1505 },
+      disabledTests: { count: 1, markers: [{ file: 'a.test.ts', marker: 'it.skip', line: '1' }] },
+    });
+    expect(r.outcome).toBe('blocked');
+    expect(r.reason).toBe('self_suppressed_suite');
+    expect(r.detail).toContain('it.skip');
+  });
+
+  // Preservation: environmental skips (no disabledTests block) keep falling open
+  // / passing exactly as before.
+  it('all-skipped suite WITHOUT markers stays undetected (environmental skip)', () => {
+    const r = derive({ detected: false, noTestsReason: 'all_skipped', output: '' });
+    expect(r.outcome).toBe('undetected');
+  });
+
+  it('mostly-skipped pass WITHOUT markers stays pass (environmental skip)', () => {
+    const r = derive({
+      detected: true,
+      passed: true,
+      output: '',
+      coverage: { passed: 5, skipped: 1500, total: 1505 },
+    });
+    expect(r.outcome).toBe('pass');
+    expect(r.reason).toBe('suite_passed_mostly_skipped');
+  });
+
+  // Preservation: a small flaky quarantine (markers present but the suite still
+  // genuinely runs) keeps passing — does NOT meet the blocking conjunction.
+  it('small flaky quarantine with markers but a running suite stays pass', () => {
+    const r = derive({
+      detected: true,
+      passed: true,
+      output: '',
+      coverage: { passed: 1400, skipped: 3, total: 1403 },
+      disabledTests: { count: 3, markers: [{ file: 'a.test.ts', marker: 'it.skip', line: '1' }] },
+    });
+    expect(r.outcome).toBe('pass');
+  });
+
+  // The frontend BLOCK threshold mirrors the backend's 0.9 (not the looser 0.8
+  // visibility threshold): a pass at 0.85 skip ratio with markers does NOT block.
+  it('markers + a pass between the 0.8 visibility and 0.9 block thresholds does NOT block', () => {
+    const r = derive({
+      detected: true,
+      passed: true,
+      output: '',
+      coverage: { passed: 15, skipped: 85, total: 100 },
+      disabledTests: { count: 1, markers: [{ file: 'a.test.ts', marker: 'it.skip', line: '1' }] },
+    });
+    expect(r.outcome).toBe('pass');
+    // Still flagged as mostly-skipped for visibility (0.85 >= 0.8).
+    expect(r.reason).toBe('suite_passed_mostly_skipped');
+  });
 });

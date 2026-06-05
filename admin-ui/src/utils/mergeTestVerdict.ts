@@ -77,6 +77,15 @@ export interface CoverageBlock {
 // NOT block or alter the merge outcome.
 export const MOSTLY_SKIPPED_RATIO = 0.8;
 
+// The skip-ratio + minimum-total thresholds used for the BLOCKING
+// self-suppression decision. These mirror the backend's `_HEAVY_SKIP_RATIO`
+// (0.9) and `_HEAVY_SKIP_MIN_TOTAL` (10) in ci_resolution.py EXACTLY, so the
+// panel's block decision can never diverge from the gate's. (The looser
+// MOSTLY_SKIPPED_RATIO above stays the VISIBILITY-only threshold for the
+// non-blocking suite_passed_mostly_skipped note.)
+export const HEAVY_SKIP_RATIO = 0.9;
+export const HEAVY_SKIP_MIN_TOTAL = 10;
+
 // Parsed, typed view of the MERGE_TEST_RESULT artifact JSON.
 export interface MergeTestVerdict {
   detected?: boolean;
@@ -110,6 +119,7 @@ export type MergeTestReason =
   | 'suite_failed'
   | 'suite_passed'
   | 'suite_passed_mostly_skipped'
+  | 'self_suppressed_suite'
   | 'undetected';
 
 export interface MergeTestResult {
@@ -215,6 +225,46 @@ export function coverageIsMostlySkipped(coverage: CoverageBlock | null): boolean
 }
 
 /**
+ * Whether a passed suite's coverage indicates a HEAVY skip ratio (skip ratio >=
+ * HEAVY_SKIP_RATIO AND total >= HEAVY_SKIP_MIN_TOTAL). This is the BLOCKING
+ * threshold — it mirrors the backend `_heavy_skip_coverage_summary` gate
+ * exactly (0.9 ratio, min total 10), distinct from the looser visibility-only
+ * coverageIsMostlySkipped (0.8). Used only inside the self-suppression
+ * conjunction so the panel's block decision matches the gate's.
+ */
+export function coverageIsHeavilySkipped(coverage: CoverageBlock | null): boolean {
+  if (!coverage) return false;
+  if (coverage.total < HEAVY_SKIP_MIN_TOTAL || coverage.total <= 0) return false;
+  if (coverage.skipped < 0) return false;
+  return coverage.skipped / coverage.total >= HEAVY_SKIP_RATIO;
+}
+
+/**
+ * Whether a verdict's suite did not really verify anything — EITHER it ran but
+ * every test was skipped (noTestsReason === 'all_skipped', the canonical
+ * all-skipped value both sides recognize) OR it passed with a heavily-skipped
+ * coverage summary. Mirrors `_suite_is_non_verifying` in ci_resolution.py.
+ */
+export function suiteIsNonVerifying(verdict: MergeTestVerdict): boolean {
+  if (verdict.noTestsReason === 'all_skipped') return true;
+  if (verdict.passed && coverageIsHeavilySkipped(verdict.coverage)) return true;
+  return false;
+}
+
+/**
+ * Whether the PR's OWN diff made the suite stop verifying by disabling tests:
+ * a well-formed disabledTests block IS present AND the suite is non-verifying.
+ * Mirrors `pr_self_suppressed_suite` in ci_resolution.py — the BLOCKING
+ * conjunction. A few flaky tests quarantined while the suite still genuinely
+ * runs (not all/near-all skipped) does NOT meet it; nor does an environmental
+ * all-skip with no disabledTests block.
+ */
+export function prSelfSuppressedSuite(verdict: MergeTestVerdict): boolean {
+  if (!verdict.disabledTests) return false;
+  return suiteIsNonVerifying(verdict);
+}
+
+/**
  * Whether an acceptance `probe` block is a CLEAR, blocking failure: it ran, was
  * not a could-not-run degrade, and did not pass. Mirrors `probe_is_clear_failure`
  * in ci_resolution.py.
@@ -276,7 +326,28 @@ export function deriveMergeTestOutcome(verdict: MergeTestVerdict): MergeTestResu
         'Partial setup failure: one or more test runners could not run their suite (environment/setup error); the suite is only partially verified.',
     };
   }
-  // 3. No unit suite detected.
+  // 3. PR-CAUSED SELF-SUPPRESSION: the PR's own diff newly disabled tests AND
+  // the suite is now non-verifying (all-skipped, or a heavily-skipped pass).
+  // BLOCKS — higher precedence than the detected===false fall-open (the
+  // all-skipped case) and the passed->pass branch (the mostly-skipped case),
+  // so both shapes are intercepted first, mirroring ci_resolution.py.
+  if (prSelfSuppressedSuite(verdict)) {
+    const disabled = verdict.disabledTests as DisabledTestsBlock;
+    const markerList = disabled.markers
+      .map(m => `${m.marker} in ${m.file}`.trim())
+      .filter(s => s && s !== 'in')
+      .join(', ');
+    const suffix = markerList ? ` (markers: ${markerList})` : '';
+    return {
+      outcome: 'blocked',
+      reason: 'self_suppressed_suite',
+      detail:
+        `PR newly disabled ${disabled.count} test(s) and thereby self-suppressed ` +
+        `the suite — the test run no longer verifies anything (all/near-all tests ` +
+        `skipped), so the suite was made green by skipping rather than by passing${suffix}.`,
+    };
+  }
+  // 4. No unit suite detected.
   if (verdict.detected === false) {
     if (probeIsClearFailure(verdict.probe)) {
       const probe = verdict.probe as ProbeBlock;
@@ -300,7 +371,7 @@ export function deriveMergeTestOutcome(verdict: MergeTestVerdict): MergeTestResu
     }
     return { outcome: 'undetected', reason: 'undetected', detail: '' };
   }
-  // 4. A suite was detected.
+  // 5. A suite was detected.
   if (verdict.passed) {
     // Visibility only: a passing suite whose tests were mostly skipped stays a
     // PASS, but the reason distinguishes it so the panel can flag it.

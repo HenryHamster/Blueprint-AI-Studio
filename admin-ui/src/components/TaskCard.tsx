@@ -3,6 +3,7 @@ import React, { useState, useEffect, useRef, memo, forwardRef } from 'react';
 import { CheckCircle, AlertTriangle, Clock, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, ShieldCheck, Package, ArrowUpDown, Wrench, MoreHorizontal, Radio, Layers, Gauge, Compass, FileText, Copy, Check } from 'lucide-react';
 import { formatDurationMs, parseTimestamp } from '../utils/time';
 import { formatVerdict, verdictToneBadgeClass } from '../utils/verdictFormatting';
+import { humanizeUnverifiedReason } from '../utils/unverifiedReasonLabels';
 import { authGet, API_BASE_URL } from '../api';
 import { EXIT_REASON_COLORS } from '../utils/fixLoopColors';
 import { useTaskCapabilities } from '../taskCapabilities';
@@ -743,6 +744,29 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
               title={`Evaluation verdict: ${label}`}
             >
               {label}
+            </span>
+          );
+        })() : null}
+        {task.status === 'COMPLETED' && task.pr_url ? (() => {
+          if (task.unverified_merge_reason) {
+            const label = humanizeUnverifiedReason(task.unverified_merge_reason);
+            return (
+              <span
+                className="inline-flex items-center text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border bg-amber-500/10 border-amber-500/20 text-amber-400"
+                title={`Merge unverified: ${label}`}
+              >
+                <AlertTriangle className="w-3 h-3 mr-1 shrink-0" />
+                Unverified
+              </span>
+            );
+          }
+          return (
+            <span
+              className="inline-flex items-center text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border bg-emerald-500/10 border-emerald-500/20 text-emerald-400"
+              title="Merge verified by tests"
+            >
+              <ShieldCheck className="w-3 h-3 mr-1 shrink-0" />
+              Verified
             </span>
           );
         })() : null}

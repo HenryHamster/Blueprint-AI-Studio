@@ -488,20 +488,133 @@ def test_classify_verdict_disabled_tests_absence_changes_nothing():
     ) == ci_resolution.classify_merge_test_verdict(with_field) == ("pass", "")
 
 
-def test_classify_verdict_disabled_tests_pairs_with_heavy_skip_detail():
-    # When BOTH a heavy-skip coverage summary and newly-disabled tests are
-    # present, the pass detail carries both, still non-blocking.
+def test_classify_verdict_disabled_tests_pairs_with_heavy_skip_blocks():
+    # When the PR newly disabled tests AND the resulting "pass" is heavily/mostly
+    # skipped, the PR self-suppressed its own suite — this now BLOCKS (fail)
+    # rather than passing with a visibility note: the suite was made green by
+    # skipping, not by passing.
     outcome, detail = ci_resolution.classify_merge_test_verdict(
         {
             "detected": True,
             "passed": True,
             "coverage": {"passed": 5, "skipped": 1500, "total": 1505},
-            "disabledTests": {"count": 1, "markers": []},
+            "disabledTests": {
+                "count": 1,
+                "markers": [
+                    {"file": "a.test.ts", "marker": "it.skip", "line": "it.skip()"}
+                ],
+            },
+        }
+    )
+    assert outcome == "fail"
+    assert "self-suppressed" in detail
+    assert "1 test(s)" in detail
+    # The detail names the PR-introduced markers so the spawned fix task knows.
+    assert "it.skip" in detail
+    # And it routes to the block-and-fix path.
+    ci_result = ci_resolution.build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "failure"
+
+
+# ---------------------------------------------------------------------------
+# pr_self_suppressed_suite — the PR's OWN diff disabled tests AND the resulting
+# suite no longer verifies anything (all-skipped or mostly-skipped pass). This
+# is the new BLOCKING conjunction; the preservation cases keep the conservative
+# non-blocking behavior for environmental skips and small flaky quarantines.
+# ---------------------------------------------------------------------------
+def test_pr_self_suppressed_all_skipped_with_markers_blocks():
+    # detected=False + all-skipped + PR newly introduced skip markers => "fail".
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": False,
+            "noTestsReason": "all_skipped",
+            "disabledTests": {
+                "count": 2,
+                "markers": [
+                    {"file": "t_a.py", "marker": "@pytest.mark.skip", "line": "1"},
+                    {"file": "t_b.py", "marker": "@pytest.mark.skip", "line": "2"},
+                ],
+            },
+        }
+    )
+    assert outcome == "fail"
+    assert "self-suppressed" in detail
+    assert "2 test(s)" in detail
+    assert "@pytest.mark.skip" in detail
+    ci_result = ci_resolution.build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "failure"
+
+
+def test_pr_self_suppressed_predicate_conjunction():
+    # The helper fires ONLY when BOTH the disabled-tests block AND a non-verifying
+    # suite are present.
+    disabled = {"count": 1, "markers": []}
+    # Both present (all-skipped) => True.
+    assert ci_resolution.pr_self_suppressed_suite(
+        {"detected": False, "noTestsReason": "all_skipped", "disabledTests": disabled}
+    )
+    # Both present (heavy-skip pass) => True.
+    assert ci_resolution.pr_self_suppressed_suite(
+        {
+            "detected": True,
+            "passed": True,
+            "coverage": {"passed": 5, "skipped": 1500, "total": 1505},
+            "disabledTests": disabled,
+        }
+    )
+    # Non-verifying but NO disabledTests (environmental skip) => False.
+    assert not ci_resolution.pr_self_suppressed_suite(
+        {"detected": False, "noTestsReason": "all_skipped"}
+    )
+    # disabledTests present but suite genuinely runs (fully-exercised pass) => False.
+    assert not ci_resolution.pr_self_suppressed_suite(
+        {"detected": True, "passed": True, "disabledTests": disabled}
+    )
+
+
+def test_preserve_environmental_all_skipped_without_markers_falls_open():
+    # An all-skipped suite where the PR did NOT introduce the skips (no
+    # disabledTests block) MUST keep falling open as "undetected".
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {"detected": False, "noTestsReason": "all_skipped"}
+    )
+    assert outcome == "undetected"
+    assert detail == ""
+
+
+def test_preserve_environmental_heavy_skip_pass_without_markers_passes():
+    # A mostly-skipped pass with NO disabledTests block keeps passing (visibility
+    # detail only).
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "coverage": {"passed": 5, "skipped": 1500, "total": 1505},
         }
     )
     assert outcome == "pass"
-    assert "passed 5, skipped 1500 of 1505" in detail
-    assert "disables 1 test(s)" in detail
+    assert detail == "passed 5, skipped 1500 of 1505"
+
+
+def test_preserve_small_flaky_quarantine_with_markers_passes():
+    # A small flaky quarantine: a disabledTests block IS present but the suite
+    # still genuinely runs (NOT all-skipped, NOT heavy-skip). MUST keep passing
+    # with the existing visibility note.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "coverage": {"passed": 1400, "skipped": 3, "total": 1403},
+            "disabledTests": {
+                "count": 3,
+                "markers": [
+                    {"file": "a.test.ts", "marker": "it.skip", "line": "1"}
+                ],
+            },
+        }
+    )
+    assert outcome == "pass"
+    assert "disables 3 test(s)" in detail
 
 
 # ---------------------------------------------------------------------------

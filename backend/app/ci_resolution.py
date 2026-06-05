@@ -432,6 +432,35 @@ def classify_merge_test_verdict(
             "their suite (environment/setup error); the suite is only partially "
             "verified.",
         )
+    # PR-CAUSED SELF-SUPPRESSION (blocks): the PR's OWN diff newly introduced
+    # skip/disable markers (a well-formed ``disabledTests`` block) AND the
+    # resulting suite is non-verifying — either it all-skipped (every test
+    # skipped) or it "passed" with a heavy/mostly-skipped coverage summary. An
+    # agent must not be able to make a red suite green by disabling its own
+    # tests. Checked AFTER documented-command / partial-setup but BEFORE the
+    # ``detected is False`` fall-open (the all-skipped case) and BEFORE the
+    # ``passed`` branch (the mostly-skipped case), so both shapes are
+    # intercepted first. Conservative by construction: it fires ONLY on
+    # PR-introduced self-suppression of the whole/near-whole suite — an
+    # environmental all-skip (no ``disabledTests``) or a small flaky quarantine
+    # (suite still genuinely runs) does NOT meet the conjunction and keeps its
+    # existing non-blocking behavior.
+    if pr_self_suppressed_suite(verdict):
+        disabled = disabled_tests_block(verdict)
+        count = disabled["count"] if disabled else 0
+        marker_list = ", ".join(
+            f"{m['marker']} in {m['file']}".strip()
+            for m in (disabled["markers"] if disabled else [])
+            if m.get("marker") or m.get("file")
+        )
+        suffix = f" (markers: {marker_list})" if marker_list else ""
+        return (
+            "fail",
+            f"PR newly disabled {count} test(s) and thereby self-suppressed the "
+            f"suite — the test run no longer verifies anything (all/near-all "
+            f"tests skipped), so the suite was made green by skipping rather "
+            f"than by passing{suffix}.",
+        )
     if verdict.get("detected") is False:
         if probe_is_clear_failure(verdict.get("probe")):
             probe = verdict["probe"]
@@ -566,6 +595,47 @@ def disabled_tests_block(verdict: Any) -> dict[str, Any] | None:
                 }
             )
     return {"count": count, "markers": markers}
+
+
+def _suite_is_non_verifying(verdict: dict[str, Any]) -> bool:
+    """Whether a verdict's suite did not really verify anything — EITHER it ran
+    but every test was skipped (``noTestsReason`` in
+    :data:`_ALL_SKIPPED_NO_TESTS_REASONS`) OR it ``passed`` with a heavy/mostly
+    -skipped coverage summary (per :func:`_heavy_skip_coverage_summary`, the
+    same 90%-skip threshold used for the operator-visible heavy-skip note).
+
+    Read-only; does not change the merge decision on its own.
+    """
+    no_tests_reason = str(verdict.get("noTestsReason") or "").strip().lower()
+    if no_tests_reason in _ALL_SKIPPED_NO_TESTS_REASONS:
+        return True
+    if verdict.get("passed") and _heavy_skip_coverage_summary(verdict.get("coverage")):
+        return True
+    return False
+
+
+def pr_self_suppressed_suite(verdict: Any) -> bool:
+    """Whether the PR's OWN diff made the suite stop verifying by disabling tests.
+
+    True ONLY when BOTH hold:
+      (a) the PR newly introduced skip/disable markers — :func:`disabled_tests_block`
+          returns a non-``None`` block; AND
+      (b) the resulting suite is non-verifying — :func:`_suite_is_non_verifying`
+          (all-skipped, or a heavily/mostly-skipped pass).
+
+    The conjunction is deliberately narrow so it stays safe for the stabilize
+    phase: an environmental all-skip / heavy-skip where the PR did NOT introduce
+    the skips (no ``disabledTests`` block) returns False and keeps falling open /
+    passing; a small flaky quarantine where a few tests are disabled but the
+    suite still genuinely runs (not all/near-all skipped) also returns False and
+    keeps its visibility-only pass. Defensive about a missing / old-shape verdict
+    (returns False) like the other optional-block accessors.
+    """
+    if not isinstance(verdict, dict):
+        return False
+    if disabled_tests_block(verdict) is None:
+        return False
+    return _suite_is_non_verifying(verdict)
 
 
 def build_no_ci_gate_ci_result(

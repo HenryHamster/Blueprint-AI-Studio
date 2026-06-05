@@ -2642,3 +2642,101 @@ def test_orchestrator_no_ci_gate_bypass_reason_wiring():
         f"{missing}. Each reason key must match an _UNVERIFIED_REASON_LABELS "
         "entry in alert_dispatch.py; update both sides together."
     )
+
+
+# ---------------------------------------------------------------------------
+# PR-caused self-suppression: the PR's OWN diff disabled tests AND the suite
+# stopped verifying (all-skipped, or a mostly-skipped pass). The gate must BLOCK
+# and route to the existing block-and-fix path. Environmental skips and small
+# flaky quarantines (where the suite still genuinely runs) MUST be preserved.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_no_ci_pr_self_suppressed_suite_blocks_merge_and_spawns_fix(
+    db_session, mocker
+):
+    _patch_github(mocker)
+    merge_mock = mocker.patch("app.github.merge_pull_request", return_value=None)
+
+    project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    verify_task, was_created = await _spawn_pipeline_task(
+        parent, "verify_tests", db_session, PR_NUMBER, BRANCH, BASE,
+        original_task_id=str(parent.id), suppress_warm_handoff=True,
+    )
+    assert was_created is True and verify_task is not None
+
+    # The PR's own diff newly added skip markers AND the suite all-skipped: the
+    # agent emits noTestsReason='all_skipped' + a disabledTests block.
+    await _plant_verdict(
+        db_session,
+        verify_task,
+        {
+            "detected": False,
+            "passed": False,
+            "noTestsReason": "all_skipped",
+            "tests": [],
+            "output": "0 passed, 12 skipped",
+            "disabledTests": {
+                "count": 12,
+                "markers": [
+                    {"file": "tests/test_math.py", "marker": "@pytest.mark.skip", "line": "1"}
+                ],
+            },
+        },
+    )
+
+    verdict = await _latest_artifact_logs(
+        db_session, verify_task.id, ArtifactType.MERGE_TEST_RESULT
+    )
+    outcome, detail = classify_merge_test_verdict(verdict)
+    assert outcome == "fail"
+    assert "self-suppressed" in detail
+    assert "@pytest.mark.skip" in detail
+
+    ci_result = build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "failure"
+
+    parent = await db_session.get(Task, parent.id)
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    # The suite was made green by skipping → merge blocked, fix spawned.
+    merge_mock.assert_not_called()
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars().all()
+    )
+    fix_tasks = [t for t in all_tasks if t.first_payload.get("type") == "fix"]
+    assert len(fix_tasks) == 1, "self-suppressed suite must spawn exactly one fix task"
+    assert "skip" in fix_tasks[0].context["ci_failure_logs"]
+
+
+def test_no_ci_self_suppression_preservation_cases_unchanged():
+    """The conservative non-blocking behavior is preserved when the PR did NOT
+    cause the suppression: an environmental all-skip (no disabledTests block)
+    still falls open UNVERIFIED, and a small flaky quarantine where the suite
+    still genuinely runs still passes. Both keep ``conclusion='success'``."""
+    # Environmental all-skip — no disabledTests block → undetected fall-open.
+    outcome, detail = classify_merge_test_verdict(
+        {"detected": False, "passed": False, "noTestsReason": "all_skipped"}
+    )
+    assert outcome == "undetected"
+    assert build_no_ci_gate_ci_result(outcome, detail)["conclusion"] == "success"
+
+    # Small flaky quarantine — markers present but the suite still genuinely runs
+    # (fully-exercised pass) → non-blocking pass with the visibility note.
+    outcome, detail = classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "coverage": {"passed": 1400, "skipped": 3, "total": 1403},
+            "disabledTests": {"count": 3, "markers": []},
+        }
+    )
+    assert outcome == "pass"
+    assert "disables 3 test(s)" in detail
+    assert build_no_ci_gate_ci_result(outcome, detail)["conclusion"] == "success"

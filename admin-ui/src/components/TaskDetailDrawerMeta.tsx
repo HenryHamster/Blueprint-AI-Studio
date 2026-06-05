@@ -1082,6 +1082,8 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
               return "The project's own declared build command failed — the gate blocked the merge.";
             case 'probe_failed':
               return 'The acceptance probe failed: the changed code does not compile/build — the gate blocked the merge.';
+            case 'self_suppressed_suite':
+              return 'This PR disabled its own tests and thereby self-suppressed the suite — the run no longer verifies anything (all/near-all tests skipped), so the gate blocked the merge rather than accept a suite made green by skipping.';
             default:
               return v.note;
           }
@@ -1129,6 +1131,10 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         // agent found at least one newly-added skip marker.
         const disabledTests = mergeTestVerdict?.disabledTests ?? null;
         const disabledMarkers = (disabledTests?.markers ?? []).slice(0, 8);
+        // When the PR's own disabling self-suppressed the suite, the gate BLOCKS
+        // — frame the disabledTests section as the CAUSE of the block instead of
+        // the visibility-only quarantine wording.
+        const disabledTestsBlocked = mergeTestResult?.reason === 'self_suppressed_suite';
         // Stale-command self-heal: the stored test command was stale and
         // auto-detection replaced it with a real suite that actually ran.
         const recovered = mergeTestVerdict?.recovered ? mergeTestVerdict : null;
@@ -1206,8 +1212,10 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
                 <div className="flex items-start gap-2">
                   <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Disabled tests</span>
                   <div className="text-xs min-w-0 flex-1">
-                    <p className="text-amber-400 font-semibold break-words">
-                      ⚠ This PR disables {disabledTests.count} test{disabledTests.count === 1 ? '' : 's'} — newly added skip/ignore markers (visibility only; does not block the merge).
+                    <p className={`font-semibold break-words ${disabledTestsBlocked ? 'text-red-400' : 'text-amber-400'}`}>
+                      {disabledTestsBlocked
+                        ? `⚠ This PR disables ${disabledTests.count} test${disabledTests.count === 1 ? '' : 's'} — newly added skip/ignore markers that self-suppressed the suite; this is the cause of the merge block.`
+                        : `⚠ This PR disables ${disabledTests.count} test${disabledTests.count === 1 ? '' : 's'} — newly added skip/ignore markers (visibility only; does not block the merge).`}
                     </p>
                     {disabledMarkers.length > 0 && (
                       <ul className="mt-1 space-y-0.5">
