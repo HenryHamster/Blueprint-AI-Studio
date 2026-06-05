@@ -1682,11 +1682,19 @@ export async function killComputeJob(jobId: string): Promise<ComputeJob> {
 // --- Knowledge documents (durable, queryable home for web_research output) ---
 
 /** A single knowledge document. List responses omit `body`; get-by-id includes it. */
-/** Codebase-grounding probe detail (design docs only; absent for web_research). */
+/**
+ * Citation-grounding probe detail, present for BOTH knowledge kinds when the
+ * agent stamped a grounding result (absent only for older / un-probed docs):
+ * for `design` the counts are file-reference citations resolved against the
+ * repo; for `web_research` they are cited URLs probed for reachability. The
+ * field names are shared across both kinds — `file_citations` is the number of
+ * citations checked, `grounded` the number confirmed (resolved files / reachable
+ * URLs).
+ */
 export interface KnowledgeGroundingProbe {
   file_citations: number;
   grounded: number;
-  /** File-reference citation strings that did NOT resolve to real repo paths. */
+  /** Citation strings that did NOT ground: absent repo paths / dead URLs. */
   unresolved: string[];
 }
 

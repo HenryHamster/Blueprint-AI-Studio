@@ -345,6 +345,10 @@ _UNVERIFIED_REASON_LABELS = {
         "no unit suite ran and the acceptance probe could not run "
         "(missing deps/unprovisioned setup)"
     ),
+    "probe_no_artifact": (
+        "no unit suite ran; the declared build command exited cleanly but "
+        "produced no artifact (possible no-op build) — not real verification"
+    ),
     "documented_command_could_not_run": (
         "a command the PR introduced/documented could not be run "
         "(missing deps/unprovisioned setup) -- claim unverified"

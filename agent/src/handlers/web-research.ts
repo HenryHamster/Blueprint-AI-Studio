@@ -47,6 +47,162 @@ function captureGitProvenance(): Record<string, string> {
   }
 }
 
+// ── Web-citation reachability grounding ───────────────────────────────────────
+//
+// Symmetric to design.ts groundDesignCitations, but for the EXTERNAL web URLs a
+// web_research document cites: it probes each http(s) citation for reachability
+// and stamps the SAME `_citation_grounding` shape the backend/frontend already
+// consume ({file_citations, grounded, checked, unresolved}). Here `file_citations`
+// means the number of web citations CHECKED. design.ts owns file/path citations;
+// this owns web URLs — the two never overlap.
+//
+// Reachability policy errs HARD toward acceptance so a document is never
+// false-failed for an environment problem:
+//   - Only http/https citations are probed (file:/path refs are design's domain).
+//   - UNRESOLVED only on a clear not-found: DNS resolution failure (ENOTFOUND) or
+//     a definitive 404/410.
+//   - GROUNDED (benefit of the doubt) for any 2xx/3xx, 403, 429, any 5xx,
+//     timeouts, and non-DNS transport errors.
+//   - Connectivity guard: a control request to a known-good host runs first; if
+//     it fails, outbound connectivity is unavailable and we DEGRADE to
+//     `checked: false` (the backend treats an unchecked stamp as a pass).
+//   - Bounded: at most the first ~12 citations are checked, each with a short
+//     per-request timeout; over-cap citations are simply not counted.
+
+// Cap on the number of web citations probed — keep the work bounded and cheap.
+const MAX_WEB_CITATIONS = 12;
+// Per-request timeout. Probes run concurrently, so the wall-clock for the whole
+// batch is bounded by roughly this value (plus one control request).
+const PROBE_TIMEOUT_MS = 3000;
+// Known-good control hosts. If NONE return any HTTP status, we have no outbound
+// connectivity and must not stamp a checked grounding.
+const CONTROL_URLS = ['https://www.google.com', 'https://example.com'];
+
+type FetchImpl = typeof globalThis.fetch;
+
+// Outcome of a single fetch attempt: a real HTTP status, or a transport-layer
+// error split into DNS-resolution failure (a clear not-found) vs everything else
+// (ambiguous — treated as reachable).
+type AttemptResult = { status: number } | { error: 'dns' | 'transport' };
+
+// True when the thrown error indicates DNS resolution failure (NXDOMAIN). Node's
+// fetch wraps the underlying error under `.cause`, so check both levels. Only
+// ENOTFOUND counts — EAI_AGAIN ("try again") is a transient/no-network signal we
+// must NOT treat as a dead host (the connectivity guard handles no-network).
+function isDnsFailure(err: unknown): boolean {
+  const codes: unknown[] = [];
+  if (err && typeof err === 'object') {
+    codes.push((err as { code?: unknown }).code);
+    const cause = (err as { cause?: unknown }).cause;
+    if (cause && typeof cause === 'object') {
+      codes.push((cause as { code?: unknown }).code);
+    }
+  }
+  return codes.includes('ENOTFOUND');
+}
+
+// One bounded fetch attempt with the given method. Never throws — classifies the
+// outcome into a status or a transport/dns error.
+async function attemptFetch(
+  url: string, method: 'HEAD' | 'GET', fetchImpl: FetchImpl, timeoutMs: number,
+): Promise<AttemptResult> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => { controller.abort(); }, timeoutMs);
+  try {
+    const res = await fetchImpl(url, { method, redirect: 'follow', signal: controller.signal });
+    return { status: res.status };
+  } catch (err) {
+    return { error: isDnsFailure(err) ? 'dns' : 'transport' };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Probe a single web URL. Returns true when the citation is GROUNDED (reachable
+// or ambiguous), false only on a clear not-found (DNS failure or 404/410).
+// HEAD-first with a GET fallback when HEAD is unsupported (405/501) or reports a
+// not-found (some servers/CDNs misreport HEAD).
+async function probeWebCitation(
+  url: string, fetchImpl: FetchImpl, timeoutMs: number,
+): Promise<boolean> {
+  const head = await attemptFetch(url, 'HEAD', fetchImpl, timeoutMs);
+  if ('error' in head) return head.error !== 'dns'; // dns = dead; other transport = benefit of doubt
+  const notFound = (s: number) => s === 404 || s === 410;
+  if (notFound(head.status) || head.status === 405 || head.status === 501) {
+    const get = await attemptFetch(url, 'GET', fetchImpl, timeoutMs);
+    if ('error' in get) return get.error !== 'dns';
+    return !notFound(get.status);
+  }
+  return true; // any 2xx/3xx/403/429/5xx — grounded by policy
+}
+
+// True when outbound connectivity is available: at least one control host
+// returns ANY HTTP status (even a 404 proves we reached a server). When every
+// control attempt errors at the transport layer, we are offline.
+async function hasConnectivity(fetchImpl: FetchImpl, timeoutMs: number): Promise<boolean> {
+  for (const url of CONTROL_URLS) {
+    const r = await attemptFetch(url, 'HEAD', fetchImpl, timeoutMs);
+    if (!('error' in r)) return true;
+  }
+  return false;
+}
+
+// Ground a web_research document's http(s) citations by probing reachability and
+// stamp `_citation_grounding` onto the document IN PLACE (mirrors
+// groundDesignCitations). Fail-soft: any unexpected error, or an offline VM,
+// degrades to `checked: false` so the document is NEVER failed for an
+// environment problem. `fetchImpl` is injectable for deterministic tests and
+// defaults to the runtime global fetch.
+export async function groundWebCitations(
+  document: Record<string, unknown>, fetchImpl: FetchImpl = globalThis.fetch,
+): Promise<Record<string, unknown>> {
+  try {
+    const cites = Array.isArray(document.source_citations) ? document.source_citations : [];
+    const urls: string[] = [];
+    for (const raw of cites) {
+      if (typeof raw !== 'string') continue;
+      const text = raw.trim();
+      if (!/^https?:\/\//i.test(text)) continue; // file:/path refs are design's domain
+      urls.push(text);
+      if (urls.length >= MAX_WEB_CITATIONS) break; // cap — over-cap not counted
+    }
+    if (urls.length === 0) {
+      document._citation_grounding = {
+        file_citations: 0, grounded: 0, checked: true, unresolved: [],
+      };
+      return document;
+    }
+    if (!(await hasConnectivity(fetchImpl, PROBE_TIMEOUT_MS))) {
+      // No outbound connectivity — degrade to not-checked rather than false-fail.
+      document._citation_grounding = {
+        file_citations: urls.length, grounded: 0, checked: false, unresolved: [],
+      };
+      return document;
+    }
+    // Probe concurrently so total wall-clock is bounded by the per-request
+    // timeout rather than the sum across citations.
+    const verdicts = await Promise.all(
+      urls.map((u) => probeWebCitation(u, fetchImpl, PROBE_TIMEOUT_MS)),
+    );
+    let grounded = 0;
+    const unresolved: string[] = [];
+    urls.forEach((u, i) => {
+      if (verdicts[i]) grounded += 1;
+      else unresolved.push(u); // the offending URL, as written
+    });
+    document._citation_grounding = {
+      file_citations: urls.length, grounded, checked: true, unresolved,
+    };
+    return document;
+  } catch {
+    // Unexpected failure — degrade to not-checked; never crash the handler.
+    document._citation_grounding = {
+      file_citations: 0, grounded: 0, checked: false, unresolved: [],
+    };
+    return document;
+  }
+}
+
 // A single knowledge-document summary as returned by the agent-facing list
 // endpoint (GET /api/agent/knowledge-documents). The list shape omits the
 // markdown body; only id/title/summary/topic/tags are present.
@@ -226,6 +382,10 @@ ${DEFAULT_TOOL_GUIDANCE}`;
   // provenance must travel inside the document, not as a sibling status field.
   const provenance = captureGitProvenance();
   if (document) {
+    // Ground the document's web-URL citations by probing reachability before
+    // emitting, so the backend persists which cited URLs are dead. Symmetric to
+    // design's file-citation grounding; fail-soft and never blocks completion.
+    await groundWebCitations(document);
     logs = sanitize(JSON.stringify({ ...document, ...provenance }));
   } else {
     logs = sanitize(lastResultText || allOutput.slice(-50_000));

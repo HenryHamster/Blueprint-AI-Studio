@@ -523,6 +523,14 @@ def classify_unverified_fall_open_reason(
     The probe signal takes precedence over the all-skipped phrasing because it is
     the stronger execution evidence we have for this fall-open.
 
+    Declared-build no-op refinement: when the PASSED probe ran the project's OWN
+    declared ``build_cmd`` and the agent confidently observed (via the additive
+    ``wrote_no_artifact`` flag) that it exited 0 yet wrote no output to the fresh
+    PR-head clone, return ``("declared build ran but emitted no artifact (...)",
+    "probe_no_artifact")`` instead of the confident ``probe_passed`` phrasing — a
+    no-op build does not honestly "build the deliverable". An absent / false flag
+    (older agent, or an ambiguous/unobservable tree) keeps ``probe_passed`` exactly.
+
     Documented-command probe: when the merge falls open and a
     ``documentedCommands`` block is present (a command the PR INTRODUCES or
     DOCUMENTS), surface DISTINCT operator-visible reason keys —
@@ -584,6 +592,28 @@ def classify_unverified_fall_open_reason(
                 )
             if probe.get("passed") is True:
                 if declared:
+                    # Honest refinement of the declared-build fall-open: a
+                    # declared build that exited 0 but — per the agent's
+                    # ``wrote_no_artifact`` observation — wrote NOTHING to the
+                    # fresh PR-head clone is a likely no-op build (an empty
+                    # Makefile recipe, a script that silently does nothing, a
+                    # generator that writes nowhere). The build's result IS the
+                    # deliverable, so "exited 0 yet emitted no artifact" makes the
+                    # confident "deliverable builds" phrasing dishonest. Distinct
+                    # phrase + stable key. The agent sets the flag ONLY when it
+                    # confidently observed the tree; an absent / false flag (an
+                    # older agent, or an ambiguous/unobservable tree) keeps
+                    # today's ``probe_passed`` behaviour byte-for-byte — the new
+                    # reason is never emitted on uncertainty.
+                    if probe.get("wrote_no_artifact") is True:
+                        phrase = (
+                            f"declared build ran but emitted no artifact ({label}) "
+                            "— possible no-op build"
+                            if label
+                            else "declared build ran but emitted no artifact "
+                            "(possible no-op build)"
+                        )
+                        return (phrase, "probe_no_artifact")
                     phrase = (
                         f"declared build command passed ({label})"
                         if label

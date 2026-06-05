@@ -10,6 +10,7 @@ import { resolveBuildConfig } from '../build-config.js';
 import {
   detectTestRunners, detectAutoTestRunners, describeRunnerDirectory,
   detectAcceptanceProbes, classifyProbeOutcome, detectProvisioningSteps,
+  buildWroteNewOutput,
   discoverDocumentedCommands, runnerFromCommand, MAX_DOCUMENTED_COMMANDS,
   type BuildConfig, type TestRunner, type AcceptanceProbe, type DocumentedCommand,
 } from '../utils/test-runners.js';
@@ -82,6 +83,14 @@ interface VerifyTestsResult {
     // operator's authoritative build) rather than a generic ecosystem compile
     // check. The backend surfaces declared-vs-generic wording from this flag.
     declared?: boolean;
+    // ADDITIVE honesty signal, set ONLY for a PASSED declared build probe whose
+    // working tree we could confidently observe before AND after the build: true
+    // when the build exited 0 yet wrote NO new output to the fresh PR-head clone
+    // (a likely no-op build — empty recipe / silent script / generator that
+    // writes nowhere). Left UNSET when observation failed or was ambiguous (git
+    // unavailable, tree unobservable) so the backend degrades to ``probe_passed``
+    // rather than emitting the no-op reason on uncertainty.
+    wrote_no_artifact?: boolean;
   };
   // Diff-aware probe of commands the PR INTRODUCES or DOCUMENTS — a newly added
   // package.json script, a newly added Makefile/justfile/Taskfile target, a
@@ -155,6 +164,30 @@ async function runVerifyLoop(
 // A small per-run budget caps total probe processes.
 const MAX_ACCEPTANCE_PROBES = 4;
 
+// Bounded timeout for the cheap working-tree snapshot taken around a declared
+// build probe. `git status` is fast even on a large clone; cap it so a wedged
+// git invocation cannot stall the gate — on timeout/error we simply leave the
+// no-artifact flag unset (degrade to probe_passed).
+const WORKING_TREE_SNAPSHOT_TIMEOUT = 30_000;
+
+// Snapshot the cloned working tree as a `git status --porcelain --ignored`
+// string so a before/after diff around a DECLARED build probe can detect a
+// no-op build that exits 0 yet writes nothing. `--ignored` is included so build
+// output landing in a gitignored directory still counts as an artifact. Returns
+// null when the tree cannot be confidently observed (git unavailable, not a
+// repo, snapshot errored/timed out) — the caller then leaves wrote_no_artifact
+// unset and the backend keeps today's probe_passed reason. CPU-cheap + bounded.
+async function snapshotWorkingTree(cwd: string): Promise<string | null> {
+  try {
+    return await execFileAsync(
+      'git', ['status', '--porcelain', '--ignored'],
+      { cwd, timeoutMs: WORKING_TREE_SNAPSHOT_TIMEOUT },
+    );
+  } catch {
+    return null;
+  }
+}
+
 // Run the detected acceptance probe(s) for the cloned workspace and reduce them
 // to a single verdict. Fail-fast: a clear compile/build FAILURE on ANY probe
 // blocks (returns immediately). Otherwise a single clean PASS wins over a
@@ -170,10 +203,22 @@ async function runAcceptanceProbe(
     return undefined;
   }
   let firstPass: AcceptanceProbe | null = null;
+  // The no-op observation for the winning declared PASS probe: undefined =
+  // not confidently observed (degrade to probe_passed); boolean = observed.
+  let firstPassWroteNoArtifact: boolean | undefined;
   let firstCouldNotRun: AcceptanceProbe | null = null;
   for (const probe of probes) {
     let outcome: 'pass' | 'fail' | 'could_not_run';
     let output = '';
+    // For a DECLARED build that could still WIN the probe verdict (no earlier
+    // pass yet), snapshot the (already prepped) tree BEFORE the build runs so a
+    // clean exit that wrote nothing can be distinguished from a real build.
+    // Generic compile probes and already-superseded probes are untouched. A
+    // failed snapshot leaves the observation unavailable (flag stays unset →
+    // probe_passed).
+    const before = probe.declared && firstPass === null
+      ? await snapshotWorkingTree(probe.cwd)
+      : null;
     const timeoutMs = probe.declared ? DECLARED_BUILD_TIMEOUT : GENERIC_PROBE_TIMEOUT;
     try {
       await execFileAsync(probe.cmd, probe.args, { cwd: probe.cwd, timeoutMs });
@@ -194,7 +239,21 @@ async function runAcceptanceProbe(
         declared: Boolean(probe.declared),
       };
     }
-    if (outcome === 'pass' && firstPass === null) firstPass = probe;
+    if (outcome === 'pass' && firstPass === null) {
+      firstPass = probe;
+      // Only a DECLARED build with BOTH snapshots observed yields a confident
+      // no-op signal; anything else leaves the flag unset.
+      if (probe.declared && before !== null) {
+        const after = await snapshotWorkingTree(probe.cwd);
+        if (after !== null) {
+          const wroteSomething = buildWroteNewOutput(before, after);
+          firstPassWroteNoArtifact = !wroteSomething;
+          if (!wroteSomething) {
+            sendLog(ws, `Acceptance probe [${probe.label}]: declared build exited cleanly but wrote no new output — possible no-op build.\n`);
+          }
+        }
+      }
+    }
     if (outcome === 'could_not_run' && firstCouldNotRun === null) firstCouldNotRun = probe;
   }
   if (firstPass !== null) {
@@ -202,6 +261,9 @@ async function runAcceptanceProbe(
       ran: true, ecosystem: firstPass.ecosystem, outcome: 'pass',
       passed: true, could_not_run: false, output: '', label: firstPass.label,
       declared: Boolean(firstPass.declared),
+      ...(firstPassWroteNoArtifact !== undefined
+        ? { wrote_no_artifact: firstPassWroteNoArtifact }
+        : {}),
     };
   }
   const cnr = firstCouldNotRun as AcceptanceProbe;
@@ -229,7 +291,9 @@ async function attachAcceptanceProbe(
     if (probe.outcome === 'fail') {
       note = `We ran your declared build command \`${probe.label}\` and it FAILED — the declared build did not succeed; blocking the merge.`;
     } else if (probe.outcome === 'pass') {
-      note = `We ran your declared build command \`${probe.label}\` and it passed — your declared build succeeds (cheap goal-level signal; unit suite still absent/thin).`;
+      note = probe.wrote_no_artifact === true
+        ? `We ran your declared build command \`${probe.label}\` and it exited cleanly but wrote no artifact — possible no-op build (cheap goal-level signal; unit suite still absent/thin).`
+        : `We ran your declared build command \`${probe.label}\` and it passed — your declared build succeeds (cheap goal-level signal; unit suite still absent/thin).`;
     } else {
       note = `We ran your declared build command \`${probe.label}\` but it could not run — missing deps / unprovisioned setup; falling open without a probe block.`;
     }

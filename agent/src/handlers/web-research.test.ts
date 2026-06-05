@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 vi.mock('../index.js', () => ({
@@ -42,7 +42,7 @@ vi.mock('child_process', () => ({
 }));
 
 // ── Imports under test ────────────────────────────────────────────────────────
-import { handleWebResearch } from './web-research.js';
+import { handleWebResearch, groundWebCitations } from './web-research.js';
 import { runClaudeCode, persistAndPostStatus, readHandlerOutput, apiGet } from '../index.js';
 import { configureAgentPermissions } from '../prompt.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
@@ -74,6 +74,13 @@ describe('handleWebResearch', () => {
     } as Awaited<ReturnType<typeof runClaudeCode>>);
     vi.mocked(readHandlerOutput).mockReturnValue(null);
     vi.mocked(apiGet).mockResolvedValue({ documents: [] });
+    // Default deterministic global fetch so the handler's web-citation grounding
+    // step never reaches the real network (every probe sees a reachable 200).
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status: 200 } as Response));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it('builds a web-first prompt with WebSearch/WebFetch and the document key cues', async () => {
@@ -153,6 +160,10 @@ describe('handleWebResearch', () => {
     expect(parsed.title).toBe(VALID_DOCUMENT.title);
     expect(parsed.body).toBe(VALID_DOCUMENT.body);
     expect(parsed.source_citations).toEqual(VALID_DOCUMENT.source_citations);
+    // The serialized document carries the web-citation grounding stamp (the one
+    // https citation probed reachable via the default fetch stub).
+    const grounding = (parsed as Record<string, unknown>)._citation_grounding as Record<string, unknown>;
+    expect(grounding).toMatchObject({ file_citations: 1, grounded: 1, checked: true, unresolved: [] });
     // No artifact_type on the success path — the backend completion handler is
     // the sole writer of the durable KnowledgeDocument.
     expect(payload.artifact_type).toBeUndefined();
@@ -290,5 +301,154 @@ describe('handleWebResearch', () => {
     expect(payload.status).toBe('FAILED');
     expect(payload.failure_category).toBe('claude_code_failed');
     expect(payload.artifact_type).toBe('ERROR_LOG');
+  });
+});
+
+// ── groundWebCitations (web-URL reachability grounding) ───────────────────────
+
+// A DNS NXDOMAIN error as Node's fetch surfaces it (code on the error, or nested
+// under `.cause`).
+function dnsError(): Error {
+  return Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND' });
+}
+
+// Build a fake fetch that maps a URL to either a status (a response) or an Error
+// (a transport failure). Control hosts (google/example) default to 200 so the
+// connectivity guard passes unless a test overrides them.
+function fakeFetch(map: (url: string, method: string) => { status: number } | Error) {
+  return vi.fn((url: string | URL, opts?: { method?: string }) => {
+    const u = String(url);
+    const r = map(u, opts?.method ?? 'GET');
+    if (r instanceof Error) return Promise.reject(r);
+    return Promise.resolve(r as unknown as Response);
+  }) as unknown as typeof globalThis.fetch;
+}
+
+const CONTROL_OK = (url: string): { status: number } | null =>
+  url.includes('www.google.com') || url.includes('example.com') ? { status: 200 } : null;
+
+describe('groundWebCitations', () => {
+  it('stamps all reachable URLs as grounded with an empty unresolved list', async () => {
+    const doc: Record<string, unknown> = {
+      source_citations: ['https://a.example.org/x', 'https://b.example.org/y'],
+    };
+    const fetchImpl = fakeFetch((url) => CONTROL_OK(url) ?? { status: 200 });
+
+    await groundWebCitations(doc, fetchImpl);
+
+    expect(doc._citation_grounding).toEqual({
+      file_citations: 2, grounded: 2, checked: true, unresolved: [],
+    });
+  });
+
+  it('lists a definitively-dead (404/410) URL as unresolved', async () => {
+    const dead = 'https://a.example.org/missing';
+    const live = 'https://b.example.org/ok';
+    const doc: Record<string, unknown> = { source_citations: [dead, live] };
+    const fetchImpl = fakeFetch((url) => {
+      const c = CONTROL_OK(url);
+      if (c) return c;
+      return url === dead ? { status: 404 } : { status: 200 };
+    });
+
+    await groundWebCitations(doc, fetchImpl);
+
+    expect(doc._citation_grounding).toEqual({
+      file_citations: 2, grounded: 1, checked: true, unresolved: [dead],
+    });
+  });
+
+  it('marks a DNS-resolution failure (ENOTFOUND) as unresolved', async () => {
+    const dead = 'https://nonexistent.invalid/page';
+    const doc: Record<string, unknown> = { source_citations: [dead] };
+    const fetchImpl = fakeFetch((url) => CONTROL_OK(url) ?? dnsError());
+
+    await groundWebCitations(doc, fetchImpl);
+
+    expect(doc._citation_grounding).toEqual({
+      file_citations: 1, grounded: 0, checked: true, unresolved: [dead],
+    });
+  });
+
+  it('treats bot-hostile statuses (403/429/5xx) as grounded, not unresolved', async () => {
+    const cites = ['https://h1/forbidden', 'https://h2/ratelimited', 'https://h3/down'];
+    const doc: Record<string, unknown> = { source_citations: cites };
+    const statuses: Record<string, number> = {
+      'https://h1/forbidden': 403, 'https://h2/ratelimited': 429, 'https://h3/down': 503,
+    };
+    const fetchImpl = fakeFetch((url) => CONTROL_OK(url) ?? { status: statuses[url] });
+
+    await groundWebCitations(doc, fetchImpl);
+
+    expect(doc._citation_grounding).toEqual({
+      file_citations: 3, grounded: 3, checked: true, unresolved: [],
+    });
+  });
+
+  it('ignores file:/path-style citations (not counted toward file_citations)', async () => {
+    const doc: Record<string, unknown> = {
+      source_citations: ['file:backend/app/x.py', 'docs/notes.md', 'https://web.example/only'],
+    };
+    const fetchImpl = fakeFetch((url) => CONTROL_OK(url) ?? { status: 200 });
+
+    await groundWebCitations(doc, fetchImpl);
+
+    // Only the single https citation is checked; non-http refs are design's domain.
+    expect(doc._citation_grounding).toEqual({
+      file_citations: 1, grounded: 1, checked: true, unresolved: [],
+    });
+  });
+
+  it('falls back to GET when HEAD is unsupported (405) and grounds on the GET status', async () => {
+    const url = 'https://head-hostile.example/resource';
+    const doc: Record<string, unknown> = { source_citations: [url] };
+    const fetchImpl = fakeFetch((u, method) => {
+      const c = CONTROL_OK(u);
+      if (c) return c;
+      return method === 'HEAD' ? { status: 405 } : { status: 200 };
+    });
+
+    await groundWebCitations(doc, fetchImpl);
+
+    expect(doc._citation_grounding).toEqual({
+      file_citations: 1, grounded: 1, checked: true, unresolved: [],
+    });
+  });
+
+  it('degrades to checked:false when there is no outbound connectivity (never false-fails)', async () => {
+    const doc: Record<string, unknown> = {
+      source_citations: ['https://a.example/x', 'https://b.example/y'],
+    };
+    // EVERY request (including the control hosts) throws a transport error.
+    const fetchImpl = fakeFetch(() => new Error('ECONNREFUSED'));
+
+    await groundWebCitations(doc, fetchImpl);
+
+    expect(doc._citation_grounding).toEqual({
+      file_citations: 2, grounded: 0, checked: false, unresolved: [],
+    });
+  });
+
+  it('stamps checked:true with empty counts when there are no web citations', async () => {
+    const doc: Record<string, unknown> = { source_citations: ['file:only/local.py'] };
+    const fetchImpl = fakeFetch((url) => CONTROL_OK(url) ?? { status: 200 });
+
+    await groundWebCitations(doc, fetchImpl);
+
+    expect(doc._citation_grounding).toEqual({
+      file_citations: 0, grounded: 0, checked: true, unresolved: [],
+    });
+  });
+
+  it('caps the number of probed citations and does not count over-cap URLs', async () => {
+    const cites = Array.from({ length: 15 }, (_, i) => `https://h${i}.example/p`);
+    const doc: Record<string, unknown> = { source_citations: cites };
+    const fetchImpl = fakeFetch((url) => CONTROL_OK(url) ?? { status: 200 });
+
+    await groundWebCitations(doc, fetchImpl);
+
+    const grounding = doc._citation_grounding as { file_citations: number; grounded: number };
+    expect(grounding.file_citations).toBe(12);
+    expect(grounding.grounded).toBe(12);
   });
 });

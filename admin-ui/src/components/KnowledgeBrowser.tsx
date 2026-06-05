@@ -82,9 +82,10 @@ function VerdictBadge({ verdict }: { verdict: KnowledgeForwardQualityVerdict | n
 
 /**
  * Acceptance-probe detail behind the verdict badge: how well the document is
- * grounded (design docs) and whether it cleared the topic-responsiveness probe.
+ * grounded in its citations (resolved file references for design, reachable URLs
+ * for web_research) and whether it cleared the topic-responsiveness probe.
  * Purely observational — degrades to nothing when no probe detail is persisted
- * (web_research docs lack grounding; pre-probe documents lack the whole blob).
+ * (older / un-probed documents lack the whole blob).
  */
 function ProbeDetail({ verdict }: { verdict: KnowledgeForwardQualityVerdict | null }) {
   const probes = verdict?.probes;
@@ -93,7 +94,8 @@ function ProbeDetail({ verdict }: { verdict: KnowledgeForwardQualityVerdict | nu
   const topic = probes.topic_responsiveness;
   if (!grounding && !topic) return null;
 
-  // A document is weakly grounded when it has file citations but few resolve.
+  // A document is weakly grounded when it has citations but few resolve
+  // (unresolved file references for design, unreachable URLs for web_research).
   const weaklyGrounded =
     !!grounding && grounding.file_citations > 0 && grounding.grounded < grounding.file_citations;
 
@@ -105,7 +107,7 @@ function ProbeDetail({ verdict }: { verdict: KnowledgeForwardQualityVerdict | nu
           <div className="flex items-center gap-1.5">
             {weaklyGrounded ? <XCircle className="w-3 h-3 text-amber-400 shrink-0" /> : <CheckCircle className="w-3 h-3 text-emerald-400 shrink-0" />}
             <span className={weaklyGrounded ? 'text-amber-400 font-medium' : 'text-neutral-300'}>
-              Grounded {grounding.grounded} of {grounding.file_citations} file citation{grounding.file_citations === 1 ? '' : 's'}
+              Grounded {grounding.grounded} of {grounding.file_citations} citation{grounding.file_citations === 1 ? '' : 's'}
             </span>
           </div>
           {grounding.unresolved.length > 0 && (

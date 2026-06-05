@@ -793,6 +793,36 @@ export interface AcceptanceProbe {
   declared?: boolean;
 }
 
+/**
+ * Compare two `git status --porcelain --ignored` snapshots (each the raw stdout
+ * string of one observation) and report whether the AFTER snapshot contains at
+ * least one status line not present BEFORE — i.e. the build wrote something
+ * (a new untracked/ignored file, or a modification to a tracked one).
+ *
+ * Used by the no-CI merge gate's DECLARED build probe to tell a genuine build
+ * apart from a no-op one (an empty Makefile recipe, a script that silently does
+ * nothing) that exits 0 yet emits no artifact. A bare "tree is empty" check
+ * would false-positive on pre-existing warm-VM cache directories (node_modules,
+ * .vitest_cache, .pnpm-store, .testmondata) that survive `git clean -fdx` and
+ * already show up as ignored entries; a before/after DIFF ignores those because
+ * they appear identically in BOTH snapshots. Returns false only when AFTER
+ * introduces no new line relative to BEFORE (the build wrote nothing new).
+ */
+export function buildWroteNewOutput(before: string, after: string): boolean {
+  const lines = (s: string): Set<string> =>
+    new Set(
+      s
+        .split('\n')
+        .map(line => line.replace(/\r$/, ''))
+        .filter(line => line.trim().length > 0),
+    );
+  const beforeLines = lines(before);
+  for (const line of lines(after)) {
+    if (!beforeLines.has(line)) return true;
+  }
+  return false;
+}
+
 // Hard cap on probes emitted so a large monorepo cannot fan out an unbounded
 // set of probe processes. The handler additionally slices to a small per-run
 // budget (see verify-tests.ts).

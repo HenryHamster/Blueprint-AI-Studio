@@ -86,7 +86,7 @@ function lastPostedPayload(): Record<string, unknown> {
 type Probe = {
   ran: boolean; ecosystem: string; outcome: string;
   passed: boolean; could_not_run: boolean; output: string; label: string;
-  declared?: boolean;
+  declared?: boolean; wrote_no_artifact?: boolean;
 };
 function parsedVerdict(): {
   detected: boolean; passed: boolean; tests: unknown[]; output: string;
@@ -526,6 +526,66 @@ describe('handleVerifyTests', () => {
     expect(verdict.probe?.passed).toBe(true);
     expect(verdict.probe?.declared).toBe(true);
     expect(verdict.output).toContain('declared build command `npm run build (admin-ui)`');
+  });
+
+  // Distinguish the git working-tree snapshot calls from the build command so a
+  // test can simulate a real build (tree changes) vs a no-op build (tree static).
+  function mockProbeWithTree(before: string, after: string): void {
+    let gitCalls = 0;
+    vi.mocked(execFileAsync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'git') {
+        gitCalls += 1;
+        return Promise.resolve(gitCalls === 1 ? before : after);
+      }
+      return Promise.resolve(''); // the declared build exits 0
+    });
+  }
+
+  it('no suite + declared build PASSES but wrote NOTHING → wrote_no_artifact flag + no-op wording', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([]);
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([DECLARED_PROBE]);
+    // before === after: the build wrote no new output (no-op build).
+    mockProbeWithTree('!! node_modules/\n', '!! node_modules/\n');
+
+    await handleVerifyTests('noop1', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.probe?.passed).toBe(true);
+    expect(verdict.probe?.declared).toBe(true);
+    expect(verdict.probe?.wrote_no_artifact).toBe(true);
+    expect(verdict.output).toContain('wrote no artifact');
+  });
+
+  it('no suite + declared build PASSES and wrote output → wrote_no_artifact false, normal wording', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([]);
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([DECLARED_PROBE]);
+    // after has a NEW untracked artifact relative to before → real build.
+    mockProbeWithTree('!! node_modules/\n', '!! node_modules/\n?? dist/bundle.js\n');
+
+    await handleVerifyTests('real1', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.probe?.passed).toBe(true);
+    expect(verdict.probe?.wrote_no_artifact).toBe(false);
+    expect(verdict.output).toContain('declared build command `npm run build (admin-ui)` and it passed');
+  });
+
+  it('no suite + declared build PASSES but tree unobservable (git fails) → flag unset', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([]);
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([DECLARED_PROBE]);
+    // git snapshot rejects (not a repo / git unavailable); build still exits 0.
+    vi.mocked(execFileAsync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'git') return Promise.reject(new Error('not a git repository'));
+      return Promise.resolve('');
+    });
+
+    await handleVerifyTests('unobs1', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.probe?.passed).toBe(true);
+    // Observation unavailable → flag must be UNSET so the backend keeps probe_passed.
+    expect(verdict.probe?.wrote_no_artifact).toBeUndefined();
+    expect(verdict.output).toContain('declared build command `npm run build (admin-ui)` and it passed');
   });
 
   it('no suite + declared build FAILS (clean non-zero) → probe.passed=false (backend blocks)', async () => {

@@ -14,7 +14,7 @@ import {
   detectTestRunners, detectAutoTestRunners, describeRunnerDirectory,
   classifySetupFailure, classifyTestExecution,
   matchesEnvironmentFailureSignature,
-  detectAcceptanceProbes, classifyProbeOutcome,
+  detectAcceptanceProbes, classifyProbeOutcome, buildWroteNewOutput,
   isSafeDocumentedCommand, isAllowlistedRunnerShape, discoverDocumentedCommands,
   MAX_DOCUMENTED_COMMANDS,
 } from './test-runners.js';
@@ -1990,6 +1990,41 @@ describe('matchesEnvironmentFailureSignature — env/setup failure detection', (
     expect(matchesEnvironmentFailureSignature(
       "FAILED test_oom.py::test_msg - AssertionError: expected 'out of memory: kill'\n1 failed in 0.02s",
     )).toBe(false);
+  });
+});
+
+// ── buildWroteNewOutput (no-op declared-build detection) ─────────────────────
+describe('buildWroteNewOutput', () => {
+  it('returns false when before and after snapshots are identical (no-op build)', () => {
+    const snap = '!! node_modules/\n!! .vitest_cache/\n';
+    expect(buildWroteNewOutput(snap, snap)).toBe(false);
+  });
+
+  it('returns false for two empty snapshots (clean tree, nothing written)', () => {
+    expect(buildWroteNewOutput('', '')).toBe(false);
+  });
+
+  it('returns true when after introduces a new untracked artifact', () => {
+    const before = '!! node_modules/\n';
+    const after = '!! node_modules/\n?? dist/bundle.js\n';
+    expect(buildWroteNewOutput(before, after)).toBe(true);
+  });
+
+  it('returns true when after modifies a tracked file', () => {
+    expect(buildWroteNewOutput('', ' M src/generated.ts\n')).toBe(true);
+  });
+
+  it('ignores pre-existing warm-VM cache dirs present in both snapshots', () => {
+    // node_modules / .pnpm-store survive `git clean -fdx` and show up in BOTH
+    // snapshots — a diff must not count them as fresh build output.
+    const before = '!! node_modules/\n!! .pnpm-store/\n!! .testmondata\n';
+    const after = '!! .pnpm-store/\n!! node_modules/\n!! .testmondata\n';
+    expect(buildWroteNewOutput(before, after)).toBe(false);
+  });
+
+  it('tolerates CRLF line endings and blank lines', () => {
+    expect(buildWroteNewOutput('!! a\r\n\r\n', '!! a\r\n')).toBe(false);
+    expect(buildWroteNewOutput('!! a\r\n', '!! a\r\n?? b\r\n')).toBe(true);
   });
 });
 

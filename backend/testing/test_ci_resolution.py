@@ -373,6 +373,98 @@ def test_fall_open_reason_all_skipped_case_insensitive_variants():
         assert key == "suite_all_skipped", value
 
 
+def test_fall_open_reason_declared_no_artifact_gets_distinct_key():
+    # A PASSED declared build probe that confidently observed it wrote NOTHING
+    # is a likely no-op build — distinct honest phrase + key, not the confident
+    # "deliverable builds" wording.
+    phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+        {
+            "detected": False,
+            "probe": {
+                "ran": True,
+                "passed": True,
+                "could_not_run": False,
+                "declared": True,
+                "label": "make build",
+                "wrote_no_artifact": True,
+            },
+        }
+    )
+    assert key == "probe_no_artifact"
+    assert "no artifact" in phrase
+    assert "make build" in phrase
+
+
+def test_fall_open_reason_declared_no_artifact_without_label():
+    phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+        {
+            "detected": False,
+            "probe": {
+                "ran": True,
+                "passed": True,
+                "could_not_run": False,
+                "declared": True,
+                "wrote_no_artifact": True,
+            },
+        }
+    )
+    assert key == "probe_no_artifact"
+    assert phrase == "declared build ran but emitted no artifact (possible no-op build)"
+
+
+def test_fall_open_reason_declared_build_passed_without_flag_keeps_probe_passed():
+    # Absent flag, false flag, and observation-unavailable (older agent / ambiguous
+    # tree) ALL keep today's probe_passed behaviour exactly — the new reason is
+    # never emitted on uncertainty.
+    for probe in (
+        {"ran": True, "passed": True, "could_not_run": False, "declared": True, "label": "make build"},
+        {"ran": True, "passed": True, "could_not_run": False, "declared": True, "label": "make build", "wrote_no_artifact": False},
+    ):
+        phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+            {"detected": False, "probe": probe}
+        )
+        assert key == "probe_passed", probe
+        assert phrase == "declared build command passed (make build)", probe
+
+
+def test_fall_open_reason_no_artifact_flag_ignored_for_non_declared_probe():
+    # A GENERIC (non-declared) probe carrying the flag is unaffected — only the
+    # declared-build branch honours wrote_no_artifact.
+    phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+        {
+            "detected": False,
+            "probe": {
+                "ran": True,
+                "passed": True,
+                "could_not_run": False,
+                "declared": False,
+                "wrote_no_artifact": True,
+            },
+        }
+    )
+    assert key == "probe_passed"
+    assert phrase == "acceptance probe passed (changed code compiles/builds)"
+
+
+def test_fall_open_reason_no_artifact_flag_ignored_for_could_not_run_probe():
+    # A could_not_run declared probe carrying the flag still maps to
+    # probe_could_not_run — the no-op refinement only applies to a PASSED probe.
+    _, key = ci_resolution.classify_unverified_fall_open_reason(
+        {
+            "detected": False,
+            "probe": {
+                "ran": True,
+                "passed": False,
+                "could_not_run": True,
+                "declared": True,
+                "label": "make build",
+                "wrote_no_artifact": True,
+            },
+        }
+    )
+    assert key == "probe_could_not_run"
+
+
 def test_fall_open_reason_no_suite_keeps_generic_reason():
     # A genuine no-suite repo (no noTestsReason field) keeps today's reason.
     phrase, key = ci_resolution.classify_unverified_fall_open_reason(

@@ -212,16 +212,51 @@ def _design_grounding_miss(document: dict[str, Any]) -> str | None:
     return None
 
 
-def _grounding_probe_detail(document: dict[str, Any]) -> dict[str, Any] | None:
-    """Structured codebase-grounding detail lifted from ``_citation_grounding``.
+def _web_research_grounding_miss(document: dict[str, Any]) -> str | None:
+    """Return an operator-readable reason when a WEB_RESEARCH doc is ungrounded.
 
-    Returns the grounding counts plus the specific UNRESOLVED file-reference
-    citation strings the design agent reported absent from its working tree (the
-    agent is the only place that can know which paths are missing). Returns
-    ``None`` when the stamp is absent or unchecked — a ``web_research`` document
-    has no file-citation grounding, so the persisted verdict omits the grounding
-    key entirely rather than carrying an empty one. Purely observational: this
-    NEVER affects the gate decision, which stays in :func:`_design_grounding_miss`.
+    A ``web_research`` document's entire value is that it is GROUNDED in real,
+    reachable web sources: its cited URLs must actually resolve. The web-research
+    agent probes each cited URL for reachability before emitting and stamps the
+    result under ``_citation_grounding`` — the SAME shape ``design`` uses, but for
+    web_research ``file_citations`` is the number of URLs CHECKED, ``grounded``
+    the count confirmed reachable, and ``unresolved`` the dead URL strings.
+
+    This gate fails ONLY the clear case — the agent checked, the document cited
+    URLs, and NONE of them were reachable — a "research" document grounded
+    entirely in dead or fabricated links. It preserves the conservative
+    errs-toward-acceptance posture everywhere else: a missing or unchecked stamp
+    (older agent), zero checked URLs, or AT LEAST ONE reachable URL all pass — so
+    a document with one dead link among several reachable ones is NOT failed.
+    Mirrors :func:`_design_grounding_miss` exactly but with web-URL-reachability
+    wording; design's reason string and behavior are untouched.
+    """
+    grounding = document.get("_citation_grounding")
+    if not isinstance(grounding, dict) or not grounding.get("checked"):
+        return None
+    checked = int(grounding.get("file_citations") or 0)
+    grounded = int(grounding.get("grounded") or 0)
+    if checked > 0 and grounded <= 0:
+        return (
+            "cited web sources are unreachable: all "
+            f"{checked} cited URL(s) failed reachability checks (dead or "
+            "unresolvable links)"
+        )
+    return None
+
+
+def _grounding_probe_detail(document: dict[str, Any]) -> dict[str, Any] | None:
+    """Structured citation-grounding detail lifted from ``_citation_grounding``.
+
+    Returns the grounding counts plus the specific UNRESOLVED citation strings
+    the agent reported as ungrounded (the agent is the only place that can know
+    which citations failed): absent file paths for ``design`` documents, dead
+    URLs for ``web_research`` documents. Returns ``None`` when the stamp is
+    absent or unchecked — older / un-probed documents simply omit the grounding
+    key from the persisted verdict rather than carrying an empty one. Kind-
+    agnostic by design, so it surfaces grounding symmetrically for both knowledge
+    kinds. Purely observational: this NEVER affects the gate decision, which
+    stays in :func:`_design_grounding_miss` / :func:`_web_research_grounding_miss`.
     """
     grounding = document.get("_citation_grounding")
     if not isinstance(grounding, dict) or not grounding.get("checked"):
@@ -242,8 +277,10 @@ def _acceptance_probe_detail(
 ) -> dict[str, Any]:
     """Structured detail behind the goal-level acceptance probes, for persistence.
 
-    Carries the grounding counts + unresolved citations (design only; absent for
-    web_research) and the topic-responsiveness overlap/total keyword counts with
+    Carries the grounding counts + unresolved citations (present for BOTH design
+    and web_research when the agent stamped a grounding result; absent only for
+    older / un-probed documents) and the topic-responsiveness overlap/total
+    keyword counts with
     a ``passed`` flag. The flag is derived from the SAME gate decider
     (:func:`_topic_responsiveness_miss`) so the persisted detail can never
     disagree with the pass/fail decision. This function is purely additive
@@ -629,6 +666,23 @@ async def _handle_knowledge_document_completion(
     # — a single broken citation among several never fails a grounded design.
     if kind == "design":
         grounding_miss = _design_grounding_miss(document)
+        if grounding_miss is not None:
+            await _fail_gate(
+                task,
+                EvaluationVerdict(
+                    False, f"{kind} {grounding_miss}", "forward-quality"
+                ),
+                session,
+                kind,
+            )
+            return
+    elif kind == "web_research":
+        # Web-citation grounding probe: a web_research document whose cited URLs
+        # are ALL unreachable is grounded in dead/fabricated links and must not
+        # ship as authoritative knowledge. Symmetric to the design branch above,
+        # reading the SAME ``_citation_grounding`` stamp; errs toward acceptance
+        # — one reachable URL among several dead ones never fails the gate.
+        grounding_miss = _web_research_grounding_miss(document)
         if grounding_miss is not None:
             await _fail_gate(
                 task,

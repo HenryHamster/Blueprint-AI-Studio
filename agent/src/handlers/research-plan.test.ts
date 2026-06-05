@@ -73,6 +73,7 @@ import { execFileSync } from 'child_process';
 import { handlePlan, handleResearch } from './research-plan.js';
 import { handleStrategic } from './strategic.js';
 import { writeDesignDocHelper } from '../prompt.js';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 import {
   calcMessageAge,
   parseResearchContext,
@@ -1983,16 +1984,12 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
   // must actually provision that helper (read-only) so the contract is honest.
   it('handlePlan provisions the read-only ./design-doc helper it advertises', async () => {
     await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
-    expect(vi.mocked(writeDesignDocHelper)).toHaveBeenCalledWith(
-      FP_TASK_ID, expect.anything(), { readOnly: true },
-    );
+    expectCalledWith(writeDesignDocHelper, FP_TASK_ID, expect.anything(), { readOnly: true });
   });
 
   it('handleResearch provisions the read-only ./design-doc helper it advertises', async () => {
     await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
-    expect(vi.mocked(writeDesignDocHelper)).toHaveBeenCalledWith(
-      FP_TASK_ID, expect.anything(), { readOnly: true },
-    );
+    expectCalledWith(writeDesignDocHelper, FP_TASK_ID, expect.anything(), { readOnly: true });
   });
 
   // ── handlePlan fingerprints ──────────────────────────────────────────────────

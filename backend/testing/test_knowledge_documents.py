@@ -719,6 +719,143 @@ async def test_design_mix_of_real_and_proposed_paths_passes(
     assert task.status == TaskStatus.COMPLETED
 
 
+# ── web_research web-citation grounding probe (cited URLs are reachable) ─────
+#
+# Symmetric to the design grounding probe above: a web_research document's value
+# is that it is grounded in real, reachable web sources. The web-research agent
+# probes each cited URL for reachability and stamps the SAME ``_citation_grounding``
+# shape design uses (``file_citations`` = URLs checked, ``grounded`` = reachable,
+# ``unresolved`` = dead URLs). The completion gate fails ONLY the clear case where
+# every checked URL is unreachable, erring toward acceptance otherwise. The
+# rejection reason is URL-appropriate, NOT the codebase/file wording.
+
+
+@pytest.mark.asyncio
+async def test_web_research_all_urls_dead_fails_with_url_reason(
+    db_session, _quiet_broadcast
+):
+    """A web_research doc whose cited URLs are ALL unreachable is ungrounded: the
+    probe fails the gate with a URL-appropriate reason (distinct from the design
+    'not grounded in the codebase' wording) and persists no document."""
+    project, task = await _make_topic_task(
+        db_session,
+        "the current state of quantum error correction hardware",
+        project_name="WRdeadurls",
+    )
+    document = {
+        "title": "State of quantum error correction hardware",
+        "summary": "Survey of surface-code error correction on superconducting qubits.",
+        "body": "# Quantum error correction\n\nHardware progress on logical qubits.",
+        "citations": ["https://example.com/dead-one", "https://example.com/dead-two"],
+        "tags": ["quantum"],
+        "_citation_grounding": {
+            "file_citations": 2, "grounded": 0, "checked": True
+        },
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    assert await _docs_for(db_session, task.id) == []
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    reason = task.context["evaluation_gate"]["reason"]
+    assert "unreachable" in reason
+    assert "not grounded in the codebase" not in reason
+    assert "no usable source citation" not in reason
+    assert "not responsive" not in reason
+
+
+@pytest.mark.asyncio
+async def test_web_research_one_url_reachable_passes(db_session, _quiet_broadcast):
+    """At least one reachable URL among dead ones is enough — the probe errs
+    toward acceptance and persists exactly one KnowledgeDocument."""
+    project, task = await _make_topic_task(
+        db_session,
+        "the current state of quantum error correction hardware",
+        project_name="WRonereach",
+    )
+    document = {
+        "title": "State of quantum error correction hardware",
+        "summary": "Survey of surface-code error correction on superconducting qubits.",
+        "body": "# Quantum error correction\n\nHardware progress on logical qubits.",
+        "citations": ["https://example.com/live", "https://example.com/dead"],
+        "tags": ["quantum"],
+        "_citation_grounding": {
+            "file_citations": 2, "grounded": 1, "checked": True
+        },
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    assert len(await _docs_for(db_session, task.id)) == 1
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_web_research_unchecked_grounding_stamp_passes(
+    db_session, _quiet_broadcast
+):
+    """An unchecked grounding stamp (older agent / probe skipped) is ignored: the
+    gate errs toward acceptance and persists the document untouched."""
+    project, task = await _make_topic_task(
+        db_session,
+        "the current state of quantum error correction hardware",
+        project_name="WRunchecked",
+    )
+    document = {
+        "title": "State of quantum error correction hardware",
+        "summary": "Survey of surface-code error correction on superconducting qubits.",
+        "body": "# Quantum error correction\n\nHardware progress on logical qubits.",
+        "citations": ["https://example.com/qec"],
+        "tags": ["quantum"],
+        # checked is falsy → stamp ignored even though grounded is 0.
+        "_citation_grounding": {
+            "file_citations": 1, "grounded": 0, "checked": False
+        },
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    assert len(await _docs_for(db_session, task.id)) == 1
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_web_research_pass_persists_grounding_probe_detail(
+    db_session, _quiet_broadcast
+):
+    """A passing web_research document carries grounding detail (counts + the
+    SPECIFIC dead URL strings) in its persisted verdict, symmetric to design."""
+    project, task = await _make_topic_task(
+        db_session,
+        "the current state of quantum error correction hardware",
+        project_name="WRgrounddetail",
+    )
+    document = {
+        "title": "State of quantum error correction hardware",
+        "summary": "Survey of surface-code error correction on superconducting qubits.",
+        "body": "# Quantum error correction\n\nHardware progress on logical qubits.",
+        "citations": ["https://example.com/live", "https://example.com/dead"],
+        "tags": ["quantum"],
+        # Agent-stamped: 2 URLs checked, 1 reachable, 1 dead.
+        "_citation_grounding": {
+            "file_citations": 2,
+            "grounded": 1,
+            "checked": True,
+            "unresolved": ["https://example.com/dead"],
+        },
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    docs = await _docs_for(db_session, task.id)
+    assert len(docs) == 1
+    verdict = docs[0].forward_quality_verdict
+    assert verdict["passed"] is True
+    grounding = verdict["probes"]["grounding"]
+    assert grounding["file_citations"] == 2
+    assert grounding["grounded"] == 1
+    assert grounding["unresolved"] == ["https://example.com/dead"]
+
+
 # ── acceptance-probe DETAIL persisted alongside the pass/fail verdict ────────
 #
 # The forward-quality gate stores a binary pass/fail, but operators also need to
