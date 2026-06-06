@@ -1838,6 +1838,8 @@ async def _finalize_qualification(
     # 'defer' verdict (prod state unreadable, candidate fetch failed, scratch DB
     # unprovisionable) HOLDS the release via _handle_infra_failure exactly like
     # the identity gate's defer path — never waved through.
+    # Thread the exact SHA snapped into last_qualification through this gate;
+    # do not re-derive it from any live checkout state.
     apply_verdict, apply_detail = await _resolve_migration_apply_at_finalize(
         session, version, candidate_sha
     )

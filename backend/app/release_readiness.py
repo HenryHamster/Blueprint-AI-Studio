@@ -187,7 +187,16 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
 
 
 def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
-    """Return an operator-facing dict for a single QualificationVerdict row."""
+    """Return an operator-facing dict for a single QualificationVerdict row.
+
+    Surfaces the durable per-attempt evidence columns (migration-safety
+    verdicts + detail, audit findings, excluded findings, erosion / smoketest /
+    reconciliation detail, and promotion-attempt context) directly from the
+    immutable verdict row, so operators read the attempt's own evidence instead
+    of whatever survives in the latest ``last_qualification`` overwrite.  All
+    evidence keys are additive and may be ``None`` on legacy rows that predate
+    the evidence columns.
+    """
     return {
         "id": str(verdict.id),
         "release_version_id": str(verdict.release_version_id),
@@ -195,6 +204,7 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "confidence": verdict.confidence,
         "sub_scores": verdict.sub_scores,
         "blocker": verdict.blocker,
+        "audit_missing_reason": verdict.audit_missing_reason,
         "would_promote": verdict.would_promote,
         "promotion_enabled": verdict.promotion_enabled,
         "terminal_status": verdict.terminal_status,
@@ -207,6 +217,28 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         if verdict.finalized_at
         else None,
         "created_at": verdict.created_at.isoformat(),
+        # Post-promotion serving outcome — how this verdict's promotion actually
+        # played out (serving_confirmed / deploy_failed / unconfirmed); null
+        # until recorded.
+        "post_promotion_outcome": verdict.post_promotion_outcome,
+        "post_promotion_outcome_at": (
+            verdict.post_promotion_outcome_at.isoformat()
+            if verdict.post_promotion_outcome_at
+            else None
+        ),
+        # --- Durable per-attempt evidence (additive; nullable on legacy rows) --
+        "migration_safety": verdict.migration_safety,
+        "migration_safety_detail": verdict.migration_safety_detail,
+        "migration_apply_safety": verdict.migration_apply_safety,
+        "migration_apply_safety_detail": verdict.migration_apply_safety_detail,
+        "audit_findings": verdict.audit_findings,
+        "excluded_audit_findings": verdict.excluded_audit_findings,
+        "test_erosion_detail": verdict.test_erosion_detail,
+        "smoketest_detail": verdict.smoketest_detail,
+        "audit_reconciliation": verdict.audit_reconciliation,
+        "promotion_pr_url": verdict.promotion_pr_url,
+        "promotion_conflict": verdict.promotion_conflict,
+        "promotion_error_detail": verdict.promotion_error_detail,
     }
 
 

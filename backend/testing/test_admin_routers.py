@@ -7857,6 +7857,63 @@ class TestQualificationVerdictsAuditMissingReason:
         assert verdicts[0]["post_promotion_outcome"] is None
         assert verdicts[0]["post_promotion_outcome_at"] is None
 
+    @pytest.mark.asyncio
+    async def test_durable_evidence_fields_exposed_on_verdict_row(
+        self, client: AsyncClient, db_session
+    ):
+        """Per-attempt evidence columns are surfaced on each verdict row, so a
+        blocked attempt's migration-safety verdict survives re-qualification."""
+        from app.models import QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        verdict = QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="blockedsha",
+            confidence=0.10,
+            blocker="migration_unsafe",
+            would_promote=False,
+            promotion_enabled=False,
+            terminal_status="not_promoted",
+            threshold=0.90,
+            migration_safety="block",
+            migration_safety_detail="renumber-skip leaves table uncreated",
+            migration_apply_safety="block",
+            migration_apply_safety_detail="apply against prod schema diverged",
+            audit_findings=[{"severity": "high", "summary": "x"}],
+            excluded_audit_findings=[{"severity": "low", "summary": "y"}],
+            test_erosion_detail={"removed": 3},
+            smoketest_detail={"passed": False},
+            audit_reconciliation={"reconciled": True},
+            promotion_pr_url="https://example.com/pr/1",
+            promotion_conflict=True,
+            promotion_error_detail="merge conflict",
+        )
+        db_session.add(verdict)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/qualification-verdicts"
+        )
+        assert resp.status_code == 200, resp.text
+        v = resp.json()["verdicts"][0]
+        assert v["migration_safety"] == "block"
+        assert v["migration_safety_detail"] == "renumber-skip leaves table uncreated"
+        assert v["migration_apply_safety"] == "block"
+        assert (
+            v["migration_apply_safety_detail"] == "apply against prod schema diverged"
+        )
+        assert v["audit_findings"] == [{"severity": "high", "summary": "x"}]
+        assert v["excluded_audit_findings"] == [{"severity": "low", "summary": "y"}]
+        assert v["test_erosion_detail"] == {"removed": 3}
+        assert v["smoketest_detail"] == {"passed": False}
+        assert v["audit_reconciliation"] == {"reconciled": True}
+        assert v["promotion_pr_url"] == "https://example.com/pr/1"
+        assert v["promotion_conflict"] is True
+        assert v["promotion_error_detail"] == "merge conflict"
+
 
 class TestQualificationVerdictsInfraContext:
     """GET /api/admin/projects/{id}/qualification-verdicts includes infra_context."""
@@ -8574,6 +8631,54 @@ class TestGetAuditFindings:
         assert data["findings"][0]["severity"] == "high"
         assert data["findings"][1]["severity"] == "low"
         assert data["finalized_at"] == "2026-01-01T00:00:00"
+
+    @pytest.mark.asyncio
+    async def test_prefers_durable_verdict_findings_over_last_qualification(
+        self, client: AsyncClient, db_session
+    ):
+        """A re-qualification overwrites last_qualification, but the earlier
+        blocked attempt's findings still surface from the durable verdict row."""
+        from datetime import datetime
+
+        from app.models import QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        # First (blocked) attempt: persist its evidence on an immutable verdict.
+        verdict = QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="blockedsha",
+            confidence=0.10,
+            blocker="migration_unsafe",
+            audit_missing_reason=None,
+            would_promote=False,
+            promotion_enabled=False,
+            terminal_status="not_promoted",
+            threshold=0.90,
+            audit_findings=[
+                {"severity": "high", "summary": "Renumber-skip leaves table uncreated."},
+            ],
+            finalized_at=datetime(2026, 1, 2, 0, 0, 0),
+        )
+        db_session.add(verdict)
+        # A later re-qualification overwrote last_qualification with no findings.
+        version.last_qualification = {
+            "audit_findings": [],
+            "audit_missing_reason": None,
+            "finalized_at": "2026-02-01T00:00:00",
+        }
+        db_session.add(version)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/audit-findings")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["source"] == "qualification_verdict"
+        assert len(data["findings"]) == 1
+        assert data["findings"][0]["severity"] == "high"
+        assert data["finalized_at"] == "2026-01-02T00:00:00"
 
     @pytest.mark.asyncio
     async def test_returns_empty_when_no_open_version(

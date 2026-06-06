@@ -274,6 +274,16 @@ async def _record_qualification_verdict(
 
         confidence = base_record.get("confidence")
         threshold = base_record.get("threshold")
+        # Promotion-attempt context (set only on the promotion_failed / promoted
+        # paths, where _record_promotion_failure/_success fold pr_url / conflict
+        # / error / detail into the record before passing it here).
+        conflict = base_record.get("conflict")
+        error = base_record.get("error")
+        detail = base_record.get("detail")
+        if error and detail:
+            promotion_error_detail = f"{error}: {detail}"
+        else:
+            promotion_error_detail = detail or error or None
         verdict = QualificationVerdict(
             project_id=version.project_id,
             release_version_id=version.id,
@@ -298,6 +308,25 @@ async def _record_qualification_verdict(
             ),
             started_at=_parse_iso_dt(base_record.get("started_at")),
             finalized_at=_parse_iso_dt(base_record.get("finalized_at")),
+            # Per-attempt evidence mirrored from last_qualification — durably
+            # retained so a re-qualification overwrite of last_qualification no
+            # longer drops the blocked/held attempt's migration-safety verdicts,
+            # findings, and gate detail.  Keys match _finalize_qualification's
+            # base_record exactly.
+            migration_safety=base_record.get("migration_safety"),
+            migration_safety_detail=base_record.get("migration_safety_detail"),
+            migration_apply_safety=base_record.get("migration_apply_safety"),
+            migration_apply_safety_detail=base_record.get(
+                "migration_apply_safety_detail"
+            ),
+            audit_findings=base_record.get("audit_findings"),
+            excluded_audit_findings=base_record.get("excluded_audit_findings"),
+            test_erosion_detail=base_record.get("test_erosion_detail"),
+            smoketest_detail=base_record.get("smoketest_detail"),
+            audit_reconciliation=base_record.get("audit_reconciliation"),
+            promotion_pr_url=base_record.get("pr_url"),
+            promotion_conflict=(conflict if isinstance(conflict, bool) else None),
+            promotion_error_detail=promotion_error_detail,
         )
         # Flush the caller's staged mutations into the outer transaction first,
         # so the savepoint below isolates ONLY the verdict INSERT.

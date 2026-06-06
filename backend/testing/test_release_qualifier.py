@@ -3976,6 +3976,66 @@ async def test_finalize_apply_gate_ok_does_not_block_promotion(db_session, mocke
 
 
 @pytest.mark.asyncio
+async def test_finalize_threads_snapshotted_candidate_sha_into_apply_gate(
+    db_session, mocker
+):
+    """The finalize path must drive migration-apply from last_qualification."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    candidate_sha = "cafe" * 10
+    version.last_qualification = {
+        **(version.last_qualification or {}),
+        "candidate_sha": candidate_sha,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    observed = {}
+
+    async def _fake_apply_gate(**kwargs):
+        observed["candidate_ref"] = kwargs["candidate_ref"]
+        return ("ok", None)
+
+    mocker.patch(
+        "app.release_qualifier.run_migration_apply_gate",
+        new=AsyncMock(side_effect=_fake_apply_gate),
+    )
+    promote_spy = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert observed["candidate_ref"] == candidate_sha
+    promote_spy.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_finalize_carries_audit_findings_into_last_qualification(
     db_session, mocker
 ):
@@ -14608,3 +14668,254 @@ async def test_record_promotion_success_leaves_serving_null_for_non_self_repo(
     assert version.status == "promoted"
     assert version.serving_status is None
     assert version.deploy_confirm_deadline is None
+
+
+# ---------------------------------------------------------------------------
+# Per-attempt evidence mirroring onto QualificationVerdict (durable history).
+#
+# release_qualifier overwrites ReleaseVersion.last_qualification on every
+# re-qualification, so the richer per-attempt evidence (migration-safety
+# verdicts, findings, gate detail, promotion-failure context) was lost there.
+# These tests assert that evidence is durably mirrored onto the immutable
+# QualificationVerdict row and survives a subsequent last_qualification
+# overwrite.
+# ---------------------------------------------------------------------------
+
+
+async def _load_only_verdict(db_session, version):
+    """Return the single QualificationVerdict row for ``version`` (asserts one)."""
+    rows = (
+        (
+            await db_session.execute(
+                select(QualificationVerdict)
+                .where(QualificationVerdict.release_version_id == version.id)
+                .order_by(QualificationVerdict.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return rows
+
+
+@pytest.mark.asyncio
+async def test_blocked_attempt_persists_evidence_on_verdict_row(db_session):
+    """A not_promoted (blocked) attempt mirrors migration-safety + findings onto
+    the immutable verdict row, and that evidence survives a later
+    re-qualification that overwrites last_qualification."""
+    from app import release_promotion as rp
+
+    project, version = await _make_project_and_version(db_session)
+
+    base_record = {
+        "candidate_sha": "abc123",
+        "confidence": 0.42,
+        "threshold": 0.75,
+        "blocker": "migration_unsafe",
+        "status": "not_promoted",
+        "migration_safety": "block",
+        "migration_safety_detail": "candidate renumber-skip leaves table uncreated",
+        "migration_apply_safety": "block",
+        "migration_apply_safety_detail": "chain does not apply on prod schema",
+        "audit_findings": [{"id": "f1", "severity": "high"}],
+        "excluded_audit_findings": [{"id": "f2", "reason": "stale"}],
+        "test_erosion_detail": {"deleted_test_files": ["t.py"]},
+        "smoketest_detail": {"passed": False},
+        "audit_reconciliation": {"reconciled": False},
+    }
+    version.last_qualification = dict(base_record)
+    db_session.add(version)
+
+    await rp._record_qualification_verdict(
+        db_session,
+        version,
+        base_record,
+        terminal_status="not_promoted",
+        would_promote=False,
+        promotion_enabled=False,
+    )
+    await db_session.commit()
+
+    rows = await _load_only_verdict(db_session, version)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.terminal_status == "not_promoted"
+    assert row.migration_safety == "block"
+    assert row.migration_safety_detail == (
+        "candidate renumber-skip leaves table uncreated"
+    )
+    assert row.migration_apply_safety == "block"
+    assert row.migration_apply_safety_detail == "chain does not apply on prod schema"
+    assert row.audit_findings == [{"id": "f1", "severity": "high"}]
+    assert row.excluded_audit_findings == [{"id": "f2", "reason": "stale"}]
+    assert row.test_erosion_detail == {"deleted_test_files": ["t.py"]}
+    assert row.smoketest_detail == {"passed": False}
+    assert row.audit_reconciliation == {"reconciled": False}
+    # Promotion-attempt columns stay NULL on a non-promotion attempt.
+    assert row.promotion_pr_url is None
+    assert row.promotion_conflict is None
+    assert row.promotion_error_detail is None
+
+    # A subsequent re-qualification overwrites last_qualification with a NEW
+    # (e.g. now-passing) evidence set — the first verdict row must keep its own.
+    next_record = {
+        "candidate_sha": "def456",
+        "confidence": 0.91,
+        "threshold": 0.75,
+        "status": "not_promoted",
+        "migration_safety": "pass",
+        "migration_safety_detail": "clean",
+    }
+    version.last_qualification = dict(next_record)
+    db_session.add(version)
+    await rp._record_qualification_verdict(
+        db_session,
+        version,
+        next_record,
+        terminal_status="not_promoted",
+        would_promote=True,
+        promotion_enabled=False,
+    )
+    await db_session.commit()
+
+    rows = await _load_only_verdict(db_session, version)
+    assert len(rows) == 2
+    first, second = rows
+    # The original blocked attempt's evidence is untouched by the overwrite.
+    assert first.migration_safety == "block"
+    assert first.migration_safety_detail == (
+        "candidate renumber-skip leaves table uncreated"
+    )
+    assert first.audit_findings == [{"id": "f1", "severity": "high"}]
+    # The new attempt carries its own (different) evidence.
+    assert second.migration_safety == "pass"
+    assert second.migration_safety_detail == "clean"
+
+
+@pytest.mark.asyncio
+async def test_promotion_failed_attempt_persists_promotion_context(db_session):
+    """A promotion_failed attempt mirrors the merge PR url / conflict / error
+    context onto the immutable verdict row alongside migration-safety."""
+    from app import release_promotion as rp
+
+    project, version = await _make_project_and_version(db_session)
+
+    base_record = {
+        "candidate_sha": "abc123",
+        "confidence": 0.88,
+        "threshold": 0.75,
+        "status": "promotion_failed",
+        "migration_safety": "pass",
+        "migration_safety_detail": "clean",
+        "audit_findings": [],
+        # Promotion-failure context folded in by _record_promotion_failure.
+        "pr_url": "https://github.com/acme/widget/pull/42",
+        "conflict": True,
+        "error": "merge_conflict",
+        "detail": "automain → main had conflicts",
+    }
+    version.last_qualification = dict(base_record)
+    db_session.add(version)
+
+    await rp._record_qualification_verdict(
+        db_session,
+        version,
+        base_record,
+        terminal_status="promotion_failed",
+        would_promote=True,
+        promotion_enabled=True,
+    )
+    await db_session.commit()
+
+    rows = await _load_only_verdict(db_session, version)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.terminal_status == "promotion_failed"
+    assert row.migration_safety == "pass"
+    assert row.promotion_pr_url == "https://github.com/acme/widget/pull/42"
+    assert row.promotion_conflict is True
+    assert row.promotion_error_detail == "merge_conflict: automain → main had conflicts"
+
+
+def test_format_verdict_for_api_surfaces_durable_evidence():
+    """format_verdict_for_api exposes the per-attempt evidence columns so
+    operators read the attempt's own migration-safety/findings, not just the
+    latest last_qualification overwrite."""
+    import uuid
+
+    verdict = QualificationVerdict(
+        project_id=uuid.uuid4(),
+        release_version_id=uuid.uuid4(),
+        candidate_sha="abc123",
+        confidence=0.1,
+        blocker="migration_unsafe",
+        audit_missing_reason=None,
+        would_promote=False,
+        promotion_enabled=False,
+        terminal_status="not_promoted",
+        threshold=0.9,
+        migration_safety="block",
+        migration_safety_detail="renumber-skip leaves table uncreated",
+        migration_apply_safety="block",
+        migration_apply_safety_detail="diverged from prod schema",
+        audit_findings=[{"severity": "high", "summary": "x"}],
+        excluded_audit_findings=[{"severity": "low", "summary": "y"}],
+        test_erosion_detail={"removed": 2},
+        smoketest_detail={"passed": False},
+        audit_reconciliation={"reconciled": True},
+        promotion_pr_url="https://example.com/pr/7",
+        promotion_conflict=True,
+        promotion_error_detail="merge conflict",
+    )
+
+    out = rq.format_verdict_for_api(verdict)
+
+    # Existing keys remain.
+    assert out["candidate_sha"] == "abc123"
+    assert out["blocker"] == "migration_unsafe"
+    assert out["audit_missing_reason"] is None
+    # New durable evidence keys.
+    assert out["migration_safety"] == "block"
+    assert out["migration_safety_detail"] == "renumber-skip leaves table uncreated"
+    assert out["migration_apply_safety"] == "block"
+    assert out["migration_apply_safety_detail"] == "diverged from prod schema"
+    assert out["audit_findings"] == [{"severity": "high", "summary": "x"}]
+    assert out["excluded_audit_findings"] == [{"severity": "low", "summary": "y"}]
+    assert out["test_erosion_detail"] == {"removed": 2}
+    assert out["smoketest_detail"] == {"passed": False}
+    assert out["audit_reconciliation"] == {"reconciled": True}
+    assert out["promotion_pr_url"] == "https://example.com/pr/7"
+    assert out["promotion_conflict"] is True
+    assert out["promotion_error_detail"] == "merge conflict"
+
+
+def test_get_latest_qualification_audit_findings_prefers_verdict_row():
+    """The findings helper prefers the durable verdict row's audit_findings and
+    falls back to last_qualification only when no verdict is supplied."""
+    import uuid
+
+    version = rv.ReleaseVersion(
+        project_id=uuid.uuid4(),
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification={"audit_findings": [{"severity": "low", "summary": "stale"}]},
+    )
+    verdict = QualificationVerdict(
+        project_id=version.project_id,
+        release_version_id=uuid.uuid4(),
+        candidate_sha="abc123",
+        confidence=0.1,
+        would_promote=False,
+        promotion_enabled=False,
+        terminal_status="not_promoted",
+        audit_findings=[{"severity": "high", "summary": "durable"}],
+    )
+
+    # Verdict row takes precedence.
+    from_verdict = rq.get_latest_qualification_audit_findings(version, verdict)
+    assert from_verdict == [{"severity": "high", "summary": "durable"}]
+
+    # Fallback to last_qualification when no verdict carries findings.
+    fallback = rq.get_latest_qualification_audit_findings(version)
+    assert fallback == [{"severity": "low", "summary": "stale"}]

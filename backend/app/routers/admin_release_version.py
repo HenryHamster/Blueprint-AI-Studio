@@ -575,12 +575,19 @@ async def get_audit_findings(
 ) -> Dict[str, Any]:
     """Return the latest qualification's audit findings for a project.
 
-    Read-only; viewer+ role required. Surfaces the ``audit_findings`` list
-    carried into ``last_qualification`` by ``_finalize_qualification`` so
-    operators can see which specific issues drove a low audit sub-score.
-    Returns an empty list when no open version exists or no qualification
-    has run yet.
+    Read-only; viewer+ role required. Prefers the durable per-attempt evidence
+    on the latest immutable ``QualificationVerdict`` row for the open version
+    (its ``audit_findings`` column survives re-qualification overwrites), and
+    falls back to the mutable ``last_qualification.audit_findings`` blob only
+    when no verdict row carries findings (e.g. legacy rows predating the
+    evidence columns).  The ``source`` field reflects which store was used
+    (``qualification_verdict`` vs ``last_qualification``).  Returns an empty
+    list when no open version exists or no qualification has run yet.
     """
+    from app.release_qualifier import (  # noqa: PLC0415
+        get_latest_qualification_audit_findings,
+    )
+
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, min_role="viewer"
     )
@@ -603,12 +610,38 @@ async def get_audit_findings(
     if open_row is None:
         return {"findings": [], "source": "no_open_version"}
 
+    # Prefer the latest durable verdict row that carries audit findings for this
+    # version — it survives the next re-qualification's last_qualification
+    # overwrite, so a blocked attempt's findings are not lost.
+    verdict = (
+        (
+            await session.execute(
+                select(QualificationVerdict)
+                .where(
+                    QualificationVerdict.release_version_id == open_row.id,
+                    QualificationVerdict.audit_findings.is_not(None),
+                )
+                .order_by(QualificationVerdict.created_at.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+    if verdict is not None:
+        return {
+            "findings": get_latest_qualification_audit_findings(open_row, verdict),
+            "audit_missing_reason": verdict.audit_missing_reason,
+            "finalized_at": verdict.finalized_at.isoformat()
+            if verdict.finalized_at
+            else None,
+            "source": "qualification_verdict",
+        }
+
     qual = open_row.last_qualification or {}
-    findings = qual.get("audit_findings") or []
-    if not isinstance(findings, list):
-        findings = []
     return {
-        "findings": findings,
+        "findings": get_latest_qualification_audit_findings(open_row),
         "audit_missing_reason": qual.get("audit_missing_reason"),
         "finalized_at": qual.get("finalized_at"),
         "source": "last_qualification",
@@ -635,7 +668,10 @@ async def list_qualification_verdicts(
     'no recent verdicts because qualifier never ran' from 'qualifier has been
     thrashing on infrastructure failures'.
     """
-    from app.release_qualifier import compute_promotion_readiness  # noqa: PLC0415
+    from app.release_qualifier import (  # noqa: PLC0415
+        compute_promotion_readiness,
+        format_verdict_for_api,
+    )
 
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "viewer"
@@ -652,34 +688,7 @@ async def list_qualification_verdicts(
     readiness = await compute_promotion_readiness(session, project_id)
 
     return {
-        "verdicts": [
-            {
-                "id": str(v.id),
-                "release_version_id": str(v.release_version_id),
-                "candidate_sha": v.candidate_sha,
-                "confidence": v.confidence,
-                "sub_scores": v.sub_scores,
-                "blocker": v.blocker,
-                "audit_missing_reason": v.audit_missing_reason,
-                "would_promote": v.would_promote,
-                "promotion_enabled": v.promotion_enabled,
-                "terminal_status": v.terminal_status,
-                "threshold": v.threshold,
-                "started_at": v.started_at.isoformat() if v.started_at else None,
-                "finalized_at": v.finalized_at.isoformat() if v.finalized_at else None,
-                "created_at": v.created_at.isoformat(),
-                # Post-promotion serving outcome — how this verdict's promotion
-                # actually played out (serving_confirmed / deploy_failed /
-                # unconfirmed); null until recorded.
-                "post_promotion_outcome": v.post_promotion_outcome,
-                "post_promotion_outcome_at": (
-                    v.post_promotion_outcome_at.isoformat()
-                    if v.post_promotion_outcome_at
-                    else None
-                ),
-            }
-            for v in rows
-        ],
+        "verdicts": [format_verdict_for_api(v) for v in rows],
         "total": len(rows),
         "infra_context": {
             "infra_failure_count": readiness.get("infra_failure_count", 0),

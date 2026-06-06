@@ -13,7 +13,9 @@ on the local SQLite harness, mirroring
 fail-safe / determinism cases that need no scratch DB run everywhere.
 """
 
+import contextlib
 import os
+from unittest.mock import AsyncMock
 
 import pytest
 import sqlalchemy as sa
@@ -165,6 +167,30 @@ async def test_renumber_skip_is_blocked_naming_missing_table():
 
 @requires_postgres
 @pytest.mark.asyncio
+async def test_derived_reference_schema_blocks_renumber_skip_without_injected_metadata():
+    """Same renumber-skip as above, but with NO injected ``required_metadata``: the
+    gate must DERIVE the required schema from the candidate's own migration chain
+    (applied to a fresh DB) and still ``block`` on the missing ``computejob``.
+
+    This exercises :func:`_build_candidate_reference_schema` end-to-end — proving
+    the full deploy-target schema is captured from migrations alone, with no
+    in-process exec of candidate model modules."""
+    async with ephemeral_postgres_database(_base_url()) as (prod_engine, _name):
+        await _seed_prod_sim(
+            prod_engine, {"widget": True, "computejob": False}, revision="a02"
+        )
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=prod_engine,
+            candidate_sources=_CANDIDATE_SOURCES,
+            # required_metadata omitted on purpose — derived from candidate chain.
+        )
+
+    assert verdict == "block", detail
+    assert "computejob" in detail
+
+
+@requires_postgres
+@pytest.mark.asyncio
 async def test_clean_candidate_is_ok():
     """A healthy live DB stamped at ``a01`` (computejob legitimately not yet
     created) — applying the candidate chain runs ``a02`` (creates computejob)
@@ -294,3 +320,164 @@ async def test_missing_github_coords_defers():
     # Prod-state read fails to connect (no such DB) OR coords are incomplete —
     # either way the verdict must be a HOLD, never 'ok'/'block'.
     assert verdict == "defer", detail
+
+
+@pytest.mark.asyncio
+async def test_required_metadata_derived_from_candidate_reference_not_live_metadata(
+    monkeypatch,
+):
+    """The required schema must be the candidate-pinned reference (its own migration
+    chain applied to a fresh DB), NOT the live process's ``SQLModel.metadata``.
+
+    A stale backend/head mismatch (automain advancing while a run is in flight)
+    must not grade the candidate against newer process-local metadata. The gate
+    derives ``required_metadata`` via :func:`_build_candidate_reference_schema`,
+    which reflects a clean apply of the candidate's migrations — no candidate
+    Python is exec'd in-process, so no event listeners/mappers leak."""
+    import app.migration_apply_gate as gate_mod
+
+    # The schema the candidate's OWN migration chain would produce on a fresh DB.
+    candidate_reference_meta = sa.MetaData()
+    sa.Table(
+        "widget", candidate_reference_meta, sa.Column("id", sa.Integer, primary_key=True)
+    )
+    sa.Table(
+        "computejob",
+        candidate_reference_meta,
+        sa.Column("id", sa.Integer, primary_key=True),
+    )
+
+    prod_meta = sa.MetaData()
+    sa.Table("widget", prod_meta, sa.Column("id", sa.Integer, primary_key=True))
+
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(return_value=gate_mod._ProdState(revision="a01", metadata=prod_meta)),
+    )
+
+    @contextlib.asynccontextmanager
+    async def _fake_ephemeral(_base_url, db_name=None):
+        yield object(), "scratch-gate"
+
+    monkeypatch.setattr(gate_mod, "ephemeral_postgres_database", _fake_ephemeral)
+    monkeypatch.setattr(gate_mod, "_seed_scratch", AsyncMock())
+    monkeypatch.setattr(gate_mod, "_apply_candidate_migrations", AsyncMock())
+
+    observed = {}
+
+    async def _fake_build_candidate_reference_schema(_base_url, _candidate_sources):
+        return candidate_reference_meta
+
+    async def _fake_build_candidate_required_metadata(**_kwargs):
+        return candidate_reference_meta
+
+    async def _fake_reflect_scratch_drift(_scratch_engine, required_metadata):
+        observed["required_metadata"] = required_metadata
+        return []
+
+    monkeypatch.setattr(
+        gate_mod,
+        "_build_candidate_reference_schema",
+        _fake_build_candidate_reference_schema,
+    )
+    monkeypatch.setattr(
+        gate_mod,
+        "_build_candidate_required_metadata",
+        _fake_build_candidate_required_metadata,
+    )
+    monkeypatch.setattr(gate_mod, "_reflect_scratch_drift", _fake_reflect_scratch_drift)
+
+    engine = create_async_engine("postgresql+asyncpg://u:p@localhost:5432/nope")
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            gh_token="t",
+            owner="o",
+            repo="r",
+            candidate_ref="candidate-sha",
+            project_id="p",
+            candidate_sources={"0001_init.py": "revision = '0001'"},
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "ok", detail
+    assert observed["required_metadata"] is candidate_reference_meta
+
+
+@pytest.mark.asyncio
+async def test_default_path_blocks_when_candidate_code_needs_missing_migration(
+    monkeypatch,
+):
+    """When ``required_metadata`` is omitted, the gate must still catch a code
+    change whose migration was forgotten.
+
+    The candidate-pinned migration reference remains the scratch-drift target,
+    but the default path must ALSO compare that reference schema against the
+    candidate code's required metadata and hard-block any object the code expects
+    that the migration chain never creates."""
+    import app.migration_apply_gate as gate_mod
+
+    candidate_reference_meta = sa.MetaData()
+    sa.Table(
+        "widget", candidate_reference_meta, sa.Column("id", sa.Integer, primary_key=True)
+    )
+
+    candidate_required_meta = sa.MetaData()
+    sa.Table(
+        "widget", candidate_required_meta, sa.Column("id", sa.Integer, primary_key=True)
+    )
+    sa.Table(
+        "computejob",
+        candidate_required_meta,
+        sa.Column("id", sa.Integer, primary_key=True),
+    )
+
+    prod_meta = sa.MetaData()
+    sa.Table("widget", prod_meta, sa.Column("id", sa.Integer, primary_key=True))
+
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(return_value=gate_mod._ProdState(revision="a01", metadata=prod_meta)),
+    )
+    monkeypatch.setattr(
+        gate_mod,
+        "_build_candidate_reference_schema",
+        AsyncMock(return_value=candidate_reference_meta),
+    )
+    monkeypatch.setattr(
+        gate_mod,
+        "_build_candidate_required_metadata",
+        AsyncMock(return_value=candidate_required_meta),
+    )
+    reflect_scratch_drift = AsyncMock(return_value=[])
+    monkeypatch.setattr(gate_mod, "_reflect_scratch_drift", reflect_scratch_drift)
+
+    @contextlib.asynccontextmanager
+    async def _fake_ephemeral(_base_url, db_name=None):
+        yield object(), "scratch-gate"
+
+    monkeypatch.setattr(gate_mod, "ephemeral_postgres_database", _fake_ephemeral)
+    monkeypatch.setattr(gate_mod, "_seed_scratch", AsyncMock())
+    monkeypatch.setattr(gate_mod, "_apply_candidate_migrations", AsyncMock())
+
+    engine = create_async_engine("postgresql+asyncpg://u:p@localhost:5432/nope")
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            gh_token="t",
+            owner="o",
+            repo="r",
+            candidate_ref="candidate-sha",
+            project_id="p",
+            candidate_sources={"0001_init.py": "revision = '0001'"},
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "block", detail
+    assert "missing migration" in detail
+    assert "computejob" in detail
+    reflect_scratch_drift.assert_not_called()

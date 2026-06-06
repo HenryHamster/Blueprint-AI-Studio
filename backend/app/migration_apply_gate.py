@@ -48,12 +48,19 @@ in as a new deterministic dimension (the same way it wired in
 
 from __future__ import annotations
 
+import asyncio
+import io
+import json
 import logging
 import os
+import sys
+import tarfile
 import tempfile
+import textwrap
 import uuid
 from contextlib import asynccontextmanager
 from typing import NamedTuple
+from urllib.parse import quote
 
 import sqlalchemy as sa
 from sqlalchemy.engine import URL
@@ -75,6 +82,49 @@ Verdict = tuple[str, str | None]
 # for the per-file text fetch — same constant the rollup validator uses.
 _ALEMBIC_VERSIONS_DIR = "backend/alembic/versions"
 
+_CANDIDATE_METADATA_SCRIPT = textwrap.dedent(
+    """
+    import importlib
+    import json
+    import os
+    import pathlib
+    import sys
+
+    from sqlmodel import SQLModel
+
+    repo_root = pathlib.Path(os.environ["CANDIDATE_REPO_ROOT"])
+    backend_root = repo_root / "backend"
+    app_root = backend_root / "app"
+    sys.path.insert(0, str(backend_root))
+
+    def _module_name(path: pathlib.Path) -> str:
+        rel = path.relative_to(backend_root).with_suffix("")
+        return ".".join(rel.parts)
+
+    def _looks_like_table_module(path: pathlib.Path) -> bool:
+        if path.name == "models.py":
+            return True
+        try:
+            text = path.read_text()
+        except Exception:
+            return False
+        markers = ("table=True", "__tablename__", "sa.Table(", "sqlalchemy.Table(")
+        return any(marker in text for marker in markers)
+
+    importlib.import_module("app.models")
+    for path in sorted(app_root.rglob("*.py")):
+        if path.name == "__init__.py" or not _looks_like_table_module(path):
+            continue
+        importlib.import_module(_module_name(path))
+
+    payload = {
+        table.name: [column.name for column in table.columns]
+        for table in SQLModel.metadata.sorted_tables
+    }
+    print(json.dumps(payload, sort_keys=True))
+    """
+)
+
 
 class _ProdState(NamedTuple):
     """Production's real recorded state: the ``alembic_version`` stamp plus the
@@ -92,6 +142,44 @@ class _MigrationApplyError(Exception):
     """A scratch-side seed/apply step failed. Always collapses to ``defer`` — an
     apply failure means we could not prove the candidate is safe, so the release
     must HOLD (never wave through, never hard-block on a possibly-fidelity issue)."""
+
+
+def _metadata_from_shape(shape: dict[str, list[str]]) -> sa.MetaData:
+    """Build minimal metadata from table/column names only.
+
+    The gate's drift checks are directional on names only: table existence and
+    column existence. Types, indexes, and constraints are irrelevant here."""
+
+    metadata = sa.MetaData()
+    for table_name in sorted(shape):
+        columns = shape[table_name] or []
+        sa.Table(
+            table_name,
+            metadata,
+            *(sa.Column(column_name, sa.String()) for column_name in columns),
+        )
+    return metadata
+
+
+def _metadata_shape_drift(
+    present_metadata: sa.MetaData, required_metadata: sa.MetaData
+) -> list[str]:
+    """Objects *required_metadata* expects that *present_metadata* lacks."""
+
+    drift: list[str] = []
+    present_tables = present_metadata.tables
+    for table_name, required_table in required_metadata.tables.items():
+        present_table = present_tables.get(table_name)
+        if present_table is None:
+            drift.append(f"table '{table_name}' is missing from the candidate migration chain")
+            continue
+        present_columns = {column.name for column in present_table.columns}
+        drift.extend(
+            f"column '{table_name}.{column.name}' is missing from the candidate migration chain"
+            for column in required_table.columns
+            if column.name not in present_columns
+        )
+    return sorted(drift)
 
 
 def _sanitize_reflected_metadata(metadata: sa.MetaData) -> None:
@@ -306,6 +394,185 @@ async def _apply_candidate_migrations(
         ) from exc
 
 
+async def _build_candidate_reference_schema(
+    base_url: URL, candidate_sources: dict[str, str]
+) -> sa.MetaData:
+    """The candidate's required schema, derived by applying its FULL migration
+    chain to a FRESH empty database and reflecting the result.
+
+    This is the canonical deploy-target schema the candidate's migrations define:
+    EVERY persisted table the chain creates, regardless of which ORM module
+    declares it. The earlier approach — exec'ing a candidate ``backend/app/
+    models.py`` snapshot inside the serving process to harvest its ORM metadata —
+    was both incomplete and unsafe:
+
+      * Incomplete: ``models.py`` is NOT the full ORM metadata. Other modules
+        register persisted tables onto the same ``SQLModel.metadata`` at import
+        time (e.g. ``DirectionDriftSnapshot`` in ``app.drift_detection``, created
+        by migration 0057). A models.py-only reconstruction would miss them, so a
+        candidate that adds/changes such a table could pass the gate even when the
+        scratch DB is missing it.
+      * Unsafe: ``models.py`` has import-time SQLAlchemy event registrations
+        (a global ``before_flush`` hook, attribute ``set`` listeners). Exec'ing it
+        in-process registers those hooks against the LIVE process and never removes
+        them, leaking listeners/mappers into production on every qualification.
+
+    Building the reference from a clean migration apply sidesteps both: migrations
+    create the FULL schema, and the candidate's Python is never executed in the
+    serving process — it runs only as Alembic DDL against an isolated scratch DB,
+    with ZERO in-process side effects. The reference DB is a separate ephemeral
+    database; production is never touched.
+    """
+
+    def _reflect(sync_conn: sa.Connection) -> sa.MetaData:
+        metadata = sa.MetaData()
+        metadata.reflect(bind=sync_conn)
+        return metadata
+
+    async with ephemeral_postgres_database(base_url) as (ref_engine, _name):
+        # Apply the candidate chain from an EMPTY DB (no prod seed): the
+        # reconcile pre-step is a strict no-op on a fresh database, so this is a
+        # plain ``alembic upgrade head`` that materializes the full schema.
+        await _apply_candidate_migrations(ref_engine, candidate_sources)
+        async with ref_engine.connect() as conn:
+            return await conn.run_sync(_reflect)
+
+
+async def _download_candidate_repo_archive(
+    gh_token: str,
+    owner: str,
+    repo: str,
+    candidate_ref: str,
+    project_id: str | None,
+) -> bytes | None:
+    """Fetch the candidate repo archive as a tarball."""
+
+    headers = {
+        "Authorization": f"Bearer {gh_token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    encoded_ref = quote(candidate_ref, safe="")
+    url = f"https://api.github.com/repos/{owner}/{repo}/tarball/{encoded_ref}"
+    try:
+        response = await github._github_request(
+            "GET",
+            url,
+            headers,
+            max_retries=2,
+            project_id=project_id,
+            follow_redirects=True,
+        )
+    except Exception:  # noqa: BLE001 - caller degrades to defer
+        return None
+    if response.status_code != 200:
+        return None
+    return response.content
+
+
+async def _build_candidate_required_metadata_from_snapshot(
+    gh_token: str,
+    owner: str,
+    repo: str,
+    candidate_ref: str,
+    project_id: str | None,
+) -> sa.MetaData:
+    """Build candidate code-required metadata out of process from a repo snapshot.
+
+    The snapshot is pinned to ``candidate_ref`` and imported in a subprocess so
+    any SQLAlchemy listeners/mappers the candidate registers cannot leak into the
+    serving process."""
+
+    archive = await _download_candidate_repo_archive(
+        gh_token, owner, repo, candidate_ref, project_id
+    )
+    if not archive:
+        raise _MigrationApplyError(
+            f"could not fetch the candidate code snapshot at {candidate_ref!r}"
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            with tarfile.open(fileobj=io.BytesIO(archive), mode="r:*") as tar:
+                tar.extractall(tmp)
+        except Exception as exc:
+            raise _MigrationApplyError(
+                f"could not unpack the candidate code snapshot at "
+                f"{candidate_ref!r}: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        extracted_roots = [
+            os.path.join(tmp, name)
+            for name in os.listdir(tmp)
+            if os.path.isdir(os.path.join(tmp, name))
+        ]
+        if not extracted_roots:
+            raise _MigrationApplyError(
+                f"candidate code snapshot at {candidate_ref!r} unpacked to no repo root"
+            )
+        repo_root = extracted_roots[0]
+
+        env = os.environ.copy()
+        env["CANDIDATE_REPO_ROOT"] = repo_root
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            _CANDIDATE_METADATA_SCRIPT,
+            cwd=repo_root,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            detail = stderr.decode(errors="replace").strip() or stdout.decode(
+                errors="replace"
+            ).strip()
+            raise _MigrationApplyError(
+                f"candidate code snapshot at {candidate_ref!r} could not be imported "
+                f"to derive required metadata: {detail or f'exit {proc.returncode}'}"
+            )
+        try:
+            shape = json.loads(stdout.decode())
+        except Exception as exc:
+            raise _MigrationApplyError(
+                f"candidate code snapshot at {candidate_ref!r} returned malformed "
+                f"required metadata: {type(exc).__name__}: {exc}"
+            ) from exc
+        if not isinstance(shape, dict) or not all(
+            isinstance(table_name, str)
+            and isinstance(columns, list)
+            and all(isinstance(column_name, str) for column_name in columns)
+            for table_name, columns in shape.items()
+        ):
+            raise _MigrationApplyError(
+                f"candidate code snapshot at {candidate_ref!r} returned an invalid "
+                "required-metadata shape"
+            )
+        return _metadata_from_shape(shape)
+
+
+async def _build_candidate_required_metadata(
+    *,
+    gh_token: str | None,
+    owner: str | None,
+    repo: str | None,
+    candidate_ref: str | None,
+    project_id: str | None,
+) -> sa.MetaData:
+    """Build the code-required schema for the candidate.
+
+    Production should resolve this from the candidate's own snapshot. Tests that
+    inject ``candidate_sources`` without GitHub coordinates fall back to the live
+    process metadata so the synthetic chains can exercise the default path."""
+
+    if gh_token and owner and repo and candidate_ref:
+        return await _build_candidate_required_metadata_from_snapshot(
+            gh_token, owner, repo, candidate_ref, project_id
+        )
+    return SQLModel.metadata
+
+
 async def _reflect_scratch_drift(
     scratch_engine: AsyncEngine, required_metadata: sa.MetaData
 ) -> list[str]:
@@ -390,13 +657,15 @@ async def run_migration_apply_gate(
     *prod_engine* is the live production bind (read-only here). *candidate_sources*
     may be injected (filename -> source) to bypass the GitHub fetch in tests; in
     production it is fetched from *gh_token/owner/repo/candidate_ref*.
-    *required_metadata* defaults to the application's full ``SQLModel.metadata``.
+    *required_metadata* remains an escape hatch for tests / explicit callers. When
+    omitted, the gate derives the candidate's migration-defined reference schema
+    from a fresh apply of its own migration chain AND compares that to the
+    candidate code's required schema so a forgotten migration still blocks.
 
     ISOLATION SAFETY: production is only ever read; the scratch database is a
     freshly-provisioned, separately-named Postgres database, and the orchestrator
     asserts its name differs from production's before any DDL.
     """
-    required = required_metadata if required_metadata is not None else SQLModel.metadata
     prod_url = prod_engine.url
     if not prod_url.get_backend_name().startswith("postgresql"):
         # The renumber-skip class is a Postgres-deploy phenomenon; the gate needs
@@ -449,6 +718,42 @@ async def run_migration_apply_gate(
                 "readable migration sources",
             )
 
+    if required_metadata is None:
+        # Derive the candidate's required schema from a clean apply of its OWN
+        # migration chain (full schema, candidate-pinned, zero in-process side
+        # effects). candidate_sources is guaranteed non-None at this point —
+        # either injected or already fetched above (else we returned 'defer').
+        try:
+            candidate_reference_metadata = await _build_candidate_reference_schema(
+                prod_url, candidate_sources
+            )
+            candidate_required_metadata = await _build_candidate_required_metadata(
+                gh_token=gh_token,
+                owner=owner,
+                repo=repo,
+                candidate_ref=candidate_ref,
+                project_id=project_id,
+            )
+        except _MigrationApplyError as exc:
+            return ("defer", str(exc))
+        except Exception as exc:  # noqa: BLE001 — reference-build failure HOLDS
+            return (
+                "defer",
+                f"could not build the candidate reference schema at "
+                f"{candidate_ref!r}: {type(exc).__name__}: {exc}",
+            )
+        missing_from_candidate_migrations = _metadata_shape_drift(
+            candidate_reference_metadata, candidate_required_metadata
+        )
+        if missing_from_candidate_migrations:
+            return (
+                "block",
+                f"candidate code at {candidate_ref!r} requires object(s) absent "
+                f"from its own migration chain (missing migration): "
+                + "; ".join(missing_from_candidate_migrations),
+            )
+        required_metadata = candidate_reference_metadata
+
     # 3. Provision an isolated scratch DB, 4. seed it, 5. apply, 6. assert no drift.
     try:
         async with ephemeral_postgres_database(prod_url) as (scratch_engine, name):
@@ -461,7 +766,7 @@ async def run_migration_apply_gate(
                 )
             await _seed_scratch(scratch_engine, prod_state)
             await _apply_candidate_migrations(scratch_engine, candidate_sources)
-            drift = await _reflect_scratch_drift(scratch_engine, required)
+            drift = await _reflect_scratch_drift(scratch_engine, required_metadata)
     except _MigrationApplyError as exc:
         return ("defer", str(exc))
     except Exception as exc:  # noqa: BLE001 — any provisioning failure HOLDS

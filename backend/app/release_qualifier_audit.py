@@ -25,6 +25,7 @@ from app.models import (
     Artifact,
     ArtifactType,
     Project,
+    QualificationVerdict,
     ReleaseVersion,
     Task,
     TaskHistory,
@@ -432,8 +433,18 @@ def _enrich_infra_error(base_label: str, task: Task | None) -> str:
 
 def get_latest_qualification_audit_findings(
     version: ReleaseVersion | None,
+    verdict: QualificationVerdict | None = None,
 ) -> list[dict[str, Any]]:
-    """Return the stored audit findings from a version's latest qualification."""
+    """Return the stored audit findings for a version's latest qualification.
+
+    Prefers the durable per-attempt evidence on an immutable
+    ``QualificationVerdict`` row when one is supplied (its ``audit_findings``
+    column survives re-qualification overwrites), falling back to the version's
+    mutable ``last_qualification.audit_findings`` blob for legacy rows that
+    predate the evidence column.  Sync, returns ``list[dict]``.
+    """
+    if verdict is not None and isinstance(verdict.audit_findings, list):
+        return [f for f in verdict.audit_findings if isinstance(f, dict)]
     qual = (version.last_qualification or {}) if version is not None else {}
     findings = qual.get("audit_findings")
     if not isinstance(findings, list):

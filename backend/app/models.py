@@ -3454,6 +3454,71 @@ class QualificationVerdict(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
 
+    # --- Per-attempt evidence mirrored from ``last_qualification`` ----------
+    # These NULLABLE columns durably retain the richer evidence the qualifier
+    # assembles into the ``last_qualification`` base_record but which was
+    # previously dropped when the verdict row was written, so blocked/held
+    # attempts no longer lose it on the next re-qualification overwrite.  All
+    # are nullable — existing verdict rows carry no such evidence.
+
+    # Migration-safety verdicts (e.g. 'pass'/'block') and their detail strings.
+    migration_safety: str | None = Field(
+        default=None,
+        sa_column=Column(String(32), nullable=True),
+    )
+    migration_safety_detail: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+    migration_apply_safety: str | None = Field(
+        default=None,
+        sa_column=Column(String(32), nullable=True),
+    )
+    migration_apply_safety_detail: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+
+    # Audit findings and the findings excluded from scoring (JSONB lists).
+    audit_findings: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+    excluded_audit_findings: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    # Structured erosion / smoketest / audit-reconciliation detail (JSONB).
+    test_erosion_detail: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+    smoketest_detail: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+    audit_reconciliation: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    # Promotion-attempt context (only set on the promotion_failed / promoted
+    # paths): the merge PR URL, whether the merge hit a conflict, and the
+    # error/detail string describing why the merge failed.
+    promotion_pr_url: str | None = Field(
+        default=None,
+        sa_column=Column(String(512), nullable=True),
+    )
+    promotion_conflict: bool | None = Field(
+        default=None,
+        sa_column=Column(Boolean, nullable=True),
+    )
+    promotion_error_detail: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
