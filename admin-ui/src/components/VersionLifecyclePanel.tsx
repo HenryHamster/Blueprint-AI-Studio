@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import {
+  clearDeployFailed,
   cutVersion,
   fetchQualificationVerdicts,
   patchAdminSettings,
@@ -458,6 +459,13 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   // the controls here so the panel presents the same truth, consistent with how
   // the cut lever already surfaces this state.
   const promotionInFlight = cv?.qualification_state?.state === 'promotion_in_flight';
+  // Admin-only lever: a promoted version latched to deploy_failed (current open
+  // version after promotion, or a recent promoted one) can be cleared once the
+  // deploy is verified or attested live. The backend endpoint is project-scoped
+  // and targets the latest promoted deploy_failed version.
+  const isAdmin = userRole === 'admin';
+  const hasDeployFailed = cv?.serving_status === 'deploy_failed'
+    || recent.some(v => v.serving_status === 'deploy_failed');
 
   const handleSetPhase = async (phase: 'build' | 'stabilize') => {
     if (!projectId) return;
@@ -587,6 +595,46 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
       onRefresh();
     } catch (error) {
       setActionMsg(error instanceof Error ? error.message : 'Request failed');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // Clear a stale post-promotion deploy_failed serving state. First attempts the
+  // verify path (no force) — the backend clears only if the promoted SHA is
+  // independently observed serving. If it refuses (live SHA unobservable), prompt
+  // for an attestation reason and retry the operator-attested force path.
+  const handleClearDeployFailed = async () => {
+    if (!projectId) return;
+    if (!window.confirm('Clear the stale deploy-failed serving state for the promoted version?\n\nThe deploy must be independently confirmed serving, or you will be asked to attest it is live.')) return;
+    setActionLoading('clear-deploy-failed');
+    setActionMsg(null);
+    try {
+      const result = await clearDeployFailed(projectId);
+      setActionMsg(`Deploy-failed cleared (${result.clear_mode}) → ${result.serving_status ?? 'n/a'}`);
+      onRefresh();
+    } catch (verifyError) {
+      const msg = verifyError instanceof Error ? verifyError.message : '';
+      // Only offer the attested override when the backend explicitly asked for it
+      // (the verify path could not confirm the deploy live).
+      if (!msg.includes('force=true')) {
+        setActionMsg(msg || 'Request failed');
+        setActionLoading(null);
+        return;
+      }
+      const reason = window.prompt('The deploy could not be independently verified live. To force-clear, enter an attestation reason (required):');
+      if (!reason || !reason.trim()) {
+        setActionMsg(msg);
+        setActionLoading(null);
+        return;
+      }
+      try {
+        const result = await clearDeployFailed(projectId, true, reason.trim());
+        setActionMsg(`Deploy-failed cleared (operator-attested) → ${result.serving_status ?? 'n/a'}`);
+        onRefresh();
+      } catch (forceError) {
+        setActionMsg(forceError instanceof Error ? forceError.message : 'Request failed');
+      }
     } finally {
       setActionLoading(null);
     }
@@ -919,6 +967,17 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-red-500/40 text-red-400 hover:bg-red-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     Cut/Abandon
+                  </button>
+                )}
+                {isAdmin && hasDeployFailed && (
+                  <button
+                    data-testid="clear-deploy-failed"
+                    onClick={handleClearDeployFailed}
+                    disabled={actionLoading !== null}
+                    title="Clear a stale post-promotion deploy-failed serving state once the deploy is verified or attested live"
+                    className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-orange-500/40 text-orange-400 hover:bg-orange-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {actionLoading === 'clear-deploy-failed' ? '…' : 'Clear deploy-failed'}
                   </button>
                 )}
                 {actionMsg && (

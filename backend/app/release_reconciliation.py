@@ -964,3 +964,196 @@ async def _confirm_serving_or_fail(
                     version_id,
                 )
             return False
+
+
+# ---------------------------------------------------------------------------
+# Post-promotion deploy-failure recovery
+# ---------------------------------------------------------------------------
+#
+# A ``serving_status="deploy_failed"`` latch is NOT terminal-by-construction.  A
+# deploy that boot-crashed and then recovered, or that was merely slow to come up
+# past the bounded confirmation window (the real v5 pattern: promoted 14:58 UTC,
+# only began serving at 19:51 UTC), would otherwise be rendered permanently
+# untrue across every surface — version status, the operator deploy-failed ERROR
+# alert, the strategist "recover the failed deploy" crisis directive, and the
+# QualificationVerdict.post_promotion_outcome precision sample.  When such a
+# version is later observed to ACTUALLY serve its promoted SHA, the recovery path
+# reconciles it back to a truthful serving_confirmed state and clears every
+# derived failure surface — bounded by a recovery window so a genuinely dead
+# deploy still stays loudly failed forever.
+_DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS_DEFAULT = 24 * 3600
+
+
+async def _recover_serving_confirmed(
+    session,
+    version: release_version.ReleaseVersion,
+    served_sha: str,
+    served_at: datetime | None,
+    now: datetime,
+) -> None:
+    """Flip a deploy_failed version back to serving_confirmed and clear surfaces.
+
+    Shared mutation helper for the deploy-failure recovery path.  Given a version
+    whose promoted SHA is now INDEPENDENTLY observed serving, it:
+
+      * flips ``serving_status`` ``deploy_failed`` -> ``serving_confirmed``,
+      * stamps ``served_sha`` / ``served_at`` from the confirmed observation,
+      * clears ``deploy_failure_reason``,
+      * updates the ``QualificationVerdict.post_promotion_outcome`` to
+        ``serving_confirmed`` (reusing ``_record_post_promotion_outcome``'s
+        SAVEPOINT discipline so the immutable verdict history is appended-to, not
+        mutated, and a verdict failure never rolls back the serving-status write),
+      * resolves the open promotion-deploy-failed operator alert, and
+      * arms a coalescing strategic refresh so the crisis directive recomputes
+        against the now-true serving_confirmed state this cycle.
+
+    Runs entirely on the caller's already-locked session; does NOT commit (the
+    caller commits under the SAME per-version row lock).
+    """
+    version.serving_status = "serving_confirmed"
+    version.served_sha = served_sha
+    version.served_at = served_at or now
+    version.deploy_failure_reason = None
+    session.add(version)
+    await _record_post_promotion_outcome(session, version, "serving_confirmed", now)
+    # Resolve the loud deploy-failed operator alert — it no longer describes a
+    # real condition once the promoted SHA is confirmed serving.  Best-effort and
+    # non-fatal: a resolve failure must never abort the recovery write.
+    try:
+        from app.release_stall_alerts import _resolve_promotion_deploy_failed_alert
+
+        await _resolve_promotion_deploy_failed_alert(session, version)
+    except Exception:
+        logger.exception(
+            "[RELEASE_QUALIFIER] deploy-failed alert resolve raised for "
+            "recovered v%d (non-fatal)",
+            version.version_number,
+        )
+    # Wake the strategist so the "recover the failed deploy" crisis directive
+    # recomputes against the now-true serving_confirmed state instead of waiting
+    # for the next natural cycle.  Best-effort and non-fatal:
+    # request_strategic_refresh swallows its own errors, does NOT commit (rides
+    # this transaction), and the single-slot marker coalesces.
+    try:
+        from app.strategic_trigger import request_strategic_refresh
+
+        await request_strategic_refresh(
+            session,
+            version.project_id,
+            "promotion_deploy_recovered",
+        )
+    except Exception:
+        logger.exception(
+            "[RELEASE_QUALIFIER] strategic refresh arm raised for recovered "
+            "v%d (non-fatal)",
+            version.version_number,
+        )
+
+
+async def _reconcile_if_deploy_failed_recovered(
+    version_id: uuid.UUID,
+    *,
+    session_factory=None,
+    now: datetime | None = None,
+    recovery_window_seconds: float = _DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS_DEFAULT,
+) -> bool:
+    """Recover a ``deploy_failed`` version whose promoted SHA is now serving.
+
+    For a ``promoted`` version latched to ``serving_status="deploy_failed"`` still
+    inside the recovery window, re-run the pure ``_classify_serving_outcome``
+    against the live DeploymentState.  When the promoted SHA is now INDEPENDENTLY
+    observed serving (a STABLE new revision booted after ``promoted_at`` whose
+    live ``current_sha`` matches ``promoted_sha``) flip it back to a truthful
+    ``serving_confirmed`` state via ``_recover_serving_confirmed`` and clear every
+    derived failure surface.  Any other classifier verdict (still failed,
+    rolled-back, sha-mismatch, or no decision) leaves the version deploy_failed.
+
+    Beyond the recovery window — anchored on when the failure was recorded
+    (``deploy_confirm_alerted_at``, falling back to ``deploy_confirm_deadline`` /
+    ``promoted_at``) — a genuinely dead deploy is no longer re-checked and stays
+    failed forever.
+
+    Runs in its own dedicated session under a row lock — the same per-version
+    isolation pattern as ``_confirm_serving_or_fail`` — so a failure on one
+    version cannot touch another's committed work.  Returns True iff the version
+    recovered this call.
+    """
+    factory = session_factory or AsyncSessionLocal
+    _now = now or _utcnow()
+    async with factory() as session:
+        try:
+            version: release_version.ReleaseVersion | None = (
+                (
+                    await session.execute(
+                        select(release_version.ReleaseVersion)
+                        .where(release_version.ReleaseVersion.id == version_id)
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if version is None:
+                return False
+            # Re-check under the lock: a concurrent sweep may have resolved it.
+            if version.status != "promoted":
+                return False
+            if version.serving_status != "deploy_failed":
+                return False
+
+            # Bound recovery: beyond the window a genuinely dead deploy stays
+            # loudly failed forever.  Anchor on when the failure was recorded.
+            anchor = _to_naive_utc(
+                version.deploy_confirm_alerted_at
+                or version.deploy_confirm_deadline
+                or version.promoted_at
+            )
+            now_naive = _to_naive_utc(_now) or _now
+            if (
+                anchor is not None
+                and recovery_window_seconds > 0
+                and (now_naive - anchor).total_seconds() > recovery_window_seconds
+            ):
+                return False
+
+            ds = await session.get(DeploymentState, 1)
+            outcome = _classify_serving_outcome(
+                ds,
+                version.promoted_at,
+                version.promoted_sha,
+                version.deploy_confirm_deadline,
+                _now,
+            )
+            # Only an independently-observed serving confirmation recovers the
+            # version; never echo promoted_sha as a stand-in (the classifier
+            # already enforces current_sha == promoted_sha for this verdict).
+            if outcome is None or outcome[0] != "serving_confirmed":
+                return False
+            _kind, served_sha, served_at = outcome
+            await _recover_serving_confirmed(
+                session, version, served_sha, served_at, _now
+            )
+            await session.commit()
+            logger.info(
+                "[RELEASE_QUALIFIER] deploy-failed RECOVERED for promoted v%d "
+                "(served_sha=%s) — promoted SHA confirmed serving after a prior "
+                "deploy_failed latch",
+                version.version_number,
+                (version.served_sha or "")[:12],
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] deploy-failed recovery: unexpected error "
+                "for version %s",
+                version_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] deploy-failed recovery: rollback failed "
+                    "for version %s",
+                    version_id,
+                )
+            return False

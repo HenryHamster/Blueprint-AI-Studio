@@ -4230,11 +4230,15 @@ async def _spawn_strategic_review(
         )
     # Failed-deploy recovery directive — even if the next version has started
     # qualification, keep the recovery priority visible while the latest promoted
-    # version remains in deploy_failed state. This directive self-clears only when
-    # a subsequent version is promoted AND confirmed serving. Fires independently
-    # of the post-promotion handoff (which self-clears once the fresh version starts
-    # qualifying) so failed deploys continue to drive strategic attention until
-    # actually recovered.
+    # version remains in deploy_failed state. Computed at view time from that
+    # version's serving_status, so it self-clears as soon as the status flips to
+    # serving_confirmed — whether by a subsequent version promoting and confirming
+    # serving OR by the deploy-failure recovery sweep observing the SAME promoted
+    # SHA finally serve (a slow / boot-crashed deploy that later comes up healthy;
+    # see release_reconciliation._reconcile_if_deploy_failed_recovered). Fires
+    # independently of the post-promotion handoff (which self-clears once the fresh
+    # version starts qualifying) so failed deploys continue to drive strategic
+    # attention until actually recovered.
     if (
         _open_version is not None
         and _integration_branch != _promotion_target
@@ -4266,8 +4270,11 @@ async def _spawn_strategic_review(
                 f"The promotion did NOT ship and code is NOT live. Your TOP priority "
                 f"this cycle is RECOVERING the failed deploy (roll forward a fix / "
                 f"investigate why the promoted SHA never served). Only after it is "
-                f"serving should you move focus on. This directive remains active until "
-                f"a subsequent version is promoted AND confirmed serving."
+                f"serving should you move focus on. This directive clears the moment "
+                f"THIS deploy is confirmed serving — recovering the SAME promoted SHA "
+                f"(a slow or boot-crashed deploy that later comes up healthy) resolves "
+                f"it automatically; you do NOT need to cut and promote a subsequent "
+                f"version for it to clear."
             )
             prompt_suffix = (
                 f"{prompt_suffix}\n{_failed_deploy_directive}"

@@ -15,7 +15,7 @@ from app.models import (
     StrategicCycle,
     QualificationVerdict,
 )
-from app.auth import get_current_user
+from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
 from app.shared_state import (
     promotion_enabled_by_project_map,
@@ -685,4 +685,160 @@ async def list_qualification_verdicts(
             "infra_failure_count": readiness.get("infra_failure_count", 0),
             "consecutive_infra_errors": readiness.get("consecutive_infra_errors", 0),
         },
+    }
+
+
+class _ClearDeployFailedBody(BaseModel):
+    # Operator override: clear a stale deploy_failed even when the live serving
+    # SHA is unobservable (the pre-Cloud-Run-API interim). Without it, the clear
+    # only proceeds when the deploy is independently confirmed serving.
+    force: bool = _Field(default=False)
+    # Recorded attestation reason — REQUIRED for the force path so the durable
+    # audit trail records WHY an unverifiable deploy was declared live.
+    reason: str | None = _Field(default=None, max_length=500)
+
+
+def _record_deploy_failed_clear_attestation(
+    version: ReleaseVersion,
+    operator_id: str,
+    reason: str,
+    now,
+) -> None:
+    """Stamp an operator-attested deploy_failed clear onto the version audit trail.
+
+    The recovery helper clears ``deploy_failure_reason``; this records the durable
+    provenance (operator identity, reason, timestamp, mode) of an attested clear
+    that was NOT independently verified live, so the audit trail never silently
+    loses the fact that a human declared the deploy serving. Reassigns
+    ``last_qualification`` (rather than mutating in place) so SQLAlchemy detects
+    the JSON change.
+    """
+    qual = dict(version.last_qualification or {})
+    qual["deploy_failed_clear"] = {
+        "mode": "operator_attested",
+        "operator": operator_id,
+        "reason": reason,
+        "attested_at": now.isoformat(),
+    }
+    version.last_qualification = qual
+
+
+@router.post("/projects/{project_id}/clear-deploy-failed")
+async def clear_deploy_failed(
+    project_id: uuid.UUID,
+    payload: _ClearDeployFailedBody,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Acknowledge and clear a stale post-promotion ``deploy_failed`` serving state.
+
+    Admin-gated (matching the deploy operator levers). Targets the latest
+    ``promoted`` version whose ``serving_status`` is ``deploy_failed`` for the
+    project, under a per-version ``with_for_update`` row lock.
+
+    Behavior:
+
+    * FIRST attempt an independent live-verify by re-running the pure
+      ``_classify_serving_outcome`` against the live DeploymentState. If the
+      promoted SHA is genuinely observed serving, clear via the shared
+      ``_recover_serving_confirmed`` helper (flip to serving_confirmed, stamp the
+      observed served_sha/served_at, clear deploy_failure_reason, update the
+      verdict outcome, resolve the alert, arm a strategic refresh).
+    * If the live serving SHA is unobservable or does not yet match (the
+      pre-Cloud-Run-API interim), require an explicit ``force=true`` plus a
+      recorded operator ``reason``, then clear via the SAME helper using the
+      promoted SHA as the attested served SHA and record the operator
+      attestation in the version audit trail.
+    * Without the override and without an independent confirmation, return 409
+      explaining the deploy could not be independently verified live.
+
+    Returns 404 when no promoted deploy_failed version exists for the project.
+    """
+    from app.release_reconciliation import (  # noqa: PLC0415
+        _classify_serving_outcome,
+        _recover_serving_confirmed,
+    )
+    from app.models import DeploymentState  # noqa: PLC0415
+    from app.time_utils import _utcnow  # noqa: PLC0415
+
+    version = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "promoted",
+                    ReleaseVersion.serving_status == "deploy_failed",
+                )
+                .order_by(ReleaseVersion.promoted_at.desc())
+                .limit(1)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if version is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No promoted version in deploy_failed state for this project.",
+        )
+
+    now = _utcnow()
+    ds = await session.get(DeploymentState, 1)
+    outcome = _classify_serving_outcome(
+        ds,
+        version.promoted_at,
+        version.promoted_sha,
+        version.deploy_confirm_deadline,
+        now,
+    )
+
+    operator_id = current_user.get("email") or current_user["user_id"]
+
+    if outcome is not None and outcome[0] == "serving_confirmed":
+        # Independently confirmed serving — clear with the OBSERVED served SHA.
+        _kind, served_sha, served_at = outcome
+        await _recover_serving_confirmed(session, version, served_sha, served_at, now)
+        clear_mode = "verified"
+        attestation_reason = None
+    else:
+        # Live serving SHA is unobservable or does not yet match — refuse unless
+        # the operator explicitly overrides AND records a reason.
+        if not payload.force:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "deploy could not be independently verified live — the promoted "
+                    "SHA is not observed serving. Re-submit with force=true and a "
+                    "reason to attest the deploy is live."
+                ),
+            )
+        attestation_reason = (payload.reason or "").strip()
+        if not attestation_reason:
+            raise HTTPException(
+                status_code=400,
+                detail="A force clear requires a non-empty operator reason.",
+            )
+        # Operator attestation: clear using the promoted SHA as the served SHA and
+        # record the provenance in the durable audit trail.
+        await _recover_serving_confirmed(
+            session, version, version.promoted_sha, now, now
+        )
+        _record_deploy_failed_clear_attestation(
+            version, operator_id, attestation_reason, now
+        )
+        clear_mode = "operator_attested"
+
+    await session.commit()
+    await session.refresh(version)
+    return {
+        "version_number": version.version_number,
+        "serving_status": version.serving_status,
+        "served_sha": version.served_sha,
+        "served_at": version.served_at.isoformat() if version.served_at else None,
+        "deploy_failure_reason": version.deploy_failure_reason,
+        "clear_mode": clear_mode,
+        "operator_attested": clear_mode == "operator_attested",
+        "attestation_reason": attestation_reason,
     }

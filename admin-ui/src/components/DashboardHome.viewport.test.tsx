@@ -267,6 +267,16 @@ vi.mock('../api', () => ({
     abandoned_version: { version_number: 42, status: 'abandoned' },
     new_version: { version_number: 43, phase: 'build', goal: null, opened_at: '2026-05-20T12:00:00Z' },
   })),
+  clearDeployFailed: vi.fn(async () => ({
+    version_number: 42,
+    serving_status: 'serving',
+    served_sha: 'abc1234def56',
+    served_at: '2026-05-20T12:00:00Z',
+    deploy_failure_reason: null,
+    clear_mode: 'verified',
+    operator_attested: false,
+    attestation_reason: null,
+  })),
   patchAdminSettings: vi.fn(async () => ({ promotion_enabled: false })),
   setProjectPromotionEnabled: vi.fn(async () => ({
     project_id: 'p1',

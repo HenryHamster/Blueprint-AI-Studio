@@ -1892,6 +1892,21 @@ ALSO write /tmp/research_progress_${taskId}.md — a concise markdown summary (u
 **Implementation findings** — these are your primary output. Each one spawns an agent that writes code:
   feature, improvement, bug, refactor, perf, security_audit, qa, deps, docs, migrate, test
 
+**Compute experiments** — spawns a budgeted, auto-torn-down compute job (NOT a code PR):
+  compute_experiment (aliases: measurement, benchmark) — emit when a MEASURABLE or EMPIRICAL
+    question can only be answered by RUNNING CODE or a BENCHMARK, not by more reading: a
+    perf claim to confirm (throughput/latency), a before-vs-after comparison, an accuracy or
+    cost measurement. Do NOT use it for questions a code read settles, or for open-ended
+    exploration. The finding must carry a launch contract describing how to run it:
+    \`command\` (a single, self-contained shell command that runs the experiment end-to-end on
+    a fresh VM), \`spend_cap_usd\` (a positive USD cap — keep it conservative), and
+    \`deadline_seconds\` (a positive wall-clock timeout). Optionally add \`success_criterion\`
+    — a numeric goal of {"metric": "<name read from the result>", "operator": ">=|<=|>|<|==|!=",
+    "threshold": <number>} — to make the result machine-checkable (the gate fails the experiment
+    if the reported metric misses the goal). Put the launch fields either flat on the finding or
+    nested under a \`compute_experiment\` object. Above a configured spend threshold the launch
+    holds for operator approval; below it, it runs autonomously.
+
 **Sub-research** — spawns another research cycle (use sparingly):
   research
 
@@ -1933,6 +1948,7 @@ implementation findings. Add metadata alongside them when relevant.
   "provides_capability": null,
   "direction_id": "d-xxx or null",
   "effort": "high|medium|low|null",
+  "compute_experiment": {"command": "self-contained shell command to run the experiment", "spend_cap_usd": 5.0, "deadline_seconds": 1800, "success_criterion": {"metric": "accuracy", "operator": ">=", "threshold": 0.9}},
   "claims": ["short factual assertion backed by your investigation (omit when synthesizing)"],
   "sources": [{"type": "file|pr|log|message", "ref": "path/to/file.py or pr#123 or msg_id", "excerpt": "optional short quote"}]
 }]
@@ -1943,6 +1959,8 @@ implementation findings. Add metadata alongside them when relevant.
 **sources** (optional, provenance only): Cite a specific origin when you have one. type 'file': a file you read, 'pr': a merged PR number, 'log': a pipeline log line, 'message': a user message. Omit the field when synthesizing. excerpt is optional — include only a directly relevant short quote.
 
 **prerequisite** (optional, default null): Declare a FOUNDATION this finding depends on that is being (or was) built OUTSIDE this batch — an earlier or concurrently-in-flight cycle, or a named capability. Shape: \`{"kind": "task", "ref": "<task-id or finding-hash>"}\` to gate on a specific in-flight/queued task, or \`{"kind": "capability", "ref": "<capability-name>"}\` to gate on whichever task advertises that capability. When it resolves to a real foundation the dependent is structurally gated (depends_on edge) so it does not run against a base missing the foundation or duplicate it; when it does not resolve the dependent enters a BLOCKED state with the unmet prerequisite recorded as a machine-resolvable need, and is resumed when the foundation appears or escalated to the operator after a timeout. Use ONLY for cross-cycle / cross-batch foundations or named capabilities — for ordering findings WITHIN this batch, use depends_on_indices instead (NOT prerequisite). Omit (or null) when there is no external foundation.
+
+**compute_experiment** (optional, default null): Present ONLY on a compute_experiment/measurement/benchmark finding — the launch contract for the budgeted compute job. Required keys \`command\`, \`spend_cap_usd\` (positive), \`deadline_seconds\` (positive); optional \`success_criterion\` (numeric metric/operator/threshold goal) and benchmark metadata (\`machine_type\`, \`experiment\`, \`benchmark\`, \`metric\`, \`cwd\`, \`env\`). Omit entirely on non-experiment findings.
 
 **provides_capability** (optional, default null): A short capability name this finding's task advertises (e.g. "payment-core"), so a sibling finding declaring \`{"kind": "capability", "ref": "payment-core"}\` can depend on it. Omit unless another finding needs to gate on this one by capability.
 

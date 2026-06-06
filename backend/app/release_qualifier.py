@@ -108,6 +108,7 @@ from app.release_promotion import (
     promote,
 )
 from app.release_reconciliation import (
+    _reconcile_if_deploy_failed_recovered,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_pending_auto_merge_landed,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_promotion_failed_landed,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_promotion_pending_timed_out,  # noqa: F401 — re-exported for back-compat

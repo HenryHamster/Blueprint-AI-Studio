@@ -28,6 +28,7 @@ from app.models import Alert, AlertSeverity
 from app.release_promotion import _notify_operator
 from app.release_reconciliation import (
     _confirm_serving_or_fail,
+    _reconcile_if_deploy_failed_recovered,
     _reconcile_if_pending_auto_merge_landed,
     _reconcile_if_promotion_failed_landed,
     _reconcile_if_promotion_pending_timed_out,
@@ -63,6 +64,17 @@ _MAX_QUALIFICATION_DURATION_SECONDS = 6 * 60 * 60
 # three consecutive crashes strongly suggest a persistent bug in the finalize
 # path rather than a transient error, and the loop must self-recover.
 _MAX_SWEEP_CRASH_STREAK = 3
+
+# How long a ``serving_status="deploy_failed"`` version remains eligible for
+# serving RECOVERY.  A deploy_failed latch is not terminal-by-construction: a
+# deploy that boot-crashed and recovered, or was merely slow past the ~60-min
+# confirmation window (the real v5 case promoted 14:58 UTC and only began serving
+# at 19:51 UTC — ~5h late), can later actually serve its promoted SHA.  Within
+# this window the post-promotion sweep re-checks deploy_failed versions and
+# recovers any whose promoted SHA is now independently observed serving; beyond
+# it a genuinely dead deploy stays loudly failed forever.  24h is generous enough
+# to cover the v5 ~5h-late case with wide margin.
+_DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS = 24 * 3600
 
 
 def _parse_started_at(qual: dict[str, Any]) -> datetime | None:
@@ -494,6 +506,52 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep resolved post-promotion serving "
                 "status for version %s",
+                version_id,
+            )
+
+    # Post-promotion deploy-failure RECOVERY.  A serving_status="deploy_failed"
+    # latch is not terminal-by-construction: a deploy that boot-crashed and then
+    # recovered (or was merely slow past the confirmation window — the real v5
+    # case served ~5h late) can later actually serve its promoted SHA.  Within a
+    # bounded recovery window, re-check promoted+deploy_failed versions and flip
+    # any whose promoted SHA is now INDEPENDENTLY observed serving back to a
+    # truthful serving_confirmed state (clearing the version status, the operator
+    # alert, the strategist crisis directive, and the verdict precision sample).
+    # Beyond the window a genuinely dead deploy stays loudly failed forever.  Like
+    # the unconfirmed loop this scans PROMOTED versions, so it runs its own narrow
+    # query; each version recovers in its own dedicated session.
+    deploy_failed_ids = list(
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion.id).where(
+                    release_version.ReleaseVersion.status == "promoted",
+                    release_version.ReleaseVersion.serving_status == "deploy_failed",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for version_id in deploy_failed_ids:
+        try:
+            recovered = await _reconcile_if_deploy_failed_recovered(
+                version_id,
+                session_factory=session_factory,
+                now=now,
+                recovery_window_seconds=_DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: deploy-failed recovery check failed "
+                "for version %s",
+                version_id,
+            )
+            continue
+        if recovered:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep recovered deploy-failed version %s "
+                "(promoted SHA confirmed serving after a prior latch)",
                 version_id,
             )
 

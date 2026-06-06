@@ -7194,6 +7194,228 @@ class TestCutVersion:
         assert await rv.current_open_version(db_session, project.id) is not None
 
 
+class TestClearDeployFailed:
+    """POST /api/admin/projects/{id}/clear-deploy-failed operator lever."""
+
+    @staticmethod
+    async def _make_deploy_failed_version(
+        session, project_id, *, promoted_sha="promotedsha123", version_number=1
+    ):
+        from datetime import datetime, timezone
+
+        from app.models import QualificationVerdict
+
+        promoted_at = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        version = ReleaseVersion(
+            project_id=project_id,
+            version_number=version_number,
+            phase="stabilize",
+            status="promoted",
+            promoted_at=promoted_at,
+            promoted_sha=promoted_sha,
+            serving_status="deploy_failed",
+            deploy_failure_reason="no_new_revision",
+            deploy_confirm_deadline=datetime(
+                2026, 1, 1, 1, 0, 0, tzinfo=timezone.utc
+            ),
+            deploy_confirm_alerted_at=datetime(
+                2026, 1, 1, 1, 0, 0, tzinfo=timezone.utc
+            ),
+        )
+        session.add(version)
+        await session.commit()
+        await session.refresh(version)
+
+        verdict = QualificationVerdict(
+            project_id=project_id,
+            release_version_id=version.id,
+            candidate_sha=promoted_sha,
+            confidence=0.95,
+            would_promote=True,
+            promotion_enabled=True,
+            terminal_status="promoted",
+            threshold=0.90,
+            post_promotion_outcome="deploy_failed",
+        )
+        session.add(verdict)
+        await session.commit()
+        return version
+
+    @pytest.mark.asyncio
+    async def test_404_when_no_deploy_failed_version(
+        self, client: AsyncClient, db_session
+    ):
+        """No promoted deploy_failed version → 404."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/clear-deploy-failed",
+            json={},
+        )
+        assert resp.status_code == 404, resp.text
+
+    @pytest.mark.asyncio
+    async def test_non_admin_rejected(self, override_get_session, db_session):
+        """Non-admin is rejected with 403 by require_admin."""
+        from fastapi import HTTPException
+
+        project = await _make_project(db_session)
+        await self._make_deploy_failed_version(db_session, project.id)
+
+        async def reject_admin():
+            raise HTTPException(status_code=403, detail="Admin privileges required")
+
+        app.dependency_overrides[require_admin] = reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    f"/api/admin/projects/{project.id}/clear-deploy-failed",
+                    json={"force": True, "reason": "x"},
+                )
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(require_admin, None)
+
+    @pytest.mark.asyncio
+    async def test_verify_path_clears_when_sha_serving(
+        self, client: AsyncClient, db_session
+    ):
+        """Promoted SHA genuinely observed serving → cleared without force."""
+        from datetime import datetime, timezone
+
+        from app.models import DeploymentState, DeploymentStatus, QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await self._make_deploy_failed_version(
+            db_session, project.id, promoted_sha="liveserving999"
+        )
+
+        # A new revision booted AFTER promotion, is STABLE, and its live serving
+        # SHA matches the promoted SHA — an independent serving confirmation.
+        db_session.add(
+            DeploymentState(
+                current_sha="liveserving999",
+                status=DeploymentStatus.STABLE,
+                deployed_at=datetime(2026, 1, 1, 0, 30, 0, tzinfo=timezone.utc),
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/clear-deploy-failed",
+            json={},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["serving_status"] == "serving_confirmed"
+        assert data["clear_mode"] == "verified"
+        assert data["operator_attested"] is False
+        assert data["served_sha"] == "liveserving999"
+        assert data["deploy_failure_reason"] is None
+
+        await db_session.refresh(version)
+        assert version.serving_status == "serving_confirmed"
+        assert version.deploy_failure_reason is None
+
+        verdict = (
+            await db_session.execute(
+                select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar_one()
+        assert verdict.post_promotion_outcome == "serving_confirmed"
+
+    @pytest.mark.asyncio
+    async def test_force_refused_without_override(
+        self, client: AsyncClient, db_session
+    ):
+        """Unobservable serving SHA + no force → 409, version stays deploy_failed."""
+        project = await _make_project(db_session)
+        version = await self._make_deploy_failed_version(db_session, project.id)
+        # No DeploymentState → serving SHA cannot be independently observed.
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/clear-deploy-failed",
+            json={},
+        )
+        assert resp.status_code == 409, resp.text
+        assert "force=true" in resp.text
+
+        await db_session.refresh(version)
+        assert version.serving_status == "deploy_failed"
+
+    @pytest.mark.asyncio
+    async def test_force_requires_reason(self, client: AsyncClient, db_session):
+        """force=true without a reason → 400."""
+        project = await _make_project(db_session)
+        await self._make_deploy_failed_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/clear-deploy-failed",
+            json={"force": True, "reason": "   "},
+        )
+        assert resp.status_code == 400, resp.text
+
+    @pytest.mark.asyncio
+    async def test_force_path_clears_and_records_attestation(
+        self, client: AsyncClient, db_session
+    ):
+        """force=true + reason clears, resolves the alert, flips the verdict."""
+        from app.models import QualificationVerdict
+        from app.release_stall_alerts import _deploy_failed_alert_title
+
+        project = await _make_project(db_session)
+        version = await self._make_deploy_failed_version(db_session, project.id)
+
+        # Seed the open deploy-failed operator alert that must be resolved.
+        alert = Alert(
+            project_id=project.id,
+            title=_deploy_failed_alert_title(version.version_number),
+            message="promotion deploy FAILED",
+        )
+        db_session.add(alert)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/clear-deploy-failed",
+            json={"force": True, "reason": "manually verified live in Cloud Run"},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["serving_status"] == "serving_confirmed"
+        assert data["clear_mode"] == "operator_attested"
+        assert data["operator_attested"] is True
+        assert data["attestation_reason"] == "manually verified live in Cloud Run"
+        # Attested clear stamps the promoted SHA as the served SHA.
+        assert data["served_sha"] == "promotedsha123"
+
+        await db_session.refresh(version)
+        assert version.serving_status == "serving_confirmed"
+        assert version.deploy_failure_reason is None
+        clear_audit = (version.last_qualification or {}).get("deploy_failed_clear")
+        assert clear_audit is not None
+        assert clear_audit["mode"] == "operator_attested"
+        assert clear_audit["reason"] == "manually verified live in Cloud Run"
+
+        # The open deploy-failed alert is resolved.
+        await db_session.refresh(alert)
+        assert alert.dismissed_at is not None
+
+        # The verdict's post-promotion outcome flips to serving_confirmed.
+        verdict = (
+            await db_session.execute(
+                select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar_one()
+        assert verdict.post_promotion_outcome == "serving_confirmed"
+
+
 class TestVersionLifecycleInfraFailureFields:
     """GET /api/admin/projects/{id}/version-lifecycle exposes infra-failure fields."""
 

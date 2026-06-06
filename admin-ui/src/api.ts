@@ -1295,6 +1295,45 @@ export async function cutVersion(
   return data;
 }
 
+export interface ClearDeployFailedResponse {
+  version_number: number;
+  serving_status: string | null;
+  served_sha: string | null;
+  served_at: string | null;
+  deploy_failure_reason: string | null;
+  clear_mode: 'verified' | 'operator_attested';
+  operator_attested: boolean;
+  attestation_reason: string | null;
+}
+
+// Clear a stale post-promotion deploy_failed serving state. Without `force`, the
+// backend only clears when the promoted SHA is independently observed serving;
+// with `force` + a `reason` it records an operator-attested clear (used in the
+// interim where the live serving SHA is unobservable).
+export async function clearDeployFailed(
+  projectId: string,
+  force?: boolean,
+  reason?: string,
+): Promise<ClearDeployFailedResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/clear-deploy-failed`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        ...(force ? { force: true } : {}),
+        ...(reason ? { reason } : {}),
+      }),
+    },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail =
+      data?.detail || data?.error?.message || `Failed to clear deploy-failed: ${res.status}`;
+    throw new Error(detail);
+  }
+  return data;
+}
+
 export type QualifyTriggerStatus =
   | 'wrong_phase'
   | 'already_pending'

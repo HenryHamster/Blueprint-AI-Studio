@@ -5981,6 +5981,139 @@ async def test_failed_deploy_directive_clears_when_newer_version_serving_confirm
 
 
 @pytest.mark.asyncio
+async def test_failed_deploy_directive_text_states_same_sha_recovery_clears(
+    db_session, mocker, _lts_split_active
+):
+    """The crisis directive text must correctly state that confirming THIS deploy
+    serving (a recovery of the SAME promoted SHA) clears it — not only a
+    subsequent promotion. The old wording wrongly implied a same-SHA recovery
+    could never clear it."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    failed_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="promoted",
+        opened_at=now - timedelta(days=5),
+        promoted_at=now - timedelta(hours=3),
+        last_qualification={"status": "promoted", "confidence": 0.93},
+        serving_status="deploy_failed",
+        deploy_failure_reason="boot crash, recovered late",
+    )
+    db_session.add(failed_version)
+    # An open v2 — the directive only fires while a version is open.
+    db_session.add(
+        ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="build",
+            status="open",
+            opened_at=now,
+            phase_changed_at=now,
+            last_qualification=None,
+            qualification_attempts=0,
+        )
+    )
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks
+    suffix = tasks[0].payloads[0].get("prompt_suffix", "")
+
+    assert "deployment crisis" in suffix.lower(), f"directive missing; got: {suffix}"
+    # The corrected wording: same-SHA recovery clears it; no subsequent version
+    # is required.
+    assert "SAME promoted SHA" in suffix, (
+        f"directive must state same-SHA recovery clears it; got: {suffix}"
+    )
+    assert "do NOT need to cut and promote a subsequent" in suffix, (
+        f"directive must not imply only a subsequent version clears it; got: {suffix}"
+    )
+    # The misleading old phrasing must be gone.
+    assert "remains active until a subsequent version is promoted AND confirmed serving" not in suffix
+
+
+@pytest.mark.asyncio
+async def test_failed_deploy_directive_clears_on_same_sha_recovery(
+    db_session, mocker, _lts_split_active
+):
+    """A same-SHA recovery (the single promoted version's serving_status flips
+    deploy_failed -> serving_confirmed, no subsequent version) clears the crisis
+    directive — the directive is computed at view time from serving_status."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    recovered_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="promoted",
+        opened_at=now - timedelta(days=5),
+        promoted_at=now - timedelta(hours=6),
+        last_qualification={"status": "promoted", "confidence": 0.93},
+        # Recovery flipped the SAME promoted SHA back to serving_confirmed.
+        serving_status="serving_confirmed",
+        served_sha="abc123def456",
+    )
+    db_session.add(recovered_version)
+    # An open v2 so the directive WOULD fire if v1 were still deploy_failed —
+    # making the "directive cleared" assertion meaningful rather than vacuous.
+    db_session.add(
+        ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="build",
+            status="open",
+            opened_at=now,
+            phase_changed_at=now,
+            last_qualification=None,
+            qualification_attempts=0,
+        )
+    )
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks
+    suffix = tasks[0].payloads[0].get("prompt_suffix", "")
+
+    assert "deployment crisis" not in suffix.lower() and "deploy_failed" not in suffix, (
+        f"Crisis directive must clear on a same-SHA recovery; got: {suffix}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_stabilize_stall_hint_suppressed_for_dry_run(
     db_session, mocker, _lts_split_active
 ):

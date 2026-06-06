@@ -1674,3 +1674,260 @@ async def test_confirm_within_window_no_decision_keeps_unconfirmed(db_session):
     assert resolved is False
     await db_session.refresh(version)
     assert version.serving_status == "unconfirmed"
+
+
+# ===========================================================================
+# Post-promotion deploy-failure RECOVERY.
+#
+# A serving_status="deploy_failed" latch is NOT terminal-by-construction.  A
+# deploy that boot-crashed and recovered, or was merely slow past the bounded
+# confirmation window (the real v5 case promoted 14:58 UTC, served 19:51 UTC),
+# can later actually serve its promoted SHA.  Within a bounded recovery window
+# the sweep flips it back to a truthful serving_confirmed state and clears every
+# derived failure surface; beyond the window a genuinely dead deploy stays failed.
+# ===========================================================================
+
+from app.release_reconciliation import (  # noqa: E402
+    _DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS_DEFAULT,
+    _reconcile_if_deploy_failed_recovered,
+)
+from app.release_stall_alerts import (  # noqa: E402
+    _deploy_failed_alert_title,
+)
+
+
+async def _make_promoted_deploy_failed_version(
+    db_session,
+    *,
+    promoted_at: datetime,
+    deadline: datetime,
+    alerted_at: datetime,
+    promoted_sha: str = _SHA_A,
+    deploy_failure_reason: str = "no_new_revision",
+    with_open_alert: bool = True,
+):
+    """Create a self-repo project + a v1 latched to promoted/deploy_failed.
+
+    Mirrors the post-``_confirm_serving_or_fail`` deploy-failed state: the verdict
+    row carries ``post_promotion_outcome="deploy_failed"`` and (optionally) a loud
+    open ERROR alert with the deterministic deploy-failed title is present.
+    """
+    project = Project(
+        name="Recover-Test",
+        user_id="recover-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+        is_self_repo=True,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    version.status = "promoted"
+    version.promoted_at = promoted_at
+    version.promoted_sha = promoted_sha
+    version.serving_status = "deploy_failed"
+    version.deploy_failure_reason = deploy_failure_reason
+    version.deploy_confirm_deadline = deadline
+    version.deploy_confirm_alerted_at = alerted_at
+    version.last_qualification = {"status": "promoted", "promoted_sha": promoted_sha}
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha=promoted_sha,
+            terminal_status="promoted",
+            would_promote=True,
+            promotion_enabled=True,
+            post_promotion_outcome="deploy_failed",
+            post_promotion_outcome_at=alerted_at,
+        )
+    )
+    if with_open_alert:
+        db_session.add(
+            Alert(
+                project_id=project.id,
+                severity=AlertSeverity.ERROR,
+                title=_deploy_failed_alert_title(version.version_number),
+                message="deploy failed",
+            )
+        )
+    await db_session.commit()
+    await db_session.refresh(version)
+    return project, version
+
+
+@pytest.mark.asyncio
+async def test_recover_deploy_failed_when_sha_serves_within_window(db_session):
+    """(a) A version latched deploy_failed whose promoted SHA later begins serving
+    within the recovery window flips back to serving_confirmed: served_sha/at are
+    stamped, deploy_failure_reason cleared, the verdict outcome flips to
+    serving_confirmed, the open operator alert is dismissed, and the strategist is
+    woken so the crisis directive recomputes."""
+    now = _utcnow()
+    promoted_at = now - timedelta(hours=5)
+    deadline = promoted_at + timedelta(hours=1)  # long since elapsed
+    alerted_at = promoted_at + timedelta(hours=1)  # within the 24h recovery window
+    project, version = await _make_promoted_deploy_failed_version(
+        db_session,
+        promoted_at=promoted_at,
+        deadline=deadline,
+        alerted_at=alerted_at,
+    )
+    # A new STABLE revision finally came up healthy serving the promoted SHA.
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        deployed_at=now - timedelta(minutes=10),
+    )
+
+    recovered = await _reconcile_if_deploy_failed_recovered(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=now,
+    )
+    assert recovered is True
+    await db_session.refresh(version)
+    assert version.serving_status == "serving_confirmed"
+    assert version.served_sha == _SHA_A
+    assert version.served_at is not None
+    assert version.deploy_failure_reason is None
+
+    # The view-time summary now reports the TRUE serving_confirmed state.
+    state = rv.summarize_qualification_state(
+        version.last_qualification, version.serving_status, version.deploy_failure_reason
+    )
+    assert state["state"] == "promoted"
+    assert state["serving_status"] == "serving_confirmed"
+
+    # The verdict's post-promotion outcome flipped — the readiness precision
+    # sample self-corrects off this row.
+    verdict = (
+        (
+            await db_session.execute(
+                _select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert verdict.post_promotion_outcome == "serving_confirmed"
+
+    # The loud deploy-failed operator alert was resolved (dismissed).
+    alerts = (
+        (
+            await db_session.execute(
+                _select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    deploy_alerts = [a for a in alerts if "deploy FAILED" in a.title]
+    assert len(deploy_alerts) == 1
+    assert deploy_alerts[0].dismissed_at is not None
+
+    # The strategist was woken so the "recover the failed deploy" crisis directive
+    # recomputes against the now-true serving_confirmed state.
+    await db_session.refresh(project)
+    assert strategic_refresh_pending(project.vision) is True
+    marker = project.vision["_strategic_refresh"]
+    assert str(marker.get("reason", "")) == "promotion_deploy_recovered"
+
+
+@pytest.mark.asyncio
+async def test_recover_skips_when_sha_never_serves(db_session):
+    """(b) A genuinely failed deploy (promoted SHA never serves — the live revision
+    predates the promotion and never advanced) stays deploy_failed and keeps its
+    alert and verdict outcome; no recovery, no refresh."""
+    now = _utcnow()
+    promoted_at = now - timedelta(hours=5)
+    deadline = promoted_at + timedelta(hours=1)
+    alerted_at = promoted_at + timedelta(hours=1)
+    project, version = await _make_promoted_deploy_failed_version(
+        db_session,
+        promoted_at=promoted_at,
+        deadline=deadline,
+        alerted_at=alerted_at,
+    )
+    # Stale revision predating the promotion; STABLE but never advanced.
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha="c" * 40,
+        deployed_at=promoted_at - timedelta(minutes=30),
+    )
+
+    recovered = await _reconcile_if_deploy_failed_recovered(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=now,
+    )
+    assert recovered is False
+    await db_session.refresh(version)
+    assert version.serving_status == "deploy_failed"
+    assert version.served_sha is None
+
+    # The open deploy-failed alert is untouched.
+    alerts = (
+        (
+            await db_session.execute(
+                _select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    deploy_alerts = [a for a in alerts if "deploy FAILED" in a.title]
+    assert len(deploy_alerts) == 1
+    assert deploy_alerts[0].dismissed_at is None
+
+    await db_session.refresh(project)
+    assert strategic_refresh_pending(project.vision) is False
+
+
+@pytest.mark.asyncio
+async def test_recover_skips_beyond_recovery_window(db_session):
+    """(b) A deploy whose promoted SHA only begins serving AFTER the recovery
+    window has elapsed stays deploy_failed forever — the recovery check is bounded
+    so a genuinely dead deploy is no longer re-examined."""
+    now = _utcnow()
+    # Failure was recorded well beyond the recovery window.
+    alerted_at = now - timedelta(
+        seconds=_DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS_DEFAULT + 3600
+    )
+    promoted_at = alerted_at - timedelta(hours=1)
+    deadline = alerted_at
+    project, version = await _make_promoted_deploy_failed_version(
+        db_session,
+        promoted_at=promoted_at,
+        deadline=deadline,
+        alerted_at=alerted_at,
+    )
+    # Even though the promoted SHA is NOW genuinely serving, the window elapsed.
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        deployed_at=now - timedelta(minutes=10),
+    )
+
+    recovered = await _reconcile_if_deploy_failed_recovered(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=now,
+    )
+    assert recovered is False
+    await db_session.refresh(version)
+    assert version.serving_status == "deploy_failed"
+    assert version.served_sha is None

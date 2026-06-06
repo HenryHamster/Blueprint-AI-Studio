@@ -2248,6 +2248,24 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     expect(p).toContain('OUTSIDE this');
     expect(p).toContain('FILE-GROUNDED design');
   });
+
+  it('handleResearch prompt teaches the compute_experiment finding type with a when-to-use rubric and launch contract', async () => {
+    await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // The finding type and its aliases must be advertised.
+    expect(p).toContain('compute_experiment');
+    expect(p).toContain('measurement');
+    expect(p).toContain('benchmark');
+    // When-to-use rubric: a measurable/empirical question that needs running code.
+    expect(p).toContain('MEASURABLE');
+    expect(p).toContain('RUNNING CODE');
+    // Launch contract fields the backend parser reads.
+    expect(p).toContain('command');
+    expect(p).toContain('spend_cap_usd');
+    expect(p).toContain('deadline_seconds');
+    // Optional machine-checkable success criterion.
+    expect(p).toContain('success_criterion');
+  });
 });
 
 // ── handleResearch — prior-knowledge injection ───────────────────────────────

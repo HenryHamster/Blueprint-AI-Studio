@@ -1208,4 +1208,114 @@ describe('VersionLifecyclePanel', () => {
       expect(within(history).getByText(/deploy failed/)).toBeInTheDocument();
     });
   });
+
+  describe('clear deploy-failed lever', () => {
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    it('shows the clear control only for admins when serving_status is deploy_failed', () => {
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({ serving_status: 'deploy_failed' }),
+      });
+      const { rerender } = render(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} userRole="admin" />
+      );
+      expect(screen.getByTestId('clear-deploy-failed')).toBeInTheDocument();
+
+      // Non-admin: hidden.
+      rerender(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} userRole="user" />
+      );
+      expect(screen.queryByTestId('clear-deploy-failed')).not.toBeInTheDocument();
+    });
+
+    it('hides the clear control when no version is deploy_failed', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ serving_status: 'serving_confirmed' }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+          userRole="admin"
+        />
+      );
+      expect(screen.queryByTestId('clear-deploy-failed')).not.toBeInTheDocument();
+    });
+
+    it('calls clearDeployFailed on the verify path and reports the outcome', async () => {
+      const clearMock = vi.fn().mockResolvedValue({
+        version_number: 1,
+        serving_status: 'serving_confirmed',
+        served_sha: 'live999',
+        served_at: '2026-01-01T00:30:00Z',
+        deploy_failure_reason: null,
+        clear_mode: 'verified',
+        operator_attested: false,
+        attestation_reason: null,
+      });
+      vi.mocked(api.clearDeployFailed).mockImplementation(clearMock);
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ serving_status: 'deploy_failed' }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+          userRole="admin"
+        />
+      );
+
+      fireEvent.click(screen.getByTestId('clear-deploy-failed'));
+
+      await waitFor(() => {
+        expect(clearMock).toHaveBeenCalledWith('proj-1');
+      });
+      await waitFor(() => {
+        expect(screen.getByText(/Deploy-failed cleared \(verified\)/)).toBeInTheDocument();
+      });
+      expect(mockRefresh).toHaveBeenCalled();
+    });
+
+    it('prompts for an attestation reason and force-clears when verify is refused', async () => {
+      const clearMock = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('deploy could not be independently verified live — re-submit with force=true and a reason'))
+        .mockResolvedValueOnce({
+          version_number: 1,
+          serving_status: 'serving_confirmed',
+          served_sha: 'promoted123',
+          served_at: '2026-01-01T02:00:00Z',
+          deploy_failure_reason: null,
+          clear_mode: 'operator_attested',
+          operator_attested: true,
+          attestation_reason: 'verified live by hand',
+        });
+      vi.mocked(api.clearDeployFailed).mockImplementation(clearMock);
+      const promptSpy = vi.spyOn(window, 'prompt').mockReturnValue('verified live by hand');
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ serving_status: 'deploy_failed' }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+          userRole="admin"
+        />
+      );
+
+      fireEvent.click(screen.getByTestId('clear-deploy-failed'));
+
+      await waitFor(() => {
+        expect(promptSpy).toHaveBeenCalled();
+      });
+      await waitFor(() => {
+        expect(clearMock).toHaveBeenLastCalledWith('proj-1', true, 'verified live by hand');
+      });
+      await waitFor(() => {
+        expect(screen.getByText(/operator-attested/)).toBeInTheDocument();
+      });
+      promptSpy.mockRestore();
+    });
+  });
 });

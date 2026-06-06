@@ -11834,6 +11834,49 @@ async def test_validated_precision_below_min_keeps_unvalidated(db_session):
 
 
 @pytest.mark.asyncio
+async def test_validated_precision_self_corrects_on_deploy_failed_recovery(db_session):
+    """(c) When a deploy_failed verdict is later recovered (its
+    post_promotion_outcome flips deploy_failed -> serving_confirmed because the
+    promoted SHA finally served), the readiness validated_precision sample
+    self-corrects on the next compute — the false-negative deploy_failed no longer
+    depresses precision. release_readiness needs no logic change: it derives the
+    precision directly from QualificationVerdict.post_promotion_outcome."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    # 4 serving_confirmed + 1 deploy_failed → precision 0.80 over 5 resolved.
+    confirmed_rows = [
+        await _seed_promoted_verdict(
+            db_session, project.id, version.id, seq=100 + i,
+            post_promotion_outcome="serving_confirmed",
+        )
+        for i in range(4)
+    ]
+    failed_row = await _seed_promoted_verdict(
+        db_session, project.id, version.id, seq=200,
+        post_promotion_outcome="deploy_failed",
+    )
+
+    before = await rq.compute_promotion_readiness(db_session, project.id)
+    assert before["serving_confirmed_count"] == 4
+    assert before["deploy_failed_count"] == 1
+    assert before["validated_precision"] == pytest.approx(0.8)
+
+    # Recovery flips the verdict outcome exactly as
+    # _recover_serving_confirmed does (deploy_failed -> serving_confirmed).
+    failed_row.post_promotion_outcome = "serving_confirmed"
+    db_session.add(failed_row)
+    await db_session.commit()
+
+    after = await rq.compute_promotion_readiness(db_session, project.id)
+    assert after["serving_confirmed_count"] == 5
+    assert after["deploy_failed_count"] == 0
+    assert after["validated_precision"] == pytest.approx(1.0)
+    # The false-negative no longer depresses the precision sample.
+    assert after["validated_precision"] > before["validated_precision"]
+    assert len(confirmed_rows) == 4
+
+
+@pytest.mark.asyncio
 async def test_readiness_recurring_blocker_not_ready(db_session):
     """A recurring hard blocker in the history blocks readiness even when the
     most-recent streak, evaluated count and would-promote rate all clear their
