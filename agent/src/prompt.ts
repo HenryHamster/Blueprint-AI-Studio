@@ -57,6 +57,7 @@ export {
   buildScopedLintOneliner,
 } from './prompts/code-change-helpers.js';
 import { excludeAgentHelpers, isBlueprintSelfRepo } from './prompts/code-change-helpers.js';
+import { isPytestCmd } from './prompts/check-helper.js';
 export { excludeAgentHelpers };
 
 // ── Agent Permission Enforcement ────────────────────────────────────────
@@ -1274,6 +1275,20 @@ function buildConfigCheckIntro(buildConfig: BuildConfig): string {
     .filter(d => d.test_cmd)
     .map(d => `\`${d.path.replace(/\/$/, '')}/\` (\`${d.test_cmd}\`)`);
   const testList = testParts.length ? testParts.join(', ') : 'any configured test commands';
+  // Mirrors buildPytestGateInner in prompts/check-helper.ts: a pytest-style
+  // test command gets the honest gate (sanctioned-harness preference +
+  // GATE-ENVIRONMENT fallback), so tell the agent what that note means.
+  const hasPytestGate = dirs.some(d => !!d.test_cmd && isPytestCmd(d.test_cmd));
+  const pytestGateNote = hasPytestGate
+    ? `  A pytest-style test command runs honestly: \`./check test\` prefers the
+  project's Docker test harness (\`scripts/test-<dir>.sh\`) when Docker can
+  run it; if this VM can faithfully run neither the harness nor a
+  Postgres-backed pytest, the gate logs a GATE-ENVIRONMENT note instead of
+  failing on pre-existing environment-only failures. When you see that
+  note, record your own faithful test evidence in the PR body — do NOT
+  treat the environment artifact as a blocker for validated work.
+`
+    : '';
   return `- \`./check\` — runs this project's configured lint/build commands for the
   directories your changes touched: ${dirList}. Fast. Exits non-zero on
   failure with the actual error tail; fix and re-run until green. If your
@@ -1282,7 +1297,7 @@ function buildConfigCheckIntro(buildConfig: BuildConfig): string {
 - \`./check test\` — same plus this project's configured test commands
   (${testList}). This local gate is a smoke check; CI runs the full suite
   on the PR after \`./pr open\`.
-`;
+${pytestGateNote}`;
 }
 
 /** Generic ./check description for a non-Blueprint repo that supplied no

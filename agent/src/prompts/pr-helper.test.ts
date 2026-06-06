@@ -185,6 +185,69 @@ esac
     expect(checkArgs).toBe('test');
   });
 
+  it('surfaces the GATE-ENVIRONMENT marker after a passing ./check test', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const markerPath = '/tmp/check_gate_env_task-lts-2.txt';
+    realFs.writeFileSync(markerPath, 'backend: pytest gate skipped — no Docker for the sanctioned harness and no Postgres test env\n');
+    try {
+      const script = writeScript({
+        taskId: 'task-lts-2',
+        workBranch: 'blueprint/task-lts-2',
+        baseBranch: 'production',
+        owner: 'acme',
+        repo: 'repo',
+        testsOnMainBranch: false,
+        promotionTarget: 'production',
+      });
+
+      const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, fsImpl) => {
+        const bin = `${dir}/bin`;
+        fsImpl.mkdirSync(bin, { recursive: true });
+        fsImpl.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+        fsImpl.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/production"*) exit 0 ;;
+  *"diff --name-only origin/production...HEAD"*) printf '%s\n' 'backend/app/main.py'; exit 0 ;;
+  *"diff --name-only HEAD"*) exit 0 ;;
+  *"ls-files --others --exclude-standard"*) exit 0 ;;
+  *"status --porcelain"*) exit 0 ;;
+  *"rev-list --count origin/production..HEAD"*) printf '1\n'; exit 0 ;;
+  *"remote set-url origin"*) exit 0 ;;
+  *"push --force-with-lease origin blueprint/task-lts-2"*) exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+        fsImpl.writeFileSync(`${bin}/curl`, `#!/bin/sh
+ARGS="$*"
+OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$ARGS" in
+  *"/api/agent/github/token?task_id=task-lts-2"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
+  *"/api/agent/github/pull-requests"*) [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/8"}}' > "$OUT"; printf '201'; exit 0 ;;
+  *"/pulls/8"*) printf '{"mergeable":true,"mergeable_state":"clean"}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+        fsImpl.writeFileSync(`${bin}/jq`, '#!/bin/sh\ncase "$*" in\n  *".data.token"*) printf \'token-abc\\n\' ;;\n  *".data.html_url"*) printf \'https://github.com/acme/repo/pull/8\\n\' ;;\n  *".mergeable_state"*) printf \'clean\\n\' ;;\n  *".mergeable // \\"null\\""*) printf \'true\\n\' ;;\n  *) printf \'{}\\n\' ;;\nesac\n', { mode: 0o755 });
+      });
+
+      expect(result.status).toBe(0);
+      // The marker is surfaced verbatim (prefixed) with the evidence guidance.
+      expect(result.stdout).toContain('[pr] NOTE: the test gate ran in GATE-ENVIRONMENT mode on this VM:');
+      expect(result.stdout).toContain('[pr]   backend: pytest gate skipped');
+      expect(result.stdout).toContain('Record your faithful test evidence');
+      // It is a note, not a blocker — the PR still ships.
+      expect(result.stdout).toContain('[pr] OK — https://github.com/acme/repo/pull/8');
+    } finally {
+      try { realFs.unlinkSync(markerPath); } catch { /* ignore */ }
+    }
+  });
+
   it('exits 4 when the created PR is mergeable=false with state dirty', async () => {
     const script = writeScript({
       taskId: 'task-dirty-1',
@@ -240,5 +303,39 @@ esac
 
     expect(result.status).toBe(4);
     expect(result.stdout).toContain('mergeable=false, mergeable_state=dirty');
+  });
+});
+
+// Static content checks (no bash execution — these run on every platform,
+// including Windows where the POSIX integration suite above is skipped).
+describe('writePrHelper — generated script content', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  it('wires the GATE-ENVIRONMENT marker surfacing into the ./check test branch', () => {
+    writePrHelper({
+      taskId: 'task-static-1',
+      workBranch: 'blueprint/task-static-1',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+    const script = capturedScripts['/tmp/workspace/pr'];
+    expect(script).toBeDefined();
+    // The marker is read AFTER the gate passes, inside the WITH_TESTS branch —
+    // a red gate still blocks; the note only annotates a green one.
+    expect(script).toMatch(/if ! \.\/check test; then[\s\S]*exit 1[\s\S]*\n {2}fi\n[\s\S]*check_gate_env_task-static-1\.txt/);
+    expect(script).toContain('if [ -s /tmp/check_gate_env_task-static-1.txt ]; then');
+    expect(script).toContain('[pr] NOTE: the test gate ran in GATE-ENVIRONMENT mode on this VM:');
+    expect(script).toContain("sed 's/^/[pr]   /' /tmp/check_gate_env_task-static-1.txt");
+    expect(script).toContain('Record your faithful test evidence');
   });
 });
