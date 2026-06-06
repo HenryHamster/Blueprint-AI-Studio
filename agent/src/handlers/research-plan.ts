@@ -1046,9 +1046,20 @@ export function buildPortfolioComposition(
   activeDirections: Array<Record<string, unknown>>,
   systems: Array<Record<string, unknown>>,
   activeByScope: Record<string, number> | undefined,
+  authoritativeActiveTotal?: number,
 ): string {
-  const total = activeDirections.length;
+  const shipped = activeDirections.length;
+  // Anchor the empty-state guard and percentage denominator on the trim-proof
+  // authoritative active total when present; fall back to the (possibly trimmed)
+  // shipped row count for old payloads/tests that omit it. Never render
+  // "portfolio is empty" while the authoritative count says directions are active.
+  const total = (typeof authoritativeActiveTotal === 'number' && authoritativeActiveTotal >= 0)
+    ? authoritativeActiveTotal
+    : shipped;
   if (total === 0) return 'No active directions — portfolio is empty.';
+  if (shipped === 0) {
+    return `Portfolio has ${total} active direction(s), but their per-direction detail was not shipped this cycle (trimmed/dropped under the byte budget) — category mix unavailable. Fetch with \`./fetch direction <id>\`.`;
+  }
 
   const catCounts: Record<string, number> = { product: 0, structural: 0, mixed: 0, uncategorized: 0 };
   const systemCounts: Record<string, number> = {};
@@ -1070,6 +1081,12 @@ export function buildPortfolioComposition(
   const pct = (n: number) => total > 0 ? Math.round((n / total) * 100) : 0;
   const productPct = pct(catCounts.product);
   const lines: string[] = [];
+  // When the shipped rows are fewer than the authoritative total, the category
+  // mix is computed from the shipped subset but percentages divide by the true
+  // total — flag that so the reader does not mistake a partial mix for the whole.
+  if (shipped < total) {
+    lines.push(`_Category mix below computed from ${shipped} of ${total} active directions shipped this cycle (${total - shipped} trimmed for budget — fetch with \`./fetch direction <id>\`); percentages use the authoritative total of ${total}._`);
+  }
   const catParts = (['product', 'structural', 'mixed', 'uncategorized'] as const)
     .filter(c => catCounts[c] > 0)
     .map(c => `${c}=${catCounts[c]} (${pct(catCounts[c])}%)`);

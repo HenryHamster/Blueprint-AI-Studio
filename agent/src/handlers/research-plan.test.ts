@@ -906,6 +906,31 @@ describe('buildPortfolioComposition', () => {
     expect(out).not.toContain('In-flight scope mix');
     expect(out).not.toContain('System coverage');
   });
+
+  it('does not render "portfolio is empty" when authoritative total>0 but no rows shipped', () => {
+    const out = buildPortfolioComposition([], [], undefined, 11);
+    expect(out).not.toContain('portfolio is empty');
+    expect(out).toContain('Portfolio has 11 active direction(s)');
+    expect(out).toContain('./fetch direction');
+  });
+
+  it('still renders "portfolio is empty" when authoritative total is zero', () => {
+    expect(buildPortfolioComposition([], [], undefined, 0))
+      .toBe('No active directions — portfolio is empty.');
+  });
+
+  it('divides percentages by authoritative total and flags the trimmed subset', () => {
+    // 2 shipped rows but the true active total is 8.
+    const dirs = [
+      { id: 'd-1', category: 'product', total_cycles: 1 },
+      { id: 'd-2', category: 'structural', total_cycles: 1 },
+    ];
+    const out = buildPortfolioComposition(dirs, [], undefined, 8);
+    // 1 of 8 product -> 13% (not 50% as it would be against the shipped subset).
+    expect(out).toContain('product=1 (13%)');
+    expect(out).toContain('Category mix below computed from 2 of 8 active directions');
+    expect(out).toContain('authoritative total of 8');
+  });
 });
 
 describe('buildEmptyRepoGuidance', () => {

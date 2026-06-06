@@ -185,6 +185,20 @@ export async function handleStrategic(
     const directionsSummary = Array.isArray(payload.directions_summary)
       ? payload.directions_summary as Array<Record<string, unknown>>
       : [];
+    // Trim-proof authoritative direction counts (active/paused/total/max_active)
+    // shipped at critical tier by the backend so they survive the byte-budget
+    // pressure that trims/drops directions_summary. The three direction views
+    // anchor their headline count, slots line, and gap flags on these so they
+    // never under-report (trimmed) or render false-empty (dropped).
+    const directionCounts = payload.direction_counts && typeof payload.direction_counts === 'object'
+      ? payload.direction_counts as Record<string, unknown>
+      : undefined;
+    const authoritativeActive = directionCounts && typeof directionCounts.active === 'number'
+      ? directionCounts.active
+      : undefined;
+    const authoritativePaused = directionCounts && typeof directionCounts.paused === 'number'
+      ? directionCounts.paused
+      : undefined;
     const projectName = strVal(payload.project_name, 'Unknown Project');
 
     const openMessages = Array.isArray(payload.open_messages)
@@ -224,7 +238,7 @@ export async function handleStrategic(
     const feedbackSection = buildFeedbackSection(openMessages);
     const openMessagesText = buildOpenMessagesText(openMessages);
 
-    const dirSummaryText = buildDirSummaryText(directionsSummary);
+    const dirSummaryText = buildDirSummaryText(directionsSummary, authoritativeActive);
 
     // Directions already staged for the next version (inert until their target
     // version promotes). Surfaced so the strategist does not re-propose them.
@@ -262,7 +276,13 @@ export async function handleStrategic(
       ? payload.max_active_directions
       : 10;
     const activeDirections = directionsSummary.filter(d => strVal(d.status, 'active') === 'active');
-    const dirHealthSummary = buildDirHealthSummary(directionsSummary, maxActiveDirections);
+    const dirHealthSummary = buildDirHealthSummary(
+      directionsSummary,
+      maxActiveDirections,
+      authoritativeActive !== undefined
+        ? { active: authoritativeActive, paused: authoritativePaused ?? 0 }
+        : undefined,
+    );
 
     // Portfolio composition: category mix, system coverage gaps, concentration
     // risk, in-flight scope, direction age — so the thinker doesn't have to
@@ -276,6 +296,7 @@ export async function handleStrategic(
       activeDirections,
       outcomeSystems,
       activeByScopeForPortfolio,
+      authoritativeActive,
     );
 
     // ── Running context from prior cycles (design doc notes/strategic-context) ──

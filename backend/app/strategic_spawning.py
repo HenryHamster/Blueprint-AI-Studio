@@ -1942,6 +1942,14 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "enable_self_improvement": {"priority": "critical"},
     "model": {"priority": "critical"},
     "effort": {"priority": "critical"},
+    # Trim-proof authoritative direction counts (true active/paused/total computed
+    # before any trimming) and the operator's real max-active ceiling. Critical
+    # tier with no summarize_fn: tiny scalars the packer ships verbatim, so the
+    # agent's direction-health/portfolio/list views can anchor their headline
+    # count, slots line, and gap flags on the true active set even when the
+    # heavier ``directions_summary`` detail list is trimmed or dropped for budget.
+    "direction_counts": {"priority": "critical"},
+    "max_active_directions": {"priority": "critical"},
     "prompt_suffix": {"priority": "high"},
     # Vision + intent — small but load-bearing for every decision
     "vision": {"priority": "critical"},
@@ -4542,13 +4550,35 @@ async def _spawn_strategic_review(
                 if prompt_suffix
                 else _approaches_block
             )
+    # Authoritative, trim-proof direction counts computed from the FULL untrimmed
+    # ``project.directions`` (NOT the budget-droppable ``directions_summary``).
+    # These anchor the agent-side Direction-Health / Portfolio-Composition /
+    # Current-research-directions views so their headline count, slots line, and
+    # gap flags can never be starved out by the same byte-budget pressure that
+    # trims or drops the per-direction detail list. Shipped as a ``critical``
+    # payload key (see _STRATEGIC_REVIEW_SCHEMA) so the packer never reduces them.
+    _all_directions = project.directions or []
+    _active_directions_count = sum(
+        1 for d in _all_directions if d.get("status") == "active"
+    )
+    _max_active_directions = _runtime_config.get("max_active_directions", 10)
+    _direction_counts = {
+        "active": _active_directions_count,
+        "paused": sum(1 for d in _all_directions if d.get("status") == "paused"),
+        "total": sum(
+            1
+            for d in _all_directions
+            if d.get("status") in ("active", "paused", "proposed")
+        ),
+        "max_active": _max_active_directions,
+    }
     # Advisory: when too few directions are active the fleet's per-direction
     # fan-out leaves most VM capacity idle. Surface that cost so the agent can
     # weigh opening more lanes for worthwhile parallel work.
     _parallelism_hint = _build_parallelism_hint(
-        sum(1 for d in (project.directions or []) if d.get("status") == "active"),
+        _active_directions_count,
         _runtime_config.get("max_concurrent_vms", 0),
-        _runtime_config.get("max_active_directions", 10),
+        _max_active_directions,
     )
     if _parallelism_hint:
         prompt_suffix = (
@@ -4653,6 +4683,11 @@ async def _spawn_strategic_review(
             "user_last_active_at": user_last_active_at,
             "self_reflection_log": (project.self_reflection_log or [])[-5:],
             "enable_self_improvement": project.enable_self_improvement,
+            # Trim-proof authoritative direction counts + operator ceiling. Both
+            # are ``critical`` so the agent's direction views always anchor on the
+            # true active set even when ``directions_summary`` is trimmed/dropped.
+            "direction_counts": _direction_counts,
+            "max_active_directions": _max_active_directions,
             "directions_summary": direction_stats,
             **(
                 {"staged_directions": _staged_directions}

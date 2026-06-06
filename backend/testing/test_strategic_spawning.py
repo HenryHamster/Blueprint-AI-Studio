@@ -4456,6 +4456,63 @@ async def test_strategic_review_packer_keeps_payload_under_cap_on_bloated_projec
         f"Trimmed list must include directions_summary; meta={meta}"
     )
 
+    # Trim-proof anchor: even though directions_summary was trimmed to <=12, the
+    # authoritative direction_counts + max ceiling must carry the TRUE active
+    # count (50) so the agent views never under-report or render false-empty.
+    assert "direction_counts" in payload, (
+        "Authoritative direction_counts must survive budget pressure"
+    )
+    assert payload["direction_counts"]["active"] == 50, (
+        f"direction_counts.active must be the true pre-trim count, got "
+        f"{payload['direction_counts']['active']}"
+    )
+    assert payload["direction_counts"]["total"] == 50
+    assert "max_active_directions" in payload, (
+        "max_active ceiling must reach the agent (no hardcoded fallback)"
+    )
+    assert payload["direction_counts"]["max_active"] == payload["max_active_directions"]
+    # Neither anchor key was trimmed or dropped — they are critical-tier.
+    dropped_keys = {entry["key"] for entry in meta["dropped"]}
+    assert "direction_counts" not in trimmed_keys | dropped_keys
+    assert "max_active_directions" not in trimmed_keys | dropped_keys
+
+
+@pytest.mark.asyncio
+async def test_direction_counts_survive_problem_model_floor_pressure(db_session):
+    """Authoritative direction_counts survive even when a huge floor-reserved
+    problem_model drops directions_summary entirely.
+
+    The problem_model has a packer floor reservation; under a tiny byte budget it
+    consumes the budget and directions_summary is dropped wholesale. The critical
+    direction_counts + max_active_directions anchor must still ship verbatim."""
+    schema = _STRATEGIC_REVIEW_SCHEMA
+    raw = {
+        "type": "strategic_review",
+        "research_mode": "strategic",
+        "project_name": "P",
+        "base_branch": "main",
+        "enable_self_improvement": False,
+        "vision": {"purpose": "x"},
+        "problem_model": {"gaps": [{"id": f"g{i}", "d": "y" * 200} for i in range(40)]},
+        "direction_counts": {"active": 7, "paused": 2, "total": 9, "max_active": 15},
+        "max_active_directions": 15,
+        "directions_summary": [
+            {"id": f"d{i}", "status": "active", "text": "z" * 200} for i in range(20)
+        ],
+    }
+    # Tiny budget: forces directions_summary to drop, problem_model to degrade.
+    packed = pack_under_budget(raw, schema, budget=2000)
+    assert packed["direction_counts"]["active"] == 7, (
+        "direction_counts must ship verbatim under maximum budget pressure"
+    )
+    assert packed["max_active_directions"] == 15
+    meta = packed["_packer_meta"]
+    affected = {e["key"] for e in meta["trimmed"]} | {e["key"] for e in meta["dropped"]}
+    assert "direction_counts" not in affected
+    assert "max_active_directions" not in affected
+    # The detail list is legitimately droppable; only the counts are trim-proof.
+    assert "directions_summary" not in packed or len(packed["directions_summary"]) < 20
+
 
 @pytest.mark.asyncio
 async def test_drift_signals_survives_budget_pressure(db_session):

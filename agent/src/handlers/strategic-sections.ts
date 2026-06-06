@@ -576,9 +576,21 @@ export function buildOpenMessagesText(openMessages: Array<Record<string, unknown
   }).join('\n');
 }
 
-export function buildDirSummaryText(directionsSummary: Array<Record<string, unknown>>): string {
-  if (directionsSummary.length === 0) return 'No directions exist yet.';
-  return directionsSummary.map((d, i) => {
+export function buildDirSummaryText(
+  directionsSummary: Array<Record<string, unknown>>,
+  authoritativeActiveCount?: number,
+): string {
+  if (directionsSummary.length === 0) {
+    // Distinguish "genuinely no directions" from "detail list dropped for
+    // budget while directions are actually active". The authoritative count
+    // (shipped trim-proof by the backend) is the ground truth — never collapse
+    // to "No directions exist yet." when it says directions are active.
+    if (typeof authoritativeActiveCount === 'number' && authoritativeActiveCount > 0) {
+      return `_${authoritativeActiveCount} active direction(s) exist but the per-direction detail list was not shipped this cycle (trimmed/dropped under the byte budget). Fetch them with \`./fetch direction <id>\` before reasoning about specific directions._`;
+    }
+    return 'No directions exist yet.';
+  }
+  const body = directionsSummary.map((d, i) => {
     const parts = [`${fmtScalar(d.total_cycles, '0')} cycles`];
     if (d.prs_merged) parts.push(`${fmtScalar(d.prs_merged)} merged`);
     if (d.tasks_failed) {
@@ -639,29 +651,52 @@ export function buildDirSummaryText(directionsSummary: Array<Record<string, unkn
 
     return `${i + 1}. [${strVal(d.priority, 'medium')}]${catNote} ${strVal(d.text)} (id: ${strVal(d.id)})${statusNote}${satNote}${sysNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}`;
   }).join('\n\n');
+  // When the shipped detail list is shorter than the authoritative active count,
+  // render an honest "showing M of N" header instead of letting the reader infer
+  // the trimmed list is the full slate.
+  const shippedActive = directionsSummary.filter(d => strVal(d.status, 'active') === 'active').length;
+  if (typeof authoritativeActiveCount === 'number' && shippedActive < authoritativeActiveCount) {
+    const hidden = authoritativeActiveCount - shippedActive;
+    return `_Showing ${shippedActive} of ${authoritativeActiveCount} active directions — ${hidden} trimmed for budget; fetch the rest with \`./fetch direction <id>\`._\n\n${body}`;
+  }
+  return body;
 }
 
 export function buildDirHealthSummary(
   directionsSummary: Array<Record<string, unknown>>,
   maxActiveDirections: number,
+  authoritative?: { active: number; paused: number },
 ): string {
-  const activeDirections = directionsSummary.filter(d => strVal(d.status, 'active') === 'active');
-  const activeCount = activeDirections.length;
-  const pausedDirections = directionsSummary.filter(d => strVal(d.status) === 'paused');
-  const autoPausedCount = pausedDirections.filter(d => d.auto_paused === true).length;
-  const userPausedCount = pausedDirections.length - autoPausedCount;
-  const saturatedCount = activeDirections.filter(d => d.possibly_saturated === true).length;
-  const productCount = activeDirections.filter(d => strVal(d.category) === 'product').length;
-  const availableSlots = maxActiveDirections - activeCount;
+  const shippedActiveDirections = directionsSummary.filter(d => strVal(d.status, 'active') === 'active');
+  const shippedActiveCount = shippedActiveDirections.length;
+  const shippedPaused = directionsSummary.filter(d => strVal(d.status) === 'paused');
+  // Anchor the headline count, slots math, and BELOW_MINIMUM flag on the
+  // trim-proof authoritative count when the backend shipped it; fall back to the
+  // (possibly trimmed) shipped list only for old payloads/tests that omit it.
+  const activeCount = authoritative ? authoritative.active : shippedActiveCount;
+  const pausedCount = authoritative ? authoritative.paused : shippedPaused.length;
+  // Whether the shipped detail list covers the FULL active slate. Saturation /
+  // product-ratio gap flags require the complete list — a trimmed/dropped list
+  // cannot prove absence of a product direction or universal saturation, so we
+  // suppress those flags (but never BELOW_MINIMUM, which the count proves).
+  const detailComplete = !authoritative || shippedActiveCount >= activeCount;
+  const autoPausedCount = shippedPaused.filter(d => d.auto_paused === true).length;
+  const userPausedCount = Math.max(0, pausedCount - autoPausedCount);
+  const saturatedCount = shippedActiveDirections.filter(d => d.possibly_saturated === true).length;
+  const productCount = shippedActiveDirections.filter(d => strVal(d.category) === 'product').length;
+  const availableSlots = Math.max(0, maxActiveDirections - activeCount);
   const gaps: string[] = [];
-  if (productCount === 0) gaps.push('NO_PRODUCT_DIRECTIONS');
-  if (saturatedCount === activeCount && activeCount > 0) gaps.push('ALL_SATURATED');
+  if (detailComplete && productCount === 0) gaps.push('NO_PRODUCT_DIRECTIONS');
+  if (detailComplete && saturatedCount === activeCount && activeCount > 0) gaps.push('ALL_SATURATED');
   if (activeCount < 3) gaps.push('BELOW_MINIMUM');
-  const pausedNote = pausedDirections.length > 0
-    ? ` Paused: ${pausedDirections.length} (${autoPausedCount} auto, ${userPausedCount} user) — listed below but not consuming active slots.`
+  const pausedNote = pausedCount > 0
+    ? ` Paused: ${pausedCount} (${autoPausedCount} auto, ${userPausedCount} user) — listed below but not consuming active slots.`
+    : '';
+  const trimNote = (authoritative && shippedActiveCount < activeCount)
+    ? ` Showing ${shippedActiveCount} of ${activeCount} active directions below — ${activeCount - shippedActiveCount} trimmed for budget; saturation/product counts reflect only the shipped subset. Fetch the rest with \`./fetch direction <id>\`.`
     : '';
   return [
-    `Active: ${activeCount}/${maxActiveDirections} slots used (${availableSlots} available). Saturated: ${saturatedCount}/${activeCount}. Product directions: ${productCount}.${pausedNote}`,
+    `Active: ${activeCount}/${maxActiveDirections} slots used (${availableSlots} available). Saturated: ${saturatedCount}/${activeCount}. Product directions: ${productCount}.${pausedNote}${trimNote}`,
     gaps.length > 0 ? `GAPS DETECTED: ${gaps.join(', ')}` : 'No critical gaps detected.',
   ].join('\n');
 }

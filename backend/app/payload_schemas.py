@@ -209,6 +209,11 @@ class StrategicReviewPayload(_SystemPopulated):
     # records.
     recommended_mode: str | None = None
     max_active_directions: int | None = None
+    # Trim-proof authoritative direction counts (active/paused/total/max_active)
+    # computed from the full untrimmed direction set before packing, so the agent
+    # views anchor on the true active count even when directions_summary is
+    # trimmed/dropped under budget. Shipped at critical tier by the packer.
+    direction_counts: dict[str, Any] | None = None
     rejected_proposals: list[dict[str, Any]] | None = None
     anomaly_summary: dict[str, Any] | None = None
     playbook_summary: dict[str, Any] | None = None
