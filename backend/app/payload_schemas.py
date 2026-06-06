@@ -381,6 +381,13 @@ class ResearchPayload(_SystemPopulated):
     anomaly_signals: list[dict[str, Any]] | None = None
     project_name: str | None = None
     design_doc: dict[str, Any] | None = None
+    # Aggregated missing-foundation demand (capability/foundation prerequisites
+    # declared by dependents that no task provides) computed at spawn time by
+    # app.capability_demand.collect_missing_capability_demand. Optional + default
+    # None so older payloads without it still validate; injected only when demand
+    # is non-empty so the research agent can propose/create the missing foundation
+    # or recommend retirement of the stranded demand.
+    missing_capability_demand: dict[str, Any] | None = None
 
 
 class StrategicReviewPayload(_SystemPopulated):
@@ -438,6 +445,10 @@ class StrategicReviewPayload(_SystemPopulated):
     # direction_text, consecutive_failures, last_failure_class,
     # dominant_error_fingerprint, recent_failure_messages}.
     held_directions: list[dict[str, Any]] | None = None
+    # Aggregated missing-foundation demand (see ResearchPayload) so the strategist
+    # can open a foundation direction or record an explicit retirement. Optional +
+    # default None; injected only when demand is non-empty.
+    missing_capability_demand: dict[str, Any] | None = None
 
 
 class DesignDocUpdatePayload(_SystemPopulated):
@@ -448,6 +459,10 @@ class DesignDocUpdatePayload(_SystemPopulated):
     project_name: str | None = None
     proposed_changes: list[dict[str, Any]] | None = None
     shipped_changes_manifest: list[dict[str, Any]] | None = None
+    # Aggregated missing-foundation demand (see ResearchPayload) so the strategist
+    # can open a foundation direction or record an explicit retirement. Optional +
+    # default None; injected only when demand is non-empty.
+    missing_capability_demand: dict[str, Any] | None = None
 
 
 class SecurityAuditPayload(_SystemPopulated):

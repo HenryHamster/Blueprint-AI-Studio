@@ -202,11 +202,44 @@ def prerequisite_matches_task(normalized: dict, task: Optional[Task]) -> bool:
     return False
 
 
+def _canonical_order_key(task: Task) -> tuple:
+    """Deterministic canonical ordering key for a candidate task.
+
+    Replicates the exact key used by
+    :func:`app.digest_metrics.compute_foundation_convergence_actions`
+    (``(getattr(t, "created_at", None) or datetime.min, str(t.id))``) so the
+    "which duplicate is canonical" decision agrees by construction across the
+    convergence path, the spawn-time resolver, and the resume-time matcher.
+
+    Earliest ``created_at`` wins; a missing/``None`` ``created_at`` sorts as the
+    minimum (``datetime.min``), so it does not silently outrank a real
+    timestamped foundation unless it genuinely is earliest. Ties on
+    ``created_at`` break on ``str(task.id)``.
+    """
+    return (getattr(task, "created_at", None) or datetime.min, str(task.id))
+
+
+def select_canonical_provider(tasks: Iterable[Task]) -> Optional[Task]:
+    """Return the canonical provider among ``tasks`` (earliest, id-tiebroken).
+
+    Purely additive deterministic tie-break: given any set of candidate tasks
+    that all satisfy the same prerequisite/need, pick the SAME canonical one —
+    earliest by ``created_at`` (``None`` treated as the minimum), tie-broken by
+    ``str(task.id)`` — using :func:`_canonical_order_key`. Returns ``None`` for
+    an empty input. Selection only; it does NOT re-check the match predicate, so
+    callers must pass an already-filtered match set.
+    """
+    candidates = list(tasks)
+    if not candidates:
+        return None
+    return min(candidates, key=_canonical_order_key)
+
+
 def resolve_prerequisite_task(
     prereq: object,
     candidate_tasks: Iterable[Task],
 ) -> Optional[Task]:
-    """Conservatively resolve a declared prerequisite to one candidate task.
+    """Conservatively resolve a declared prerequisite to one canonical candidate.
 
     EXPLICIT references only — never fuzzy title overlap — so genuinely
     independent work is never falsely serialized:
@@ -218,17 +251,24 @@ def resolve_prerequisite_task(
         :func:`_task_capability_markers`).
 
     ``prereq`` is normalized internally, so a raw finding field can be passed
-    directly. Returns the first matching :class:`Task`, or ``None`` when the
+    directly. When MORE THAN ONE candidate satisfies the prereq (e.g. several
+    active tasks advertise the same explicit capability marker), the CANONICAL
+    provider — earliest by ``created_at``, tie-broken by ``str(task.id)`` (see
+    :func:`select_canonical_provider`) — is returned, NOT merely the first in
+    iteration order, so every dependent of a duplicated foundation
+    deterministically attaches to the SAME provider. Returns ``None`` when the
     prereq is malformed or nothing matches. The candidate enumeration (e.g.
     active/queued/in-flight statuses) is entirely the caller's responsibility.
     """
     normalized = normalize_prerequisite(prereq)
     if normalized is None:
         return None
-    for task in candidate_tasks:
-        if prerequisite_matches_task(normalized, task):
-            return task
-    return None
+    matches = [
+        task
+        for task in candidate_tasks
+        if prerequisite_matches_task(normalized, task)
+    ]
+    return select_canonical_provider(matches)
 
 
 def build_dedup_state(

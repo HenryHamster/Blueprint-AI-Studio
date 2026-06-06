@@ -50,6 +50,10 @@ from app.source_ref_validation import (
     detect_absent_symbols,
     resolve_branch_verification_context,
 )
+from app.capability_demand import (
+    fetch_missing_demand_for_spawn,
+    missing_demand_prompt_hint,
+)
 
 logger = logging.getLogger(__name__)
 _spawn_locks: dict[str, asyncio.Lock] = {}
@@ -1263,7 +1267,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                         TaskStatus.IN_PROGRESS,
                     ]
                 ),
-                Task.payloads[0]["type"].astext == "research",
+                Task.payloads[0]["type"].as_string() == "research",
             )
         )
     ).scalar() or 0
@@ -1289,7 +1293,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                         TaskStatus.EVALUATING,
                     ]
                 ),
-                Task.payloads[0]["type"].astext == "research",
+                Task.payloads[0]["type"].as_string() == "research",
             )
         )
     ).scalar() or 0
@@ -1334,7 +1338,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 Task.project_id == project.id,
                 Task.created_by == "ORCHESTRATOR",
                 Task.created_at >= one_hour_ago,
-                Task.payloads[0]["type"].astext == "research",
+                Task.payloads[0]["type"].as_string() == "research",
             )
         )
     ).scalar() or 0
@@ -1785,6 +1789,17 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
 
         if project.build_config:
             research_payload["build_config"] = project.build_config
+        # Surface aggregated missing-foundation demand so the research agent can
+        # propose/create the absent foundation capability or recommend retiring the
+        # stranded demand. Advisory + additive: read-only, fail-open, injected only
+        # when demand is non-empty, and it does NOT bypass the spawn dedup/cooldown/
+        # circuit-breaker guards that already ran above.
+        _missing_demand = await fetch_missing_demand_for_spawn(session, project.id)
+        if _missing_demand.get("demands"):
+            research_payload["missing_capability_demand"] = _missing_demand
+            _demand_hint = missing_demand_prompt_hint(_missing_demand)
+            if _demand_hint:
+                append_prompt_suffix(research_payload, _demand_hint)
         # Compact, body-omitted index of existing knowledge documents
         # (web_research / design output), scoped to this project and — when the
         # cycle is directed — the current direction first. Lets the research

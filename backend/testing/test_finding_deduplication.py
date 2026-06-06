@@ -25,6 +25,7 @@ from app.finding_deduplication import (
     normalize_prerequisite,
     prerequisite_matches_task,
     resolve_prerequisite_task,
+    select_canonical_provider,
 )
 from app.models import Task, TaskStatus
 
@@ -1232,17 +1233,106 @@ def test_resolve_prerequisite_task_malformed_prereq_returns_none():
     assert resolve_prerequisite_task({"kind": "bogus", "ref": "x"}, [foundation]) is None
 
 
-def test_resolve_prerequisite_task_prefers_first_match_in_order():
-    # Caller controls candidate ordering (e.g. in-flight before sibling batch);
-    # the first explicit match wins.
-    first = _make_task(
-        status=TaskStatus.IN_PROGRESS, context={"finding_hash": "shared-hash-0001"}
+def test_resolve_prerequisite_task_selects_canonical_earliest_created_at():
+    # Several candidates share the same explicit signal (duplicate foundations).
+    # The CANONICAL provider — earliest by created_at — must win regardless of
+    # the order the caller supplies the candidates in, so every dependent
+    # deterministically attaches to the same foundation.
+    base = datetime(2026, 1, 1, 12, 0, 0)
+    earliest = _make_task(
+        status=TaskStatus.IN_PROGRESS,
+        context={"finding_hash": "shared-hash-0001"},
+        created_at=base,
     )
-    second = _make_task(
-        status=TaskStatus.QUEUED, context={"finding_hash": "shared-hash-0001"}
+    later = _make_task(
+        status=TaskStatus.QUEUED,
+        context={"finding_hash": "shared-hash-0001"},
+        created_at=base + timedelta(hours=2),
     )
     prereq = {"kind": "task", "ref": "shared-hash-0001"}
-    assert resolve_prerequisite_task(prereq, [first, second]) is first
+    # `later` appears first in iteration order, but `earliest` is canonical.
+    assert resolve_prerequisite_task(prereq, [later, earliest]) is earliest
+    # Order-independent: the same canonical choice with the list reversed.
+    assert resolve_prerequisite_task(prereq, [earliest, later]) is earliest
+
+
+def test_resolve_prerequisite_task_canonical_capability_earliest_wins():
+    # Multiple active tasks advertise the SAME explicit capability marker.
+    base = datetime(2026, 2, 1, 9, 0, 0)
+    earliest = _make_task(
+        status=TaskStatus.IN_PROGRESS,
+        context={"provides_capability": "auth-service"},
+        created_at=base,
+    )
+    later = _make_task(
+        status=TaskStatus.IN_PROGRESS,
+        context={"capability": ["auth-service"]},
+        created_at=base + timedelta(minutes=30),
+    )
+    prereq = {"kind": "capability", "ref": "auth-service"}
+    assert resolve_prerequisite_task(prereq, [later, earliest]) is earliest
+
+
+def test_resolve_prerequisite_task_created_at_tie_breaks_on_str_id():
+    # Same created_at: the tie breaks deterministically on str(task.id), the
+    # exact rule compute_foundation_convergence_actions uses.
+    base = datetime(2026, 3, 1, 0, 0, 0)
+    a = _make_task(
+        status=TaskStatus.IN_PROGRESS,
+        context={"finding_hash": "tie-hash-0001"},
+        created_at=base,
+    )
+    b = _make_task(
+        status=TaskStatus.QUEUED,
+        context={"finding_hash": "tie-hash-0001"},
+        created_at=base,
+    )
+    expected = min((a, b), key=lambda t: str(t.id))
+    prereq = {"kind": "task", "ref": "tie-hash-0001"}
+    assert resolve_prerequisite_task(prereq, [a, b]) is expected
+    assert resolve_prerequisite_task(prereq, [b, a]) is expected
+
+
+def test_resolve_prerequisite_task_none_created_at_sorts_as_minimum():
+    # A missing created_at sorts as datetime.min — so it only wins if it is
+    # genuinely the earliest, matching the convergence path's rule. Here the
+    # None-dated task wins over a real-dated one (None == minimum).
+    no_date = _make_task(
+        status=TaskStatus.IN_PROGRESS, context={"finding_hash": "nd-hash-0001"}
+    )
+    no_date.created_at = None
+    dated = _make_task(
+        status=TaskStatus.QUEUED,
+        context={"finding_hash": "nd-hash-0001"},
+        created_at=datetime(2026, 1, 1, 0, 0, 0),
+    )
+    prereq = {"kind": "task", "ref": "nd-hash-0001"}
+    assert resolve_prerequisite_task(prereq, [dated, no_date]) is no_date
+
+
+def test_resolve_prerequisite_task_single_match_unchanged():
+    # A lone match is returned as-is (no behavioral change for the common case).
+    foundation = _make_task(
+        status=TaskStatus.IN_PROGRESS, context={"finding_hash": "solo-hash-0001"}
+    )
+    other = _make_task(status=TaskStatus.QUEUED)
+    prereq = {"kind": "task", "ref": "solo-hash-0001"}
+    assert resolve_prerequisite_task(prereq, [other, foundation]) is foundation
+
+
+def test_select_canonical_provider_empty_returns_none():
+    assert select_canonical_provider([]) is None
+
+
+def test_select_canonical_provider_picks_earliest_then_id():
+    base = datetime(2026, 4, 1, 0, 0, 0)
+    later = _make_task(created_at=base + timedelta(hours=1))
+    earlier = _make_task(created_at=base)
+    assert select_canonical_provider([later, earlier]) is earlier
+    # created_at tie → str(id) tiebreak
+    a = _make_task(created_at=base)
+    b = _make_task(created_at=base)
+    assert select_canonical_provider([a, b]) is min((a, b), key=lambda t: str(t.id))
 
 
 # ---------------------------------------------------------------------------

@@ -6,6 +6,7 @@ covered separately in ``test_reaper.py``.
 """
 
 import uuid
+from datetime import datetime, timedelta
 
 from app.blocked_need_resolution import (
     completed_foundation_for_need,
@@ -17,7 +18,8 @@ from app.models import Task, TaskStatus
 
 
 def _task(*, status=TaskStatus.IN_PROGRESS, title="cand", payloads=None,
-          context=None, depends_on=None, tid=None, parent_task_id=None) -> Task:
+          context=None, depends_on=None, tid=None, parent_task_id=None,
+          created_at=None) -> Task:
     return Task(
         id=tid or uuid.uuid4(),
         project_id=uuid.uuid4(),
@@ -30,6 +32,7 @@ def _task(*, status=TaskStatus.IN_PROGRESS, title="cand", payloads=None,
         context=context or {},
         depends_on=depends_on or [],
         parent_task_id=parent_task_id,
+        created_at=created_at,
         status_log=[],
     )
 
@@ -96,12 +99,22 @@ def test_pr_need_no_match_returns_none():
     assert resolve_blocked_need(blocked, need, [foundation]) is None
 
 
-def test_pr_need_ambiguous_returns_none():
-    a = _task(payloads=[{"type": "fix", "pr_number": 7}])
-    b = _task(payloads=[{"type": "create", "pr_number": 7}])
+def test_pr_need_ambiguous_resolves_to_canonical():
+    # Two candidates own PR #7 (genuine duplicate foundations). The resume-time
+    # matcher deterministically picks the canonical (earliest-created) one
+    # rather than refusing to resolve.
+    base = datetime(2026, 5, 1, 0, 0, 0)
+    earliest = _task(
+        payloads=[{"type": "fix", "pr_number": 7}], created_at=base
+    )
+    later = _task(
+        payloads=[{"type": "create", "pr_number": 7}],
+        created_at=base + timedelta(hours=1),
+    )
     blocked = _task(status=TaskStatus.BLOCKED)
     need = {"kind": "pr", "ref": "7"}
-    assert resolve_blocked_need(blocked, need, [a, b]) is None
+    assert resolve_blocked_need(blocked, need, [later, earliest]) is earliest
+    assert resolve_blocked_need(blocked, need, [earliest, later]) is earliest
 
 
 # ── kind='capability' ────────────────────────────────────────────────────────
@@ -155,12 +168,45 @@ def test_capability_resolves_on_marker_in_list():
     assert resolve_blocked_need(blocked, need, [foundation]) is foundation
 
 
-def test_capability_ambiguous_returns_none():
-    a = _task(payloads=[{"type": "design"}])
-    b = _task(title="design")
+def test_capability_ambiguous_resolves_to_canonical():
+    # Two candidates qualify for capability 'design' by different exact signals
+    # (payload type vs. exact title). The canonical (earliest-created) one wins
+    # deterministically, regardless of caller order.
+    base = datetime(2026, 6, 1, 0, 0, 0)
+    earliest = _task(payloads=[{"type": "design"}], created_at=base)
+    later = _task(title="design", created_at=base + timedelta(minutes=10))
     blocked = _task(status=TaskStatus.BLOCKED)
     need = {"kind": "capability", "ref": "design"}
-    assert resolve_blocked_need(blocked, need, [a, b]) is None
+    assert resolve_blocked_need(blocked, need, [later, earliest]) is earliest
+    assert resolve_blocked_need(blocked, need, [earliest, later]) is earliest
+
+
+def test_capability_ambiguous_marker_resolves_to_canonical():
+    # Multiple candidates advertise the SAME explicit capability marker.
+    base = datetime(2026, 6, 2, 0, 0, 0)
+    earliest = _task(
+        context={"provides_capability": "search-index"}, created_at=base
+    )
+    later = _task(
+        context={"capability": ["search-index"]},
+        created_at=base + timedelta(hours=3),
+    )
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "capability", "ref": "search-index"}
+    assert resolve_blocked_need(blocked, need, [later, earliest]) is earliest
+
+
+def test_capability_ambiguous_created_at_tie_breaks_on_id():
+    # Same created_at across duplicate capability providers → str(id) tiebreak,
+    # matching compute_foundation_convergence_actions' canonical ordering.
+    base = datetime(2026, 6, 3, 0, 0, 0)
+    a = _task(context={"provides_capability": "cache"}, created_at=base)
+    b = _task(context={"provides_capability": "cache"}, created_at=base)
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "capability", "ref": "cache"}
+    expected = min((a, b), key=lambda t: str(t.id))
+    assert resolve_blocked_need(blocked, need, [a, b]) is expected
+    assert resolve_blocked_need(blocked, need, [b, a]) is expected
 
 
 # ── parity guard: resume matcher must not miss what spawn resolves ────────────
@@ -185,6 +231,32 @@ def test_resume_matcher_parity_with_spawn_resolver():
         assert resolve_prerequisite_task(need, [expected]) is expected
         # ...and the resume-time matcher resolves to the same candidate.
         assert resolve_blocked_need(blocked, need, [expected]) is expected
+
+
+def test_spawn_and_resume_pick_same_canonical_among_duplicates():
+    """With duplicate foundations, the spawn-time resolver and the resume-time
+    matcher must select the SAME canonical (earliest, id-tiebroken) provider —
+    they share ``select_canonical_provider`` so a dependent attaches to one
+    foundation no matter which path resolves it."""
+    from app.finding_deduplication import resolve_prerequisite_task
+
+    base = datetime(2026, 7, 1, 0, 0, 0)
+    earliest = _task(
+        context={"provides_capability": "vector-store"}, created_at=base
+    )
+    later = _task(
+        context={"capability": ["vector-store"]},
+        created_at=base + timedelta(hours=5),
+    )
+    blocked = _task(status=TaskStatus.BLOCKED)
+    need = {"kind": "capability", "ref": "vector-store"}
+    candidates = [later, earliest]
+
+    spawn_choice = resolve_prerequisite_task(need, candidates)
+    resume_choice = resolve_blocked_need(blocked, need, candidates)
+    assert spawn_choice is earliest
+    assert resume_choice is earliest
+    assert spawn_choice is resume_choice
 
 
 # ── guards ───────────────────────────────────────────────────────────────────

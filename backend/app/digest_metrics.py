@@ -1279,6 +1279,9 @@ _LIVE_BLOCKED_LIST_LIMIT = 100
 # on the surfaced per-task list. Same window as the symmetric give-up signal.
 _BLOCKED_RESUME_WINDOW = timedelta(days=7)
 _BLOCKED_RESUME_LIST_LIMIT = 100
+# Missing-capability-demand aggregate: cap on the surfaced per-demand list
+# (the producer is already largest-demand-first, so this preserves the top tail).
+_MISSING_DEMAND_LIST_LIMIT = 50
 
 
 def _task_related_files(t: "Task") -> set:
@@ -1664,6 +1667,8 @@ def _genuine_duplicate_reason(ti: "Task", fi: set, tj: "Task", fj: set):
 
 def compute_foundation_convergence_actions(
     active_write_tasks: List[Task],
+    *,
+    exclude_same_parent: bool = True,
 ) -> List[Dict[str, Any]]:
     """High-confidence genuine duplicate-foundation pairs to serialize. Pure.
 
@@ -1674,6 +1679,18 @@ def compute_foundation_convergence_actions(
     builds-on instead of rebuilding. Earlier-is-canonical ordering keeps the edge
     direction deterministic and the wired graph acyclic by construction. The
     caller still applies a self-edge / cycle guard before wiring.
+
+    ``exclude_same_parent`` (default ``True``) skips pairs that share a non-null
+    ``parent_task_id`` — coordinated decomposition siblings that reconcile at
+    merge. The reaper Step 15 sweep and the observability signal keep this on
+    (cross-decomposition tasks have distinct parents). The spawn-time path passes
+    ``exclude_same_parent=False``: a just-spawned batch's children all share the
+    one research-task parent, so the coarse parent check would mask EVERY
+    within-batch genuine duplicate. There the finer "already gated by explicit
+    ``depends_on``" exclusion is enforced downstream by the apply-with-guards
+    helper instead — an already-linked or cycle-closing edge is refused — so
+    coordinated siblings are still left alone while undeclared genuine duplicates
+    converge.
     """
     enriched = [
         (t, _task_related_files(t))
@@ -1691,7 +1708,7 @@ def compute_foundation_convergence_actions(
         for j in range(i + 1, len(enriched)):
             tj, fj = enriched[j]
             pj = getattr(tj, "parent_task_id", None)
-            if pi is not None and pi == pj:
+            if exclude_same_parent and pi is not None and pi == pj:
                 continue
             reason = _genuine_duplicate_reason(ti, fi, tj, fj)
             if reason is None:
@@ -1706,6 +1723,116 @@ def compute_foundation_convergence_actions(
                 }
             )
     return actions
+
+
+async def compute_missing_capability_demand_summary(
+    session: AsyncSession,
+    project_id: "uuid.UUID | None" = None,
+    *,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Summarize stranded capability/foundation prerequisites as operator demand.
+
+    Thin reshape over ``capability_demand.collect_missing_capability_demand`` — does
+    NOT reimplement the aggregation. The producer scans BLOCKED dependents (unresolved
+    foundation needs, ``still_blocked``) and recently give-up-CANCELLED dependents
+    retired as missing-foundation (``already_cancelled``), folding both by normalized
+    ``(kind, ref)`` identity, largest-demand-first. This stranded demand IS the
+    feedback signal the missing-foundation loop acts on; surfacing it next to the
+    give-up and resume metrics lets an operator see unmet prerequisites that are about
+    to be (or already were) abandoned without a foundation ever being commissioned.
+
+    Returns the distinct-demand ``total``, the ``still_blocked`` vs
+    ``already_cancelled`` split summed across demands, a ``by_direction`` count of how
+    many demands each originating direction carries, and a bounded ``demands`` sample
+    that preserves the producer's largest-first order. Read-only — no DB writes.
+    Tolerant of the producer's empty ``{"total": 0, "demands": []}`` shape.
+    """
+    from app import capability_demand
+
+    demand = await capability_demand.collect_missing_capability_demand(
+        session, project_id, now=now
+    )
+    demands = demand.get("demands") or []
+
+    still_blocked = 0
+    already_cancelled = 0
+    by_direction: Dict[str, int] = defaultdict(int)
+    for entry in demands:
+        still_blocked += int(entry.get("still_blocked", 0) or 0)
+        already_cancelled += int(entry.get("already_cancelled", 0) or 0)
+        for direction_id in entry.get("direction_ids") or []:
+            by_direction[str(direction_id)] += 1
+
+    return {
+        "total": demand.get("total", len(demands)),
+        "still_blocked": still_blocked,
+        "already_cancelled": already_cancelled,
+        "by_direction": dict(by_direction),
+        "demands": demands[:_MISSING_DEMAND_LIST_LIMIT],
+    }
+
+
+def apply_foundation_convergence_action(
+    action: Dict[str, Any],
+    by_id: Dict[str, "Task"],
+    candidates: List["Task"],
+    *,
+    logger=None,
+) -> "Task | None":
+    """Wire ONE convergence action's ``depends_on`` edge with the shared guards.
+
+    Looks up the dependent and canonical foundation in ``by_id`` and, applying the
+    SAME guards the reaper Step 15 sweep uses, refuses a self-edge, a duplicate
+    edge, or any edge that would close a ``depends_on`` cycle
+    (``blocked_need_resolution._would_create_cycle`` over ``candidates``). On
+    success it appends the edge, records its structural provenance, and stamps the
+    dependent's ``_foundation_converged`` context marker so an operator can see why
+    the task was serialized. Returns the mutated dependent task when an edge was
+    wired (the caller still does ``session.add`` / logging / broadcast), else
+    ``None``.
+
+    Both the spawn-time path (``research_completion``) and the reaper Step 15
+    sweep (``reaper_sweeps.sweep_converge_duplicate_foundations``) call this, so
+    the wiring-and-guards step can never drift from the predicate that emitted the
+    action.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.blocked_need_resolution import _would_create_cycle
+    from app.depends_on_provenance import remember_structural_depends_on
+
+    dependent = by_id.get(action["dependent_id"])
+    foundation = by_id.get(action["foundation_id"])
+    if dependent is None or foundation is None:
+        return None
+    found_id = str(foundation.id)
+    if found_id == str(dependent.id):  # defensive self-edge guard
+        return None
+    existing = [str(d) for d in (dependent.depends_on or [])]
+    if found_id in existing:
+        return None
+    if _would_create_cycle(dependent, foundation, candidates):
+        if logger is not None:
+            logger.info(
+                "[CONVERGE] skipped converging %s -> %s — edge would close a "
+                "depends_on cycle",
+                dependent.id,
+                found_id,
+            )
+        return None
+    dependent.depends_on = existing + [found_id]
+    remember_structural_depends_on(dependent, found_id)
+    ctx = dependent.context or {}
+    ctx["_foundation_converged"] = {
+        "foundation_id": found_id,
+        "reason": action["reason"],
+        "shared_files": action["shared_files"],
+    }
+    dependent.context = ctx
+    flag_modified(dependent, "depends_on")
+    flag_modified(dependent, "context")
+    return dependent
 
 
 async def compute_dependency_health_signals(
@@ -1882,6 +2009,9 @@ async def compute_dependency_health_signals(
         "live_blocked": compute_live_blocked_summary(list(live_blocked)),
         "resumes": compute_blocked_resume_summary(
             list(resumed), window_start=resume_window_start
+        ),
+        "missing_capability_demand": await compute_missing_capability_demand_summary(
+            session, project_id
         ),
     }
 

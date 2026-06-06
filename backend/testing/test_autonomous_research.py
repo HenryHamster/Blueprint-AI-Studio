@@ -33,6 +33,8 @@ from app.autonomous_research import _spawn_research_task
 from app.research_completion import _handle_research_completion
 from app.direction_outcomes import _update_direction_research_outcomes
 from app.max_plan_pool import _max_plan_pools, _account_by_id
+from app.capability_demand import collect_missing_capability_demand
+from app.payload_schemas import validate_internal_payload
 
 
 @pytest.fixture(autouse=True)
@@ -11602,3 +11604,113 @@ async def test_qualification_refresh_on_circuit_breaker_open_stays_silent(db_ses
         assert len(steering) == 0, "qualification-origin marker must stay silent"
     finally:
         _shared_state.circuit_breakers.pop(str(project.id), None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Missing-foundation demand injected into the research spawn payload
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _blocked_dependent(project_id, need, *, direction_id="d-other"):
+    """A BLOCKED dependent waiting on a single capability/foundation need.
+
+    Uses a non-research task type on a DIFFERENT direction than the active
+    research lane so it contributes demand without occupying the lane the
+    autonomous loop wants to (re)spawn research on.
+    """
+    return Task(
+        project_id=project_id,
+        title="create: needs a missing foundation",
+        payloads=[{"type": "create", "prompt": "build feature", "base_branch": "main"}],
+        status=TaskStatus.BLOCKED,
+        blocked_at=datetime.utcnow() - timedelta(hours=4),
+        context={
+            "direction_id": direction_id,
+            "blocker": {
+                "source": "agent",
+                "waiting_on": need.get("ref"),
+                "reason": "BLOCKER: waiting on foundation",
+                "need": need,
+                "needs": [need],
+            },
+        },
+        created_by="ORCHESTRATOR",
+    )
+
+
+async def _spawn_tactical_research(db_session, directions):
+    """Build a project that spawns a tactical (directed) research task and return it."""
+    project = Project(
+        name="Demand Research",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=directions,
+        # purpose present + an active direction → force_strategic is False;
+        # _research_spawn_count=1 is NOT divisible by strategic_frequency (6),
+        # so this is a tactical research cycle, not a strategic one.
+        vision={"purpose": "test", "_research_spawn_count": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+@pytest.mark.asyncio
+async def test_research_payload_includes_missing_capability_demand(db_session):
+    """When a stranded dependent declares a capability prerequisite no task
+    provides, the spawned research payload carries the aggregated demand
+    (matching the collector) plus an advisory hint, and validates cleanly."""
+    project = await _spawn_tactical_research(
+        db_session, [_active_direction("d-research1", "Active research lane")]
+    )
+    need = {"kind": "capability", "ref": "auth-subsystem", "label": "Auth subsystem"}
+    db_session.add(_blocked_dependent(project.id, need))
+    await db_session.commit()
+
+    expected = await collect_missing_capability_demand(db_session, project.id)
+    assert expected["total"] == 1  # sanity: the fixture really produces demand
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research) == 1, "exactly one tactical research task should spawn"
+    payload = research[0].first_payload
+
+    # The demand field is present and matches what the collector returns.
+    assert "missing_capability_demand" in payload
+    assert payload["missing_capability_demand"] == expected
+    assert payload["missing_capability_demand"]["demands"][0]["ref"] == "auth-subsystem"
+    # The advisory prompt hint frames the demand as something to act on.
+    assert "Missing-foundation demand" in (payload.get("prompt_suffix") or "")
+    # Payload still validates cleanly with the new optional field present.
+    validate_internal_payload(dict(payload), "test_research_demand")
+
+
+@pytest.mark.asyncio
+async def test_research_payload_omits_demand_when_none(db_session):
+    """With no stranded dependents the research payload omits the demand field
+    entirely (and no advisory hint is appended) yet still validates."""
+    project = await _spawn_tactical_research(
+        db_session, [_active_direction("d-research2", "Active research lane")]
+    )
+
+    # Sanity: collector reports no demand for this project.
+    expected = await collect_missing_capability_demand(db_session, project.id)
+    assert expected["total"] == 0
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research) == 1
+    payload = research[0].first_payload
+
+    assert "missing_capability_demand" not in payload
+    assert "Missing-foundation demand" not in (payload.get("prompt_suffix") or "")
+    validate_internal_payload(dict(payload), "test_research_no_demand")

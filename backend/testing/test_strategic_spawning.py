@@ -46,7 +46,8 @@ from app.strategic_spawning import (
     _summarize_design_doc_index,
     _DESIGN_DOC_INDEX_SUMMARY_CHARS,
 )
-from app.payload_schemas import pack_under_budget
+from app.payload_schemas import pack_under_budget, validate_internal_payload
+from app.capability_demand import collect_missing_capability_demand
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 
@@ -10184,3 +10185,134 @@ async def test_design_doc_update_ships_design_doc_index_not_full_prose(
     assert set(by_key) == {"systems/auth", "capabilities/login"}
     assert by_key["capabilities/login"]["status"] == "working"
     assert unique not in json.dumps(dd)
+
+
+# ── Missing-foundation demand in strategic payloads ──────────────────────────
+
+
+def _blocked_dependent(project_id, need, *, direction_id="d-strat-dep"):
+    """A BLOCKED dependent waiting on a single capability/foundation need."""
+    from app.time_utils import _utcnow as _ut
+
+    return Task(
+        project_id=project_id,
+        title="create: needs a missing foundation",
+        payloads=[{"type": "create", "prompt": "build feature", "base_branch": "main"}],
+        status=TaskStatus.BLOCKED,
+        blocked_at=_ut() - timedelta(hours=4),
+        context={
+            "direction_id": direction_id,
+            "blocker": {
+                "source": "agent",
+                "waiting_on": need.get("ref"),
+                "reason": "BLOCKER: waiting on foundation",
+                "need": need,
+                "needs": [need],
+            },
+        },
+        created_by="ORCHESTRATOR",
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_includes_missing_capability_demand(db_session):
+    """The strategic_review payload surfaces aggregated missing-foundation demand
+    (matching the collector) plus an advisory hint, and validates cleanly."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    need = {"kind": "capability", "ref": "auth-subsystem", "label": "Auth subsystem"}
+    db_session.add(_blocked_dependent(project.id, need))
+    await db_session.commit()
+
+    expected = await collect_missing_capability_demand(db_session, project.id)
+    assert expected["total"] == 1
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = [
+        t for t in result.scalars().all()
+        if t.payloads[0].get("type") == "strategic_review"
+    ][0].payloads[0]
+
+    assert payload["missing_capability_demand"] == expected
+    assert "Missing-foundation demand" in (payload.get("prompt_suffix") or "")
+    validate_internal_payload(dict(payload), "test_sr_demand")
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_omits_demand_when_none(db_session):
+    """The strategic_review payload omits the demand field when no demand exists."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    assert (await collect_missing_capability_demand(db_session, project.id))["total"] == 0
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = [
+        t for t in result.scalars().all()
+        if t.payloads[0].get("type") == "strategic_review"
+    ][0].payloads[0]
+
+    assert "missing_capability_demand" not in payload
+    validate_internal_payload(dict(payload), "test_sr_no_demand")
+
+
+@pytest.mark.asyncio
+async def test_design_doc_update_includes_missing_capability_demand(db_session):
+    """The design_doc_update payload surfaces aggregated missing-foundation demand
+    (matching the collector) plus an advisory hint, and validates cleanly."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    need = {"kind": "capability", "ref": "search-index", "label": "Search index"}
+    db_session.add(_blocked_dependent(project.id, need))
+    await db_session.commit()
+
+    expected = await collect_missing_capability_demand(db_session, project.id)
+    assert expected["total"] == 1
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = [
+        t for t in result.scalars().all()
+        if t.payloads[0].get("type") == "design_doc_update"
+    ][0].payloads[0]
+
+    assert payload["missing_capability_demand"] == expected
+    assert "Missing-foundation demand" in (payload.get("prompt_suffix") or "")
+    validate_internal_payload(dict(payload), "test_ddu_demand")
+
+
+@pytest.mark.asyncio
+async def test_design_doc_update_omits_demand_when_none(db_session):
+    """The design_doc_update payload omits the demand field when no demand exists."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert (await collect_missing_capability_demand(db_session, project.id))["total"] == 0
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = [
+        t for t in result.scalars().all()
+        if t.payloads[0].get("type") == "design_doc_update"
+    ][0].payloads[0]
+
+    assert "missing_capability_demand" not in payload
+    validate_internal_payload(dict(payload), "test_ddu_no_demand")

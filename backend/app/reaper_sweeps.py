@@ -557,6 +557,21 @@ RESUME_MARKER_CONTEXT_KEY = "_blocked_resume"
 GIVE_UP_FOUNDATION_DIED = "foundation_died"  # needed foundation reached terminal FAILED/CANCELLED
 GIVE_UP_NEVER_SATISFIABLE = "never_satisfiable"  # need outlived its bounded parked re-evals
 
+# Need kinds that name a FOUNDATION (a sibling task / finding-hash, or an explicit
+# capability) rather than an external ref like a PR number. When one of these is
+# cancelled as never_satisfiable, no task ever provided it — the dependent was
+# stranded because the foundation was never created, which is first-class
+# missing-foundation demand (see
+# ``capability_demand.collect_missing_capability_demand``).
+_FOUNDATION_NEED_KINDS = ("capability", "task")
+# Additive sub-key stamped onto the UNRESUMABLE_CANCEL_CONTEXT_KEY marker when a
+# never-satisfiable give-up cancelled a foundation-kind need: it flags an EXPLICIT
+# missing-foundation retirement (stranded because nothing was ever built to satisfy
+# the prerequisite), distinct from a give-up whose foundation existed and died.
+# Purely additive — it never removes or renames an existing marker key, and the
+# demand collector reads it to fold post-cancel demand back into the aggregate.
+MISSING_FOUNDATION_MARKER_KEY = "missing_foundation"
+
 
 def _next_recheck_delay(attempts: int) -> timedelta:
     """Exponential backoff for the next recheck, capped at ``_BLOCKED_RECHECK_MAX``."""
@@ -876,14 +891,12 @@ async def sweep_converge_duplicate_foundations(session, now=None) -> int:
     stamps the dependent's context so an operator can see why it was serialized.
     Returns the number of edges wired.
     """
-    from sqlalchemy.orm.attributes import flag_modified
-
-    from app.blocked_need_resolution import (
-        ACTIVE_CANDIDATE_STATUSES,
-        _would_create_cycle,
-    )
+    from app.blocked_need_resolution import ACTIVE_CANDIDATE_STATUSES
     from app.broadcast import broadcast_to_project as _bcast
-    from app.digest_metrics import compute_foundation_convergence_actions
+    from app.digest_metrics import (
+        apply_foundation_convergence_action,
+        compute_foundation_convergence_actions,
+    )
 
     active = [TaskStatus(s) for s in ACTIVE_CANDIDATE_STATUSES]
     rows = (
@@ -902,33 +915,12 @@ async def sweep_converge_duplicate_foundations(session, now=None) -> int:
             continue
         by_id = {str(t.id): t for t in tasks}
         for action in compute_foundation_convergence_actions(tasks):
-            dependent = by_id.get(action["dependent_id"])
-            foundation = by_id.get(action["foundation_id"])
-            if dependent is None or foundation is None:
+            dependent = apply_foundation_convergence_action(
+                action, by_id, tasks, logger=logger
+            )
+            if dependent is None:
                 continue
-            found_id = str(foundation.id)
-            if found_id == str(dependent.id):  # defensive self-edge guard
-                continue
-            existing = [str(d) for d in (dependent.depends_on or [])]
-            if found_id in existing:
-                continue
-            if _would_create_cycle(dependent, foundation, tasks):
-                logger.info(
-                    f"[REAPER] Step 15: skipped converging {dependent.id} -> "
-                    f"{found_id} — edge would close a depends_on cycle"
-                )
-                continue
-            dependent.depends_on = existing + [found_id]
-            remember_structural_depends_on(dependent, found_id)
-            ctx = dependent.context or {}
-            ctx["_foundation_converged"] = {
-                "foundation_id": found_id,
-                "reason": action["reason"],
-                "shared_files": action["shared_files"],
-            }
-            dependent.context = ctx
-            flag_modified(dependent, "depends_on")
-            flag_modified(dependent, "context")
+            found_id = action["foundation_id"]
             session.add(dependent)
             wired += 1
             logger.info(
@@ -1109,12 +1101,24 @@ async def _cancel_blocker_as_dead(
     direction_id = (task.context or {}).get("direction_id")
     _clear_blocked_fields(task, preserve_first_blocked=False)
     ctx = task.context or {}
-    ctx[UNRESUMABLE_CANCEL_CONTEXT_KEY] = {
+    marker = {
         "give_up_class": give_up_class,
         "need": need if isinstance(need, dict) else None,
         "direction_id": direction_id,
         "at": _utcnow().isoformat(),
     }
+    # Additively flag a never-satisfiable give-up of a FOUNDATION-kind need
+    # (capability / sibling-task / finding-hash) as an explicit missing-foundation
+    # retirement: nothing was ever built to satisfy the prerequisite, so the
+    # stranded dependent is first-class demand to COMMISSION that foundation. A PR
+    # need or a foundation-died give-up does not get the flag. Purely additive.
+    if (
+        give_up_class == GIVE_UP_NEVER_SATISFIABLE
+        and isinstance(need, dict)
+        and need.get("kind") in _FOUNDATION_NEED_KINDS
+    ):
+        marker[MISSING_FOUNDATION_MARKER_KEY] = True
+    ctx[UNRESUMABLE_CANCEL_CONTEXT_KEY] = marker
     task.context = ctx
     task.status = TaskStatus.CANCELLED
     task.latest_status_message = message

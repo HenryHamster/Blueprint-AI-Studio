@@ -1145,6 +1145,79 @@ def _research_findings_would_spawn(findings: List[Dict[str, Any]]) -> bool:
     return False
 
 
+def converge_spawn_batch_foundations(
+    child_tasks: List[Task],
+    active_tasks: List[Task],
+) -> List[Task]:
+    """Serialize genuine duplicate foundations at spawn time, BEFORE the just-
+    spawned children begin executing.
+
+    Considers the new batch (``child_tasks``) AND currently-active tasks
+    (``active_tasks``) together and reuses the SAME high-confidence predicate and
+    apply-with-guards helper as the reaper Step 15 sweep
+    (``digest_metrics.compute_foundation_convergence_actions`` /
+    ``apply_foundation_convergence_action``), so spawn-time and reaper-time
+    convergence can never drift. For each genuine-duplicate pair — a shared finding
+    origin, a shared explicit capability marker, or near-identical related-file
+    sets at the convergence Jaccard — the LATER task is wired to depend on the
+    earlier (canonical) one so the duplicate rebases on the canonical's landed work
+    and builds-on instead of rebuilding.
+
+    Only a just-spawned child is ever made the dependent: the canonical is always
+    the earliest-by-``created_at`` task, so a pre-existing active task is always the
+    canonical and is never re-pointed at a peer here (active-vs-active pairs are the
+    reaper's job). Conservative by construction — sub-threshold incidental
+    shared-infra overlap is left to proceed in parallel and reconcile at merge.
+    ``exclude_same_parent=False`` is passed because a batch's children all share the
+    one research parent; coordinated siblings (already linked by explicit
+    ``depends_on`` / auto-decomposition chaining) are instead left alone by the
+    apply-with-guards helper, which refuses an already-present or cycle-closing
+    edge along with a self-edge.
+
+    Returns the list of dependent child tasks that had an edge wired (each already
+    mutated in place with ``depends_on`` plus the ``_foundation_converged`` context
+    marker); the caller persists them.
+    """
+    from app.digest_metrics import (  # noqa: PLC0415
+        apply_foundation_convergence_action,
+        compute_foundation_convergence_actions,
+    )
+
+    candidates = list(active_tasks) + list(child_tasks)
+    by_id = {str(t.id): t for t in candidates}
+    child_ids = {str(c.id) for c in child_tasks}
+    converged: List[Task] = []
+    # exclude_same_parent=False: a batch's children all share the one research
+    # parent, so the coarse parent check would mask every within-batch duplicate.
+    # Coordinated siblings (already linked by explicit depends_on / depends_on_indices
+    # or auto-decomposition chaining) are still left alone — the apply-with-guards
+    # helper refuses an already-present or cycle-closing edge.
+    for action in compute_foundation_convergence_actions(
+        candidates, exclude_same_parent=False
+    ):
+        if action["dependent_id"] not in child_ids:
+            continue
+        dependent = apply_foundation_convergence_action(
+            action, by_id, candidates, logger=logger
+        )
+        if dependent is None:
+            continue
+        converged.append(dependent)
+        logger.info(
+            "[RESEARCH] Serialized duplicate foundation at spawn — task %s now "
+            "depends on %s (%s)",
+            dependent.id,
+            action["foundation_id"],
+            action["reason"],
+        )
+    if converged:
+        logger.info(
+            "[RESEARCH] Spawn-time foundation convergence wired %d edge(s)",
+            len(converged),
+        )
+    return converged
+
+
 async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
     """Parse research findings and create tasks from them.
 
@@ -3704,6 +3777,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 ctx["file_overlap_warnings"] = warnings
                 child_tasks[ci].context = ctx
                 session.add(child_tasks[ci])
+
+    # Spawn-time foundation convergence: serialize GENUINE duplicate foundations
+    # behind one canonical task BEFORE the just-spawned children begin executing,
+    # rather than letting two duplicate peers both burn agent-VM runtime until the
+    # reaper's Step 15 sweep converges them after the fact. See
+    # converge_spawn_batch_foundations — it reuses the SAME predicate and the SAME
+    # apply-with-guards helper as the reaper sweep, so the two paths can never drift.
+    for _dep in converge_spawn_batch_foundations(child_tasks, existing_tasks):
+        session.add(_dep)
 
     await session.commit()
 

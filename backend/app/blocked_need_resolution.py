@@ -17,8 +17,12 @@ blocked-resume machinery carry the work to completion — no parallel waiting lo
 Matching is deliberately CONSERVATIVE: an explicit reference (task id, PR number)
 is matched directly; a capability need is matched only on an exact/explicit
 signal (payload type, exact title, or an exact related-file reference) and never
-on a fuzzy heuristic. When the signal is ambiguous (more than one candidate) or
-weak, it returns ``None`` so good independent work is never falsely serialized.
+on a fuzzy heuristic. When the signal is weak (no candidate qualifies) it returns
+``None`` so good independent work is never falsely serialized. When MORE THAN ONE
+candidate qualifies (genuine duplicate foundations), it deterministically returns
+the CANONICAL provider — earliest by ``created_at``, tie-broken by ``str(id)`` —
+matching the spawn-time resolver and the convergence path so every dependent
+attaches to the SAME foundation rather than an arbitrary duplicate.
 
 This is a pure matcher over a pre-fetched candidate list — it does no IO, which
 keeps it cheap to call inside the sweep loop and trivial to unit-test.
@@ -28,7 +32,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from app.finding_deduplication import prerequisite_matches_task
+from app.finding_deduplication import (
+    prerequisite_matches_task,
+    select_canonical_provider,
+)
 from app.landed_signal import has_merge_unblock_signal
 from app.models import Task
 
@@ -74,26 +81,30 @@ def _match_task(ref: str, candidates: List[Task]) -> Optional[Task]:
     (:func:`finding_deduplication.prerequisite_matches_task`) so a need that
     names its foundation by a non-UUID ``finding_hash`` — exactly how the
     producer records sibling/prerequisite needs — resolves here too, not only a
-    raw task id. Ambiguity (more than one candidate sharing the signal) returns
-    ``None`` so independent work is never falsely serialized.
+    raw task id. When more than one candidate shares the signal, the CANONICAL
+    provider (earliest by ``created_at``, id-tiebroken) is returned so the
+    resume-time matcher attaches the dependent to the SAME foundation the
+    spawn-time resolver would pick.
     """
     normalized = {"kind": "task", "ref": str(ref).strip()}
     matches = [c for c in candidates if prerequisite_matches_task(normalized, c)]
-    return matches[0] if len(matches) == 1 else None
+    return select_canonical_provider(matches)
 
 
 def _match_pr(ref: str, candidates: List[Task]) -> Optional[Task]:
-    """kind='pr': the single candidate whose open PR equals ``ref``.
+    """kind='pr': the canonical candidate whose open PR equals ``ref``.
 
-    Ambiguity (more than one candidate owning the number) returns ``None`` — we
-    never guess which in-flight task to serialize behind.
+    When more than one candidate owns the number, the CANONICAL provider
+    (earliest by ``created_at``, id-tiebroken) is returned so dependents
+    deterministically serialize behind the same foundation rather than an
+    arbitrary one.
     """
     try:
         pr_num = int(str(ref).strip().lstrip("#"))
     except (ValueError, AttributeError, TypeError):
         return None
     matches = [c for c in candidates if _candidate_pr_number(c) == pr_num]
-    return matches[0] if len(matches) == 1 else None
+    return select_canonical_provider(matches)
 
 
 def _match_capability(
@@ -112,8 +123,11 @@ def _match_capability(
       - its title exactly equals the ref (case-insensitive, trimmed), OR
       - the ref appears as an exact entry in its ``related_files``.
 
-    Returns the match only when EXACTLY ONE candidate qualifies; ambiguity or no
-    signal returns ``None`` so independent work is never falsely serialized.
+    When more than one candidate qualifies, the CANONICAL provider (earliest by
+    ``created_at``, id-tiebroken) is returned so every dependent of duplicate
+    capability providers deterministically attaches to the SAME foundation; no
+    qualifying signal returns ``None`` so independent work is never falsely
+    serialized.
     """
     ref_text = str(ref).strip()
     if not ref_text:
@@ -139,7 +153,7 @@ def _match_capability(
         ):
             matches.append(c)
             continue
-    return matches[0] if len(matches) == 1 else None
+    return select_canonical_provider(matches)
 
 
 def _match_need(need: Dict[str, Any], candidates: List[Task]) -> Optional[Task]:

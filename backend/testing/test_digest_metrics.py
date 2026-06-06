@@ -2666,6 +2666,114 @@ async def test_dependency_health_signals_query_surfaces_blocked_resumes(db_sessi
     assert agg["tasks"][0]["title"] == "resumed-then-done"
 
 
+def _blocked_dependent(project_id, need, *, direction_id=None, blocked_at=None):
+    """A BLOCKED dependent waiting on a single machine-resolvable foundation need —
+    mirrors the producer's expected ``blocker.needs`` shape (see
+    test_capability_demand._blocked)."""
+    ctx = {
+        "blocker": {
+            "source": "agent",
+            "waiting_on": need.get("ref"),
+            "reason": "BLOCKER: waiting on foundation",
+            "need": need,
+            "needs": [need],
+        },
+    }
+    if direction_id is not None:
+        ctx["direction_id"] = direction_id
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.BLOCKED,
+        blocked_at=blocked_at or (_utcnow() - timedelta(hours=4)),
+        context=ctx,
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_capability_demand_summary_aggregates_blocked_and_cancelled(
+    db_session,
+):
+    """The summary folds live-blocked (still_blocked) and recently give-up-CANCELLED
+    (already_cancelled) dependents of the same capability into one demand, exposing
+    the split, the per-direction count, and a largest-first sample."""
+    from app.digest_metrics import compute_missing_capability_demand_summary
+    from app.reaper_sweeps import (
+        GIVE_UP_NEVER_SATISFIABLE,
+        MISSING_FOUNDATION_MARKER_KEY,
+        UNRESUMABLE_CANCEL_CONTEXT_KEY,
+    )
+
+    project = make_project(name="Missing demand summary", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    cap_need = {"kind": "capability", "ref": "auth-subsystem", "label": "Auth"}
+
+    # Two live BLOCKED dependents of the same capability under different directions.
+    live_a = _blocked_dependent(
+        project.id, cap_need, direction_id="d-live", blocked_at=now - timedelta(hours=10)
+    )
+    live_b = _blocked_dependent(
+        project.id, cap_need, direction_id="d-live2", blocked_at=now - timedelta(hours=3)
+    )
+    # A give-up-CANCELLED dependent retired as missing-foundation within the window.
+    cancelled = make_task(
+        project_id=project.id,
+        status=TaskStatus.CANCELLED,
+        context={
+            UNRESUMABLE_CANCEL_CONTEXT_KEY: {
+                "give_up_class": GIVE_UP_NEVER_SATISFIABLE,
+                "need": cap_need,
+                "direction_id": "d-dead",
+                "at": (now - timedelta(hours=2)).isoformat(),
+                MISSING_FOUNDATION_MARKER_KEY: True,
+            }
+        },
+    )
+    db_session.add_all([live_a, live_b, cancelled])
+    await db_session.commit()
+
+    summary = await compute_missing_capability_demand_summary(
+        db_session, project_id=project.id, now=now
+    )
+
+    assert summary["total"] == 1
+    assert summary["still_blocked"] == 2
+    assert summary["already_cancelled"] == 1
+    # by_direction counts how many demands each originating direction carries.
+    assert summary["by_direction"] == {"d-live": 1, "d-live2": 1, "d-dead": 1}
+    entry = summary["demands"][0]
+    assert entry["kind"] == "capability"
+    assert entry["dependent_count"] == 3
+    assert entry["oldest_blocked_at"] == (now - timedelta(hours=10)).isoformat()
+
+
+@pytest.mark.asyncio
+async def test_dependency_health_signals_includes_missing_capability_demand(db_session):
+    """The dependency-health rollup nests the missing-capability-demand summary so the
+    digest router emits it with no router edit — a real named consumer."""
+    project = make_project(name="Missing demand rollup", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cap_need = {"kind": "capability", "ref": "billing-core", "label": "Billing"}
+    blocked = _blocked_dependent(project.id, cap_need, direction_id="d-aaa")
+    db_session.add(blocked)
+    await db_session.commit()
+
+    result = await compute_dependency_health_signals(db_session, project_id=project.id)
+
+    assert "missing_capability_demand" in result
+    agg = result["missing_capability_demand"]
+    assert agg["total"] == 1
+    assert agg["still_blocked"] == 1
+    assert agg["already_cancelled"] == 0
+    assert agg["by_direction"] == {"d-aaa": 1}
+
+
 def test_duplicate_foundation_signal_flags_cross_parent_overlap():
     """Two active write-tasks under DIFFERENT parents whose related-file sets
     strongly overlap are surfaced; a disjoint task is not."""
@@ -2996,6 +3104,110 @@ def test_compute_foundation_convergence_actions_same_parent_excluded():
     actions = compute_foundation_convergence_actions([t1, t2])
 
     assert len(actions) == 0, "Same-parent siblings should be excluded"
+
+
+def test_compute_foundation_convergence_actions_same_parent_included_when_opted_out():
+    """exclude_same_parent=False (the spawn-time call) DOES converge same-parent
+    genuine duplicates: a research batch's children all share one parent, so the
+    coarse parent check would otherwise mask every within-batch duplicate."""
+    from app.digest_metrics import compute_foundation_convergence_actions
+
+    now = _utcnow()
+    parent_id = uuid4()
+    t1 = make_task(
+        created_at=now - timedelta(hours=1),
+        status=TaskStatus.QUEUED,
+        parent_task_id=parent_id,
+        payloads=[{"type": "fix"}],
+        context={"finding_hash": "same_finding"},
+    )
+    t2 = make_task(
+        created_at=now,
+        status=TaskStatus.QUEUED,
+        parent_task_id=parent_id,  # Same parent — included only when opted out.
+        payloads=[{"type": "fix"}],
+        context={"finding_hash": "same_finding"},
+    )
+
+    assert compute_foundation_convergence_actions([t1, t2]) == []
+    actions = compute_foundation_convergence_actions(
+        [t1, t2], exclude_same_parent=False
+    )
+    assert len(actions) == 1
+    assert actions[0]["foundation_id"] == str(t1.id)
+    assert actions[0]["dependent_id"] == str(t2.id)
+
+
+def test_apply_foundation_convergence_action_wires_edge_and_stamps_marker():
+    """The shared apply helper wires the depends_on edge and stamps the
+    _foundation_converged marker, returning the mutated dependent."""
+    from app.digest_metrics import (
+        apply_foundation_convergence_action,
+        compute_foundation_convergence_actions,
+    )
+
+    now = _utcnow()
+    canonical = make_task(
+        created_at=now - timedelta(hours=1),
+        status=TaskStatus.QUEUED,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create"}],
+        context={"finding_hash": "apply001"},
+    )
+    dependent = make_task(
+        created_at=now,
+        status=TaskStatus.QUEUED,
+        parent_task_id=uuid4(),
+        payloads=[{"type": "create"}],
+        context={"finding_hash": "apply001"},
+    )
+    by_id = {str(canonical.id): canonical, str(dependent.id): dependent}
+    candidates = [canonical, dependent]
+    [action] = compute_foundation_convergence_actions(candidates)
+
+    result = apply_foundation_convergence_action(action, by_id, candidates)
+
+    assert result is dependent
+    assert str(canonical.id) in [str(d) for d in dependent.depends_on]
+    marker = dependent.context.get("_foundation_converged", {})
+    assert marker.get("foundation_id") == str(canonical.id)
+    assert "apply001" in marker.get("reason", "")
+
+
+def test_apply_foundation_convergence_action_refuses_self_and_existing_edge():
+    """The apply helper is idempotent and refuses a self-edge: an already-present
+    edge returns None and does not duplicate, and a self-referential action is
+    rejected."""
+    from app.digest_metrics import apply_foundation_convergence_action
+
+    now = _utcnow()
+    canonical = make_task(created_at=now - timedelta(hours=1), payloads=[{"type": "fix"}])
+    dependent = make_task(
+        created_at=now,
+        payloads=[{"type": "fix"}],
+        depends_on=[str(canonical.id)],
+    )
+    by_id = {str(canonical.id): canonical, str(dependent.id): dependent}
+    candidates = [canonical, dependent]
+
+    # Already-present edge → no-op.
+    existing_action = {
+        "dependent_id": str(dependent.id),
+        "foundation_id": str(canonical.id),
+        "reason": "x",
+        "shared_files": [],
+    }
+    assert apply_foundation_convergence_action(existing_action, by_id, candidates) is None
+    assert dependent.depends_on == [str(canonical.id)]
+
+    # Self-edge → refused.
+    self_action = {
+        "dependent_id": str(dependent.id),
+        "foundation_id": str(dependent.id),
+        "reason": "x",
+        "shared_files": [],
+    }
+    assert apply_foundation_convergence_action(self_action, by_id, candidates) is None
 
 
 def test_compute_foundation_convergence_actions_earlier_task_is_canonical():

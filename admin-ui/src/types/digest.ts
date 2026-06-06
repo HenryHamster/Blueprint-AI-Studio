@@ -296,6 +296,32 @@ export interface DependencyHealthSignals {
     by_direction: Record<string, number>;
     findings: FindingStructuralGiveUpItem[];
   };
+  // Stranded capability/foundation prerequisites surfaced as missing-foundation
+  // demand. Mirrors backend compute_missing_capability_demand_summary: distinct
+  // demand total, the still_blocked-vs-already_cancelled split, a per-direction
+  // demand count, and a bounded largest-demand-first sample.
+  missing_capability_demand?: {
+    total: number;
+    still_blocked: number;
+    already_cancelled: number;
+    by_direction: Record<string, number>;
+    demands: MissingCapabilityDemand[];
+  };
+}
+
+// A single stranded capability/foundation prerequisite aggregated across the
+// dependents that need it. Mirrors a capability_demand demand entry.
+export interface MissingCapabilityDemand {
+  kind: string;
+  ref: string | null;
+  label: string | null;
+  dependent_count: number;
+  still_blocked: number;
+  already_cancelled: number;
+  sample_task_ids: string[];
+  direction_ids: string[];
+  oldest_blocked_at: string | null;
+  max_parked_reevals: number;
 }
 
 export interface DigestData<DP = unknown> {

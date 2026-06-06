@@ -10291,6 +10291,176 @@ async def test_converge_refuses_cycle(reaper_db, _no_broadcast):
     assert earlier.depends_on == [str(later.id)]
 
 
+# ── Spawn-time foundation convergence (research_completion) ────────────────────
+# These exercise converge_spawn_batch_foundations, which serializes GENUINE
+# duplicate foundations BEFORE the just-spawned children begin executing — reusing
+# the SAME predicate + apply-with-guards helper as the reaper Step 15 sweep above,
+# so the early and late paths can never drift.
+
+
+@pytest.mark.asyncio
+async def test_spawn_converge_within_batch_genuine_duplicate(reaper_db):
+    """(a) Two just-spawned siblings that are genuine duplicates (shared finding
+    origin) — even though they share the one research parent — are serialized: the
+    later child is wired to depend on the earlier (canonical) one at spawn."""
+    from app.research_completion import converge_spawn_batch_foundations
+
+    project = await _make_project(reaper_db)
+    research_parent = _uuid_mod.uuid4()
+    canonical = await _conv_task(
+        reaper_db,
+        project,
+        files=["backend/app/a.py"],
+        parent=research_parent,
+        ctx={"finding_hash": "spawnhash00000001"},
+        created_at=datetime.utcnow() - timedelta(minutes=5),
+        status=TaskStatus.QUEUED,
+    )
+    dependent = await _conv_task(
+        reaper_db,
+        project,
+        files=["backend/app/b.py", "backend/app/c.py"],
+        parent=research_parent,
+        ctx={"finding_hash": "spawnhash00000001"},
+        created_at=datetime.utcnow(),
+        status=TaskStatus.QUEUED,
+    )
+
+    wired = converge_spawn_batch_foundations([canonical, dependent], [])
+
+    assert [t.id for t in wired] == [dependent.id]
+    assert str(canonical.id) in [str(d) for d in dependent.depends_on]
+    assert not canonical.depends_on
+    assert dependent.context.get("_foundation_converged", {}).get(
+        "foundation_id"
+    ) == str(canonical.id)
+
+
+@pytest.mark.asyncio
+async def test_spawn_converge_new_finding_vs_active_task(reaper_db):
+    """(b) A just-spawned child whose foundation duplicates an already-active task
+    is serialized behind that active task (the earlier = canonical one), rather
+    than running as an independent peer until the reaper cleans it up."""
+    from app.research_completion import converge_spawn_batch_foundations
+
+    project = await _make_project(reaper_db)
+    active = await _conv_task(
+        reaper_db,
+        project,
+        files=["backend/app/cap.py"],
+        parent=_uuid_mod.uuid4(),
+        ctx={"provides_capability": "token-budgeter"},
+        created_at=datetime.utcnow() - timedelta(hours=1),
+        status=TaskStatus.IN_PROGRESS,
+    )
+    child = await _conv_task(
+        reaper_db,
+        project,
+        files=["backend/app/other.py"],
+        parent=_uuid_mod.uuid4(),
+        ctx={"provides_capability": "token-budgeter"},
+        created_at=datetime.utcnow(),
+        status=TaskStatus.QUEUED,
+    )
+
+    wired = converge_spawn_batch_foundations([child], [active])
+
+    assert [t.id for t in wired] == [child.id]
+    assert str(active.id) in [str(d) for d in child.depends_on]
+    assert not active.depends_on
+
+
+@pytest.mark.asyncio
+async def test_spawn_no_converge_subthreshold_incidental_overlap(reaper_db):
+    """Negative: two just-spawned children that merely share one incidental infra
+    file (Jaccard below the convergence threshold, no shared origin/capability) are
+    left to proceed in parallel and reconcile at merge — NOT serialized."""
+    from app.research_completion import converge_spawn_batch_foundations
+
+    project = await _make_project(reaper_db)
+    research_parent = _uuid_mod.uuid4()
+    a = await _conv_task(
+        reaper_db,
+        project,
+        files=["backend/app/shared.py", "backend/app/a.py", "backend/app/b.py"],
+        parent=research_parent,
+        created_at=datetime.utcnow() - timedelta(minutes=1),
+    )
+    b = await _conv_task(
+        reaper_db,
+        project,
+        files=["backend/app/shared.py", "backend/app/c.py", "backend/app/d.py"],
+        parent=research_parent,
+        created_at=datetime.utcnow(),
+    )
+
+    wired = converge_spawn_batch_foundations([a, b], [])
+
+    assert wired == []
+    assert not a.depends_on
+    assert not b.depends_on
+
+
+@pytest.mark.asyncio
+async def test_spawn_converge_skips_active_vs_active_pairs(reaper_db):
+    """The spawn helper only ever makes a just-spawned child the dependent. A
+    genuine-duplicate pair of pre-existing active tasks (neither in the batch) is
+    left for the reaper sweep — the spawn path never re-points an active peer."""
+    from app.research_completion import converge_spawn_batch_foundations
+
+    project = await _make_project(reaper_db)
+    files = ["backend/app/f.py", "backend/app/g.py", "backend/app/h.py"]
+    active_a = await _conv_task(
+        reaper_db, project, files=files, parent=_uuid_mod.uuid4(),
+        created_at=datetime.utcnow() - timedelta(hours=2),
+    )
+    active_b = await _conv_task(
+        reaper_db, project, files=files, parent=_uuid_mod.uuid4(),
+        created_at=datetime.utcnow() - timedelta(hours=1),
+    )
+    # The batch child is unrelated, so no child-dependent action is emitted.
+    child = await _conv_task(
+        reaper_db, project, files=["backend/app/unrelated.py"],
+        parent=_uuid_mod.uuid4(), created_at=datetime.utcnow(),
+    )
+
+    wired = converge_spawn_batch_foundations([child], [active_a, active_b])
+
+    assert wired == []
+    assert not active_a.depends_on
+    assert not active_b.depends_on
+    assert not child.depends_on
+
+
+@pytest.mark.asyncio
+async def test_spawn_converge_refuses_cycle_for_coordinated_siblings(reaper_db):
+    """A genuine-duplicate batch pair already linked by explicit depends_on (the
+    canonical declared to depend on the later child) is left alone: the reverse
+    convergence edge would close a cycle, so the apply-with-guards helper refuses
+    it — mirroring constraint #3 (coordinated siblings stay untouched)."""
+    from app.research_completion import converge_spawn_batch_foundations
+
+    project = await _make_project(reaper_db)
+    research_parent = _uuid_mod.uuid4()
+    later = await _conv_task(
+        reaper_db, project, files=["backend/app/a.py"], parent=research_parent,
+        ctx={"finding_hash": "cyclehash00000001"}, created_at=datetime.utcnow(),
+    )
+    # earlier=canonical, but already declared to depend on `later` → reverse cycles.
+    earlier = await _conv_task(
+        reaper_db, project, files=["backend/app/a.py"], parent=research_parent,
+        ctx={"finding_hash": "cyclehash00000001"},
+        created_at=datetime.utcnow() - timedelta(hours=1),
+        depends_on=[str(later.id)],
+    )
+
+    wired = converge_spawn_batch_foundations([later, earlier], [])
+
+    assert wired == []
+    assert earlier.depends_on == [str(later.id)]
+    assert not later.depends_on
+
+
 # ── Step 17: auto-resolve OPEN owned bug-class messages on owner success ───────
 
 from app.reaper_sweeps import sweep_resolve_open_owned_bug_messages  # noqa: E402

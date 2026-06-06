@@ -30,6 +30,10 @@ from app.models import (
     SystemMaturity,
 )
 from app.payload_schemas import pack_under_budget, validate_internal_payload
+from app.capability_demand import (
+    fetch_missing_demand_for_spawn,
+    missing_demand_prompt_hint,
+)
 from app.problem_model import REJECTED_AGENT_EDITS_KEY as PM_REJECTED_EDITS_KEY
 from app.problem_model import compute_model_size_signal, parse_problem_model
 from app.running_update_merge import RUNNING_UPDATE_REJECTED_KIND
@@ -2073,6 +2077,12 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # hold threshold. Low priority — purely observational planning context the
     # strategic agent reads to decide whether to refine/retire a stuck direction.
     "held_directions": {"priority": "low"},
+    # Aggregated missing-foundation demand (capability/foundation prerequisites
+    # declared by dependents that no task provides). Medium priority and bounded at
+    # build time by collect_missing_capability_demand, so the packer drops it whole
+    # under budget rather than trimming. Actionable: the strategist can open a
+    # foundation direction or record an explicit retirement.
+    "missing_capability_demand": {"priority": "medium"},
 }
 
 
@@ -2107,6 +2117,12 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     "model_health": {"priority": "high"},
     "proposed_changes": {"priority": "high"},
     "shipped_changes_manifest": {"priority": "medium"},
+    # Advisory prompt hint framing missing-foundation demand to act on. High
+    # priority so the directive survives budget pressure (it is small).
+    "prompt_suffix": {"priority": "high"},
+    # Aggregated missing-foundation demand — see _STRATEGIC_REVIEW_SCHEMA. Medium
+    # priority; bounded at build time so the packer drops it whole under budget.
+    "missing_capability_demand": {"priority": "medium"},
     # Compact, body-omitted index of existing knowledge documents — see
     # _STRATEGIC_REVIEW_SCHEMA["knowledge_index"]. Capped at build time, dropped
     # whole under budget; full bodies fetched on demand.
@@ -3154,6 +3170,14 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         _agent_view_design_doc(project.design_doc), **verification_kwargs
     )
 
+    # Surface aggregated missing-foundation demand to the strategist so it can open
+    # a foundation direction or record an explicit retirement of stranded demand.
+    # Read-only, fail-open, additive: included only when demand is non-empty.
+    _missing_demand = await fetch_missing_demand_for_spawn(session, project.id)
+    _missing_demand_present = bool(_missing_demand.get("demands"))
+    _missing_demand_hint = (
+        missing_demand_prompt_hint(_missing_demand) if _missing_demand_present else None
+    )
     # Compact, body-omitted index of existing knowledge documents (web_research /
     # design output) so the strategist knows what knowledge already exists and
     # can fetch full bodies on demand — included only when documents exist.
@@ -3167,6 +3191,12 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
             "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
             "project_name": project.name,
             "vision": project.vision or {},
+            **(
+                {"missing_capability_demand": _missing_demand}
+                if _missing_demand_present
+                else {}
+            ),
+            **({"prompt_suffix": _missing_demand_hint} if _missing_demand_hint else {}),
             "problem_model": await _verify_capability_backing_paths(
                 _agent_view_problem_model(project.problem_model),
                 **verification_kwargs,
@@ -3669,6 +3699,10 @@ async def _spawn_strategic_review(
                 session, project.id, drift_summary
             )
     except Exception:
+        # A failed best-effort snapshot flush leaves the AsyncSession in a
+        # pending-rollback state; clear it so the rest of the strategic spawn
+        # can continue on the same session.
+        await session.rollback()
         logger.exception("[STRATEGIC] drift signal computation failed; continuing")
         drift_summary = {}
     # LTS version/phase context — active whenever the integration branch and
@@ -4632,6 +4666,20 @@ async def _spawn_strategic_review(
                 if prompt_suffix
                 else _steering_directive
             )
+    # Surface aggregated missing-foundation demand to the strategist so it can open
+    # a foundation direction or record an explicit retirement of stranded demand.
+    # Read-only, fail-open, additive: included only when demand is non-empty, and
+    # the advisory hint is appended to the cycle prompt_suffix.
+    _missing_demand = await fetch_missing_demand_for_spawn(session, project.id)
+    _missing_demand_present = bool(_missing_demand.get("demands"))
+    if _missing_demand_present:
+        _missing_demand_hint = missing_demand_prompt_hint(_missing_demand)
+        if _missing_demand_hint:
+            prompt_suffix = (
+                f"{prompt_suffix}\n{_missing_demand_hint}"
+                if prompt_suffix
+                else _missing_demand_hint
+            )
     # Compute the grounded problem_model once so it backs BOTH the payload field
     # and the cycle-start reconciliation (capabilities carry their advisory
     # ``verification`` block here). Reusing the single computed view keeps the
@@ -4789,6 +4837,11 @@ async def _spawn_strategic_review(
             **(
                 {"held_directions": _held_directions_block}
                 if _held_directions_block
+                else {}
+            ),
+            **(
+                {"missing_capability_demand": _missing_demand}
+                if _missing_demand_present
                 else {}
             ),
             "base_branch": get_project_integration_branch(project),
