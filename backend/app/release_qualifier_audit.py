@@ -227,8 +227,17 @@ async def _latest_artifact_logs(
 async def get_latest_release_audit_report(
     session: AsyncSession,
     project_id: uuid.UUID,
+    *,
+    candidate_sha: str | None = None,
 ) -> dict[str, Any] | None:
-    """Return the latest ``release_audit`` task's parsed report for a project."""
+    """Return the latest ``release_audit`` task's parsed report for a project.
+
+    When ``candidate_sha`` is provided, the lookup is scoped to audit tasks that
+    evaluated that exact candidate. If the open version has no candidate SHA or
+    no matching audit exists, return ``None`` rather than a mismatched report.
+    """
+    if not candidate_sha:
+        return None
     audit_task = (
         (
             await session.execute(
@@ -236,6 +245,7 @@ async def get_latest_release_audit_report(
                 .where(
                     Task.project_id == project_id,
                     Task.payloads[0]["type"].as_string() == "release_audit",
+                    Task.context["candidate_sha"].as_string() == candidate_sha,
                 )
                 .order_by(Task.created_at.desc())
                 .limit(1)
@@ -264,6 +274,115 @@ async def get_latest_release_audit_report(
         else None,
         "report": report,
     }
+
+
+async def _audit_report_for_task(
+    session: AsyncSession,
+    task: Task,
+) -> dict[str, Any]:
+    """Build the operator-facing report envelope for a single ``release_audit`` task."""
+    report = await _latest_artifact_logs(
+        session, task.id, ArtifactType.RELEASE_AUDIT_REPORT
+    )
+    ctx = task.context or {}
+    status_val = task.status.value if hasattr(task.status, "value") else str(task.status)
+    return {
+        "audit_task_id": str(task.id),
+        "task_status": status_val,
+        "candidate_sha": ctx.get("candidate_sha"),
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "report": report,
+    }
+
+
+def _select_lifecycle_audit(
+    audit_rows: list[dict[str, Any]],
+    evaluated_sha: str | None,
+) -> dict[str, Any]:
+    """Classify version-scoped audit rows against the evaluated candidate SHA.
+
+    ``audit_rows`` is a newest-first list of dicts, each carrying at least a
+    ``candidate_sha`` key (the candidate the audit task was pinned to).
+    ``evaluated_sha`` is the open version's currently-evaluated candidate (from
+    ``last_qualification['candidate_sha']``).
+
+    Returns a dict with:
+
+    * ``state`` — ``current`` when the newest matching-candidate audit exists,
+      ``stale`` when audits exist but none match the evaluated candidate (the
+      newest is historical), or ``none`` when there are no audits at all.
+    * ``current`` — the matching row when ``state == "current"`` else ``None``.
+    * ``stale`` — the newest (historical) row when ``state == "stale"`` else
+      ``None``.
+
+    Pure and synchronous so the selection policy is unit-testable without a DB.
+    """
+    if not audit_rows:
+        return {"state": "none", "current": None, "stale": None}
+    if evaluated_sha:
+        for row in audit_rows:
+            if row.get("candidate_sha") == evaluated_sha:
+                return {"state": "current", "current": row, "stale": None}
+    # Audits exist but none was run against the evaluated candidate — the newest
+    # is historical evidence; surface it as stale provenance, never as current.
+    return {"state": "stale", "current": None, "stale": audit_rows[0]}
+
+
+async def resolve_lifecycle_audit_evidence(
+    session: AsyncSession,
+    version: ReleaseVersion | None,
+) -> dict[str, Any]:
+    """Resolve audit evidence scoped to an open version's evaluated candidate.
+
+    Unlike :func:`get_latest_release_audit_report` (which returns the newest
+    ``release_audit`` anywhere in the project), this scopes evidence to the
+    given version via ``Task.context['release_version_id']`` and classifies it
+    against the version's evaluated candidate SHA so a fresh or newly-cut
+    version never inherits another version's findings.
+
+    Returns a dict:
+
+    * ``state`` — ``current`` | ``stale`` | ``none``.
+    * ``latest_audit`` — the matching audit report envelope when
+      ``state == "current"``, else ``None`` (so stale findings are never
+      presented as the current audit).
+    * ``stale_audit`` — the historical audit report envelope (provenance the UI
+      can use to explain the findings are stale) when ``state == "stale"``, else
+      ``None``.
+    """
+    if version is None:
+        return {"state": "none", "latest_audit": None, "stale_audit": None}
+
+    audit_tasks = list(
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == version.project_id,
+                    Task.payloads[0]["type"].as_string() == "release_audit",
+                    Task.context["release_version_id"].as_string() == str(version.id),
+                )
+                .order_by(Task.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    rows = [
+        {"candidate_sha": (t.context or {}).get("candidate_sha"), "task": t}
+        for t in audit_tasks
+    ]
+    evaluated_sha = (version.last_qualification or {}).get("candidate_sha")
+    selection = _select_lifecycle_audit(rows, evaluated_sha)
+
+    if selection["state"] == "current":
+        report = await _audit_report_for_task(session, selection["current"]["task"])
+        return {"state": "current", "latest_audit": report, "stale_audit": None}
+    if selection["state"] == "stale":
+        report = await _audit_report_for_task(session, selection["stale"]["task"])
+        return {"state": "stale", "latest_audit": None, "stale_audit": report}
+    return {"state": "none", "latest_audit": None, "stale_audit": None}
 
 
 async def _handle_infra_failure(

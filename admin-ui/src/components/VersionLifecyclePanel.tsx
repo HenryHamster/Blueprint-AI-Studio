@@ -159,53 +159,34 @@ function ServingStatusBadge({
   return null;
 }
 
-// Provenance + staleness header for the audit findings. Shows which commit the
-// audit ran against and how long ago, and flags when that commit differs from the
-// version's most-recently-evaluated candidate (currentCandidateSha) — i.e. the
-// integration branch advanced and some findings may already be fixed.
+// Provenance for scoped audit evidence. Shows which commit the audit ran
+// against and how long ago; the backend decides whether that evidence is
+// current or merely historical context for this candidate.
 function AuditProvenance({
   audit,
-  currentCandidateSha,
 }: {
   audit: LatestAudit;
-  currentCandidateSha?: string | null;
 }) {
-  const sha = audit.candidate_sha;
-  const isStale = !!(sha && currentCandidateSha && sha !== currentCandidateSha);
-  if (!sha && !audit.created_at) return null;
+  if (!audit.candidate_sha && !audit.created_at) return null;
   return (
     <div className="flex flex-wrap items-center gap-1.5">
-      {sha && (
-        <span className="text-[10px] text-neutral-500 font-mono" title={sha}>
-          @{sha.slice(0, 7)}
+      {audit.candidate_sha && (
+        <span className="text-[10px] text-neutral-500 font-mono" title={audit.candidate_sha}>
+          @{audit.candidate_sha.slice(0, 7)}
         </span>
       )}
       {audit.created_at && (
         <span className="text-[10px] text-neutral-600">ran {timeAgo(audit.created_at)}</span>
       )}
-      {isStale && (
-        <span
-          className="text-[10px] px-1.5 py-0.5 rounded border bg-amber-950/40 text-amber-400 border-amber-900/50"
-          title={`audit commit ${(sha ?? '').slice(0, 7)} differs from evaluated candidate ${(currentCandidateSha ?? '').slice(0, 7)}`}
-        >
-          findings from an older commit — branch advanced
-        </span>
-      )}
     </div>
   );
 }
 
-function AuditFindingsList({
-  audit,
-  currentCandidateSha,
-}: {
-  audit: LatestAudit;
-  currentCandidateSha?: string | null;
-}) {
+function AuditFindingsList({ audit }: { audit: LatestAudit }) {
   if (!audit.report) {
     return (
       <div className="space-y-0.5">
-        <AuditProvenance audit={audit} currentCandidateSha={currentCandidateSha} />
+        <AuditProvenance audit={audit} />
         <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20">
           audit crashed — no report
         </span>
@@ -216,7 +197,7 @@ function AuditFindingsList({
   if (findings.length === 0) {
     return (
       <div className="space-y-0.5">
-        <AuditProvenance audit={audit} currentCandidateSha={currentCandidateSha} />
+        <AuditProvenance audit={audit} />
         <span className="text-[10px] text-neutral-500 italic">audit: no findings</span>
       </div>
     );
@@ -229,13 +210,25 @@ function AuditFindingsList({
   return (
     <div className="space-y-0.5">
       <p className="text-[10px] text-neutral-500 uppercase tracking-wide">Audit Findings</p>
-      <AuditProvenance audit={audit} currentCandidateSha={currentCandidateSha} />
+      <AuditProvenance audit={audit} />
       {sorted.map((f, i) => (
         <div key={i} className={`flex items-start gap-1.5 text-[10px] px-1.5 py-0.5 rounded border ${FINDING_SEVERITY_STYLE[f.severity?.toLowerCase() ?? ''] ?? 'bg-neutral-800/50 text-neutral-400 border-neutral-700/50'}`}>
           <span className="font-semibold shrink-0">{f.severity ?? '?'}</span>
           <span>{f.summary}</span>
         </div>
       ))}
+    </div>
+  );
+}
+
+function HistoricalAuditContext({ audit }: { audit: LatestAudit }) {
+  return (
+    <div className="space-y-0.5">
+      <p className="text-[10px] text-neutral-500 uppercase tracking-wide">Historical Audit Context</p>
+      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-amber-500/10 text-amber-400 border-amber-500/20">
+        no current audit for this candidate
+      </span>
+      <AuditProvenance audit={audit} />
     </div>
   );
 }
@@ -459,6 +452,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   // the controls here so the panel presents the same truth, consistent with how
   // the cut lever already surfaces this state.
   const promotionInFlight = cv?.qualification_state?.state === 'promotion_in_flight';
+  const auditEvidenceState = cv?.audit_evidence_state ?? (cv?.latest_audit ? 'current' : 'none');
   // Admin-only lever: a promoted version latched to deploy_failed (current open
   // version after promotion, or a recent promoted one) can be cleared once the
   // deploy is verified or attested live. The backend endpoint is project-scoped
@@ -879,12 +873,14 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 )}
               </div>
             )}
-            {cv.latest_audit && (
+            {auditEvidenceState === 'current' && cv.latest_audit && (
               <div className="pl-2 border-l border-neutral-700/50">
-                <AuditFindingsList
-                  audit={cv.latest_audit}
-                  currentCandidateSha={cv.last_qualification?.candidate_sha}
-                />
+                <AuditFindingsList audit={cv.latest_audit} />
+              </div>
+            )}
+            {auditEvidenceState === 'stale' && cv.stale_audit && (
+              <div className="pl-2 border-l border-neutral-700/50">
+                <HistoricalAuditContext audit={cv.stale_audit} />
               </div>
             )}
             {projectId && (

@@ -7449,8 +7449,14 @@ class TestVersionLifecycleInfraFailureFields:
                 new=AsyncMock(return_value={"ready": False, "reason": "test"}),
             ),
             patch(
-                "app.release_qualifier.get_latest_release_audit_report",
-                new=AsyncMock(return_value=None),
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
             ),
             patch(
                 "app.release_version.count_merged_since",
@@ -7498,8 +7504,14 @@ class TestVersionLifecycleInfraFailureFields:
                 new=AsyncMock(return_value={"ready": True, "reason": "ok"}),
             ),
             patch(
-                "app.release_qualifier.get_latest_release_audit_report",
-                new=AsyncMock(return_value=None),
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
             ),
             patch(
                 "app.release_version.count_merged_since",
@@ -7547,8 +7559,14 @@ class TestVersionLifecycleInfraFailureFields:
                 new=AsyncMock(return_value={"ready": False, "reason": "test"}),
             ),
             patch(
-                "app.release_qualifier.get_latest_release_audit_report",
-                new=AsyncMock(return_value=None),
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
             ),
             patch(
                 "app.release_version.count_merged_since",
@@ -7564,6 +7582,192 @@ class TestVersionLifecycleInfraFailureFields:
         assert current["qualification_state"]["state"] == "promotion_in_flight"
         assert current["qualification_state"]["promotion_pr_number"] == 7357
         assert "auto-merge is armed" in current["qualification_state"]["summary"].lower()
+
+
+class TestVersionLifecycleAuditEvidence:
+    """GET /version-lifecycle scopes audit evidence to the open candidate SHA."""
+
+    @staticmethod
+    async def _add_audit_task(
+        db_session, project, version_id, candidate_sha, *, report=None
+    ):
+        task = Task(
+            project_id=project.id,
+            title="release audit",
+            payloads=[{"type": "release_audit", "base_branch": "main"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "release_version_id": str(version_id),
+                "candidate_sha": candidate_sha,
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        if report is not None:
+            db_session.add(
+                Artifact(
+                    task_id=task.id,
+                    artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+                    logs=json.dumps(report),
+                )
+            )
+            await db_session.commit()
+        return task
+
+    @staticmethod
+    def _readiness_patch():
+        from unittest.mock import patch
+
+        return (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_matching_audit_is_current(self, client: AsyncClient, db_session):
+        """An audit pinned to the evaluated candidate → latest_audit populated,
+        audit_evidence_state=current, stale_audit null."""
+        project = await _make_project(db_session)
+        candidate = "feed" * 10
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+            last_qualification={"status": "pending", "candidate_sha": candidate},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        report = {"audit_score": 0.8, "findings": []}
+        await self._add_audit_task(
+            db_session, project, version.id, candidate, report=report
+        )
+
+        readiness, merged = self._readiness_patch()
+        with readiness, merged:
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["audit_evidence_state"] == "current"
+        assert current["latest_audit"] is not None
+        assert current["latest_audit"]["candidate_sha"] == candidate
+        assert current["latest_audit"]["report"] == report
+        assert current["stale_audit"] is None
+
+    @pytest.mark.asyncio
+    async def test_stale_prior_candidate_audit(self, client: AsyncClient, db_session):
+        """Only an older-candidate audit exists → latest_audit null, stale_audit
+        provenance present, audit_evidence_state=stale."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+            last_qualification={"status": "pending", "candidate_sha": "newc" * 10},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        report = {"audit_score": 0.5, "findings": [{"severity": "high"}]}
+        await self._add_audit_task(
+            db_session, project, version.id, "0ld0" * 10, report=report
+        )
+
+        readiness, merged = self._readiness_patch()
+        with readiness, merged:
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["audit_evidence_state"] == "stale"
+        assert current["latest_audit"] is None
+        assert current["stale_audit"] is not None
+        assert current["stale_audit"]["candidate_sha"] == "0ld0" * 10
+        assert current["stale_audit"]["report"] == report
+
+    @pytest.mark.asyncio
+    async def test_no_matching_audit_is_none(self, client: AsyncClient, db_session):
+        """A newly-cut version with no audit of its own → audit_evidence_state=none,
+        latest_audit null, even when another version has an audit."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="stabilize",
+            status="open",
+            last_qualification={"status": "pending", "candidate_sha": "feed" * 10},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Audit belonging to a different version must not leak in.
+        import uuid as _uuid
+
+        await self._add_audit_task(
+            db_session, project, _uuid.uuid4(), "feed" * 10, report={"audit_score": 0.9}
+        )
+
+        readiness, merged = self._readiness_patch()
+        with readiness, merged:
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["audit_evidence_state"] == "none"
+        assert current["latest_audit"] is None
+        assert current["stale_audit"] is None
+
+    @pytest.mark.asyncio
+    async def test_current_audit_without_artifact(
+        self, client: AsyncClient, db_session
+    ):
+        """A matching audit with no report artifact → state current, latest_audit
+        provenance present but report null."""
+        project = await _make_project(db_session)
+        candidate = "feed" * 10
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+            last_qualification={"status": "pending", "candidate_sha": candidate},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        await self._add_audit_task(db_session, project, version.id, candidate)
+
+        readiness, merged = self._readiness_patch()
+        with readiness, merged:
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["audit_evidence_state"] == "current"
+        assert current["latest_audit"] is not None
+        assert current["latest_audit"]["report"] is None
 
 
 class TestVersionLifecycleStagedDirections:
@@ -7602,8 +7806,14 @@ class TestVersionLifecycleStagedDirections:
                 new=AsyncMock(return_value={"ready": False, "reason": "test"}),
             ),
             patch(
-                "app.release_qualifier.get_latest_release_audit_report",
-                new=AsyncMock(return_value=None),
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
             ),
             patch(
                 "app.release_version.count_merged_since",
@@ -7642,8 +7852,14 @@ class TestVersionLifecycleStagedDirections:
                 new=AsyncMock(return_value={"ready": False, "reason": "test"}),
             ),
             patch(
-                "app.release_qualifier.get_latest_release_audit_report",
-                new=AsyncMock(return_value=None),
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
             ),
             patch(
                 "app.release_version.count_merged_since",
@@ -7702,8 +7918,14 @@ class TestVersionLifecycleInFlightCount:
                 new=AsyncMock(return_value={"ready": False, "reason": "test"}),
             ),
             patch(
-                "app.release_qualifier.get_latest_release_audit_report",
-                new=AsyncMock(return_value=None),
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
             ),
             patch(
                 "app.release_version.count_merged_since",

@@ -120,11 +120,13 @@ from app.release_qualifier_audit import (
     _enrich_infra_error,
     _handle_infra_failure,
     _latest_artifact_logs,
+    _select_lifecycle_audit,  # noqa: F401 — re-exported for callers/tests
     _spawn_qualifier_smoketest_task,
     _spawn_release_audit_task,
     get_infra_failure_stats,  # noqa: F401 — re-exported for callers/tests
     get_latest_qualification_audit_findings,  # noqa: F401 — re-exported for callers/tests
     get_latest_release_audit_report,  # noqa: F401 — re-exported for callers/tests
+    resolve_lifecycle_audit_evidence,  # noqa: F401 — re-exported for callers/tests
 )
 from app.release_scoring import (
     # Re-exports — release_qualifier is the canonical import + test-patch

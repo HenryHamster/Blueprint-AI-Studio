@@ -137,7 +137,7 @@ async def get_version_lifecycle(
     )
     from app.release_qualifier import (  # noqa: PLC0415
         compute_promotion_readiness,
-        get_latest_release_audit_report,
+        resolve_lifecycle_audit_evidence,
     )
     from app.models import Project  # noqa: PLC0415
     from app.strategic_spawning import (  # noqa: PLC0415
@@ -176,10 +176,16 @@ async def get_version_lifecycle(
         qual_state = _release_version.summarize_qualification_state(
             qual, open_row.serving_status, open_row.deploy_failure_reason
         )
-        # Surface the latest release_audit's actual findings/score so a verdict
-        # is explainable (the verdict record only keeps the composite, and the
+        # Surface the open version's audit findings/score so a verdict is
+        # explainable (the verdict record only keeps the composite, and the
         # task API strips artifact logs — otherwise operators are blind to WHY).
-        latest_audit = await get_latest_release_audit_report(session, project_id)
+        # Scoped to THIS version's evaluated candidate so a fresh/newly-cut
+        # version never inherits another version's findings: ``latest_audit`` is
+        # populated only when the newest scoped audit matches the evaluated
+        # candidate SHA; otherwise the audit is surfaced as ``stale_audit``
+        # provenance and ``audit_evidence_state`` explains which case applies.
+        audit_evidence = await resolve_lifecycle_audit_evidence(session, open_row)
+        latest_audit = audit_evidence["latest_audit"]
 
         # Fetch live current_focus from the project's problem_model
         live_current_focus = None
@@ -210,6 +216,13 @@ async def get_version_lifecycle(
             "qualification_state": qual_state,
             "last_qualification": _format_qualification(qual) if qual else None,
             "latest_audit": latest_audit,
+            # Provenance for version-scoped audit evidence (additive). When the
+            # newest scoped audit was run against an OLDER candidate than the one
+            # under evaluation, its report is surfaced here (not as latest_audit)
+            # so the UI can mark the findings historical. ``audit_evidence_state``
+            # is ``current`` | ``stale`` | ``none``.
+            "audit_evidence_state": audit_evidence["state"],
+            "stale_audit": audit_evidence["stale_audit"],
             # Post-promotion serving confirmation (additive; NULL until the open
             # version is itself promoted — normally NULL for a still-open one).
             "serving_status": open_row.serving_status,

@@ -24,6 +24,8 @@ function makeCurrentVersion(overrides: Partial<api.CurrentVersion> = {}): api.Cu
     qualification_state: null,
     last_qualification: null,
     latest_audit: null,
+    audit_evidence_state: 'none',
+    stale_audit: null,
     ...overrides,
   };
 }
@@ -34,6 +36,30 @@ function makeVersionLifecycleResponse(overrides: Partial<VersionLifecycleRespons
     recent_versions: [],
     promotion_enabled: false,
     promotion_readiness: null,
+    ...overrides,
+  };
+}
+
+function makeQualification(overrides: Partial<api.VersionQualification> = {}): api.VersionQualification {
+  return {
+    status: 'not_promoted',
+    confidence: 0.89,
+    threshold: 0.9,
+    sub_scores: null,
+    ci_resolution: null,
+    blocker: null,
+    finalized_at: '2026-01-01T00:00:00Z',
+    ...overrides,
+  };
+}
+
+function makeLatestAudit(overrides: Partial<api.LatestAudit> = {}): api.LatestAudit {
+  return {
+    audit_task_id: 'task-1',
+    task_status: 'completed',
+    candidate_sha: 'abcdef1234567890',
+    created_at: '2026-01-01T00:00:00Z',
+    report: { findings: [{ severity: 'medium', summary: 'unverified finding' }] },
     ...overrides,
   };
 }
@@ -781,36 +807,13 @@ describe('VersionLifecyclePanel', () => {
     });
   });
 
-  describe('audit findings provenance + staleness', () => {
-    function makeQualification(overrides: Partial<api.VersionQualification> = {}): api.VersionQualification {
-      return {
-        status: 'not_promoted',
-        confidence: 0.89,
-        threshold: 0.9,
-        sub_scores: null,
-        ci_resolution: null,
-        blocker: null,
-        finalized_at: '2026-01-01T00:00:00Z',
-        ...overrides,
-      };
-    }
-
-    function makeLatestAudit(overrides: Partial<api.LatestAudit> = {}): api.LatestAudit {
-      return {
-        audit_task_id: 'task-1',
-        task_status: 'completed',
-        candidate_sha: 'abcdef1234567890',
-        created_at: '2026-01-01T00:00:00Z',
-        report: { findings: [{ severity: 'medium', summary: 'unverified finding' }] },
-        ...overrides,
-      };
-    }
-
-    it('renders the audit candidate SHA and run-age provenance', () => {
+  describe('audit evidence rendering', () => {
+    it('renders the current audit findings with provenance for the active candidate', () => {
       render(
         <VersionLifecyclePanel
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
+              audit_evidence_state: 'current',
               latest_audit: makeLatestAudit({ candidate_sha: 'abcdef1234567890' }),
             }),
           })}
@@ -819,17 +822,21 @@ describe('VersionLifecyclePanel', () => {
           onRefresh={mockRefresh}
         />
       );
+      expect(screen.getByText('Audit Findings')).toBeInTheDocument();
+      expect(screen.getByText('unverified finding')).toBeInTheDocument();
       expect(screen.getByText('@abcdef1')).toBeInTheDocument();
       expect(screen.getByText(/^ran /)).toBeInTheDocument();
     });
 
-    it('shows a stale badge when the audit commit differs from the evaluated candidate', () => {
+    it('renders stale audit provenance as historical context only and says there is no current audit', () => {
       render(
         <VersionLifecyclePanel
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
               last_qualification: makeQualification({ candidate_sha: 'fed9876543210000' }),
-              latest_audit: makeLatestAudit({ candidate_sha: 'abcdef1234567890' }),
+              audit_evidence_state: 'stale',
+              latest_audit: null,
+              stale_audit: makeLatestAudit({ candidate_sha: 'abcdef1234567890' }),
             }),
           })}
           loading={false}
@@ -837,16 +844,23 @@ describe('VersionLifecyclePanel', () => {
           onRefresh={mockRefresh}
         />
       );
-      expect(screen.getByText(/findings from an older commit/)).toBeInTheDocument();
+      expect(screen.getByText('Historical Audit Context')).toBeInTheDocument();
+      expect(screen.getByText(/no current audit for this candidate/i)).toBeInTheDocument();
+      expect(screen.getByText('@abcdef1')).toBeInTheDocument();
+      expect(screen.getByText(/^ran /)).toBeInTheDocument();
+      expect(screen.queryByText('unverified finding')).not.toBeInTheDocument();
+      expect(screen.queryByText('Audit Findings')).not.toBeInTheDocument();
     });
 
-    it('does not show a stale badge when the audit commit matches the evaluated candidate', () => {
+    it('does not display inherited findings when the current candidate has no audit evidence', () => {
       render(
         <VersionLifecyclePanel
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
               last_qualification: makeQualification({ candidate_sha: 'abcdef1234567890' }),
-              latest_audit: makeLatestAudit({ candidate_sha: 'abcdef1234567890' }),
+              audit_evidence_state: 'none',
+              latest_audit: null,
+              stale_audit: null,
             }),
           })}
           loading={false}
@@ -854,7 +868,43 @@ describe('VersionLifecyclePanel', () => {
           onRefresh={mockRefresh}
         />
       );
-      expect(screen.queryByText(/findings from an older commit/)).not.toBeInTheDocument();
+      expect(screen.queryByText('Audit Findings')).not.toBeInTheDocument();
+      expect(screen.queryByText(/no current audit for this candidate/i)).not.toBeInTheDocument();
+      expect(screen.queryByText('unverified finding')).not.toBeInTheDocument();
+    });
+
+    it('preserves the crashed-audit affordance only for the current candidate audit', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              audit_evidence_state: 'current',
+              latest_audit: makeLatestAudit({ report: null }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByText(/audit crashed — no report/)).toBeInTheDocument();
+    });
+
+    it('preserves the no-findings affordance only for the current candidate audit', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              audit_evidence_state: 'current',
+              latest_audit: makeLatestAudit({ report: { findings: [] } }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByText(/audit: no findings/)).toBeInTheDocument();
     });
 
     it('renders an "as of" freshness label beside the qualification summary', () => {

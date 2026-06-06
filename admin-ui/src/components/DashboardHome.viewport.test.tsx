@@ -75,6 +75,7 @@ let versionLifecycleResponse: unknown = {
       status: 'dry_run',
       confidence: 0.78,
       threshold: 0.80,
+      candidate_sha: 'abcdef1234567890',
       sub_scores: { audit: 0.85, test_erosion: 0.70, smoketest: 0.90 },
       blocker: null,
       finalized_at: '2026-05-20T11:00:00Z',

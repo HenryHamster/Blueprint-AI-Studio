@@ -1105,6 +1105,12 @@ export interface CurrentVersion {
   qualification_state?: QualificationState | null;
   last_qualification: VersionQualification | null;
   latest_audit?: LatestAudit | null;
+  // Version-scoped audit evidence for the open candidate. `latest_audit` is
+  // current only when audit_evidence_state='current'; `stale_audit` carries
+  // historical provenance when the newest scoped audit belongs to an older
+  // candidate, and 'none' means this candidate has no scoped audit evidence yet.
+  audit_evidence_state?: 'current' | 'stale' | 'none';
+  stale_audit?: LatestAudit | null;
   // Post-promotion serving confirmation (additive). serving_status is one of
   // 'unconfirmed' | 'serving_confirmed' | 'deploy_failed'; served_sha/served_at
   // record the confirmed-serving commit, and deploy_failure_reason the detail

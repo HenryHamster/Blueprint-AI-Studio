@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import uuid
 from unittest.mock import AsyncMock
 
 import pytest
@@ -13640,7 +13641,9 @@ async def test_get_latest_release_audit_report_none_when_no_audit_task(db_sessio
     """No release_audit task → None (a fresh project has no audit history)."""
     project, _version = await _make_project_and_version(db_session)
 
-    result = await rq.get_latest_release_audit_report(db_session, project.id)
+    result = await rq.get_latest_release_audit_report(
+        db_session, project.id, candidate_sha="feed" * 10
+    )
 
     assert result is None
 
@@ -13684,7 +13687,9 @@ async def test_get_latest_release_audit_report_returns_parsed_report(db_session)
     )
     await db_session.commit()
 
-    result = await rq.get_latest_release_audit_report(db_session, project.id)
+    result = await rq.get_latest_release_audit_report(
+        db_session, project.id, candidate_sha="feed" * 10
+    )
 
     assert result is not None
     assert result["audit_task_id"] == str(audit_task.id)
@@ -13705,12 +13710,15 @@ async def test_get_latest_release_audit_report_report_none_when_no_artifact(db_s
         title="crashed audit",
         payloads=[{"type": "release_audit", "base_branch": "main"}],
         status=TaskStatus.FAILED,
+        context={"candidate_sha": "feed" * 10},
     )
     db_session.add(audit_task)
     await db_session.commit()
     await db_session.refresh(audit_task)
 
-    result = await rq.get_latest_release_audit_report(db_session, project.id)
+    result = await rq.get_latest_release_audit_report(
+        db_session, project.id, candidate_sha="feed" * 10
+    )
 
     assert result is not None
     assert result["audit_task_id"] == str(audit_task.id)
@@ -13719,15 +13727,15 @@ async def test_get_latest_release_audit_report_report_none_when_no_artifact(db_s
 
 
 @pytest.mark.asyncio
-async def test_get_latest_release_audit_report_picks_most_recent(db_session):
-    """With several release_audit tasks, the most recent (by created_at) wins —
-    so a re-qualification's audit supersedes the prior attempt's."""
+async def test_get_latest_release_audit_report_scopes_to_candidate_sha(db_session):
+    """With several release_audit tasks, the latest matching candidate SHA wins."""
     from datetime import timedelta
 
     from app.time_utils import _utcnow
 
     project, _version = await _make_project_and_version(db_session)
     base = _utcnow()
+    candidate_sha = "feed" * 10
 
     old_task = Task(
         project_id=project.id,
@@ -13735,6 +13743,7 @@ async def test_get_latest_release_audit_report_picks_most_recent(db_session):
         payloads=[{"type": "release_audit", "base_branch": "main"}],
         status=TaskStatus.COMPLETED,
         created_at=base - timedelta(hours=2),
+        context={"candidate_sha": candidate_sha},
     )
     new_task = Task(
         project_id=project.id,
@@ -13742,6 +13751,7 @@ async def test_get_latest_release_audit_report_picks_most_recent(db_session):
         payloads=[{"type": "release_audit", "base_branch": "main"}],
         status=TaskStatus.COMPLETED,
         created_at=base,
+        context={"candidate_sha": "beef" * 10},
     )
     # A non-audit task that must be ignored even though it is the newest.
     other_task = Task(
@@ -13753,21 +13763,250 @@ async def test_get_latest_release_audit_report_picks_most_recent(db_session):
     )
     db_session.add_all([old_task, new_task, other_task])
     await db_session.commit()
-    await db_session.refresh(new_task)
+    await db_session.refresh(old_task)
     db_session.add(
         Artifact(
-            task_id=new_task.id,
+            task_id=old_task.id,
             artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
             logs=json.dumps({"audit_score": 0.91}),
         )
     )
     await db_session.commit()
 
-    result = await rq.get_latest_release_audit_report(db_session, project.id)
+    result = await rq.get_latest_release_audit_report(
+        db_session, project.id, candidate_sha=candidate_sha
+    )
 
     assert result is not None
-    assert result["audit_task_id"] == str(new_task.id)
+    assert result["audit_task_id"] == str(old_task.id)
     assert result["report"] == {"audit_score": 0.91}
+
+
+# ---------------------------------------------------------------------------
+# resolve_lifecycle_audit_evidence / _select_lifecycle_audit — version-scoped
+# audit evidence
+#
+# The lifecycle view must only show audit evidence belonging to the open
+# version's evaluated candidate.  These cover the pure selector's classification
+# (current / stale / none) plus the version-scoped DB resolver.
+# ---------------------------------------------------------------------------
+
+
+def test_select_lifecycle_audit_matching_candidate_is_current():
+    """The newest row whose candidate_sha equals the evaluated SHA → current."""
+    rows = [
+        {"candidate_sha": "newc" * 10},
+        {"candidate_sha": "0ld0" * 10},
+    ]
+    sel = rq._select_lifecycle_audit(rows, "newc" * 10)
+    assert sel["state"] == "current"
+    assert sel["current"] is rows[0]
+    assert sel["stale"] is None
+
+
+def test_select_lifecycle_audit_only_prior_candidate_is_stale():
+    """Audits exist but none match the evaluated SHA → newest is stale."""
+    rows = [
+        {"candidate_sha": "0ld0" * 10},
+        {"candidate_sha": "evnoldr" * 5 + "00000"},
+    ]
+    sel = rq._select_lifecycle_audit(rows, "newc" * 10)
+    assert sel["state"] == "stale"
+    assert sel["current"] is None
+    assert sel["stale"] is rows[0]
+
+
+def test_select_lifecycle_audit_empty_is_none():
+    """No audit rows → none, regardless of evaluated SHA."""
+    sel = rq._select_lifecycle_audit([], "newc" * 10)
+    assert sel == {"state": "none", "current": None, "stale": None}
+
+
+def test_select_lifecycle_audit_no_evaluated_sha_is_stale():
+    """Rows present but no evaluated SHA to match → newest treated as stale."""
+    rows = [{"candidate_sha": "0ld0" * 10}]
+    sel = rq._select_lifecycle_audit(rows, None)
+    assert sel["state"] == "stale"
+    assert sel["stale"] is rows[0]
+
+
+async def _add_release_audit_task(
+    db_session,
+    project,
+    *,
+    version_id,
+    candidate_sha,
+    created_at=None,
+    report=None,
+    status=TaskStatus.COMPLETED,
+):
+    """Insert a release_audit Task scoped to a version (+ optional report)."""
+    kwargs = {}
+    if created_at is not None:
+        kwargs["created_at"] = created_at
+    task = Task(
+        project_id=project.id,
+        title="release audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        status=status,
+        context={
+            "release_version_id": str(version_id),
+            "candidate_sha": candidate_sha,
+        },
+        **kwargs,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    if report is not None:
+        db_session.add(
+            Artifact(
+                task_id=task.id,
+                artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+                logs=json.dumps(report),
+            )
+        )
+        await db_session.commit()
+    return task
+
+
+@pytest.mark.asyncio
+async def test_resolve_lifecycle_audit_evidence_matching_candidate(db_session):
+    """An audit pinned to the open version's evaluated candidate → current."""
+    project, version = await _make_project_and_version(db_session)
+    candidate = "feed" * 10
+    version.last_qualification = {"status": "pending", "candidate_sha": candidate}
+    db_session.add(version)
+    await db_session.commit()
+
+    report = {"audit_score": 0.8, "findings": []}
+    task = await _add_release_audit_task(
+        db_session, project, version_id=version.id, candidate_sha=candidate, report=report
+    )
+
+    result = await rq.resolve_lifecycle_audit_evidence(db_session, version)
+
+    assert result["state"] == "current"
+    assert result["stale_audit"] is None
+    assert result["latest_audit"] is not None
+    assert result["latest_audit"]["audit_task_id"] == str(task.id)
+    assert result["latest_audit"]["candidate_sha"] == candidate
+    assert result["latest_audit"]["report"] == report
+
+
+@pytest.mark.asyncio
+async def test_resolve_lifecycle_audit_evidence_stale_prior_candidate(db_session):
+    """Only an audit against an OLDER candidate exists → stale provenance, no
+    current report (the prior findings must not be presented as current)."""
+    project, version = await _make_project_and_version(db_session)
+    version.last_qualification = {"status": "pending", "candidate_sha": "newc" * 10}
+    db_session.add(version)
+    await db_session.commit()
+
+    report = {"audit_score": 0.5, "findings": [{"severity": "high"}]}
+    task = await _add_release_audit_task(
+        db_session,
+        project,
+        version_id=version.id,
+        candidate_sha="0ld0" * 10,
+        report=report,
+    )
+
+    result = await rq.resolve_lifecycle_audit_evidence(db_session, version)
+
+    assert result["state"] == "stale"
+    assert result["latest_audit"] is None
+    assert result["stale_audit"] is not None
+    assert result["stale_audit"]["audit_task_id"] == str(task.id)
+    assert result["stale_audit"]["candidate_sha"] == "0ld0" * 10
+    assert result["stale_audit"]["report"] == report
+
+
+@pytest.mark.asyncio
+async def test_resolve_lifecycle_audit_evidence_excludes_other_version(db_session):
+    """An audit belonging to a DIFFERENT release version is never attached —
+    a fresh version with no audit of its own returns the explicit none state."""
+    project, version = await _make_project_and_version(db_session)
+    version.last_qualification = {"status": "pending", "candidate_sha": "feed" * 10}
+    db_session.add(version)
+    await db_session.commit()
+
+    other_version_id = uuid.uuid4()
+    await _add_release_audit_task(
+        db_session,
+        project,
+        version_id=other_version_id,
+        candidate_sha="feed" * 10,
+        report={"audit_score": 0.9},
+    )
+
+    result = await rq.resolve_lifecycle_audit_evidence(db_session, version)
+
+    assert result["state"] == "none"
+    assert result["latest_audit"] is None
+    assert result["stale_audit"] is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_lifecycle_audit_evidence_none_when_no_audit(db_session):
+    """No release_audit task for the version → explicit none state."""
+    project, version = await _make_project_and_version(db_session)
+    version.last_qualification = {"status": "pending", "candidate_sha": "feed" * 10}
+    db_session.add(version)
+    await db_session.commit()
+
+    result = await rq.resolve_lifecycle_audit_evidence(db_session, version)
+
+    assert result == {"state": "none", "latest_audit": None, "stale_audit": None}
+
+
+@pytest.mark.asyncio
+async def test_resolve_lifecycle_audit_evidence_current_report_none_no_artifact(
+    db_session,
+):
+    """A matching audit that crashed without a report → current with a null
+    report body but provenance present (state stays current, not none)."""
+    project, version = await _make_project_and_version(db_session)
+    candidate = "feed" * 10
+    version.last_qualification = {"status": "pending", "candidate_sha": candidate}
+    db_session.add(version)
+    await db_session.commit()
+
+    task = await _add_release_audit_task(
+        db_session,
+        project,
+        version_id=version.id,
+        candidate_sha=candidate,
+        status=TaskStatus.FAILED,
+    )
+
+    result = await rq.resolve_lifecycle_audit_evidence(db_session, version)
+
+    assert result["state"] == "current"
+    assert result["latest_audit"] is not None
+    assert result["latest_audit"]["audit_task_id"] == str(task.id)
+    assert result["latest_audit"]["task_status"] == "FAILED"
+    assert result["latest_audit"]["report"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_latest_release_audit_report_none_when_candidate_missing(db_session):
+    """No open-version candidate SHA means there is no comparable audit scope."""
+    project, _version = await _make_project_and_version(db_session)
+
+    audit_task = Task(
+        project_id=project.id,
+        title="candidate-scoped audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        context={"candidate_sha": "feed" * 10},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+
+    result = await rq.get_latest_release_audit_report(db_session, project.id)
+
+    assert result is None
 
 
 @pytest.mark.asyncio
