@@ -3312,6 +3312,17 @@ class ReleaseVersion(SQLModel, table=True):
     # ``status`` flips to "promoted" the instant the candidate merges; these
     # columns track whether the deploy then stabilized.  All nullable so the
     # migration is purely additive and pre-existing rows backfill naturally.
+    #
+    # **IMPORTANT: This field is a legacy projection for single-artifact releases.**
+    # It mirrors the ``backend_revision`` artifact's serving_status via
+    # ``project_backend_revision_artifact()`` during multi-artifact windows.
+    # When multiple required artifacts are registered (e.g. backend_revision + other
+    # services), this scalar reflects ONLY the backend artifact's state, not the
+    # whole-release aggregate. For the authoritative whole-release status, use
+    # ``aggregate_required_artifact_status()`` to compute from the full
+    # ReleaseDeployArtifact rows. This scalar is whole-release-accurate only
+    # while backend_revision is the sole required artifact.
+    #
     #   serving_status values: NULL (not-yet-promoted / NA) | "unconfirmed"
     #     | "serving_confirmed" | "deploy_failed".
     serving_status: str | None = Field(
@@ -3320,6 +3331,13 @@ class ReleaseVersion(SQLModel, table=True):
     )
 
     # The production serving SHA captured when serving was confirmed.
+    # **IMPORTANT: This is a legacy projection field.**
+    # It mirrors ``ReleaseDeployArtifact.served_identifier`` for the backend_revision
+    # artifact via ``project_backend_revision_artifact()``. During multi-artifact
+    # windows, this scalar reflects ONLY the backend artifact's serving SHA.
+    # The authoritative per-artifact serving identity is stored in
+    # ReleaseDeployArtifact.served_identifier. This field is whole-release-accurate
+    # only while backend_revision is the sole required artifact.
     served_sha: str | None = Field(
         default=None,
         sa_column=Column(String(40), nullable=True),
