@@ -277,4 +277,47 @@ describe('handleComputeExperiment', () => {
     expect(completion.status).toBe('FAILED');
     expect(completion.failure_category).toBe('compute_monitor_failed');
   });
+
+  it('forwards reported result metrics as top-level numeric keys in the COMPUTE_RESULT artifact', async () => {
+    vi.mocked(apiPost).mockResolvedValue(jobResponse({ status: 'RUNNING' }));
+    vi.mocked(apiGet).mockResolvedValue(jobResponse({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      polling_metadata: {
+        result_metrics: { accuracy: 0.91, tokens_per_sec: 1234, ignored: 'nope' },
+      },
+    }));
+
+    await handleComputeExperiment('task-1', { ...VALID_PAYLOAD }, TASK, '', 'o', 'r', null, { value: '' });
+
+    const result = JSON.parse(lastCompletionPayload().logs as string) as Record<string, unknown>;
+    // Read by name at the top level — the contract the downstream gate relies on.
+    expect(result.accuracy).toBe(0.91);
+    expect(result.tokens_per_sec).toBe(1234);
+    // Non-numeric metric values are dropped.
+    expect(result.ignored).toBeUndefined();
+    // Existing job-level fields stay intact.
+    expect(result.final_cost_usd).toBe(1.0);
+    expect(result.outcome).toBe('SUCCESS');
+  });
+
+  it('does not let a metric colliding with a reserved key overwrite the job-level field', async () => {
+    vi.mocked(apiPost).mockResolvedValue(jobResponse({ status: 'RUNNING' }));
+    vi.mocked(apiGet).mockResolvedValue(jobResponse({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      polling_metadata: {
+        // 'final_cost_usd' collides with a reserved key; 'accuracy' does not.
+        result_metrics: { final_cost_usd: 999, accuracy: 0.5 },
+      },
+    }));
+
+    await handleComputeExperiment('task-1', { ...VALID_PAYLOAD }, TASK, '', 'o', 'r', null, { value: '' });
+
+    const result = JSON.parse(lastCompletionPayload().logs as string) as Record<string, unknown>;
+    expect(result.final_cost_usd).toBe(1.0); // reserved field NOT overwritten
+    expect(result.accuracy).toBe(0.5);
+  });
 });

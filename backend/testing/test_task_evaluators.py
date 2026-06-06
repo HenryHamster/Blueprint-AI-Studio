@@ -391,22 +391,45 @@ def test_compute_criterion_missing_measurable_metric_fails_closed():
     assert "not evaluable" in v.reason
 
 
-def test_compute_criterion_unmeasurable_metric_does_not_bury_success():
-    """A criterion naming an experiment-domain metric the terminal result can
-    NEVER carry (accuracy/loss/…) must NOT permanently fail a successful run.
-    The gate passes on the terminal+costed outcome and surfaces the
-    unenforceable criterion explicitly to the operator."""
-    artifact = _compute_result()  # real shape: no 'accuracy' key, ever
+def test_compute_criterion_reported_metric_met_passes_with_goal_named():
+    """A reported experiment-domain metric (accuracy) that the agent flattened to
+    a top-level key and that MEETS its declared goal PASSES, naming the goal."""
+    artifact = _compute_result(accuracy=0.93)
     v = MetricStrategy().evaluate(_criterion_task("accuracy", ">=", 0.9), artifact)
     assert v.passed is True
-    assert "NOT enforced" in v.reason
-    assert "accuracy" in v.reason
-    # Even an injected domain metric does not flip the gate — the real artifact
-    # never carries it, so we never trust it.
-    injected = _compute_result(accuracy=0.5)
-    v2 = MetricStrategy().evaluate(_criterion_task("accuracy", ">=", 0.9), injected)
-    assert v2.passed is True
-    assert "NOT enforced" in v2.reason
+    assert "criterion met" in v.reason
+    assert "accuracy >= 0.9" in v.reason
+
+
+def test_compute_criterion_reported_metric_unmet_fails():
+    """A reported experiment-domain metric that MISSES its declared goal FAILS the
+    gate, naming the metric, observed value, operator and threshold."""
+    artifact = _compute_result(accuracy=0.83)
+    v = MetricStrategy().evaluate(_criterion_task("accuracy", ">=", 0.9), artifact)
+    assert v.passed is False
+    assert "not met" in v.reason
+    assert "accuracy=0.83" in v.reason
+    assert ">= 0.9" in v.reason
+
+
+def test_compute_criterion_absent_reported_metric_fails_closed():
+    """A declared experiment-domain metric the command did NOT report (absent from
+    the artifact) FAILS CLOSED with an operator-readable reason — it must NOT
+    silently pass as 'unmeasurable'."""
+    artifact = _compute_result()  # no 'accuracy' key reported
+    v = MetricStrategy().evaluate(_criterion_task("accuracy", ">=", 0.9), artifact)
+    assert v.passed is False
+    assert "not evaluable" in v.reason
+    assert "accuracy >= 0.9" in v.reason
+    assert "no numeric 'accuracy'" in v.reason
+
+
+def test_compute_criterion_non_numeric_reported_metric_fails_closed():
+    """A declared metric present but non-numeric in the artifact fails closed."""
+    artifact = _compute_result(accuracy="n/a")
+    v = MetricStrategy().evaluate(_criterion_task("accuracy", ">=", 0.9), artifact)
+    assert v.passed is False
+    assert "not evaluable" in v.reason
 
 
 def test_compute_criterion_can_gate_on_cost_metric():

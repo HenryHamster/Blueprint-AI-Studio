@@ -15,6 +15,10 @@ GCP zone, cost rate, launch command) lives on the row — see
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import json
+import math
 import os
 import shlex
 import signal
@@ -32,6 +36,21 @@ from app.vm_lifecycle import _ensure_vm_deleted
 _SERIAL_STATUS_PREFIX = "BLUEPRINT_COMPUTE_STATUS="
 _SERIAL_EXIT_PREFIX = "BLUEPRINT_COMPUTE_EXIT_CODE="
 _SERIAL_REASON_PREFIX = "BLUEPRINT_COMPUTE_REASON="
+# Single-line, base64-encoded marker carrying the command's own result metrics so
+# no metric value has to survive serial/escape passes — see CLAUDE.md's rule on
+# generating one language from another.
+_SERIAL_METRICS_PREFIX = "BLUEPRINT_COMPUTE_METRICS="
+
+# Well-known env var pointing the launched command at a result file it may write
+# (a small flat JSON object of metric-name -> number). Absence = no metrics.
+RESULT_FILE_ENV = "BLUEPRINT_RESULT_FILE"
+# Designated result-file path the command writes; read back after it finishes.
+_GCP_RESULT_FILE_PATH = "/tmp/blueprint_compute_result.json"
+_LOCAL_RESULT_FILENAME = "result.json"
+# Defensive bounds on the reported-metrics payload — a garbled/oversized marker
+# must be tolerated as simply ABSENT, never raise.
+_MAX_RESULT_METRICS = 64
+_MAX_RESULT_METRICS_DECODED_BYTES = 8192
 
 LOCAL_BACKEND_NAME = "local-subprocess"
 GCP_BACKEND_NAME = "gcp"
@@ -72,6 +91,10 @@ class ComputeStatusResult:
     message: str | None = None
     exit_code: int | None = None
     finished_at: datetime | None = None
+    # Result metrics the launched command reported about itself (accuracy,
+    # tokens_per_sec, final_loss, ...). None means the command reported nothing
+    # OR the marker was missing/garbled — both treated identically as ABSENT.
+    metrics: dict[str, float] | None = None
 
 
 @dataclass(slots=True)
@@ -469,24 +492,28 @@ def _read_local_terminal_status_for_external_id(
             finished_at = parsed
         except ValueError:
             finished_at = _utcnow()
+    metrics = _decode_result_metrics(data.get("METRICS"))
     if raw_status == "SUCCEEDED":
         return ComputeStatusResult(
             status=ComputeJobStatus.SUCCEEDED,
             message="local subprocess exited 0",
             exit_code=0 if exit_code is None else exit_code,
             finished_at=finished_at,
+            metrics=metrics,
         )
     if exit_code is None:
         return ComputeStatusResult(
             status=ComputeJobStatus.FAILED,
             message="local subprocess exited with unknown code",
             finished_at=finished_at,
+            metrics=metrics,
         )
     return ComputeStatusResult(
         status=ComputeJobStatus.FAILED,
         message=f"local subprocess exited with code {exit_code}",
         exit_code=exit_code,
         finished_at=finished_at,
+        metrics=metrics,
     )
 
 
@@ -494,10 +521,13 @@ def _build_local_wrapper_command(command: str, *, external_id: str) -> str:
     state_dir = shlex.quote(_local_state_dir_for_external_id(external_id))
     pid_path = shlex.quote(_local_pid_path_for_external_id(external_id))
     terminal_path = shlex.quote(_local_terminal_path_for_external_id(external_id))
+    result_path = shlex.quote(_local_result_path_for_external_id(external_id))
     command_literal = shlex.quote(command)
     return f"""mkdir -p {state_dir}
 printf '%s\\n' "$$" > {pid_path}
 rm -f {terminal_path}
+rm -f {result_path}
+export {RESULT_FILE_ENV}={result_path}
 EXIT_CODE=0
 if bash -lc {command_literal}; then
   STATUS=SUCCEEDED
@@ -507,10 +537,15 @@ else
   EXIT_CODE=$?
 fi
 FINISHED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+METRICS_B64=""
+if [ -f {result_path} ]; then
+  METRICS_B64=$(base64 -w0 < {result_path} 2>/dev/null || true)
+fi
 cat > {terminal_path} <<EOF
 STATUS=$STATUS
 EXIT_CODE=$EXIT_CODE
 FINISHED_AT=$FINISHED_AT
+METRICS=$METRICS_B64
 EOF
 exit "$EXIT_CODE"
 """
@@ -536,6 +571,13 @@ def _local_terminal_path_for_external_id(external_id: str | None) -> str:
     return os.path.join(
         _local_state_dir_for_external_id(external_id),
         _LOCAL_TERMINAL_FILENAME,
+    )
+
+
+def _local_result_path_for_external_id(external_id: str | None) -> str:
+    return os.path.join(
+        _local_state_dir_for_external_id(external_id),
+        _LOCAL_RESULT_FILENAME,
     )
 
 
@@ -603,6 +645,7 @@ def _build_gcp_startup_script(spec: ComputeLaunchSpec) -> str:
     else:
         deadline_seconds = 3600
     command = shlex.quote(spec.command)
+    result_file = shlex.quote(_GCP_RESULT_FILE_PATH)
     return f"""#!/bin/bash
 set -u -o pipefail
 TTL_SECONDS={deadline_seconds}
@@ -616,6 +659,8 @@ TTL_SECONDS={deadline_seconds}
 TTL_PID=$!
 echo "{_SERIAL_STATUS_PREFIX}RUNNING"
 {env_block}
+export {RESULT_FILE_ENV}={result_file}
+rm -f {result_file}
 {cwd_line}
 EXIT_CODE=0
 if bash -lc {command}; then
@@ -628,16 +673,67 @@ else
   echo "{_SERIAL_STATUS_PREFIX}FAILED"
 fi
 echo "{_SERIAL_EXIT_PREFIX}$EXIT_CODE"
+if [ -f {result_file} ]; then
+  METRICS_B64=$(base64 -w0 < {result_file} 2>/dev/null || true)
+  if [ -n "$METRICS_B64" ]; then
+    echo "{_SERIAL_METRICS_PREFIX}$METRICS_B64"
+  fi
+fi
 kill "$TTL_PID" 2>/dev/null || true
 poweroff || shutdown -h now || true
 exit "$EXIT_CODE"
 """
 
 
+def _decode_result_metrics(raw_b64: str | None) -> dict[str, float] | None:
+    """Decode a base64 metrics marker into a bounded, numeric-only dict.
+
+    Defensive by contract: any decode/parse/shape error — missing, oversized,
+    non-base64, non-JSON, non-object — yields ``None`` (metrics simply ABSENT).
+    Per-entry, only numeric and boolean values survive (bool coerced to a
+    number); strings, nulls, and nested objects/arrays are dropped. The monitor
+    must NEVER raise on a garbled marker, so all failure modes funnel to ``None``.
+    """
+    if not raw_b64:
+        return None
+    candidate = raw_b64.strip()
+    if not candidate:
+        return None
+    try:
+        decoded = base64.b64decode(candidate, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(decoded) > _MAX_RESULT_METRICS_DECODED_BYTES:
+        return None
+    try:
+        parsed = json.loads(decoded.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    metrics: dict[str, float] = {}
+    for key, value in parsed.items():
+        if len(metrics) >= _MAX_RESULT_METRICS:
+            break
+        if not isinstance(key, str):
+            continue
+        # bool is a subclass of int — coerce explicitly before the int/float test.
+        if isinstance(value, bool):
+            metrics[key] = float(value)
+        elif isinstance(value, (int, float)):
+            numeric = float(value)
+            if not math.isfinite(numeric):
+                continue
+            metrics[key] = numeric
+        # strings, None, nested dict/list → dropped (not numeric)
+    return metrics or None
+
+
 def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
     status_line: str | None = None
     exit_code: int | None = None
     reason: str | None = None
+    metrics_b64: str | None = None
     for raw_line in serial_output.splitlines():
         line = raw_line.strip()
         if line.startswith(_SERIAL_STATUS_PREFIX):
@@ -649,20 +745,25 @@ def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
                 exit_code = None
         elif line.startswith(_SERIAL_REASON_PREFIX):
             reason = line[len(_SERIAL_REASON_PREFIX) :]
+        elif line.startswith(_SERIAL_METRICS_PREFIX):
+            metrics_b64 = line[len(_SERIAL_METRICS_PREFIX) :]
     if status_line is None:
         return None
     if status_line == "RUNNING":
         return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+    metrics = _decode_result_metrics(metrics_b64)
     if status_line == "SUCCEEDED":
         return ComputeStatusResult(
             status=ComputeJobStatus.SUCCEEDED,
             message=reason,
             exit_code=exit_code,
             finished_at=_utcnow(),
+            metrics=metrics,
         )
     return ComputeStatusResult(
         status=ComputeJobStatus.FAILED,
         message=reason or "compute-job startup script failed",
         exit_code=exit_code,
         finished_at=_utcnow(),
+        metrics=metrics,
     )

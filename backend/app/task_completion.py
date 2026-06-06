@@ -1877,6 +1877,21 @@ async def _handle_compute_experiment_completion(
         crashes.
     """
     verdict = evaluate_terminal_output(task, logs)
+
+    # Record the declared success-criterion verdict DURABLY on the task so the
+    # operator and strategic consumers can read whether the experiment's goal
+    # was actually met — metric/operator/threshold, observed value, met/unmet,
+    # and whether it was reported (measurable) — for met, unmet, and
+    # not-reported cases alike, independent of the gate's pass/fail. Written
+    # before record_failed_gate so the FAIL path preserves it alongside the
+    # evaluation_gate record.
+    criterion = evaluate_compute_success_criterion(task, logs)
+    if criterion is not None:
+        crit_context = dict(task.context or {})
+        crit_context["compute_success_criterion"] = criterion
+        task.context = crit_context
+        flag_modified(task, "context")
+
     if not verdict.passed:
         record_failed_gate(task, verdict)
         session.add(task)
@@ -1904,7 +1919,7 @@ async def _handle_compute_experiment_completion(
         compute_result: dict = {"outcome": outcome, "final_cost_usd": cost}
         # The gate passed, so a declared success criterion (if any) was met —
         # surface it on the durable result for the operator-visible summary.
-        criterion = evaluate_compute_success_criterion(task, logs)
+        # ``criterion`` was already computed above and recorded on task.context.
         if criterion is not None:
             compute_result["criterion"] = criterion
         plan_output["compute_result"] = compute_result

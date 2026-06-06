@@ -337,6 +337,14 @@ class ComputeSuccessCriterion(BaseModel):
     Deliberately minimal — no expression framework, just enough to express a
     single numeric/threshold goal the metric gate can check at completion. When
     absent, the gate keeps its presence-only behavior (terminal outcome + cost).
+
+    The ``metric`` may name a reserved job-level field (final_cost_usd, …) OR
+    any experiment-domain metric the command reports (accuracy, tokens_per_sec,
+    final_loss, …): the compute substrate now carries reported metrics through
+    ``ComputeJob.polling_metadata.result_metrics``, which the agent flattens to
+    top-level numeric keys on the COMPUTE_RESULT, so the gate enforces them by
+    name. A declared metric the experiment does not report fails the gate
+    closed at completion (it is not silently treated as unmeasurable).
     """
 
     model_config = ConfigDict(extra="forbid")

@@ -470,6 +470,12 @@ async def _process_single_compute_job(session, job: ComputeJob) -> None:
         finished = status.finished_at or now
         cost = await backend.poll_cost(job, as_of=finished)
         job.accrued_cost_usd = max(float(job.accrued_cost_usd or 0.0), cost.total_cost_usd)
+        # Persist any command-reported result metrics under a dedicated
+        # polling_metadata key. polling_metadata already serializes to the agent
+        # via serialize_compute_job_response, so the metrics reach the handler
+        # without a migration. Absent metrics (None) leave the key unwritten.
+        if status.metrics:
+            _set_meta(job, result_metrics=dict(status.metrics))
         outcome = (
             ComputeJobOutcome.SUCCESS
             if status.status == ComputeJobStatus.SUCCEEDED

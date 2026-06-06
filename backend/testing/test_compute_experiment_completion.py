@@ -312,6 +312,58 @@ async def test_compute_completion_met_criterion_completes_and_records_goal(
     assert criterion["met"] is True
     assert criterion["metric"] == "final_cost_usd"
     assert criterion["value"] == pytest.approx(0.42)
+    # Durable criterion verdict is also recorded on task.context for consumers.
+    ctx_criterion = task.context["compute_success_criterion"]
+    assert ctx_criterion["met"] is True
+    assert ctx_criterion["measurable"] is True
+
+
+@pytest.mark.asyncio
+async def test_compute_completion_reported_metric_met_records_goal(
+    db_session, _quiet_compute_io
+):
+    """A command-reported experiment metric (accuracy) flattened to a top-level
+    key that MEETS its declared goal PASSES, completes the task, and records the
+    met verdict durably on both plan_output and task.context."""
+    task = await _make_compute_task_with_criterion(
+        db_session, "accuracy", ">=", 0.9
+    )
+
+    await _handle_compute_experiment_completion(
+        task, _result_artifact(accuracy=0.93), db_session
+    )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    criterion = task.plan_output["compute_result"]["criterion"]
+    assert criterion["met"] is True
+    assert criterion["measurable"] is True
+    assert criterion["value"] == pytest.approx(0.93)
+    assert task.context["compute_success_criterion"]["met"] is True
+
+
+@pytest.mark.asyncio
+async def test_compute_completion_reported_metric_unmet_fails_gate(
+    db_session, _quiet_compute_io
+):
+    """A reported experiment metric that MISSES its declared goal FAILS the gate
+    and records the unmet criterion durably on task.context."""
+    task = await _make_compute_task_with_criterion(
+        db_session, "accuracy", ">=", 0.9
+    )
+
+    await _handle_compute_experiment_completion(
+        task, _result_artifact(accuracy=0.83), db_session
+    )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert task.context["evaluation_gate"]["passed"] is False
+    assert "not met" in task.context["evaluation_gate"]["reason"]
+    ctx_criterion = task.context["compute_success_criterion"]
+    assert ctx_criterion["met"] is False
+    assert ctx_criterion["measurable"] is True
+    assert ctx_criterion["value"] == pytest.approx(0.83)
 
 
 @pytest.mark.asyncio
@@ -333,26 +385,31 @@ async def test_compute_completion_unmet_criterion_fails_gate(
     assert task.status == TaskStatus.FAILED
     assert task.context["evaluation_gate"]["passed"] is False
     assert "not met" in task.context["evaluation_gate"]["reason"]
+    assert task.context["compute_success_criterion"]["met"] is False
 
 
 @pytest.mark.asyncio
-async def test_compute_completion_unmeasurable_criterion_does_not_bury_success(
+async def test_compute_completion_absent_metric_fails_closed_and_records(
     db_session, _quiet_compute_io
 ):
-    """A criterion naming an experiment-domain metric the terminal result can
-    NEVER carry (accuracy/loss/…) must NOT permanently fail a successful run at
-    the lifecycle level. The gate passes on the terminal+costed outcome and the
-    durable criterion records that the goal was unmeasurable (not silently met)."""
+    """A declared experiment-domain metric the command did NOT report (absent from
+    the terminal artifact) FAILS the gate CLOSED — it must NOT silently complete
+    as 'unmeasurable'. The durable criterion records the metric was not
+    measurable (absent) and the gate reason is operator-readable."""
     task = await _make_compute_task_with_criterion(db_session, "accuracy", ">=", 0.9)
 
-    # Real terminal artifact shape: no 'accuracy' key, ever.
+    # Real terminal artifact shape: no 'accuracy' key reported.
     await _handle_compute_experiment_completion(task, _result_artifact(), db_session)
 
     await db_session.refresh(task)
-    assert task.status == TaskStatus.COMPLETED
-    criterion = task.plan_output["compute_result"]["criterion"]
-    assert criterion["measurable"] is False
-    assert criterion["metric"] == "accuracy"
+    assert task.status == TaskStatus.FAILED
+    assert task.context["evaluation_gate"]["passed"] is False
+    assert "not evaluable" in task.context["evaluation_gate"]["reason"]
+    ctx_criterion = task.context["compute_success_criterion"]
+    assert ctx_criterion["measurable"] is False
+    assert ctx_criterion["met"] is False
+    assert ctx_criterion["metric"] == "accuracy"
+    assert ctx_criterion["value"] is None
 
 
 # ── Full lifecycle: substrate kill → task completion ────────────────────────
