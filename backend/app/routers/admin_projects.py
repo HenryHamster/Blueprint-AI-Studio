@@ -19,7 +19,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.database import get_session
+from app.database import get_session, resolve_dialect_name
 from app.shared_state import limiter
 from app.models import (
     Task,
@@ -80,6 +80,18 @@ async def get_all_projects(
     # Select only lightweight columns — large JSONB (directions, vision, design_doc,
     # problem_model, self_reflection_log, running_update) are excluded here and
     # available via GET /api/admin/projects/{project_id}.
+
+    # Build dialect-safe directions_count expression
+    dialect_name = resolve_dialect_name(session)
+    if dialect_name == "sqlite":
+        directions_count_expr = func.coalesce(
+            func.json_array_length(Project.directions), 0
+        )
+    else:
+        directions_count_expr = func.coalesce(
+            func.jsonb_array_length(Project.directions), 0
+        )
+
     stmt = (
         select(
             Project.id,
@@ -97,9 +109,7 @@ async def get_all_projects(
             Project.merge_gate_runtime,
             Project.sr_catch_rate_targets,
             Project.running_update_acknowledged_at,
-            func.coalesce(func.jsonb_array_length(Project.directions), 0).label(
-                "directions_count"
-            ),
+            directions_count_expr.label("directions_count"),
             ProjectMember.role.label("my_role"),
         )
         .join(ProjectMember, ProjectMember.project_id == Project.id)

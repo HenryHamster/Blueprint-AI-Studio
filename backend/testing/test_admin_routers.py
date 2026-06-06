@@ -617,6 +617,43 @@ class TestGetAllProjects:
         assert "env_vars" not in target["build_config"]
         assert target["build_config"].get("node_version") == "20"
 
+    @pytest.mark.asyncio
+    async def test_directions_count_matches_actual_count(
+        self, client: AsyncClient, db_session
+    ):
+        """directions_count in list response matches actual number of directions."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="Directions Count Test")
+
+        # Test 1: empty directions should yield directions_count=0
+        project.directions = []
+        flag_modified(project, "directions")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/projects")
+        assert resp.status_code == 200
+        items = resp.json()["items"]
+        target = next(p for p in items if p["id"] == str(project.id))
+        assert target["directions_count"] == 0
+
+        # Test 2: 3 directions should yield directions_count=3
+        project.directions = [
+            {"id": "d-1", "text": "Direction 1", "priority": "high"},
+            {"id": "d-2", "text": "Direction 2", "priority": "medium"},
+            {"id": "d-3", "text": "Direction 3", "priority": "low"},
+        ]
+        flag_modified(project, "directions")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/projects")
+        assert resp.status_code == 200
+        items = resp.json()["items"]
+        target = next(p for p in items if p["id"] == str(project.id))
+        assert target["directions_count"] == 3
+
 
 class TestGetProject:
     @pytest.mark.asyncio
