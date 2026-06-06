@@ -4751,6 +4751,35 @@ class TestNotificationConfigSettings:
         assert bad2.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_patch_rollup_merge_queue_enabled(self, client: AsyncClient):
+        """rollup_merge_queue_enabled accepts booleans, rejects non-booleans,
+        and round-trips on GET. Guards all four wiring points (allowlist,
+        apply block, GET projection, persist) — a missing apply block would
+        200 the PATCH and silently drop the write (#8528 pattern)."""
+        resp = await client.patch(
+            "/api/admin/settings", json={"rollup_merge_queue_enabled": False}
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["rollup_merge_queue_enabled"] is False
+
+        resp = await client.patch(
+            "/api/admin/settings", json={"rollup_merge_queue_enabled": True}
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["rollup_merge_queue_enabled"] is True
+
+        bad = await client.patch(
+            "/api/admin/settings", json={"rollup_merge_queue_enabled": "false"}
+        )
+        assert bad.status_code == 400
+        bad2 = await client.patch(
+            "/api/admin/settings", json={"rollup_merge_queue_enabled": 0}
+        )
+        assert bad2.status_code == 400
+
+    @pytest.mark.asyncio
     async def test_patch_warm_pool_project_allowlist_round_trip(
         self, client: AsyncClient
     ):

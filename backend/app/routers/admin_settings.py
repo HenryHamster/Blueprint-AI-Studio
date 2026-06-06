@@ -131,6 +131,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "reserved_slots_for_types",
         "residual_audit_defer_escalation_threshold",
         "residual_remediation_cooldown_hours",
+        "rollup_merge_queue_enabled",
         "smoketest_enabled",
         "strategic_max_interval_minutes",
         "strategic_research_frequency",
@@ -368,6 +369,9 @@ async def get_settings(
         ),
         "warm_backlog_reuse_enabled": bool(
             _runtime_config.get("warm_backlog_reuse_enabled", False)
+        ),
+        "rollup_merge_queue_enabled": bool(
+            _runtime_config.get("rollup_merge_queue_enabled", True)
         ),
         "cochange_decomposition_enabled": bool(
             _runtime_config.get("cochange_decomposition_enabled", False)
@@ -861,6 +865,14 @@ async def _apply_settings(
                 detail="warm_backlog_reuse_enabled must be a boolean",
             )
         _runtime_config["warm_backlog_reuse_enabled"] = val
+    if "rollup_merge_queue_enabled" in payload:
+        val = payload["rollup_merge_queue_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="rollup_merge_queue_enabled must be a boolean",
+            )
+        _runtime_config["rollup_merge_queue_enabled"] = val
     if "cochange_decomposition_enabled" in payload:
         val = payload["cochange_decomposition_enabled"]
         if not isinstance(val, bool):
@@ -2064,6 +2076,13 @@ async def _apply_settings(
                     ),
                     "warm_backlog_reuse_enabled": bool(
                         _runtime_config.get("warm_backlog_reuse_enabled", False)
+                    ),
+                    # Persist the rollup merge-train flag so an operator
+                    # disable survives a Cloud Run restart (config-sync reads
+                    # this key back on boot; without it the in-memory value
+                    # reverts to the True default).
+                    "rollup_merge_queue_enabled": bool(
+                        _runtime_config.get("rollup_merge_queue_enabled", True)
                     ),
                     "cochange_decomposition_enabled": bool(
                         _runtime_config.get("cochange_decomposition_enabled", False)

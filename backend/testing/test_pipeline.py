@@ -99,20 +99,20 @@ class TestVerdictParsing:
         text = (
             'Here is my review.\n\n{"verdict": "APPROVE", "feedback": "LGTM"}\n\nDone.'
         )
-        verdict, feedback, parsed = self._parse_verdict(text)
+        verdict, _feedback, parsed = self._parse_verdict(text)
         assert verdict == "APPROVE"
         assert parsed
 
     def test_feedback_key_before_verdict(self):
         """Regression: verdict regex must work when feedback appears before verdict in JSON."""
         text = '{"feedback": "All good", "verdict": "APPROVE"}'
-        verdict, feedback, parsed = self._parse_verdict(text)
+        verdict, _feedback, parsed = self._parse_verdict(text)
         assert verdict == "APPROVE"
         assert parsed
 
     def test_truncated_json_falls_back(self):
         text = '{"verdict": "APPROVE", "feedback": "Loo'
-        verdict, _, parsed = self._parse_verdict(text)
+        _verdict, _, parsed = self._parse_verdict(text)
         # Truncated JSON can't be parsed — should fallback
         assert not parsed
 
@@ -136,7 +136,7 @@ class TestVerdictParsing:
     def test_multiple_json_objects_uses_last(self):
         """When multiple verdict JSONs exist, should use the last complete one."""
         text = '{"verdict": "REQUEST_CHANGES", "feedback": "v1"}\nUpdated:\n{"verdict": "APPROVE", "feedback": "v2"}'
-        verdict, feedback, parsed = self._parse_verdict(text)
+        verdict, _feedback, parsed = self._parse_verdict(text)
         # The regex uses finditer so it processes all matches — last one wins
         assert verdict == "APPROVE"
         assert parsed
@@ -150,7 +150,7 @@ class TestVerdictParsing:
     def test_missing_verdict_key(self):
         """JSON without "verdict" key should not be parsed as a verdict."""
         text = '{"result": "APPROVE", "feedback": "good"}'
-        verdict, _, parsed = self._parse_verdict(text)
+        _verdict, _, parsed = self._parse_verdict(text)
         # No "verdict" key in the JSON, so regex won't match and parsed stays False
         # Fallback keyword scan also won't find "APPROVE" or "REQUEST_CHANGES" as quoted strings
         # (the word APPROVE is present but as value of "result", not as "APPROVE" standalone)
@@ -563,7 +563,7 @@ class TestCausationAnalysis:
 
     def test_no_results(self):
         self._setup_monitoring([])
-        do_rb, reason, response = should_rollback()
+        do_rb, _reason, response = should_rollback()
         assert not do_rb
         assert response == "SELF_HEAL"
 
@@ -1025,7 +1025,7 @@ class TestPerTypeDispatchGate:
                 (ts, "failure", "CODE_ERROR", "create"),
             ]
         )
-        rate, n = get_task_type_failure_rate("create", window_minutes=15)
+        _rate, n = get_task_type_failure_rate("create", window_minutes=15)
         assert n == 2
         assert n < 3  # Gate requires minimum 3 samples
 
@@ -1095,7 +1095,7 @@ class TestMonitoringWindowEdgeCases:
         ]
         deploy_monitoring["pre_deploy_failure_rate"] = 0.0
         deploy_monitoring["window_start"] = datetime.utcnow() - timedelta(minutes=20)
-        do_rollback, reason, response = should_rollback()
+        do_rollback, _reason, response = should_rollback()
         assert do_rollback
         assert response == "ROLLBACK"
 
@@ -1978,9 +1978,9 @@ async def test_dispatch_rollup_approval_alert_enriched_payload(rollup_db, mocker
     )
     await rollup_db.commit()
 
-    payload = [
+    payload = next(
         c for c in mock_dispatch.call_args_list if c.args[1] == "APPROVAL_NEEDED"
-    ][0].args[2]
+    ).args[2]
     assert payload["approval_reason"] == "stuck cycle"
     assert payload["pr_url"] == "https://github.com/o/r/pull/99"
     assert payload["critical_files"] == ["backend/app/main.py", "backend/app/models.py"]
@@ -3349,6 +3349,322 @@ async def test_rollup_premerge_unrelated_422_still_increments_counter(
         "unrelated 422 must still bump the retry counter"
     )
     assert mock_spawn.await_count == 0
+
+
+# ── Rollup Merge Queue (merge train) ─────────────────────────────────────────
+
+
+_MQ_TARGET = "research/parent-xyz"
+
+
+def _mq_sibling_pr_detail(pr_number, created_at, *, state="open", base=_MQ_TARGET):
+    return {
+        "number": pr_number,
+        "state": state,
+        "merged": False,
+        "mergeable_state": "behind",
+        "created_at": created_at,
+        "head": {"sha": f"sib-head-{pr_number}"},
+        "base": {"ref": base},
+    }
+
+
+def _patch_merge_queue_merged_mocks(mocker, sibling_details):
+    """Mocks so OUR rollup PR (#777) auto-merges successfully and the merge
+    queue observes the supplied sibling PR details (keyed by pr_number)."""
+    _patch_common_rollup_mocks(mocker)
+
+    own_pr_detail = {
+        "additions": 5,
+        "deletions": 5,
+        "state": "open",
+        "merged": False,
+        "mergeable_state": "clean",
+        "head": {"sha": "abc123"},
+    }
+
+    async def _pr_get(*args, **_kwargs):
+        pr_number = args[3]
+        if pr_number == 777:
+            return own_pr_detail
+        return sibling_details[pr_number]
+
+    mocker.patch("app.github.get_pull_request", new=AsyncMock(side_effect=_pr_get))
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "ok", "report": ""},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True, "sha": "merge-sha"},
+    )
+    mocker.patch("app.github.delete_branch", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.post_pr_merged_message", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff", new_callable=AsyncMock, return_value=""
+    )
+    mocker.patch(
+        "app.viewport_coverage.update_viewport_coverage_snapshot_from_diff",
+        new_callable=AsyncMock,
+    )
+    # Sibling heads do NOT contain the base tip → genuinely behind.
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    return mocker.patch(
+        "app.github.update_branch_with_sha_retry",
+        new_callable=AsyncMock,
+        return_value={"updated": True},
+    )
+
+
+async def _make_mq_sibling_parent(rollup_db, project, pr_number):
+    sibling = Task(
+        project_id=project.id,
+        title=f"sibling rollup parent {pr_number}",
+        payloads=[{"type": "research", "prompt": "sibling parent"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "_is_rollup_review": True,
+            "rollup_pr_number": pr_number,
+            "rollup_pr_url": f"https://example.com/pr/{pr_number}",
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": pr_number,
+                "polls_since_pr_fetch": 0,
+                "head_sha": "stale-head",
+            },
+        },
+    )
+    rollup_db.add(sibling)
+    await rollup_db.commit()
+    await rollup_db.refresh(sibling)
+    return sibling
+
+
+@pytest.mark.asyncio
+async def test_rollup_merge_queue_updates_siblings_fifo_by_pr_created_at(
+    rollup_db, mocker
+):
+    """Merge train: after a rollup PR merges, every open sibling rollup PR
+    queued against the same base gets a proactive update_branch, ordered FIFO
+    by PR created_at (NOT by PR number), each stamped with the in-flight
+    marker. Closed siblings are skipped."""
+    # created_at deliberately out of pr-number order: FIFO must be 903, 902, 901.
+    sibling_details = {
+        901: _mq_sibling_pr_detail(901, "2026-06-06T00:03:00Z"),
+        902: _mq_sibling_pr_detail(902, "2026-06-06T00:02:00Z"),
+        903: _mq_sibling_pr_detail(903, "2026-06-06T00:01:00Z"),
+        904: _mq_sibling_pr_detail(904, "2026-06-06T00:00:00Z", state="closed"),
+    }
+    mock_update = _patch_merge_queue_merged_mocks(mocker, sibling_details)
+
+    project, _parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch=_MQ_TARGET
+    )
+    siblings = {
+        pr: await _make_mq_sibling_parent(rollup_db, project, pr)
+        for pr in (901, 902, 903, 904)
+    }
+
+    await _check_and_trigger_rollup(child, rollup_db)
+
+    updated_pr_order = [c.args[3] for c in mock_update.await_args_list]
+    assert updated_pr_order == [903, 902, 901], (
+        f"siblings must be updated FIFO by PR created_at (closed #904 skipped), "
+        f"got {updated_pr_order}"
+    )
+    # Each updated sibling carries the in-flight marker + a forced PR refetch.
+    from app.rollup_state import (
+        _MERGE_QUEUE_UPDATE_AT_KEY,
+        _merge_queue_update_in_flight,
+    )
+
+    for pr in (901, 902, 903):
+        await rollup_db.refresh(siblings[pr])
+        ctx = siblings[pr].context or {}
+        assert _merge_queue_update_in_flight(ctx), (
+            f"sibling PR #{pr} must carry a fresh {_MERGE_QUEUE_UPDATE_AT_KEY} marker"
+        )
+        rl = ctx.get("review_loop") or {}
+        assert rl.get("polls_since_pr_fetch") == 999
+        assert rl.get("head_sha") == ""
+        assert "merge queue" in (siblings[pr].latest_status_message or "").lower()
+    await rollup_db.refresh(siblings[904])
+    assert _MERGE_QUEUE_UPDATE_AT_KEY not in (siblings[904].context or {}), (
+        "closed sibling PR must not be stamped"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rollup_merge_queue_disabled_skips_sibling_updates(rollup_db, mocker):
+    """rollup_merge_queue_enabled=False keeps the merge train fully inert —
+    siblings recover via the lazy CI-poll path as before."""
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"rollup_merge_queue_enabled": False},
+    )
+    sibling_details = {901: _mq_sibling_pr_detail(901, "2026-06-06T00:01:00Z")}
+    mock_update = _patch_merge_queue_merged_mocks(mocker, sibling_details)
+
+    project, _parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch=_MQ_TARGET
+    )
+    sibling = await _make_mq_sibling_parent(rollup_db, project, 901)
+
+    await _check_and_trigger_rollup(child, rollup_db)
+
+    assert mock_update.await_count == 0, "flag off → no proactive update_branch"
+    await rollup_db.refresh(sibling)
+    from app.rollup_state import _MERGE_QUEUE_UPDATE_AT_KEY
+
+    assert _MERGE_QUEUE_UPDATE_AT_KEY not in (sibling.context or {})
+
+
+@pytest.mark.asyncio
+async def test_rollup_merge_queue_skips_not_behind_sibling(rollup_db, mocker):
+    """A sibling whose head already contains the base tip (pr_is_not_behind=True)
+    must not be update-branched — no CI churn on an already-current PR."""
+    sibling_details = {
+        901: _mq_sibling_pr_detail(901, "2026-06-06T00:01:00Z"),
+        902: _mq_sibling_pr_detail(902, "2026-06-06T00:02:00Z"),
+    }
+    mock_update = _patch_merge_queue_merged_mocks(mocker, sibling_details)
+
+    # PR 901's head already contains the base tip; 902 is genuinely behind.
+    async def _ancestor(_token, _owner, _repo, _base_tip, head_sha, **_kw):
+        return head_sha == "sib-head-901"
+
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(side_effect=_ancestor))
+
+    project, _parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch=_MQ_TARGET
+    )
+    for pr in (901, 902):
+        await _make_mq_sibling_parent(rollup_db, project, pr)
+
+    await _check_and_trigger_rollup(child, rollup_db)
+
+    updated_pr_order = [c.args[3] for c in mock_update.await_args_list]
+    assert updated_pr_order == [902], (
+        f"only the genuinely-behind sibling gets update_branch, got {updated_pr_order}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rollup_dirty_within_merge_queue_window_defers_fix_spawn(
+    rollup_db, mocker
+):
+    """Double-fire guard: a 'dirty' observation made while a merge-queue
+    update-branch is fresh (<5 min) must defer the conflict-fix spawn — the
+    dirty read is likely GitHub's stale mergeable cache lagging the queue's
+    own merge commit."""
+    from app.rollup_state import _MERGE_QUEUE_UPDATE_AT_KEY
+    from app.time_utils import _utcnow
+
+    _patch_common_rollup_mocks(mocker)
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "additions": 5,
+            "deletions": 5,
+            "state": "open",
+            "merged": False,
+            "mergeable_state": "dirty",
+        },
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "ok", "report": ""},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": False, "message": "real conflict"},
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new=AsyncMock(return_value=(MagicMock(id="fix-1"), None)),
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch=_MQ_TARGET
+    )
+    parent.context = {
+        **(parent.context or {}),
+        _MERGE_QUEUE_UPDATE_AT_KEY: _utcnow().isoformat(),
+    }
+    rollup_db.add(parent)
+    await rollup_db.commit()
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+
+    assert mock_spawn.await_count == 0, (
+        "conflict-fix must NOT spawn while a merge-queue update is in flight"
+    )
+    assert parent.status == TaskStatus.EVALUATING
+    msg = (parent.latest_status_message or "").lower()
+    assert "deferring" in msg and "merge-queue" in msg
+
+
+@pytest.mark.asyncio
+async def test_rollup_dirty_with_stale_merge_queue_marker_spawns_fix(
+    rollup_db, mocker
+):
+    """Genuine-conflict fallback: once the merge-queue marker is older than the
+    freshness window, a dirty PR takes the agent conflict-fix path unchanged."""
+    from app.rollup_state import _MERGE_QUEUE_UPDATE_AT_KEY
+    from app.time_utils import _utcnow
+
+    _patch_common_rollup_mocks(mocker)
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "additions": 5,
+            "deletions": 5,
+            "state": "open",
+            "merged": False,
+            "mergeable_state": "dirty",
+        },
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "ok", "report": ""},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": False, "message": "real conflict"},
+    )
+    mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new=AsyncMock(return_value=(MagicMock(id="fix-1"), None)),
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch=_MQ_TARGET
+    )
+    parent.context = {
+        **(parent.context or {}),
+        _MERGE_QUEUE_UPDATE_AT_KEY: (_utcnow() - timedelta(minutes=10)).isoformat(),
+    }
+    rollup_db.add(parent)
+    await rollup_db.commit()
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+
+    assert mock_spawn.await_count == 1, (
+        "a genuine dirty conflict (stale marker) must still spawn the fix task"
+    )
 
 
 # ── Strategic Completion Handler ─────────────────────────────────────────────

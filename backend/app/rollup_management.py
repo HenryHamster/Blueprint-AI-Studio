@@ -55,8 +55,11 @@ from app.rollup_pr_verification import (  # noqa: F401 — re-exported for calle
     _verify_pr_merged,
 )
 from app.rollup_state import (  # noqa: F401 — re-exported for legacy callers/tests
+    _MERGE_QUEUE_UPDATE_AT_KEY,
     _ROLLUP_TRANSIENT_CTX_KEYS,
     _clear_rollup_transient_state,
+    _is_rollup_parent_awaiting_merge,
+    _merge_queue_update_in_flight,
 )
 from app.branch_resolution import (
     InvalidProjectBranchConfiguration,
@@ -127,7 +130,7 @@ async def _attempt_alembic_autoreconcile(
         plan = await _plan_rollup_migration_reconciliation(
             gh_token, owner, repo, rollup_pr_number, target_branch
         )
-    except Exception as e:  # noqa: BLE001 — fail-safe: fall back to operator path
+    except Exception as e:
         logger.warning(
             f"[ROLLUP] PR #{rollup_pr_number} alembic auto-reconcile planning "
             f"failed ({type(e).__name__}: {e}); falling back to fix path"
@@ -148,7 +151,7 @@ async def _attempt_alembic_autoreconcile(
             ref=staging_branch,
             project_id=str(parent.project_id),
         )
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning(
             f"[ROLLUP] PR #{rollup_pr_number} alembic auto-reconcile could not "
             f"fetch main.py ({type(e).__name__}: {e}); falling back to fix path"
@@ -188,7 +191,7 @@ async def _attempt_alembic_autoreconcile(
             ),
             project_id=str(parent.project_id),
         )
-    except Exception as e:  # noqa: BLE001 — push failed: fall back to fix path
+    except Exception as e:
         logger.warning(
             f"[ROLLUP] PR #{rollup_pr_number} alembic auto-reconcile push failed "
             f"({type(e).__name__}: {e}); falling back to fix path"
@@ -538,6 +541,246 @@ def _build_rollup_pr_body(
     lines.append("---")
     lines.append("*Automated by Blueprint Pipeline*")
     return "\n".join(lines)
+
+
+# Upper bound on sibling rollup PRs nudged per merge. Each nudge costs a PR
+# fetch + (usually) an update-branch round-trip, all serial inside the rollup
+# post-merge handler; observed queue depth is ~8, so 20 is generous headroom
+# without letting a pathological backlog stall the handler.
+_MERGE_QUEUE_MAX_SIBLINGS = 20
+
+
+async def _nudge_sibling_rollup_prs(
+    merged_parent: Task,
+    session: AsyncSession,
+    gh_token: str,
+    owner: str,
+    repo: str,
+    target_branch: str,
+    merged_pr_number: int | None = None,
+) -> None:
+    """Rollup merge train: proactively update-branch sibling rollup PRs.
+
+    When N rollup PRs are queued against the same integration branch, each
+    merge staleness-bumps the rest — GitHub flips them to ``behind`` and the
+    LAZY recovery (CI polling / next rollup sweep) takes minutes to notice,
+    while a stale ``dirty`` read burns a 20-50min agent conflict-fix cycle.
+    This runs in the rollup post-merge handler: it finds the project's other
+    rollup parents (EVALUATING/BLOCKED with a ``rollup_pr_number``), orders
+    their PRs FIFO by PR ``created_at``, and calls the existing
+    ``update_branch_with_sha_retry`` on each behind sibling. Merging base INTO
+    the branch preserves review state (``review_approved`` was on the code;
+    CI revalidates the combination on the new merge commit).
+
+    Each successful update stamps ``_merge_queue_update_at`` on the sibling
+    parent's context so the conflict-fix spawners defer a dirty observation
+    while the update is fresh (<5 min) — the queue and the agent path never
+    double-fire. Failures are logged and left to the lazy path unchanged.
+
+    Best-effort by design: gated on runtime_config ``rollup_merge_queue_enabled``
+    (default True); any per-sibling error skips that sibling, never the train.
+    """
+    if not _runtime_config.get("rollup_merge_queue_enabled", True):
+        return
+    from app.github import (
+        get_branch_sha,
+        get_pull_request,
+        pr_is_not_behind_for,
+        update_branch_with_sha_retry,
+    )
+    from app.time_utils import _utcnow
+
+    project_id_str = str(merged_parent.project_id)
+
+    # Sibling rollup parents: same project, not this parent, still in flight.
+    # ``rollup_pr_number`` presence is checked dialect-aware (GIN ``?`` on
+    # Postgres, json_extract on SQLite) — mirrors the stale-window heuristic.
+    if resolve_dialect_name(session) == "postgresql":
+        _rollup_pr_present = Task.context.has_key("rollup_pr_number")
+    else:
+        _rollup_pr_present = _func.json_extract(
+            Task.context, "$.rollup_pr_number"
+        ).isnot(None)
+    sibling_tasks = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == merged_parent.project_id,
+                    Task.id != merged_parent.id,
+                    Task.status.in_(
+                        [TaskStatus.EVALUATING, TaskStatus.BLOCKED]
+                    ),
+                    _rollup_pr_present,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # Collect open sibling rollup PRs against the same base, FIFO by created_at.
+    # Snapshot (pr_number, task_id) scalars up front — the update loop below
+    # commits/rolls back per sibling, and a rollback expires loaded ORM
+    # instances (stale-batch trap); the locked re-fetch works from the id.
+    candidates: list[tuple[str, int, object, dict]] = []
+    seen_pr_numbers: set[int] = set()
+    for sibling in sibling_tasks:
+        ctx = sibling.context or {}
+        # Child review/fix tasks spawned FOR a rollup PR also carry
+        # rollup_pr_number — only true rollup parents awaiting merge qualify.
+        if not _is_rollup_parent_awaiting_merge(ctx):
+            continue
+        try:
+            pr_number = int(ctx.get("rollup_pr_number"))
+        except (TypeError, ValueError):
+            continue
+        if pr_number in seen_pr_numbers:
+            continue
+        if merged_pr_number is not None and pr_number == merged_pr_number:
+            continue
+        seen_pr_numbers.add(pr_number)
+        if len(candidates) >= _MERGE_QUEUE_MAX_SIBLINGS:
+            logger.info(
+                f"[MERGE-QUEUE] Sibling cap ({_MERGE_QUEUE_MAX_SIBLINGS}) reached for "
+                f"project {project_id_str} — remaining rollups recover via the lazy path"
+            )
+            break
+        try:
+            pr_detail = await get_pull_request(
+                gh_token, owner, repo, pr_number, project_id=project_id_str
+            )
+        except Exception as fetch_exc:
+            # Best-effort train: a failed fetch falls back to lazy recovery
+            # for that sibling.
+            logger.warning(
+                f"[MERGE-QUEUE] Could not fetch sibling rollup PR #{pr_number}: {fetch_exc}"
+            )
+            continue
+        if (pr_detail.get("state") or "").lower() != "open" or pr_detail.get("merged"):
+            continue
+        base_ref = ((pr_detail.get("base") or {}).get("ref")) or ""
+        if base_ref and target_branch and base_ref != target_branch:
+            # Queued against a different base — our merge didn't bump it.
+            continue
+        candidates.append(
+            (str(pr_detail.get("created_at") or ""), pr_number, sibling.id, pr_detail)
+        )
+    if not candidates:
+        return
+    # FIFO: oldest PR first (ISO-8601 sorts lexicographically; PR number
+    # tiebreaks and covers a missing created_at).
+    candidates.sort(key=lambda c: (c[0], c[1]))
+
+    # Fetch the base tip once — pr_is_not_behind_for would otherwise round-trip
+    # get_branch_sha per sibling. On failure each check falls back internally.
+    base_tip_sha = None
+    try:
+        base_tip_sha = await get_branch_sha(gh_token, owner, repo, target_branch)
+    except Exception as tip_exc:
+        # Tip fetch is an optimization; per-sibling checks degrade gracefully
+        # without it (pr_is_not_behind_for fetches per-call).
+        logger.warning(
+            f"[MERGE-QUEUE] get_branch_sha({target_branch}) failed: {tip_exc}"
+        )
+
+    for _created_at, pr_number, sibling_task_id, pr_detail in candidates:
+        try:
+            not_behind = await pr_is_not_behind_for(
+                gh_token,
+                owner,
+                repo,
+                pr_detail=pr_detail,
+                base_branch=target_branch,
+                base_tip_sha=base_tip_sha,
+                project_id=project_id_str,
+                call_site="rollup_merge_queue",
+            )
+            if not_behind is True:
+                # Head already contains the base tip — nothing to update.
+                continue
+            upd = await update_branch_with_sha_retry(
+                gh_token,
+                owner,
+                repo,
+                pr_number,
+                expected_head_sha=(pr_detail.get("head") or {}).get("sha"),
+                project_id=project_id_str,
+            )
+            if not upd.get("updated"):
+                # not_behind (stale flag) or transient failure — the lazy
+                # behind-recovery path (CI polling / rollup sweep) owns it.
+                logger.info(
+                    f"[MERGE-QUEUE] update_branch skipped/failed for sibling rollup "
+                    f"PR #{pr_number} ({upd.get('message') or 'not behind'}) — lazy path owns it"
+                )
+                continue
+            # Stamp the in-flight marker UNDER a short row lock so the
+            # conflict-fix spawners defer dirty observations inside the
+            # freshness window. skip_locked: if another loop holds the row
+            # (CI polling, heartbeat), skip the stamp — the update itself
+            # already happened; worst case is today's behavior.
+            locked_sibling = (
+                (
+                    await session.execute(
+                        select(Task)
+                        .where(
+                            Task.id == sibling_task_id,
+                            Task.status.in_(
+                                [TaskStatus.EVALUATING, TaskStatus.BLOCKED]
+                            ),
+                        )
+                        .with_for_update(skip_locked=True)
+                        .execution_options(populate_existing=True)
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if locked_sibling is None:
+                await session.rollback()
+                logger.info(
+                    f"[MERGE-QUEUE] Sibling rollup parent for PR #{pr_number} locked "
+                    f"elsewhere — branch updated but marker not stamped"
+                )
+                continue
+            new_ctx = {
+                **(locked_sibling.context or {}),
+                _MERGE_QUEUE_UPDATE_AT_KEY: _utcnow().isoformat(),
+            }
+            # Force the sibling's CI polling loop to refetch the PR promptly —
+            # the update-branch merge commit changed the head SHA, mirroring
+            # the lazy behind path's post-update refresh.
+            review_loop = new_ctx.get("review_loop")
+            if isinstance(review_loop, dict):
+                new_ctx["review_loop"] = {
+                    **review_loop,
+                    "polls_since_pr_fetch": 999,
+                    "head_sha": "",
+                }
+            locked_sibling.context = new_ctx
+            locked_sibling.latest_status_message = (
+                f"Rollup PR #{pr_number} was behind {target_branch} after sibling "
+                f"rollup merge — merge queue updated branch, awaiting fresh CI"
+            )
+            session.add(locked_sibling)
+            await session.commit()
+            logger.info(
+                f"[MERGE-QUEUE] Updated sibling rollup PR #{pr_number} after "
+                f"PR #{merged_pr_number} merged into {target_branch}"
+            )
+        except Exception as sib_exc:
+            # One sibling must never derail the train; its lazy recovery path
+            # is unchanged. Rollback of an already-dead session is best-effort.
+            try:
+                await session.rollback()
+            except Exception as rb_exc:
+                logger.debug(
+                    f"[MERGE-QUEUE] rollback after sibling PR #{pr_number} "
+                    f"failure also failed: {rb_exc}"
+                )
+            logger.warning(
+                f"[MERGE-QUEUE] Failed to nudge sibling rollup PR #{pr_number}: {sib_exc}"
+            )
 
 
 async def _check_and_trigger_rollup(
@@ -2631,6 +2874,27 @@ async def _check_and_trigger_rollup(
                                     "status": TaskStatus.COMPLETED,
                                 },
                             )
+                        # Rollup merge train: this merge just staleness-bumped
+                        # every sibling rollup PR queued against target_branch.
+                        # Proactively update-branch them (FIFO by PR created_at)
+                        # instead of waiting for lazy CI-poll recovery. Best-
+                        # effort — a queue failure never un-merges this rollup.
+                        try:
+                            await _nudge_sibling_rollup_prs(
+                                parent,
+                                session,
+                                gh_token,
+                                owner,
+                                repo,
+                                target_branch,
+                                merged_pr_number=rollup_pr_number,
+                            )
+                        except Exception as _queue_exc:
+                            # Merge train is strictly best-effort post-merge work.
+                            logger.warning(
+                                f"[MERGE-QUEUE] Sibling nudge after rollup PR "
+                                f"#{rollup_pr_number} failed: {_queue_exc}"
+                            )
                         return
                     else:
                         # Merge failed (conflicts) — spawn review/fix cycle instead of giving up
@@ -3106,6 +3370,33 @@ async def _check_and_trigger_rollup(
                                 f"alert@{alert_threshold}/{total_alert_threshold}/{time_alert_minutes}min, "
                                 f"approval@{approval_threshold}/{total_approval_threshold}/{time_approval_minutes}min) "
                                 f"— deferring to next rollup sweep, no fix spawn"
+                            )
+                            return
+                        # Merge-queue double-fire guard: a proactive update-
+                        # branch from the rollup merge train landed on this PR
+                        # moments ago. GitHub's mergeable computation lags the
+                        # new merge commit, so a 'dirty' read inside the
+                        # freshness window is likely stale — defer the fix
+                        # spawn to the next sweep instead of double-firing an
+                        # agent against the queue's in-flight update. A
+                        # GENUINE conflict outlives the window and falls
+                        # through to the unchanged fix path below.
+                        if _ms == "dirty" and _merge_queue_update_in_flight(parent_ctx):
+                            parent.context = {
+                                **parent_ctx,
+                                "rollup_pr_url": rollup_pr_url,
+                                "rollup_pr_number": rollup_pr_number,
+                            }
+                            parent.latest_status_message = (
+                                f"Rollup PR #{rollup_pr_number} reported dirty shortly "
+                                f"after a merge-queue branch update — deferring "
+                                f"conflict-fix spawn to next sweep"
+                            )
+                            session.add(parent)
+                            await session.commit()
+                            logger.info(
+                                f"[ROLLUP] PR #{rollup_pr_number} dirty within the "
+                                f"merge-queue update window — deferring fix spawn"
                             )
                             return
                         # Observability: check if concurrent rollups may explain this conflict

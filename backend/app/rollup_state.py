@@ -5,6 +5,24 @@ line-count guardrail. The transient-keys set and the scrubber that wipes
 them on terminal transitions are pure dict helpers with no other deps.
 """
 
+from datetime import datetime
+
+# Rollup merge queue (merge train): when a sibling rollup merges into the
+# shared base, the post-merge handler proactively update-branches every other
+# queued rollup PR and stamps this ISO-timestamp marker on each updated
+# parent's context. Conflict-fix spawners consult the marker (via
+# ``_merge_queue_update_in_flight``) and defer a dirty-state fix spawn while
+# the update is fresh — GitHub's mergeable computation lags the update-branch
+# merge commit, so a "dirty" read inside this window is likely stale and a fix
+# VM would double-fire against the queue's own in-flight update.
+_MERGE_QUEUE_UPDATE_AT_KEY = "_merge_queue_update_at"
+
+# Freshness window (seconds) for the merge-queue update marker. Within this
+# window a mergeable=False+dirty observation defers the conflict-fix spawn to
+# the next sweep instead of spawning; past it, the normal agent conflict-fix
+# path proceeds unchanged so a genuine conflict is never wedged.
+_MERGE_QUEUE_UPDATE_FRESH_SECONDS = 300
+
 # Ephemeral counters/flags written to parent.context during the rollup's merge
 # phase. They exist to ratchet retry budgets and de-duplicate alerts *within a
 # single EVALUATING → terminal cycle*, not across cycles. Any terminal
@@ -23,6 +41,9 @@ _ROLLUP_TRANSIENT_CTX_KEYS = frozenset(
         "_refetch_failure_count",
         "_behind_update_retries",
         "_rollup_retries",
+        # Merge-queue update marker (see _MERGE_QUEUE_UPDATE_AT_KEY above) —
+        # only meaningful while the rollup PR is in flight; scrub on terminal.
+        _MERGE_QUEUE_UPDATE_AT_KEY,
         # Duplicate-create guard: a per-cycle stake (epoch seconds) that a peer
         # invocation is mid-create of the rollup PR. It must never outlive the
         # cycle — a stale claim would block the next rollup attempt until its
@@ -43,6 +64,39 @@ def _clear_rollup_transient_state(ctx: dict | None) -> dict:
     if not ctx:
         return {}
     return {k: v for k, v in ctx.items() if k not in _ROLLUP_TRANSIENT_CTX_KEYS}
+
+
+def _merge_queue_update_in_flight(ctx: dict | None, now: datetime | None = None) -> bool:
+    """True if a merge-queue update-branch on this parent's rollup PR is fresh.
+
+    Reads the ``_merge_queue_update_at`` ISO timestamp stamped by the rollup
+    merge train (rollup_management._nudge_sibling_rollup_prs) and returns True
+    while it is younger than ``_MERGE_QUEUE_UPDATE_FRESH_SECONDS``. Conflict-fix
+    spawners call this before spawning on mergeable=False+dirty so the queue's
+    proactive update and the agent fix path never double-fire on the same PR.
+
+    A malformed or missing marker reads as "not in flight" — the normal
+    conflict-fix path proceeds, never wedging on bad data.
+    """
+    raw = (ctx or {}).get(_MERGE_QUEUE_UPDATE_AT_KEY)
+    if not raw or not isinstance(raw, str):
+        return False
+    try:
+        stamped = datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return False
+    if stamped.tzinfo is not None:
+        # Stored values are naive UTC (app convention); tolerate an aware
+        # writer by normalizing instead of miscomparing.
+        from datetime import timezone
+
+        stamped = stamped.astimezone(timezone.utc).replace(tzinfo=None)
+    if now is None:
+        from app.time_utils import _utcnow
+
+        now = _utcnow()
+    age_seconds = (now - stamped).total_seconds()
+    return 0 <= age_seconds < _MERGE_QUEUE_UPDATE_FRESH_SECONDS
 
 
 def _is_rollup_parent_awaiting_merge(ctx: dict | None) -> bool:

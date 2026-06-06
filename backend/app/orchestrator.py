@@ -4746,6 +4746,33 @@ async def orchestrator_worker():
                                     f"(deferral {deferred_count}/alert@{alert_threshold}) — continuing CI polling, not spawning fix"
                                 )
                                 continue
+                            # Merge-queue double-fire guard: a proactive
+                            # update-branch from the rollup merge train landed
+                            # on this PR moments ago, and GitHub's mergeable
+                            # computation lags the new merge commit — a 'dirty'
+                            # read inside the freshness window is likely stale.
+                            # Defer the conflict-fix spawn to the next poll so
+                            # the queue and the agent path never double-fire; a
+                            # GENUINE conflict outlives the window and falls
+                            # through to the unchanged fix path below.
+                            if _ms == "dirty":
+                                from app.rollup_state import (
+                                    _merge_queue_update_in_flight,
+                                )
+
+                                if _merge_queue_update_in_flight(ci_task.context):
+                                    ci_task.latest_status_message = (
+                                        f"PR #{ci_pr_number} reported dirty shortly "
+                                        f"after a merge-queue branch update — "
+                                        f"deferring conflict-fix spawn to next poll"
+                                    )
+                                    session.add(ci_task)
+                                    await session.commit()
+                                    logger.info(
+                                        f"[CI] PR #{ci_pr_number} dirty within the "
+                                        f"merge-queue update window — deferring fix spawn"
+                                    )
+                                    continue
                             ci_payload = ci_task.first_payload
                             # Resolve the fix-spawn head branch with a live-PR
                             # fallback so a missing/stale stored branch can't
