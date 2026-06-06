@@ -411,6 +411,52 @@ class TestPriorOutcomeTagging:
         assert "Clean up Z [small] (merged)" in result
         assert "(proposed)" not in result
 
+    def test_merged_but_unverified_not_tagged_merged(self):
+        # prs_merged>0 but verified_prs_merged=0: terminal/settled, but the
+        # merge did not reproduce on HEAD, so it must NOT read as shipped.
+        prior = self._prior_with_proposed(["Unverified W"])
+        history = [
+            {
+                "finding_titles": ["Unverified W"],
+                "tasks_created": 1,
+                "prs_merged": 1,
+                "verified_prs_merged": 0,
+                "failed_task_details": [],
+            }
+        ]
+        result = _build_research_context(
+            prior_context=prior,
+            finding_titles=[],
+            key_finding_descriptions=[],
+            cycle_insights=[],
+            history_entry={},
+            prior_history=history,
+        )
+        assert "Unverified W [small] (proposed)" in result
+        assert "(merged)" not in result
+
+    def test_verified_merge_still_tagged_merged(self):
+        prior = self._prior_with_proposed(["Verified V"])
+        history = [
+            {
+                "finding_titles": ["Verified V"],
+                "tasks_created": 1,
+                "prs_merged": 1,
+                "verified_prs_merged": 1,
+                "failed_task_details": [],
+            }
+        ]
+        result = _build_research_context(
+            prior_context=prior,
+            finding_titles=[],
+            key_finding_descriptions=[],
+            cycle_insights=[],
+            history_entry={},
+            prior_history=history,
+        )
+        assert "Verified V [small] (merged)" in result
+        assert "(proposed)" not in result
+
     def test_no_history_is_noop(self):
         prior = self._prior_with_proposed(["Thing A"])
         result = _build_research_context(

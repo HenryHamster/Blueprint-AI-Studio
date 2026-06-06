@@ -205,6 +205,16 @@ def _apply_prior_outcomes(established: list, prior_history: list) -> list:
             if f.get("title")
         }
         prs_merged = entry.get("prs_merged", 0) or 0
+        # 'settled' tracks whether every created task reached a terminal state
+        # (merged-or-failed) and must keep counting RAW merges — a merged-but-
+        # unverified task is still terminal and accounted-for. The 'merged' TAG,
+        # however, signals shipped work and so requires a VERIFIED merge; a PR
+        # that merged without its claim reproducing on HEAD is not shipped work.
+        # Function-scope import: direction_outcomes imports research_context
+        # lazily, so a module-level import here would be circular.
+        from app.direction_outcomes import verified_merged_count
+
+        verified_merged = verified_merged_count(entry)
         tasks_created = entry.get("tasks_created", 0) or 0
         settled = tasks_created > 0 and (prs_merged + len(failed)) >= tasks_created
         for t in entry.get("finding_titles") or []:
@@ -214,7 +224,7 @@ def _apply_prior_outcomes(established: list, prior_history: list) -> list:
             if tn in failed_map:
                 cat = failed_map[tn] or "unknown"
                 outcomes[tn] = f"failed: {cat}"
-            elif settled and prs_merged > 0:
+            elif settled and verified_merged > 0:
                 outcomes[tn] = "merged"
     if not outcomes:
         return established

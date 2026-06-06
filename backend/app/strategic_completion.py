@@ -1369,8 +1369,15 @@ def record_outcome_progress_snapshot(direction: dict) -> None:
     history = direction.get("research_history") or []
     agg = direction.get("history_aggregate") or {}
     total_cycles = len(history) + (agg.get("total_cycles") or 0)
-    total_merged = sum(e.get("prs_merged", 0) for e in history) + (
-        agg.get("total_prs_merged") or 0
+    # Verified basis: progress is only credited for merges that reproduced on
+    # HEAD. ``verified_merged_count`` falls back to raw ``prs_merged`` for legacy
+    # entries; the aggregate falls back from ``total_verified_prs_merged`` to
+    # ``total_prs_merged`` for legacy folds (same basis as line ~890 and
+    # ``_check_direction_completion``). The reset baseline in
+    # ``_reset_scaffolding_state_on_outcome_change`` MUST use this same basis so
+    # the ``post_merged = total - reset_merged`` delta math stays consistent.
+    total_merged = sum(verified_merged_count(e) for e in history) + agg.get(
+        "total_verified_prs_merged", agg.get("total_prs_merged", 0)
     )
     se_text = ((direction.get("context") or {}).get("success_evidence") or "").encode()
     success_evidence_fp = hashlib.sha256(se_text).hexdigest()[:16]
@@ -1455,8 +1462,10 @@ def _reset_scaffolding_state_on_outcome_change(direction: dict) -> bool:
     history = direction.get("research_history") or []
     agg = direction.get("history_aggregate") or {}
     total_cycles = len(history) + (agg.get("total_cycles") or 0)
-    total_merged = sum(e.get("prs_merged", 0) for e in history) + (
-        agg.get("total_prs_merged") or 0
+    # Verified basis — MUST match ``record_outcome_progress_snapshot`` exactly so
+    # the latch's ``post_merged = total - reset_merged`` delta stays on one basis.
+    total_merged = sum(verified_merged_count(e) for e in history) + agg.get(
+        "total_verified_prs_merged", agg.get("total_prs_merged", 0)
     )
     direction["outcome_progress_reset_at_cycle"] = total_cycles
     direction["outcome_progress_reset_at_merged"] = total_merged
@@ -2293,12 +2302,17 @@ async def _handle_strategic_completion(
                 mapped_dirs = [
                     d for d in directions_list if d.get("system_id") == sys_id
                 ]
+                # Verified basis: only merges that reproduced on HEAD upgrade a
+                # system's status, consistent with the completion detector and the
+                # outcome-progress latch. Legacy entries/folds fall back to raw.
                 total_merged = 0
                 for d in mapped_dirs:
                     for h in d.get("research_history", []):
-                        total_merged += h.get("prs_merged", 0)
+                        total_merged += verified_merged_count(h)
                     agg = d.get("history_aggregate", {})
-                    total_merged += agg.get("total_prs_merged", 0)
+                    total_merged += agg.get(
+                        "total_verified_prs_merged", agg.get("total_prs_merged", 0)
+                    )
                 # Only upgrade status, never downgrade what the agent set
                 agent_status = sys.get("status", "planned")
                 STATUS_RANK = {

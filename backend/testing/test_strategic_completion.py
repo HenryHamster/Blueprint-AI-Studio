@@ -1796,6 +1796,133 @@ class TestRecommendedModeNormalization:
 
 
 @pytest.mark.asyncio
+async def test_system_status_not_upgraded_on_unverified_merges(db_session, mocker):
+    """A system whose mapped directions have raw merges but ZERO verified
+    merges must NOT be auto-upgraded to functional/in_progress — the upgrade
+    is credited only for merges that reproduced on HEAD."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d1",
+                "system_id": "sys1",
+                # 8 raw merges, none verified -> verified total is 0.
+                "research_history": [
+                    {"prs_merged": 5, "verified_prs_merged": 0},
+                    {"prs_merged": 3, "verified_prs_merged": 0},
+                ],
+                "history_aggregate": {
+                    "total_prs_merged": 6,
+                    "total_verified_prs_merged": 0,
+                },
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+
+    logs = json.dumps(
+        {
+            "vision": {
+                "purpose": "test",
+                "revision": 2,
+                "systems": [{"id": "sys1", "status": "planned"}],
+            },
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    sys = next(s for s in project.vision["systems"] if s["id"] == "sys1")
+    # zero verified merges -> NOT promoted to functional even though raw merges
+    # are >= 5. (in_progress still fires from the mapped-direction presence
+    # branch, which is independent of merge counts.)
+    assert sys["status"] != "functional"
+    assert sys["status"] == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_system_status_upgraded_on_verified_merges(db_session, mocker):
+    """Verified merges still upgrade a system to functional exactly as before."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d1",
+                "system_id": "sys1",
+                "research_history": [
+                    {"prs_merged": 5, "verified_prs_merged": 5},
+                    {"prs_merged": 3, "verified_prs_merged": 3},
+                ],
+                "history_aggregate": {},
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+
+    logs = json.dumps(
+        {
+            "vision": {
+                "purpose": "test",
+                "revision": 2,
+                "systems": [{"id": "sys1", "status": "planned"}],
+            },
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    sys = next(s for s in project.vision["systems"] if s["id"] == "sys1")
+    # 8 verified merges >= 5 -> functional.
+    assert sys["status"] == "functional"
+
+
+@pytest.mark.asyncio
 async def test_strategic_completion_persists_recommended_mode_on_create(
     db_session, mocker
 ):
@@ -6978,6 +7105,66 @@ class TestRecordOutcomeProgressSnapshot:
         record_outcome_progress_snapshot(d)
         assert d.get("outcome_progress_ever_met") is True
 
+    def test_snapshot_merged_counts_verified_not_raw(self):
+        # Entries with raw prs_merged but verified_prs_merged=0 must record
+        # ``merged`` on the VERIFIED basis (0), not the raw basis.
+        d = {
+            "research_history": [
+                {"prs_merged": 4, "verified_prs_merged": 0},
+                {"prs_merged": 3, "verified_prs_merged": 1},
+            ],
+            "history_aggregate": {
+                "total_cycles": 0,
+                "total_prs_merged": 5,
+                "total_verified_prs_merged": 2,
+            },
+            "research_context": "",
+        }
+        record_outcome_progress_snapshot(d)
+        # verified history 0 + 1, aggregate verified 2 -> 3 (raw would be 12)
+        assert d["outcome_progress_history"][0]["merged"] == 3
+
+    def test_fully_unverified_direction_does_not_latch_ever_met(self):
+        # All raw merges, none verified -> the cumulative completion heuristic
+        # cannot trip on verified basis, so the stall-exemption latch stays off.
+        history = [
+            {
+                "tasks_created": 3,
+                "tasks_completed": 3,
+                "tasks_failed": 0,
+                "prs_merged": 2,
+                "verified_prs_merged": 0,
+            },
+            {
+                "tasks_created": 3,
+                "tasks_completed": 3,
+                "tasks_failed": 0,
+                "prs_merged": 2,
+                "verified_prs_merged": 0,
+            },
+            {
+                "tasks_created": 1,
+                "tasks_completed": 1,
+                "tasks_failed": 0,
+                "prs_merged": 0,
+                "verified_prs_merged": 0,
+            },
+            {
+                "tasks_created": 1,
+                "tasks_completed": 1,
+                "tasks_failed": 0,
+                "prs_merged": 0,
+                "verified_prs_merged": 0,
+            },
+        ]
+        d = {
+            "research_history": history,
+            "history_aggregate": {},
+            "research_context": "",
+        }
+        record_outcome_progress_snapshot(d)
+        assert d.get("outcome_progress_ever_met") is not True
+
 
 class TestCheckOutcomeScaffolding:
     def test_fires_on_long_running_healthy_no_progress_direction(self):
@@ -8426,6 +8613,27 @@ class TestResetScaffoldingStateOnOutcomeChange:
         # 2 visible history entries + 5 aggregated cycles = 7
         assert d["outcome_progress_reset_at_cycle"] == 7
         # 3 merged in history + 4 aggregated merged = 7
+        assert d["outcome_progress_reset_at_merged"] == 7
+
+    def test_reset_baseline_uses_verified_merges_not_raw(self):
+        # Reset baseline must be stamped on the VERIFIED basis so the latch's
+        # post_merged = total - reset_merged delta math stays consistent with
+        # record_outcome_progress_snapshot.
+        d = {
+            "research_history": [
+                {"prs_merged": 4, "verified_prs_merged": 1},
+                {"prs_merged": 3, "verified_prs_merged": 2},
+            ],
+            "history_aggregate": {
+                "total_cycles": 5,
+                "total_prs_merged": 9,
+                "total_verified_prs_merged": 4,
+            },
+            "outcome_progress_ever_met": True,
+        }
+        _reset_scaffolding_state_on_outcome_change(d)
+        assert d["outcome_progress_reset_at_cycle"] == 7
+        # verified history 1 + 2, aggregate verified 4 -> 7 (raw would be 16)
         assert d["outcome_progress_reset_at_merged"] == 7
 
 
