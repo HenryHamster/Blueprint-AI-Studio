@@ -448,6 +448,37 @@ class TestNormalizeAgentFailureCategory:
         )
         assert classify_failure(task) == PROVISION_FAILURE
 
+    def test_vm_config_missing_routes_to_provision_failure(self):
+        """Agent emits vm_config_missing when the provider CLI died because a
+        boot/retarget-materialized config file is gone from the VM (Claude CLI
+        exits in seconds with "Claude configuration file not found" when
+        ~/.claude.json was destroyed). A VM/infra fault — must route to
+        PROVISION_FAILURE (infra backoff + requeue on a fresh VM), never
+        RATE_LIMIT: the generic-label init-banner-only tail reclassification
+        misread these deaths as usage exhaustion (2026-06-06 incidents, tasks
+        1330d291 / cf28097f)."""
+        msg = (
+            "Fatal error: Claude Code provider config file missing on VM "
+            "(boot/retarget materialization lost) — "
+            "Claude configuration file not found"
+        )
+        task = _task(msg)
+        assert (
+            normalize_agent_failure_category("vm_config_missing", task)
+            == PROVISION_FAILURE
+        )
+
+    def test_vm_config_missing_via_classify_failure_context_fast_path(self):
+        """End-to-end: classify_failure sees vm_config_missing in context and
+        routes to PROVISION_FAILURE without falling through to the text
+        classifier (whose init-banner heuristics produced the usage-exhausted
+        misread this label exists to prevent)."""
+        task = _task(
+            "Fatal error: Claude configuration file not found",
+            {"failure_category": "vm_config_missing"},
+        )
+        assert classify_failure(task) == PROVISION_FAILURE
+
     def test_reassigned_routes_to_reassigned_class(self):
         """Agent self-terminates gracefully on a non-transient heartbeat 4xx
         (reassignment/deauth) or cancel/supersede during startup and posts

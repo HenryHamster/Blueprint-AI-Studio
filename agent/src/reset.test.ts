@@ -1,4 +1,5 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
+import path from 'path';
 
 // ── Module mocks ─────────────────────────────────────────────────────────────
 // fs mock — supports both default-import (`import fs from 'fs'`) and the
@@ -57,7 +58,7 @@ vi.mock('os', () => ({
 }));
 
 // ── Imports (after mocks) ────────────────────────────────────────────────────
-import { resetForNextRole, clearProviderCredentials } from './reset.js';
+import { resetForNextRole, clearStaleProviderCredentials } from './reset.js';
 import {
   registerChildPid,
   killAllChildren,
@@ -271,7 +272,8 @@ describe('resetForNextRole', () => {
 
       const rmPaths = fsPromisesMocks.rm.mock.calls.map((c) => c[0] as string);
       // The ~/.claude SESSION dir wipe (step 3) is still expected...
-      expect(rmPaths).toContain('/home/agent/.claude');
+      // (path.join emits host separators; match both like the sibling tests.)
+      expect(rmPaths.some((p) => /[\\/]home[\\/]agent[\\/]\.claude$/.test(p))).toBe(true);
       // ...but NONE of the account-scoped provider credential paths.
       expect(rmPaths).not.toContain('/etc/agent.env');
       expect(rmPaths).not.toContain('/home/agent/.claude.json');
@@ -492,9 +494,14 @@ describe('resetForNextRole', () => {
   });
 });
 
-// ── clearProviderCredentials ─────────────────────────────────────────────────
-describe('clearProviderCredentials', () => {
+// ── clearStaleProviderCredentials ────────────────────────────────────────────
+describe('clearStaleProviderCredentials', () => {
   let consoleErrorSpy: ConsoleSpy | null = null;
+
+  // path.resolve() on the host running the tests (Windows CI included) maps
+  // '/home/agent/...' to an absolute form with the host's separators; resolve
+  // the expectation the same way so assertions are platform-agnostic.
+  const resolved = (p: string) => path.resolve(p);
 
   beforeEach(() => {
     consoleErrorSpy = installConsoleSpy('error');
@@ -509,25 +516,65 @@ describe('clearProviderCredentials', () => {
     consoleErrorSpy = null;
   });
 
-  it('removes the env file and every provider credential path via fs.promises.rm', async () => {
-    await clearProviderCredentials('/home/agent', '/etc/agent.env');
+  it('removes every provider credential path when the manifest owns none of them', async () => {
+    await clearStaleProviderCredentials([], '/home/agent');
 
     const rmCalls = fsPromisesMocks.rm.mock.calls;
     const rmPaths = rmCalls.map((c) => c[0] as string);
-    expect(rmPaths).toContain('/etc/agent.env');
-    expect(rmPaths).toContain('/home/agent/.anthropic');
-    expect(rmPaths).toContain('/home/agent/.openai');
-    expect(rmPaths).toContain('/home/agent/.gemini');
-    expect(rmPaths).toContain('/home/agent/.claude.json');
+    expect(rmPaths).toContain(resolved('/home/agent/.anthropic'));
+    expect(rmPaths).toContain(resolved('/home/agent/.openai'));
+    expect(rmPaths).toContain(resolved('/home/agent/.gemini'));
+    expect(rmPaths).toContain(resolved('/home/agent/.claude.json'));
     // Every removal must be recursive + force so dirs and missing paths are fine.
     for (const c of rmCalls) {
       expect(c[1]).toEqual(expect.objectContaining({ recursive: true, force: true }));
     }
   });
 
-  it('falls back to `sudo rm -rf` when the agent user lacks permission (root-owned env file)', async () => {
+  it('NEVER removes the systemd env file (materialize rewrote it in place)', async () => {
+    // Regression guard for the 2026-06-06 poisoned-VM window: removing
+    // /etc/agent.env here would recreate the configless gap that
+    // write-new-then-swap exists to close.
+    await clearStaleProviderCredentials([], '/home/agent');
+
+    const rmPaths = fsPromisesMocks.rm.mock.calls.map((c) => c[0] as string);
+    expect(rmPaths.some((p) => p.includes('agent.env'))).toBe(false);
+    const sudoCall = execFileImpl.mock.calls.find((c) => c[0] === 'sudo');
+    expect(sudoCall).toBeUndefined();
+  });
+
+  it('preserves a path the new manifest owns exactly (~/.claude.json on an anthropic re-target)', async () => {
+    await clearStaleProviderCredentials(['/home/agent/.claude.json'], '/home/agent');
+
+    const rmPaths = fsPromisesMocks.rm.mock.calls.map((c) => c[0] as string);
+    expect(rmPaths).not.toContain(resolved('/home/agent/.claude.json'));
+    // The other provider paths are still stale and must go.
+    expect(rmPaths).toContain(resolved('/home/agent/.anthropic'));
+    expect(rmPaths).toContain(resolved('/home/agent/.openai'));
+    expect(rmPaths).toContain(resolved('/home/agent/.gemini'));
+  });
+
+  it('preserves a directory that CONTAINS a manifest-owned file (~/.gemini for settings.json)', async () => {
+    await clearStaleProviderCredentials(['/home/agent/.gemini/settings.json'], '/home/agent');
+
+    const rmPaths = fsPromisesMocks.rm.mock.calls.map((c) => c[0] as string);
+    expect(rmPaths).not.toContain(resolved('/home/agent/.gemini'));
+    // Stale paths from the prior account are still removed.
+    expect(rmPaths).toContain(resolved('/home/agent/.claude.json'));
+    expect(rmPaths).toContain(resolved('/home/agent/.anthropic'));
+    expect(rmPaths).toContain(resolved('/home/agent/.openai'));
+  });
+
+  it('does not preserve on prefix-only matches (.gemini-extra is not .gemini)', async () => {
+    await clearStaleProviderCredentials(['/home/agent/.gemini-extra/settings.json'], '/home/agent');
+
+    const rmPaths = fsPromisesMocks.rm.mock.calls.map((c) => c[0] as string);
+    expect(rmPaths).toContain(resolved('/home/agent/.gemini'));
+  });
+
+  it('falls back to `sudo rm -rf` when the agent user lacks permission', async () => {
     fsPromisesMocks.rm.mockImplementation((p: string) => {
-      if (p === '/etc/agent.env') {
+      if (p === resolved('/home/agent/.claude.json')) {
         const err = new Error('permission denied') as NodeJS.ErrnoException;
         err.code = 'EACCES';
         return Promise.reject(err);
@@ -535,22 +582,16 @@ describe('clearProviderCredentials', () => {
       return Promise.resolve(undefined);
     });
 
-    await clearProviderCredentials('/home/agent', '/etc/agent.env');
+    await clearStaleProviderCredentials([], '/home/agent');
 
     const sudoCall = execFileImpl.mock.calls.find((c) => c[0] === 'sudo');
     expect(sudoCall).toBeDefined();
-    expect(sudoCall?.[1]).toEqual(['rm', '-rf', '/etc/agent.env']);
+    expect(sudoCall?.[1]).toEqual(['rm', '-rf', resolved('/home/agent/.claude.json')]);
   });
 
   it('resolves (no throw) and logs when an unexpected rm error occurs', async () => {
     fsPromisesMocks.rm.mockRejectedValue(new Error('something weird'));
-    await expect(clearProviderCredentials('/home/agent', '/etc/agent.env')).resolves.toBeUndefined();
+    await expect(clearStaleProviderCredentials([], '/home/agent')).resolves.toBeUndefined();
     expect(consoleErrorSpy).toHaveBeenCalled();
-  });
-
-  it('defaults the env path to /etc/agent.env when not provided', async () => {
-    await clearProviderCredentials('/home/agent');
-    const rmPaths = fsPromisesMocks.rm.mock.calls.map((c) => c[0] as string);
-    expect(rmPaths).toContain('/etc/agent.env');
   });
 });

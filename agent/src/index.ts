@@ -13,7 +13,7 @@ import {
   startEventLoopLagMonitor, traceHeartbeat, installExitMarkers, recordFinalState,
 } from './diagnostics.js';
 import { registerChildPid, unregisterChildPid } from './processTracking.js';
-import { resetForNextRole, clearProviderCredentials } from './reset.js';
+import { resetForNextRole, clearStaleProviderCredentials } from './reset.js';
 import { isHeartbeatTransient } from './heartbeat-classify.js';
 import {
   type FixLoopEvent,
@@ -54,7 +54,9 @@ import {
 } from './utils/test-runners.js';
 import {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
-  parseLLMCliTranslation, matchesRateLimit, matchesAuthFailure, RateLimitError, AuthFailureError, NoProgressTimeoutError,
+  parseLLMCliTranslation, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing,
+  RateLimitError, AuthFailureError, NoProgressTimeoutError, VmConfigMissingError,
+  missingProviderConfigFiles,
   refreshRuntimeState,
   getProviderRunner, providerSupportsNativeSubagents,
   __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
@@ -65,7 +67,9 @@ import {
 
 export {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
-  parseLLMCliTranslation, matchesRateLimit, matchesAuthFailure, RateLimitError, AuthFailureError, NoProgressTimeoutError,
+  parseLLMCliTranslation, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing,
+  RateLimitError, AuthFailureError, NoProgressTimeoutError, VmConfigMissingError,
+  missingProviderConfigFiles,
   refreshRuntimeState,
   getProviderRunner, providerSupportsNativeSubagents,
   __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
@@ -75,7 +79,7 @@ export type { LLMCliTranslation, ClaudeOutput, RunnerCommand, ValidationCommand,
 export { computeRefreshDelayMs, isBootstrapToken };
 
 // ── Failure categories ───────────────────────────────────────────────────────
-export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'no_progress_timeout' | 'timeout' | 'oauth_rotation_failed' | 'reset_failed' | 'reassigned' | 'external_api';
+export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'no_progress_timeout' | 'timeout' | 'oauth_rotation_failed' | 'reset_failed' | 'reassigned' | 'external_api' | 'vm_config_missing';
 
 // ── Graceful-shutdown signalling (cluster C7) ────────────────────────────────
 // A non-error "shutdown requested" control signal. Thrown from the deep call
@@ -459,18 +463,49 @@ function captureBootCredentialSnapshot(): void {
   activeCredentialStateSource = 'boot';
 }
 
+// Poisoned-VM claim guard (2026-06-06 incidents, tasks 1330d291 / cf28097f):
+// the disk check only applies on a real VM — local dev / unit tests never have
+// /home/agent/.claude.json and must not be doomed for it. The orchestrator's
+// startup script always bakes a real VM_INSTANCE_ID into /etc/agent.env;
+// 'local' is the module-level fallback for dev machines.
+export function missingVmProviderConfigFiles(provider = PROVIDER): string[] {
+  const vmId = process.env.VM_INSTANCE_ID;
+  if (!vmId || vmId === 'local') return [];
+  return missingProviderConfigFiles(provider);
+}
+
+// Refuse to hand a claimed role to a configless VM. Runs AFTER
+// materializeClaimCredentialState has re-written every credential file it
+// knows about (boot snapshot or retarget manifest) — that re-write IS the
+// self-heal; if the required config is still absent afterwards, no source on
+// this VM can recreate it (the poisoned post-retarget state), so the only safe
+// move is to fail the claim with the distinct vm_config_missing category. The
+// orchestrator requeues the task as an infra failure (PROVISION_FAILURE) and
+// cold-provisions instead of letting every claim die in seconds with
+// "Claude configuration file not found".
+function assertVmProviderConfigPresent(context: string): void {
+  const missing = missingVmProviderConfigFiles();
+  if (missing.length === 0) return;
+  const err = new Error(
+    `${context}: vm_config_missing — required provider config absent after re-materialization: ${missing.join(', ')}; refusing to run a role configless`,
+  ) as Error & { failureCategory: FailureCategory };
+  err.failureCategory = 'vm_config_missing';
+  throw err;
+}
+
 function materializeClaimCredentialState(
   secretManifest: unknown,
   context: string,
 ): void {
   if (secretManifest !== undefined) {
     materializeCredentialState(normalizeSecretManifest(secretManifest, context), 'retarget');
-    return;
+  } else {
+    if (bootCredentialSnapshot === null) {
+      throw toFailure(`${context}: boot credential snapshot is unavailable`);
+    }
+    materializeCredentialState(bootCredentialSnapshot, 'boot');
   }
-  if (bootCredentialSnapshot === null) {
-    throw toFailure(`${context}: boot credential snapshot is unavailable`);
-  }
-  materializeCredentialState(bootCredentialSnapshot, 'boot');
+  assertVmProviderConfigPresent(context);
 }
 
 export function _resetCredentialStateForTesting(): void {
@@ -1191,13 +1226,16 @@ export const MATERIALIZE_SCRIPT_PATH = fileURLToPath(
 );
 
 // Injectable side effects of the re-target path, so unit tests can assert the
-// clear → materialize → re-exec sequence without touching sudo / systemd /
-// the real filesystem. Mirrors the __setRunClaudeCodeOverrideForSmoke pattern.
+// materialize → verify → clear-stale → re-exec sequence without touching sudo /
+// systemd / the real filesystem. Mirrors the __setRunClaudeCodeOverrideForSmoke
+// pattern.
 export interface WarmRetargetDeps {
-  /** Wipe the prior account's credential material (env file + cred dirs). */
-  clearCreds: () => Promise<void>;
   /** Run the real materialize helper as root to (re)write envPath + cred files. */
   materialize: (manifest: SecretManifest, envPath: string) => void;
+  /** Post-write check: returns the manifest-owned paths missing from disk. */
+  verifyMaterialized: (manifest: SecretManifest, envPath: string) => string[];
+  /** Remove prior-account credential paths the new manifest does NOT own. */
+  clearStaleCreds: (manifest: SecretManifest) => Promise<void>;
   /** Re-exec the agent process so frozen provider constants are re-read. */
   reexec: () => Promise<never> | Promise<void>;
 }
@@ -1218,6 +1256,25 @@ function defaultMaterialize(manifest: SecretManifest, envPath: string): void {
   } finally {
     try { fs.unlinkSync(manifestPath); } catch { /* ignore — best effort */ }
   }
+}
+
+function defaultVerifyMaterialized(manifest: SecretManifest, envPath: string): string[] {
+  // existsSync (not access checks): the env file is root-owned 0600 and the
+  // agent user can stat-but-not-read it; presence is the contract we verify.
+  const missing: string[] = [];
+  const expected = [envPath, ...(manifest.files ?? []).map(f => f.path)];
+  for (const p of expected) {
+    try {
+      if (!fs.existsSync(p)) missing.push(p);
+    } catch {
+      // A failed stat must not abort an otherwise-successful re-target.
+    }
+  }
+  return missing;
+}
+
+function defaultClearStaleCreds(manifest: SecretManifest): Promise<void> {
+  return clearStaleProviderCredentials((manifest.files ?? []).map(f => f.path));
 }
 
 async function defaultReexec(): Promise<never> {
@@ -1242,28 +1299,44 @@ async function defaultReexec(): Promise<never> {
   return new Promise<never>(() => { /* resolved only by process teardown */ });
 }
 
-let warmRetargetDeps: WarmRetargetDeps = {
-  clearCreds: () => clearProviderCredentials(),
-  materialize: defaultMaterialize,
-  reexec: defaultReexec,
-};
+function defaultWarmRetargetDeps(): WarmRetargetDeps {
+  return {
+    materialize: defaultMaterialize,
+    verifyMaterialized: defaultVerifyMaterialized,
+    clearStaleCreds: defaultClearStaleCreds,
+    reexec: defaultReexec,
+  };
+}
+
+let warmRetargetDeps: WarmRetargetDeps = defaultWarmRetargetDeps();
 
 /** Test-only: override the warm-retarget side effects. */
 export function __setWarmRetargetDepsForTesting(deps: Partial<WarmRetargetDeps> | null): void {
-  warmRetargetDeps = deps
-    ? { clearCreds: () => clearProviderCredentials(), materialize: defaultMaterialize, reexec: defaultReexec, ...deps }
-    : { clearCreds: () => clearProviderCredentials(), materialize: defaultMaterialize, reexec: defaultReexec };
+  warmRetargetDeps = { ...defaultWarmRetargetDeps(), ...(deps ?? {}) };
 }
 
 /**
  * Re-target a warm VM onto the account-divergent claim's provider credentials.
  *
- * 1. Clear the prior account's credential material (no leakage).
- * 2. Re-inject the rotated JWT + task id + warm-handoff/re-exec markers the
+ * 1. Re-inject the rotated JWT + task id + warm-handoff/re-exec markers the
  *    backend dropped/omitted from the manifest, then materialize the new
- *    account's manifest (rewrites /etc/agent.env + provider cred files).
+ *    account's manifest (rewrites /etc/agent.env + provider cred files IN
+ *    PLACE) and verify the files landed on disk.
+ * 2. Clear the prior account's stale credential paths — only the ones the new
+ *    manifest does NOT own (same-path creds were already overwritten in step 1).
  * 3. Controlled re-exec so the frozen provider constants are re-read and the
  *    role resumes on the correct provider.
+ *
+ * Write-new-then-swap ordering (2026-06-06 poisoned-VM incidents): the old
+ * clear-then-write sequence had a configless window — if the process died after
+ * the clear, the VM was left with no /etc/agent.env and no ~/.claude.json,
+ * looked healthy, and every task it claimed died in seconds. Now there is no
+ * instant without a complete config: until materialize finishes, the prior
+ * account's config is intact; afterwards the new account's is. The
+ * no-cross-account-leakage property is preserved because the role only ever
+ * starts AFTER step 2 (a role runs only post-reexec), and a same-provider
+ * re-target's credential files share paths, so step 1's overwrite already
+ * destroyed the prior account's material.
  *
  * In production step 3 never returns (the restart SIGTERMs us). The injectable
  * deps make the sequence assertable in tests.
@@ -1273,10 +1346,7 @@ export async function performWarmRetarget(
   opts: { rotatedJwt: string; taskId: string },
   deps: WarmRetargetDeps = warmRetargetDeps,
 ): Promise<void> {
-  // 1. Clear-then-write ordering: wipe prior creds before materializing new ones.
-  await deps.clearCreds();
-
-  // 2. The backend strips AGENT_SECRET_TOKEN from the manifest (the authoritative
+  // 1. The backend strips AGENT_SECRET_TOKEN from the manifest (the authoritative
   //    rotated JWT rides the response's agent_token), so re-inject it here. TASK_ID
   //    pins the just-claimed role so the re-exec'd process resumes THAT claim
   //    (idempotent /api/agent/claim replay) rather than re-polling. The warm
@@ -1288,8 +1358,26 @@ export async function performWarmRetarget(
   env.BLUEPRINT_REEXEC = '1';
   const manifest: SecretManifest = { ...secretManifest, env };
 
-  // 3. Materialize via the real helper, then re-exec.
+  // Materialize FIRST (write-new-then-swap): the helper overwrites
+  // /etc/agent.env and every new-account credential file in place, so a death
+  // anywhere in this sequence leaves the VM with a complete config — either
+  // still the prior account's (recoverable: the throw below surfaces
+  // reset_failed and the orchestrator cold-provisions) or already the new one.
   deps.materialize(manifest, '/etc/agent.env');
+  const missing = deps.verifyMaterialized(manifest, '/etc/agent.env');
+  if (missing.length > 0) {
+    throw new Error(
+      `warm re-target verification failed — materialized config missing on disk: ${missing.join(', ')}`,
+    );
+  }
+
+  // 2. Now (and only now) remove the prior account's stale credential paths the
+  //    new manifest does not own. Best-effort like the pre-existing clear: the
+  //    role cannot start until reexec, so a logged-and-swallowed rm failure here
+  //    is the same residual exposure the old ordering had.
+  await deps.clearStaleCreds(manifest);
+
+  // 3. Re-exec onto the freshly written /etc/agent.env.
   await deps.reexec();
 }
 
@@ -2434,6 +2522,22 @@ async function validateProviderAuth(runner: ProviderRunner, reportPreClaimFailur
   const missing = runner.missingCredentials();
   if (missing.length > 0) {
     const reason = `missing provider credentials: ${missing.join(', ')}`;
+    log(reason);
+    reportPreClaimFailure(reason);
+    process.exit(1);
+  }
+  // Boot-materialized config-file presence (poisoned-VM guard, 2026-06-06).
+  // On a VM whose ~/.claude.json was destroyed (e.g. a warm re-target that died
+  // mid-sequence under the OLD clear-then-write ordering, then got restarted by
+  // systemd), the env credentials look perfectly healthy but every Claude
+  // invocation dies in seconds with "Claude configuration file not found".
+  // Nothing on the VM can recreate the file pre-claim (the boot manifest is not
+  // retained on disk), so fail HERE — before any claim — with an explained
+  // pre-claim death the orchestrator can tear down, instead of claiming tasks
+  // that are doomed to fail. Gated to real VMs via missingVmProviderConfigFiles.
+  const missingConfig = missingVmProviderConfigFiles(runner.provider);
+  if (missingConfig.length > 0) {
+    const reason = `vm_config_missing: required provider config file(s) absent on disk: ${missingConfig.join(', ')} — boot materialization lost; refusing to claim work configless`;
     log(reason);
     reportPreClaimFailure(reason);
     process.exit(1);

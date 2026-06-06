@@ -232,6 +232,56 @@ export function matchesAuthFailure(text: string, provider: ProviderName = PROVID
   if (AUTH_FAILURE_PATTERNS_GENERIC.some(p => lower.includes(p))) return true;
   return AUTH_FAILURE_PATTERNS[provider].some(p => lower.includes(p));
 }
+
+// VM-config-missing signatures: the provider CLI died because a
+// boot/retarget-materialized config FILE is absent from the VM — not because
+// of anything the account or the code under test did. The canonical case is
+// the Claude CLI's instant death when ~/.claude.json (the onboarding-bypass
+// config written by materialize_manifest.py) has been destroyed: it exits
+// within seconds printing "Claude configuration file not found" and leaves a
+// ~/.claude/backups/.claude.json.backup.<epoch-ms> file behind. Production
+// 2026-06-06 (tasks 1330d291 / cf28097f on VMs dfa09f9f / 312537c4): a warm
+// account-divergent re-target died after clearing credentials but before
+// re-materializing, and every task the poisoned VM claimed died this way while
+// the orchestrator misread the init-banner-only output tail as usage
+// exhaustion. Kept deliberately narrow — this routes to an infra class that
+// bypasses the code-error retry budget, so a loose match would hide real
+// defects.
+const VM_CONFIG_MISSING_PATTERNS: readonly string[] = [
+  'claude configuration file not found',
+];
+
+export function matchesVmConfigMissing(text: string): boolean {
+  const lower = text.toLowerCase();
+  return VM_CONFIG_MISSING_PATTERNS.some(p => lower.includes(p));
+}
+
+// Boot-materialized config files the provider CLI cannot start without.
+// anthropic: ~/.claude.json is the onboarding-bypass file — without it the
+// Claude CLI dies in seconds regardless of valid OAuth/API-key env. Other
+// providers have no CONFIRMED hard file requirement (codex auth rides
+// CODEX_HOME/env; gemini can run on GEMINI_API_KEY alone), so they are left
+// empty rather than risking false VM dooms — extend per provider as
+// requirements are confirmed.
+export function requiredProviderConfigFiles(provider: ProviderName = PROVIDER): string[] {
+  if (provider === 'anthropic') {
+    const home = process.env.HOME || '/home/agent';
+    return [`${home}/.claude.json`];
+  }
+  return [];
+}
+
+/** Required provider config files (see above) that are absent from disk. */
+export function missingProviderConfigFiles(provider: ProviderName = PROVIDER): string[] {
+  return requiredProviderConfigFiles(provider).filter(p => {
+    try {
+      return !fs.existsSync(p);
+    } catch {
+      // A failed stat must not produce a false "missing" doom signal.
+      return false;
+    }
+  });
+}
 export class RateLimitError extends Error {
   constructor(message: string) {
     super(message);
@@ -262,6 +312,24 @@ export class AuthFailureError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'AuthFailureError';
+  }
+}
+
+// Thrown when the provider CLI died because a boot/retarget-materialized config
+// file is missing from the VM (VM_CONFIG_MISSING_PATTERNS matched on a non-zero
+// exit). This is a VM/infra fault — the account is healthy and no code edit can
+// fix it — so it carries its own failureCategory ('vm_config_missing' →
+// PROVISION_FAILURE backend-side: requeue on a fresh VM, no code-error retry
+// burn, no account cooldown). Distinct from the generic 'claude_code_failed' /
+// 'fatal' labels, whose init-banner-only output tail the orchestrator
+// reclassifies as usage exhaustion (RATE_LIMIT) — exactly the misread the
+// 2026-06-06 poisoned-VM incidents produced.
+export class VmConfigMissingError extends Error {
+  readonly failureCategory = 'vm_config_missing' as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'VmConfigMissingError';
   }
 }
 
@@ -1387,6 +1455,14 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
     throw err;
   }
 
+  // Checked before auth-failure/rate-limit: a CLI that died because its
+  // materialized config file is gone is a VM fault, and its sparse output must
+  // not fall through to the generic non-zero-exit path (whose init-banner-only
+  // tail the orchestrator reclassifies as usage exhaustion).
+  if (exitCode !== 0 && matchesVmConfigMissing(combined)) {
+    const snippet = (stderrBuffer || allOutput.slice(-500)).slice(0, 500);
+    throw new VmConfigMissingError(`${runner.displayName} provider config file missing on VM (boot/retarget materialization lost) — ${snippet}`);
+  }
   if (exitCode !== 0 && matchesAuthFailure(combined, runner.provider)) {
     const snippet = (stderrBuffer || allOutput.slice(-500)).slice(0, 500);
     throw new AuthFailureError(`${runner.displayName} authentication failed — ${snippet}`);
