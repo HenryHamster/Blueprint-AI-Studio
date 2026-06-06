@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.broadcast import broadcast_to_project
 from app.depends_on_provenance import remember_structural_depends_on
 from app.models import Project, Task, TaskHistory, TaskStatus
-from app.payload_schemas import validate_internal_payload
+from app.payload_schemas import read_acceptance_evidence, validate_internal_payload
 from app.task_capabilities import PLAN_KNOWLEDGE_SUBTASK_TYPES, PLAN_SUBTASK_TYPES
 from app.shared_state import (
     get_project_integration_branch,
@@ -639,6 +639,22 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         # task_type_models pins only; orchestrator resolves per child
         # from routing otherwise.
         subtask_model = _runtime_config.get("task_type_models", {}).get(subtask_type)
+        # Forward-carry a plan-time acceptance_evidence declaration onto the
+        # child payload so the requirement survives decomposition. Pre-validate
+        # leniently here: an LLM-generated declaration is untrusted, and a
+        # malformed one passed straight into the strict validate_internal_payload
+        # below would raise ValueError, aborting the whole spawn loop and rolling
+        # back EVERY child (recovery re-parses the same plan_output, so it fails
+        # deterministically and the decomposition is lost permanently). Degrade a
+        # malformed declaration to 'no declaration' (key omitted) instead.
+        subtask_acceptance_evidence = subtask_def.get("acceptance_evidence")
+        if subtask_acceptance_evidence is not None and (
+            read_acceptance_evidence(
+                {"acceptance_evidence": subtask_acceptance_evidence}
+            )
+            is None
+        ):
+            subtask_acceptance_evidence = None
         child = Task(
             project_id=task.project_id,
             title=subtask_def.get("title", "Untitled subtask"),
@@ -655,6 +671,11 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                         **({"effort": subtask_effort} if subtask_effort else {}),
                         **({"prompt_suffix": create_suffix} if create_suffix else {}),
                         **({"hotfix": True} if parent_hotfix else {}),
+                        **(
+                            {"acceptance_evidence": subtask_acceptance_evidence}
+                            if subtask_acceptance_evidence
+                            else {}
+                        ),
                     },
                     f"task_completion:plan_subtask:{subtask_type}",
                 )

@@ -553,6 +553,153 @@ async def test_conversion_rate_excludes_degraded_unverified_merge(
     assert entry["conversion_rate"] == round(2 / 3, 3)
 
 
+@pytest.mark.asyncio
+async def test_verified_merged_excludes_declared_unsatisfied_acceptance(
+    db_session: AsyncSession,
+):
+    """A merged PR whose declared acceptance evidence is unsatisfied does not
+    count toward verified_prs_merged (or conversion_rate); satisfied / no-key
+    merges still count, mirroring the per-task outcome layer."""
+    direction_id = "d-accept-conv"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
+    await db_session.flush()
+
+    # Merge with no acceptance verdict (legacy / no declaration) — still counts.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        title="no-acceptance",
+    )
+    # Merge with acceptance declared AND satisfied — counts.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "code_acceptance_verdict": {"satisfied": True},
+        },
+        title="acceptance-satisfied",
+    )
+    # Merge with acceptance declared but NOT satisfied — excluded.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "code_acceptance_verdict": {"satisfied": False},
+        },
+        title="acceptance-unsatisfied",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["prs_merged"] == 3
+    # Only the no-key + satisfied merges are verified; the unsatisfied one drops.
+    assert entry["verified_prs_merged"] == 2
+    assert entry["conversion_rate"] == round(2 / 3, 3)
+
+
+@pytest.mark.asyncio
+async def test_verified_merged_excludes_degraded_and_unsatisfied_acceptance(
+    db_session: AsyncSession,
+):
+    """The acceptance exclusion composes with the degraded-unverified one: a
+    merge that is both degraded and acceptance-unsatisfied drops once, and each
+    exclusion independently removes its row."""
+    direction_id = "d-accept-degraded"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=4)
+    ]
+    await db_session.flush()
+
+    # Clean verified merge — counts.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        title="clean",
+    )
+    # Degraded-unverified merge — excluded by the degraded gate.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "review_loop": {"unverified_merge_reason": "verify_setup_failed"},
+        },
+        title="degraded",
+    )
+    # Acceptance-unsatisfied merge — excluded by the acceptance gate.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "code_acceptance_verdict": {"satisfied": False},
+        },
+        title="acceptance-unsatisfied",
+    )
+    # Both degraded AND acceptance-unsatisfied — still drops exactly once.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "review_loop": {"unverified_merge_reason": "verify_setup_failed"},
+            "code_acceptance_verdict": {"satisfied": False},
+        },
+        title="both",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["prs_merged"] == 4
+    # Only the clean merge survives both gates.
+    assert entry["verified_prs_merged"] == 1
+    assert entry["conversion_rate"] == round(1 / 4, 3)
+
+
 def test_churn_metrics_excludes_degraded_unverified_merges():
     """_compute_churn_metrics counts degraded merges as non-merge finished work."""
     from app.strategic_completion import _compute_churn_metrics

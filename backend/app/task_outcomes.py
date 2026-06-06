@@ -44,10 +44,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
+from app.acceptance_gate import (
+    CODE_ACCEPTANCE_VERDICT_KEY,
+    acceptance_blocks_success,
+)
 from app.ci_resolution import classify_merge_test_verdict
 from app.direction_outcomes import _counts_as_failure
 from app.landed_signal import is_merged_completion, merge_verification_status
 from app.models import Task
+from app.reproduction_scoring import (
+    TARGET_DEFECT_REPRODUCTION_KEY,
+    reproduction_blocks_success,
+)
 from app.task_capabilities import WRITE_TASK_TYPES, get_task_capability
 
 OutcomeStatus = Literal["success", "neutral", "failure"]
@@ -122,6 +130,27 @@ def _evaluate_write(task: Task) -> TaskOutcome:
     if is_merged_completion(task):
         vs = merge_verification_status(task)
         if vs == "unverified_degraded":
+            return TaskOutcome("neutral", KIND_CODE_MERGE)
+        # Reproduce-on-HEAD scoring gate. A fix spawned to resolve a defect carries
+        # that defect's reproduce-on-HEAD verdict (recorded at spawn under
+        # ``target_defect_reproduction``). When a verdict was recorded but the
+        # defect was NOT positively established to reproduce on HEAD (absent or
+        # indeterminate), a bare merge does not prove a real defect was fixed —
+        # score neutral, not success, so it does not count as direction progress.
+        # Tasks with no recorded verdict (feature creates, legacy rows) are
+        # unaffected and keep their merged-success credit.
+        ctx = _task_local_attr(task, "context") or {}
+        if reproduction_blocks_success(ctx.get(TARGET_DEFECT_REPRODUCTION_KEY)):
+            return TaskOutcome("neutral", KIND_CODE_MERGE)
+        # Code-task acceptance gate. A code task that DECLARED acceptance
+        # evidence carries a durable verdict (recorded at merge under
+        # ``code_acceptance_verdict``). When that evidence was declared but is
+        # NOT satisfied — the named test is absent, ran without real
+        # verification, exercised no changed seam, or a declared behavior/artifact
+        # shipped nothing — a bare merge does not prove the claimed behavior, so
+        # score neutral rather than success. Tasks with no recorded verdict
+        # (no declaration, legacy rows) are unaffected and keep merged-success.
+        if acceptance_blocks_success(ctx.get(CODE_ACCEPTANCE_VERDICT_KEY)):
             return TaskOutcome("neutral", KIND_CODE_MERGE)
         return TaskOutcome("success", KIND_CODE_MERGE)
     if _counts_as_failure(task):

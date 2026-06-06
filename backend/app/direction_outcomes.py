@@ -27,6 +27,10 @@ from app.failure_classification import (
     classify_failure as _classify_failure,
     classify_failure_taxonomy as _classify_taxonomy,
 )
+from app.acceptance_gate import (
+    CODE_ACCEPTANCE_VERDICT_KEY,
+    acceptance_blocks_success,
+)
 from app.landed_signal import is_merged_completion, merge_verification_status
 from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
 from app.review_pipeline import _is_test_file
@@ -433,13 +437,25 @@ async def _update_direction_research_outcomes(
         1 for ct in _merged_rows if not is_autonomous_merge(ct)
     )
     # verified_prs_merged: merged completions whose PR was actually verified by
-    # a real test suite (not a fall-open for a degraded environment/setup reason).
-    # Additive alongside prs_merged for back-compat; consumers that need "proven
-    # fix" counts should prefer this field over the raw prs_merged.
+    # a real test suite (not a fall-open for a degraded environment/setup reason)
+    # AND whose declared acceptance evidence, if any, was satisfied. Additive
+    # alongside prs_merged for back-compat; consumers that need "proven fix"
+    # counts should prefer this field over the raw prs_merged.
+    #
+    # The acceptance exclusion mirrors the per-task outcome layer
+    # (``task_outcomes._evaluate_write``): a code task that DECLARED acceptance
+    # evidence carries a durable verdict under ``code_acceptance_verdict``; when
+    # that evidence was declared but NOT satisfied, the merge does not prove the
+    # claimed behavior and must not inflate verified progress. Rows with no
+    # recorded verdict (no declaration, legacy rows) are never excluded — the
+    # predicate is additive and backward-compatible.
     entry["verified_prs_merged"] = sum(
         1
         for ct in _merged_rows
         if merge_verification_status(ct) != "unverified_degraded"
+        and not acceptance_blocks_success(
+            (ct.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+        )
     )
     # operator_action_count: tasks in this cycle with any detectable operator intervention
     entry["operator_action_count"] = sum(

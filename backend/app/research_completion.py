@@ -59,7 +59,7 @@ from app.finding_deduplication import (
     normalize_prerequisite,
     resolve_prerequisite_task,
 )
-from app.payload_schemas import validate_internal_payload
+from app.payload_schemas import read_acceptance_evidence, validate_internal_payload
 from app.playbook_learning import (
     RECENT_SUCCESSES_TASK_TYPES,
     summarize_recent_successes,
@@ -90,7 +90,10 @@ from app.source_ref_validation import (
     _has_validation_backend,
     _parse_path_symbol_refs,
     CITATION_STATE_ABSENT,
+    CITATION_STATE_PRESENT,
+    CITATION_STATE_INDETERMINATE,
 )
+from app.reproduction_scoring import record_target_defect_reproduction
 from app.scope_complexity import _composite_complexity_score
 from app.shared_state import (
     runtime_config as _runtime_config,
@@ -1404,8 +1407,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             ungrounded_symbol_count=len((_ungrounded or {}).get("ungrounded_refs") or []),
             has_backend=_has_backend,
         )
-        if _repro == CITATION_STATE_ABSENT:
-            _f["_reproduce_on_head"] = "absent"
+        # Store the FULL verdict (present/absent/indeterminate), not only the
+        # absent stamp: the spawn gate below keys on ``== "absent"`` (unchanged),
+        # but a spawned fix needs to carry present/indeterminate so its outcome
+        # scoring can refuse bare-merge credit when the defect never reproduced.
+        if _repro in (
+            CITATION_STATE_PRESENT,
+            CITATION_STATE_ABSENT,
+            CITATION_STATE_INDETERMINATE,
+        ):
+            _f["_reproduce_on_head"] = _repro
         # Reconcile the self-reported verification_basis against the validation
         # just computed: a finding cannot honestly claim a verified-against-code
         # tier while its own citations are absent at HEAD. Reuses the broken-ref
@@ -1630,8 +1641,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 ),
                 has_backend=_has_backend,
             )
-            if _re_repro == CITATION_STATE_ABSENT:
-                f["_reproduce_on_head"] = "absent"
+            if _re_repro in (
+                CITATION_STATE_PRESENT,
+                CITATION_STATE_ABSENT,
+                CITATION_STATE_INDETERMINATE,
+            ):
+                f["_reproduce_on_head"] = _re_repro
         if prior_actionable:
             logger.info(
                 f"[RESEARCH] Prepending {len(prior_actionable)} deferred finding(s) from previous cycle "
@@ -3026,6 +3041,22 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "research_completion:finding:compute_experiment",
             )
         else:
+            # Forward-carry the finding's declared acceptance_evidence (the
+            # evidence that will prove its claim true) onto the spawned child
+            # payload — distinct from the backward verification_basis. Pre-validate
+            # leniently: an LLM-generated finding declaration is untrusted, and a
+            # malformed one passed into the strict validate_internal_payload below
+            # would raise ValueError, aborting _handle_research_completion and
+            # losing ALL findings in this completion. Degrade a malformed
+            # declaration to 'no declaration' (key omitted) instead.
+            _finding_acceptance_evidence = finding.get("acceptance_evidence")
+            if _finding_acceptance_evidence is not None and (
+                read_acceptance_evidence(
+                    {"acceptance_evidence": _finding_acceptance_evidence}
+                )
+                is None
+            ):
+                _finding_acceptance_evidence = None
             finding_payload = validate_internal_payload(
                 {
                     "type": task_type,
@@ -3034,6 +3065,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     **({"model": finding_model} if finding_model else {}),
                     **({"effort": finding_effort} if finding_effort else {}),
                     **({"prompt_suffix": _combined_suffix} if _combined_suffix else {}),
+                    **(
+                        {"acceptance_evidence": _finding_acceptance_evidence}
+                        if _finding_acceptance_evidence
+                        else {}
+                    ),
                 },
                 f"research_completion:finding:{task_type}",
             )
@@ -3170,6 +3206,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             requires_approval=needs_approval,
             depends_on=[],
             priority=finding_priority,
+        )
+        # Record the defect's reproduce-on-HEAD verdict on the spawned fix so its
+        # outcome scoring can refuse bare-merge success when the target defect
+        # was never established to reproduce. Absent findings are already gated
+        # out above (not spawned), so this carries present/indeterminate only;
+        # the helper no-ops for a missing/unrecognized verdict, preserving the
+        # legacy bare-merge behavior for findings without a recorded verdict.
+        record_target_defect_reproduction(
+            new_task.context, finding.get("_reproduce_on_head")
         )
         session.add(new_task)
         if (

@@ -30,14 +30,14 @@ from __future__ import annotations
 
 import json
 import logging
-import operator
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.acceptance_gate import CRITERION_OPS, coerce_number, criterion_met
 from app.models import Task, TaskStatus
 from app.task_capabilities import get_task_capability
 
@@ -427,17 +427,10 @@ def _extract_measurement(artifact_text: str | None) -> list | None:
     return parsed if isinstance(parsed, list) else None
 
 
-def _coerce_number(value: Any) -> float | None:
-    """Return ``value`` as a float when it is a real number, else ``None``.
-
-    ``bool`` is a subclass of ``int`` in Python, so it is explicitly rejected —
-    ``True``/``False`` is never a valid cost measurement.
-    """
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    return None
+# Alias the shared fail-closed numeric core (now owned by app.acceptance_gate so
+# the compute success-criterion gate and the code acceptance gate share ONE
+# core). Existing references in this module keep their underscored names.
+_coerce_number = coerce_number
 
 
 def _extract_compute_measurement(
@@ -467,17 +460,10 @@ def _extract_compute_measurement(
     return outcome.strip(), cost
 
 
-# Closed, bounded set of comparison operators a compute success criterion may
-# declare — no general expression framework, just a single numeric/threshold
-# goal. Mirrors the ``Literal`` operator set on ``ComputeSuccessCriterion``.
-_CRITERION_OPS: dict[str, Callable[[float, float], bool]] = {
-    ">=": operator.ge,
-    "<=": operator.le,
-    ">": operator.gt,
-    "<": operator.lt,
-    "==": operator.eq,
-    "!=": operator.ne,
-}
+# The comparison-operator table is the shared fail-closed core, now owned by
+# app.acceptance_gate. Aliased here so the compute success-criterion gate and the
+# code acceptance gate compare numbers identically.
+_CRITERION_OPS = CRITERION_OPS
 
 # The terminal COMPUTE_RESULT artifact (agent/src/handlers/compute-experiment.ts)
 # always carries these numeric, job-level fields. It ALSO now carries any
@@ -541,8 +527,11 @@ def evaluate_compute_success_criterion(
         return None
     metric, op, threshold = criterion
     obj = _extract_json_object(artifact_text) or {}
-    value = _coerce_number(obj.get(metric))
-    met = value is not None and _CRITERION_OPS[op](value, threshold)
+    raw_value = obj.get(metric)
+    value = _coerce_number(raw_value)
+    # Shared fail-closed core: a metric absent/non-numeric in the result is never
+    # "met" (and ``criterion_met`` enforces that identically for the code gate).
+    met = criterion_met(raw_value, op, threshold)
     return {
         "metric": metric,
         "operator": op,

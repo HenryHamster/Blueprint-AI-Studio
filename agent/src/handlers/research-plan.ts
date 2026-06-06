@@ -1325,7 +1325,8 @@ Output EXACTLY one JSON block as the VERY LAST thing in your response:
       "scope": "medium",
       "risk": "low",
       "type": "create",
-      "approval_reason": "Only set when risk=high — brief reason why human approval is needed (omit otherwise)"
+      "approval_reason": "Only set when risk=high — brief reason why human approval is needed (omit otherwise)",
+      "acceptance_evidence": { "kind": "named_test", "test_path": "testing/test_foo.py", "test_id": "test_bar" }
     },
     {
       "title": "feat: second subtask",
@@ -1372,6 +1373,7 @@ Rules:
 - Use effort=high only for complex architectural subtasks. Leave null for simple additive changes — the orchestrator resolves the model from provider routing.
 - scope: "small" for changes under ~100 lines across 1-3 files with clear, narrow scope, "medium" for changes spanning 3-8 files or 100-300 lines, or touching shared infrastructure, "large" for cross-component architectural changes, 300+ lines, or changes to auth/data models/core orchestration
 - The "type" field controls how the subtask is executed: "create" (default) for new features/additions, "refactor" for code quality improvements with no behavior change, "migrate" for database schema changes (Alembic migrations), "qa" for test-only PRs.
+- acceptance_evidence (OPTIONAL, additive — omit when you have nothing substantive to declare): the concrete evidence that will prove THIS subtask's claim true, carried forward to the implementing agent and the evaluation lane. Exactly one of three kinds: (1) {"kind": "named_test", "test_path": "tests/test_x.py", "test_id": "test_fn"} — a test exercising the changed seam (test_path must name a real test file; test_id optional, or embed inline as path::test_fn); (2) {"kind": "observable_behavior", "description": "..."} — a substantive (≥10 char, non-placeholder) description of a behavior that should be exercised; (3) {"kind": "downstream_artifact", "artifact_id": "..."} — an artifact a later task consumes. Declare it only for subtasks where the success condition is concrete; never invent a placeholder/always-true declaration (those are rejected).
 - ATOMIC SCHEMA RULE: a database schema change is ONE subtask, never split across dependent subtasks. If a subtask modifies SQLAlchemy/SQLModel models (backend/app/models.py) or adds/changes tables or columns, that SAME subtask must also generate the Alembic migration and bump the schema revision. Do NOT emit a separate dependent type="migrate" subtask for the migration of a model change in another subtask — splitting the model edit from its migration manufactures dead serialization and ships a model PR with no migration (which reviewers reject). Set the subtask's type="migrate" and include in its related_files the model file(s) (backend/app/models.py), the new Alembic file (backend/alembic/versions/...), and backend/app/main.py for EXPECTED_SCHEMA_REVISION. The migration agent will handle Alembic generation and the revision bump within that single subtask/PR. Only create a separate subtask when the other work is genuinely independent of the schema change — never to carry the migration for it.
 - If any subtask adds new user-facing functionality, consider whether a test subtask is needed. New API endpoints should have corresponding integration tests. New agent handlers should have at least one smoke test. Add a test subtask with depends_on_indices pointing to the implementation subtask.
 - If any subtask changes a public API interface (endpoint signatures, request/response shapes, TypeScript types exported to frontend), include explicit notes in the prompt about backward compatibility requirements.
@@ -1924,6 +1926,7 @@ implementation findings. Add metadata alongside them when relevant.
   "priority": "high|medium|low",
   "actionability_grade": "HIGH|MEDIUM|LOW",
   "verification_basis": "code_verified|path_verified|pattern_inferred|deduced",
+  "acceptance_evidence": null,
   "related_files": ["path/to/file.py"],
   "depends_on_indices": [],
   "prerequisite": null,
@@ -1953,6 +1956,8 @@ implementation findings. Add metadata alongside them when relevant.
 - path_verified: you confirmed the relevant file paths are present/absent via the file tree, but did not read their contents.
 - pattern_inferred: structural inference from naming/architecture patterns, with no direct inspection. This is the default — use it (or omit the field) when uncertain.
 - deduced: derived from adjacent evidence (e.g. another finding, a log line) without directly inspecting the subject.
+
+**acceptance_evidence** (OPTIONAL, additive — default null): the FORWARD evidence that will prove this finding's claim true once implemented, carried onto the spawned task. This is the OPPOSITE direction from verification_basis: verification_basis is BACKWARD ('how well-evidenced is the claim I am making now'), acceptance_evidence is FORWARD ('what concrete observation will demonstrate the fix worked'). Exactly one of three kinds: (1) {"kind": "named_test", "test_path": "tests/test_x.py", "test_id": "test_fn"} — a test exercising the changed seam (test_path must name a real test file; test_id optional, or inline as path::test_fn); (2) {"kind": "observable_behavior", "description": "..."} — a substantive (≥10 char, non-placeholder) description of a behavior to exercise; (3) {"kind": "downstream_artifact", "artifact_id": "..."} — an artifact a later task consumes. Omit (or null) when you cannot name a concrete, non-trivial proof — never invent a placeholder/always-true declaration (those are rejected).
 
 Scope: small (<50 lines, 1 file), medium (2-5 files, 50-200 lines), large (cross-component, 200+ lines).
 Risk: low (cosmetic), medium (logic/endpoints), high (core logic, auth, data models).

@@ -1806,6 +1806,112 @@ class TestReproduceOnHeadGate:
         assert (task.context or {}).get("research_surviving_findings") == 1
 
     @_pytest.mark.asyncio
+    async def test_spawned_child_carries_present_reproduction_verdict(
+        self, db_session, mocker
+    ):
+        """A grounded finding's spawned fix carries target_defect_reproduction=present
+        so its outcome scoring can credit a merge as a verified fix."""
+        from test_autonomous_research import _make_finding
+
+        finding = _make_finding(
+            title="Grounded reproducible finding", direction_id="d-repro-verd01"
+        )
+        finding["sources"] = [{"type": "file", "ref": "backend/app/present.py"}]
+
+        async def _validate(sources, **kw):
+            return list(sources)
+
+        task = await self._run_and_get_child_ctx(
+            db_session,
+            mocker,
+            direction_id="d-repro-verd01",
+            parsed_findings=[finding],
+            validate=_validate,
+        )
+        assert task.get("target_defect_reproduction") == "present"
+
+    @_pytest.mark.asyncio
+    async def test_spawned_child_carries_indeterminate_reproduction_verdict(
+        self, db_session, mocker
+    ):
+        """No backend → spawned fix carries an indeterminate verdict, which blocks
+        bare-merge success scoring downstream."""
+        from test_autonomous_research import _make_finding
+
+        finding = _make_finding(
+            title="Indeterminate verdict finding", direction_id="d-repro-verd02"
+        )
+        finding["sources"] = [{"type": "file", "ref": "backend/app/whatever.py"}]
+
+        async def _validate(sources, **kw):
+            return list(sources)
+
+        ctx = await self._run_and_get_child_ctx(
+            db_session,
+            mocker,
+            direction_id="d-repro-verd02",
+            parsed_findings=[finding],
+            has_backend=False,
+            validate=_validate,
+        )
+        assert ctx.get("target_defect_reproduction") == "indeterminate"
+
+    async def _run_and_get_child_ctx(self, db_session, mocker, **kw):
+        """Run a research completion and return the single spawned child's context."""
+        from test_autonomous_research import _patch_research_externals
+
+        direction_id = kw.pop("direction_id")
+        parsed_findings = kw.pop("parsed_findings")
+        has_backend = kw.pop("has_backend", True)
+        validate = kw.pop("validate", None)
+
+        _project, direction, task = await _grader_project_and_task(
+            db_session, direction_id
+        )
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=parsed_findings,
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+        mocker.patch(
+            "app.research_completion.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        mocker.patch(
+            "app.research_completion.resolve_head_commit",
+            new=AsyncMock(return_value=None),
+        )
+        mocker.patch(
+            "app.research_completion.cited_paths_changed_since",
+            new=AsyncMock(return_value=None),
+        )
+        mocker.patch(
+            "app.research_completion._has_validation_backend",
+            return_value=has_backend,
+        )
+        if validate is not None:
+            mocker.patch("app.research_completion.validate_source_refs", new=validate)
+        mocker.patch(
+            "app.research_completion._summarize_ungrounded_claims_grounded",
+            new=AsyncMock(return_value=None),
+        )
+        await _handle_research_completion(task, "", db_session)
+        child = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        return child.context or {}
+
+    @_pytest.mark.asyncio
     async def test_indeterminate_context_never_rejects(self, db_session, mocker):
         """No validation backend → all-broken citations still pass through."""
         from test_autonomous_research import _make_finding
@@ -4670,4 +4776,119 @@ class TestComputeExperimentSpawn:
         deferred = (task.context or {}).get("deferred_findings", [])
         assert any(
             d.get("deferred_reason") == "compute_contract_invalid" for d in deferred
+        )
+
+
+class TestAcceptanceEvidencePropagation:
+    """A finding's declared forward acceptance_evidence is carried onto the
+    spawned child's payload; absence changes nothing."""
+
+    async def _spawn_child(self, db_session, mocker, *, direction_id, finding):
+        from test_autonomous_research import _patch_research_externals
+
+        _project, _direction, task = await _grader_project_and_task(
+            db_session, direction_id
+        )
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding],
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+        mocker.patch(
+            "app.research_completion.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        for path in (
+            "app.research_completion.resolve_head_commit",
+            "app.research_completion.cited_paths_changed_since",
+            "app.research_completion._summarize_ungrounded_claims_grounded",
+        ):
+            mocker.patch(path, new=AsyncMock(return_value=None))
+        mocker.patch(
+            "app.research_completion._has_validation_backend",
+            return_value=False,
+        )
+        await _handle_research_completion(task, "", db_session)
+        return (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    @_pytest.mark.asyncio
+    async def test_finding_acceptance_evidence_lands_on_child_payload(
+        self, db_session, mocker
+    ):
+        from test_autonomous_research import _make_finding
+
+        finding = _make_finding(
+            title="Finding with forward evidence", direction_id="d-ae-prop01"
+        )
+        finding["acceptance_evidence"] = {
+            "kind": "observable_behavior",
+            "description": "the endpoint returns 409 when promotion is in flight",
+        }
+        child = await self._spawn_child(
+            db_session, mocker, direction_id="d-ae-prop01", finding=finding
+        )
+        assert child is not None
+        evidence = child.first_payload.get("acceptance_evidence")
+        assert evidence is not None, "acceptance_evidence missing from child payload"
+        assert evidence["kind"] == "observable_behavior"
+        assert "promotion is in flight" in evidence["description"]
+
+    @_pytest.mark.asyncio
+    async def test_finding_without_acceptance_evidence_spawns_unchanged(
+        self, db_session, mocker
+    ):
+        from test_autonomous_research import _make_finding
+
+        finding = _make_finding(
+            title="Finding without forward evidence", direction_id="d-ae-prop02"
+        )
+        child = await self._spawn_child(
+            db_session, mocker, direction_id="d-ae-prop02", finding=finding
+        )
+        assert child is not None
+        assert "acceptance_evidence" not in child.first_payload, (
+            "acceptance_evidence must not be synthesized when the finding omits it, "
+            f"got {child.first_payload.get('acceptance_evidence')!r}"
+        )
+
+    @_pytest.mark.asyncio
+    async def test_malformed_finding_acceptance_evidence_degrades_not_aborts(
+        self, db_session, mocker
+    ):
+        """A malformed finding declaration must NOT abort the completion.
+
+        An LLM-generated finding declaration is untrusted. A malformed one
+        (here: observable_behavior with a too-short description) must degrade to
+        'no declaration' (key omitted) and still spawn its child — the strict
+        payload validation must never raise out of the spawn loop, which would
+        lose ALL findings in the completion.
+        """
+        from test_autonomous_research import _make_finding
+
+        finding = _make_finding(
+            title="Finding with malformed evidence", direction_id="d-ae-prop03"
+        )
+        finding["acceptance_evidence"] = {
+            "kind": "observable_behavior",
+            "description": "x",  # < 10 chars → AcceptanceEvidence rejects it
+        }
+        child = await self._spawn_child(
+            db_session, mocker, direction_id="d-ae-prop03", finding=finding
+        )
+        assert child is not None, "finding lost — malformed evidence aborted the batch"
+        assert "acceptance_evidence" not in child.first_payload, (
+            "malformed acceptance_evidence must degrade to omitted, got "
+            f"{child.first_payload.get('acceptance_evidence')!r}"
         )

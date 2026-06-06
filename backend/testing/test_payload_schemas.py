@@ -997,3 +997,148 @@ async def test_system_maturity_unique_constraint_project_system(db_session):
     db_session.add(row2)
     with pytest.raises(IntegrityError):
         await db_session.commit()
+
+
+# ---------------------------------------------------------------------------
+# AcceptanceEvidence — the general plan-time declaration contract
+# ---------------------------------------------------------------------------
+
+# The 7 code/PR-producing task types that carry the optional acceptance_evidence
+# field. Each entry maps the task type to the minimal extra fields needed to
+# satisfy its own required-field schema (so we can build a complete payload).
+_ACCEPTANCE_TYPES: dict[str, dict] = {
+    "create": {"prompt": "do the thing"},
+    "fix": {"prompt": "fix it", "pr_number": 7, "branch": "fix/x"},
+    "refactor": {"prompt": "refactor it"},
+    "qa": {},
+    "migrate": {"prompt": "add a column"},
+    "deps": {},
+    "docs": {},
+}
+
+_VALID_EVIDENCE = {
+    "named_test": {
+        "kind": "named_test",
+        "test_path": "backend/testing/test_agent.py",
+        "test_id": "test_agent_completes",
+    },
+    "named_test_inline_node": {
+        "kind": "named_test",
+        "test_path": "backend/testing/test_agent.py::test_agent_completes",
+    },
+    "observable_behavior": {
+        "kind": "observable_behavior",
+        "description": "the merge gate blocks a self-skipping PR",
+    },
+    "downstream_artifact": {
+        "kind": "downstream_artifact",
+        "artifact_id": "COMPUTE_RESULT:accuracy",
+    },
+}
+
+
+@pytest.mark.parametrize("task_type", sorted(_ACCEPTANCE_TYPES))
+@pytest.mark.parametrize("evidence_key", sorted(_VALID_EVIDENCE))
+def test_acceptance_evidence_valid_kinds_round_trip(task_type, evidence_key):
+    """Each code/PR-producing type accepts a valid declaration of each kind and round-trips it."""
+    evidence = dict(_VALID_EVIDENCE[evidence_key])
+    raw = {"type": task_type, **_ACCEPTANCE_TYPES[task_type], "acceptance_evidence": evidence}
+    result = _valid(raw)
+    assert result["acceptance_evidence"]["kind"] == evidence["kind"]
+    # Optional sub-fields that were None are dropped by exclude_none; declared
+    # ones survive verbatim.
+    for k, v in evidence.items():
+        assert result["acceptance_evidence"][k] == v
+
+
+@pytest.mark.parametrize("task_type", sorted(_ACCEPTANCE_TYPES))
+def test_acceptance_evidence_absent_is_legacy_compatible(task_type):
+    """A payload with no acceptance_evidence validates and omits the field entirely (legacy)."""
+    raw = {"type": task_type, **_ACCEPTANCE_TYPES[task_type]}
+    result = _valid(raw)
+    assert "acceptance_evidence" not in result, (
+        "exclude_none must drop the unset field so legacy payloads round-trip identically"
+    )
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        # named_test pointing at a path that is not a test file
+        {"kind": "named_test", "test_path": "backend/app/payload_schemas.py"},
+        # bare 'test' placeholder path (not a file)
+        {"kind": "named_test", "test_path": "test"},
+        # empty test_path
+        {"kind": "named_test", "test_path": ""},
+        # real test file but a placeholder/always-true test reference
+        {
+            "kind": "named_test",
+            "test_path": "backend/testing/test_agent.py",
+            "test_id": "assert True",
+        },
+        {"kind": "named_test", "test_path": "backend/testing/test_x.py::test_true"},
+        # observable_behavior with an empty / trivial description
+        {"kind": "observable_behavior", "description": ""},
+        {"kind": "observable_behavior", "description": "   "},
+        {"kind": "observable_behavior", "description": "works"},
+        {"kind": "observable_behavior", "description": "assert True"},
+        # downstream_artifact with no / trivial id
+        {"kind": "downstream_artifact", "artifact_id": ""},
+        {"kind": "downstream_artifact", "artifact_id": "placeholder"},
+    ],
+)
+def test_acceptance_evidence_trivial_declarations_rejected(evidence):
+    """Trivial / always-true / non-test declarations fail closed at validation time."""
+    raw = {"type": "create", "prompt": "p", "acceptance_evidence": evidence}
+    _invalid(raw)
+
+
+def test_acceptance_evidence_unknown_kind_rejected():
+    raw = {
+        "type": "create",
+        "prompt": "p",
+        "acceptance_evidence": {"kind": "vibes", "description": "trust me"},
+    }
+    _invalid(raw)
+
+
+def test_acceptance_evidence_extra_field_forbidden():
+    """AcceptanceEvidence is a closed shape (extra='forbid')."""
+    raw = {
+        "type": "create",
+        "prompt": "p",
+        "acceptance_evidence": {
+            "kind": "observable_behavior",
+            "description": "the gate blocks a bad PR",
+            "bogus": "x",
+        },
+    }
+    _invalid(raw)
+
+
+def test_read_acceptance_evidence_accessor():
+    """read_acceptance_evidence parses a well-formed declaration and is fail-soft otherwise."""
+    from app.payload_schemas import AcceptanceEvidence, read_acceptance_evidence
+
+    parsed = read_acceptance_evidence(
+        {"acceptance_evidence": {"kind": "named_test", "test_path": "backend/testing/test_agent.py"}}
+    )
+    assert isinstance(parsed, AcceptanceEvidence)
+    assert parsed.kind == "named_test"
+
+    # Absent / malformed / wrong-type all read as None rather than raising.
+    assert read_acceptance_evidence(None) is None
+    assert read_acceptance_evidence({}) is None
+    assert read_acceptance_evidence({"acceptance_evidence": None}) is None
+    assert read_acceptance_evidence({"acceptance_evidence": "nope"}) is None
+    assert read_acceptance_evidence(
+        {"acceptance_evidence": {"kind": "named_test", "test_path": "backend/app/main.py"}}
+    ) is None
+
+
+def test_acceptance_evidence_round_trips_through_model_instance():
+    """The accessor accepts an already-parsed AcceptanceEvidence instance."""
+    from app.payload_schemas import AcceptanceEvidence, read_acceptance_evidence
+
+    ev = AcceptanceEvidence(kind="downstream_artifact", artifact_id="KNOWLEDGE_DOC:42")
+    assert read_acceptance_evidence({"acceptance_evidence": ev}) is ev

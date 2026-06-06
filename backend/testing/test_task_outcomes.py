@@ -100,6 +100,51 @@ def test_write_completed_no_merge_is_neutral():
     assert is_successful_outcome(task) is False
 
 
+def test_write_merged_present_verdict_is_success():
+    # A fix whose target defect reproduced on HEAD (verdict "present"), then
+    # merged, is a verified success.
+    ctx = {**_merged_context(), "target_defect_reproduction": "present"}
+    task = _make_task("fix", context=ctx)
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_CODE_MERGE)
+    assert is_successful_outcome(task) is True
+
+
+def test_write_merged_indeterminate_verdict_is_neutral():
+    # The target defect was never positively shown to reproduce — a bare merge
+    # does not prove a real fix, so it scores neutral, not success.
+    ctx = {**_merged_context(), "target_defect_reproduction": "indeterminate"}
+    task = _make_task("fix", context=ctx)
+    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_CODE_MERGE)
+    assert is_successful_outcome(task) is False
+
+
+def test_write_merged_absent_verdict_is_neutral():
+    # Defect cited code is absent on HEAD (does not reproduce) — neutral.
+    ctx = {**_merged_context(), "target_defect_reproduction": "absent"}
+    task = _make_task("fix", context=ctx)
+    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_CODE_MERGE)
+
+
+def test_write_merged_no_verdict_key_is_success_legacy():
+    # No recorded verdict (feature create, legacy row) keeps bare-merge success.
+    task = _make_task("create", context=_merged_context())
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_CODE_MERGE)
+
+
+def test_write_unverified_degraded_neutral_regardless_of_verdict():
+    # An unverified-degraded merge stays neutral even when the defect reproduced;
+    # the degraded-environment gate is independent of the reproduction gate.
+    from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+
+    ctx = {
+        **_merged_context(),
+        REVIEW_LOOP_KEY: {UNVERIFIED_MERGE_REASON_KEY: "verify_setup_failed"},
+        "target_defect_reproduction": "present",
+    }
+    task = _make_task("fix", context=ctx)
+    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_CODE_MERGE)
+
+
 def test_write_success_matches_is_merged_completion_exactly():
     from app.landed_signal import is_merged_completion
 
@@ -107,6 +152,40 @@ def test_write_success_matches_is_merged_completion_exactly():
     unmerged = _make_task("refactor", context={})
     assert is_successful_outcome(merged) == is_merged_completion(merged) is True
     assert is_successful_outcome(unmerged) == is_merged_completion(unmerged) is False
+
+
+def test_write_merged_satisfied_acceptance_is_success():
+    # A merged code task whose declared acceptance evidence was SATISFIED keeps
+    # its verified-success credit.
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    ctx = {
+        **_merged_context(),
+        CODE_ACCEPTANCE_VERDICT_KEY: {"satisfied": True, "kind": "named_test"},
+    }
+    task = _make_task("create", context=ctx)
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_CODE_MERGE)
+
+
+def test_write_merged_unsatisfied_acceptance_is_neutral():
+    # Declared acceptance evidence that was NOT satisfied (e.g. the named test is
+    # absent or ran unverified) holds the merge back from a verified success.
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    ctx = {
+        **_merged_context(),
+        CODE_ACCEPTANCE_VERDICT_KEY: {"satisfied": False, "kind": "named_test"},
+    }
+    task = _make_task("create", context=ctx)
+    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_CODE_MERGE)
+    assert is_successful_outcome(task) is False
+
+
+def test_write_merged_no_acceptance_key_is_success_legacy():
+    # No recorded acceptance verdict (no declaration / legacy row) keeps the
+    # bare-merge success exactly as before.
+    task = _make_task("create", context=_merged_context())
+    assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_CODE_MERGE)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

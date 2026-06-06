@@ -895,3 +895,150 @@ async def test_injection_cycle_drops_only_offending_edge_keeps_rest(
     assert any(
         e["successor"] == "B" and e["predecessor"] == "A" for e in dropped
     ), f"Dropped record must name the B→A edge, got {dropped!r}"
+
+
+@pytest.mark.asyncio
+async def test_acceptance_evidence_propagated_to_child_payload(
+    db_session, mocker, _quiet_mocks
+):
+    """A subtask's declared acceptance_evidence lands on its child payload.
+
+    A plan declaring a well-formed named_test acceptance_evidence on a subtask
+    must propagate it verbatim onto the spawned child task's first_payload,
+    validated by the child payload schema's AcceptanceEvidence model.
+    """
+    evidence = {
+        "kind": "named_test",
+        "test_path": "testing/test_foo.py",
+        "test_id": "test_seam_behavior",
+    }
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "feat: implement seam",
+                    "prompt": "implement the seam",
+                    "scope": "small",
+                    "type": "create",
+                    "acceptance_evidence": evidence,
+                }
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, f"Expected 1 child, got {len(children)}"
+    child_evidence = children[0].first_payload.get("acceptance_evidence")
+    assert child_evidence is not None, "acceptance_evidence missing from child payload"
+    assert child_evidence["kind"] == "named_test"
+    assert child_evidence["test_path"] == "testing/test_foo.py"
+    assert child_evidence["test_id"] == "test_seam_behavior"
+
+
+@pytest.mark.asyncio
+async def test_acceptance_evidence_absent_not_synthesized(
+    db_session, mocker, _quiet_mocks
+):
+    """A subtask with no acceptance_evidence spawns a child without the key.
+
+    Absence must change nothing — the key stays out of the child payload; the
+    backend never synthesizes one.
+    """
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "feat: no evidence",
+                    "prompt": "do it",
+                    "scope": "small",
+                    "type": "create",
+                }
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, f"Expected 1 child, got {len(children)}"
+    assert "acceptance_evidence" not in children[0].first_payload, (
+        "acceptance_evidence must not be synthesized when absent, got "
+        f"{children[0].first_payload.get('acceptance_evidence')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_malformed_acceptance_evidence_degrades_not_aborts_spawn(
+    db_session, mocker, _quiet_mocks
+):
+    """A malformed acceptance_evidence must NOT abort the whole decomposition.
+
+    An LLM-generated declaration is untrusted. A malformed one (here: a
+    named_test pointing at a non-test path) must degrade to 'no declaration' on
+    its own child — the key is simply omitted — while every other subtask spawns
+    normally. The pre-validation must never raise out of the spawn loop, which
+    would roll back EVERY child and lose the decomposition permanently.
+    """
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "feat: malformed evidence",
+                    "prompt": "implement A",
+                    "scope": "small",
+                    "type": "create",
+                    # Not a test file → AcceptanceEvidence validation fails.
+                    "acceptance_evidence": {
+                        "kind": "named_test",
+                        "test_path": "app/handler.py",
+                    },
+                },
+                {
+                    "title": "feat: well-formed sibling",
+                    "prompt": "implement B",
+                    "scope": "small",
+                    "type": "create",
+                    "acceptance_evidence": {
+                        "kind": "named_test",
+                        "test_path": "testing/test_bar.py",
+                        "test_id": "test_sibling_behavior",
+                    },
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    # Both children survive — the malformed declaration did not abort the batch.
+    assert len(children) == 2, f"Expected 2 children, got {len(children)}"
+    by_title = {c.title: c for c in children}
+    malformed_child = by_title["feat: malformed evidence"]
+    sibling_child = by_title["feat: well-formed sibling"]
+    # Malformed declaration degraded to 'no declaration' (key omitted).
+    assert "acceptance_evidence" not in malformed_child.first_payload, (
+        "malformed acceptance_evidence must degrade to omitted, got "
+        f"{malformed_child.first_payload.get('acceptance_evidence')!r}"
+    )
+    # The well-formed sibling still carries its declaration verbatim.
+    sibling_evidence = sibling_child.first_payload.get("acceptance_evidence")
+    assert sibling_evidence is not None, "well-formed sibling lost its evidence"
+    assert sibling_evidence["test_path"] == "testing/test_bar.py"

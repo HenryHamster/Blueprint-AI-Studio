@@ -280,6 +280,22 @@ def apply_merged_landed_signal(
         )
     if landed_on_integration:
         mark_landed_on_integration(task)
+        # Augment the merge with the code-task acceptance gate: when the task
+        # DECLARED acceptance evidence, evaluate it now (the changed files and
+        # merge-verification reason are both on the task) and stamp the verdict
+        # durably so success scoring can consume it. Fail-safe: no declaration =>
+        # no key written, scoring unchanged. Lazy import avoids a module cycle
+        # (acceptance_gate imports this module for its constants).
+        try:
+            from app.acceptance_gate import record_code_acceptance_verdict
+
+            record_code_acceptance_verdict(task)
+        except Exception:  # noqa: BLE001 — gating must never undo a real merge
+            logger.warning(
+                "[LANDED] code-acceptance verdict recording failed for task %s",
+                getattr(task, "id", None),
+                exc_info=True,
+            )
     elif non_merge_reason:
         mark_unblocked_non_merge(task, reason=non_merge_reason)
     return landed_on_integration
