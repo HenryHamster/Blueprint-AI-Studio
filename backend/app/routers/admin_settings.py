@@ -89,6 +89,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "auto_archive_interval_minutes",
         "auto_archive_max_terminal_tasks_per_project",
         "auto_archive_terminal_after_days",
+        "auto_debug_enabled",
         "autonomous_direction_cooldown_hours",
         "autonomous_direction_cooldown_minutes",
         "autonomous_periodic_tasks",

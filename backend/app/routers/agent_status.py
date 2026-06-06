@@ -2803,7 +2803,13 @@ async def update_agent_status(
             < _shared_state.USER_DEBUG_MAX_PER_HOUR
         )
         should_auto_debug = (
-            payload.status
+            # Live kill-switch: lets an operator pause the debug->fix spawn
+            # chain (e.g. while a misclassification storm labels infra deaths
+            # CODE_ERROR and every phantom failure amplifies into a debug VM
+            # + a fix VM). Toggle via PATCH /api/admin/settings
+            # {"auto_debug_enabled": false}; default unchanged.
+            bool(_runtime_config.get("auto_debug_enabled", True))
+            and payload.status
             == TaskStatus.FAILED  # Only for failed tasks (failure_class is unset for COMPLETED)
             and failed_task_type != "debug"  # Don't recursively debug debug tasks
             and (task.context or {}).get("debug_task_id")
