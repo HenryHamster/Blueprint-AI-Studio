@@ -90,6 +90,52 @@ def parse_retry_hint_seconds(text: str) -> int | None:
 
 
 @dataclass(frozen=True)
+class UsageSnapshot:
+    """Normalized, provider-agnostic account usage-headroom snapshot.
+
+    Produced by :meth:`LLMProvider.probe_usage`. ADVISORY ONLY — consumed by the
+    pool's proactive headroom gate/ranking, never by correctness paths. The two
+    load-bearing windows are ``five_hour`` and ``seven_day`` (utilization is a
+    percentage in roughly [0, 100]); providers MAY surface extra windows
+    (per-model sub-buckets etc.) additively.
+
+    - ``known=False`` is the sentinel "no clean usage source / probe failed".
+      Selection MUST treat an unknown snapshot exactly as it behaves with no
+      probe at all (not skipped by the gate, ranked neutrally).
+    - ``window_utilizations`` maps window name → float utilization percentage.
+    - ``resets_at`` maps window name → ISO-8601 reset timestamp or None.
+    - ``probed_at`` is the ISO-8601 time the probe ran (None for the unknown
+      sentinel that was synthesized without a probe).
+    """
+
+    known: bool
+    window_utilizations: Mapping[str, float] = field(default_factory=dict)
+    resets_at: Mapping[str, str | None] = field(default_factory=dict)
+    probed_at: str | None = None
+
+    @classmethod
+    def unknown(cls, probed_at: str | None = None) -> UsageSnapshot:
+        return cls(known=False, probed_at=probed_at)
+
+    def load_bearing_utilizations(self) -> tuple[float, ...]:
+        """The five_hour / seven_day utilizations that are present + numeric.
+
+        Empty tuple when the snapshot is unknown or carries neither window —
+        callers treat that as "unknown" for gate/ranking purposes.
+        """
+        if not self.known:
+            return ()
+        out: list[float] = []
+        for window in ("five_hour", "seven_day"):
+            val = self.window_utilizations.get(window)
+            if isinstance(val, bool):
+                continue
+            if isinstance(val, (int, float)):
+                out.append(float(val))
+        return tuple(out)
+
+
+@dataclass(frozen=True)
 class FileMaterial:
     path: str
     content: str
@@ -288,6 +334,33 @@ class LLMProvider(ABC):
         Default implementation returns None (no listing capability).
         """
         return None
+
+    async def probe_usage(
+        self,
+        secret: str | None,
+        auth_mode: LLMAuthMode,
+        provider_metadata: Mapping[str, Any] | None = None,
+    ) -> UsageSnapshot:
+        """Return a normalized account usage-headroom snapshot, or "unknown".
+
+        Used by the pool's PROACTIVE headroom gate/ranking to avoid dispatching
+        long-running work onto a near-exhausted account before it dies mid-run.
+
+        Contract (anti-fragility is mandatory — this is advisory only):
+        - Returns a concrete :class:`UsageSnapshot` (``known=True``) only when a
+          clean usage source returned the load-bearing windows.
+        - Returns ``UsageSnapshot.unknown()`` for ANY of: no usage source for
+          this provider/auth-mode, HTTP/auth/timeout error, JSON schema drift,
+          a missing/null/non-numeric load-bearing field, or an unparseable body.
+          "unknown" makes selection behave exactly as it does with no probe.
+        - NEVER raises. All I/O and parse errors are swallowed → unknown.
+        - Short timeout (~5s). Must never be called under the pool lock — it
+          does network I/O; the pool probes out-of-band and caches the result.
+
+        Default implementation returns unknown (provider exposes no usage
+        source), so a provider/auth-mode with no clean source is unchanged.
+        """
+        return UsageSnapshot.unknown()
 
     def fallback_model(self, model: str | None) -> str | None:
         """Return the logical GA counterpart for a preview/restricted model.

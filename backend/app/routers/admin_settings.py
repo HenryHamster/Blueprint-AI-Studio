@@ -139,6 +139,10 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "task_type_model_preferences",
         "task_type_provider_overrides",
         "task_type_routing",
+        # Proactive account-usage headroom (advisory; ships dark by default).
+        "usage_headroom_gate_enabled",
+        "usage_headroom_long_running_task_types",
+        "usage_headroom_threshold_pct",
         # Side-effect-only key: fires a test webhook, never stored.
         "test_notification",
         "warm_backlog_reuse_enabled",
@@ -333,6 +337,15 @@ async def get_settings(
             "task_type_provider_overrides", {}
         ),
         "health_check_urls": _runtime_config.get("health_check_urls", []),
+        "usage_headroom_gate_enabled": bool(
+            _runtime_config.get("usage_headroom_gate_enabled", False)
+        ),
+        "usage_headroom_threshold_pct": _runtime_config.get(
+            "usage_headroom_threshold_pct", 90
+        ),
+        "usage_headroom_long_running_task_types": _runtime_config.get(
+            "usage_headroom_long_running_task_types", []
+        ),
         "agent_prompt_suffixes": _runtime_config.get("agent_prompt_suffixes", {}),
         "autonomous_periodic_tasks": _runtime_config.get(
             "autonomous_periodic_tasks", {}
@@ -695,6 +708,42 @@ async def _apply_settings(
         _runtime_config["promotion_enabled"] = bool(payload["promotion_enabled"])
     if "smoketest_enabled" in payload:
         _runtime_config["smoketest_enabled"] = bool(payload["smoketest_enabled"])
+    if "usage_headroom_gate_enabled" in payload:
+        val = payload["usage_headroom_gate_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="usage_headroom_gate_enabled must be a boolean",
+            )
+        _runtime_config["usage_headroom_gate_enabled"] = val
+    if "usage_headroom_threshold_pct" in payload:
+        try:
+            val = int(payload["usage_headroom_threshold_pct"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="usage_headroom_threshold_pct must be a number",
+            )
+        # A utilization percentage in [1, 100]. 0 would gate out every probed
+        # account (defeating the advisory intent); >100 is unreachable.
+        if not (1 <= val <= 100):
+            raise HTTPException(
+                status_code=400,
+                detail="usage_headroom_threshold_pct must be between 1 and 100",
+            )
+        _runtime_config["usage_headroom_threshold_pct"] = val
+    if "usage_headroom_long_running_task_types" in payload:
+        raw = payload["usage_headroom_long_running_task_types"]
+        if not isinstance(raw, list) or not all(isinstance(t, str) for t in raw):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "usage_headroom_long_running_task_types must be a list of "
+                    "task-type strings"
+                ),
+            )
+        cleaned_types = sorted({t.strip() for t in raw if t.strip()})
+        _runtime_config["usage_headroom_long_running_task_types"] = cleaned_types
     if "promotion_enabled_by_project" in payload:
         raw = payload["promotion_enabled_by_project"]
         # Per-project live-promotion overrides: a mapping of project-id strings to

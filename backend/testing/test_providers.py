@@ -662,3 +662,215 @@ class TestGeminiLegacyAliases:
         """Anthropic doesn't gate models per key; no fallback map needed."""
         provider = get_provider(LLMProviderName.ANTHROPIC)
         assert provider.fallback_model("claude-opus-4-7") is None
+
+
+# ── Usage-headroom probe (provider-agnostic, advisory) ───────────────────────
+
+
+class _FakeResponse:
+    def __init__(self, json_data=None, raise_status=False, raise_json=False):
+        self._json = json_data
+        self._raise_status = raise_status
+        self._raise_json = raise_json
+
+    def raise_for_status(self):
+        if self._raise_status:
+            raise RuntimeError("HTTP 401 Unauthorized")
+
+    def json(self):
+        if self._raise_json:
+            raise ValueError("not json")
+        return self._json
+
+
+class _FakeAsyncClient:
+    """Minimal async-context-manager stand-in for httpx.AsyncClient."""
+
+    def __init__(self, response=None, raise_on_get=False, **_kw):
+        self._response = response
+        self._raise_on_get = raise_on_get
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url, headers=None, **_kw):
+        if self._raise_on_get:
+            raise RuntimeError("connect timeout")
+        # Expose the request so tests can assert headers were sent.
+        _FakeAsyncClient.last_url = url
+        _FakeAsyncClient.last_headers = headers
+        return self._response
+
+
+def _patch_httpx(monkeypatch, client):
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: client)
+
+
+class TestAnthropicUsageNormalization:
+    def test_valid_body_known_with_load_bearing_windows(self):
+        from app.providers.anthropic import _normalize_anthropic_usage
+
+        snap = _normalize_anthropic_usage(
+            {
+                "five_hour": {"utilization": 28.0, "resets_at": "2026-06-06T00:00:00Z"},
+                "seven_day": {"utilization": 64.0, "resets_at": None},
+                "seven_day_sonnet": {"utilization": None},
+            },
+            "2026-06-06T01:00:00",
+        )
+        assert snap.known is True
+        assert snap.window_utilizations["five_hour"] == 28.0
+        assert snap.window_utilizations["seven_day"] == 64.0
+        assert snap.resets_at["five_hour"] == "2026-06-06T00:00:00Z"
+        assert snap.resets_at["seven_day"] is None
+        # Per-model null window is tolerated and simply not carried.
+        assert "seven_day_sonnet" not in snap.window_utilizations
+        assert snap.probed_at == "2026-06-06T01:00:00"
+        assert set(snap.load_bearing_utilizations()) == {28.0, 64.0}
+
+    def test_extra_numeric_window_carried_additively(self):
+        from app.providers.anthropic import _normalize_anthropic_usage
+
+        snap = _normalize_anthropic_usage(
+            {
+                "five_hour": {"utilization": 1.0},
+                "seven_day": {"utilization": 2.0},
+                "seven_day_opus": {"utilization": 3.0, "resets_at": "x"},
+            },
+            "n",
+        )
+        assert snap.window_utilizations["seven_day_opus"] == 3.0
+        # But extras are never load-bearing.
+        assert set(snap.load_bearing_utilizations()) == {1.0, 2.0}
+
+    def test_missing_load_bearing_window_is_unknown(self):
+        from app.providers.anthropic import _normalize_anthropic_usage
+
+        snap = _normalize_anthropic_usage({"five_hour": {"utilization": 10.0}}, "n")
+        assert snap.known is False
+
+    def test_null_load_bearing_field_is_unknown(self):
+        from app.providers.anthropic import _normalize_anthropic_usage
+
+        snap = _normalize_anthropic_usage(
+            {"five_hour": {"utilization": None}, "seven_day": {"utilization": 5.0}}, "n"
+        )
+        assert snap.known is False
+
+    def test_bool_utilization_is_unknown(self):
+        from app.providers.anthropic import _normalize_anthropic_usage
+
+        snap = _normalize_anthropic_usage(
+            {"five_hour": {"utilization": True}, "seven_day": {"utilization": 5.0}}, "n"
+        )
+        assert snap.known is False
+
+    def test_non_mapping_body_is_unknown(self):
+        from app.providers.anthropic import _normalize_anthropic_usage
+
+        assert _normalize_anthropic_usage("garbage", "n").known is False
+        assert _normalize_anthropic_usage(None, "n").known is False
+        assert _normalize_anthropic_usage([1, 2, 3], "n").known is False
+
+    def test_window_cell_not_mapping_is_unknown(self):
+        from app.providers.anthropic import _normalize_anthropic_usage
+
+        snap = _normalize_anthropic_usage(
+            {"five_hour": 28.0, "seven_day": {"utilization": 5.0}}, "n"
+        )
+        assert snap.known is False
+
+
+class TestAnthropicProbeUsage:
+    @pytest.mark.asyncio
+    async def test_probe_returns_known_snapshot_on_valid_response(self, monkeypatch):
+        provider = get_provider(LLMProviderName.ANTHROPIC)
+        resp = _FakeResponse(
+            json_data={
+                "five_hour": {"utilization": 28.0, "resets_at": "2026-06-06T00:00:00Z"},
+                "seven_day": {"utilization": 64.0, "resets_at": None},
+            }
+        )
+        _patch_httpx(monkeypatch, _FakeAsyncClient(response=resp))
+        snap = await provider.probe_usage("sk-ant-oat01-secret", LLMAuthMode.OAUTH, {})
+        assert snap.known is True
+        assert snap.window_utilizations["five_hour"] == 28.0
+        # Sends the OAuth bearer + beta header.
+        assert _FakeAsyncClient.last_headers["Authorization"] == (
+            "Bearer sk-ant-oat01-secret"
+        )
+        assert _FakeAsyncClient.last_headers["anthropic-beta"] == "oauth-2025-04-20"
+
+    @pytest.mark.asyncio
+    async def test_http_error_resolves_to_unknown(self, monkeypatch):
+        provider = get_provider(LLMProviderName.ANTHROPIC)
+        _patch_httpx(monkeypatch, _FakeAsyncClient(raise_on_get=True))
+        snap = await provider.probe_usage("sk-ant-oat01-secret", LLMAuthMode.OAUTH, {})
+        assert snap.known is False
+
+    @pytest.mark.asyncio
+    async def test_status_error_resolves_to_unknown(self, monkeypatch):
+        provider = get_provider(LLMProviderName.ANTHROPIC)
+        _patch_httpx(
+            monkeypatch, _FakeAsyncClient(response=_FakeResponse(raise_status=True))
+        )
+        snap = await provider.probe_usage("sk-ant-oat01-secret", LLMAuthMode.OAUTH, {})
+        assert snap.known is False
+
+    @pytest.mark.asyncio
+    async def test_garbage_json_resolves_to_unknown(self, monkeypatch):
+        provider = get_provider(LLMProviderName.ANTHROPIC)
+        _patch_httpx(
+            monkeypatch, _FakeAsyncClient(response=_FakeResponse(raise_json=True))
+        )
+        snap = await provider.probe_usage("sk-ant-oat01-secret", LLMAuthMode.OAUTH, {})
+        assert snap.known is False
+
+    @pytest.mark.asyncio
+    async def test_schema_drift_resolves_to_unknown(self, monkeypatch):
+        provider = get_provider(LLMProviderName.ANTHROPIC)
+        _patch_httpx(
+            monkeypatch,
+            _FakeAsyncClient(response=_FakeResponse(json_data={"unexpected": "shape"})),
+        )
+        snap = await provider.probe_usage("sk-ant-oat01-secret", LLMAuthMode.OAUTH, {})
+        assert snap.known is False
+
+    @pytest.mark.asyncio
+    async def test_api_key_auth_mode_is_unknown_without_probe(self, monkeypatch):
+        provider = get_provider(LLMProviderName.ANTHROPIC)
+
+        # Probe must not even attempt I/O for API-key mode.
+        def _boom(**_kw):
+            raise AssertionError("must not call httpx for API_KEY mode")
+
+        import httpx
+
+        monkeypatch.setattr(httpx, "AsyncClient", _boom)
+        snap = await provider.probe_usage("sk-ant-key", LLMAuthMode.API_KEY, {})
+        assert snap.known is False
+
+    @pytest.mark.asyncio
+    async def test_missing_secret_is_unknown(self):
+        provider = get_provider(LLMProviderName.ANTHROPIC)
+        snap = await provider.probe_usage(None, LLMAuthMode.OAUTH, {})
+        assert snap.known is False
+
+
+class TestOtherProvidersProbeUnknown:
+    @pytest.mark.asyncio
+    async def test_openai_probe_is_unknown(self):
+        provider = get_provider(LLMProviderName.OPENAI)
+        snap = await provider.probe_usage("sk-proj-x", LLMAuthMode.API_KEY, {})
+        assert snap.known is False
+
+    @pytest.mark.asyncio
+    async def test_gemini_probe_is_unknown(self):
+        provider = get_provider(LLMProviderName.GEMINI)
+        snap = await provider.probe_usage("key", LLMAuthMode.API_KEY, {})
+        assert snap.known is False

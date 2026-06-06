@@ -650,6 +650,30 @@ runtime_config: Dict = {
     # Global orchestrator safety cap, not per-project. Operator-tunable via
     # runtime_config_json; persisted across restarts.
     "project_broadcast_limit": 1000,
+    # Proactive account-usage headroom (advisory). When enabled, the max_plan
+    # pool consults a per-account, ~60s-cached provider usage-probe snapshot to
+    # (a) skip near-exhausted accounts for long-running task types at claim time
+    # and (b) prefer more remaining headroom in selection ranking. Ships DARK
+    # (default OFF) — when disabled, selection behaves exactly as before and no
+    # usage probing happens. The probe is advisory: any failure/unknown snapshot
+    # makes selection behave as it does today, and the reactive rate-limit
+    # cooldowns remain the backstop. Tunable via /api/admin/settings, no deploy.
+    "usage_headroom_gate_enabled": False,
+    # Utilization percentage (5h OR 7d) at/above which an account is skipped for
+    # long-running task types when the gate is enabled. 0..100.
+    "usage_headroom_threshold_pct": 90,
+    # Task types the claim-time gate applies to (long-running work that burns a
+    # large share of an account's budget if it dies mid-run and restarts). The
+    # headroom RANKING preference applies to all task types when enabled; only
+    # the skip-gate is scoped to this set.
+    "usage_headroom_long_running_task_types": [
+        "create",
+        "refactor",
+        "migrate",
+        "research",
+        "plan",
+        "security_audit",
+    ],
 }
 
 # Promotion-policy key set — the rubric controls that live in runtime_config.
@@ -990,6 +1014,22 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "warm_retarget_enabled",
                         bool(config_json["warm_retarget_enabled"]),
                     )
+                if "usage_headroom_gate_enabled" in config_json:
+                    _set(
+                        "usage_headroom_gate_enabled",
+                        bool(config_json["usage_headroom_gate_enabled"]),
+                    )
+                if "usage_headroom_long_running_task_types" in config_json:
+                    raw_types = config_json["usage_headroom_long_running_task_types"]
+                    if isinstance(raw_types, str):
+                        raw_types = raw_types.split(",")
+                    if isinstance(raw_types, (list, tuple, set)):
+                        _set(
+                            "usage_headroom_long_running_task_types",
+                            sorted(
+                                {str(t).strip() for t in raw_types if str(t).strip()}
+                            ),
+                        )
                 if "warm_pool_enabled" in config_json:
                     _set(
                         "warm_pool_enabled",
@@ -1087,6 +1127,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "reaper_cycle_halt_cooldown_seconds",
                     "reaper_half_open_probe_limit",
                     "reaper_max_orphans_per_cycle",
+                    "usage_headroom_threshold_pct",
                 ):
                     if int_key in config_json:
                         _set(int_key, int(config_json[int_key]))

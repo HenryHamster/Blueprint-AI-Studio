@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Mapping
 
@@ -8,12 +9,75 @@ from app.providers.base import (
     CLITranslation,
     LLMProvider,
     SecretMaterial,
+    UsageSnapshot,
     ValidationResult,
     tier_model_from_runtime_config,
     validate_required_metadata_fields,
 )
 
+logger = logging.getLogger(__name__)
+
 _TOKEN_RE = re.compile(r"sk-ant-[A-Za-z0-9_\-]+")
+
+# Undocumented OAuth usage-headroom endpoint. Returns per-window utilization
+# (five_hour / seven_day load-bearing; per-model sub-buckets may be null). Used
+# by the pool's proactive headroom gate. Probe is ADVISORY — any failure or
+# schema drift resolves to UsageSnapshot.unknown().
+_USAGE_PROBE_URL = "https://api.anthropic.com/api/oauth/usage"
+_USAGE_PROBE_BETA_HEADER = "oauth-2025-04-20"
+_USAGE_PROBE_TIMEOUT_SECONDS = 5.0
+
+
+def _coerce_utilization(raw: Any) -> float | None:
+    """Coerce a utilization field to a float, rejecting bools and non-numerics."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    return None
+
+
+def _normalize_anthropic_usage(data: Any, probed_at: str | None) -> UsageSnapshot:
+    """Normalize the /api/oauth/usage body into a UsageSnapshot.
+
+    Pure + total: tolerates unknown/extra fields (undocumented endpoint) and
+    resolves to ``UsageSnapshot.unknown()`` on ANY structural drift or a
+    missing/null/non-numeric load-bearing field. The five_hour AND seven_day
+    utilization windows are both required; per-model windows (seven_day_sonnet
+    etc.) are carried additively when numeric but never load-bearing.
+    """
+    if not isinstance(data, Mapping):
+        return UsageSnapshot.unknown(probed_at)
+    windows: dict[str, float] = {}
+    resets: dict[str, str | None] = {}
+    for window in ("five_hour", "seven_day"):
+        cell = data.get(window)
+        if not isinstance(cell, Mapping):
+            return UsageSnapshot.unknown(probed_at)
+        util = _coerce_utilization(cell.get("utilization"))
+        if util is None:
+            return UsageSnapshot.unknown(probed_at)
+        windows[window] = util
+        reset_raw = cell.get("resets_at")
+        resets[window] = reset_raw if isinstance(reset_raw, str) and reset_raw else None
+    # Additively carry any other window the endpoint surfaces (e.g. per-model
+    # sub-buckets) when it has a numeric utilization. Non-numeric/null extras
+    # are simply skipped — they are never load-bearing.
+    for key, cell in data.items():
+        if key in windows or not isinstance(cell, Mapping):
+            continue
+        util = _coerce_utilization(cell.get("utilization"))
+        if util is None:
+            continue
+        windows[key] = util
+        reset_raw = cell.get("resets_at")
+        resets[key] = reset_raw if isinstance(reset_raw, str) and reset_raw else None
+    return UsageSnapshot(
+        known=True,
+        window_utilizations=windows,
+        resets_at=resets,
+        probed_at=probed_at,
+    )
 
 _RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "you've hit your limit",
@@ -131,6 +195,52 @@ class AnthropicProvider(LLMProvider):
         if auth_mode == LLMAuthMode.API_KEY:
             return SecretMaterial(env={"ANTHROPIC_API_KEY": secret or ""})
         return SecretMaterial(env={"CLAUDE_CODE_OAUTH_TOKEN": secret or ""})
+
+    async def probe_usage(
+        self,
+        secret: str | None,
+        auth_mode: LLMAuthMode,
+        provider_metadata: Mapping[str, Any] | None = None,
+    ) -> UsageSnapshot:
+        """Probe the OAuth usage-headroom endpoint. Advisory; never raises.
+
+        Only OAuth accounts have this source; API-key auth has no equivalent
+        usage endpoint, so it resolves to unknown. Any HTTP/auth/timeout error
+        or schema drift also resolves to unknown so a probe failure can never
+        block, delay, or fail a claim.
+        """
+        self.ensure_supported_auth_mode(auth_mode)
+        if auth_mode != LLMAuthMode.OAUTH or not secret:
+            return UsageSnapshot.unknown()
+        # Stamp probed_at locally so the snapshot is timestamped even on the
+        # failure path (the cache uses its own wall-clock TTL separately).
+        from app.time_utils import _utcnow
+
+        probed_at = _utcnow().isoformat()
+        try:
+            import httpx
+        except ImportError:
+            logger.warning("[ANTHROPIC] httpx unavailable; skipping usage probe")
+            return UsageSnapshot.unknown(probed_at)
+        try:
+            async with httpx.AsyncClient(
+                timeout=_USAGE_PROBE_TIMEOUT_SECONDS
+            ) as client:
+                resp = await client.get(
+                    _USAGE_PROBE_URL,
+                    headers={
+                        "Authorization": f"Bearer {secret}",
+                        "anthropic-beta": _USAGE_PROBE_BETA_HEADER,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:  # noqa: BLE001 — unknown is the contract
+            logger.info(
+                "[ANTHROPIC] usage probe failed: %s (returning unknown)", exc
+            )
+            return UsageSnapshot.unknown(probed_at)
+        return _normalize_anthropic_usage(data, probed_at)
 
     def settings_schema(self) -> dict[str, Any]:
         # Permission mode is intentionally NOT exposed: anything other than
