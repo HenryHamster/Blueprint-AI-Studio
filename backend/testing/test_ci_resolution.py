@@ -1751,7 +1751,7 @@ def test_unverified_reason_sets_are_disjoint():
 
 
 def test_unverified_reason_sets_union_is_canonical():
-    """Their union must equal the canonical 12-key emitted reason set."""
+    """Their union must equal the canonical emitted reason set."""
     canonical = {
         "no_detectable_test_command",
         "kill_switch_off",
@@ -1765,6 +1765,7 @@ def test_unverified_reason_sets_union_is_canonical():
         "documented_command_could_not_run",
         "documented_command_passed",
         "documented_command_no_artifact",
+        "acceptance_test_not_run",
     }
     union = (
         ci_resolution.BENIGN_UNVERIFIED_REASONS
@@ -1796,3 +1797,175 @@ def test_alert_severity_map_derives_from_shared_sets():
         **{r: AlertSeverity.WARNING for r in ci_resolution.BENIGN_UNVERIFIED_REASONS},
     }
     assert _UNVERIFIED_REASON_SEVERITY == expected
+
+
+# ── Declared acceptance-test gate ─────────────────────────────────────────────
+def test_acceptance_test_block_parses_well_formed():
+    block = ci_resolution.acceptance_test_block(
+        {
+            "acceptanceTest": {
+                "declared": True,
+                "descriptor": "the seam test",
+                "selector": "testing/test_seam.py::test_x",
+                "present": True,
+                "ran": True,
+                "status": "ran",
+            }
+        }
+    )
+    assert block is not None
+    assert block["status"] == "ran"
+    assert block["ran"] is True
+    assert block["selector"] == "testing/test_seam.py::test_x"
+
+
+def test_acceptance_test_block_defensive_none():
+    # Missing / non-dict / not-declared / bad-status all degrade to None.
+    assert ci_resolution.acceptance_test_block(None) is None
+    assert ci_resolution.acceptance_test_block({}) is None
+    assert ci_resolution.acceptance_test_block({"acceptanceTest": "x"}) is None
+    assert (
+        ci_resolution.acceptance_test_block(
+            {"acceptanceTest": {"declared": False, "status": "ran"}}
+        )
+        is None
+    )
+    assert (
+        ci_resolution.acceptance_test_block(
+            {"acceptanceTest": {"declared": True, "status": "weird"}}
+        )
+        is None
+    )
+
+
+def test_acceptance_test_is_clear_failure_predicate():
+    # Absent or skipped (and not ran) is a clear failure; ran / could_not_run /
+    # non-declared / missing are not.
+    assert ci_resolution.acceptance_test_is_clear_failure(
+        {"declared": True, "ran": False, "status": "absent"}
+    )
+    assert ci_resolution.acceptance_test_is_clear_failure(
+        {"declared": True, "ran": False, "status": "skipped"}
+    )
+    assert not ci_resolution.acceptance_test_is_clear_failure(
+        {"declared": True, "ran": True, "status": "ran"}
+    )
+    assert not ci_resolution.acceptance_test_is_clear_failure(
+        {"declared": True, "ran": False, "status": "could_not_run"}
+    )
+    assert not ci_resolution.acceptance_test_is_clear_failure(
+        {"declared": False, "ran": False, "status": "absent"}
+    )
+    assert not ci_resolution.acceptance_test_is_clear_failure(None)
+
+
+def test_classify_verdict_absent_acceptance_test_blocks_passing_suite():
+    # A green unit suite must NOT let a promised-but-missing test merge as proven.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "acceptanceTest": {
+                "declared": True,
+                "descriptor": "the seam test",
+                "selector": "testing/test_seam.py::test_x",
+                "present": False,
+                "ran": False,
+                "status": "absent",
+            },
+        }
+    )
+    assert outcome == "fail"
+    assert "acceptance test" in detail.lower()
+    assert "testing/test_seam.py::test_x" in detail
+    assert "absent" in detail.lower()
+    ci_result = ci_resolution.build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "failure"
+
+
+def test_classify_verdict_skipped_acceptance_test_blocks_passing_suite():
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "acceptanceTest": {
+                "declared": True,
+                "descriptor": "the seam test",
+                "selector": "testing/test_seam.py::test_x",
+                "present": True,
+                "ran": False,
+                "status": "skipped",
+            },
+        }
+    )
+    assert outcome == "fail"
+    assert "skipped" in detail.lower()
+
+
+def test_classify_verdict_ran_acceptance_test_keeps_pass():
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "acceptanceTest": {
+                "declared": True,
+                "descriptor": "the seam test",
+                "selector": "testing/test_seam.py::test_x",
+                "present": True,
+                "ran": True,
+                "status": "ran",
+            },
+        }
+    )
+    assert outcome == "pass"
+    assert detail == ""
+
+
+def test_classify_verdict_could_not_run_acceptance_test_does_not_block():
+    # A check that could not run (no targetable suite) must NOT hard-block; it
+    # degrades to a fall-open instead.
+    outcome, _ = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "acceptanceTest": {
+                "declared": True,
+                "descriptor": "x",
+                "present": False,
+                "ran": False,
+                "status": "could_not_run",
+            },
+        }
+    )
+    assert outcome == "pass"
+
+
+def test_classify_verdict_no_acceptance_block_unchanged():
+    # Absent declaration → today's behavior byte-for-byte.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {"detected": True, "passed": True}
+    )
+    assert outcome == "pass"
+    assert detail == ""
+
+
+def test_fall_open_reason_acceptance_test_could_not_run_key():
+    phrase, key = ci_resolution.classify_unverified_fall_open_reason(
+        {
+            "detected": False,
+            "acceptanceTest": {
+                "declared": True,
+                "descriptor": "x",
+                "selector": "testing/test_seam.py::test_x",
+                "present": False,
+                "ran": False,
+                "status": "could_not_run",
+            },
+        }
+    )
+    assert key == "acceptance_test_not_run"
+    assert "testing/test_seam.py::test_x" in phrase
+
+
+def test_acceptance_test_not_run_is_degraded_reason():
+    assert ci_resolution.is_degraded_unverified_reason("acceptance_test_not_run")

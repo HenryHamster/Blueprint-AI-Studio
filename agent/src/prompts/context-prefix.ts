@@ -729,6 +729,35 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     prefix += scopeLines.join('\n') + '\n';
   }
 
+  // Acceptance Evidence — the proof a planned task declared at plan time that
+  // would show its claim is true. The backend validates the declaration and
+  // stamps it onto this child task's context.acceptance_evidence (closed shape:
+  // kind ∈ {test, behavior, artifact}, descriptor, optional selector). Presence
+  // gated: when absent the prompt is byte-identical to today. This names the
+  // proof to AIM for; it does NOT gate merge.
+  const acceptanceEvidence = taskContext?.acceptance_evidence as Record<string, unknown> | undefined;
+  if (acceptanceEvidence && typeof acceptanceEvidence === 'object') {
+    const kind = strVal(acceptanceEvidence.kind);
+    const descriptor = strVal(acceptanceEvidence.descriptor);
+    if (kind || descriptor) {
+      const aeLines: string[] = ['## Acceptance Evidence'];
+      aeLines.push(
+        'This task declared, at plan time, the proof that would show its claim is true. Aim to produce it — this is the evidence the work should demonstrate, not a merge gate.',
+      );
+      const kindLabels: Record<string, string> = {
+        test: 'test (a named test or selector exercising the seam end-to-end)',
+        behavior: 'behavior (an observable runtime behavior)',
+        artifact: 'artifact (an artifact a downstream task consumes)',
+      };
+      if (kind) aeLines.push(`- Kind: ${kindLabels[kind] ?? kind}`);
+      if (descriptor) aeLines.push(`- Proof: ${descriptor}`);
+      const selector = strVal(acceptanceEvidence.selector);
+      if (selector) aeLines.push(`- Selector: ${selector}`);
+      aeLines.push('');
+      prefix += aeLines.join('\n') + '\n';
+    }
+  }
+
   // Append hidden-signal section surfacing backend-computed quality signals
   // stored in task.context that would otherwise never reach the agent.
   if (taskContext) {

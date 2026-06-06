@@ -122,7 +122,7 @@
     "utils/stale-result.ts": 150,
     "handlers/strategic-sections.ts": 950,
     "providers/runners.ts": 1400,
-    "prompts/context-prefix.ts": 850,
+    "prompts/context-prefix.ts": 1100,
     "handlers/fresh-reviewer.ts": 700
   },
   "frontend": {

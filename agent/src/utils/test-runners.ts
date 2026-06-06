@@ -1903,6 +1903,60 @@ export function buildTargetedPytestRunners(runners: TestRunner[], selectors: str
     .filter((runner): runner is TestRunner => runner !== null);
 }
 
+// ── Declared acceptance-test probe ───────────────────────────────────────────
+// When an implementation task declared, at plan time, a named acceptance test
+// (``acceptance_evidence`` with ``kind="test"``), the no-CI merge gate must
+// confirm that specific test actually EXISTS and RAN in the PR's suite — not
+// just that the suite as a whole passed. These two helpers are the pure,
+// unit-testable core of that probe; the execution + timeout discipline lives in
+// the verify-tests handler.
+
+/** A plan-time acceptance-test declaration as it travels on the task context. */
+export interface DeclaredAcceptanceTest {
+  descriptor: string;
+  selector?: string;
+}
+
+/** Build a TARGETED runner that runs ONLY the declared acceptance test, reusing
+ *  the same pytest-selector targeting the gate uses for CI-failure replay.
+ *
+ *  Conservative: it only knows how to target a pytest-style selector (a
+ *  ``…test_x.py::test_y`` node id, or a ``testing/…`` path) against an
+ *  already-detected pytest runner. When the declaration carries no usable
+ *  selector, or no detected runner accepts pytest selectors, it returns ``null``
+ *  — the caller then degrades to a "could not run the check" fall-open rather
+ *  than fabricating an arbitrary command. ``runners`` is passed in (not detected
+ *  here) so the function stays pure and the caller controls detection. */
+export function buildAcceptanceTestRunner(
+  declared: DeclaredAcceptanceTest,
+  runners: TestRunner[],
+): TestRunner | null {
+  const selector = (declared.selector || declared.descriptor || '').trim();
+  if (!selector) return null;
+  // Only a pytest-shaped selector can be targeted today. A bare prose
+  // descriptor (no ``.py`` node id / ``testing/`` path) is not runnable as a
+  // selector, so we decline rather than guess.
+  const looksPytest = /\.py(::|$)/.test(selector) || /(^|\/)testing\//.test(selector);
+  if (!looksPytest) return null;
+  const targeted = buildTargetedPytestRunners(runners, [selector]);
+  return targeted.length > 0 ? targeted[0] : null;
+}
+
+/** Classify whether the declared acceptance test's targeted run actually
+ *  executed the test. Thin map over :func:`classifyTestExecution`:
+ *    - ``ran``     — the test executed (passed or failed; execution is what we
+ *                    confirm here, the suite gate owns pass/fail);
+ *    - ``skipped`` — the selector matched but every collected test was
+ *                    skipped/deselected/xfail'd (it did NOT actually run);
+ *    - ``absent``  — the selector matched nothing (the promised test is missing
+ *                    / zero-collection / unknown node id). */
+export function classifyAcceptanceTestRun(output: string): 'ran' | 'skipped' | 'absent' {
+  const cls = classifyTestExecution(output);
+  if (cls === 'no_tests') return 'absent';
+  if (cls === 'all_skipped') return 'skipped';
+  return 'ran';
+}
+
 // isDockerRunner is used by callers in index.ts via re-export
 export { isDockerRunner };
 

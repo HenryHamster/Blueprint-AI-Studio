@@ -18,6 +18,7 @@ import {
   isSafeDocumentedCommand, isAllowlistedRunnerShape, discoverDocumentedCommands,
   MAX_DOCUMENTED_COMMANDS,
   discoverNewlyDisabledTests, isTestFilePath, MAX_DISABLED_TEST_MARKERS,
+  buildAcceptanceTestRunner, classifyAcceptanceTestRun,
 } from './test-runners.js';
 import type { BuildConfig, TestRunner } from './test-runners.js';
 
@@ -3220,5 +3221,67 @@ describe('discoverNewlyDisabledTests', () => {
     expect(markers.map(m => m.marker).sort()).toEqual(
       ['#[ignore]', '@Disabled', '@Ignore', 't.Skip()'].sort(),
     );
+  });
+});
+
+describe('buildAcceptanceTestRunner — targeted declared acceptance test', () => {
+  const PYTEST_RUNNER: TestRunner = {
+    cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'],
+    cwd: '/tmp/workspace/backend', label: 'pytest (backend)',
+  };
+
+  it('targets a pytest node-id selector against a detected pytest runner', () => {
+    const runner = buildAcceptanceTestRunner(
+      { descriptor: 'the seam test', selector: 'testing/test_seam.py::test_blocks' },
+      [PYTEST_RUNNER],
+    );
+    expect(runner).not.toBeNull();
+    // The selector is appended to the pytest argv (cwd ends in /backend, so the
+    // testing/ prefix is normalized for a backend-run pytest).
+    expect(runner?.args).toContain('testing/test_seam.py::test_blocks');
+    expect(runner?.cmd).toBe('python3');
+  });
+
+  it('falls back to descriptor when no selector is given but descriptor is a pytest path', () => {
+    const runner = buildAcceptanceTestRunner(
+      { descriptor: 'testing/test_seam.py::test_x' },
+      [PYTEST_RUNNER],
+    );
+    expect(runner).not.toBeNull();
+    expect(runner?.args).toContain('testing/test_seam.py::test_x');
+  });
+
+  it('returns null for a non-pytest / prose descriptor (not targetable)', () => {
+    expect(
+      buildAcceptanceTestRunner({ descriptor: 'the dashboard renders the new column' }, [PYTEST_RUNNER]),
+    ).toBeNull();
+  });
+
+  it('returns null when no detected runner accepts pytest selectors', () => {
+    const goRunner: TestRunner = { cmd: 'go', args: ['test', './...'], cwd: '/tmp/workspace', label: 'go test' };
+    expect(
+      buildAcceptanceTestRunner({ descriptor: 'x', selector: 'testing/test_seam.py::test_x' }, [goRunner]),
+    ).toBeNull();
+  });
+
+  it('returns null for an empty selector/descriptor', () => {
+    expect(buildAcceptanceTestRunner({ descriptor: '   ' }, [PYTEST_RUNNER])).toBeNull();
+  });
+});
+
+describe('classifyAcceptanceTestRun — ran / skipped / absent', () => {
+  it('maps a real execution to ran', () => {
+    expect(classifyAcceptanceTestRun('collected 1 item\n1 passed in 0.10s')).toBe('ran');
+    // A failing-but-executed test still counts as ran (the suite gate owns pass/fail).
+    expect(classifyAcceptanceTestRun('FAILED testing/test_seam.py::test_x\n1 failed in 0.2s')).toBe('ran');
+  });
+
+  it('maps an all-skipped run to skipped', () => {
+    expect(classifyAcceptanceTestRun('collected 1 item\n1 skipped in 0.01s')).toBe('skipped');
+  });
+
+  it('maps a zero-collection / not-found run to absent', () => {
+    expect(classifyAcceptanceTestRun('no tests ran in 0.01s')).toBe('absent');
+    expect(classifyAcceptanceTestRun('collected 0 items')).toBe('absent');
   });
 });

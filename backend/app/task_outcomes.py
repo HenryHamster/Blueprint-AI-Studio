@@ -48,10 +48,15 @@ from app.acceptance_gate import (
     CODE_ACCEPTANCE_VERDICT_KEY,
     acceptance_blocks_success,
 )
-from app.ci_resolution import classify_merge_test_verdict
+from app.ci_resolution import (
+    acceptance_test_block,
+    acceptance_test_is_clear_failure,
+    classify_merge_test_verdict,
+)
 from app.direction_outcomes import _counts_as_failure
 from app.landed_signal import is_merged_completion, merge_verification_status
 from app.models import Task
+from app.payload_schemas import parse_acceptance_evidence
 from app.reproduction_scoring import (
     TARGET_DEFECT_REPRODUCTION_KEY,
     reproduction_blocks_success,
@@ -568,6 +573,12 @@ def _build_verify_tests_summary(task: Task, ctx: SummaryContext) -> dict[str, An
     # merge regardless of suite detection — see classify_merge_test_verdict — so a
     # green suite that also broke the declared build must NOT show a clean "pass".
     declared_build_failed = probe_failed and isinstance(probe, dict) and probe.get("declared") is True
+    # A CLEAR declared-acceptance-test failure (a promised named test that was
+    # absent or skipped) blocks the merge regardless of suite detection — see
+    # classify_merge_test_verdict — so the summary must read "fail" even when a
+    # unit suite passed, never a clean "pass".
+    acceptance_block = acceptance_test_block(result)
+    acceptance_test_failed = acceptance_test_is_clear_failure(acceptance_block)
     if detected is False:
         # A clear acceptance-probe failure on a no-suite fall-open is a real,
         # merge-blocking verdict (the gate flips it to "fail"); reflect that here
@@ -579,6 +590,10 @@ def _build_verify_tests_summary(task: Task, ctx: SummaryContext) -> dict[str, An
         # merge is blocked.
         verdict = "fail" if declared_build_failed else "pass"
     elif detected is True:
+        verdict = "fail"
+    # A clear declared-acceptance-test failure overrides any non-fail verdict
+    # (it blocks at HIGH precedence regardless of suite detection / pass).
+    if acceptance_test_failed:
         verdict = "fail"
 
     if detected is not None:
@@ -595,6 +610,17 @@ def _build_verify_tests_summary(task: Task, ctx: SummaryContext) -> dict[str, An
             _summary_item(
                 "Acceptance probe",
                 f"{ecosystem + ': ' if ecosystem else ''}{probe_state}",
+            )
+        )
+    if acceptance_block is not None:
+        name = str(
+            acceptance_block.get("selector") or acceptance_block.get("descriptor") or ""
+        ).strip()
+        status_text = str(acceptance_block.get("status") or "unknown").strip()
+        evidence.append(
+            _summary_item(
+                "Declared acceptance test",
+                f"{name + ': ' if name else ''}{status_text}",
             )
         )
     if isinstance(tests, list) and tests:
@@ -907,6 +933,52 @@ SUMMARY_BUILDERS: dict[str, Callable[[Task, SummaryContext], dict[str, Any] | No
 }
 
 
+def _declared_acceptance_evidence(task: Task) -> dict | None:
+    """Read the optional plan-time acceptance-evidence declaration off a task.
+
+    Reads it from the task context (deferred-column-safe via
+    :func:`_task_local_attr`) and validates it through the shared helper, so an
+    absent or malformed declaration yields ``None`` and the summary is left
+    exactly as today.
+    """
+    context = _task_local_attr(task, "context") or {}
+    if not isinstance(context, dict):
+        return None
+    return parse_acceptance_evidence(context.get("acceptance_evidence"))
+
+
+def _apply_acceptance_evidence(
+    task: Task, summary: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Surface the declared acceptance evidence on *summary*, uniformly.
+
+    When a well-formed declaration is present, append a single
+    ``Acceptance evidence`` item so reviewers and the strategic layer can read
+    what proof was promised. Applied here (rather than per builder) so it covers
+    every implementation task type — including write types (create/fix/…) whose
+    builder returns ``None`` in the common no-findings case: for those we
+    synthesize a minimal ``declared``-verdict summary carrying only the promised
+    proof, rather than dropping it on the floor. When the declaration is absent
+    or malformed the summary is returned byte-for-byte unchanged (``None`` stays
+    ``None``).
+    """
+    declared = _declared_acceptance_evidence(task)
+    if declared is None:
+        return summary
+    item = _summary_item("Acceptance evidence", declared["descriptor"])
+    if summary is None:
+        return {
+            "status": _summary_status_label(task),
+            "verdict": "declared",
+            "evidence": [item],
+            "highlights": [],
+        }
+    evidence = summary.get("evidence")
+    if isinstance(evidence, list):
+        evidence.append(item)
+    return summary
+
+
 def build_task_evaluation_summary(
     task: Task,
     *,
@@ -925,4 +997,5 @@ def build_task_evaluation_summary(
     task_type = _task_type(task) or ""
     ctx = SummaryContext(merge_test_result=merge_test_result)
     builder = SUMMARY_BUILDERS.get(task_type, _build_findings_summary)
-    return builder(task, ctx)
+    summary = builder(task, ctx)
+    return _apply_acceptance_evidence(task, summary)

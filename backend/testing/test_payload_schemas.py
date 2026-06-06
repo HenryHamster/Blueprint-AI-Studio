@@ -7,6 +7,7 @@ from app.payload_schemas import (
     PayloadTooLargeError,
     TaskType,
     _MAX_PAYLOAD_BYTES,
+    parse_acceptance_evidence,
     validate_internal_payload,
     validate_task_payload,
 )
@@ -29,6 +30,50 @@ def _invalid(raw: dict) -> str:
     with pytest.raises(ValueError) as exc_info:
         validate_task_payload(raw)
     return str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# parse_acceptance_evidence — the closed-vocabulary acceptance-evidence helper
+# ---------------------------------------------------------------------------
+
+
+def test_parse_acceptance_evidence_valid_test_kind_roundtrips():
+    raw = {
+        "kind": "test",
+        "descriptor": "end-to-end seam test passes",
+        "selector": "testing/test_foo.py::test_bar",
+    }
+    assert parse_acceptance_evidence(raw) == raw
+
+
+def test_parse_acceptance_evidence_valid_without_selector():
+    raw = {"kind": "behavior", "descriptor": "endpoint returns scoped audit"}
+    assert parse_acceptance_evidence(raw) == raw
+
+
+def test_parse_acceptance_evidence_strips_descriptor():
+    out = parse_acceptance_evidence({"kind": "artifact", "descriptor": "  blob  "})
+    assert out == {"kind": "artifact", "descriptor": "blob"}
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        "not-a-dict",
+        42,
+        {},
+        {"descriptor": "no kind"},
+        {"kind": "test"},  # missing descriptor
+        {"kind": "screenshot", "descriptor": "bad kind"},
+        {"kind": "test", "descriptor": ""},  # empty descriptor
+        {"kind": "test", "descriptor": "   "},  # whitespace-only descriptor
+        {"kind": "test", "descriptor": "ok", "extra": "forbidden"},  # extra key
+    ],
+)
+def test_parse_acceptance_evidence_malformed_returns_none(raw):
+    """Any absent/malformed value yields None and never raises."""
+    assert parse_acceptance_evidence(raw) is None
 
 
 # ---------------------------------------------------------------------------

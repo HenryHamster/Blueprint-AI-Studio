@@ -14,7 +14,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.broadcast import broadcast_to_project
 from app.depends_on_provenance import remember_structural_depends_on
 from app.models import Project, Task, TaskHistory, TaskStatus
-from app.payload_schemas import read_acceptance_evidence, validate_internal_payload
+from app.payload_schemas import (
+    parse_acceptance_evidence,
+    read_acceptance_evidence,
+    validate_internal_payload,
+)
 from app.task_capabilities import PLAN_KNOWLEDGE_SUBTASK_TYPES, PLAN_SUBTASK_TYPES
 from app.shared_state import (
     get_project_integration_branch,
@@ -633,6 +637,13 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         child_approval_reason = (
             subtask_def.get("approval_reason") if child_risk == "high" else None
         )
+        # Optional plan-time acceptance-evidence contract: propagate it onto the
+        # child context the same way scope/risk/related_files are. Validated via
+        # the shared helper, so an absent or malformed declaration yields None and
+        # the child context is byte-for-byte unchanged from today.
+        child_acceptance_evidence = parse_acceptance_evidence(
+            subtask_def.get("acceptance_evidence")
+        )
         # Ignore subtask_def.model and parent plan model — legacy hints
         # that anchored every child to one provider regardless of the
         # operator's category_routing. Respect operator-level
@@ -687,6 +698,11 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 "risk": child_risk,
                 "related_files": related_files,
                 "parent_context": plan_parent_context,
+                **(
+                    {"acceptance_evidence": child_acceptance_evidence}
+                    if child_acceptance_evidence
+                    else {}
+                ),
                 **(
                     {"approval_reason": child_approval_reason}
                     if child_approval_reason

@@ -59,7 +59,11 @@ from app.finding_deduplication import (
     normalize_prerequisite,
     resolve_prerequisite_task,
 )
-from app.payload_schemas import read_acceptance_evidence, validate_internal_payload
+from app.payload_schemas import (
+    parse_acceptance_evidence,
+    read_acceptance_evidence,
+    validate_internal_payload,
+)
 from app.playbook_learning import (
     RECENT_SUCCESSES_TASK_TYPES,
     summarize_recent_successes,
@@ -3173,6 +3177,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # Cited paths the finding references — propagated so the launch-time
         # staleness recompute can diff them against the current integration HEAD.
         _child_cited_paths = finding_cited_paths(finding)
+        # Optional plan-time acceptance-evidence contract. Read it straight off
+        # the surviving ``finding`` dict (NOT routed through the
+        # depends_on_indices remap), so it survives batch-cap truncation and
+        # dedup for every finding that survives. Validated via the shared helper:
+        # an absent or malformed declaration yields None and the child context is
+        # byte-for-byte unchanged from today.
+        _acceptance_evidence = parse_acceptance_evidence(
+            finding.get("acceptance_evidence")
+        )
         new_task = Task(
             project_id=task.project_id,
             title=title,
@@ -3191,6 +3204,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "research_depth": research_depth + 1,
                 "related_files": related_files,
                 "finding_hash": fhash,
+                **(
+                    {"acceptance_evidence": _acceptance_evidence}
+                    if _acceptance_evidence
+                    else {}
+                ),
                 **(
                     {"provides_capability": finding["_provides_capability"]}
                     if finding.get("_provides_capability")

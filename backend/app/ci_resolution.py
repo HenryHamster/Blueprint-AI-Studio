@@ -569,6 +569,17 @@ def classify_merge_test_verdict(
             f"tests skipped), so the suite was made green by skipping rather "
             f"than by passing{suffix}.",
         )
+    # HIGH precedence: a DECLARED acceptance test (the named test the plan
+    # promised would exercise the seam) that was ABSENT or SKIPPED in the PR's run
+    # did NOT prove the claim — block the merge REGARDLESS of whether the unit
+    # suite was detected and passed, exactly the way compute_experiment fails
+    # closed when its declared success metric is absent from the result. A green
+    # suite must not let a promised-but-missing/never-run test merge as proven. A
+    # check that itself could_not_run (no targetable suite / environment failure)
+    # does NOT block here — it falls open with the ``acceptance_test_not_run``
+    # degraded reason via :func:`classify_unverified_fall_open_reason`.
+    if acceptance_test_is_clear_failure(acceptance_test_block(verdict)):
+        return ("fail", _acceptance_test_failure_detail(acceptance_test_block(verdict)))
     # HIGH precedence: the operator's OWN declared build command CLEARLY failed.
     # A green unit suite must NOT mask a broken declared build (bundled frontends,
     # tests that exercise source without the build step), so a declared-build
@@ -738,6 +749,79 @@ def disabled_tests_block(verdict: Any) -> dict[str, Any] | None:
     return {"count": count, "markers": markers}
 
 
+def acceptance_test_block(verdict: Any) -> dict[str, Any] | None:
+    """Defensively normalize the optional ``acceptanceTest`` block an agent
+    attaches when the implementation task declared (at plan time) a named
+    acceptance test (``acceptance_evidence`` with ``kind="test"``).
+
+    Returns ``{"declared", "descriptor", "selector"?, "present", "ran",
+    "status"}`` when a well-formed ``declared=true`` block with a recognized
+    ``status`` is present, else ``None``. ``status`` is one of ``ran`` /
+    ``skipped`` / ``absent`` / ``could_not_run``. Pure read-side accessor,
+    mirroring :func:`disabled_tests_block`: defensive about a missing / non-dict /
+    malformed / older-agent block (returns ``None``), so an agent that omits it
+    degrades silently and the gate is unchanged.
+    """
+    if not isinstance(verdict, dict):
+        return None
+    raw = verdict.get("acceptanceTest")
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("declared") is not True:
+        return None
+    status = str(raw.get("status") or "").strip().lower()
+    if status not in {"ran", "skipped", "absent", "could_not_run"}:
+        return None
+    descriptor = str(raw.get("descriptor") or "").strip()
+    block: dict[str, Any] = {
+        "declared": True,
+        "descriptor": descriptor,
+        "present": bool(raw.get("present")),
+        "ran": bool(raw.get("ran")),
+        "status": status,
+    }
+    selector = raw.get("selector")
+    if isinstance(selector, str) and selector.strip():
+        block["selector"] = selector.strip()
+    return block
+
+
+def acceptance_test_is_clear_failure(block: Any) -> bool:
+    """Whether a declared acceptance-test block is a CLEAR, blocking failure — a
+    promised test that was ABSENT or SKIPPED (it did not actually run).
+
+    True only when the block is the declared acceptance test, it did NOT run, and
+    its status is the definitive ``absent`` or ``skipped``. A ``could_not_run``
+    status is NOT a clear failure: the check itself could not be performed (no
+    targetable suite / environment failure), so it degrades to a fall-open
+    (``acceptance_test_not_run``) rather than hard-blocking. Defensive about a
+    missing / non-dict / old-shape block (returns False), so an older agent that
+    emits no ``acceptanceTest`` keeps today's gate behavior exactly.
+    """
+    if not isinstance(block, dict):
+        return False
+    if block.get("declared") is not True:
+        return False
+    if block.get("ran") is True:
+        return False
+    return block.get("status") in {"absent", "skipped"}
+
+
+def _acceptance_test_failure_detail(block: dict[str, Any]) -> str:
+    """Build the operator-facing ``detail`` for a CLEAR declared-acceptance-test
+    failure so the spawned fix task knows which promised test must run."""
+    name = str(block.get("selector") or block.get("descriptor") or "").strip()
+    status = str(block.get("status") or "").strip()
+    label = f"`{name}` " if name else ""
+    if status == "absent":
+        reason = "is absent — the promised test was not found in the PR's run"
+    elif status == "skipped":
+        reason = "was skipped — the promised test did not actually execute"
+    else:  # defensive; only absent/skipped reach here
+        reason = "did not run"
+    return f"Declared acceptance test {label}{reason}.".replace("  ", " ")
+
+
 def _suite_is_non_verifying(verdict: dict[str, Any]) -> bool:
     """Whether a verdict's suite did not really verify anything — EITHER it ran
     but every test was skipped (``noTestsReason`` in
@@ -856,6 +940,7 @@ DEGRADED_UNVERIFIED_REASONS = frozenset(
         "probe_no_artifact",
         "documented_command_could_not_run",
         "documented_command_no_artifact",
+        "acceptance_test_not_run",
     }
 )
 BENIGN_UNVERIFIED_REASONS = frozenset(
@@ -935,6 +1020,22 @@ def classify_unverified_fall_open_reason(
     ``documentedCommands`` keeps the generic reason).
     """
     if isinstance(verdict, dict):
+        # A DECLARED acceptance test that the gate could not confirm RAN takes
+        # precedence over every other fall-open phrasing: it is the most specific
+        # promise the plan made. A clear absent/skipped never reaches here (it
+        # blocks via :func:`classify_merge_test_verdict`); this surfaces the
+        # could_not_run degrade (no targetable suite / environment failure) so the
+        # operator sees the promised test went unconfirmed and the merge is
+        # excluded from verified-merge accounting.
+        acceptance = acceptance_test_block(verdict)
+        if acceptance is not None and not acceptance.get("ran"):
+            name = str(acceptance.get("selector") or acceptance.get("descriptor") or "").strip()
+            phrase = (
+                f"a declared acceptance test could not be confirmed to run ({name})"
+                if name
+                else "a declared acceptance test could not be confirmed to run"
+            )
+            return (phrase, "acceptance_test_not_run")
         documented = verdict.get("documentedCommands")
         if isinstance(documented, dict) and documented.get("ran"):
             label = str(documented.get("label") or "").strip()

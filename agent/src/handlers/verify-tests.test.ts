@@ -974,3 +974,95 @@ describe('handleVerifyTests', () => {
     });
   });
 });
+
+describe('handleVerifyTests — declared acceptance-test probe', () => {
+  const payload = { branch: 'feature/x', base_branch: 'main' };
+  const PYTEST_RUNNER = {
+    cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'],
+    cwd: '/tmp/workspace/backend', label: 'pytest (backend)',
+  };
+  const declaredTask = (selector: string, kind = 'test') => ({
+    context: { acceptance_evidence: { kind, descriptor: 'the seam test', selector } },
+  });
+
+  type Acc = { declared: boolean; descriptor: string; selector?: string; present: boolean; ran: boolean; status: string };
+  function acceptanceBlock(): Acc | undefined {
+    return (JSON.parse(lastPostedPayload().logs as string) as { acceptanceTest?: Acc }).acceptanceTest;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(detectAutoTestRunners).mockReturnValue([]);
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([]);
+    vi.mocked(discoverDocumentedCommands).mockReturnValue([]);
+    vi.mocked(detectTestRunners).mockReturnValue([PYTEST_RUNNER]);
+    vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
+  });
+
+  it('declared test that RAN → acceptanceTest.status=ran, ran=true (no block)', async () => {
+    vi.mocked(execFileAsync).mockImplementation((cmd: string) =>
+      Promise.resolve(cmd === 'git' ? '' : 'collected 1 item\n1 passed in 0.10s'),
+    );
+    await handleVerifyTests('at1', payload, declaredTask('testing/test_seam.py::test_x'), 'tok', 'o', 'r', null, { value: '' });
+    const block = acceptanceBlock();
+    expect(block).toBeDefined();
+    expect(block?.status).toBe('ran');
+    expect(block?.ran).toBe(true);
+    expect(block?.present).toBe(true);
+    expect(block?.selector).toBe('testing/test_seam.py::test_x');
+  });
+
+  it('declared test SKIPPED → status=skipped, ran=false (backend blocks)', async () => {
+    vi.mocked(execFileAsync).mockImplementation((cmd: string) =>
+      Promise.resolve(cmd === 'git' ? '' : 'collected 1 item\n1 skipped in 0.01s'),
+    );
+    await handleVerifyTests('at2', payload, declaredTask('testing/test_seam.py::test_x'), 'tok', 'o', 'r', null, { value: '' });
+    const block = acceptanceBlock();
+    expect(block?.status).toBe('skipped');
+    expect(block?.ran).toBe(false);
+    expect(block?.present).toBe(true);
+  });
+
+  it('declared test ABSENT → status=absent, present=false (backend blocks)', async () => {
+    vi.mocked(execFileAsync).mockImplementation((cmd: string) =>
+      Promise.resolve(cmd === 'git' ? '' : 'no tests ran in 0.01s'),
+    );
+    await handleVerifyTests('at3', payload, declaredTask('testing/test_missing.py::test_y'), 'tok', 'o', 'r', null, { value: '' });
+    const block = acceptanceBlock();
+    expect(block?.status).toBe('absent');
+    expect(block?.present).toBe(false);
+    expect(block?.ran).toBe(false);
+  });
+
+  it('environment failure during targeted run → could_not_run (degrades, never false-absent)', async () => {
+    vi.mocked(execFileAsync).mockImplementation((cmd: string) => {
+      if (cmd === 'git') return Promise.resolve('');
+      const err = Object.assign(new Error('boom'), { stdout: '', stderr: 'error while loading shared libraries: libatk-1.0.so.0' });
+      return Promise.reject(err);
+    });
+    await handleVerifyTests('at4', payload, declaredTask('testing/test_seam.py::test_x'), 'tok', 'o', 'r', null, { value: '' });
+    const block = acceptanceBlock();
+    expect(block?.status).toBe('could_not_run');
+    expect(block?.ran).toBe(false);
+  });
+
+  it('non-pytest / un-targetable selector → could_not_run (no execFile run)', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([{ cmd: 'npm', args: ['test'], cwd: '/tmp/workspace', label: 'npm test (root)' }]);
+    vi.mocked(execFileAsync).mockResolvedValue('');
+    await handleVerifyTests('at5', payload, declaredTask('testing/test_seam.py::test_x'), 'tok', 'o', 'r', null, { value: '' });
+    const block = acceptanceBlock();
+    expect(block?.status).toBe('could_not_run');
+  });
+
+  it('no acceptance evidence declared → acceptanceTest omitted entirely', async () => {
+    vi.mocked(execFileAsync).mockResolvedValue('');
+    await handleVerifyTests('at6', payload, {}, 'tok', 'o', 'r', null, { value: '' });
+    expect(acceptanceBlock()).toBeUndefined();
+  });
+
+  it('non-test acceptance kind (behavior) → acceptanceTest omitted', async () => {
+    vi.mocked(execFileAsync).mockResolvedValue('');
+    await handleVerifyTests('at7', payload, declaredTask('something', 'behavior'), 'tok', 'o', 'r', null, { value: '' });
+    expect(acceptanceBlock()).toBeUndefined();
+  });
+});

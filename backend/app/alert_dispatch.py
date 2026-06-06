@@ -405,6 +405,10 @@ _UNVERIFIED_REASON_LABELS = {
         "a build command the PR introduced/documented exited cleanly but "
         "produced no artifact (possible no-op build) -- claim unverified"
     ),
+    "acceptance_test_not_run": (
+        "the PR declared a named acceptance test but the gate could not confirm "
+        "it ran (no targetable suite/environment failure) -- claim unverified"
+    ),
 }
 
 # Severity escalation for no-CI UNVERIFIED-merge reasons: degraded environment/

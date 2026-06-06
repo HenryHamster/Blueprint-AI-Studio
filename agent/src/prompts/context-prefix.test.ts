@@ -70,4 +70,64 @@ describe('buildContextPrefix', () => {
     });
     expect(prefix).not.toContain('## Existing knowledge documents');
   });
+
+  it('renders the acceptance-evidence section when context.acceptance_evidence is present', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'create' }],
+      context: {
+        scope: 'medium',
+        acceptance_evidence: {
+          kind: 'test',
+          descriptor: 'end-to-end test of the propagation seam',
+          selector: 'testing/test_propagation.py::test_seam',
+        },
+      },
+    });
+
+    expect(prefix).toContain('## Acceptance Evidence');
+    expect(prefix).toContain('end-to-end test of the propagation seam');
+    expect(prefix).toContain('test (a named test or selector exercising the seam end-to-end)');
+    expect(prefix).toContain('testing/test_propagation.py::test_seam');
+    // It frames the proof as something to aim for, not a blocking gate.
+    expect(prefix).toContain('Aim to produce it');
+  });
+
+  it('omits the selector line when no selector is supplied', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'create' }],
+      context: {
+        acceptance_evidence: {
+          kind: 'behavior',
+          descriptor: 'retry count visible in the dashboard',
+        },
+      },
+    });
+
+    expect(prefix).toContain('## Acceptance Evidence');
+    expect(prefix).toContain('retry count visible in the dashboard');
+    expect(prefix).not.toContain('- Selector:');
+  });
+
+  it('omits the acceptance-evidence section and stays byte-identical when absent', () => {
+    const base = {
+      payloads: [{ type: 'create' }],
+      context: { scope: 'medium' },
+    };
+    const withField = buildContextPrefix({
+      ...base,
+      context: { ...base.context, acceptance_evidence: undefined },
+    });
+    const without = buildContextPrefix(base);
+
+    expect(without).not.toContain('## Acceptance Evidence');
+    expect(withField).toEqual(without);
+  });
+
+  it('ignores a malformed (non-object) acceptance_evidence', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'create' }],
+      context: { acceptance_evidence: 'not-an-object' },
+    });
+    expect(prefix).not.toContain('## Acceptance Evidence');
+  });
 });

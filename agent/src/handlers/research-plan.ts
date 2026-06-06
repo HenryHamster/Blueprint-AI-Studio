@@ -1950,7 +1950,8 @@ implementation findings. Add metadata alongside them when relevant.
   "effort": "high|medium|low|null",
   "compute_experiment": {"command": "self-contained shell command to run the experiment", "spend_cap_usd": 5.0, "deadline_seconds": 1800, "success_criterion": {"metric": "accuracy", "operator": ">=", "threshold": 0.9}},
   "claims": ["short factual assertion backed by your investigation (omit when synthesizing)"],
-  "sources": [{"type": "file|pr|log|message", "ref": "path/to/file.py or pr#123 or msg_id", "excerpt": "optional short quote"}]
+  "sources": [{"type": "file|pr|log|message", "ref": "path/to/file.py or pr#123 or msg_id", "excerpt": "optional short quote"}],
+  "acceptance_evidence": {"kind": "test", "descriptor": "named test exercising the new seam end-to-end", "selector": "testing/test_foo.py::test_bar"}
 }]
 \`\`\`
 
@@ -1963,6 +1964,8 @@ implementation findings. Add metadata alongside them when relevant.
 **compute_experiment** (optional, default null): Present ONLY on a compute_experiment/measurement/benchmark finding — the launch contract for the budgeted compute job. Required keys \`command\`, \`spend_cap_usd\` (positive), \`deadline_seconds\` (positive); optional \`success_criterion\` (numeric metric/operator/threshold goal) and benchmark metadata (\`machine_type\`, \`experiment\`, \`benchmark\`, \`metric\`, \`cwd\`, \`env\`). Omit entirely on non-experiment findings.
 
 **provides_capability** (optional, default null): A short capability name this finding's task advertises (e.g. "payment-core"), so a sibling finding declaring \`{"kind": "capability", "ref": "payment-core"}\` can depend on it. Omit unless another finding needs to gate on this one by capability.
+
+**acceptance_evidence** (optional): Declare the proof that will show this finding's claim is true. Shape: \`{"kind": "test"|"behavior"|"artifact", "descriptor": "short human-readable proof", "selector": "optional test path/selector or artifact ref"}\`. kind=test = a named test/selector exercising the seam end-to-end; behavior = an observable runtime behavior; artifact = an artifact a downstream task consumes. Omit the whole object when you are not declaring a proof — omitting it preserves today's behavior exactly. Do NOT invent other kinds.
 
 **actionability_grade rubric** (required on every finding):
 - HIGH: problem statement is clear, desired outcome is clear, related files identified, no major unknowns blocking implementation.

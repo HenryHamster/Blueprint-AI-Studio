@@ -13,7 +13,9 @@ import {
   buildWroteNewOutput,
   discoverDocumentedCommands, runnerFromCommand, MAX_DOCUMENTED_COMMANDS,
   discoverNewlyDisabledTests, MAX_DISABLED_TEST_MARKERS,
+  buildAcceptanceTestRunner, classifyAcceptanceTestRun, matchesEnvironmentFailureSignature,
   type BuildConfig, type TestRunner, type AcceptanceProbe, type DocumentedCommand,
+  type DeclaredAcceptanceTest,
 } from '../utils/test-runners.js';
 import { testFixLoop } from '../utils/test-fix-loop.js';
 
@@ -156,6 +158,33 @@ interface VerifyTestsResult {
   disabledTests?: {
     count: number;
     markers: Array<{ file: string; marker: string; line: string }>;
+  };
+  // Declared acceptance-test probe. Attached ONLY when the implementation task
+  // declared, at plan time, a named acceptance test (``acceptance_evidence`` with
+  // ``kind="test"``) — the test that should exercise the seam end-to-end. The
+  // gate runs that SPECIFIC test (targeted) and reports whether it actually
+  // executed in the PR's run. A declared test that is ABSENT (not found) or
+  // SKIPPED (collected but every match skipped/deselected/xfail'd) did NOT prove
+  // the claim — the backend (ci_resolution.acceptance_test_is_clear_failure)
+  // flips this to a HIGH-precedence merge BLOCK, mirroring how
+  // compute_experiment fails closed when its declared metric is absent. A check
+  // that itself ``could_not_run`` (no targetable pytest suite / environment
+  // failure) degrades to a fall-open carrying the operator-visible
+  // ``acceptance_test_not_run`` reason rather than a hard block. ADDITIVE +
+  // CONSERVATIVE: omitted entirely when no acceptance test was declared (or the
+  // declared kind is not ``test``), so a PR with no declaration serializes
+  // byte-for-byte as today and an older backend that ignores the field is
+  // unaffected.
+  acceptanceTest?: {
+    declared: boolean;
+    descriptor: string;
+    selector?: string;
+    // The declared test was found/collected (true for ``ran``/``skipped``,
+    // false for ``absent``).
+    present: boolean;
+    // The declared test actually executed (true ONLY for ``ran``).
+    ran: boolean;
+    status: 'ran' | 'skipped' | 'absent' | 'could_not_run';
   };
 }
 
@@ -611,6 +640,107 @@ function attachDisabledTests(
   return { ...base, disabledTests: { count: markers.length, markers } };
 }
 
+// ── Declared acceptance-test probe ───────────────────────────────────────────
+// Read the optional plan-time acceptance-test declaration off the task context.
+// Returns a normalized {descriptor, selector?} ONLY for a well-formed
+// ``kind="test"`` declaration; null for an absent / malformed / non-test
+// declaration (mirroring the backend ``parse_acceptance_evidence`` shape, read
+// defensively). NEVER throws.
+function parseDeclaredAcceptanceTest(
+  task: Record<string, unknown>,
+): DeclaredAcceptanceTest | null {
+  const ctx = (task as { context?: unknown }).context;
+  if (!ctx || typeof ctx !== 'object') return null;
+  const ev = (ctx as Record<string, unknown>).acceptance_evidence;
+  if (!ev || typeof ev !== 'object') return null;
+  const e = ev as Record<string, unknown>;
+  if (e.kind !== 'test') return null;
+  const descriptor = typeof e.descriptor === 'string' ? e.descriptor.trim() : '';
+  if (!descriptor) return null;
+  const selector =
+    typeof e.selector === 'string' && e.selector.trim() ? e.selector.trim() : undefined;
+  return { descriptor, selector };
+}
+
+// Run the declared acceptance test (if any) and fold the verdict into the
+// result via the additive ``acceptanceTest`` block. Self-contained: it detects
+// the runner, runs ONLY the declared test (targeted), and classifies whether it
+// executed. A clear ABSENT/SKIPPED is carried on the block for the backend to
+// flip into a merge BLOCK; an environment failure or an un-targetable selector
+// degrades to ``could_not_run`` (fall-open). NEVER throws — any error degrades
+// to the unchanged result. Skipped entirely when no acceptance test was
+// declared, so a PR with no declaration is byte-for-byte unchanged.
+async function attachAcceptanceTestProbe(
+  ws: WebSocket | null,
+  buildConfig: BuildConfig | undefined,
+  task: Record<string, unknown>,
+  base: VerifyTestsResult,
+): Promise<VerifyTestsResult> {
+  let declared: DeclaredAcceptanceTest | null;
+  try {
+    declared = parseDeclaredAcceptanceTest(task);
+  } catch {
+    return base;
+  }
+  if (!declared) return base;
+  const label = declared.selector || declared.descriptor;
+
+  let runner: TestRunner | null = null;
+  try {
+    runner = buildAcceptanceTestRunner(declared, detectTestRunners(buildConfig));
+  } catch {
+    runner = null;
+  }
+  const blockBase = {
+    declared: true,
+    descriptor: declared.descriptor,
+    ...(declared.selector ? { selector: declared.selector } : {}),
+  };
+  if (!runner) {
+    sendLog(ws, `Declared acceptance test [${label}]: no targetable suite — could not run the check (fall-open).\n`);
+    const note = `Declared acceptance test \`${label}\` could not be targeted (no runnable suite to execute it) — cannot confirm it ran; falling open as degraded.`;
+    return {
+      ...base,
+      acceptanceTest: { ...blockBase, present: false, ran: false, status: 'could_not_run' },
+      output: [base.output, note].filter(Boolean).join('\n'),
+    };
+  }
+
+  let output = '';
+  let status: 'ran' | 'skipped' | 'absent' | 'could_not_run';
+  try {
+    output = await execFileAsync(runner.cmd, runner.args, { cwd: runner.cwd, timeoutMs: TEST_RUNNER_TIMEOUT });
+    status = classifyAcceptanceTestRun(output);
+  } catch (err: unknown) {
+    const e = err as Error & { stdout?: string; stderr?: string };
+    output = [e.stdout, e.stderr, e.message].filter(Boolean).join('\n');
+    // An environment/setup failure (missing runtime, OOM, docker daemon, …) means
+    // we could NOT confidently observe whether the test ran — degrade to
+    // could_not_run rather than mis-reading a missing tool as an absent test.
+    status = matchesEnvironmentFailureSignature(output)
+      ? 'could_not_run'
+      : classifyAcceptanceTestRun(output);
+  }
+  const ran = status === 'ran';
+  const present = status !== 'absent';
+  sendLog(ws, `Declared acceptance test [${label}]: ${status}\n`);
+  let note: string;
+  if (status === 'ran') {
+    note = `Declared acceptance test \`${label}\` ran — confirmed present and executed.`;
+  } else if (status === 'skipped') {
+    note = `Declared acceptance test \`${label}\` was SKIPPED — the promised test did not actually execute; blocking the merge.`;
+  } else if (status === 'absent') {
+    note = `Declared acceptance test \`${label}\` is ABSENT — the promised test was not found in the PR's run; blocking the merge.`;
+  } else {
+    note = `Declared acceptance test \`${label}\` could not be run — cannot confirm it ran; falling open as degraded.`;
+  }
+  return {
+    ...base,
+    acceptanceTest: { ...blockBase, present, ran, status },
+    output: [base.output, note].filter(Boolean).join('\n'),
+  };
+}
+
 // ── Stale-command self-heal ──────────────────────────────────────────────────
 // When the stored build_config test command turns out to be STALE — it ran but
 // executed no real tests (placeholder / zero-collection / missing script /
@@ -932,6 +1062,12 @@ export async function handleVerifyTests(
   const prDiff = await computePrDiff(ws, baseBranch);
   result = await attachDocumentedCommandsProbe(ws, result, prDiff);
   result = attachDisabledTests(ws, result, prDiff);
+  // Declared acceptance-test probe: when the implementation task promised a named
+  // test, confirm that SPECIFIC test actually ran in the PR. Runs on every
+  // completed path (the early setup-failure FAILED returns above skip it); a
+  // no-op when no acceptance test was declared.
+  statusRef.value = 'Confirming declared acceptance test ran...';
+  result = await attachAcceptanceTestProbe(ws, buildConfig, task, result);
 
   // Write the result file (parity with smoketest's /tmp result file — useful
   // for operator inspection); the authoritative copy is the artifact logs.

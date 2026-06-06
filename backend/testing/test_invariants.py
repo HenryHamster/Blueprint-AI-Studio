@@ -8362,6 +8362,7 @@ _UNVERIFIED_REASON_KEYS = frozenset(
         "documented_command_could_not_run",
         "documented_command_passed",
         "documented_command_no_artifact",
+        "acceptance_test_not_run",
     }
 )
 
@@ -8441,6 +8442,7 @@ _DEGRADED_REASON_KEYS = frozenset(
         "probe_no_artifact",
         "documented_command_could_not_run",
         "documented_command_no_artifact",
+        "acceptance_test_not_run",
     }
 )
 

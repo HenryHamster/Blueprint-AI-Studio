@@ -25,6 +25,7 @@ export const UNVERIFIED_REASON_LABELS: Record<string, string> = {
   documented_command_could_not_run: 'a command the PR introduced/documented could not be run (missing deps/unprovisioned setup) -- claim unverified',
   documented_command_passed: 'no unit suite ran; a command the PR introduced/documented was executed and passed',
   documented_command_no_artifact: 'no unit suite ran; a build command the PR introduced/documented exited cleanly but produced no artifact (possible no-op build) — not real verification',
+  acceptance_test_not_run: 'the PR declared a named acceptance test but the gate could not confirm it ran (no targetable suite/environment failure) — claim unverified',
 };
 
 /**

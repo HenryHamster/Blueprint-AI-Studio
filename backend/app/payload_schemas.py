@@ -571,6 +571,61 @@ class ComputeSuccessCriterion(BaseModel):
     threshold: float
 
 
+class PlanAcceptanceEvidence(BaseModel):
+    """An optional, structured proof descriptor that travels on the task CONTEXT.
+
+    Distinct from the payload-borne :class:`AcceptanceEvidence` (which the merge
+    gate consumes): this lighter ``{kind, descriptor[, selector]}`` shape is the
+    human-readable proof the agent renders in its prompt and best-effort runs —
+    see :func:`parse_acceptance_evidence` and the agent's acceptance-test probe.
+
+    Closed vocabulary aligned with the finding ``claims``/``verification_basis``
+    fields and the direction-level ``success_evidence`` concept (do NOT invent a
+    parallel vocabulary):
+      * ``kind="test"`` — a named test or test-selector that exercises the seam
+        end-to-end.
+      * ``kind="behavior"`` — an observable runtime behavior.
+      * ``kind="artifact"`` — an artifact a downstream task consumes.
+
+    Purely additive: it establishes/propagates/records a contract and never
+    blocks a merge. ``extra='forbid'`` (mirroring :class:`ComputeSuccessCriterion`)
+    so a malformed declaration — a typo'd kind or an extra key — is rejected by
+    :func:`parse_acceptance_evidence` rather than silently carried.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["test", "behavior", "artifact"]
+    descriptor: str
+    selector: str | None = None
+
+
+def parse_acceptance_evidence(raw: Any) -> dict | None:
+    """Validate an arbitrary raw acceptance-evidence value into a normalized dict.
+
+    The single source of truth for the acceptance-evidence vocabulary. Returns a
+    plain dict (``{kind, descriptor[, selector]}``) when *raw* is a well-formed
+    declaration, or ``None`` when it is absent or malformed (missing/bad kind,
+    empty descriptor, extra keys, wrong type). NEVER raises — it mirrors the
+    defensive read in ``task_evaluators._declared_success_criterion`` so an
+    invalid declaration degrades to today's exact behavior rather than failing a
+    decomposition or summary path.
+    """
+    if not isinstance(raw, dict):
+        return None
+    try:
+        evidence = PlanAcceptanceEvidence.model_validate(raw)
+    except Exception:  # noqa: BLE001 — any validation error means treat as absent
+        return None
+    descriptor = evidence.descriptor.strip()
+    if not descriptor:
+        return None
+    result: dict[str, Any] = {"kind": evidence.kind, "descriptor": descriptor}
+    if evidence.selector is not None:
+        result["selector"] = evidence.selector
+    return result
+
+
 class ComputeExperimentPayload(_SystemPopulated):
     """Reference compute-heavy task (benchmark/evaluation style).
 

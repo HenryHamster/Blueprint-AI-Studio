@@ -897,6 +897,11 @@ async def test_injection_cycle_drops_only_offending_edge_keeps_rest(
     ), f"Dropped record must name the B→A edge, got {dropped!r}"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Acceptance-evidence propagation (plan decomposition → child payload + context)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 @pytest.mark.asyncio
 async def test_acceptance_evidence_propagated_to_child_payload(
     db_session, mocker, _quiet_mocks
@@ -1042,3 +1047,110 @@ async def test_malformed_acceptance_evidence_degrades_not_aborts_spawn(
     sibling_evidence = sibling_child.first_payload.get("acceptance_evidence")
     assert sibling_evidence is not None, "well-formed sibling lost its evidence"
     assert sibling_evidence["test_path"] == "testing/test_bar.py"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Acceptance-evidence propagation (plan decomposition → child CONTEXT)
+# The lighter {kind, descriptor, selector} proof descriptor the agent renders.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_plan_subtask_acceptance_evidence_propagates_to_child_context(
+    db_session, mocker, _quiet_mocks
+):
+    """A well-formed subtask acceptance_evidence round-trips onto child context."""
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Step A",
+                    "prompt": "do step A",
+                    "scope": "small",
+                    "acceptance_evidence": {
+                        "kind": "test",
+                        "descriptor": "seam test exercises new path end-to-end",
+                        "selector": "testing/test_foo.py::test_bar",
+                    },
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    assert children[0].context["acceptance_evidence"] == {
+        "kind": "test",
+        "descriptor": "seam test exercises new path end-to-end",
+        "selector": "testing/test_foo.py::test_bar",
+    }
+
+
+@pytest.mark.asyncio
+async def test_plan_subtask_absent_acceptance_evidence_is_noop(
+    db_session, mocker, _quiet_mocks
+):
+    """No declaration ⇒ child context carries no acceptance_evidence key at all."""
+    plan_logs = json.dumps(
+        {"subtasks": [{"title": "Step A", "prompt": "do step A", "scope": "small"}]}
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    assert "acceptance_evidence" not in (children[0].context or {})
+
+
+@pytest.mark.asyncio
+async def test_plan_subtask_malformed_acceptance_evidence_is_dropped(
+    db_session, mocker, _quiet_mocks
+):
+    """A malformed declaration (bad kind) is dropped — no key, no raise."""
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Step A",
+                    "prompt": "do step A",
+                    "scope": "small",
+                    "acceptance_evidence": {"kind": "screenshot", "descriptor": "nope"},
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    assert "acceptance_evidence" not in (children[0].context or {})

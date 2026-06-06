@@ -675,6 +675,53 @@ def test_summary_verify_tests_generic_probe_fail_on_passing_suite_stays_pass():
     assert summary["verdict"] == "pass"
 
 
+def test_summary_verify_tests_absent_acceptance_test_on_passing_suite_is_fail():
+    # A green suite that promised a named test which is ABSENT must surface
+    # "fail" (the gate blocks at HIGH precedence) and carry the test as evidence.
+    task = _make_task("verify_tests")
+    summary = build_task_evaluation_summary(
+        task,
+        merge_test_result={
+            "detected": True,
+            "passed": True,
+            "acceptanceTest": {
+                "declared": True,
+                "descriptor": "the seam test",
+                "selector": "testing/test_seam.py::test_x",
+                "present": False,
+                "ran": False,
+                "status": "absent",
+            },
+        },
+    )
+    assert summary["verdict"] == "fail"
+    labels = {e["label"]: e["value"] for e in summary["evidence"]}
+    assert "Declared acceptance test" in labels
+    assert "absent" in labels["Declared acceptance test"]
+
+
+def test_summary_verify_tests_ran_acceptance_test_stays_pass():
+    task = _make_task("verify_tests")
+    summary = build_task_evaluation_summary(
+        task,
+        merge_test_result={
+            "detected": True,
+            "passed": True,
+            "acceptanceTest": {
+                "declared": True,
+                "descriptor": "the seam test",
+                "selector": "testing/test_seam.py::test_x",
+                "present": True,
+                "ran": True,
+                "status": "ran",
+            },
+        },
+    )
+    assert summary["verdict"] == "pass"
+    labels = {e["label"]: e["value"] for e in summary["evidence"]}
+    assert "Declared acceptance test" in labels
+
+
 def test_summary_memo_artifact():
     task = _make_task(
         "memo",
@@ -1104,6 +1151,95 @@ def test_first_attempt_succeeded_none_verification_backward_compat():
     assert _compute_first_attempt_succeeded(1, TaskStatus.COMPLETED, merge_verification=None) is True
     assert _compute_first_attempt_succeeded(2, TaskStatus.COMPLETED, merge_verification=None) is False
     assert _compute_first_attempt_succeeded(0, TaskStatus.FAILED, merge_verification=None) is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Acceptance-evidence surfacing (build_task_evaluation_summary wrapper)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _audit_plan_output() -> dict:
+    """A findings-shaped plan_output that yields a non-None base summary."""
+    return {"findings": [{"title": "leak", "severity": "high"}]}
+
+
+def test_summary_acceptance_evidence_absent_is_byte_for_byte_unchanged():
+    """No declaration ⇒ summary identical to today's (no extra evidence item)."""
+    base = build_task_evaluation_summary(
+        _make_task("security_audit", plan_output=_audit_plan_output())
+    )
+    with_ctx = build_task_evaluation_summary(
+        _make_task(
+            "security_audit", plan_output=_audit_plan_output(), context={"other": 1}
+        )
+    )
+    assert with_ctx == base
+    assert all(e["label"] != "Acceptance evidence" for e in with_ctx["evidence"])
+
+
+def test_summary_acceptance_evidence_declared_is_appended():
+    """A well-formed declaration appends alongside the builder's own evidence."""
+    task = _make_task(
+        "security_audit",
+        plan_output=_audit_plan_output(),
+        context={
+            "acceptance_evidence": {
+                "kind": "test",
+                "descriptor": "end-to-end seam test passes",
+                "selector": "testing/test_foo.py::test_bar",
+            }
+        },
+    )
+    summary = build_task_evaluation_summary(task)
+    assert summary is not None
+    # Builder's own evidence is preserved, with the contract appended last.
+    assert summary["evidence"][0]["label"] == "Findings"
+    assert summary["evidence"][-1] == {
+        "label": "Acceptance evidence",
+        "value": "end-to-end seam test passes",
+    }
+
+
+def test_summary_acceptance_evidence_malformed_is_dropped():
+    """A malformed declaration (bad kind) never surfaces and never raises."""
+    task = _make_task(
+        "security_audit",
+        plan_output=_audit_plan_output(),
+        context={"acceptance_evidence": {"kind": "screenshot", "descriptor": "nope"}},
+    )
+    summary = build_task_evaluation_summary(task)
+    assert summary is not None
+    assert all(e["label"] != "Acceptance evidence" for e in summary["evidence"])
+
+
+def test_summary_acceptance_evidence_synthesized_when_no_builder_summary():
+    """A write type with no findings still surfaces the promised proof.
+
+    The fallback findings builder returns None for a plain merged create task; a
+    declaration must still surface as a minimal ``declared``-verdict summary so
+    reviewers see the contract.
+    """
+    ctx = _merged_context()
+    ctx["acceptance_evidence"] = {
+        "kind": "behavior",
+        "descriptor": "the new endpoint scopes audit to the candidate",
+    }
+    task = _make_task("create", status=TaskStatus.COMPLETED, context=ctx)
+    summary = build_task_evaluation_summary(task)
+    assert summary is not None
+    assert summary["verdict"] == "declared"
+    assert summary["evidence"] == [
+        {
+            "label": "Acceptance evidence",
+            "value": "the new endpoint scopes audit to the candidate",
+        }
+    ]
+
+
+def test_summary_acceptance_evidence_absent_no_findings_stays_none():
+    """No declaration AND no findings ⇒ summary stays None (unchanged)."""
+    task = _make_task("create", status=TaskStatus.COMPLETED, context=_merged_context())
+    assert build_task_evaluation_summary(task) is None
 
 
 if __name__ == "__main__":

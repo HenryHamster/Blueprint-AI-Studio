@@ -4848,9 +4848,18 @@ class TestComputeExperimentSpawn:
         )
 
 
+
 class TestAcceptanceEvidencePropagation:
-    """A finding's declared forward acceptance_evidence is carried onto the
-    spawned child's payload; absence changes nothing."""
+    """Plan-time acceptance_evidence rides each surviving finding to its child.
+
+    Two complementary carriers: automain's named_test declaration lands on the
+    child PAYLOAD (consumed by the merge gate) via ``_spawn_child``; this PR's
+    lighter ``{kind, descriptor, selector}`` proof descriptor lands on the child
+    CONTEXT (rendered/run by the agent) via ``_spawn_from_findings``. The
+    declaration is a plain field on the finding dict (NOT routed through
+    depends_on_indices), so it must survive batch-cap truncation for every
+    finding that survives. Absence changes nothing.
+    """
 
     async def _spawn_child(self, db_session, mocker, *, direction_id, finding):
         from test_autonomous_research import _patch_research_externals
@@ -4891,6 +4900,50 @@ class TestAcceptanceEvidencePropagation:
             .scalars()
             .first()
         )
+
+    async def _spawn_from_findings(
+        self, db_session, mocker, *, direction_id, findings, force_cap_one=False
+    ):
+        from test_autonomous_research import _patch_research_externals
+
+        _project, _direction, task = await _grader_project_and_task(
+            db_session, direction_id
+        )
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=findings,
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+        if force_cap_one:
+            # Saturate the VM gauge so _cap_by_slots floors the batch cap to 1 —
+            # exercises the truncation path deterministically.
+            mocker.patch("app.shared_state.tasks_active_gauge", 100)
+            mocker.patch("app.shared_state.tasks_queued_gauge", 0)
+        for path, value in (
+            ("app.research_completion.resolve_branch_verification_context", {}),
+            ("app.research_completion.resolve_head_commit", None),
+            ("app.research_completion.cited_paths_changed_since", False),
+            ("app.research_completion._summarize_ungrounded_claims_grounded", None),
+        ):
+            mocker.patch(path, new=AsyncMock(return_value=value))
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return children, task
 
     @_pytest.mark.asyncio
     async def test_finding_acceptance_evidence_lands_on_child_payload(
@@ -4961,3 +5014,93 @@ class TestAcceptanceEvidencePropagation:
             "malformed acceptance_evidence must degrade to omitted, got "
             f"{child.first_payload.get('acceptance_evidence')!r}"
         )
+
+    @_pytest.mark.asyncio
+    async def test_finding_acceptance_evidence_propagates_to_child_context(
+        self, db_session, mocker
+    ):
+        from test_autonomous_research import _make_finding
+
+        finding = _make_finding(title="Declared proof", direction_id="d-ae-ctx01")
+        finding["acceptance_evidence"] = {
+            "kind": "test",
+            "descriptor": "seam test exercises new path end-to-end",
+            "selector": "testing/test_foo.py::test_bar",
+        }
+        children, _task = await self._spawn_from_findings(
+            db_session, mocker, direction_id="d-ae-ctx01", findings=[finding]
+        )
+        child = next(c for c in children if c.title == "Declared proof")
+        assert child.context["acceptance_evidence"] == {
+            "kind": "test",
+            "descriptor": "seam test exercises new path end-to-end",
+            "selector": "testing/test_foo.py::test_bar",
+        }
+
+    @_pytest.mark.asyncio
+    async def test_finding_absent_acceptance_evidence_is_noop(
+        self, db_session, mocker
+    ):
+        from test_autonomous_research import _make_finding
+
+        finding = _make_finding(title="No proof", direction_id="d-ae-ctx02")
+        children, _task = await self._spawn_from_findings(
+            db_session, mocker, direction_id="d-ae-ctx02", findings=[finding]
+        )
+        child = next(c for c in children if c.title == "No proof")
+        assert "acceptance_evidence" not in (child.context or {})
+
+    @_pytest.mark.asyncio
+    async def test_finding_malformed_acceptance_evidence_is_dropped(
+        self, db_session, mocker
+    ):
+        from test_autonomous_research import _make_finding
+
+        finding = _make_finding(title="Bad proof", direction_id="d-ae-ctx03")
+        finding["acceptance_evidence"] = {"kind": "screenshot", "descriptor": "nope"}
+        children, _task = await self._spawn_from_findings(
+            db_session, mocker, direction_id="d-ae-ctx03", findings=[finding]
+        )
+        child = next(c for c in children if c.title == "Bad proof")
+        assert "acceptance_evidence" not in (child.context or {})
+
+    @_pytest.mark.asyncio
+    async def test_acceptance_evidence_survives_batch_cap_truncation(
+        self, db_session, mocker
+    ):
+        """A surviving high-priority finding keeps acceptance_evidence under a cap.
+
+        With the batch cap forced to 1, the low-priority finding is deferred and
+        the high-priority one survives — and its declaration must ride through.
+        """
+        from test_autonomous_research import _make_finding
+
+        survivor = _make_finding(
+            title="Survivor with proof",
+            direction_id="d-ae-trunc01",
+            priority="high",
+        )
+        survivor["acceptance_evidence"] = {
+            "kind": "behavior",
+            "descriptor": "endpoint scopes audit to the open candidate",
+        }
+        deferred = _make_finding(
+            title="Deferred no proof",
+            direction_id="d-ae-trunc01",
+            priority="low",
+        )
+        children, _task = await self._spawn_from_findings(
+            db_session,
+            mocker,
+            direction_id="d-ae-trunc01",
+            findings=[survivor, deferred],
+            force_cap_one=True,
+        )
+        titles = {c.title for c in children}
+        assert "Survivor with proof" in titles
+        assert "Deferred no proof" not in titles
+        survivor_child = next(c for c in children if c.title == "Survivor with proof")
+        assert survivor_child.context["acceptance_evidence"] == {
+            "kind": "behavior",
+            "descriptor": "endpoint scopes audit to the open candidate",
+        }
