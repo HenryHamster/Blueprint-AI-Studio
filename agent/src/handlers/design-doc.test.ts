@@ -103,7 +103,7 @@ describe('handleDesignDocUpdate', () => {
     );
     if (!fetchCall) throw new Error('fetch helper script was not written');
     const content = fetchCall[1] as string;
-    expect(content).toContain('Usage: fetch direction|playbook|gap|message|section [id]');
+    expect(content).toContain('Usage: fetch direction|playbook|gap|message|section|knowledge [id]');
     expect(content).toContain('messages/$ID');
     expect(content).toContain('design-doc/$ID');
 

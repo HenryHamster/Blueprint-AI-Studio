@@ -18,6 +18,7 @@ from sqlmodel import select
 from app import strategic_cycle
 from app.direction_metrics import _compute_direction_quality_score
 from app.direction_mode import mode_prompt_hint, normalized_recommended_mode
+from app.knowledge_query import build_knowledge_index
 from app.models import (
     Task,
     Project,
@@ -1999,6 +2000,12 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # (op:get) — see _design_doc_index. The summarize fallback drops per-entry
     # summaries to a navigation skeleton under genuine budget exhaustion.
     "design_doc": {"priority": "medium", "summarize": _summarize_design_doc_index},
+    # Compact, body-omitted index of existing knowledge documents (web_research /
+    # design output). Medium priority with no summarize_fn: it is already capped
+    # (count) and char-bounded (per-entry summary) at build time, so the packer
+    # drops it whole under budget rather than trimming — mirroring
+    # staged_directions / operator_overrides. Full bodies fetched on demand.
+    "knowledge_index": {"priority": "medium"},
     "outcome_evaluation": {
         "priority": "medium",
         "summarize": _summarize_outcome_evaluation,
@@ -2084,6 +2091,10 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     "model_health": {"priority": "high"},
     "proposed_changes": {"priority": "high"},
     "shipped_changes_manifest": {"priority": "medium"},
+    # Compact, body-omitted index of existing knowledge documents — see
+    # _STRATEGIC_REVIEW_SCHEMA["knowledge_index"]. Capped at build time, dropped
+    # whole under budget; full bodies fetched on demand.
+    "knowledge_index": {"priority": "medium"},
 }
 
 
@@ -3127,10 +3138,16 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         _agent_view_design_doc(project.design_doc), **verification_kwargs
     )
 
+    # Compact, body-omitted index of existing knowledge documents (web_research /
+    # design output) so the strategist knows what knowledge already exists and
+    # can fetch full bodies on demand — included only when documents exist.
+    _knowledge_index = await build_knowledge_index(session, project.id)
+
     payload: dict = pack_under_budget(
         {
             "type": "design_doc_update",
             "design_doc": _design_doc_index(reconciled_design_doc),
+            **({"knowledge_index": _knowledge_index} if _knowledge_index else {}),
             "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
             "project_name": project.name,
             "vision": project.vision or {},
@@ -4541,6 +4558,10 @@ async def _spawn_strategic_review(
         _sr_model_health,
         _utcnow().isoformat(),
     )
+    # Compact, body-omitted index of existing knowledge documents (web_research /
+    # design output) so the strategist knows what knowledge already exists and
+    # can fetch full bodies on demand — included only when documents exist.
+    _knowledge_index = await build_knowledge_index(session, project.id)
     payload: dict = pack_under_budget(
         {
             "type": "strategic_review",
@@ -4568,6 +4589,7 @@ async def _spawn_strategic_review(
             # Concrete prune candidates — present only when the model is
             # large/oversized AND something is actually prunable. Advisory list.
             **({"prune_candidates": _prune_candidates} if _prune_candidates else {}),
+            **({"knowledge_index": _knowledge_index} if _knowledge_index else {}),
             "running_update": project.running_update or "",
             "running_update_acknowledged_at": (
                 project.running_update_acknowledged_at.isoformat()

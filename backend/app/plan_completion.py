@@ -15,7 +15,7 @@ from app.broadcast import broadcast_to_project
 from app.depends_on_provenance import remember_structural_depends_on
 from app.models import Project, Task, TaskHistory, TaskStatus
 from app.payload_schemas import validate_internal_payload
-from app.task_capabilities import PLAN_SUBTASK_TYPES
+from app.task_capabilities import PLAN_KNOWLEDGE_SUBTASK_TYPES, PLAN_SUBTASK_TYPES
 from app.shared_state import (
     get_project_integration_branch,
     runtime_config as _runtime_config,
@@ -520,10 +520,15 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     # Pre-validate: identify which subtasks will be skipped and check for unsatisfiable dependencies.
     # Do this before creating any child tasks so we can fail cleanly if a spawned subtask
     # depends on a skipped (non-eligible) producer.
+    # A plan child is eligible if it is a PR-producing implementation subtype OR a
+    # knowledge-prerequisite subtype (web_research / design). The latter spawns AS
+    # ITSELF (no branch/PR) so a downstream implementation child can validly depend
+    # on the knowledge it produces.
+    plan_child_allowlist = PLAN_SUBTASK_TYPES | PLAN_KNOWLEDGE_SUBTASK_TYPES
     skipped_indices = set()
     for i, subtask_def in enumerate(subtasks):
         raw_type = subtask_def.get("type", "create")
-        if raw_type not in PLAN_SUBTASK_TYPES:
+        if raw_type not in plan_child_allowlist:
             skipped_indices.add(i)
 
     for i, subtask_def in enumerate(subtasks):
@@ -581,7 +586,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             raw_type = subtask_def.get("type", "create")
             logger.warning(
                 "[PLAN] Skipping subtask %r with non-eligible type %r "
-                "(not a registered plan-spawnable write task type) in plan %s",
+                "(not a registered plan-spawnable write or knowledge task type) in plan %s",
                 subtask_def.get("title", "Untitled subtask"),
                 raw_type,
                 task.id,
@@ -600,7 +605,14 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             if related_files
             else prompt_text
         )
-        create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
+        # The "create" prompt suffix primes code/PR work; a knowledge-prerequisite
+        # child (web_research / design) produces a knowledge document, not a branch,
+        # so it must NOT receive the implementation suffix.
+        create_suffix = (
+            _runtime_config.get("agent_prompt_suffixes", {}).get("create")
+            if subtask_type in PLAN_SUBTASK_TYPES
+            else None
+        )
         subtask_priority = TASK_PRIORITY_MAP.get(
             subtask_def.get("priority", "medium"), 50
         )

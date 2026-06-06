@@ -92,7 +92,7 @@ describe('writeStrategicHelpers', () => {
     // The new subcommand maps `fetch message <ref>` to the read-only lookup
     // endpoint that resolves a short ref or full UUID backend-side.
     expect(content).toContain('message)    PATH_SUFFIX="messages/$ID"');
-    expect(content).toContain('fetch problem-model|direction|playbook|gap|message|section [id]');
+    expect(content).toContain('fetch problem-model|direction|playbook|gap|message|section|knowledge [id]');
     // Reuses the existing X-Agent-Token GET path — no new auth/curl block.
     expect(content).toContain('-H "X-Agent-Token: $TOKEN"');
     // The shared id-required guard covers `message` (only problem-model is id-less).
@@ -105,7 +105,7 @@ describe('writeStrategicHelpers', () => {
     writeStrategicHelpers(taskId, projectId, testWorkspace);
 
     const content = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
-    expect(content).toContain('Usage: fetch problem-model|direction|playbook|gap|message|section [id]');
+    expect(content).toContain('Usage: fetch problem-model|direction|playbook|gap|message|section|knowledge [id]');
     expect(content).toContain('problem-model) PATH_SUFFIX="problem-model"');
     expect(content).toContain('fetch $KIND requires an id argument');
   });
@@ -286,7 +286,7 @@ describe('writeFetchHelper (verb-subset read-only fetch)', () => {
     const viaStrategic = readFetch();
     expect(viaWriter).toBe(viaStrategic);
     // Spot-check the load-bearing usage + case lines the strategic suite pins.
-    expect(viaWriter).toContain('fetch problem-model|direction|playbook|gap|message|section [id]');
+    expect(viaWriter).toContain('fetch problem-model|direction|playbook|gap|message|section|knowledge [id]');
     expect(viaWriter).toContain('problem-model) PATH_SUFFIX="problem-model"');
     expect(viaWriter).toContain('message)    PATH_SUFFIX="messages/$ID"');
     expect(viaWriter).toContain('section)    PATH_SUFFIX="design-doc/$ID"');
@@ -303,8 +303,8 @@ describe('writeFetchHelper (verb-subset read-only fetch)', () => {
     expect(content).not.toContain('PATH_SUFFIX="playbook/$ID"');
     expect(content).not.toContain('PATH_SUFFIX="messages/$ID"');
     expect(content).not.toContain('PATH_SUFFIX="design-doc/$ID"');
-    // Usage line lists only the granted subset (canonical order).
-    expect(content).toContain('Usage: fetch problem-model|direction|gap [id]');
+    // Usage line lists only the granted subset (canonical order; knowledge last).
+    expect(content).toContain('Usage: fetch problem-model|direction|gap|knowledge [id]');
   });
 
   it('rejects a disallowed-but-valid verb with a clear not-permitted message', () => {
@@ -312,7 +312,7 @@ describe('writeFetchHelper (verb-subset read-only fetch)', () => {
     const content = readFetch();
     // playbook/message/section are full-vocabulary verbs not granted here — they
     // get an explicit reject branch rather than a generic "unknown kind".
-    expect(content).toContain('playbook|message|section) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: problem-model|direction|gap)."');
+    expect(content).toContain('playbook|message|section) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: problem-model|direction|gap|knowledge)."');
   });
 
   it('different subsets bake different verb vocabularies (plan subset)', () => {
@@ -321,9 +321,9 @@ describe('writeFetchHelper (verb-subset read-only fetch)', () => {
     expect(content).toContain('direction)  PATH_SUFFIX="directions/$ID"');
     expect(content).toContain('section)    PATH_SUFFIX="design-doc/$ID"');
     expect(content).toContain('playbook)   PATH_SUFFIX="playbook/$ID"');
-    expect(content).toContain('Usage: fetch direction|playbook|section [id]');
+    expect(content).toContain('Usage: fetch direction|playbook|section|knowledge [id]');
     // problem-model / gap / message are rejected here.
-    expect(content).toContain('problem-model|gap|message) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: direction|playbook|section)."');
+    expect(content).toContain('problem-model|gap|message) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: direction|playbook|section|knowledge)."');
   });
 
   it('different subsets bake different verb vocabularies (design-doc subset)', () => {
@@ -334,9 +334,9 @@ describe('writeFetchHelper (verb-subset read-only fetch)', () => {
     expect(content).toContain('playbook)   PATH_SUFFIX="playbook/$ID"');
     expect(content).toContain('gap)        PATH_SUFFIX="gaps/$ID"');
     expect(content).toContain('message)    PATH_SUFFIX="messages/$ID"');
-    expect(content).toContain('Usage: fetch direction|playbook|gap|message|section [id]');
+    expect(content).toContain('Usage: fetch direction|playbook|gap|message|section|knowledge [id]');
     // problem-model is rejected here because it is not part of the design-doc subset.
-    expect(content).toContain('problem-model) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: direction|playbook|gap|message|section)."');
+    expect(content).toContain('problem-model) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: direction|playbook|gap|message|section|knowledge)."');
   });
 
   it('bakes the project id and escapes shell-injection attempts', () => {
@@ -358,6 +358,35 @@ describe('writeFetchHelper (verb-subset read-only fetch)', () => {
     // The empty-project guard is generalized (no longer strategic-only wording).
     expect(content).toContain('no project_id available; ./fetch is unavailable in this workspace');
     expect(content).not.toContain('strategic-mode tasks');
+  });
+
+  it('provisions the SEARCH-shaped knowledge verb against the token-scoped endpoint', () => {
+    writeFetchHelper('t', 'proj-k', testWorkspace, { verbs: STRATEGIC_FETCH_VERBS });
+    const content = readFetch();
+    // knowledge is a granted case arm.
+    expect(content).toContain('  knowledge)');
+    // Get-by-id hits /knowledge-documents/$1 (full body), NOT the project path.
+    expect(content).toContain('-X GET "$API/api/agent/knowledge-documents/$1"');
+    // List/search hits the bare list endpoint with URL-encoded query filters.
+    expect(content).toContain('--get');
+    expect(content).toContain('"$API/api/agent/knowledge-documents"');
+    expect(content).toContain('--data-urlencode "topic=${2:-}"');
+    expect(content).toContain('--data-urlencode "direction=${2:-}"');
+    expect(content).toContain('--data-urlencode "q=${2:-}"');
+    expect(content).toContain('--data-urlencode "source_kind=${2:-}"');
+    expect(content).toContain('--data-urlencode "tag=${2:-}"');
+    // It is token-scoped: no project_id is baked into the knowledge URL.
+    expect(content).not.toContain('knowledge-documents/$PROJECT');
+  });
+
+  it('rejects the knowledge verb in subsets that do not grant it', () => {
+    // A bespoke subset without knowledge must reject it as not-permitted.
+    writeFetchHelper('t', 'proj-k', testWorkspace, { verbs: ['direction'] });
+    const content = readFetch();
+    expect(content).not.toContain('  knowledge)\n    shift');
+    expect(content).toContain('not permitted in this workspace');
+    // The reject branch enumerates knowledge among the disallowed verbs.
+    expect(content).toMatch(/knowledge\) echo "Error: \.\/fetch/);
   });
 });
 
@@ -381,6 +410,15 @@ describe('buildFetchGuidance', () => {
     expect(block).toContain('`./fetch gap <id>`');
     expect(block).toContain('`./fetch message <ref>`');
     expect(block).not.toContain('`./fetch problem-model`');
+  });
+
+  it('describes the SEARCH-shaped knowledge verb when granted', () => {
+    const block = buildFetchGuidance(RESEARCH_FETCH_VERBS);
+    expect(block).toContain('`./fetch knowledge');
+    expect(block).toContain('--topic');
+    expect(block).toContain('--direction');
+    // Not present when the subset omits it.
+    expect(buildFetchGuidance(['direction'])).not.toContain('`./fetch knowledge');
   });
 
   it('returns empty string when no verbs are granted', () => {

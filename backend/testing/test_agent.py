@@ -18,6 +18,7 @@ from app.models import (
     ComputeJob,
     DeploymentState,
     DeploymentStatus,
+    KnowledgeDocument,
     LLMAuthMode,
     LLMProviderName,
     MaxPlanAccount,
@@ -16888,3 +16889,141 @@ async def test_reset_health_clears_flap_escalation_state(
     followup_payload = followup_resp.json()
     assert followup_payload["health_recovery_streak_required"] == 3
     assert followup_payload["health_recovery_flap_escalated"] is False
+
+
+async def _seed_knowledge_doc(
+    db_session,
+    *,
+    project_id,
+    source_task_id,
+    title,
+    source_kind,
+    direction_id=None,
+    topic=None,
+):
+    """Persist one KnowledgeDocument for the agent-fetch endpoint tests."""
+    doc = KnowledgeDocument(
+        project_id=project_id,
+        source_task_id=source_task_id,
+        title=title,
+        summary=f"summary of {title}",
+        body=f"# {title}\n\nfull body",
+        source_kind=source_kind,
+        direction_id=direction_id,
+        topic=topic,
+    )
+    db_session.add(doc)
+    await db_session.commit()
+    await db_session.refresh(doc)
+    return doc
+
+
+@pytest.mark.asyncio
+async def test_agent_knowledge_documents_direction_and_source_kind_filters(
+    client: AsyncClient, db_session
+):
+    """The agent list endpoint honors the new direction / source_kind filters and
+    stays project-scoped to the token's task, never leaking cross-project docs."""
+    project = Project(name="Knowledge Fetch", user_id="test-user-knowledge")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "plan"}],
+        vm_instance_id="agent-vm-knowledge",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Another project + task whose documents must NEVER appear for our token.
+    other_project = Project(name="Other Knowledge", user_id="test-user-other")
+    db_session.add(other_project)
+    await db_session.commit()
+    await db_session.refresh(other_project)
+    other_task = Task(
+        project_id=other_project.id,
+        payloads=[{"type": "plan"}],
+        vm_instance_id="agent-vm-other-knowledge",
+    )
+    db_session.add(other_task)
+    await db_session.commit()
+    await db_session.refresh(other_task)
+
+    web_doc = await _seed_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="Web research on caching",
+        source_kind="web_research",
+        direction_id="d-aaa111",
+    )
+    design_doc = await _seed_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="Design for cache layer",
+        source_kind="design",
+        direction_id="d-bbb222",
+    )
+    # A cross-project doc that matches the filters but belongs to another project.
+    await _seed_knowledge_doc(
+        db_session,
+        project_id=other_project.id,
+        source_task_id=other_task.id,
+        title="Foreign web research",
+        source_kind="web_research",
+        direction_id="d-aaa111",
+    )
+
+    token = create_agent_token(str(task.id), "agent-vm-knowledge")
+    headers = {"x-agent-token": token}
+
+    # No filters: both project docs, no cross-project doc, body omitted.
+    resp = await client.get("/api/agent/knowledge-documents", headers=headers)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["total"] == 2
+    titles = {d["title"] for d in data["documents"]}
+    assert titles == {"Web research on caching", "Design for cache layer"}
+    assert all("body" not in d for d in data["documents"])
+
+    # source_kind filter narrows to a single origin.
+    resp = await client.get(
+        "/api/agent/knowledge-documents?source_kind=design", headers=headers
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["total"] == 1
+    assert data["documents"][0]["title"] == "Design for cache layer"
+    assert data["documents"][0]["id"] == str(design_doc.id)
+
+    # direction filter narrows to the motivating direction.
+    resp = await client.get(
+        "/api/agent/knowledge-documents?direction=d-aaa111", headers=headers
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["total"] == 1
+    assert data["documents"][0]["id"] == str(web_doc.id)
+
+    # Combined filters that match nothing return an empty, well-formed page.
+    resp = await client.get(
+        "/api/agent/knowledge-documents?direction=d-bbb222&source_kind=web_research",
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["total"] == 0
+    assert data["documents"] == []
+
+    # Get-by-id returns the full body for an in-project document.
+    resp = await client.get(
+        f"/api/agent/knowledge-documents/{web_doc.id}", headers=headers
+    )
+    assert resp.status_code == 200, resp.text
+    body_doc = resp.json()
+    assert body_doc["id"] == str(web_doc.id)
+    assert "full body" in body_doc["body"]

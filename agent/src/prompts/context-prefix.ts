@@ -245,6 +245,39 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     }
   }
 
+  // Existing knowledge documents — a compact, body-omitted index of
+  // web_research / design output so the strategist / research agent knows what
+  // knowledge already exists (and can fetch full bodies on demand) instead of
+  // re-commissioning research it already paid for. Rendered only when the
+  // backend shipped a non-empty index; absent otherwise (clean omission).
+  const knowledgeIndex = Array.isArray(payload?.knowledge_index)
+    ? payload.knowledge_index as Array<Record<string, unknown>>
+    : [];
+  if (knowledgeIndex.length > 0) {
+    const kdLines: string[] = ['## Existing knowledge documents'];
+    kdLines.push(
+      'Knowledge already produced by prior web_research / design work. Build on it — fetch the full body on demand with `./fetch knowledge <id>` rather than re-deriving it.',
+    );
+    for (const entry of knowledgeIndex) {
+      const id = strVal(entry.id);
+      const title = strVal(entry.title);
+      if (!id || !title) continue;
+      const meta: string[] = [];
+      const topic = strVal(entry.topic);
+      if (topic) meta.push(`topic: ${topic}`);
+      const directionId = strVal(entry.direction_id);
+      if (directionId) meta.push(`direction: ${directionId}`);
+      const sourceKind = strVal(entry.source_kind);
+      if (sourceKind) meta.push(sourceKind);
+      const metaSuffix = meta.length > 0 ? ` (${meta.join(', ')})` : '';
+      kdLines.push(`- [${id}] ${title}${metaSuffix}`);
+      const summary = strVal(entry.summary);
+      if (summary) kdLines.push(`  ${summary}`);
+    }
+    kdLines.push('');
+    prefix += kdLines.join('\n') + '\n';
+  }
+
   if (projectCtx) {
     const hasData = Object.keys(projectCtx).some(k => {
       const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;

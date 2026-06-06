@@ -340,6 +340,15 @@ runtime_config: Dict = {
     "max_retained_images": 10,  # Agent VM image family pruning (keep N most recent; GCP per-project image quota is tight)
     "require_approval_gates": True,
     "daily_cost_ceiling_usd": 0,  # 0 = disabled; positive float enables budget alerts
+    # Proposed compute_experiment spend cap (USD) above which an autonomously
+    # authored launch is HELD for operator approval (requires_approval=True at
+    # spawn) rather than dispatched. A per-direction override is honored when a
+    # direction dict carries its own "compute_experiment_spend_threshold_usd"
+    # key (directions are flat JSON dicts that already hold per-direction floats
+    # like cost_budget_usd — no new column/migration). This sits ABOVE the hard
+    # global clamp in compute_jobs.py (MAX_COMPUTE_JOB_SPEND_CAP_USD), which
+    # remains an untouched backstop. <=0 means hold every positive-cap launch.
+    "compute_experiment_spend_threshold_usd": 10.0,
     "spawn_confidence_threshold": 0.25,  # P(success) below this injects low_confidence_spawn=True into task context
     # During degraded operation only, tasks whose P(success) falls below this floor
     # are skipped this dispatch cycle (remain QUEUED) so scarce slots go to higher-
@@ -926,6 +935,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "daily_cost_ceiling_usd",
                         float(config_json["daily_cost_ceiling_usd"]),
+                    )
+                if "compute_experiment_spend_threshold_usd" in config_json:
+                    _set(
+                        "compute_experiment_spend_threshold_usd",
+                        float(config_json["compute_experiment_spend_threshold_usd"]),
                     )
                 if "auto_archive_enabled" in config_json:
                     _set(

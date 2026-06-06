@@ -1663,6 +1663,125 @@ class TestProvenanceWarningsAttachment:
         assert "_finding_cited_paths" not in ctx
 
 
+class TestKnowledgeFindingRouting:
+    """web_research / design findings route to the matching knowledge child.
+
+    Guards the additive branches in BOTH routing cascades inside
+    _handle_research_completion: a finding of type 'web_research' must spawn a
+    web_research child and 'design' a design child, never falling through to the
+    scope-based plan/create fallback. The spawned knowledge child must also carry
+    the originating direction context like every other spawned child.
+    """
+
+    async def _spawn_from_finding(self, db_session, mocker, *, direction_id, finding):
+        from test_autonomous_research import _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(
+            db_session, direction_id
+        )
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding],
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+        for path, value in (
+            ("app.research_completion.resolve_branch_verification_context", {}),
+            ("app.research_completion.resolve_head_commit", None),
+            ("app.research_completion.cited_paths_changed_since", False),
+            ("app.research_completion._summarize_ungrounded_claims_grounded", None),
+        ):
+            mocker.patch(path, new=AsyncMock(return_value=value))
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return next(c for c in children if c.title == finding["title"]), task
+
+    @_pytest.mark.asyncio
+    async def test_web_research_finding_spawns_web_research_child(
+        self, db_session, mocker
+    ):
+        from test_autonomous_research import _make_finding
+
+        finding = _make_finding(
+            title="Investigate vendor API",
+            direction_id="d-know-wr01",
+            finding_type="web_research",
+        )
+        child, _task = await self._spawn_from_finding(
+            db_session, mocker, direction_id="d-know-wr01", finding=finding
+        )
+        assert child.first_payload["type"] == "web_research"
+
+    @_pytest.mark.asyncio
+    async def test_design_finding_spawns_design_child(self, db_session, mocker):
+        from test_autonomous_research import _make_finding
+
+        finding = _make_finding(
+            title="Design the ingestion pipeline",
+            direction_id="d-know-ds01",
+            finding_type="design",
+        )
+        child, _task = await self._spawn_from_finding(
+            db_session, mocker, direction_id="d-know-ds01", finding=finding
+        )
+        assert child.first_payload["type"] == "design"
+
+    @_pytest.mark.asyncio
+    async def test_large_scope_web_research_finding_not_routed_to_plan(
+        self, db_session, mocker
+    ):
+        """A large-scope knowledge finding routes to its knowledge type, NOT plan.
+
+        Guards the branch-ordering requirement: the knowledge branch must come
+        before the scope-based plan/create fallback.
+        """
+        from test_autonomous_research import _make_finding
+
+        finding = _make_finding(
+            title="Survey distributed-tracing protocols",
+            direction_id="d-know-wr02",
+            scope="large",
+            finding_type="web_research",
+        )
+        child, _task = await self._spawn_from_finding(
+            db_session, mocker, direction_id="d-know-wr02", finding=finding
+        )
+        assert child.first_payload["type"] == "web_research"
+
+    @_pytest.mark.asyncio
+    async def test_knowledge_child_carries_direction_context(
+        self, db_session, mocker
+    ):
+        from test_autonomous_research import _make_finding
+
+        finding = _make_finding(
+            title="Research auth-token best practices",
+            direction_id="d-know-ctx01",
+            finding_type="web_research",
+        )
+        child, task = await self._spawn_from_finding(
+            db_session, mocker, direction_id="d-know-ctx01", finding=finding
+        )
+        ctx = child.context or {}
+        assert ctx.get("direction_id") == "d-know-ctx01"
+        assert ctx.get("research_task_id") == str(task.id)
+        assert ctx.get("parent_research_task_id") == str(task.id)
+
+
 class TestRecomputeLaunchStaleness:
     """Launch-time cited-file staleness recompute (orchestrator dispatch hook)."""
 
@@ -3928,3 +4047,423 @@ class TestBreakFindingDependencyCycles:
         rec = dropped[0]
         assert {rec["successor_index"], rec["predecessor_index"]} == {0, 1}
         assert rec["successor"] in {"cycle-a", "cycle-b"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# compute_experiment launch-contract authoring + spend-threshold approval gate
+#
+# The decomposition/finding spawn path authors + validates a compute_experiment
+# launch contract (command / spend_cap_usd / deadline_seconds / optional
+# success_criterion) before creating any task. When the proposed spend cap
+# exceeds the configured threshold knob (per-direction override else the global
+# `compute_experiment_spend_threshold_usd`), the spawn is held for operator
+# approval via Task.requires_approval; at or below the threshold it dispatches.
+# A malformed / incomplete contract is deferred loudly (no broken job spawned).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _compute_finding(
+    direction_id: str,
+    *,
+    command="python3 bench.py --n 1000",
+    spend_cap_usd=2.0,
+    deadline_seconds=3600,
+    success_criterion=None,
+    nested_key=None,
+    title="Measure throughput regression",
+):
+    """A compute_experiment-typed research finding carrying a launch contract.
+
+    By default the launch fields are flat on the finding; pass ``nested_key`` to
+    nest them under ``compute_experiment`` / ``launch_contract`` instead.
+    """
+    from test_autonomous_research import _make_finding
+
+    finding = _make_finding(
+        title=title, direction_id=direction_id, finding_type="compute_experiment"
+    )
+    launch = {}
+    if command is not None:
+        launch["command"] = command
+    if spend_cap_usd is not None:
+        launch["spend_cap_usd"] = spend_cap_usd
+    if deadline_seconds is not None:
+        launch["deadline_seconds"] = deadline_seconds
+    if success_criterion is not None:
+        launch["success_criterion"] = success_criterion
+    if nested_key:
+        finding[nested_key] = launch
+    else:
+        finding.update(launch)
+    return finding
+
+
+async def _children_of(db_session, task):
+    return (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+class TestComputeLaunchContractAuthoring:
+    """_author_compute_launch_contract: collect launch fields flat or nested."""
+
+    def test_flat_fields_collected(self):
+        from app.research_completion import _author_compute_launch_contract
+
+        contract = _author_compute_launch_contract(
+            {
+                "command": "run.sh",
+                "spend_cap_usd": 3.5,
+                "deadline_seconds": 1800,
+                "success_criterion": {"metric": "ms", "max": 50},
+                "machine_type": "n2-standard-4",
+            }
+        )
+        assert contract["command"] == "run.sh"
+        assert contract["spend_cap_usd"] == 3.5
+        assert contract["deadline_seconds"] == 1800
+        assert contract["success_criterion"] == {"metric": "ms", "max": 50}
+        assert contract["machine_type"] == "n2-standard-4"
+
+    def test_nested_under_compute_experiment_key(self):
+        from app.research_completion import _author_compute_launch_contract
+
+        contract = _author_compute_launch_contract(
+            {"compute_experiment": {"command": "x.py", "spend_cap_usd": 1, "deadline_seconds": 60}}
+        )
+        assert contract["command"] == "x.py"
+        assert contract["spend_cap_usd"] == 1
+        assert contract["deadline_seconds"] == 60
+
+    def test_nested_under_launch_contract_key(self):
+        from app.research_completion import _author_compute_launch_contract
+
+        contract = _author_compute_launch_contract(
+            {"launch_contract": {"command": "y.py", "spend_cap_usd": 2, "deadline_seconds": 120}}
+        )
+        assert contract["command"] == "y.py"
+        assert contract["deadline_seconds"] == 120
+
+    def test_optional_fields_omitted_when_absent(self):
+        from app.research_completion import _author_compute_launch_contract
+
+        contract = _author_compute_launch_contract(
+            {"command": "z.py", "spend_cap_usd": 1, "deadline_seconds": 1}
+        )
+        assert "success_criterion" not in contract
+        assert "machine_type" not in contract
+
+
+class TestComputeLaunchContractValidation:
+    """_validate_compute_launch_contract: loud reasons for each failure mode."""
+
+    def test_valid_contract_ok(self):
+        from app.research_completion import _validate_compute_launch_contract
+
+        ok, reason = _validate_compute_launch_contract(
+            {"command": "run.sh", "spend_cap_usd": 2.0, "deadline_seconds": 60}
+        )
+        assert ok is True
+        assert reason == ""
+
+    def test_missing_command_rejected(self):
+        from app.research_completion import _validate_compute_launch_contract
+
+        ok, reason = _validate_compute_launch_contract(
+            {"command": None, "spend_cap_usd": 2.0, "deadline_seconds": 60}
+        )
+        assert ok is False
+        assert "command" in reason
+
+    def test_blank_command_rejected(self):
+        from app.research_completion import _validate_compute_launch_contract
+
+        ok, reason = _validate_compute_launch_contract(
+            {"command": "   ", "spend_cap_usd": 2.0, "deadline_seconds": 60}
+        )
+        assert ok is False
+        assert "command" in reason
+
+    def test_nonpositive_spend_rejected(self):
+        from app.research_completion import _validate_compute_launch_contract
+
+        ok, reason = _validate_compute_launch_contract(
+            {"command": "run.sh", "spend_cap_usd": 0, "deadline_seconds": 60}
+        )
+        assert ok is False
+        assert "spend_cap_usd" in reason
+
+    def test_nonnumeric_spend_rejected(self):
+        from app.research_completion import _validate_compute_launch_contract
+
+        ok, reason = _validate_compute_launch_contract(
+            {"command": "run.sh", "spend_cap_usd": "free", "deadline_seconds": 60}
+        )
+        assert ok is False
+        assert "spend_cap_usd" in reason
+
+    def test_nonpositive_deadline_rejected(self):
+        from app.research_completion import _validate_compute_launch_contract
+
+        ok, reason = _validate_compute_launch_contract(
+            {"command": "run.sh", "spend_cap_usd": 2.0, "deadline_seconds": 0}
+        )
+        assert ok is False
+        assert "deadline_seconds" in reason
+
+
+class TestResolveComputeSpendThreshold:
+    """_resolve_compute_spend_threshold: per-direction override else global."""
+
+    def test_global_default(self):
+        from app.research_completion import _resolve_compute_spend_threshold
+
+        assert _resolve_compute_spend_threshold(
+            {"compute_experiment_spend_threshold_usd": 7.5}, None
+        ) == 7.5
+
+    def test_direction_override_wins(self):
+        from app.research_completion import _resolve_compute_spend_threshold
+
+        assert _resolve_compute_spend_threshold(
+            {"compute_experiment_spend_threshold_usd": 5.0},
+            {"compute_experiment_spend_threshold_usd": 20.0},
+        ) == 20.0
+
+    def test_nonpositive_override_falls_back_to_global(self):
+        from app.research_completion import _resolve_compute_spend_threshold
+
+        assert _resolve_compute_spend_threshold(
+            {"compute_experiment_spend_threshold_usd": 5.0},
+            {"compute_experiment_spend_threshold_usd": 0},
+        ) == 5.0
+
+    def test_missing_global_defaults_zero(self):
+        from app.research_completion import _resolve_compute_spend_threshold
+
+        assert _resolve_compute_spend_threshold({}, None) == 0.0
+
+
+@_pytest.mark.asyncio
+class TestComputeExperimentSpawn:
+    """End-to-end spawn path: below/above-threshold dispatch + malformed defer."""
+
+    async def test_below_threshold_spawns_dispatched_not_held(self, db_session, mocker):
+        from test_autonomous_research import _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(db_session, "d-cx01")
+        finding = _compute_finding(
+            direction["id"], spend_cap_usd=2.0, deadline_seconds=3600
+        )
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings", return_value=[finding]
+        )
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 5.0},
+        )
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = await _children_of(db_session, task)
+        assert len(children) == 1
+        child = children[0]
+        payload = child.first_payload or {}
+        assert payload.get("type") == "compute_experiment"
+        assert payload.get("command") == "python3 bench.py --n 1000"
+        assert payload.get("spend_cap_usd") == 2.0
+        assert payload.get("deadline_seconds") == 3600
+        # At/below threshold -> dispatched, not held.
+        assert child.requires_approval is False
+
+    async def test_above_threshold_spawns_held_for_approval(self, db_session, mocker):
+        from test_autonomous_research import _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(db_session, "d-cx02")
+        finding = _compute_finding(
+            direction["id"], spend_cap_usd=50.0, deadline_seconds=7200
+        )
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings", return_value=[finding]
+        )
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 5.0},
+        )
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = await _children_of(db_session, task)
+        assert len(children) == 1
+        child = children[0]
+        # Task is still spawned (not dropped) — but held for operator approval.
+        assert (child.first_payload or {}).get("type") == "compute_experiment"
+        assert child.requires_approval is True
+        msg = child.latest_status_message or ""
+        assert "$50.00" in msg
+        assert "approval" in msg.lower()
+
+    async def test_per_direction_override_holds_below_global(self, db_session, mocker):
+        """A per-direction override below the global threshold holds a spend that
+        the global alone would have dispatched."""
+        from test_autonomous_research import _patch_research_externals
+
+        from sqlalchemy.orm.attributes import flag_modified
+
+        _project, direction, task = await _grader_project_and_task(db_session, "d-cx03")
+        # Direction-level override of $1; global is $100. Proposed $10 > $1 -> held.
+        # The handler reads the override from the persisted project's directions
+        # (a JSON column), so set it there rather than on the local dict copy.
+        _project.directions[0]["compute_experiment_spend_threshold_usd"] = 1.0
+        flag_modified(_project, "directions")
+        db_session.add(_project)
+        await db_session.commit()
+        finding = _compute_finding(
+            direction["id"], spend_cap_usd=10.0, deadline_seconds=600
+        )
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings", return_value=[finding]
+        )
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 100.0},
+        )
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = await _children_of(db_session, task)
+        assert len(children) == 1
+        assert children[0].requires_approval is True
+
+    async def test_nested_contract_below_threshold_dispatches(self, db_session, mocker):
+        """A launch contract nested under `compute_experiment` is authored +
+        dispatched identically to a flat one."""
+        from test_autonomous_research import _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(db_session, "d-cx04")
+        finding = _compute_finding(
+            direction["id"],
+            spend_cap_usd=1.0,
+            deadline_seconds=120,
+            nested_key="compute_experiment",
+        )
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings", return_value=[finding]
+        )
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 5.0},
+        )
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = await _children_of(db_session, task)
+        assert len(children) == 1
+        payload = children[0].first_payload or {}
+        assert payload.get("command") == "python3 bench.py --n 1000"
+        assert payload.get("spend_cap_usd") == 1.0
+        assert children[0].requires_approval is False
+
+    async def test_malformed_missing_command_defers_no_task(
+        self, db_session, mocker, caplog
+    ):
+        from test_autonomous_research import _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(db_session, "d-cx05")
+        finding = _compute_finding(
+            direction["id"], command=None, spend_cap_usd=2.0, deadline_seconds=60
+        )
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings", return_value=[finding]
+        )
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 5.0},
+        )
+
+        with caplog.at_level(logging.WARNING, logger="app.research_completion"):
+            await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+        # No compute_experiment task spawned for the malformed contract.
+        children = await _children_of(db_session, task)
+        assert not any(
+            (c.first_payload or {}).get("type") == "compute_experiment"
+            for c in children
+        )
+        # The finding is deferred loudly under the compute_contract_invalid reason.
+        deferred = (task.context or {}).get("deferred_findings", [])
+        assert any(
+            d.get("deferred_reason") == "compute_contract_invalid" for d in deferred
+        )
+        # Deferred loudly: a warning names the contract failure (empty command).
+        assert any(
+            "malformed launch contract" in r.getMessage()
+            and "command" in r.getMessage()
+            for r in caplog.records
+        )
+
+    async def test_malformed_nonpositive_spend_defers_no_task(self, db_session, mocker):
+        from test_autonomous_research import _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(db_session, "d-cx06")
+        finding = _compute_finding(
+            direction["id"], spend_cap_usd=0, deadline_seconds=60
+        )
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings", return_value=[finding]
+        )
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 5.0},
+        )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+        children = await _children_of(db_session, task)
+        assert children == []
+        deferred = (task.context or {}).get("deferred_findings", [])
+        assert any(
+            d.get("deferred_reason") == "compute_contract_invalid" for d in deferred
+        )
+
+    async def test_malformed_nonpositive_deadline_defers_no_task(
+        self, db_session, mocker
+    ):
+        from test_autonomous_research import _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(db_session, "d-cx07")
+        finding = _compute_finding(
+            direction["id"], spend_cap_usd=2.0, deadline_seconds=0
+        )
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings", return_value=[finding]
+        )
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 5.0},
+        )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+        children = await _children_of(db_session, task)
+        assert children == []
+        deferred = (task.context or {}).get("deferred_findings", [])
+        assert any(
+            d.get("deferred_reason") == "compute_contract_invalid" for d in deferred
+        )

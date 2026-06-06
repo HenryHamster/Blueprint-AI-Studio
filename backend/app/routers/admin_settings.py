@@ -96,6 +96,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "category_routing",
         "ci_backstop_timeout_minutes",
         "cochange_decomposition_enabled",
+        "compute_experiment_spend_threshold_usd",
         "cross_provider_fallback_enabled",
         "daily_cost_ceiling_usd",
         "drift_over_claim_consistency_threshold",
@@ -430,6 +431,9 @@ async def get_settings(
         "github_account": github_account,
         "require_approval_gates": _runtime_config.get("require_approval_gates", True),
         "daily_cost_ceiling_usd": _runtime_config.get("daily_cost_ceiling_usd", 0),
+        "compute_experiment_spend_threshold_usd": _runtime_config.get(
+            "compute_experiment_spend_threshold_usd", 10.0
+        ),
         "auto_archive_enabled": _runtime_config.get("auto_archive_enabled", True),
         "auto_archive_terminal_after_days": _runtime_config.get(
             "auto_archive_terminal_after_days", 7
@@ -1602,6 +1606,23 @@ async def _apply_settings(
                 detail="daily_cost_ceiling_usd must be between 0 and 100000 (0 = disabled)",
             )
         _runtime_config["daily_cost_ceiling_usd"] = val
+    if "compute_experiment_spend_threshold_usd" in payload:
+        try:
+            val = float(payload["compute_experiment_spend_threshold_usd"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="compute_experiment_spend_threshold_usd must be a number",
+            )
+        if not (0 <= val <= 100000):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "compute_experiment_spend_threshold_usd must be between 0 and "
+                    "100000 (<=0 holds every positive-cap launch for approval)"
+                ),
+            )
+        _runtime_config["compute_experiment_spend_threshold_usd"] = val
     if "auto_archive_enabled" in payload:
         val = payload["auto_archive_enabled"]
         if not isinstance(val, bool):
@@ -1998,6 +2019,9 @@ async def _apply_settings(
                     ),
                     "daily_cost_ceiling_usd": _runtime_config.get(
                         "daily_cost_ceiling_usd", 0
+                    ),
+                    "compute_experiment_spend_threshold_usd": _runtime_config.get(
+                        "compute_experiment_spend_threshold_usd", 10.0
                     ),
                     "max_provision_retries": _runtime_config.get(
                         "max_provision_retries", 3

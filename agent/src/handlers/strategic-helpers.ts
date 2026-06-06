@@ -82,13 +82,14 @@ echo ""
 // /api/agent/projects/{project_id}/... — all share the standard agent auth and
 // are callable by any of the project's agent tokens, so the helper works for
 // every task type, not just strategic-cycle agents.
-export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section';
+export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge';
 
-// Canonical order of the full vocabulary. STRATEGIC provisions all of these and
-// its emitted ./fetch script must stay byte-identical to the historical output,
-// so this ordering (and the per-verb spacing below) is load-bearing.
+// Canonical order of the full vocabulary. STRATEGIC provisions all of these.
+// `knowledge` is a SEARCH-shaped verb (token-scoped list/search + get-by-id),
+// distinct from the single-id project-path verbs that precede it; it is appended
+// last so the historical path-verb ordering is otherwise preserved.
 export const STRATEGIC_FETCH_VERBS: FetchVerb[] = [
-  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section',
+  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge',
 ];
 
 // Read-only verb subsets for non-strategic agents. Research resolves directions,
@@ -97,13 +98,15 @@ export const STRATEGIC_FETCH_VERBS: FetchVerb[] = [
 // grounding; design-doc curation resolves directions, design-doc sections,
 // playbook entries, gaps, and operator messages for architecture review.
 // All subsets are strictly read-only (every verb is a GET).
-export const RESEARCH_FETCH_VERBS: FetchVerb[] = ['direction', 'problem-model', 'gap'];
-export const PLAN_FETCH_VERBS: FetchVerb[] = ['direction', 'section', 'playbook'];
-export const DESIGN_DOC_FETCH_VERBS: FetchVerb[] = ['direction', 'section', 'playbook', 'gap', 'message'];
+export const RESEARCH_FETCH_VERBS: FetchVerb[] = ['direction', 'problem-model', 'gap', 'knowledge'];
+export const PLAN_FETCH_VERBS: FetchVerb[] = ['direction', 'section', 'playbook', 'knowledge'];
+export const DESIGN_DOC_FETCH_VERBS: FetchVerb[] = ['direction', 'section', 'playbook', 'gap', 'message', 'knowledge'];
 
-// Exact case-statement body for each verb. The spacing is preserved verbatim so
-// the full-set (strategic) script remains byte-identical to the original.
-const FETCH_VERB_CASE: Record<FetchVerb, string> = {
+// Exact case-statement body for each PATH-SUFFIX verb. The spacing is preserved
+// verbatim so the path-verb arms stay byte-identical to the original. `knowledge`
+// is intentionally absent here — it is SEARCH-shaped (its own base URL, optional
+// query filters, no project path) and gets a self-contained arm below.
+const FETCH_VERB_CASE: Partial<Record<FetchVerb, string>> = {
   'problem-model': 'problem-model) PATH_SUFFIX="problem-model"',
   'direction':     'direction)  PATH_SUFFIX="directions/$ID"',
   'playbook':      'playbook)   PATH_SUFFIX="playbook/$ID"',
@@ -111,6 +114,43 @@ const FETCH_VERB_CASE: Record<FetchVerb, string> = {
   'message':       'message)    PATH_SUFFIX="messages/$ID"',
   'section':       'section)    PATH_SUFFIX="design-doc/$ID"',
 };
+
+// Self-contained case arm for the SEARCH-shaped `knowledge` verb. Unlike the
+// path-suffix verbs it hits the token-scoped /api/agent/knowledge-documents
+// endpoint directly (project resolved from the token, not the URL): a bare
+// positional id pulls one document's full body, otherwise optional
+// --topic/--direction/--q/--source-kind/--tag flags become URL-encoded query
+// params on the list/search endpoint. It does its own curl and exits, so it
+// never falls through to the project-path fetch below.
+const KNOWLEDGE_FETCH_CASE = `  knowledge)
+    shift
+    if [ -n "\${1:-}" ] && [ "\${1#--}" = "$1" ]; then
+      kresp=$(curl -sS --max-time 20 --connect-timeout 10 \\
+        -X GET "$API/api/agent/knowledge-documents/$1" \\
+        -H "X-Agent-Token: $TOKEN" -w '\\n%{http_code}')
+    else
+      QARGS=()
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --topic)       QARGS+=(--data-urlencode "topic=\${2:-}"); shift 2 ;;
+          --direction)   QARGS+=(--data-urlencode "direction=\${2:-}"); shift 2 ;;
+          --source-kind) QARGS+=(--data-urlencode "source_kind=\${2:-}"); shift 2 ;;
+          --q)           QARGS+=(--data-urlencode "q=\${2:-}"); shift 2 ;;
+          --tag)         QARGS+=(--data-urlencode "tag=\${2:-}"); shift 2 ;;
+          *) echo "[ERROR] fetch knowledge: unknown flag '$1' (use --topic/--direction/--q/--source-kind/--tag or a document id)" >&2; exit 1 ;;
+        esac
+      done
+      kresp=$(curl -sS --max-time 20 --connect-timeout 10 --get \\
+        "\${QARGS[@]}" "$API/api/agent/knowledge-documents" \\
+        -H "X-Agent-Token: $TOKEN" -w '\\n%{http_code}')
+    fi
+    kcode=$(printf '%s' "$kresp" | tail -n1)
+    kbody=$(printf '%s' "$kresp" | head -n -1)
+    if [ "$kcode" -ge 200 ] && [ "$kcode" -lt 300 ]; then printf '%s' "$kbody"; echo ""; exit 0; fi
+    printf '%s' "$kbody" >&2
+    echo "[ERROR] fetch knowledge failed (HTTP $kcode)" >&2
+    exit 1
+    ;;`;
 
 // One-line description of what each verb resolves, for the prompt guidance block.
 const FETCH_VERB_HELP: Record<FetchVerb, string> = {
@@ -120,6 +160,7 @@ const FETCH_VERB_HELP: Record<FetchVerb, string> = {
   'gap':           '`./fetch gap <id>` — a full gap record',
   'message':       '`./fetch message <ref>` — an operator message (short ref or UUID)',
   'section':       '`./fetch section <key>` — a full design-doc section',
+  'knowledge':     '`./fetch knowledge [--topic T] [--direction D] [--q TERM] [--source-kind K] [--tag T]` — list/search knowledge documents (web_research/design outputs); `./fetch knowledge <id>` for one document\'s full body',
 };
 
 function generateFetchScript(projectIdRaw: string, verbs: FetchVerb[]): string {
@@ -130,7 +171,9 @@ function generateFetchScript(projectIdRaw: string, verbs: FetchVerb[]): string {
   const rejected = STRATEGIC_FETCH_VERBS.filter(v => !verbs.includes(v));
   const verbList = granted.join('|');
   const caseBody = [
-    ...granted.map(v => `  ${FETCH_VERB_CASE[v]} ;;`),
+    ...granted.map(v => v === 'knowledge'
+      ? KNOWLEDGE_FETCH_CASE
+      : `  ${FETCH_VERB_CASE[v]} ;;`),
     // Verbs in the full vocabulary that are NOT granted here get an explicit
     // "not permitted in this workspace" reject (mirrors writeDesignDocHelper's
     // read-only reject) rather than a generic "unknown kind". For the full set

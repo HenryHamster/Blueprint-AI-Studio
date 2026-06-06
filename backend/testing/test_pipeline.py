@@ -3761,8 +3761,15 @@ async def test_set_vision_preserves_internal_tracking_fields(strategic_db, mocke
     assert "_strategic_failures_at" not in vision
 
 
-async def _post_spawn_task(strategic_db, task_id, *, title, prompt, spawn_type="plan"):
-    """POST a strategic spawn_task op against the test app, returning the JSON body."""
+async def _post_spawn_task(
+    strategic_db, task_id, *, title, prompt, spawn_type="plan", expect_status=200
+):
+    """POST a strategic spawn_task op against the test app.
+
+    Returns the parsed JSON body. When ``expect_status`` is the default 200 the
+    JSON is the success body; for an expected error status (e.g. 400) it is the
+    FastAPI error envelope ({"detail": ...}).
+    """
     from httpx import AsyncClient, ASGITransport
     from app.main import app
     from app.database import get_session
@@ -3788,7 +3795,7 @@ async def _post_spawn_task(strategic_db, task_id, *, title, prompt, spawn_type="
                     "data": {"type": spawn_type, "title": title, "prompt": prompt},
                 },
             )
-        assert resp.status_code == 200, resp.text
+        assert resp.status_code == expect_status, resp.text
         return resp.json()
     finally:
         app.dependency_overrides.pop(get_session, None)
@@ -3901,6 +3908,85 @@ async def test_spawn_task_distinct_title_is_not_deduped(strategic_db):
         )
     ).scalar()
     assert count == 2
+
+
+async def _make_strategic_review(strategic_db):
+    """Helper: create a project + IN_PROGRESS strategic_review task, returning
+    (project, review_id) for spawn_task tests."""
+    project = Project(name="P", user_id="u1")
+    strategic_db.add(project)
+    await strategic_db.commit()
+    await strategic_db.refresh(project)
+
+    review = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review"}],
+    )
+    strategic_db.add(review)
+    await strategic_db.commit()
+    await strategic_db.refresh(review)
+    return project, str(review.id)
+
+
+@pytest.mark.parametrize("spawn_type", ["web_research", "design"])
+@pytest.mark.asyncio
+async def test_spawn_task_allows_registry_knowledge_types(strategic_db, spawn_type):
+    """web_research and design are strategist_spawnable in the registry, so the
+    spawn_task op must accept them end-to-end and create a QUEUED task carrying the
+    expected payload type, created_by, and strategic_direct context."""
+    from sqlmodel import select
+
+    _project, review_id = await _make_strategic_review(strategic_db)
+
+    body = await _post_spawn_task(
+        strategic_db,
+        review_id,
+        title=f"Investigate via {spawn_type}",
+        prompt=f"Do {spawn_type} work",
+        spawn_type=spawn_type,
+    )
+    assert body["status"] == "ok"
+    assert body["type"] == spawn_type
+    assert not body.get("deduplicated")
+
+    spawned = (
+        await strategic_db.execute(
+            select(Task).where(Task.id == body["task_id"])
+        )
+    ).scalar_one()
+    assert spawned.status == TaskStatus.QUEUED
+    assert spawned.created_by == "STRATEGIC_AGENT"
+    assert spawned.first_payload.get("type") == spawn_type
+    ctx = spawned.context or {}
+    assert ctx.get("spawned_by") == "strategic_direct"
+    assert ctx.get("parent_strategic_task_id") == review_id
+
+
+@pytest.mark.asyncio
+async def test_spawn_task_rejects_non_allowlisted_implementation_type(strategic_db):
+    """An implementation / PR-producing type (create) is not strategist_spawnable,
+    so the spawn_task op must reject it with a 400 listing the allowed types."""
+    from app.task_capabilities import STRATEGIST_SPAWNABLE_TASK_TYPES
+
+    _project, review_id = await _make_strategic_review(strategic_db)
+
+    body = await _post_spawn_task(
+        strategic_db,
+        review_id,
+        title="Should not be allowed",
+        prompt="implement a feature",
+        spawn_type="create",
+        expect_status=400,
+    )
+    # The app's HTTPException handler wraps the detail as {"error": {"message": ...}}.
+    detail = body["error"]["message"]
+    assert "must be one of" in detail
+    assert "create" in detail  # echoes the rejected type
+    # The allowed-types list in the message is the registry-derived sorted set.
+    assert str(sorted(STRATEGIST_SPAWNABLE_TASK_TYPES)) in detail
 
 
 # ── Direction Starvation Detection ───────────────────────────────────────────

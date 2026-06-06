@@ -1632,3 +1632,220 @@ async def test_persist_document_provenance_absent_stores_null(
     doc = docs[0]
     assert doc.authoring_branch is None
     assert doc.head_sha is None
+
+
+# ── build_knowledge_index: compact, bounded, scoped index ────────────────────
+
+
+async def _make_knowledge_doc(
+    db_session,
+    *,
+    project_id,
+    source_task_id,
+    title,
+    summary="A summary.",
+    topic="t",
+    direction_id=None,
+    source_kind="web_research",
+    created_at=None,
+):
+    """Persist one KnowledgeDocument for index tests, with optional explicit
+    created_at so ordering is deterministic within a single transaction."""
+    doc = KnowledgeDocument(
+        project_id=project_id,
+        source_task_id=source_task_id,
+        title=title,
+        summary=summary,
+        body="# Body\n\n" + ("x" * 50),
+        topic=topic,
+        direction_id=direction_id,
+        source_kind=source_kind,
+    )
+    if created_at is not None:
+        doc.created_at = created_at
+    db_session.add(doc)
+    await db_session.commit()
+    await db_session.refresh(doc)
+    return doc
+
+
+@pytest.mark.asyncio
+async def test_build_knowledge_index_compact_fields_no_body(db_session):
+    """The index carries only the compact navigation fields and never the body."""
+    from app.knowledge_query import build_knowledge_index
+
+    project, task = await _make_web_research_task(db_session, project_name="KI1")
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="Doc A",
+        summary="Summary A",
+        topic="auth",
+        direction_id="d-aaaa1111",
+        source_kind="design",
+    )
+
+    index = await build_knowledge_index(db_session, project.id)
+    assert len(index) == 1
+    entry = index[0]
+    assert set(entry.keys()) == {
+        "id",
+        "title",
+        "summary",
+        "topic",
+        "direction_id",
+        "source_kind",
+        "created_at",
+    }
+    assert "body" not in entry
+    assert entry["title"] == "Doc A"
+    assert entry["summary"] == "Summary A"
+    assert entry["topic"] == "auth"
+    assert entry["direction_id"] == "d-aaaa1111"
+    assert entry["source_kind"] == "design"
+
+
+@pytest.mark.asyncio
+async def test_build_knowledge_index_empty_when_no_documents(db_session):
+    """No documents → empty list (the caller omits the payload field entirely)."""
+    from app.knowledge_query import build_knowledge_index
+
+    project, _task = await _make_web_research_task(db_session, project_name="KI2")
+    assert await build_knowledge_index(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_build_knowledge_index_respects_count_cap(db_session):
+    """The entry count never exceeds the requested limit."""
+    from app.knowledge_query import build_knowledge_index
+
+    project, task = await _make_web_research_task(db_session, project_name="KI3")
+    for i in range(5):
+        await _make_knowledge_doc(
+            db_session,
+            project_id=project.id,
+            source_task_id=task.id,
+            title=f"Doc {i}",
+        )
+    index = await build_knowledge_index(db_session, project.id, limit=3)
+    assert len(index) == 3
+
+
+@pytest.mark.asyncio
+async def test_build_knowledge_index_truncates_summary(db_session):
+    """Long summaries are collapsed and truncated to summary_chars (with ellipsis)."""
+    from app.knowledge_query import build_knowledge_index
+
+    project, task = await _make_web_research_task(db_session, project_name="KI4")
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="Long",
+        summary="word " * 100,
+    )
+    index = await build_knowledge_index(db_session, project.id, summary_chars=40)
+    assert len(index) == 1
+    summary = index[0]["summary"]
+    assert len(summary) <= 40
+    assert summary.endswith("…")
+
+
+@pytest.mark.asyncio
+async def test_build_knowledge_index_newest_first(db_session):
+    """Entries are ordered newest-first by created_at."""
+    from datetime import datetime, timedelta
+
+    from app.knowledge_query import build_knowledge_index
+
+    project, task = await _make_web_research_task(db_session, project_name="KI5")
+    base = datetime(2026, 1, 1, 12, 0, 0)
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="Older",
+        created_at=base,
+    )
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="Newer",
+        created_at=base + timedelta(hours=1),
+    )
+    index = await build_knowledge_index(db_session, project.id)
+    assert [e["title"] for e in index] == ["Newer", "Older"]
+
+
+@pytest.mark.asyncio
+async def test_build_knowledge_index_direction_scope_first_then_project_fill(
+    db_session,
+):
+    """Direction-scoped docs come first; project-wide docs fill the remainder,
+    with no duplicates and total bounded by the limit."""
+    from datetime import datetime, timedelta
+
+    from app.knowledge_query import build_knowledge_index
+
+    project, task = await _make_web_research_task(db_session, project_name="KI6")
+    base = datetime(2026, 1, 1, 12, 0, 0)
+    # Two project-wide (no direction) docs, NEWER than the direction-scoped one.
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="Proj newer 1",
+        direction_id=None,
+        created_at=base + timedelta(hours=5),
+    )
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="Proj newer 2",
+        direction_id=None,
+        created_at=base + timedelta(hours=4),
+    )
+    # One direction-scoped doc, OLDER than the project-wide ones.
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="Dir doc",
+        direction_id="d-zzzz9999",
+        created_at=base,
+    )
+
+    index = await build_knowledge_index(
+        db_session, project.id, direction_id="d-zzzz9999"
+    )
+    titles = [e["title"] for e in index]
+    # Direction doc first despite being oldest; then project-wide fill newest-first.
+    assert titles[0] == "Dir doc"
+    assert set(titles) == {"Dir doc", "Proj newer 1", "Proj newer 2"}
+    assert len(titles) == len(set(titles))  # no duplicates
+
+
+@pytest.mark.asyncio
+async def test_build_knowledge_index_excludes_cross_project(db_session):
+    """Documents from other projects are never included."""
+    from app.knowledge_query import build_knowledge_index
+
+    project_a, task_a = await _make_web_research_task(db_session, project_name="KIA")
+    project_b, task_b = await _make_web_research_task(db_session, project_name="KIB")
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project_a.id,
+        source_task_id=task_a.id,
+        title="A doc",
+    )
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project_b.id,
+        source_task_id=task_b.id,
+        title="B doc",
+    )
+    index_a = await build_knowledge_index(db_session, project_a.id)
+    assert [e["title"] for e in index_a] == ["A doc"]

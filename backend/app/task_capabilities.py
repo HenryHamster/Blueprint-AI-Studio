@@ -185,6 +185,24 @@ class TaskCapability:
     # `fix`) require a pre-existing PR context (pr_number/branch) a plan cannot
     # supply, so they are not valid fresh plan children.
     plan_subtask_eligible: bool = False
+    # Whether a completing plan task may spawn this type as a knowledge-prerequisite
+    # subtask — a non-PR-producing child that yields a durable knowledge document
+    # (web_research / design) which a downstream implementation child can depend on.
+    # SINGLE source of truth for the plan-decomposition KNOWLEDGE child allowlist
+    # (plan_completion.py) — see PLAN_KNOWLEDGE_SUBTASK_TYPES. This is DELIBERATELY
+    # disjoint from plan_subtask_eligible: a knowledge prerequisite does NOT push a
+    # branch/PR, has no pre-existing PR context, and must NOT be classified as a
+    # PR-producing implementation subtype, so it carries its own separate flag
+    # rather than widening PLAN_SUBTASK_TYPES.
+    plan_knowledge_prereq_eligible: bool = False
+    # Whether the autonomous strategist (strategic_review) may directly spawn this
+    # type via the spawn_task ops operation. SINGLE source of truth for the
+    # strategist spawn allowlist (routers/admin_agent_ops.py) — see
+    # STRATEGIST_SPAWNABLE_TASK_TYPES. Intentionally limited to investigation /
+    # knowledge / plan types (research, plan, web_research, design); it is NOT set
+    # on implementation / PR-producing types, which must flow through the normal
+    # direction → research → plan → create path rather than being spawned directly.
+    strategist_spawnable: bool = False
     # Short presentation badge for compact operator surfaces (task cards, filter
     # chips). Defaults to ``label`` when unset via the published contract.
     badge: str | None = None
@@ -258,6 +276,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         default_category="strategic",
         user_launchable=True,
         reservable=True,
+        strategist_spawnable=True,
         description="Decompose work into subtasks.",
         run_shape="single_agent",
         output_kind="knowledge",
@@ -273,6 +292,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         default_category="strategic",
         user_launchable=True,
         reservable=True,
+        strategist_spawnable=True,
         description="Analyze the codebase and produce findings.",
         run_shape="single_agent",
         output_kind="knowledge",
@@ -552,6 +572,8 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "read_only",
         default_category="strategic",
         user_launchable=True,
+        strategist_spawnable=True,
+        plan_knowledge_prereq_eligible=True,
         description=(
             "Web-first research that produces a durable, queryable knowledge "
             "document (with web citations) into the knowledge-document store."
@@ -570,6 +592,8 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "read_only",
         default_category="strategic",
         user_launchable=True,
+        strategist_spawnable=True,
+        plan_knowledge_prereq_eligible=True,
         description=(
             "Codebase-internal design work: ground a design question in the "
             "actual code and produce a durable, queryable design document (with "
@@ -675,6 +699,36 @@ PLAN_SUBTASK_TYPES: frozenset[str] = frozenset(
     capability.id.value
     for capability in TASK_CAPABILITIES
     if capability.plan_subtask_eligible
+)
+# Canonical registry of task types a completing plan task may spawn as a
+# KNOWLEDGE-PREREQUISITE subtask. SINGLE source of truth for the plan-decomposition
+# knowledge-child allowlist (plan_completion.py). These types (web_research, design)
+# produce a durable knowledge document, NOT a branch/PR, and have no pre-existing PR
+# context — so a downstream implementation child can validly depend on the knowledge
+# they yield before code work proceeds. This set is DELIBERATELY DISJOINT from
+# PLAN_SUBTASK_TYPES (the PR-producing write/implementation subtypes): a knowledge
+# prerequisite is read-only and must NOT be classified as PR-producing, so it is
+# derived from a separate ``plan_knowledge_prereq_eligible`` flag rather than folded
+# into PLAN_SUBTASK_TYPES. A newly registered knowledge type becomes a valid plan
+# prerequisite by declaring that flag alone.
+PLAN_KNOWLEDGE_SUBTASK_TYPES: frozenset[str] = frozenset(
+    capability.id.value
+    for capability in TASK_CAPABILITIES
+    if capability.plan_knowledge_prereq_eligible
+)
+# Canonical registry of task types the autonomous strategist (strategic_review)
+# may directly spawn via the spawn_task ops operation. SINGLE source of truth for
+# the strategist spawn allowlist (routers/admin_agent_ops.py) — the handler
+# derives its allowed set from this frozenset rather than a hardcoded literal, so
+# a newly registered investigation/knowledge type becomes strategist-spawnable by
+# declaring ``strategist_spawnable=True`` alone, with no handler edit. Deliberately
+# limited to investigation/knowledge/plan types (research, plan, web_research,
+# design); implementation / PR-producing write types are excluded and must flow
+# through the normal direction → research → plan → create path.
+STRATEGIST_SPAWNABLE_TASK_TYPES: frozenset[str] = frozenset(
+    capability.id.value
+    for capability in TASK_CAPABILITIES
+    if capability.strategist_spawnable
 )
 # Map of task-type value -> declared completion-handler logical name, derived
 # from the registry. This REPLACES the hand-maintained if/elif completion

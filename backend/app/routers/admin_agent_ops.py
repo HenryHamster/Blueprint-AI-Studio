@@ -65,7 +65,10 @@ from app.strategic_constants import (
     STRATEGIC_RESOLUTION_MAX,
     STRATEGIC_SYSTEM_ID_MAX,
 )
-from app.task_capabilities import STRATEGIC_TASK_TYPES
+from app.task_capabilities import (
+    STRATEGIC_TASK_TYPES,
+    STRATEGIST_SPAWNABLE_TASK_TYPES,
+)
 from app.task_locking import (
     lock_project_or_429 as _lock_project_or_429,
     with_directions_locked as _with_directions_locked,
@@ -1517,16 +1520,19 @@ async def strategic_operation(
         )
 
     elif payload.op == "spawn_task":
-        # Allow strategic review to directly spawn a research or plan task for
-        # targeted investigation, jumping the normal autonomous research queue.
-        # Restricted to investigation types — implementation must go through
-        # normal direction → research → plan → create flow.
-        ALLOWED_SPAWN_TYPES = {"research", "plan"}
+        # Allow strategic review to directly spawn a research, plan, web_research,
+        # or design task for targeted investigation, jumping the normal autonomous
+        # research queue. The allowed set is DERIVED FROM THE TASK-TYPE REGISTRY
+        # (STRATEGIST_SPAWNABLE_TASK_TYPES) rather than a hardcoded literal, so a
+        # newly registered investigation/knowledge type becomes spawnable by
+        # declaring strategist_spawnable=True alone. Restricted to investigation /
+        # knowledge / plan types — implementation must go through the normal
+        # direction → research → plan → create flow.
         spawn_type = data.get("type")
-        if spawn_type not in ALLOWED_SPAWN_TYPES:
+        if spawn_type not in STRATEGIST_SPAWNABLE_TASK_TYPES:
             raise HTTPException(
                 status_code=400,
-                detail=f"spawn_task type must be one of {sorted(ALLOWED_SPAWN_TYPES)}; got '{spawn_type}'",
+                detail=f"spawn_task type must be one of {sorted(STRATEGIST_SPAWNABLE_TASK_TYPES)}; got '{spawn_type}'",
             )
         raw_prompt = str(data.get("prompt", "")).strip()
         if not raw_prompt:

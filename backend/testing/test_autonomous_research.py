@@ -181,6 +181,65 @@ async def _make_research_task(
 
 
 @pytest.mark.asyncio
+async def test_research_payload_includes_knowledge_index_scoped_to_direction(
+    db_session,
+):
+    """A spawned research task carries the compact knowledge index, with the
+    chosen direction's documents surfaced first."""
+    from app.models import KnowledgeDocument
+
+    project = Project(
+        name="Knowledge Index Research",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-ki-research")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    src = Task(
+        project_id=project.id,
+        title="src",
+        payloads=[{"type": "web_research", "topic": "t", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(src)
+    await db_session.commit()
+    await db_session.refresh(src)
+    db_session.add(
+        KnowledgeDocument(
+            project_id=project.id,
+            source_task_id=src.id,
+            title="Existing knowledge",
+            summary="A prior document.",
+            body="# Body\n\n" + ("x" * 50),
+            topic="auth",
+            direction_id="d-ki-research",
+            source_kind="web_research",
+        )
+    )
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research) == 1
+    payload = research[0].first_payload
+    assert "knowledge_index" in payload
+    entry = payload["knowledge_index"][0]
+    assert entry["title"] == "Existing knowledge"
+    assert entry["direction_id"] == "d-ki-research"
+    assert "body" not in entry
+
+
+@pytest.mark.asyncio
 async def test_spawn_blocked_by_open_circuit_breaker(db_session):
     """Circuit breaker in OPEN state (cooldown not elapsed) prevents spawning."""
     project = Project(

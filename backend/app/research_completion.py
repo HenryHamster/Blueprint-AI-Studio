@@ -484,6 +484,101 @@ def _compute_prompt_telemetry(
     }
 
 
+# Finding ``type`` values that declare an empirical-measurement intent and should
+# route to a ``compute_experiment`` child (a budgeted, auto-torn-down compute job)
+# rather than a code-writing implementer.
+COMPUTE_EXPERIMENT_FINDING_TYPES: frozenset[str] = frozenset(
+    {"compute_experiment", "measurement", "benchmark"}
+)
+
+
+def _author_compute_launch_contract(finding: Dict[str, Any]) -> Dict[str, Any]:
+    """Assemble a compute_experiment launch contract from a research finding.
+
+    A measurement finding may carry the launch fields either flat on the finding
+    or nested under a ``compute_experiment`` / ``launch_contract`` dict. The
+    required fields are ``command``, ``spend_cap_usd`` and ``deadline_seconds``;
+    optional fields (``success_criterion`` and the benchmark/launch metadata) are
+    forwarded only when present. Validation is the caller's responsibility via
+    :func:`_validate_compute_launch_contract` — this only collects the raw spec.
+    """
+    nested = finding.get("compute_experiment") or finding.get("launch_contract") or {}
+    if not isinstance(nested, dict):
+        nested = {}
+
+    def _pick(key: str) -> Any:
+        val = nested.get(key)
+        if val is None:
+            val = finding.get(key)
+        return val
+
+    contract: Dict[str, Any] = {
+        "command": _pick("command"),
+        "spend_cap_usd": _pick("spend_cap_usd"),
+        "deadline_seconds": _pick("deadline_seconds"),
+    }
+    success = _pick("success_criterion")
+    if success is not None:
+        contract["success_criterion"] = success
+    for opt_key in ("machine_type", "experiment", "benchmark", "metric", "cwd", "env"):
+        val = _pick(opt_key)
+        if val is not None:
+            contract[opt_key] = val
+    return contract
+
+
+def _validate_compute_launch_contract(
+    contract: Dict[str, Any],
+) -> tuple[bool, str]:
+    """Return ``(ok, reason)`` for a proposed compute_experiment launch contract.
+
+    Requires a non-empty command, a strictly positive ``spend_cap_usd`` and a
+    strictly positive ``deadline_seconds``. ``reason`` names the first failure so
+    the finding can be deferred with a clear logged reason instead of spawning a
+    broken job.
+    """
+    command = contract.get("command")
+    if not (isinstance(command, str) and command.strip()):
+        return False, "missing or empty command"
+    try:
+        spend = float(contract.get("spend_cap_usd"))
+    except (TypeError, ValueError):
+        return False, f"spend_cap_usd is not a number ({contract.get('spend_cap_usd')!r})"
+    if not spend > 0:
+        return False, f"spend_cap_usd must be positive (got {spend})"
+    try:
+        deadline = int(contract.get("deadline_seconds"))
+    except (TypeError, ValueError):
+        return (
+            False,
+            f"deadline_seconds is not an integer ({contract.get('deadline_seconds')!r})",
+        )
+    if not deadline > 0:
+        return False, f"deadline_seconds must be positive (got {deadline})"
+    return True, ""
+
+
+def _resolve_compute_spend_threshold(
+    runtime_config: Dict[str, Any],
+    direction: Dict[str, Any] | None,
+) -> float:
+    """Resolve the compute_experiment approval threshold (USD).
+
+    A per-direction override wins when the direction dict carries a positive
+    ``compute_experiment_spend_threshold_usd`` (directions are flat JSON dicts
+    that already hold per-direction floats like ``cost_budget_usd`` — no new
+    column/migration). Otherwise the global runtime_config default applies.
+    """
+    if direction:
+        override = direction.get("compute_experiment_spend_threshold_usd")
+        if isinstance(override, (int, float)) and override > 0:
+            return float(override)
+    try:
+        return float(runtime_config.get("compute_experiment_spend_threshold_usd", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _outcome_complexity_threshold(
     direction: Optional[Dict[str, Any]],
 ) -> Optional[float]:
@@ -1862,6 +1957,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _impl_spawned = 0
     _degradation_gate_deferred: list[dict] = []
     _low_actionability_deferred: list[dict] = []
+    # compute_experiment findings whose authored launch contract was incomplete
+    # or malformed — deferred loudly rather than spawning a broken compute job.
+    _compute_contract_deferred: list[dict] = []
     _low_conf_skipped_findings: list[dict] = []
     _scope_skip_counts: dict[str, int] = {}
 
@@ -2086,6 +2184,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 # pre-calibration scope, which is the proposed scope at this point.
                 if finding_type == "research":
                     _prelim_task_type: str | None = "research"
+                elif finding_type in COMPUTE_EXPERIMENT_FINDING_TYPES:
+                    _prelim_task_type = "compute_experiment"
                 elif finding_type in (
                     "security_audit",
                     "qa",
@@ -2097,6 +2197,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     _prelim_task_type = finding_type
                 elif finding_type == "refactor":
                     _prelim_task_type = "refactor"
+                elif finding_type in ("web_research", "design"):
+                    # knowledge-producing types: spawn the matching knowledge
+                    # task rather than falling through to the scope-based
+                    # plan/create fallback below.
+                    _prelim_task_type = finding_type
                 elif scope == "large":
                     _prelim_task_type = "plan"
                 else:
@@ -2137,6 +2242,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
         if finding_type == "research":
             task_type = "research"  # deeper investigation before implementation
+        elif finding_type in COMPUTE_EXPERIMENT_FINDING_TYPES:
+            # Empirical-measurement finding -> budgeted compute-job substrate.
+            # The launch contract is authored + validated below; only spawnable
+            # from THIS research path (plan decomposition is NOT loosened: the
+            # type stays out of PLAN_SUBTASK_TYPES so plan_completion can't spawn
+            # a contract-less compute job from a bare prompt).
+            task_type = "compute_experiment"
         elif finding_type in (
             "security_audit",
             "qa",
@@ -2148,6 +2260,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             task_type = finding_type  # spawn specialized agent
         elif finding_type == "refactor":
             task_type = "refactor"  # code quality improvement, no behavior change
+        elif finding_type in ("web_research", "design"):
+            # knowledge-producing types (read-only, output_kind=knowledge):
+            # commission external knowledge or a grounded design. Must come
+            # before the scope-based plan/create fallback so a large-scope
+            # knowledge finding is never mis-routed to plan/create.
+            task_type = finding_type
         elif scope == "large":
             task_type = "plan"  # large scope needs decomposition
         else:
@@ -2169,6 +2287,40 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             )
             continue
 
+        # compute_experiment launch-contract authoring + loud validation + the
+        # spend-threshold approval decision. Author a concrete launch contract
+        # (command / spend_cap_usd / deadline_seconds / optional success_criterion)
+        # BEFORE creating any task; on an incomplete or malformed contract, defer
+        # the finding loudly (exactly like the low-actionability/scope-budget defer
+        # paths) rather than spawning a broken job. When the proposed spend cap
+        # exceeds the configured threshold (per-direction override else global),
+        # the spawn is held for operator approval via requires_approval.
+        _compute_contract: dict | None = None
+        _compute_requires_approval = False
+        _compute_threshold = 0.0
+        if task_type == "compute_experiment":
+            _compute_contract = _author_compute_launch_contract(finding)
+            _cc_ok, _cc_reason = _validate_compute_launch_contract(_compute_contract)
+            if not _cc_ok:
+                _compute_contract_deferred.append(finding)
+                logger.warning(
+                    "[RESEARCH] Deferring compute_experiment finding '%s': "
+                    "malformed launch contract (%s)",
+                    title,
+                    _cc_reason,
+                )
+                continue
+            _cc_dir_id = finding.get("direction_id") or _parent_direction_id
+            _cc_direction = (
+                _directions_by_id.get(str(_cc_dir_id)) if _cc_dir_id else None
+            )
+            _compute_threshold = _resolve_compute_spend_threshold(
+                _runtime_config, _cc_direction
+            )
+            _compute_requires_approval = (
+                float(_compute_contract["spend_cap_usd"]) > _compute_threshold
+            )
+
         # Apply failure-feedback mitigation: downscope when rejection patterns are high
         # for this direction, and bias toward smaller scopes with proven success patterns.
         _mit_dir_id = finding.get("direction_id") or _parent_direction_id
@@ -2186,7 +2338,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # Only final merge to main requires human approval (critical files gate).
         # Exception: large-scope findings that far exceed the large-scope file budget
         # require operator confirmation before dispatching (scope_budget_mismatch gate).
-        needs_approval = _budget_requires_approval
+        # A compute_experiment whose proposed spend exceeds the threshold is also
+        # held (composes with the scope-budget gate — held if EITHER trips).
+        needs_approval = _budget_requires_approval or _compute_requires_approval
 
         direction_id = finding.get("direction_id")
         # Ignore finding.model: it's a legacy anthropic-only hint that
@@ -2683,17 +2837,54 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if _recent:
                 full_prompt = full_prompt + "\n\n" + _recent
 
-        finding_payload = validate_internal_payload(
-            {
-                "type": task_type,
-                "prompt": full_prompt,
-                "base_branch": research_branch,
-                **({"model": finding_model} if finding_model else {}),
-                **({"effort": finding_effort} if finding_effort else {}),
-                **({"prompt_suffix": _combined_suffix} if _combined_suffix else {}),
-            },
-            f"research_completion:finding:{task_type}",
-        )
+        if task_type == "compute_experiment":
+            # Build + validate the compute_experiment payload from the launch
+            # contract authored above (already validated non-empty command /
+            # positive spend cap / positive deadline). Proposed spend + deadline
+            # are present in the payload so they are operator-visible; the
+            # handler+metric gate read budget/deadline kills as intentional
+            # terminal outcomes unchanged.
+            _cc = _compute_contract or {}
+            finding_payload = validate_internal_payload(
+                {
+                    "type": "compute_experiment",
+                    "command": _cc["command"],
+                    "spend_cap_usd": float(_cc["spend_cap_usd"]),
+                    "deadline_seconds": int(_cc["deadline_seconds"]),
+                    **(
+                        {"success_criterion": _cc["success_criterion"]}
+                        if _cc.get("success_criterion") is not None
+                        else {}
+                    ),
+                    **{
+                        k: _cc[k]
+                        for k in (
+                            "machine_type",
+                            "experiment",
+                            "benchmark",
+                            "metric",
+                            "cwd",
+                            "env",
+                        )
+                        if _cc.get(k) is not None
+                    },
+                    **({"model": finding_model} if finding_model else {}),
+                    **({"effort": finding_effort} if finding_effort else {}),
+                },
+                "research_completion:finding:compute_experiment",
+            )
+        else:
+            finding_payload = validate_internal_payload(
+                {
+                    "type": task_type,
+                    "prompt": full_prompt,
+                    "base_branch": research_branch,
+                    **({"model": finding_model} if finding_model else {}),
+                    **({"effort": finding_effort} if finding_effort else {}),
+                    **({"prompt_suffix": _combined_suffix} if _combined_suffix else {}),
+                },
+                f"research_completion:finding:{task_type}",
+            )
         # Audit W1: previous_error_fingerprint is a column. Pull it out of
         # prior_retry_ctx so it lands on the column, not in JSONB context.
         _prev_fp_col = prior_retry_ctx.pop("_previous_error_fingerprint", None)
@@ -2814,6 +3005,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             priority=finding_priority,
         )
         session.add(new_task)
+        if (
+            task_type == "compute_experiment"
+            and _compute_requires_approval
+            and _compute_contract
+        ):
+            # Operator-visible reason naming proposed spend, deadline and the
+            # threshold it crossed, so the existing approval queue + 2h timeout +
+            # operator approve flow surface a held launch distinctly from a
+            # running/completed one.
+            new_task.latest_status_message = (
+                "Held for operator approval: compute_experiment proposes "
+                f"${float(_compute_contract['spend_cap_usd']):.2f} spend cap / "
+                f"{int(_compute_contract['deadline_seconds'])}s deadline, exceeding "
+                f"the ${_compute_threshold:.2f} approval threshold."
+            )
         child_tasks.append(new_task)
         finding_indices.append(orig_i)
         _auto_decomposed_flags.append(bool(finding.get("auto_decomposed")))
@@ -2835,6 +3041,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _all_deferred = (
         [_stamp_deferral(f, "low_actionability") for f in _low_actionability_deferred]
         + [_stamp_deferral(f, "degradation_gate") for f in _degradation_gate_deferred]
+        + [
+            _stamp_deferral(f, "compute_contract_invalid")
+            for f in _compute_contract_deferred
+        ]
         + [_stamp_deferral(f, "batch_cap") for f in _batch_cap_deferred]
         + [
             {
@@ -2928,6 +3138,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         )
     if _batch_cap_deferred:
         _deferral_reasons.append(f"batch cap ({len(_batch_cap_deferred)})")
+    if _compute_contract_deferred:
+        _deferral_reasons.append(
+            f"compute_contract_invalid ({len(_compute_contract_deferred)})"
+        )
 
     if _all_deferred or _scope_skip_counts or _spawned_memo_ids or _finding_give_up:
         ctx = dict(task.context or {})

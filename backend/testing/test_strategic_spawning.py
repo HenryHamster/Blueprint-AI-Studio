@@ -41,6 +41,7 @@ from app.strategic_spawning import (
     _AGENT_VIEW_FLOOR_BYTES,
     _FLOOR_MIN_GAPS,
     _STRATEGIC_REVIEW_SCHEMA,
+    _DESIGN_DOC_UPDATE_SCHEMA,
     _design_doc_index,
     _summarize_design_doc_index,
     _DESIGN_DOC_INDEX_SUMMARY_CHARS,
@@ -516,6 +517,143 @@ async def test_spawn_review_omits_operator_overrides_when_empty(db_session):
     payload = result.scalars().all()[0].payloads[0]
 
     assert "operator_overrides" not in payload
+
+
+# ── knowledge_index in strategic payloads ───────────────────────────────────
+
+
+async def _seed_knowledge_doc(session, project, *, title="KDoc", direction_id=None):
+    """Persist one KnowledgeDocument for the project (FK source_task_id needs a task)."""
+    from app.models import KnowledgeDocument
+
+    task = Task(
+        project_id=project.id,
+        title="src",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "web_research", "topic": "t", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=task.id,
+        title=title,
+        summary="A prior knowledge summary.",
+        body="# Body\n\n" + ("x" * 50),
+        topic="auth",
+        direction_id=direction_id,
+        source_kind="web_research",
+    )
+    session.add(doc)
+    await session.commit()
+    await session.refresh(doc)
+    return doc
+
+
+def test_knowledge_index_registered_in_both_schemas():
+    """The packer must know about knowledge_index so it never warns / drops it
+    as an unregistered key."""
+    assert "knowledge_index" in _STRATEGIC_REVIEW_SCHEMA
+    assert "knowledge_index" in _DESIGN_DOC_UPDATE_SCHEMA
+
+
+@pytest.mark.asyncio
+async def test_spawn_review_includes_knowledge_index_when_docs_exist(db_session):
+    """strategic_review carries the compact, body-omitted knowledge index when
+    the project has knowledge documents."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+    await _seed_knowledge_doc(db_session, project, title="Prior research")
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.payloads[0]["type"] == "strategic_review"
+    )
+
+    assert "knowledge_index" in payload
+    entry = payload["knowledge_index"][0]
+    assert entry["title"] == "Prior research"
+    assert "body" not in entry
+    assert set(entry.keys()) == {
+        "id",
+        "title",
+        "summary",
+        "topic",
+        "direction_id",
+        "source_kind",
+        "created_at",
+    }
+
+
+@pytest.mark.asyncio
+async def test_spawn_review_omits_knowledge_index_when_none(db_session):
+    """strategic_review omits knowledge_index entirely when no documents exist."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.payloads[0]["type"] == "strategic_review"
+    )
+    assert "knowledge_index" not in payload
+
+
+@pytest.mark.asyncio
+async def test_spawn_design_doc_update_includes_knowledge_index_when_docs_exist(
+    db_session,
+):
+    """design_doc_update carries the knowledge index when documents exist."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_knowledge_doc(db_session, project, title="Design knowledge")
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.payloads[0]["type"] == "design_doc_update"
+    )
+    assert "knowledge_index" in payload
+    assert payload["knowledge_index"][0]["title"] == "Design knowledge"
+
+
+@pytest.mark.asyncio
+async def test_spawn_design_doc_update_omits_knowledge_index_when_none(db_session):
+    """design_doc_update omits knowledge_index entirely when no documents exist."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.payloads[0]["type"] == "design_doc_update"
+    )
+    assert "knowledge_index" not in payload
 
 
 # ── operator_rejection_rate in _spawn_strategic_review ────────────────────────

@@ -19,6 +19,7 @@ from app.models import (
     AlertSeverity,
 )
 from app.database import AsyncSessionLocal, resolve_dialect_name
+from app.knowledge_query import build_knowledge_index
 from app.payload_schemas import (
     validate_internal_payload,
     ALL_TASK_TYPES,
@@ -1784,6 +1785,16 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
 
         if project.build_config:
             research_payload["build_config"] = project.build_config
+        # Compact, body-omitted index of existing knowledge documents
+        # (web_research / design output), scoped to this project and — when the
+        # cycle is directed — the current direction first. Lets the research
+        # agent ground findings in knowledge that already exists and fetch full
+        # bodies on demand. Included only when documents exist.
+        _knowledge_index = await build_knowledge_index(
+            session, project.id, direction_id=current_dir_id
+        )
+        if _knowledge_index:
+            research_payload["knowledge_index"] = _knowledge_index
         research_payload = validate_internal_payload(
             research_payload, "autonomous_research:research"
         )

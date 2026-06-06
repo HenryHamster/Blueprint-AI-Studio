@@ -612,21 +612,29 @@ async def _compute_digest(
         )
         t_dir_id = (t.context or {}).get("direction_id")
         t_dir_text = dir_id_to_text.get(str(t_dir_id)) if t_dir_id else None
-        needs_attention.append(
-            {
-                "task_id": tid,
-                "title": t.title or "Pending approval",
-                "reason": "approval_required",
-                "error_snippet": None,
-                "pr_url": pr_artifact_map.get(tid),
-                "waiting_since": waiting_since.isoformat() if waiting_since else None,
-                "waiting_hours": waiting_hours,
-                "approval_reason": t.latest_status_message,
-                "touched_critical": (t.context or {}).get("touched_critical", []),
-                "direction_id": t_dir_id,
-                "direction_text": t_dir_text,
-            }
-        )
+        payload = t.first_payload
+        task_type = payload.get("type", "create")
+        entry = {
+            "task_id": tid,
+            "title": t.title or "Pending approval",
+            "reason": "approval_required",
+            "error_snippet": None,
+            "pr_url": pr_artifact_map.get(tid),
+            "waiting_since": waiting_since.isoformat() if waiting_since else None,
+            "waiting_hours": waiting_hours,
+            "approval_reason": t.latest_status_message,
+            "touched_critical": (t.context or {}).get("touched_critical", []),
+            "direction_id": t_dir_id,
+            "direction_text": t_dir_text,
+            "task_type": task_type,
+        }
+        # Held compute_experiment launches carry a proposed spend cap and
+        # deadline in their payload — surface them so the operator can approve,
+        # adjust the cap, or reject with full context.
+        if task_type == "compute_experiment":
+            entry["spend_cap_usd"] = payload.get("spend_cap_usd")
+            entry["deadline_seconds"] = payload.get("deadline_seconds")
+        needs_attention.append(entry)
     needs_attention.sort(
         key=lambda x: (
             0 if x["reason"] == "approval_required" else 1,

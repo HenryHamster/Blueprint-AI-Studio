@@ -20,7 +20,7 @@ from sqlmodel import select
 
 from app.models import Task, TaskHistory, TaskStatus
 from app.plan_completion import _handle_plan_completion
-from app.task_capabilities import PLAN_SUBTASK_TYPES
+from app.task_capabilities import PLAN_KNOWLEDGE_SUBTASK_TYPES, PLAN_SUBTASK_TYPES
 from testing.factories import make_project, make_task
 
 
@@ -458,6 +458,128 @@ async def test_dependent_on_skipped_producer_fails_plan(
     assert len(children) == 0, (
         f"No children should spawn when plan fails due to unsatisfiable dependency, "
         f"got {len(children)}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("knowledge_type", sorted(PLAN_KNOWLEDGE_SUBTASK_TYPES))
+async def test_knowledge_prereq_subtype_spawns_as_itself(
+    db_session, mocker, _quiet_mocks, knowledge_type
+):
+    """A plan subtask of a knowledge-prerequisite type (web_research / design)
+    spawns AS ITSELF, carries the parent's direction context, and is NOT given
+    the implementation ``create`` prompt suffix.
+
+    These types produce a durable knowledge document, not a branch/PR, so they
+    must become spawnable plan children without being treated as PR-producing
+    implementation subtypes.
+    """
+    # Configure a create suffix so we can assert the knowledge child does NOT
+    # receive it (the suffix is for code/PR work only).
+    from app.shared_state import runtime_config
+
+    runtime_config["agent_prompt_suffixes"] = {"create": "IMPLEMENTATION SUFFIX"}
+
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": f"Knowledge {knowledge_type}",
+                    "prompt": "gather the prerequisite knowledge",
+                    "type": knowledge_type,
+                }
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    # Thread direction context onto the parent plan, as the real pipeline does.
+    task.context = {
+        **(task.context or {}),
+        "direction_id": "dir-knowledge-1",
+        "research_task_id": "res-knowledge-1",
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, (
+        f"Expected 1 child for {knowledge_type}, got {len(children)}"
+    )
+    child = children[0]
+    # Spawned as the knowledge type, not downgraded to create.
+    assert child.first_payload.get("type") == knowledge_type, (
+        f"Knowledge child should keep type {knowledge_type!r}, "
+        f"got {child.first_payload.get('type')!r}"
+    )
+    # No implementation prompt suffix for a non-PR producer.
+    assert "prompt_suffix" not in child.first_payload, (
+        f"Knowledge child must not receive the create prompt_suffix, "
+        f"got {child.first_payload.get('prompt_suffix')!r}"
+    )
+    # Direction context threaded to the child like every other plan child.
+    assert (child.context or {}).get("direction_id") == "dir-knowledge-1"
+    assert (child.context or {}).get("research_task_id") == "res-knowledge-1"
+
+
+@pytest.mark.asyncio
+async def test_implementation_child_can_depend_on_knowledge_prereq(
+    db_session, mocker, _quiet_mocks
+):
+    """An implementation child may depend on a knowledge-prerequisite producer.
+
+    web_research produces the knowledge a downstream ``create`` needs. Because
+    the knowledge type is now a valid plan child (not skipped), the dependent
+    create spawns with depends_on pointing at the producer — and the plan does
+    NOT fail with an unsatisfiable-dependency error.
+    """
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Research the vendor API",
+                    "prompt": "learn the vendor protocol",
+                    "type": "web_research",
+                },
+                {
+                    "title": "Implement the integration",
+                    "prompt": "build it on the research",
+                    "type": "create",
+                    "depends_on_indices": [0],
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(db_session, mocker, plan_logs)
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status != TaskStatus.FAILED, (
+        f"Plan must not fail when a create depends on a knowledge prereq, "
+        f"got status {task.status} / {task.latest_status_message!r}"
+    )
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 2, f"Expected 2 children, got {len(children)}"
+    by_title = {c.title: c for c in children}
+    producer = by_title["Research the vendor API"]
+    dependent = by_title["Implement the integration"]
+
+    assert producer.first_payload.get("type") == "web_research"
+    assert dependent.depends_on == [str(producer.id)], (
+        f"Dependent create should depend on the knowledge producer, "
+        f"got {dependent.depends_on!r}"
     )
 
 

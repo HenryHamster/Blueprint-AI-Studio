@@ -9563,6 +9563,60 @@ class TestBulkApprove:
         assert (task.context or {}).get("pr_merged") is None
         assert "awaiting downstream landing" in (task.latest_status_message or "")
 
+    @pytest.mark.asyncio
+    async def test_bulk_approve_clears_held_compute_experiment(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """Operator approve clears the hold on a QUEUED compute_experiment task
+        held for spend-threshold approval, making it dispatchable. A QUEUED task
+        skips the COMPLETED/EVALUATING PR-merge branch, so no GitHub calls fire."""
+        project = await _make_project(db_session)
+
+        task = Task(
+            project_id=project.id,
+            title="Held compute_experiment",
+            payloads=[
+                {
+                    "type": "compute_experiment",
+                    "command": "python3 bench.py",
+                    "spend_cap_usd": 50.0,
+                    "deadline_seconds": 7200,
+                }
+            ],
+            status=TaskStatus.QUEUED,
+            requires_approval=True,
+            latest_status_message=(
+                "Held for operator approval: compute_experiment proposes "
+                "$50.00 spend cap / 7200s deadline, exceeding the $5.00 approval "
+                "threshold."
+            ),
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        merge_pr = mocker.patch(
+            "app.github.merge_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merged": True},
+        )
+
+        resp = await client.post(
+            "/api/admin/tasks/bulk-action",
+            json={"action": "approve", "task_ids": [str(task.id)]},
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success_count"] == 1
+        assert body["error_count"] == 0
+        await db_session.refresh(task)
+        # The hold is cleared so the orchestrator can dispatch the launch.
+        assert task.requires_approval is False
+        # A QUEUED hold is not a PR merge — status is unchanged, no GitHub calls.
+        assert task.status == TaskStatus.QUEUED
+        merge_pr.assert_not_awaited()
+
 
 class TestBulkRetrySessionFactory:
     """The bulk-retry scoped session factory must resolve a real engine even
@@ -10299,3 +10353,52 @@ class TestBugReportCitationGate:
         ).scalar_one()
         assert "_provenance_warnings" not in (task.context or {})
         assert task.payloads[0]["prompt"] == "Investigate something."
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# task_capabilities.py — strategist spawn allowlist is registry-derived
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestStrategistSpawnableRegistry:
+    """Guard: the strategist spawn allowlist is DERIVED from the per-type
+    ``strategist_spawnable`` capability flag, not a hardcoded literal. A future
+    type becomes strategist-spawnable by declaring the flag alone — no handler
+    edit — and implementation / PR-producing write types stay excluded."""
+
+    def test_allowlist_equals_expected_knowledge_types(self):
+        from app.task_capabilities import STRATEGIST_SPAWNABLE_TASK_TYPES
+
+        assert STRATEGIST_SPAWNABLE_TASK_TYPES == frozenset(
+            {"research", "plan", "web_research", "design"}
+        )
+
+    def test_allowlist_is_derived_from_capability_flag(self):
+        from app.task_capabilities import (
+            STRATEGIST_SPAWNABLE_TASK_TYPES,
+            TASK_CAPABILITY_BY_VALUE,
+        )
+
+        # Every member declares the flag...
+        for t in STRATEGIST_SPAWNABLE_TASK_TYPES:
+            assert TASK_CAPABILITY_BY_VALUE[t].strategist_spawnable is True
+        # ...and the set is exactly the flagged capabilities (derivation, not a
+        # parallel literal that could drift).
+        derived = frozenset(
+            value
+            for value, cap in TASK_CAPABILITY_BY_VALUE.items()
+            if cap.strategist_spawnable
+        )
+        assert STRATEGIST_SPAWNABLE_TASK_TYPES == derived
+
+    def test_no_write_type_is_strategist_spawnable(self):
+        from app.task_capabilities import (
+            STRATEGIST_SPAWNABLE_TASK_TYPES,
+            WRITE_TASK_TYPES,
+        )
+
+        # Implementation / PR-producing types must not be directly spawnable —
+        # they flow through direction → research → plan → create.
+        assert STRATEGIST_SPAWNABLE_TASK_TYPES.isdisjoint(WRITE_TASK_TYPES)
+        for impl in ("create", "fix", "refactor", "migrate", "qa"):
+            assert impl not in STRATEGIST_SPAWNABLE_TASK_TYPES

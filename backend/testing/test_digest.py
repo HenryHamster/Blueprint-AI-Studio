@@ -1068,6 +1068,62 @@ async def test_digest_with_pending_approval(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_digest_approval_compute_experiment_enriched(
+    client: AsyncClient, db_session
+):
+    """A held compute_experiment task surfaces its proposed spend cap and
+    deadline plus task_type in its needs_attention entry; a plain approval
+    task omits the compute-specific fields."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    compute_task = make_task(
+        project_id=project.id,
+        title="Held compute launch",
+        status=TaskStatus.IN_PROGRESS,
+        requires_approval=True,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "spend_cap_usd": 42.5,
+                "deadline_seconds": 7200,
+            }
+        ],
+    )
+    plain_task = make_task(
+        project_id=project.id,
+        title="Plain approval",
+        status=TaskStatus.IN_PROGRESS,
+        requires_approval=True,
+        payloads=[{"type": "create"}],
+    )
+    db_session.add(compute_task)
+    db_session.add(plain_task)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    by_id = {
+        a["task_id"]: a
+        for a in data["needs_attention"]
+        if a["reason"] == "approval_required"
+    }
+    compute_entry = by_id[str(compute_task.id)]
+    assert compute_entry["task_type"] == "compute_experiment"
+    assert compute_entry["spend_cap_usd"] == 42.5
+    assert compute_entry["deadline_seconds"] == 7200
+
+    plain_entry = by_id[str(plain_task.id)]
+    assert plain_entry["task_type"] == "create"
+    assert "spend_cap_usd" not in plain_entry
+    assert "deadline_seconds" not in plain_entry
+
+
+@pytest.mark.asyncio
 async def test_digest_time_window_filtering(client: AsyncClient, db_session):
     """Tasks with created_at outside the requested hours window are excluded."""
     project = make_project()

@@ -1832,6 +1832,10 @@ ALSO write /tmp/research_progress_${taskId}.md — a concise markdown summary (u
 **Sub-research** — spawns another research cycle (use sparingly):
   research
 
+**Knowledge** — these spawn a read-only agent that produces a durable knowledge document (no code change), to be consumed before implementation can proceed:
+  web_research — use when the work needs external/industry knowledge: best-practices, an unfamiliar library/protocol/vendor API.
+  design — use when a grounded design (architecture, interface, data-model) is needed before implementation can proceed.
+
 **Metadata** — these update the system's knowledge but do not produce code changes:
   direction_note, direction_update, direction_proposal, design_doc_observation
 

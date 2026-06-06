@@ -4108,6 +4108,8 @@ async def agent_list_knowledge_documents(
     q: str | None = Query(default=None, description="Full-text search term"),
     topic: str | None = Query(default=None, description="Exact topic filter"),
     tag: str | None = Query(default=None, description="Exact tag filter"),
+    direction: str | None = Query(default=None, description="Exact direction_id filter"),
+    source_kind: str | None = Query(default=None, description="Exact source_kind filter"),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
@@ -4116,14 +4118,24 @@ async def agent_list_knowledge_documents(
     """List / search knowledge documents for the authenticated task's project.
 
     Mirrors the operator list endpoint (``q`` over title/summary/body/topic/tags,
-    exact ``topic`` / ``tag`` filters, newest-first, limit/offset paginated) but
-    scopes to the token's task project — never a URL-supplied project — so an
-    agent cannot read another project's documents. The list shape omits the
-    markdown body; use get-by-id for the full document.
+    exact ``topic`` / ``tag`` / ``direction`` / ``source_kind`` filters,
+    newest-first, limit/offset paginated) but scopes to the token's task project
+    — never a URL-supplied project — so an agent cannot read another project's
+    documents. The list shape omits the markdown body; use get-by-id for the
+    full document. The new ``direction`` / ``source_kind`` filters are additive:
+    omitting them preserves the prior behavior and response shape exactly.
     """
     project_id = await _resolve_token_project_id(session, token)
     return await kq_list_knowledge_documents(
-        session, project_id, q=q, topic=topic, tag=tag, limit=limit, offset=offset
+        session,
+        project_id,
+        q=q,
+        topic=topic,
+        tag=tag,
+        direction=direction,
+        source_kind=source_kind,
+        limit=limit,
+        offset=offset,
     )
 
 

@@ -671,10 +671,20 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # assessed no directions — it's an optional precision refinement, never required.
 ./strategic set-evidence-progress '[{"direction_id":"d-xxx","status":"advancing","rationale":"..."}]'
 
-# Spawn a targeted investigation task (research or plan only) when something
-# from the Recent Work section needs investigation NOW instead of waiting for
-# the next autonomous cycle.
+# Spawn a targeted investigation/knowledge task when something from the Recent
+# Work section needs attention NOW instead of waiting for the next autonomous
+# cycle. Choose the type by what you need:
+#   research     — codebase investigation that yields implementation findings
+#   plan         — decompose a large change into implementation subtasks
+#   web_research — external / web knowledge (best practices, unfamiliar
+#                  protocols/APIs/vendors); produces a citation-grounded doc
+#   design       — codebase-grounded design exploration for a subsystem before
+#                  implementation; produces a design document
+# (Implementation/PR types are intentionally NOT spawnable here — they flow
+# through the normal direction → research → plan → create path.)
 ./strategic spawn-task '{"type": "research", "title": "...", "prompt": "Full investigation prompt...", "direction_id": "d-xxx"}'
+./strategic spawn-task '{"type": "web_research", "title": "...", "prompt": "What external knowledge to gather...", "direction_id": "d-xxx"}'
+./strategic spawn-task '{"type": "design", "title": "...", "prompt": "Design question grounded in the codebase...", "direction_id": "d-xxx"}'
 
 # Pull full detail for items the strategic packer trimmed (see "Context not
 # shipped this cycle" section in your prompt). Use only when you actually
