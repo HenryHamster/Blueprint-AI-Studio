@@ -173,6 +173,26 @@ async def get_version_lifecycle(
         merged_count = await count_merged_since(session, project_id, open_row.opened_at)
         in_flight_count = await count_in_flight_tasks(session, project_id)
         qual = open_row.last_qualification or {}
+        # Verdict-staleness signal: how many tasks merged AT/AFTER the open
+        # version's last qualification verdict was finalized. Each verdict is
+        # evaluated against one candidate commit; merges landing after
+        # ``finalized_at`` mean the displayed confidence/sub-scores no longer
+        # reflect the current tree. Computed from the verdict's ``finalized_at``
+        # (NOT the version's ``opened_at``). ``None`` when there is no verdict or
+        # no parseable ``finalized_at`` — never fabricate a count.
+        merged_since_verdict: Optional[int] = None
+        finalized_at_raw = qual.get("finalized_at")
+        if finalized_at_raw:
+            try:
+                from datetime import datetime  # noqa: PLC0415
+
+                finalized_at_dt = datetime.fromisoformat(finalized_at_raw)
+            except (ValueError, TypeError):
+                finalized_at_dt = None
+            if finalized_at_dt is not None:
+                merged_since_verdict = await count_merged_since(
+                    session, project_id, finalized_at_dt
+                )
         qual_state = _release_version.summarize_qualification_state(
             qual, open_row.serving_status, open_row.deploy_failure_reason
         )
@@ -209,6 +229,9 @@ async def get_version_lifecycle(
             "opened_at": open_row.opened_at.isoformat(),
             "qualification_attempts": open_row.qualification_attempts,
             "merged_task_count": merged_count,
+            # Tasks merged AT/AFTER the last qualification verdict's finalized_at
+            # (verdict-staleness signal). None when no verdict/finalized_at.
+            "merged_since_verdict": merged_since_verdict,
             # In-flight (non-terminal) tasks that a version cut will NOT stop —
             # they keep running and land against the freshly-opened next version.
             # Surfaced so the cut confirmation can disclose this consequence.

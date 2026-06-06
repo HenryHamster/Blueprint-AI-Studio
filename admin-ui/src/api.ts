@@ -1099,6 +1099,11 @@ export interface CurrentVersion {
   opened_at: string;
   qualification_attempts: number;
   merged_task_count: number;
+  /** Tasks merged at/after the last qualification verdict's finalized_at — a
+   *  verdict-staleness signal. >0 means work landed since the verdict was
+   *  computed, so the displayed confidence no longer reflects the current tree.
+   *  null when there is no verdict or no parseable finalized_at. */
+  merged_since_verdict?: number | null;
   /** Non-terminal tasks still in flight against this version. A version cut does
    *  not stop them — they continue and land against the freshly-opened version. */
   in_flight_task_count?: number;

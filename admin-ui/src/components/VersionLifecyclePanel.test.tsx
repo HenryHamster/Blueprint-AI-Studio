@@ -998,6 +998,99 @@ describe('VersionLifecyclePanel', () => {
     });
   });
 
+  describe('qualification verdict staleness', () => {
+    it('flags the verdict as stale and shows the verdict candidate SHA when tasks merged after it', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({ candidate_sha: 'abcdef1234567890' }),
+              merged_since_verdict: 3,
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(
+        screen.getByText(/3 tasks merged since this verdict — re-qualify for current state/)
+      ).toBeInTheDocument();
+      expect(screen.getByText('@abcdef1')).toBeInTheDocument();
+    });
+
+    it('singularizes the staleness flag for a single merge', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({ candidate_sha: 'abcdef1234567890' }),
+              merged_since_verdict: 1,
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(
+        screen.getByText(/1 task merged since this verdict — re-qualify for current state/)
+      ).toBeInTheDocument();
+    });
+
+    it('renders no staleness flag when zero tasks merged after the verdict', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({ candidate_sha: 'abcdef1234567890' }),
+              merged_since_verdict: 0,
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByText(/merged since this verdict/)).not.toBeInTheDocument();
+    });
+
+    it('renders no staleness flag when merged_since_verdict is null/absent', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({ candidate_sha: 'abcdef1234567890' }),
+              merged_since_verdict: null,
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByText(/merged since this verdict/)).not.toBeInTheDocument();
+    });
+
+    it('renders no verdict SHA or staleness flag gracefully when there is no candidate_sha', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({ candidate_sha: null }),
+              merged_since_verdict: 0,
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByText(/^@/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/merged since this verdict/)).not.toBeInTheDocument();
+    });
+  });
+
   describe('promotion-in-flight locks qualify + phase controls', () => {
     beforeEach(() => {
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });

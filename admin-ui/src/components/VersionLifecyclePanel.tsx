@@ -880,10 +880,23 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
               <div className="pl-2 border-l border-neutral-700/50 space-y-0.5">
                 <div className="flex flex-wrap items-center gap-2">
                   <QualSummary q={cv.last_qualification} />
+                  {cv.last_qualification.candidate_sha && (
+                    <span
+                      className="text-[10px] text-neutral-500 font-mono"
+                      title={cv.last_qualification.candidate_sha}
+                    >
+                      @{cv.last_qualification.candidate_sha.slice(0, 7)}
+                    </span>
+                  )}
                   {cv.last_qualification.finalized_at && (
                     <span className="text-[10px] text-neutral-600">as of {timeAgo(cv.last_qualification.finalized_at)}</span>
                   )}
                 </div>
+                {(cv.merged_since_verdict ?? 0) > 0 && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded border bg-amber-500/10 text-amber-400 border-amber-500/20">
+                    {cv.merged_since_verdict} task{cv.merged_since_verdict === 1 ? '' : 's'} merged since this verdict — re-qualify for current state
+                  </span>
+                )}
                 {(cv.last_qualification.sub_scores || cv.last_qualification.ci_resolution) && (
                   <div className="flex flex-wrap gap-x-2 gap-y-0.5 text-[10px] text-neutral-500">
                     {cv.last_qualification.sub_scores && (

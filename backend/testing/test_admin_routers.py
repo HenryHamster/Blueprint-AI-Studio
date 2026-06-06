@@ -7813,6 +7813,160 @@ class TestVersionLifecycleInfraFailureFields:
         assert lq["audit_missing_reason"] is None
 
     @pytest.mark.asyncio
+    async def test_merged_since_verdict_counts_merges_after_finalized_at(
+        self, client: AsyncClient, db_session
+    ):
+        """current_version.merged_since_verdict reflects tasks merged at/after the
+        verdict's finalized_at, computed from finalized_at (not opened_at)."""
+        from datetime import datetime
+
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+            last_qualification={
+                "status": "dry_run",
+                "confidence": 0.89,
+                "threshold": 0.90,
+                "candidate_sha": "abc1234",
+                "finalized_at": "2026-05-27T00:00:00",
+            },
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        finalized_dt = datetime.fromisoformat("2026-05-27T00:00:00")
+
+        async def _count(session, project_id, since):
+            # The verdict-staleness call passes the parsed finalized_at; the
+            # opened-version call passes the version's opened_at.
+            return 4 if since == finalized_dt else 0
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(side_effect=_count),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        cv = resp.json()["current_version"]
+        assert cv["merged_since_verdict"] == 4
+
+    @pytest.mark.asyncio
+    async def test_merged_since_verdict_zero_when_no_merges_after_verdict(
+        self, client: AsyncClient, db_session
+    ):
+        """merged_since_verdict is 0 (not null) when the helper finds no merges
+        after the verdict's finalized_at."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+            last_qualification={
+                "status": "dry_run",
+                "candidate_sha": "abc1234",
+                "finalized_at": "2026-05-27T00:00:00",
+            },
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        cv = resp.json()["current_version"]
+        assert cv["merged_since_verdict"] == 0
+
+    @pytest.mark.asyncio
+    async def test_merged_since_verdict_null_when_no_finalized_at(
+        self, client: AsyncClient, db_session
+    ):
+        """merged_since_verdict is null when there is no verdict / no finalized_at —
+        the count is never fabricated."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+            last_qualification={"status": "pending", "candidate_sha": "abc1234"},
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        cv = resp.json()["current_version"]
+        assert cv["merged_since_verdict"] is None
+
+    @pytest.mark.asyncio
     async def test_promotion_pending_state_exposed_in_current_version(
         self, client: AsyncClient, db_session
     ):
