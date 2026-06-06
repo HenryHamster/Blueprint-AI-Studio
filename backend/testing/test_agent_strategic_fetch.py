@@ -1042,6 +1042,52 @@ async def test_strategic_create_message_present_citation_not_flagged(
 
 
 @pytest.mark.asyncio
+async def test_strategic_create_message_mixed_present_citation_is_flagged(
+    client: AsyncClient, db_session, mocker
+):
+    """A partially grounded strategist BUG_REPORT keeps its mixed ref detail."""
+    from unittest.mock import AsyncMock
+
+    project, task = await _make_project_task(db_session)
+    mocker.patch(
+        "app.source_ref_validation.resolve_branch_verification_context",
+        new=AsyncMock(return_value={}),
+    )
+    mocker.patch(
+        "app.source_ref_validation._file_exists_at_head",
+        new=AsyncMock(side_effect=lambda path, **_: True if "alive.py" in path else False),
+    )
+    token = create_agent_token(
+        str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    res = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "create_message",
+            "data": {
+                "type": "BUG_REPORT",
+                "content": (
+                    "The crash spans backend/app/gone.py and "
+                    "backend/app/alive.py during init."
+                ),
+            },
+        },
+    )
+    assert res.status_code == 200, res.text
+    msg = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalar_one()
+    warnings = (msg.context or {}).get("_provenance_warnings")
+    assert warnings is not None
+    assert warnings["citation_state"] == "present"
+    assert "backend/app/gone.py" in warnings["broken_refs"]
+
+
+@pytest.mark.asyncio
 async def test_strategic_create_message_note_type_not_grounded(
     client: AsyncClient, db_session, mocker
 ):

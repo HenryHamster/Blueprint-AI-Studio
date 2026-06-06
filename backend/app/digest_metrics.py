@@ -88,6 +88,7 @@ from app.failure_classification import (
 logger = logging.getLogger(__name__)
 
 _CPM_RETIREMENT_MULTIPLIER = 3.0  # cost_per_merge > median × this → retirement signal
+_MIGRATION_SLOT_CONTENTION_ELEVATION_THRESHOLD = timedelta(hours=2)
 
 _FAILURE_CLASS_LABELS = {
     CODE_ERROR: "Code Error",
@@ -2161,6 +2162,7 @@ def compute_migration_health(
     failed_tasks: List[Task],
     *,
     error_log_map: Dict[str, Any],
+    active_tasks: List[Task] | None = None,
 ) -> Dict[str, Any]:
     """Summarize migration-task throughput and migration-error incidence.
 
@@ -2187,6 +2189,38 @@ def compute_migration_health(
             for f in payload_files
         )
 
+    def _is_migration_producing(t: Task) -> bool:
+        if _task_type(t) == "migrate":
+            return True
+        ctx = t.context or {}
+        files = ctx.get("related_files") or []
+        if isinstance(files, list) and any(
+            isinstance(f, str)
+            and (
+                f.startswith("backend/alembic/versions/")
+                or f == "backend/app/models.py"
+                or f.endswith("/backend/app/models.py")
+            )
+            for f in files
+        ):
+            return True
+        payload_files = (t.first_payload or {}).get("related_files") or []
+        return isinstance(payload_files, list) and any(
+            isinstance(f, str)
+            and (
+                f.startswith("backend/alembic/versions/")
+                or f == "backend/app/models.py"
+                or f.endswith("/backend/app/models.py")
+            )
+            for f in payload_files
+        )
+
+    def _task_age_seconds(t: Task, *, field: str) -> int | None:
+        ts = getattr(t, field, None)
+        if ts is None:
+            return None
+        return max(0, int((_utcnow() - ts).total_seconds()))
+
     _migrate_completed = [t for t in completed_tasks if _task_type(t) == "migrate"]
     _migrate_failed = [t for t in failed_tasks if _task_type(t) == "migrate"]
     _migration_errors = sum(
@@ -2200,6 +2234,72 @@ def compute_migration_health(
         for t in (completed_tasks + failed_tasks)
         if _task_type(t) != "migrate" and _touched_migration(t)
     )
+
+    active_migration_tasks = [
+        t for t in (active_tasks or []) if _is_migration_producing(t)
+    ]
+    migration_slot_holder = min(
+        (
+            t
+            for t in active_migration_tasks
+            if t.status == TaskStatus.IN_PROGRESS
+        ),
+        key=lambda t: (
+            t.started_at or t.created_at or _utcnow(),
+            str(t.id),
+        ),
+        default=None,
+    )
+    holder_hold_seconds = (
+        _task_age_seconds(migration_slot_holder, field="started_at")
+        if migration_slot_holder is not None
+        else None
+    )
+    if holder_hold_seconds is None and migration_slot_holder is not None:
+        holder_hold_seconds = _task_age_seconds(
+            migration_slot_holder, field="created_at"
+        )
+    serializing_waiters = [
+        t
+        for t in active_migration_tasks
+        if t.status == TaskStatus.QUEUED
+        and (t.latest_status_message or "").startswith(
+            "Waiting: serializing migration"
+        )
+    ]
+    longest_wait = min(
+        serializing_waiters,
+        key=lambda t: (
+            t.updated_at or t.created_at or t.started_at or _utcnow(),
+            str(t.id),
+        ),
+        default=None,
+    )
+    longest_wait_seconds = (
+        _task_age_seconds(longest_wait, field="updated_at")
+        if longest_wait is not None
+        else None
+    )
+    if longest_wait_seconds is None and longest_wait is not None:
+        longest_wait_seconds = _task_age_seconds(longest_wait, field="created_at")
+    deferred_count = len(serializing_waiters)
+    if migration_slot_holder is None and deferred_count == 0:
+        contention_status = "idle"
+        contention_severity = "info"
+    elif deferred_count == 0:
+        contention_status = "held"
+        contention_severity = "info"
+    else:
+        hold_threshold_seconds = int(
+            _MIGRATION_SLOT_CONTENTION_ELEVATION_THRESHOLD.total_seconds()
+        )
+        if holder_hold_seconds is not None and holder_hold_seconds >= hold_threshold_seconds:
+            contention_status = "elevated"
+            contention_severity = "critical"
+        else:
+            contention_status = "contention"
+            contention_severity = "warning"
+
     return {
         "current_schema_revision": EXPECTED_SCHEMA_REVISION,
         "migration_tasks_in_window": len(_migrate_completed) + len(_migrate_failed),
@@ -2207,6 +2307,31 @@ def compute_migration_health(
         "migration_tasks_failed": len(_migrate_failed),
         "migration_errors_in_window": _migration_errors,
         "auto_generated_migrations": _auto_generated_migrations,
+        "migration_slot_contention": {
+            "status": contention_status,
+            "severity": contention_severity,
+            "holder": {
+                "task_id": str(migration_slot_holder.id),
+                "title": migration_slot_holder.title,
+                "started_at": migration_slot_holder.started_at.isoformat()
+                if migration_slot_holder.started_at
+                else None,
+                "hold_seconds": holder_hold_seconds,
+            }
+            if migration_slot_holder is not None
+            else None,
+            "deferred_count": deferred_count,
+            "longest_wait": {
+                "task_id": str(longest_wait.id),
+                "title": longest_wait.title,
+                "waiting_since": longest_wait.updated_at.isoformat()
+                if longest_wait.updated_at
+                else None,
+                "wait_seconds": longest_wait_seconds,
+            }
+            if longest_wait is not None
+            else None,
+        },
     }
 
 

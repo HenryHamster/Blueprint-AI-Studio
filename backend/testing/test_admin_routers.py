@@ -11665,6 +11665,45 @@ class TestBugReportCitationGate:
         assert "_provenance_warnings" not in (msg.context or {})
 
     @pytest.mark.asyncio
+    async def test_bug_report_mixed_present_citation_is_flagged(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A partially grounded BUG_REPORT keeps its mixed-state ref detail."""
+        project = await self._project_with_repo(db_session)
+        mocker.patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        mocker.patch(
+            "app.source_ref_validation._file_exists_at_head",
+            new=AsyncMock(
+                side_effect=lambda path, **_: True if "alive.py" in path else False
+            ),
+        )
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "BUG_REPORT",
+                "content": (
+                    "The regression spans backend/app/gone.py and "
+                    "backend/app/alive.py during init."
+                ),
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        msg = (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        ).scalar_one()
+        warnings = (msg.context or {}).get("_provenance_warnings")
+        assert warnings is not None
+        assert warnings["citation_state"] == "present"
+        assert "backend/app/gone.py" in warnings["broken_refs"]
+        assert warnings["ungrounded_refs"] == []
+
+    @pytest.mark.asyncio
     async def test_bug_report_no_refs_not_flagged(
         self, client: AsyncClient, db_session, mocker
     ):
@@ -11744,6 +11783,60 @@ class TestBugReportCitationGate:
         verdict = (task.context or {}).get("reproduce_verdict")
         assert verdict is not None
         assert verdict["status"] == "already_resolved"
+
+    @pytest.mark.asyncio
+    async def test_investigate_task_mixed_citation_preserves_warning_but_not_stale(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A mixed citation warning is carried forward without seeding stale-state."""
+        project = await self._project_with_repo(db_session)
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            from_type="user",
+            content=(
+                "The handler touches backend/app/gone.py and "
+                "backend/app/alive.py during load."
+            ),
+        )
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+
+        mocker.patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        mocker.patch(
+            "app.source_ref_validation._file_exists_at_head",
+            new=AsyncMock(
+                side_effect=lambda path, **_: True if "alive.py" in path else False
+            ),
+        )
+        resp = await client.post(
+            "/api/admin/tasks",
+            json={
+                "github_repo": "acme/citegate",
+                "title": "Investigate mixed grounding",
+                "prompt": "Investigate the reported regression.",
+                "task_type": "investigate",
+                "source_message_id": str(msg.id),
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project.id)
+            )
+        ).scalar_one()
+        warnings = (task.context or {}).get("_provenance_warnings")
+        assert warnings is not None
+        assert warnings["citation_state"] == "present"
+        assert "backend/app/gone.py" in warnings["broken_refs"]
+        assert "Provenance warning" not in task.payloads[0]["prompt"]
+        verdict = (task.context or {}).get("reproduce_verdict")
+        assert verdict is not None
+        assert verdict["status"] == "indeterminate"
 
     @pytest.mark.asyncio
     async def test_investigate_task_present_citation_seeds_indeterminate_verdict(

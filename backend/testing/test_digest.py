@@ -6660,6 +6660,52 @@ async def test_digest_top_level_schema_keys(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_digest_migration_health_includes_slot_contention(client: AsyncClient, db_session):
+    """The digest surfaces migration-slot contention with holder and wait-time detail."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    now = _utcnow()
+
+    holder = make_task(
+        project_id=project.id,
+        title="Author migration",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "migrate"}],
+        started_at=now - timedelta(hours=3, minutes=15),
+    )
+    waiter = make_task(
+        project_id=project.id,
+        title="Queued migration waiter",
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "create",
+                "related_files": ["backend/app/models.py"],
+            }
+        ],
+        latest_status_message="Waiting: serializing migration — task abc12345 holds the chain",
+        created_at=now - timedelta(hours=1, minutes=45),
+        updated_at=now - timedelta(hours=1, minutes=30),
+    )
+    db_session.add(holder)
+    db_session.add(waiter)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    contention = data["migration_health"]["migration_slot_contention"]
+    assert contention["status"] == "elevated"
+    assert contention["severity"] == "critical"
+    assert contention["deferred_count"] == 1
+    assert contention["holder"]["task_id"] == str(holder.id)
+    assert contention["longest_wait"]["task_id"] == str(waiter.id)
+
+
+@pytest.mark.asyncio
 async def test_digest_needs_attention_approval_before_failed(
     client: AsyncClient, db_session
 ):

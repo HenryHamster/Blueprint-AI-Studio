@@ -103,22 +103,54 @@ function getProvenanceWarnings(context: ProjectMessageContext): ProvenanceWarnin
   };
 }
 
+// Per-state presentation for the citation provenance badge. Each state mirrors the
+// reproduce-on-HEAD tri-state semantics from classify_reproduction:
+//   absent        → nothing cited survives on HEAD (fully stale)
+//   present       → at least one citation survives but some refs are broken/ungrounded (partially grounded)
+//   indeterminate → no validation backend could verify the citations (unverifiable)
+const CITATION_BADGE_CONFIG: Record<CitationState, { label: string; container: string; labelText: string; refText: string }> = {
+  absent: {
+    label: 'cited code missing on HEAD',
+    container: 'border-amber-500/30 bg-amber-500/10',
+    labelText: 'text-amber-300',
+    refText: 'text-amber-100/80',
+  },
+  present: {
+    label: 'some cited code missing on HEAD',
+    container: 'border-amber-500/20 bg-amber-500/5',
+    labelText: 'text-amber-200',
+    refText: 'text-amber-100/70',
+  },
+  indeterminate: {
+    label: 'citations could not be verified',
+    container: 'border-neutral-500/30 bg-neutral-500/10',
+    labelText: 'text-neutral-300',
+    refText: 'text-neutral-200/80',
+  },
+};
+
 function StaleCitationBadge({ msg }: { msg: ProjectMessage }) {
   if (msg.message_type !== 'BUG_REPORT' && msg.message_type !== 'BLOCKER') return null;
   const warnings = getProvenanceWarnings(msg.context);
-  if (!warnings || warnings.citation_state !== 'absent') return null;
+  const state = warnings?.citation_state;
+  if (!state) return null;
 
   const refs = [...new Set([...(warnings.broken_refs ?? []), ...(warnings.ungrounded_refs ?? [])])];
   const refSummary = refs.length > 0 ? refs.join(', ') : null;
 
+  // A partially grounded report only warrants a badge when there is something
+  // broken/ungrounded to inspect; a clean 'present' state stays quiet.
+  if (state === 'present' && !refSummary) return null;
+
+  const cfg = CITATION_BADGE_CONFIG[state];
   return (
-    <div className="mt-2 inline-flex max-w-full flex-col gap-1 rounded-xl border border-amber-500/30 bg-amber-500/10 px-2.5 py-2">
-      <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-300">
+    <div className={`mt-2 inline-flex max-w-full flex-col gap-1 rounded-xl border px-2.5 py-2 ${cfg.container}`}>
+      <span className={`inline-flex items-center gap-1 text-[11px] font-semibold ${cfg.labelText}`}>
         <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-        cited code missing on HEAD
+        {cfg.label}
       </span>
       {refSummary && (
-        <span className="text-[11px] leading-relaxed text-amber-100/80 break-words">
+        <span className={`text-[11px] leading-relaxed break-words ${cfg.refText}`}>
           {refSummary}
         </span>
       )}

@@ -261,6 +261,53 @@ def test_compute_migration_health_counts_migration_errors_only_for_migrate_tasks
     assert result["migration_errors_in_window"] == 1
 
 
+def test_compute_migration_health_reports_migration_slot_contention():
+    now = _utcnow()
+    holder = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        title="Author migration",
+        payloads=[{"type": "migrate"}],
+        started_at=now - timedelta(hours=3, minutes=15),
+    )
+    oldest_waiter = make_task(
+        status=TaskStatus.QUEUED,
+        title="Queued migration waiter",
+        payloads=[
+            {
+                "type": "create",
+                "related_files": ["backend/app/models.py"],
+            }
+        ],
+        latest_status_message="Waiting: serializing migration — task abc12345 holds the chain",
+        created_at=now - timedelta(hours=1, minutes=45),
+        updated_at=now - timedelta(hours=1, minutes=30),
+    )
+    newer_waiter = make_task(
+        status=TaskStatus.QUEUED,
+        title="Younger migration waiter",
+        payloads=[{"type": "migrate"}],
+        latest_status_message="Waiting: serializing migration — task abc12345 holds the chain",
+        created_at=now - timedelta(minutes=50),
+        updated_at=now - timedelta(minutes=20),
+    )
+
+    result = compute_migration_health(
+        [],
+        [],
+        error_log_map={},
+        active_tasks=[holder, oldest_waiter, newer_waiter],
+    )
+
+    contention = result["migration_slot_contention"]
+    assert contention["status"] == "elevated"
+    assert contention["severity"] == "critical"
+    assert contention["deferred_count"] == 2
+    assert contention["holder"]["task_id"] == str(holder.id)
+    assert contention["holder"]["hold_seconds"] >= 3 * 3600
+    assert contention["longest_wait"]["task_id"] == str(oldest_waiter.id)
+    assert contention["longest_wait"]["wait_seconds"] >= 90 * 60
+
+
 def test_compute_narrative_summary_convergence_verdict_appears():
     """When the outer-loop window has churn signal (>=2 trend buckets) and a
     dominant blocker, the briefing states a falling/rising churn verdict and

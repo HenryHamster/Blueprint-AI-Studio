@@ -2628,10 +2628,10 @@ async def sweep_resolve_open_owned_bug_messages(
 #   - Citations are re-grounded FRESH against the current HEAD at sweep time via
 #     ``compute_message_citation_warning`` — the ingestion-time provenance stamp
 #     is NEVER trusted (the code may have been re-added since).
-#   - That helper honours a tri-state and returns a non-None signal ONLY on an
-#     unambiguous ``absent`` verdict; a ``present`` or ``indeterminate`` (no
-#     backend / no creds / nothing parseable / partially-grounded) verdict yields
-#     None and leaves the message OPEN. We resolve on a non-None signal alone.
+#   - That helper honours a tri-state and may also surface mixed non-absent
+#     provenance (broken/ungrounded refs on an otherwise actionable report), so
+#     this sweep MUST gate explicitly on ``citation_state == 'absent'``. Any
+#     ``present``/``indeterminate`` verdict leaves the message OPEN.
 #
 # Ordering: this runs AFTER Step 17 in the reaper cycle, so an owner that
 # genuinely landed is positively resolved first (the better, more specific
@@ -2656,11 +2656,11 @@ async def _stale_bug_message_resolution(session, msg, project_cache) -> tuple[st
     """`(audit, signal)` when ``msg``'s citations are absent on HEAD, else None.
 
     Re-grounds the message's citations FRESH against the current integration
-    HEAD via :func:`compute_message_citation_warning`, which returns a signal
-    ONLY on an unambiguous ``absent`` verdict (a ``present`` or ``indeterminate``
-    verdict yields None). The ingestion-time provenance stamp is never consulted.
-    Returns None — fail-safe, leaving the message open — for any present,
-    indeterminate, or partially-grounded verdict.
+    HEAD via :func:`compute_message_citation_warning`. That helper may return a
+    mixed non-absent provenance signal, so this sweep trusts it ONLY when
+    ``citation_state == "absent"``. The ingestion-time provenance stamp is
+    never consulted. Returns None — fail-safe, leaving the message open — for
+    any present, indeterminate, or partially-grounded verdict.
 
     ``project_cache`` memoises ``Project`` lookups across the batch by project_id.
     """
@@ -2680,7 +2680,7 @@ async def _stale_bug_message_resolution(session, msg, project_cache) -> tuple[st
         msg.content,
         structured_context=msg.context if isinstance(msg.context, dict) else None,
     )
-    if not signal:
+    if not signal or signal.get("citation_state") != "absent":
         # present / indeterminate / partially-grounded — never resolve.
         return None
     audit = (

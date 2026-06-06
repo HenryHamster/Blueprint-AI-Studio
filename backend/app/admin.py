@@ -1438,17 +1438,19 @@ async def create_task_manually(
     # Reproduce-on-HEAD citation gate for investigation tasks spawned from a
     # bug-report message. The decision-critical moment: a full agent run is
     # about to chase a defect. Re-validate the originating message's citations
-    # against CURRENT HEAD (which may have moved since ingestion) and, when the
-    # cited code is unambiguously absent, inject the signal into the spawned
-    # task's context (mirroring how research_completion injects
-    # finding["_provenance_warnings"]) and append a short provenance note to the
-    # prompt so the investigating agent discounts a stale report. Best-effort:
-    # a missing message or no extractable refs degrades silently (no injection).
+    # against CURRENT HEAD (which may have moved since ingestion). Persist any
+    # actionable provenance signal into the spawned task's context (mirroring
+    # how research_completion injects finding["_provenance_warnings"]), and
+    # only append the loud prompt note when the cited code is unambiguously
+    # absent so the investigating agent discounts a stale report without
+    # treating a partially grounded one as resolved. Best-effort: a missing
+    # message or no extractable refs degrades silently (no injection).
     citation_task_context: dict | None = None
     if payload.source_message_id is not None and payload.task_type == TaskType.investigate:
         from app.source_ref_validation import (
             resolve_branch_verification_context,
             summarize_bug_report_citations,
+            should_persist_message_citation_warning,
         )
 
         src_msg = await session.get(ProjectMessage, payload.source_message_id)
@@ -1489,8 +1491,9 @@ async def create_task_manually(
                         ),
                     }
                 }
-                if _citation_absent:
+                if should_persist_message_citation_warning(signal):
                     citation_task_context["_provenance_warnings"] = signal
+                if _citation_absent:
                     refs = list(signal.get("broken_refs") or []) + list(
                         signal.get("ungrounded_refs") or []
                     )

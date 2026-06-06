@@ -1,5 +1,6 @@
-import { CheckCircle, DollarSign } from 'lucide-react';
+import { AlertTriangle, CheckCircle, DollarSign } from 'lucide-react';
 import type { DirectionProgress } from './DirectionProgressSection';
+import { formatDuration } from './catchupHelpers';
 
 interface ReviewCapExhaustionSummary {
   count: number;
@@ -30,6 +31,23 @@ interface MigrationHealth {
   migration_tasks_failed: number;
   migration_errors_in_window: number;
   auto_generated_migrations: number;
+  migration_slot_contention?: {
+    status: 'idle' | 'held' | 'contention' | 'elevated';
+    severity: 'info' | 'warning' | 'critical';
+    holder: {
+      task_id: string;
+      title: string | null;
+      started_at: string | null;
+      hold_seconds: number | null;
+    } | null;
+    deferred_count: number;
+    longest_wait: {
+      task_id: string;
+      title: string | null;
+      waiting_since: string | null;
+      wait_seconds: number | null;
+    } | null;
+  };
 }
 
 interface PreventionEfficacy {
@@ -265,9 +283,29 @@ export function CatchUpOperationalMetricsSection({
       {/* Migration health */}
       {migrationHealth && (() => {
         const mh = migrationHealth;
-        const highlight = mh.migration_tasks_failed > 0 || mh.migration_errors_in_window > 0 || mh.auto_generated_migrations > 0;
+        const contention = mh.migration_slot_contention;
+        const contentionActive = Boolean(
+          contention && (contention.holder || contention.deferred_count > 0),
+        );
+        const highlight = contention?.severity === 'critical'
+          || contention?.severity === 'warning'
+          || mh.migration_tasks_failed > 0
+          || mh.migration_errors_in_window > 0
+          || mh.auto_generated_migrations > 0;
+        const wrapClass = contention?.severity === 'critical'
+          ? 'rounded px-1.5 py-1 ring-1 ring-red-500/40 bg-red-500/5'
+          : contention?.severity === 'warning'
+            ? 'rounded px-1.5 py-1 ring-1 ring-amber-500/40 bg-amber-500/5'
+            : highlight
+              ? 'rounded px-1.5 py-1 ring-1 ring-amber-500/40 bg-amber-500/5'
+              : '';
+        const titleClass = contention?.severity === 'critical'
+          ? 'text-red-400'
+          : contention?.severity === 'warning'
+            ? 'text-amber-400'
+            : 'text-neutral-500';
         return (
-          <div className={`flex flex-wrap items-center gap-1.5 ${highlight ? 'rounded px-1.5 py-1 ring-1 ring-amber-500/40 bg-amber-500/5' : ''}`}>
+          <div className={`flex flex-wrap items-center gap-1.5 ${wrapClass}`}>
             <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Migration health</span>
             {mh.current_schema_revision && (
               <span className="text-[10px] text-neutral-400 font-mono">rev {mh.current_schema_revision}</span>
@@ -278,6 +316,27 @@ export function CatchUpOperationalMetricsSection({
             <span className={`text-[10px] ${mh.migration_errors_in_window > 0 ? 'text-red-400' : 'text-neutral-500'}`}>· {mh.migration_errors_in_window} migration errors</span>
             {mh.auto_generated_migrations > 0 && (
               <span className="text-[10px] text-amber-400 font-semibold">· ⚠ {mh.auto_generated_migrations} auto-generated</span>
+            )}
+            {contentionActive && (
+              <>
+                <span className={`text-[10px] font-bold uppercase tracking-widest inline-flex items-center gap-0.5 ${titleClass}`}>
+                  {contention?.severity !== 'info' && <AlertTriangle className="w-2.5 h-2.5" />}
+                  {(contention?.deferred_count ?? 0) > 0 ? 'Migration slot contention' : 'Migration slot'}
+                </span>
+                {contention?.holder && (
+                  <span className="text-[10px] text-neutral-400">
+                    · {contention.holder.title || contention.holder.task_id.slice(0, 8)} held {formatDuration(contention.holder.hold_seconds ?? 0)}
+                  </span>
+                )}
+                <span className="text-[10px] text-neutral-400">
+                  · {contention?.deferred_count ?? 0} waiting
+                </span>
+                {contention?.longest_wait && (
+                  <span className="text-[10px] text-neutral-500">
+                    · longest wait {formatDuration(contention.longest_wait.wait_seconds ?? 0)}
+                  </span>
+                )}
+              </>
             )}
           </div>
         );

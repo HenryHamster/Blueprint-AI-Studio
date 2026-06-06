@@ -1673,6 +1673,25 @@ async def summarize_bug_report_citations(
     }
 
 
+def should_persist_message_citation_warning(signal: Any) -> bool:
+    """Whether a citation signal should be stored on message/task context.
+
+    We only persist signals that carry operator/strategist-facing provenance:
+    a fully stale ``absent`` verdict, or a mixed non-absent verdict that still
+    has broken/ungrounded refs worth surfacing. Clean ``present`` and empty
+    ``indeterminate`` results are omitted to avoid storing noise.
+    """
+    if not isinstance(signal, dict):
+        return False
+    if signal.get("citation_state") == CITATION_STATE_ABSENT:
+        return True
+    broken_refs = signal.get("broken_refs")
+    if isinstance(broken_refs, list) and broken_refs:
+        return True
+    ungrounded_refs = signal.get("ungrounded_refs")
+    return isinstance(ungrounded_refs, list) and bool(ungrounded_refs)
+
+
 async def compute_message_citation_warning(
     session: Any,
     project: Any,
@@ -1684,11 +1703,13 @@ async def compute_message_citation_warning(
 
     Resolves the project's integration-branch verification context (via
     :func:`resolve_branch_verification_context`) and runs
-    :func:`summarize_bug_report_citations`. Returns the structured signal ONLY
-    when the citation state is unambiguously ``absent`` — so a ``present`` or
-    ``indeterminate`` result never stores a misleading provenance warning on the
-    message. Never raises: any failure degrades to None, so message creation is
-    never blocked by grounding.
+    :func:`summarize_bug_report_citations`. Returns the structured signal when
+    it carries actionable provenance for downstream consumers: a fully stale
+    ``absent`` verdict, or a mixed non-absent verdict with broken/ungrounded
+    refs that should remain visible. Clean ``present``/``indeterminate`` inputs
+    still return None so message creation does not accumulate noise. Never
+    raises: any failure degrades to None, so message creation is never blocked
+    by grounding.
     """
     try:
         ctx = await resolve_branch_verification_context(session, project)
@@ -1701,6 +1722,6 @@ async def compute_message_citation_warning(
             exc_info=True,
         )
         return None
-    if signal and signal.get("citation_state") == CITATION_STATE_ABSENT:
+    if should_persist_message_citation_warning(signal):
         return signal
     return None

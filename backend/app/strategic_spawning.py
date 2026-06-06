@@ -1857,10 +1857,20 @@ def _open_message_citation_summary(context: Any) -> dict:
     BUG_REPORT/BLOCKER ingestion stores a reproduce-on-HEAD citation signal under
     ``context['_provenance_warnings']`` (the same key research findings use). This
     surfaces it at the top level of the packed open-message dict so the strategist
-    sees a stale/broken-citation report as discounted instead of trusting it. The
-    signal is only stored when a citation is unambiguously absent, so a present
-    summary always means "cited code is missing on HEAD". Returns an empty dict
-    (no key added) when there is no recorded warning.
+    sees the report's grounding state instead of trusting it blindly.
+
+    The signal is surfaced in two cases:
+
+    * ``citation_state == "absent"`` — the report is fully stale (cited code gone
+      on HEAD); the strategist must discount it.
+    * any state that still carries ``broken_refs``/``ungrounded_refs`` — the
+      report is only PARTIALLY grounded (mixed/indeterminate). The broken and
+      ungrounded references stay VISIBLE so the strategist can inspect them
+      during triage instead of having that detail stripped, while the non-absent
+      state keeps the report actionable (not discounted as stale).
+
+    Returns an empty dict (no key added) when there is no recorded warning, or
+    when a non-absent state carries no broken/ungrounded refs (nothing to flag).
     """
     if not isinstance(context, dict):
         return {}
@@ -1868,15 +1878,22 @@ def _open_message_citation_summary(context: Any) -> dict:
     if not isinstance(warnings, dict):
         return {}
     state = warnings.get("citation_state")
-    if state != "absent":
-        return {}
-    summary: dict = {"citation_state": state}
     broken = warnings.get("broken_refs")
-    if isinstance(broken, list) and broken:
-        summary["broken_refs"] = broken
+    broken_list = broken if isinstance(broken, list) and broken else []
     ungrounded = warnings.get("ungrounded_refs")
-    if isinstance(ungrounded, list) and ungrounded:
-        summary["ungrounded_refs"] = ungrounded
+    ungrounded_list = ungrounded if isinstance(ungrounded, list) and ungrounded else []
+    # Surface when fully absent (stale) OR when a non-absent state still carries
+    # broken/ungrounded refs (mixed/partially grounded). A non-absent state with
+    # no refs has nothing to flag, so it is omitted (keeps the feed clean).
+    if state != "absent" and not broken_list and not ungrounded_list:
+        return {}
+    summary: dict = {}
+    if isinstance(state, str) and state:
+        summary["citation_state"] = state
+    if broken_list:
+        summary["broken_refs"] = broken_list
+    if ungrounded_list:
+        summary["ungrounded_refs"] = ungrounded_list
     return summary
 
 

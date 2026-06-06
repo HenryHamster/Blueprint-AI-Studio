@@ -8525,6 +8525,82 @@ def test_reproducing_bug_survives_over_older_stale_one():
     assert trimmed_strict[0]["id"] == "new_reproducing"
 
 
+def test_open_message_citation_summary_promotes_absent_state_with_refs():
+    """A fully absent citation signal is promoted with its broken/ungrounded refs."""
+    from app.strategic_spawning import _open_message_citation_summary
+
+    context = {
+        "_provenance_warnings": {
+            "citation_state": "absent",
+            "broken_refs": ["backend/app/x.py"],
+            "ungrounded_refs": ["backend/app/y.py:foo"],
+        }
+    }
+    summary = _open_message_citation_summary(context)
+    assert summary["citation_state"] == "absent"
+    assert summary["broken_refs"] == ["backend/app/x.py"]
+    assert summary["ungrounded_refs"] == ["backend/app/y.py:foo"]
+
+
+def test_open_message_citation_summary_promotes_mixed_present_state_with_refs():
+    """A partially grounded (present) report keeps its ref detail instead of being stripped."""
+    from app.strategic_spawning import _open_message_citation_summary
+
+    context = {
+        "_provenance_warnings": {
+            "citation_state": "present",
+            "broken_refs": ["backend/app/x.py"],
+            "ungrounded_refs": [],
+        }
+    }
+    summary = _open_message_citation_summary(context)
+    # Non-absent state is preserved (NOT collapsed/stripped) so the strategist
+    # can see it is mixed rather than fully stale.
+    assert summary["citation_state"] == "present"
+    assert summary["broken_refs"] == ["backend/app/x.py"]
+    assert "ungrounded_refs" not in summary
+
+
+def test_open_message_citation_summary_promotes_indeterminate_state_with_refs():
+    """An indeterminate report carrying ungrounded refs surfaces those refs."""
+    from app.strategic_spawning import _open_message_citation_summary
+
+    context = {
+        "_provenance_warnings": {
+            "citation_state": "indeterminate",
+            "broken_refs": [],
+            "ungrounded_refs": ["backend/app/z.py:bar"],
+        }
+    }
+    summary = _open_message_citation_summary(context)
+    assert summary["citation_state"] == "indeterminate"
+    assert summary["ungrounded_refs"] == ["backend/app/z.py:bar"]
+    assert "broken_refs" not in summary
+
+
+def test_open_message_citation_summary_omits_non_absent_state_without_refs():
+    """A non-absent state with no broken/ungrounded refs has nothing to flag."""
+    from app.strategic_spawning import _open_message_citation_summary
+
+    context = {
+        "_provenance_warnings": {
+            "citation_state": "present",
+            "broken_refs": [],
+            "ungrounded_refs": [],
+        }
+    }
+    assert _open_message_citation_summary(context) == {}
+
+
+def test_open_message_citation_summary_empty_without_warning():
+    """No recorded warning yields an empty summary (no keys added)."""
+    from app.strategic_spawning import _open_message_citation_summary
+
+    assert _open_message_citation_summary({}) == {}
+    assert _open_message_citation_summary(None) == {}
+    assert _open_message_citation_summary({"_provenance_warnings": "nope"}) == {}
+
+
 class TestParallelismHint:
     """_build_parallelism_hint nudges toward enough INDEPENDENT direction lanes.
 

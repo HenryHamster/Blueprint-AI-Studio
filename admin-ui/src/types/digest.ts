@@ -465,6 +465,23 @@ export interface DigestData<DP = unknown> {
     migration_tasks_failed: number;
     migration_errors_in_window: number;
     auto_generated_migrations: number;
+    migration_slot_contention?: {
+      status: 'idle' | 'held' | 'contention' | 'elevated';
+      severity: 'info' | 'warning' | 'critical';
+      holder: {
+        task_id: string;
+        title: string | null;
+        started_at: string | null;
+        hold_seconds: number | null;
+      } | null;
+      deferred_count: number;
+      longest_wait: {
+        task_id: string;
+        title: string | null;
+        waiting_since: string | null;
+        wait_seconds: number | null;
+      } | null;
+    };
   } | null;
   prevention_efficacy?: {
     preventive_tasks_created: number;

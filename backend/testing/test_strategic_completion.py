@@ -9980,6 +9980,70 @@ async def test_strategic_completion_present_citation_not_flagged(db_session, moc
 
 
 @pytest.mark.asyncio
+async def test_strategic_completion_mixed_present_citation_is_flagged(
+    db_session, mocker
+):
+    """A partially grounded strategist-emitted BUG_REPORT keeps its mixed refs."""
+    from unittest.mock import AsyncMock
+    from sqlalchemy import select as _select
+    from app.strategic_completion import _handle_strategic_completion
+    from app.models import ProjectMessage
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.source_ref_validation.resolve_branch_verification_context",
+        new=AsyncMock(return_value={}),
+    )
+    mocker.patch(
+        "app.source_ref_validation._file_exists_at_head",
+        new=AsyncMock(side_effect=lambda path, **_: True if "alive.py" in path else False),
+    )
+
+    project = Project(
+        name="P", user_id="u1", vision={"purpose": "test", "revision": 1}, directions=[]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "messages": [
+                {
+                    "type": "BUG_REPORT",
+                    "content": (
+                        "The crash spans backend/app/gone.py and "
+                        "backend/app/alive.py during init."
+                    ),
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    msg = (
+        await db_session.execute(
+            _select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalar_one()
+    warnings = (msg.context or {}).get("_provenance_warnings")
+    assert warnings is not None
+    assert warnings["citation_state"] == "present"
+    assert "backend/app/gone.py" in warnings["broken_refs"]
+
+
+@pytest.mark.asyncio
 async def test_strategic_completion_note_message_not_grounded(db_session, mocker):
     """A NOTE-type strategist message is never grounded, even when it cites code."""
     from unittest.mock import AsyncMock

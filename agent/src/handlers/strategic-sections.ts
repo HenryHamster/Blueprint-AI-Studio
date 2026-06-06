@@ -574,19 +574,27 @@ export function buildOpenMessagesText(openMessages: Array<Record<string, unknown
     const age = calcMessageAge(m);
     const line = `- [${strVal(m.type)}] (id: ${strVal(m.id)}, from: ${strVal(m.from)}, open ${age}) ${strVal(m.content).slice(0, 5000)}`;
     // The backend stamps a reproduce-on-HEAD citation signal onto the message
-    // when its cited code is unambiguously gone on the integration branch
-    // (citation_state === 'absent'). Surface it inline so a stale bug
-    // report/blocker is VISIBLY discounted instead of silently trusted — the
-    // strategist must not spawn a fix/investigation to chase a defect whose
-    // cited code no longer exists without first re-establishing it on HEAD.
+    // from its cited code's grounding on the integration branch. Surface it
+    // inline so the strategist sees the report's grounding state instead of
+    // trusting it blindly. Two cases:
+    //  - citation_state === 'absent': cited code is unambiguously gone on HEAD.
+    //    The report is fully stale and DISCOUNTED — do not route a fix until it
+    //    is independently re-confirmed to still reproduce on HEAD.
+    //  - any non-absent state that still carries broken/ungrounded refs: the
+    //    report is only PARTIALLY grounded. The unconfirmed refs stay VISIBLE so
+    //    the strategist can inspect them, but the report is NOT discounted —
+    //    fix/investigation routing remains allowed.
+    const broken = Array.isArray(m.broken_refs) ? (m.broken_refs as unknown[]).map(r => strVal(r)) : [];
+    const ungrounded = Array.isArray(m.ungrounded_refs) ? (m.ungrounded_refs as unknown[]).map(r => strVal(r)) : [];
+    const parts: string[] = [];
+    if (broken.length > 0) parts.push(`files ${broken.join(', ')}`);
+    if (ungrounded.length > 0) parts.push(`symbols ${ungrounded.join(', ')}`);
+    const refs = parts.length > 0 ? `: ${parts.join('; ')}` : '';
     if (strVal(m.citation_state) === 'absent') {
-      const broken = Array.isArray(m.broken_refs) ? (m.broken_refs as unknown[]).map(r => strVal(r)) : [];
-      const ungrounded = Array.isArray(m.ungrounded_refs) ? (m.ungrounded_refs as unknown[]).map(r => strVal(r)) : [];
-      const parts: string[] = [];
-      if (broken.length > 0) parts.push(`files ${broken.join(', ')}`);
-      if (ungrounded.length > 0) parts.push(`symbols ${ungrounded.join(', ')}`);
-      const refs = parts.length > 0 ? `: ${parts.join('; ')}` : '';
       return `${line}\n  ⚠ STALE — cited code gone on HEAD${refs}. DISCOUNTED/UNPROVEN: do NOT route into a fix/investigation task unless the defect is independently re-confirmed to still reproduce on HEAD.`;
+    }
+    if (parts.length > 0) {
+      return `${line}\n  ⚠ PARTIALLY GROUNDED — some cited refs unconfirmed on HEAD${refs}. The report is NOT stale; fix/investigation routing is allowed — verify the unconfirmed refs during triage.`;
     }
     return line;
   }).join('\n');

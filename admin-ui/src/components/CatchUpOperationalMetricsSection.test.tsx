@@ -74,4 +74,42 @@ describe('CatchUpOperationalMetricsSection', () => {
     expect(screen.getByText('Provision waste')).toBeInTheDocument();
     expect(screen.queryByText('Provisioning overhead')).not.toBeInTheDocument();
   });
+
+  it('renders migration slot contention with an elevated highlight when waiters are stalled', () => {
+    render(
+      <CatchUpOperationalMetricsSection
+        directionProgress={[]}
+        migrationHealth={{
+          current_schema_revision: '9a0892a1b2c3',
+          migration_tasks_in_window: 2,
+          migration_tasks_succeeded: 1,
+          migration_tasks_failed: 0,
+          migration_errors_in_window: 0,
+          auto_generated_migrations: 0,
+          migration_slot_contention: {
+            status: 'elevated',
+            severity: 'critical',
+            holder: {
+              task_id: 'holder-1',
+              title: 'Author migration',
+              started_at: '2026-06-06T10:00:00Z',
+              hold_seconds: 9000,
+            },
+            deferred_count: 2,
+            longest_wait: {
+              task_id: 'waiter-1',
+              title: 'Queued migration waiter',
+              waiting_since: '2026-06-06T11:00:00Z',
+              wait_seconds: 5400,
+            },
+          },
+        }}
+      />
+    );
+
+    expect(screen.getByText('Migration slot contention')).toBeInTheDocument();
+    expect(screen.getByText(/Author migration held 2\.5h/)).toBeInTheDocument();
+    expect(screen.getByText(/2 waiting/)).toBeInTheDocument();
+    expect(screen.getByText(/longest wait 1\.5h/)).toBeInTheDocument();
+  });
 });

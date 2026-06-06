@@ -177,21 +177,28 @@ describe('MessageBubble', () => {
     expect(screen.getByText(/backend\/app\/orchestrator\.py#spawn/)).toBeTruthy();
   });
 
-  test('does not render stale citation badge for present or indeterminate citation states', () => {
-    const { rerender } = render(<MessageBubble {...makeProps({
+  test('renders partial-grounding badge for BUG_REPORT when citation_state=present with broken/ungrounded refs', () => {
+    render(<MessageBubble {...makeProps({
       msg: makeMsg({
         message_type: 'BUG_REPORT',
         context: {
           _provenance_warnings: {
             citation_state: 'present',
             broken_refs: ['backend/app/models.py:Task'],
+            ungrounded_refs: ['backend/app/reaper.py#sweep'],
           },
         },
       }),
     })} />);
+    // Partially grounded uses a distinct, softer label — not the fully-stale wording.
+    expect(screen.getByText('some cited code missing on HEAD')).toBeTruthy();
     expect(screen.queryByText('cited code missing on HEAD')).toBeNull();
+    expect(screen.getByText(/backend\/app\/models\.py:Task/)).toBeTruthy();
+    expect(screen.getByText(/backend\/app\/reaper\.py#sweep/)).toBeTruthy();
+  });
 
-    rerender(<MessageBubble {...makeProps({
+  test('renders indeterminate badge for BLOCKER when citation_state=indeterminate', () => {
+    render(<MessageBubble {...makeProps({
       msg: makeMsg({
         message_type: 'BLOCKER',
         context: {
@@ -202,7 +209,26 @@ describe('MessageBubble', () => {
         },
       }),
     })} />);
+    expect(screen.getByText('citations could not be verified')).toBeTruthy();
+    expect(screen.getByText(/backend\/app\/models\.py:Task/)).toBeTruthy();
+  });
+
+  test('renders no badge when citation_state=present and no broken/ungrounded refs', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        message_type: 'BUG_REPORT',
+        context: {
+          _provenance_warnings: {
+            citation_state: 'present',
+            broken_refs: [],
+            ungrounded_refs: [],
+          },
+        },
+      }),
+    })} />);
+    expect(screen.queryByText('some cited code missing on HEAD')).toBeNull();
     expect(screen.queryByText('cited code missing on HEAD')).toBeNull();
+    expect(screen.queryByText('citations could not be verified')).toBeNull();
   });
 
   test('data-testid message-bubble is set', () => {

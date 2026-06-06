@@ -611,6 +611,62 @@ describe('buildOpenMessagesText', () => {
     expect(result).not.toContain('STALE');
   });
 
+  it('renders a PARTIALLY GROUNDED advisory (not STALE) for a mixed present-citation report with refs', () => {
+    const result = buildOpenMessagesText([
+      {
+        id: 'm1',
+        type: 'BUG_REPORT',
+        content: 'partially grounded',
+        from: 'agent',
+        created_at: new Date().toISOString(),
+        citation_state: 'present',
+        broken_refs: ['backend/app/x.py'],
+        ungrounded_refs: ['backend/app/y.py:foo'],
+      },
+    ]);
+    expect(result).toContain('⚠ PARTIALLY GROUNDED');
+    expect(result).toContain('files backend/app/x.py');
+    expect(result).toContain('symbols backend/app/y.py:foo');
+    // Mixed reports stay actionable — no stale-discount language.
+    expect(result).not.toContain('STALE');
+    expect(result).not.toContain('do NOT route');
+    expect(result).toContain('routing is allowed');
+  });
+
+  it('renders a PARTIALLY GROUNDED advisory for an indeterminate report with refs', () => {
+    const result = buildOpenMessagesText([
+      {
+        id: 'm2',
+        type: 'BLOCKER',
+        content: 'could not verify some refs',
+        from: 'agent',
+        created_at: new Date().toISOString(),
+        citation_state: 'indeterminate',
+        broken_refs: ['backend/app/z.py'],
+      },
+    ]);
+    expect(result).toContain('⚠ PARTIALLY GROUNDED');
+    expect(result).toContain('files backend/app/z.py');
+    expect(result).not.toContain('STALE');
+  });
+
+  it('renders no advisory for a present citation_state with no refs', () => {
+    const result = buildOpenMessagesText([
+      {
+        id: 'm3',
+        type: 'BUG_REPORT',
+        content: 'fully grounded',
+        from: 'agent',
+        created_at: new Date().toISOString(),
+        citation_state: 'present',
+        broken_refs: [],
+        ungrounded_refs: [],
+      },
+    ]);
+    expect(result).not.toContain('STALE');
+    expect(result).not.toContain('PARTIALLY GROUNDED');
+  });
+
   it('renders the STALE marker without a ref list when ref arrays are empty', () => {
     const result = buildOpenMessagesText([
       {

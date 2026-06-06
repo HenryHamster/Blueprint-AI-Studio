@@ -467,6 +467,9 @@ async def _compute_digest(
                     Task.status,
                     Task.title,
                     Task.started_at,
+                    Task.created_at,
+                    Task.updated_at,
+                    Task.latest_status_message,
                     Task.project_id,
                     Task.context,
                     Task.vm_provisioned_at,
@@ -494,6 +497,9 @@ async def _compute_digest(
                     Task.title,
                     Task.payloads,
                     Task.started_at,
+                    Task.created_at,
+                    Task.updated_at,
+                    Task.latest_status_message,
                     Task.project_id,
                     Task.context,
                     Task.vm_provisioned_at,
@@ -1305,7 +1311,10 @@ async def _compute_digest(
     )
 
     migration_health = compute_migration_health(
-        completed_tasks, failed_tasks, error_log_map=error_log_map
+        completed_tasks,
+        failed_tasks,
+        error_log_map=error_log_map,
+        active_tasks=active_tasks_all,
     )
 
     return {

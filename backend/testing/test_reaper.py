@@ -10801,14 +10801,16 @@ async def test_stale_open_bug_resolves_when_citations_absent(reaper_db, monkeypa
 @pytest.mark.asyncio
 @pytest.mark.parametrize("state", ["present", "indeterminate"])
 async def test_stale_open_bug_stays_open_when_not_absent(reaper_db, monkeypatch, state):
-    """A present or indeterminate citation verdict leaves the message OPEN — the
-    helper returns None for anything but an unambiguous 'absent' verdict."""
+    """A truthy non-absent citation signal still leaves the message OPEN."""
     project = await _make_project(reaper_db)
     msg = await _make_bug_message(reaper_db, project)
 
-    # The real helper returns None for present/indeterminate; mirror that here.
     async def _not_absent(_session, _project, _content, *, structured_context=None):
-        return None
+        return {
+            "citation_state": state,
+            "broken_refs": ["app/gone.py"] if state == "present" else [],
+            "ungrounded_refs": [],
+        }
 
     monkeypatch.setattr(_rs, "compute_message_citation_warning", _not_absent, raising=False)
     monkeypatch.setattr(
