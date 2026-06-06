@@ -5688,6 +5688,160 @@ async def test_post_promote_handoff_hint_skipped_for_bootstrap_version(
 
 
 @pytest.mark.asyncio
+async def test_failed_deploy_directive_renders_after_next_version_qualification_started(
+    db_session, mocker, _lts_split_active
+):
+    """Failed-deploy directive must keep rendering even after the next version
+    has begun qualification — until a subsequent version is promoted and confirmed
+    serving. This ensures the recovery priority remains visible to the strategist
+    even when the next version is building/qualifying."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    # v1: promoted but deployment failed
+    prior_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="promoted",
+        opened_at=now - timedelta(days=5),
+        promoted_at=now - timedelta(hours=3),
+        last_qualification={"status": "promoted", "confidence": 0.93},
+        serving_status="deploy_failed",
+        deploy_failure_reason="Cloud Run deployment timed out",
+    )
+    db_session.add(prior_version)
+    # v2: open and already started qualification (condition that used to clear handoff)
+    current_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="build",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={"status": "not_promoted", "confidence": 0.75},
+        qualification_attempts=1,  # Has started qualifying
+    )
+    db_session.add(current_version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks
+    payload = tasks[0].payloads[0]
+
+    suffix = payload.get("prompt_suffix", "")
+    # The post-promotion handoff must have self-cleared (fresh version has qualified)
+    assert "Version handoff" not in suffix, (
+        f"Post-promotion handoff should self-clear after first qualification; got: {suffix}"
+    )
+    # But the failed-deploy directive must be present
+    assert "deployment crisis" in suffix.lower() or "failed deploy" in suffix.lower(), (
+        f"Failed-deploy directive must render even after next version has qualified; got: {suffix}"
+    )
+    assert "v1" in suffix, f"Directive must reference the failed v1; got: {suffix}"
+    assert "deploy_failed" in suffix or "DID NOT confirm serving" in suffix, (
+        f"Directive must reference deployment failure; got: {suffix}"
+    )
+    assert "Cloud Run deployment timed out" in suffix, (
+        f"Directive must include failure reason; got: {suffix}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_deploy_directive_clears_when_newer_version_serving_confirmed(
+    db_session, mocker, _lts_split_active
+):
+    """Failed-deploy directive must clear once a subsequent version is promoted
+    AND confirmed serving. This prevents the recovery priority from lingering
+    after it has actually been resolved by a newer promotion."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    # v1: promoted but deployment failed
+    failed_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="promoted",
+        opened_at=now - timedelta(days=10),
+        promoted_at=now - timedelta(days=5),
+        last_qualification={"status": "promoted", "confidence": 0.93},
+        serving_status="deploy_failed",
+        deploy_failure_reason="Cloud Run crashed on startup",
+    )
+    db_session.add(failed_version)
+    # v2: promoted and serving confirmed (recovery successful)
+    recovery_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="stabilize",
+        status="promoted",
+        opened_at=now - timedelta(days=5),
+        promoted_at=now - timedelta(days=1),
+        last_qualification={"status": "promoted", "confidence": 0.95},
+        serving_status="serving_confirmed",
+        served_sha="abc123def456",
+    )
+    db_session.add(recovery_version)
+    # v3: open and ready for next iteration
+    current_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        phase="build",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification=None,
+        qualification_attempts=0,
+    )
+    db_session.add(current_version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks
+    payload = tasks[0].payloads[0]
+
+    suffix = payload.get("prompt_suffix", "")
+    # The failed-deploy directive must NOT be present because v2 is the latest
+    # promoted version and it is serving_confirmed (not deploy_failed)
+    assert "deployment crisis" not in suffix.lower() and "deploy_failed" not in suffix, (
+        f"Failed-deploy directive must clear when recovery is confirmed serving; got: {suffix}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_stabilize_stall_hint_suppressed_for_dry_run(
     db_session, mocker, _lts_split_active
 ):

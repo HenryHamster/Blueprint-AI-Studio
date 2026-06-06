@@ -4178,6 +4178,52 @@ async def _spawn_strategic_review(
             if prompt_suffix
             else _post_promote_hint
         )
+    # Failed-deploy recovery directive — even if the next version has started
+    # qualification, keep the recovery priority visible while the latest promoted
+    # version remains in deploy_failed state. This directive self-clears only when
+    # a subsequent version is promoted AND confirmed serving. Fires independently
+    # of the post-promotion handoff (which self-clears once the fresh version starts
+    # qualifying) so failed deploys continue to drive strategic attention until
+    # actually recovered.
+    if (
+        _open_version is not None
+        and _integration_branch != _promotion_target
+    ):
+        _latest_promoted_version: Any | None = None
+        try:
+            from app.release_version import recent_closed_versions as _rcv
+
+            for _v in await _rcv(
+                session, project.id, limit=1
+            ):
+                if _v.status == "promoted":
+                    _latest_promoted_version = _v
+                    break
+        except Exception:
+            logger.exception(
+                "[STRATEGIC] failed-deploy directive: latest promoted lookup failed; continuing"
+            )
+        if _latest_promoted_version is not None and _latest_promoted_version.serving_status == "deploy_failed":
+            _reason_txt = (
+                f" (reason={_latest_promoted_version.deploy_failure_reason})"
+                if _latest_promoted_version.deploy_failure_reason
+                else ""
+            )
+            _failed_deploy_directive = (
+                f"Active deployment crisis — v{_latest_promoted_version.version_number} "
+                f"MERGED to {_promotion_target} but DID NOT confirm serving{_reason_txt} "
+                f"(see `deployment_state.promoted_serving_status` = 'deploy_failed'). "
+                f"The promotion did NOT ship and code is NOT live. Your TOP priority "
+                f"this cycle is RECOVERING the failed deploy (roll forward a fix / "
+                f"investigate why the promoted SHA never served). Only after it is "
+                f"serving should you move focus on. This directive remains active until "
+                f"a subsequent version is promoted AND confirmed serving."
+            )
+            prompt_suffix = (
+                f"{prompt_suffix}\n{_failed_deploy_directive}"
+                if prompt_suffix
+                else _failed_deploy_directive
+            )
     # Qualification sub-state directive — last_qualification.status is overloaded
     # ("pending" = audit-scoring OR promotion-PR-open-and-auto-merging), which
     # made the agent conflate "wait for the audit" with "the promotion is

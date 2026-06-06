@@ -1205,6 +1205,31 @@ def test_classify_sha_mismatch_is_deploy_failed():
     assert out == ("deploy_failed", "sha_mismatch", None)
 
 
+def test_classify_unobservable_serving_sha_does_not_confirm_within_window():
+    """A new STABLE revision booted after promotion but its live serving SHA is
+    unobservable (Cloud Run lookup degraded to no value).  Within the window the
+    gate must NOT confirm — and crucially must never echo the promoted SHA as a
+    served_sha stand-in.  No decision yet → keep waiting."""
+    promoted_at = datetime(2026, 6, 5, 12, 0, 0)
+    deadline = datetime(2026, 6, 5, 13, 0, 0)
+    now = datetime(2026, 6, 5, 12, 40, 0)
+    # STABLE, booted after the promotion, but current_sha is unobservable ("").
+    ds = _ds(DeploymentStatus.STABLE, promoted_at.replace(minute=5), current_sha="")
+    assert _classify_serving_outcome(ds, promoted_at, _SHA_A, deadline, now) is None
+
+
+def test_classify_unobservable_serving_sha_fails_after_deadline():
+    """If the serving SHA stays unobservable until the deadline elapses, the gate
+    lands a DISTINCT deploy_failed reason (serving_sha_unobservable) rather than
+    silently confirming with the promoted SHA."""
+    promoted_at = datetime(2026, 6, 5, 12, 0, 0)
+    deadline = datetime(2026, 6, 5, 13, 0, 0)
+    after = datetime(2026, 6, 5, 13, 1, 0)
+    ds = _ds(DeploymentStatus.STABLE, promoted_at.replace(minute=5), current_sha="")
+    out = _classify_serving_outcome(ds, promoted_at, _SHA_A, deadline, after)
+    assert out == ("deploy_failed", "serving_sha_unobservable", None)
+
+
 def test_classify_no_new_revision_only_after_deadline():
     promoted_at = datetime(2026, 6, 5, 12, 0, 0)
     deadline = datetime(2026, 6, 5, 13, 0, 0)
@@ -1364,6 +1389,71 @@ async def test_confirm_serving_confirmed_scenario(db_session):
     )
     assert verdict.post_promotion_outcome == "serving_confirmed"
     assert verdict.post_promotion_outcome_at is not None
+
+
+@pytest.mark.asyncio
+async def test_confirm_unobservable_sha_within_window_stays_unconfirmed(db_session):
+    """A new STABLE revision booted after promotion but its serving SHA is
+    unobservable: within the window the sweep must NOT confirm and must NEVER
+    stamp served_sha with the promoted (merged) SHA stand-in."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    # STABLE, booted after promotion, but no observable serving SHA.
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha="",
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=40),
+    )
+    assert resolved is False
+    await db_session.refresh(version)
+    assert version.serving_status == "unconfirmed"
+    # Critically: served_sha was NOT fabricated from the promoted SHA.
+    assert version.served_sha is None
+
+
+@pytest.mark.asyncio
+async def test_confirm_unobservable_sha_after_deadline_deploy_failed(db_session):
+    """If the serving SHA never becomes observable before the deadline, the sweep
+    lands a distinct serving_sha_unobservable deploy_failed state — it never
+    upgrades to serving_confirmed by echoing the merged SHA."""
+    promoted_at = _utcnow() - timedelta(hours=2)
+    deadline = promoted_at + timedelta(hours=1)  # already elapsed
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    # New STABLE revision booted after promotion, but serving SHA unobservable.
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha="",
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "deploy_failed"
+    assert version.deploy_failure_reason == "serving_sha_unobservable"
+    # No fabricated served_sha.
+    assert version.served_sha is None
+
+    state = rv.summarize_qualification_state(
+        version.last_qualification, version.serving_status, version.deploy_failure_reason
+    )
+    assert state["state"] == "promotion_deploy_failed"
+    assert state["serving_status"] == "deploy_failed"
 
 
 @pytest.mark.asyncio

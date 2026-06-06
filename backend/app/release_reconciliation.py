@@ -710,17 +710,26 @@ def _classify_serving_outcome(
       * ``None`` — no decision yet: still inside the confirmation window and no
         new healthy revision has booted (keep waiting).
       * ``("serving_confirmed", served_sha, served_at)`` — a new revision booted
-        AFTER ``promoted_at`` and is STABLE (and, where the deployed SHA is
-        observable, matches ``promoted_sha``).
+        AFTER ``promoted_at``, is STABLE, and its live serving SHA was
+        INDEPENDENTLY observed to match ``promoted_sha``.  ``served_sha`` is
+        always that observed value, never a ``promoted_sha`` stand-in.
       * ``("deploy_failed", reason)`` (third element ``None``) — the deploy did
         not come up healthy: a ROLLED_BACK/HALTED state arose after the promotion
         (``reason`` ``rolled_back``/``halted``), the observed serving SHA does
-        not match the promoted SHA (``sha_mismatch``), or no new healthy revision
-        appeared by ``deadline`` (``no_new_revision``).
+        not match the promoted SHA (``sha_mismatch``), no new healthy revision
+        appeared by ``deadline`` (``no_new_revision``), or a new revision did go
+        STABLE but its serving SHA could never be independently observed before
+        the deadline (``serving_sha_unobservable``).
     """
     promoted_at = _to_naive_utc(promoted_at)
     deadline = _to_naive_utc(deadline)
     now = _to_naive_utc(now) or now
+
+    # A new revision went STABLE after the promotion, but its live serving SHA
+    # could not be independently observed (Cloud Run lookup degraded to no
+    # value).  Tracked so the deadline path lands a distinct, honest failure
+    # reason instead of confirming with a fabricated served SHA.
+    serving_sha_unobservable = False
 
     if ds is not None:
         deployed_at = _to_naive_utc(ds.deployed_at)
@@ -747,16 +756,25 @@ def _classify_serving_outcome(
             return ("deploy_failed", "rolled_back", None)
 
         # SERVING CONFIRMED: a new revision booted after the promotion and the
-        # monitoring window passed (STABLE).  Where the deployed SHA is
-        # observable, strengthen to require it matches the promoted SHA.
+        # monitoring window passed (STABLE).  Confirm ONLY when the live serving
+        # SHA was INDEPENDENTLY observed AND matches the promoted SHA — never
+        # echo the promoted (merged) SHA as a stand-in.  When the serving SHA is
+        # unobservable, do NOT confirm: keep waiting within the window, and let
+        # the deadline land a distinct ``serving_sha_unobservable`` failure.
         if status == DeploymentStatus.STABLE and revision_after_promotion:
             current_sha = ds.current_sha or None
-            if promoted_sha and current_sha and current_sha != promoted_sha:
+            if current_sha and promoted_sha:
+                if current_sha == promoted_sha:
+                    return ("serving_confirmed", current_sha, deployed_at)
                 return ("deploy_failed", "sha_mismatch", None)
-            return ("serving_confirmed", current_sha or promoted_sha, deployed_at)
+            # New revision is STABLE but the live serving SHA (or the promoted
+            # SHA to match it against) cannot be observed — not confirmable.
+            serving_sha_unobservable = True
 
     # No confirmation yet — deploy-failed only once the bounded window elapses.
     if deadline is not None and now >= deadline:
+        if serving_sha_unobservable:
+            return ("deploy_failed", "serving_sha_unobservable", None)
         return ("deploy_failed", "no_new_revision", None)
     return None
 
