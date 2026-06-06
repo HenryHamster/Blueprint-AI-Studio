@@ -28,6 +28,7 @@ from app.models import Task, TaskStatus
 from app.time_utils import _utcnow
 
 _SR_SKIP_BLIND_SPOT_MARKERS = ("self-review skipped", "self-review JSON parsing failed")
+_REVIEWER_CONFIRMED_CATEGORY_EXCLUSIONS = frozenset({"other"})
 
 # Patterns matching blind_spot entries that agents must NOT emit (per prompt.ts).
 # These describe the intended-design pipeline split — agents run a targeted
@@ -296,9 +297,10 @@ async def aggregate_sr_blind_spot_themes(
 def reviewer_confirmed_categories(ctx: Dict[str, Any]) -> set:
     """Canonical reviewer-LLM-confirmed category truth set for one task.
 
-    The ground truth is the reviewer LLM verdict history (NOT human labels):
-    a category is "confirmed" when some reviewer iteration rejected the work
-    for it. Prefers the all-iterations superset
+    The reviewer-confirmed truth set is persisted in task context, not
+    reconstructed from review history: a category is "confirmed" when some
+    reviewer iteration rejected the work for it. Prefers the all-iterations
+    superset
     (``_all_iterations_rejection_categories``, stamped on every rejection
     iteration) and falls back to the first-attempt set
     (``_first_attempt_rejection_categories``) only when the all-iterations
@@ -309,19 +311,24 @@ def reviewer_confirmed_categories(ctx: Dict[str, Any]) -> set:
     false-alarm/hit/miss computation — so a category the author flagged that
     the reviewer confirmed only on a *later* iteration is never miscounted as a
     false alarm, and the surfaces agree by construction.
+
+    ``other`` is deliberately excluded even if persisted in the rejection
+    categories. The author self-review vocabulary cannot emit ``other``, so
+    treating it as canonical reviewer-confirmed truth would create impossible
+    misses/false alarms and depress catch-rate denominators across every shared
+    analytics surface.
     """
     confirmed = set(ctx.get("_all_iterations_rejection_categories") or {})
     if not confirmed:
         confirmed = set(ctx.get("_first_attempt_rejection_categories") or {})
-    return confirmed
+    return confirmed - _REVIEWER_CONFIRMED_CATEGORY_EXCLUSIONS
 
 
 def has_reviewer_confirmed_categories(ctx: Dict[str, Any]) -> bool:
     """Sample-membership predicate for prediction-accuracy scoring.
 
-    Returns True when a task carries reviewer-confirmed categories on *any*
-    review iteration — i.e. :func:`reviewer_confirmed_categories` would return
-    a non-empty set. This is the single source of the "is this task part of the
+    Returns True when :func:`reviewer_confirmed_categories` would return a
+    non-empty set. This is the single source of the "is this task part of the
     self-review prediction-accuracy sample?" contract: a task belongs to the
     sample iff its reviewer-confirmed truth set (the same set the scorer reads)
     is non-empty.
@@ -334,10 +341,7 @@ def has_reviewer_confirmed_categories(ctx: Dict[str, Any]) -> bool:
     ``_first_attempt_rejection_categories``) is in-sample — it must not be
     dropped just because the first review approved.
     """
-    return bool(
-        ctx.get("_all_iterations_rejection_categories")
-        or ctx.get("_first_attempt_rejection_categories")
-    )
+    return bool(reviewer_confirmed_categories(ctx))
 
 
 async def aggregate_sr_blind_spot_envelope(

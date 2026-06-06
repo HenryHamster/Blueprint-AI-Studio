@@ -17,11 +17,14 @@ from app.sr_analytics_common import (
     _SR_CODE_CHANGE_TYPES,
     _TREND_DELTA_THRESHOLD,
     _categorize_review_issues,
-    _categorize_review_issues_keyword,
     _finalize_examples,
     _is_trend_significant,
 )
-from app.sr_blind_spots import _REVIEWER_ORIGINS, is_skipped_sr_outcome
+from app.sr_blind_spots import (
+    _REVIEWER_ORIGINS,
+    is_skipped_sr_outcome,
+    reviewer_confirmed_categories,
+)
 
 
 def _partition_edges_by_origin(edges: list) -> "tuple[list, list]":
@@ -198,10 +201,10 @@ def _stats_for_tasks(
     """Compute SR stats for a pre-filtered task list (no date filtering).
 
     The "ground truth" these rates are scored against is the automated
-    review-pipeline (reviewer-LLM) verdict history, NOT a human reviewer.
+    persisted reviewer-confirmed truth, not review-history reconstruction.
     Catch/miss/precision/recall here therefore measure author-SR-agent vs.
-    reviewer-LLM-agent AGREEMENT — an inter-agent agreement signal, not a
-    catch rate against an external/human truth. Variables are named
+    reviewer-confirmed agreement — an inter-agent agreement signal, not a
+    catch rate against persisted reviewer-confirmed truth. Variables are named
     ``reviewer_*`` accordingly. Internal ``*human_count`` aggregation keys are
     a legacy implementation detail retained so the stats builder can keep its
     existing shape while the serialized/UI contract exposes reviewer-grounded
@@ -216,9 +219,9 @@ def _stats_for_tasks(
     Returns (count, cat_stats, type_cat_stats, all_iter_cat_stats, sev_stats,
     scope_cat_stats). ``all_iter_cat_stats`` uses ALL review iterations as the
     reviewer-confirmed truth set (not just iteration 0). Falls back to
-    first-attempt categories when ``review_loop.review_history`` is absent
-    (backward compat). ``sev_stats`` accumulates per-severity hit/miss counts
-    from review_history issues across all categories. ``scope_cat_stats``
+    first-attempt categories when ``_all_iterations_rejection_categories`` is
+    absent (backward compat). ``sev_stats`` accumulates per-severity hit/miss
+    counts from review_history issues across all categories. ``scope_cat_stats``
     mirrors ``type_cat_stats`` keyed by task scope (small|medium|large)
     instead of task type, using ``task.context['scope']`` (default: small).
     """
@@ -269,7 +272,14 @@ def _stats_for_tasks(
             rev_cats = _categorize_review_issues(rev_hist)
             for cat_name, issues in rev_cats.items():
                 cat_weights[cat_name] = max(_sw.get(i["severity"], 1) for i in issues)
-        reviewer_confirmed_cats = set(
+        reviewer_confirmed_cats = reviewer_confirmed_categories(ctx)
+        # First-attempt-only confirmed truth drives the ``current_hit_rate``
+        # (first-attempt) metric below. It is intentionally NOT the
+        # all-iterations-preferred ``reviewer_confirmed_cats``: a category the
+        # reviewer raised only on a later iteration must surface in
+        # ``all_iterations_catch_rate`` but stay absent from the first-attempt
+        # metric, so the two rates can diverge as documented.
+        first_attempt_cats = set(
             ctx.get("_first_attempt_rejection_categories") or {}
         ) - {"other"}
 
@@ -315,7 +325,7 @@ def _stats_for_tasks(
                     sev_stats[sev]["hit_count"] += 1
         task_type = t.first_payload.get("type", "")
         task_scope = (t.context or {}).get("scope", DEFAULT_TASK_SCOPE)
-        for cat in reviewer_confirmed_cats:
+        for cat in first_attempt_cats:
             if cat not in cat_stats:
                 cat_stats[cat] = {
                     "hit_count": 0,
@@ -392,18 +402,11 @@ def _stats_for_tasks(
                         scope_cat_stats[task_scope][cat]["miss_examples"].append(
                             {"desc": issue["desc"], "severity": issue["severity"]}
                         )
-        # All-iterations reviewer-confirmed truth: prefer persisted _all_iterations_rejection_categories
-        # (written by task_lifecycle on every rejection iteration); fall back to
-        # categorising review_history in-line, then to first-attempt categories.
-        _stored_all_iter = ctx.get("_all_iterations_rejection_categories") or {}
-        if _stored_all_iter:
-            all_iter_cats = set(_stored_all_iter.keys()) - {"other"}
-        elif rev_hist:
-            all_iter_cats = set(_categorize_review_issues_keyword(rev_hist).keys()) - {
-                "other"
-            }
-        else:
-            all_iter_cats = reviewer_confirmed_cats
+        # All-iterations reviewer-confirmed truth: prefer the persisted set
+        # written by task_lifecycle on every rejection iteration. If that field
+        # is absent, fall back to the first-attempt categories only; do not
+        # reconstruct truth from review_history.
+        all_iter_cats = reviewer_confirmed_categories(ctx)
         for cat in all_iter_cats:
             if cat not in all_iter_cat_stats:
                 all_iter_cat_stats[cat] = {"hit_count": 0, "human_count": 0}
@@ -485,15 +488,15 @@ def compute_sr_catch_rate_by_direction(
             if stats["human_count"] == 0:
                 continue
             hit_rate = round(stats["hit_count"] / stats["human_count"], 3)
-            entry: dict[str, Any] = {
+            cat_entry: dict[str, Any] = {
                 "hit_rate": hit_rate,
                 "miss_rate": round(1 - hit_rate, 3),
                 "sample_count": stats["human_count"],
             }
             ex = _finalize_examples(stats.get("miss_examples", []))
             if ex:
-                entry["examples"] = ex
-            categories[cat] = entry
+                cat_entry["examples"] = ex
+            categories[cat] = cat_entry
         if categories:
             categories = dict(
                 sorted(
@@ -519,7 +522,7 @@ def compute_sr_catch_rate_by_direction(
                 if weighted_miss_rate is not None
                 else None
             )
-            entry: dict[str, Any] = {
+            direction_entry: dict[str, Any] = {
                 "sample_count": count,
                 "miss_rate": weighted_miss_rate,
                 "overall_catch_rate": overall_catch_rate,
@@ -528,7 +531,7 @@ def compute_sr_catch_rate_by_direction(
             if direction_text_map:
                 raw_text = direction_text_map.get(direction_id, "")
                 if raw_text:
-                    entry["direction_text"] = raw_text[:120]
+                    direction_entry["direction_text"] = raw_text[:120]
             if existing_by_direction is not None:
                 prev_entry: dict = dict(existing_by_direction.get(direction_id) or {})
                 prev_miss_rate = prev_entry.get("miss_rate")
@@ -556,10 +559,10 @@ def compute_sr_catch_rate_by_direction(
                         dir_trend = "stable"
                 else:
                     dir_trend = "stable"
-                entry["previous_miss_rate"] = prev_miss_rate
-                entry["trend"] = dir_trend
-                entry["rate_history"] = rate_history
-            result[direction_id] = entry
+                direction_entry["previous_miss_rate"] = prev_miss_rate
+                direction_entry["trend"] = dir_trend
+                direction_entry["rate_history"] = rate_history
+            result[direction_id] = direction_entry
     return dict(
         sorted(result.items(), key=lambda item: (-(item[1]["miss_rate"] or 0), item[0]))
     )

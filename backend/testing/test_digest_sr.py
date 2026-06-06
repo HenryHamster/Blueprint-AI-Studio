@@ -4420,7 +4420,7 @@ async def test_sr_recent_misses_total_not_capped_at_scan_limit(
 
 @pytest.mark.asyncio
 async def test_sr_recent_misses_fallback_first_attempt(client: AsyncClient, db_session):
-    """When no _all_iterations and no review_history, _first_attempt_rejection_categories is used."""
+    """When _all_iterations is absent, first-attempt categories are used and review history alone is ignored."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
@@ -4434,6 +4434,19 @@ async def test_sr_recent_misses_fallback_first_attempt(client: AsyncClient, db_s
             payloads=[{"type": "fix"}],
             context={
                 "_first_attempt_rejection_categories": {"security": 1},
+                "review_loop": {
+                    "review_history": [
+                        {
+                            "iteration": 2,
+                            "issues": [
+                                {
+                                    "description": "architecture issue",
+                                    "severity": "MAJOR",
+                                }
+                            ],
+                        }
+                    ]
+                },
                 "_self_review_outcome": {
                     "verdict": "pass",
                     "fixes_applied": False,
@@ -4450,6 +4463,7 @@ async def test_sr_recent_misses_fallback_first_attempt(client: AsyncClient, db_s
     body = response.json()
     assert body["total"] == 1
     assert "security" in body["misses"][0]["missed_categories"]
+    assert "architecture" not in body["misses"][0]["missed_categories"]
 
 
 # Retired: test_digest_fresh_reviewer_trend_* (null_without_design_doc,

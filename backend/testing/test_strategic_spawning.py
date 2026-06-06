@@ -34,6 +34,7 @@ from app.autonomous_research import _spawn_research_task
 from app.strategic_spawning import (
     _spawn_design_doc_update,
     _spawn_strategic_review,
+    _direction_activity_score,
     _build_operator_steering_directive,
     _build_shipped_changes_manifest,
     _build_recent_interventions,
@@ -10449,3 +10450,26 @@ async def test_design_doc_update_omits_demand_when_none(db_session):
 
     assert "missing_capability_demand" not in payload
     validate_internal_payload(dict(payload), "test_ddu_no_demand")
+
+
+# ---------------------------------------------------------------------------
+# _direction_activity_score: verified-merge selection input
+# ---------------------------------------------------------------------------
+
+
+def test_direction_activity_score_prefers_verified_merges():
+    """A degraded merge (verified_prs_merged=0) must not boost the activity score."""
+    degraded = {"verified_prs_merged": 0, "prs_merged": 5}
+    verified = {"verified_prs_merged": 5, "prs_merged": 5}
+    # The degraded direction shipped nothing verified → no merge boost (score 0),
+    # while the verified direction earns the 3x-per-merge boost.
+    assert _direction_activity_score(degraded) == 0
+    assert _direction_activity_score(verified) == 15
+    assert _direction_activity_score(verified) > _direction_activity_score(degraded)
+
+
+def test_direction_activity_score_legacy_falls_back_to_prs_merged():
+    """Stat dict predating verified_prs_merged uses raw prs_merged (back-compat)."""
+    legacy = {"prs_merged": 4}
+    # 4 merges * 3 = 12, no other signals.
+    assert _direction_activity_score(legacy) == 12

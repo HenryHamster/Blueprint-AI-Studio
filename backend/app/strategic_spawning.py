@@ -998,10 +998,18 @@ def _direction_activity_score(stat: dict) -> int:
     Higher = more activity. Combines work shipped (merged), work pending (failed),
     and recency (cycles). High-priority directions get a small boost so a quiet
     high-priority direction doesn't get evicted by a chatty low-priority one.
+
+    "Work shipped" counts VERIFIED merges (``verified_prs_merged``, populated in
+    the direction_stats loop) so a direction whose merges never actually landed —
+    or landed degraded/unverified — does not win payload space over one that
+    truly shipped. Falls back to the raw ``prs_merged`` for back-compat with
+    stat dicts that predate the verified field.
     """
     if not isinstance(stat, dict):
         return 0
-    merged = int(stat.get("prs_merged") or 0)
+    merged = int(
+        stat.get("verified_prs_merged", stat.get("prs_merged", 0)) or 0
+    )
     failed = int(stat.get("tasks_failed") or 0)
     cycles = int(stat.get("total_cycles") or 0)
     priority = stat.get("priority")
@@ -2857,8 +2865,12 @@ def _build_previous_decision_outcomes(
         history = d.get("research_history") or []
         agg = d.get("history_aggregate") or {}
         cycles_active = len(history) + (agg.get("total_cycles") or 0)
-        prs_merged = sum(h.get("prs_merged", 0) for h in history) + (
-            agg.get("total_prs_merged") or 0
+        # Verified merge total — the previous-decision-outcome prior (and the
+        # derived calibration_delta) must reflect work that actually landed, not
+        # degraded/unverified merges. Legacy fallback handled by
+        # verified_merged_count / the aggregate .get chain.
+        prs_merged = sum(verified_merged_count(h) for h in history) + (
+            agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
         )
         is_paused = d.get("status") == "paused"
         auto_paused = bool(d.get("auto_paused"))
@@ -3384,6 +3396,16 @@ async def _spawn_strategic_review(
         total_merged = sum(h.get("prs_merged", 0) for h in history) + (
             agg.get("total_prs_merged") or 0
         )
+        # Verified lifetime merge total — degraded/unverified merges excluded
+        # (legacy fallback baked into verified_merged_count / the aggregate .get).
+        # The displayed prs_merged and operator_rejection_rate below stay RAW
+        # (operator-judgment metrics); only the activity-score selection input
+        # reads this verified field.
+        total_verified_merged = sum(
+            verified_merged_count(h) for h in history
+        ) + (
+            agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
+        )
         total_rejected = sum(h.get("prs_rejected", 0) for h in history) + (
             agg.get("total_prs_rejected") or 0
         )
@@ -3441,6 +3463,7 @@ async def _spawn_strategic_review(
             "status": d.get("status"),
             "total_cycles": total_cycles,
             "prs_merged": total_merged,
+            "verified_prs_merged": total_verified_merged,
             "tasks_failed": total_failed,
             "possibly_saturated": d.get("possibly_saturated", False),
         }

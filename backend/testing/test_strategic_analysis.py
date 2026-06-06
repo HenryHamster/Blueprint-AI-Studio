@@ -14,6 +14,7 @@ from app.strategic_analysis import (
 from app.direction_metrics import (
     _compute_difficulty_index,
     _compute_lifetime_generalized_outcome_state,
+    _compute_productivity_score,
 )
 
 
@@ -1041,6 +1042,114 @@ def test_difficulty_index_mixed_uses_history_and_aggregate():
 def test_difficulty_index_capped_at_thirty():
     d = {"research_history": [{"tasks_created": 1000, "prs_merged": 1}]}
     assert _compute_difficulty_index(d) == 30.0
+
+
+# ---------------------------------------------------------------------------
+# Verified-merge scoring: a degraded/unverified merge (prs_merged=1 but
+# verified_prs_merged=0) must NOT inflate selection/scoring inputs. Legacy
+# entries (only prs_merged) must still count via the fallback.
+# ---------------------------------------------------------------------------
+
+
+def test_difficulty_index_excludes_degraded_unverified_merge():
+    """A degraded merge counts as zero verified merges → direction stays 'hard'."""
+    d = {
+        "research_history": [
+            {"tasks_created": 10, "prs_merged": 1, "verified_prs_merged": 0}
+        ]
+    }
+    # 0 verified merges → defaults to 1.0 (unknown / easy-until-proven), NOT
+    # 10/1 = 10.0 which the raw count would have produced.
+    assert _compute_difficulty_index(d) == 1.0
+
+
+def test_difficulty_index_legacy_entry_still_counts():
+    """Entry with only prs_merged (no verified field) falls back to raw count."""
+    d = {"research_history": [{"tasks_created": 10, "prs_merged": 2}]}
+    assert _compute_difficulty_index(d) == 5.0
+
+
+def test_productivity_score_excludes_degraded_unverified_merge():
+    """A degraded merge does not credit productivity (verified merges only)."""
+    degraded = {
+        "research_history": [
+            {"tasks_created": 1, "prs_merged": 1, "verified_prs_merged": 0}
+        ]
+    }
+    verified = {
+        "research_history": [
+            {"tasks_created": 1, "prs_merged": 1, "verified_prs_merged": 1}
+        ]
+    }
+    # Degraded merge scores 0 (no verified merge, no rejection); a real verified
+    # merge scores positive. They must NOT be equal.
+    assert _compute_productivity_score(degraded) == 0.0
+    assert _compute_productivity_score(verified) > 0.0
+
+
+def test_productivity_score_legacy_entry_still_counts():
+    """Legacy entry (only prs_merged) credits productivity via fallback."""
+    legacy = {"research_history": [{"tasks_created": 1, "prs_merged": 1}]}
+    assert _compute_productivity_score(legacy) > 0.0
+
+
+def test_outcome_evaluation_window_merged_excludes_degraded_but_acceptance_raw():
+    """outcome['merged'] counts verified merges; acceptance_rate stays raw."""
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [
+                {
+                    "timestamp": "2026-01-01T00:00:00",
+                    "prs_merged": 2,
+                    "verified_prs_merged": 1,
+                    "prs_rejected": 1,
+                    "tasks_created": 4,
+                },
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(
+        project, (project.vision or {}).get("_strategic_cycle_history") or []
+    )
+    d = result["directions"][0]
+    # Verified merged = 1 (one of the two merges was degraded/unverified).
+    assert d["merged"] == 1
+    # acceptance_rate is an operator-judgment metric: counts RAW merges
+    # (2 merged / (2 merged + 1 rejected)).
+    assert d["acceptance_rate"] == round(2 / 3, 3)
+    # operator_rejection_rate also stays raw (1 rejected / 3 total raw PRs).
+    assert d["operator_rejection_rate"] == round(1 / 3, 2)
+
+
+def test_prediction_calibration_factor_uses_verified_merges():
+    """Calibration compares prediction against the VERIFIED actual merge total."""
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [
+                # 4 raw merges but only 2 verified → actual should be 2.
+                {"prs_merged": 4, "verified_prs_merged": 2},
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    cycle_history = [
+        {
+            "outcome": "completed",
+            "created_predictions": {"dir-1": {"similar_past_merges": 2}},
+        }
+    ]
+    # actual_verified (2) / predicted (2) = 1.0 ratio. With raw merges it would
+    # have been 4/2 = 2.0 → clipped to 1.5. Prove we get the verified-derived 1.0
+    # (blended toward 1.0 for the single sample, which keeps it exactly 1.0).
+    factor = _real_compute_prediction_calibration_factor(
+        project, cycle_history, min_samples=1
+    )
+    assert factor == 1.0
 
 
 def test_cost_estimate_per_direction_and_overall():

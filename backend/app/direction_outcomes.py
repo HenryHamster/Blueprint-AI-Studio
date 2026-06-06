@@ -33,7 +33,6 @@ from app.acceptance_gate import (
 )
 from app.landed_signal import is_merged_completion, merge_verification_status
 from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
-from app.review_pipeline import _is_test_file
 from app.task_capabilities import PRODUCT_TASK_TYPES
 from app.task_locking import with_design_doc_locked, with_directions_locked
 
@@ -841,6 +840,11 @@ async def _update_direction_research_outcomes(
         # Exclude test files: related_files typically declares production files
         # only, so including test files in the numerator systematically inflates
         # the ratio for tasks that ship proper test coverage.
+        # Deferred import: review_pipeline -> spawn_calibration -> direction_metrics
+        # imports verified_merged_count back out of this module, so importing
+        # review_pipeline at module load creates a circular import.
+        from app.review_pipeline import _is_test_file
+
         prod_changed = [f for f in changed if not _is_test_file(f)]
         if related and prod_changed:
             ratio = len(prod_changed) / len(related)

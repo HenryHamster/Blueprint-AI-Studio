@@ -11,7 +11,7 @@ from typing import Any, Optional
 
 from app.models import Task
 from app.shared_state import DEFAULT_TASK_SCOPE
-from app.sr_blind_spots import _REVIEWER_ORIGINS
+from app.sr_blind_spots import _REVIEWER_ORIGINS, reviewer_confirmed_categories
 
 
 # In-app Alert row title prefixes for SR catch-rate alerts. The router that
@@ -218,17 +218,13 @@ def _compute_cat_fp_stats(
         }
         if not sr_failed:
             continue
+        reviewer_confirmed_cats = reviewer_confirmed_categories(ctx)
         reviewer_cats = {
             finding.get("category")
             for finding in (sro.get("reviewer_findings") or [])
             if isinstance(finding, dict) and finding.get("category")
         }
-        human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
-        rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
-        rev_hist_cats: set[str] = set()
-        if rev_hist:
-            rev_hist_cats = set(_categorize_review_issues_keyword(rev_hist).keys())
-        confirmed = reviewer_cats | human_cats | rev_hist_cats
+        confirmed = reviewer_confirmed_cats | reviewer_cats
         task_scope = ctx.get("scope", DEFAULT_TASK_SCOPE)
         for category in sr_failed:
             bucket = cat_fp.setdefault(category, {"fp": 0, "tp": 0})
@@ -267,8 +263,13 @@ def _compute_cat_severity_calibration(
         rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
         if not rev_hist:
             continue
+        confirmed = reviewer_confirmed_categories(ctx)
+        if not confirmed:
+            continue
         rev_cats = _categorize_review_issues(rev_hist)
         for category, rev_issues in rev_cats.items():
+            if category not in confirmed:
+                continue
             cr = check_results.get(category)
             if not isinstance(cr, dict):
                 continue

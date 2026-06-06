@@ -660,10 +660,17 @@ def _build_creation_prediction(
         other_words = set((d.get("text") or "").lower().split()) - _PRED_STOPWORDS
         if len(words) >= 2 and len(words & other_words) >= 3:
             similar_count += 1
+            # Count VERIFIED merges so the creation-difficulty prediction is
+            # primed on work that actually shipped, not degraded/unverified
+            # merges. Legacy fallback handled by verified_merged_count / the
+            # aggregate .get chain.
             for h in d.get("research_history") or []:
-                similar_past_merges_raw += h.get("prs_merged", 0)
+                similar_past_merges_raw += verified_merged_count(h)
             agg = d.get("history_aggregate") or {}
-            similar_past_merges_raw += agg.get("total_prs_merged") or 0
+            similar_past_merges_raw += (
+                agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0))
+                or 0
+            )
     similar_past_merges = round(similar_past_merges_raw * calibration_factor)
     result: Dict[str, Any] = {
         "estimated_difficulty": estimated_difficulty,

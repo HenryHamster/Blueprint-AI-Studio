@@ -145,6 +145,8 @@ def _compute_sr_skip_rate(terminal_tasks: List[Task]) -> "Dict[str, Any] | None"
     by_type: Dict[str, Dict[str, int]] = {}
     for t in code_change_tasks:
         ttype = (t.first_payload or {}).get("type")
+        if not isinstance(ttype, str):
+            continue
         ctx = t.context or {}
         sro = ctx.get("_self_review_outcome")
         is_skip = _is_skipped_sr_outcome(sro)
@@ -194,6 +196,8 @@ def _compute_sr_disallowed_blind_spot_rate(
     by_type: Dict[str, Dict[str, int]] = {}
     for t in code_change_tasks:
         ttype = (t.first_payload or {}).get("type")
+        if not isinstance(ttype, str):
+            continue
         ctx = t.context or {}
         sro = ctx.get("_self_review_outcome") or {}
         has_violation = (sro.get("_filtered_blind_spots_count") or 0) > 0
@@ -503,9 +507,10 @@ def compute_sr_prediction_accuracy(
     :func:`has_reviewer_confirmed_categories` predicate — i.e.
     ``_all_iterations_rejection_categories`` non-empty, falling back to
     ``_first_attempt_rejection_categories``). Including later-iteration-only
-    confirmations keeps the sampled set aligned with the ground truth the scorer
-    reads via :func:`reviewer_confirmed_categories`; a task first approved then
-    rejected on a later iteration is in-sample, not dropped.
+    confirmations keeps the sampled set aligned with the reviewer-confirmed
+    truth the scorer reads via :func:`reviewer_confirmed_categories`; a task
+    first approved then rejected on a later iteration is in-sample, not
+    dropped.
     Returns None when sample size < 5.
     """
     if len(tasks_with_both) < 5:
@@ -521,16 +526,16 @@ def compute_sr_prediction_accuracy(
         # first-attempt set only when absent) — shared with the sibling FP
         # surfaces so a later-iteration confirmation is not scored as a false
         # alarm and all "false alarm" figures reconcile.
-        human_cats = reviewer_confirmed_categories(ctx)
+        reviewer_confirmed_cats = reviewer_confirmed_categories(ctx)
         sr_failed = _author_sr_failed_categories(check_results)
-        total_human += len(human_cats)
-        total_overlap += len(human_cats & sr_failed)
-        total_missed += len(human_cats - sr_failed)
-        total_false += len(sr_failed - human_cats)
+        total_human += len(reviewer_confirmed_cats)
+        total_overlap += len(reviewer_confirmed_cats & sr_failed)
+        total_missed += len(reviewer_confirmed_cats - sr_failed)
+        total_false += len(sr_failed - reviewer_confirmed_cats)
         total_sr_failed += len(sr_failed)
-        if human_cats:
+        if reviewer_confirmed_cats:
             tasks_with_rejections += 1
-            if human_cats & sr_failed:
+            if reviewer_confirmed_cats & sr_failed:
                 self_flagged_task_count += 1
         rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
         cat_weights: Dict[str, int] = {}
@@ -548,7 +553,7 @@ def compute_sr_prediction_accuracy(
                 cat_weights[cat] = max(
                     _SR_SEVERITY_WEIGHTS.get(i["severity"], 1) for i in issues
                 )
-        for cat in human_cats:
+        for cat in reviewer_confirmed_cats:
             w = cat_weights.get(cat, 1)
             if cat in sr_failed:
                 w_caught += w

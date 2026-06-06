@@ -3806,7 +3806,7 @@ async def test_compute_sr_catch_rate_trends_all_iterations_catch_rate_vs_first_a
     project = await _make_project(db_session)
     tasks = []
     # Current window (5 tasks): SR passes everything.
-    # First-attempt human truth: test-coverage only (iteration 0).
+    # First-attempt reviewer-confirmed truth: test-coverage only (iteration 0).
     # All-iterations truth: test-coverage + correctness (flagged in iteration 2).
     for _ in range(5):
         task = Task(
@@ -3872,13 +3872,20 @@ async def test_compute_sr_catch_rate_trends_all_iterations_catch_rate_vs_first_a
 async def test_compute_sr_catch_rate_trends_all_iterations_backward_compat(
     db_session: AsyncSession,
 ):
-    """When _all_iterations_rejection_categories is absent and review_history is empty,
-    all_iterations_catch_rate falls back to the first-attempt categories so existing
-    tasks continue to produce a non-None all_iterations value."""
+    """When _all_iterations_rejection_categories is absent, review_history-only
+    categories are ignored and all_iterations_catch_rate falls back to first-attempt."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
     project = await _make_project(db_session)
     tasks = []
+    review_history = [
+        {
+            "iteration": 2,
+            "issues": [
+                {"description": "architecture issue in docs", "severity": "MAJOR"}
+            ],
+        }
+    ]
     # 5 current tasks: only _first_attempt_rejection_categories, no all-iterations field
     for _ in range(5):
         t = _make_sr_task(
@@ -3887,6 +3894,7 @@ async def test_compute_sr_catch_rate_trends_all_iterations_backward_compat(
             human_cats={"test-coverage": 1},
             sr_failed_cats=["test-coverage"],
         )
+        t.context["review_loop"] = {"review_history": review_history}
         db_session.add(t)
         tasks.append(t)
     # 5 previous tasks: same
@@ -3897,6 +3905,7 @@ async def test_compute_sr_catch_rate_trends_all_iterations_backward_compat(
             human_cats={"test-coverage": 1},
             sr_failed_cats=["test-coverage"],
         )
+        t.context["review_loop"] = {"review_history": review_history}
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -3910,6 +3919,7 @@ async def test_compute_sr_catch_rate_trends_all_iterations_backward_compat(
     assert cat["all_iterations_catch_rate"] is not None
     assert cat["current_hit_rate"] == cat["all_iterations_catch_rate"]
     assert cat["all_iterations_miss_rate"] is not None
+    assert "architecture" not in result["categories"]
 
 
 # ---------------------------------------------------------------------------
@@ -3994,11 +4004,17 @@ async def test_sr_false_positive_rate_human_confirms_is_zero(db_session: AsyncSe
 
 
 @pytest.mark.asyncio
-async def test_sr_false_positive_rate_review_history_confirms_not_fp(
+async def test_sr_false_positive_rate_review_history_only_is_not_confirmation(
     db_session: AsyncSession,
 ):
-    """SR fails test-coverage; review_history (iter 2) contains a 'missing test' issue
-    that keyword-matches test-coverage → not counted as a false positive."""
+    """SR fails test-coverage; the only reviewer signal is a review_history (iter 2)
+    'missing test' issue with no persisted rejection-category record.
+
+    The reviewer-confirmed truth set is now the persisted
+    ``_all_iterations_rejection_categories`` / ``_first_attempt_rejection_categories``
+    (see :func:`app.sr_blind_spots.reviewer_confirmed_categories`); review_history is
+    no longer reconstructed into confirmed categories. With no persisted record for
+    test-coverage, the SR failure is therefore counted as a false positive."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
     project = await _make_project(db_session)
@@ -4047,9 +4063,10 @@ async def test_sr_false_positive_rate_review_history_confirms_not_fp(
 
     assert result is not None
     cat = result["categories"]["test-coverage"]
-    # review_history confirmed the SR failure → fp_count == 0
-    assert cat["false_positive_rate"] == 0.0, (
-        "review_history keyword-matched test-coverage → SR failure is confirmed, not a FP"
+    # review_history is not a confirmation source → SR failure is a false positive
+    assert cat["false_positive_rate"] == 1.0, (
+        "review_history-only (no persisted rejection category) does not confirm the "
+        "SR failure → it is counted as a false positive"
     )
 
 
@@ -6433,7 +6450,10 @@ def test_compute_sr_quality_by_fingerprint_groups_metrics_and_gates_low_sr_sampl
     assert a["reviewer_rescue_sample_size"] == 1
     assert a["reviewer_rescue_rate"] == 1.0
     assert a["sr_false_positive_sample_size"] == 4
-    assert a["sr_false_positive_rate"] == 0.25
+    # test-coverage is confirmed only by review_history (no persisted rejection
+    # category), which is no longer a confirmation source — so it now counts as a
+    # false positive alongside performance: 2 FPs / 4 sampled = 0.5.
+    assert a["sr_false_positive_rate"] == 0.5
     fp_by_cat = {
         entry["category"]: (entry["fp_count"], entry["tp_count"])
         for entry in a["sr_false_positive_rate_by_category"]
@@ -6441,7 +6461,8 @@ def test_compute_sr_quality_by_fingerprint_groups_metrics_and_gates_low_sr_sampl
     assert fp_by_cat["architecture"] == (0, 1)
     assert fp_by_cat["correctness"] == (0, 1)
     assert fp_by_cat["performance"] == (1, 0)
-    assert fp_by_cat["test-coverage"] == (0, 1)
+    # review_history-only confirmation no longer suppresses the false positive.
+    assert fp_by_cat["test-coverage"] == (1, 0)
     disagreements = {
         entry["category"]: (
             entry["reviewer_overrode_sr_count"],

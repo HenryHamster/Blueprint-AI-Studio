@@ -208,7 +208,6 @@ from app.review_learning import (  # noqa: E402,F401
     compute_recurring_first_review_descriptions,
     compute_review_effectiveness,
     extract_review_feedback_to_playbook,
-    resolve_sr_miss_human_truth,
 )
 
 

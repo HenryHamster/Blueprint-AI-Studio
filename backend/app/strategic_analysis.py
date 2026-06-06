@@ -9,6 +9,7 @@ from app.direction_metrics import (
     _entry_generalized_successes,
     _entry_generalized_terminal_outcomes,
 )
+from app.direction_outcomes import verified_merged_count
 from app.time_utils import _utcnow
 
 # Directions whose cost_per_merged_pr exceeds median * multiplier are flagged
@@ -240,7 +241,12 @@ def _build_outcome_evaluation(
             window_history = list(history)
 
         cycles = len(window_history)
-        merged = sum(h.get("prs_merged", 0) for h in window_history)
+        # raw_merged stays RAW (operator-judgment metrics acceptance_rate and
+        # operator_rejection_rate below count every operator-accepted merge,
+        # verified or not). verified_merged is the shipped-work signal that feeds
+        # outcome["merged"], difficulty, and the downstream selection trims.
+        raw_merged = sum(h.get("prs_merged", 0) for h in window_history)
+        verified_merged = sum(verified_merged_count(h) for h in window_history)
         # For CPM, count only autonomous merges; legacy entries without the field
         # are treated as all-autonomous (conservative fallback for old data).
         autonomous_merged = sum(
@@ -288,8 +294,10 @@ def _build_outcome_evaluation(
                     confirmed.append(item)  # Unmarked items are treated as confirmed
             failed_approaches = parsed.get("failed", [])
 
-        total_prs = merged + rejected
-        acceptance_rate = round(merged / total_prs, 3) if total_prs > 0 else None
+        total_prs = raw_merged + rejected
+        acceptance_rate = (
+            round(raw_merged / total_prs, 3) if total_prs > 0 else None
+        )
         # avg_time_to_merge_hours: average of per-cycle values where present
         merge_time_values = [
             h["avg_time_to_merge_hours"]
@@ -308,7 +316,7 @@ def _build_outcome_evaluation(
             "system_id": d.get("system_id"),
             "status": status,
             "cycles": cycles,
-            "merged": merged,
+            "merged": verified_merged,
             "failed": failed,
             "prs_rejected": rejected,
         }
@@ -348,7 +356,7 @@ def _build_outcome_evaluation(
             if estimated_cost_usd > cost_budget_usd:
                 outcome["budget_exceeded"] = True
         if rejected > 0:
-            total_prs = merged + rejected
+            total_prs = raw_merged + rejected
             outcome["operator_rejection_rate"] = (
                 round(rejected / total_prs, 2) if total_prs > 0 else None
             )
@@ -1006,8 +1014,13 @@ def _compute_prediction_calibration_factor(
                 continue
             history = d.get("research_history") or []
             agg = d.get("history_aggregate") or {}
-            actual = sum(h.get("prs_merged", 0) for h in history) + (
-                agg.get("total_prs_merged") or 0
+            # Actual merge total is the VERIFIED lifetime total: calibrating the
+            # prediction against degraded/unverified merges would teach the
+            # predictor that work shipped when it did not. Legacy fallback handled
+            # by verified_merged_count / the aggregate .get chain.
+            actual = sum(verified_merged_count(h) for h in history) + (
+                agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0))
+                or 0
             )
             ratios.append(actual / predicted)
 

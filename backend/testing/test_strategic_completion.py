@@ -1704,6 +1704,41 @@ class TestDirectionPredictionCalibration:
         assert pred["similar_direction_count"] == 1
         assert pred["mature_system_count"] == 1
 
+    def test_build_creation_prediction_excludes_degraded_unverified_merges(self):
+        """Similar-past-merges counts VERIFIED merges only (history + aggregate)."""
+        similar = {
+            "id": "d0",
+            "text": "cache invalidation dashboard refresh",
+            "research_history": [
+                # 2 raw merges, 1 verified.
+                {"prs_merged": 2, "verified_prs_merged": 1},
+            ],
+            "history_aggregate": {
+                # 5 raw, 2 verified.
+                "total_prs_merged": 5,
+                "total_verified_prs_merged": 2,
+            },
+        }
+        p = Project(name="P", user_id="u", directions=[similar], vision={})
+        new_d = {"id": "d1", "text": "cache invalidation dashboard refresh strategy"}
+        pred = _build_creation_prediction(new_d, p)
+        # Verified-only: 1 (history) + 2 (aggregate) = 3, NOT raw 2+5=7.
+        assert pred["similar_past_merges"] == 3
+
+    def test_build_creation_prediction_legacy_aggregate_falls_back(self):
+        """Aggregate predating total_verified_prs_merged uses total_prs_merged."""
+        similar = {
+            "id": "d0",
+            "text": "cache invalidation dashboard refresh",
+            "research_history": [{"prs_merged": 1}],
+            "history_aggregate": {"total_prs_merged": 4},
+        }
+        p = Project(name="P", user_id="u", directions=[similar], vision={})
+        new_d = {"id": "d1", "text": "cache invalidation dashboard refresh strategy"}
+        pred = _build_creation_prediction(new_d, p)
+        # 1 (legacy history fallback) + 4 (legacy aggregate fallback) = 5.
+        assert pred["similar_past_merges"] == 5
+
     def test_build_retirement_metrics_snapshots_merges_and_cycles(self):
         d = {
             "id": "d1",
