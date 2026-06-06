@@ -1029,6 +1029,80 @@ async def test_bug_report_citations_flags_absent_symbol(mocker):
 
 
 @pytest.mark.asyncio
+async def test_bug_report_citations_mixed_refs_stay_present(mocker):
+    """A report citing several files where one is gone but others survive is
+    NOT collapsed to 'absent' — the surviving files keep the verdict 'present'
+    while the broken one is still surfaced in broken_refs."""
+    from app.source_ref_validation import summarize_bug_report_citations
+
+    async def _content(path, **_kw):
+        # backend/app/gone.py is deleted; the other two survive.
+        if path == "backend/app/gone.py":
+            return (False, None)
+        return (True, 400)
+
+    mocker.patch(
+        "app.source_ref_validation._file_content_in_repo_branch",
+        side_effect=_content,
+    )
+    signal = await summarize_bug_report_citations(
+        "Crash spans backend/app/gone.py, backend/app/alive.py and "
+        "backend/app/also_here.py.",
+        **_CITE_CREDS,
+    )
+    assert signal["citation_state"] == "present"
+    assert "backend/app/gone.py" in signal["broken_refs"]
+    assert "backend/app/alive.py" not in signal["broken_refs"]
+
+
+@pytest.mark.asyncio
+async def test_bug_report_citations_mixed_broken_and_grounded_symbol(mocker):
+    """A surviving independent file keeps a report 'present' even when another
+    cited symbol is ungrounded — the report is not 'absent' and the stale symbol
+    is still reported."""
+    from app.source_ref_validation import summarize_bug_report_citations
+
+    async def _content(path, **_kw):
+        # The symbol host survives; so does an independently cited file.
+        return (True, 250)
+
+    mocker.patch(
+        "app.source_ref_validation._file_content_in_repo_branch",
+        side_effect=_content,
+    )
+    mocker.patch(
+        "app.source_ref_validation._symbol_defined_at_head",
+        new=AsyncMock(return_value=False),
+    )
+    signal = await summarize_bug_report_citations(
+        "Regression: backend/app/host.py:gone_fn was removed, but the flow in "
+        "backend/app/alive.py still misbehaves.",
+        **_CITE_CREDS,
+    )
+    assert signal["citation_state"] == "present"
+    assert "backend/app/host.py:gone_fn" in signal["ungrounded_refs"]
+
+
+@pytest.mark.asyncio
+async def test_bug_report_citations_all_files_broken_is_absent(mocker):
+    """When every cited file is gone (and no symbol survives) the report is
+    'absent' — the all-citations-gone case the shared contract reserves."""
+    from app.source_ref_validation import summarize_bug_report_citations
+
+    mocker.patch(
+        "app.source_ref_validation._file_content_in_repo_branch",
+        new=AsyncMock(return_value=(False, None)),
+    )
+    signal = await summarize_bug_report_citations(
+        "Crash spans backend/app/gone.py and backend/app/also_gone.py.",
+        **_CITE_CREDS,
+    )
+    assert signal["citation_state"] == "absent"
+    assert "backend/app/gone.py" in signal["broken_refs"]
+    assert "backend/app/also_gone.py" in signal["broken_refs"]
+
+
+@pytest.mark.asyncio
 async def test_bug_report_citations_uses_structured_file_path(mocker):
     """A structured file_path (e.g. annotation) is grounded even if prose omits it."""
     from app.source_ref_validation import summarize_bug_report_citations

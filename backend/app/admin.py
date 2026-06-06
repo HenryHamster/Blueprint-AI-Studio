@@ -1491,13 +1491,24 @@ async def create_task_manually(
                         ),
                     }
                 }
+                # Persist the provenance signal whenever it carries actionable
+                # detail (absent verdict, or a non-absent verdict that still has
+                # broken/ungrounded refs). The shared helper centralizes that
+                # policy so present/indeterminate noise is dropped consistently.
                 if should_persist_message_citation_warning(signal):
                     citation_task_context["_provenance_warnings"] = signal
+                # Surface the specific stale citations to the investigating
+                # agent as advisory provenance REGARDLESS of the overall verdict.
+                # A partially-grounded (present/indeterminate) report still
+                # benefits from learning which individual references are stale,
+                # WITHOUT being told the whole defect is resolved — that detail
+                # used to be dropped for every non-absent report. The
+                # `already_resolved` seeding above stays gated on `_citation_absent`.
+                stale_refs = list(signal.get("broken_refs") or []) + list(
+                    signal.get("ungrounded_refs") or []
+                )
                 if _citation_absent:
-                    refs = list(signal.get("broken_refs") or []) + list(
-                        signal.get("ungrounded_refs") or []
-                    )
-                    ref_note = f" ({', '.join(refs[:5])})" if refs else ""
+                    ref_note = f" ({', '.join(stale_refs[:5])})" if stale_refs else ""
                     task_payload["prompt"] = (
                         task_payload["prompt"]
                         + "\n\n[Provenance warning] The originating bug report cites "
@@ -1505,6 +1516,22 @@ async def create_task_manually(
                         f"{ref_note}. The defect may already be fixed or refactored "
                         "away — verify it still reproduces on HEAD before investing, "
                         "and discount its actionability accordingly."
+                    )
+                elif stale_refs:
+                    # Mixed/partially-grounded report: the bug is NOT presumed
+                    # resolved, but some cited references are stale. Carry the
+                    # detail forward and name the stale refs so the agent does not
+                    # chase them, without discounting the defect itself. The
+                    # provenance signal itself is already persisted by the
+                    # `should_persist_message_citation_warning` gate above.
+                    ref_note = ", ".join(stale_refs[:5])
+                    task_payload["prompt"] = (
+                        task_payload["prompt"]
+                        + "\n\n[Provenance note] The originating bug report is only "
+                        "partially grounded on the current integration branch: some "
+                        f"cited references are stale ({ref_note}). The defect itself "
+                        "is NOT presumed resolved — verify it still reproduces, but "
+                        "treat those specific stale references as outdated."
                     )
 
     try:

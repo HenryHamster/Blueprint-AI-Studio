@@ -9881,6 +9881,14 @@ async def test_strategic_completion_grounds_emitted_bug_report(db_session, mocke
         "app.source_ref_validation._file_exists_at_head",
         new=AsyncMock(return_value=False),
     )
+    # The shared reproduce-on-HEAD contract (classify_reproduction) only reports
+    # ``absent`` when a validation backend could actually run; with the branch
+    # context mocked empty, assert the backend is available so a genuinely-broken
+    # citation reaches ``absent`` rather than degrading to ``indeterminate``.
+    mocker.patch(
+        "app.source_ref_validation._has_validation_backend",
+        return_value=True,
+    )
 
     project = Project(
         name="P", user_id="u1", vision={"purpose": "test", "revision": 1}, directions=[]

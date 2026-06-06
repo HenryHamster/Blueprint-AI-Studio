@@ -11769,6 +11769,12 @@ class TestBugReportCitationGate:
             "app.source_ref_validation._file_exists_at_head",
             new=AsyncMock(return_value=False),
         )
+        # Simulate the local-HEAD backend actually being available so the absent
+        # verdict is reached (not degraded to indeterminate by a missing backend).
+        mocker.patch(
+            "app.source_ref_validation._has_validation_backend",
+            return_value=True,
+        )
         resp = await client.post(
             "/api/admin/messages",
             json={
@@ -11912,6 +11918,10 @@ class TestBugReportCitationGate:
             "app.source_ref_validation._file_exists_at_head",
             new=AsyncMock(return_value=False),
         )
+        mocker.patch(
+            "app.source_ref_validation._has_validation_backend",
+            return_value=True,
+        )
         resp = await client.post(
             "/api/admin/tasks",
             json={
@@ -12040,6 +12050,75 @@ class TestBugReportCitationGate:
         # Present citations leave the report untouched — no provenance warning.
         assert "_provenance_warnings" not in (task.context or {})
         assert "Provenance warning" not in task.payloads[0]["prompt"]
+
+    @pytest.mark.asyncio
+    async def test_investigate_task_partial_citation_seeds_indeterminate_with_note(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A partially-grounded bug report (one stale citation among surviving
+        ones) is NOT treated as already-resolved: the verdict stays
+        `indeterminate`, but the specific stale reference is still surfaced to the
+        investigating agent as an advisory provenance note."""
+        project = await self._project_with_repo(db_session)
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            from_type="user",
+            content=(
+                "The flow spans backend/app/gone.py and backend/app/alive.py; "
+                "the guard is dropped."
+            ),
+        )
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+
+        async def _exists(path, **_kw):
+            return path != "backend/app/gone.py"
+
+        mocker.patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        mocker.patch(
+            "app.source_ref_validation._file_exists_at_head",
+            side_effect=_exists,
+        )
+        mocker.patch(
+            "app.source_ref_validation._has_validation_backend",
+            return_value=True,
+        )
+        resp = await client.post(
+            "/api/admin/tasks",
+            json={
+                "github_repo": "acme/citegate",
+                "title": "Investigate partially-grounded report",
+                "prompt": "Investigate the reported dropped guard.",
+                "task_type": "investigate",
+                "source_message_id": str(msg.id),
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project.id)
+            )
+        ).scalar_one()
+        # Mixed grounding ⇒ defect not presumed resolved.
+        verdict = (task.context or {}).get("reproduce_verdict")
+        assert verdict is not None
+        assert verdict["status"] == "indeterminate"
+        assert verdict["status"] != "already_resolved"
+        # The stale reference is carried forward and named in the prompt note,
+        # without claiming the whole bug is gone.
+        warnings = (task.context or {}).get("_provenance_warnings")
+        assert warnings is not None
+        assert warnings["citation_state"] == "present"
+        assert "backend/app/gone.py" in warnings["broken_refs"]
+        prompt = task.payloads[0]["prompt"]
+        assert "Provenance note" in prompt
+        assert "backend/app/gone.py" in prompt
+        assert "Provenance warning" not in prompt
 
     @pytest.mark.asyncio
     async def test_investigate_task_no_source_message_is_unaffected(
