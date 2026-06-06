@@ -11717,6 +11717,122 @@ async def test_readiness_empty_carries_ground_truth_caveat(db_session):
     assert "self-approval only" in out["caveat"]
 
 
+async def _seed_promoted_verdict(
+    db_session,
+    project_id,
+    version_id,
+    *,
+    seq: int,
+    post_promotion_outcome: str | None,
+):
+    """Insert ONE promoted QualificationVerdict with a resolved (or NULL/unconfirmed)
+    post-promotion serving outcome, for ground-truth precision tests."""
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    row = QualificationVerdict(
+        project_id=project_id,
+        release_version_id=version_id,
+        candidate_sha="cd" * 20,
+        confidence=0.95,
+        sub_scores={"audit": 1.0},
+        blocker=None,
+        would_promote=True,
+        promotion_enabled=True,
+        terminal_status="promoted",
+        threshold=0.9,
+        post_promotion_outcome=post_promotion_outcome,
+        created_at=_utcnow() + timedelta(minutes=seq),
+    )
+    db_session.add(row)
+    await db_session.commit()
+    return row
+
+
+@pytest.mark.asyncio
+async def test_validated_precision_none_when_no_resolved_outcomes(db_session):
+    """Only dry-run verdicts (no resolved promoted outcomes) → validated_precision
+    null, sample 0, ground_truth_validated False; self-approval framing intact."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    for i in range(6):
+        await _seed_verdict(
+            db_session, project.id, version.id, seq=i, would_promote=True
+        )
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    assert out["validated_precision"] is None
+    assert out["resolved_outcome_sample"] == 0
+    assert out["serving_confirmed_count"] == 0
+    assert out["deploy_failed_count"] == 0
+    assert out["ground_truth_validated"] is False
+    assert "self-approval only" in out["caveat"]
+    # Self-approval rate is still reported independently.
+    assert out["would_promote_rate"] == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_validated_precision_from_resolved_outcomes(db_session):
+    """A mixed serving_confirmed/deploy_failed sample at/above the minimum computes
+    the correct precision and flips ground_truth_validated True; unconfirmed/NULL
+    rows are ignored. The self-approval rate is still reported independently."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    # Self-approval window (dry-run regime) — separate signal.
+    for i in range(6):
+        await _seed_verdict(
+            db_session, project.id, version.id, seq=i, would_promote=True
+        )
+    # Resolved promoted outcomes: 4 serving_confirmed, 1 deploy_failed → 0.80.
+    outcomes = (
+        ["serving_confirmed"] * 4
+        + ["deploy_failed"]
+        + ["unconfirmed", None]  # ignored
+    )
+    for j, outcome in enumerate(outcomes):
+        await _seed_promoted_verdict(
+            db_session, project.id, version.id, seq=100 + j,
+            post_promotion_outcome=outcome,
+        )
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    assert out["serving_confirmed_count"] == 4
+    assert out["deploy_failed_count"] == 1
+    assert out["resolved_outcome_sample"] == 5
+    assert out["validated_precision"] == pytest.approx(0.8)
+    assert out["ground_truth_validated"] is True
+    assert "validated precision" in out["caveat"]
+    # The self-approval rate is augmented, never replaced.
+    assert out["would_promote_rate"] == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_validated_precision_below_min_keeps_unvalidated(db_session):
+    """A resolved sample below the minimum reports the precision but keeps
+    ground_truth_validated False and the self-approval-only caveat."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    # Only 2 resolved outcomes — below _READINESS_MIN_RESOLVED_OUTCOMES (5).
+    await _seed_promoted_verdict(
+        db_session, project.id, version.id, seq=100,
+        post_promotion_outcome="serving_confirmed",
+    )
+    await _seed_promoted_verdict(
+        db_session, project.id, version.id, seq=101,
+        post_promotion_outcome="deploy_failed",
+    )
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    assert out["resolved_outcome_sample"] == 2
+    assert out["validated_precision"] == pytest.approx(0.5)
+    assert out["ground_truth_validated"] is False
+    assert "self-approval only" in out["caveat"]
+
+
 @pytest.mark.asyncio
 async def test_readiness_recurring_blocker_not_ready(db_session):
     """A recurring hard blocker in the history blocks readiness even when the

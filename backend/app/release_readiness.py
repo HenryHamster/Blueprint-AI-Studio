@@ -3,17 +3,24 @@
 Provides the operator-facing readiness verdict (whether promotion is ready) based
 on recent dry-run qualification history, plus formatting helpers for API responses.
 
-GROUND-TRUTH CAVEAT: this signal is a *self-approval* track record, NOT a
-validated trust measurement. ``would_promote`` is the qualifier's own
-confidence >= threshold, so ``would_promote_rate`` is just the rate at which the
-qualifier approved itself. There is no recorded post-promotion outcome on
-QualificationVerdict (was the promoted candidate reverted, did main CI/regression
-follow), and no outcome-feedback code in the release_* modules — so a qualifier
-that systematically over-scores a defect class still reads ~100% here. Until such
-a ground truth is recorded and a true precision/false-positive rate is derived,
-this MUST be surfaced as "qualifier self-approval streak", never as a "trustworthy"
-or validated judgment. The returned ``ground_truth_validated`` flag (always False
-today) and ``caveat`` string exist so every consumer states this honestly.
+GROUND-TRUTH: the ``would_promote_rate`` signal is a *self-approval* track
+record — ``would_promote`` is the qualifier's own confidence >= threshold, so
+that rate is just how often the qualifier approved itself. It is NOT a measured
+precision on its own.
+
+A real ground truth IS now recorded, however: each promoted verdict's deploy is
+resolved post-promotion and stamped onto ``QualificationVerdict.post_promotion_outcome``
+(``serving_confirmed`` | ``deploy_failed`` | ``unconfirmed``) by
+release_reconciliation. From the resolved subset
+(``terminal_status == "promoted"`` and outcome in {serving_confirmed,
+deploy_failed}) we derive ``validated_precision = serving_confirmed /
+(serving_confirmed + deploy_failed)`` — a true post-promotion precision that
+augments (never replaces) the self-approval rate. It is surfaced alongside the
+self-approval keys, and ``ground_truth_validated`` flips True ONLY once the
+resolved-outcome sample reaches ``_READINESS_MIN_RESOLVED_OUTCOMES``. Below that
+the validated precision is still reported but ``ground_truth_validated`` stays
+False and the ``caveat`` keeps the honest "self-approval only" framing so no
+consumer over-claims on a thin sample.
 """
 
 from __future__ import annotations
@@ -58,10 +65,80 @@ _READINESS_CONFIDENCE_STDEV_MAX = 0.15
 # no post-promotion outcome is recorded against which a true precision could be
 # computed. Surfaced to every consumer so none of them claims "trustworthy".
 _READINESS_GROUND_TRUTH_CAVEAT = (
-    "self-approval only — no post-promotion outcome (revert / main CI / "
-    "regression) is recorded, so this is the rate at which the qualifier "
-    "approved itself, not a measured precision"
+    "self-approval only — no post-promotion serving outcome has resolved yet, "
+    "so this is the rate at which the qualifier approved itself, not a measured "
+    "precision"
 )
+
+# Minimum number of RESOLVED post-promotion outcomes (serving_confirmed or
+# deploy_failed) before the derived ``validated_precision`` is trusted as a real
+# ground truth. Below this the precision is still reported but
+# ``ground_truth_validated`` stays False and the caveat keeps self-approval framing.
+_READINESS_MIN_RESOLVED_OUTCOMES = 5
+
+
+def _readiness_caveat(validated: dict[str, Any]) -> str:
+    """Build the ground-truth caveat from the validated-precision aggregate.
+
+    Keeps the honest "self-approval only" framing until enough post-promotion
+    outcomes have resolved; once validated, states the measured precision.
+    """
+    sample = validated["resolved_outcome_sample"]
+    if validated["ground_truth_validated"]:
+        return (
+            f"ground-truth validated — post-promotion serving outcome is "
+            f"recorded; validated precision "
+            f"{validated['validated_precision']:.2f} over {sample} resolved "
+            f"promotion(s) ({validated['serving_confirmed_count']} "
+            f"serving-confirmed, {validated['deploy_failed_count']} "
+            f"deploy-failed), augmenting the qualifier self-approval rate"
+        )
+    if sample > 0:
+        return (
+            f"self-approval only for now — post-promotion outcome IS recorded "
+            f"but only {sample} resolved promotion(s) so far (need >= "
+            f"{_READINESS_MIN_RESOLVED_OUTCOMES} to validate precision); the "
+            f"would-promote rate is the qualifier approving itself, not yet a "
+            f"measured precision"
+        )
+    return _READINESS_GROUND_TRUTH_CAVEAT
+
+
+async def _compute_validated_precision(
+    session: AsyncSession, project_id: uuid.UUID
+) -> dict[str, Any]:
+    """Derive ground-truth qualifier precision from resolved post-promotion outcomes.
+
+    Considers only verdicts that actually promoted
+    (``terminal_status == "promoted"``) whose serving outcome has RESOLVED to
+    ``serving_confirmed`` or ``deploy_failed`` (``unconfirmed``/NULL ignored).
+    Returns the precision, the resolved sample size, the per-outcome counts, and
+    a ``ground_truth_validated`` flag set only when the sample meets the minimum.
+
+    NOTE: this query is intentionally NOT restricted to the dry-run regime —
+    promoted verdicts are recorded with ``promotion_enabled`` True, and the
+    post-promotion precision is precisely the live-regime signal the dry-run
+    window cannot see.
+    """
+    stmt = select(QualificationVerdict.post_promotion_outcome).where(
+        QualificationVerdict.project_id == project_id,
+        QualificationVerdict.terminal_status == "promoted",
+        QualificationVerdict.post_promotion_outcome.in_(
+            ("serving_confirmed", "deploy_failed")
+        ),
+    )
+    outcomes = list((await session.execute(stmt)).scalars().all())
+    serving_confirmed = sum(1 for o in outcomes if o == "serving_confirmed")
+    deploy_failed = sum(1 for o in outcomes if o == "deploy_failed")
+    sample = serving_confirmed + deploy_failed
+    validated_precision = round(serving_confirmed / sample, 4) if sample else None
+    return {
+        "validated_precision": validated_precision,
+        "resolved_outcome_sample": sample,
+        "serving_confirmed_count": serving_confirmed,
+        "deploy_failed_count": deploy_failed,
+        "ground_truth_validated": sample >= _READINESS_MIN_RESOLVED_OUTCOMES,
+    }
 
 # The readiness window is hardcoded to DRY-RUN-regime verdicts (promotion_enabled
 # is False) — sensible pre-go-live calibration, but stale once promotion goes
@@ -138,8 +215,23 @@ def _empty_readiness(
     *,
     infra_failure_count: int = 0,
     consecutive_infra_errors: int = 0,
+    validated: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """The not-ready summary returned when there is no verdict history yet."""
+    """The not-ready summary returned when there is no verdict history yet.
+
+    ``validated`` carries the ground-truth post-promotion precision aggregate
+    (see :func:`_compute_validated_precision`); the no-history self-approval
+    window is empty, but resolved post-promotion outcomes may still exist, so the
+    validated keys are surfaced here too to keep the dict shape stable.
+    """
+    if validated is None:
+        validated = {
+            "validated_precision": None,
+            "resolved_outcome_sample": 0,
+            "serving_confirmed_count": 0,
+            "deploy_failed_count": 0,
+            "ground_truth_validated": False,
+        }
     return {
         "ready": False,
         "reason": "no qualification verdicts recorded yet — nothing to evaluate",
@@ -159,8 +251,12 @@ def _empty_readiness(
         "recurring_blockers": {},
         "blocker_counts": {},
         "thresholds": thresholds,
-        "ground_truth_validated": False,
-        "caveat": _READINESS_GROUND_TRUTH_CAVEAT,
+        "validated_precision": validated["validated_precision"],
+        "resolved_outcome_sample": validated["resolved_outcome_sample"],
+        "serving_confirmed_count": validated["serving_confirmed_count"],
+        "deploy_failed_count": validated["deploy_failed_count"],
+        "ground_truth_validated": validated["ground_truth_validated"],
+        "caveat": _readiness_caveat(validated),
         "promotion_enabled": False,
         "regime": "pre_go_live_calibration",
         "is_current_readiness": True,
@@ -229,12 +325,15 @@ async def compute_promotion_readiness(
     )
     verdicts = list((await session.execute(stmt)).scalars().all())
 
+    validated = await _compute_validated_precision(session, project_id)
+
     evaluated = len(verdicts)
     if evaluated == 0:
         out = _empty_readiness(
             thresholds,
             infra_failure_count=infra_failure_count,
             consecutive_infra_errors=consecutive_infra_errors,
+            validated=validated,
         )
         if infra_failure_count:
             out["reason"] = (
@@ -302,7 +401,7 @@ async def compute_promotion_readiness(
             f"{would_promote_count}/{evaluated} would-promote "
             f"(self-approval rate {would_promote_rate:.2f}), {consecutive_clean} "
             f"consecutive clean passes, no recurring blockers. "
-            f"NOTE: {_READINESS_GROUND_TRUTH_CAVEAT}"
+            f"NOTE: {_readiness_caveat(validated)}"
         )
     else:
         reason = "; ".join(reasons)
@@ -326,6 +425,10 @@ async def compute_promotion_readiness(
         "recurring_blockers": recurring_blockers,
         "blocker_counts": blocker_counts,
         "thresholds": thresholds,
-        "ground_truth_validated": False,
-        "caveat": _READINESS_GROUND_TRUTH_CAVEAT,
+        "validated_precision": validated["validated_precision"],
+        "resolved_outcome_sample": validated["resolved_outcome_sample"],
+        "serving_confirmed_count": validated["serving_confirmed_count"],
+        "deploy_failed_count": validated["deploy_failed_count"],
+        "ground_truth_validated": validated["ground_truth_validated"],
+        "caveat": _readiness_caveat(validated),
     }, promotion_enabled)

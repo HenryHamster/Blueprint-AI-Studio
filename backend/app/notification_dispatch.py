@@ -2258,18 +2258,44 @@ async def post_version_promotion_readiness_message(
     would_promote_rate: float,
     consecutive_clean_passes: int,
     reason: str,
+    validated_precision: float | None = None,
+    resolved_outcome_sample: int = 0,
+    ground_truth_validated: bool = False,
 ) -> ProjectMessage:
     """Notify operator when the dry-run track record first reaches promotion-readiness.
 
     Fires once per not-ready→ready transition while promotion is disabled.
     Enable promotion_enabled in settings to act on this signal.
+
+    ``validated_precision`` / ``resolved_outcome_sample`` / ``ground_truth_validated``
+    carry the ground-truth post-promotion precision derived from resolved promoted
+    verdicts. When ``ground_truth_validated`` is True the message states the
+    measured precision; otherwise it states that no resolved outcome sample exists
+    yet (rather than claiming no outcome is ever recorded).
     Does NOT commit — the caller owns the transaction.
     """
+    if ground_truth_validated and validated_precision is not None:
+        ground_truth_note = (
+            f"GROUND TRUTH: validated post-promotion precision "
+            f"{validated_precision:.0%} over {resolved_outcome_sample} resolved "
+            f"promotion(s)."
+        )
+    elif resolved_outcome_sample > 0:
+        ground_truth_note = (
+            f"NOTE: this is the qualifier's own approval rate; only "
+            f"{resolved_outcome_sample} post-promotion outcome(s) have resolved "
+            f"so far — not yet enough to validate precision."
+        )
+    else:
+        ground_truth_note = (
+            "NOTE: this is the qualifier's own approval rate with no resolved "
+            "post-promotion outcome yet."
+        )
     summary = (
         f"v{version_number} qualifier self-approval streak clears thresholds: "
         f"{would_promote_rate:.0%} self-approval rate ({verdicts_evaluated} dry-run verdict(s)), "
         f"{consecutive_clean_passes} consecutive clean passes. "
-        f"NOTE: this is the qualifier's own approval rate with no post-promotion outcome recorded. "
+        f"{ground_truth_note} "
         f"Enable promotion in settings to unlock automain→main autonomy."
     )
     msg = await post_event_message(
@@ -2283,6 +2309,9 @@ async def post_version_promotion_readiness_message(
             "verdicts_evaluated": verdicts_evaluated,
             "would_promote_rate": would_promote_rate,
             "consecutive_clean_passes": consecutive_clean_passes,
+            "validated_precision": validated_precision,
+            "resolved_outcome_sample": resolved_outcome_sample,
+            "ground_truth_validated": ground_truth_validated,
             "reason": reason,
         },
     )
@@ -2296,6 +2325,9 @@ async def post_version_promotion_readiness_message(
                 "verdicts_evaluated": verdicts_evaluated,
                 "would_promote_rate": would_promote_rate,
                 "consecutive_clean_passes": consecutive_clean_passes,
+                "validated_precision": validated_precision,
+                "resolved_outcome_sample": resolved_outcome_sample,
+                "ground_truth_validated": ground_truth_validated,
                 "reason": reason,
                 "summary": summary,
             },

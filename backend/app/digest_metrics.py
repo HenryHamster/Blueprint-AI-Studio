@@ -2378,15 +2378,13 @@ def compute_digest_cost_economics(
         if _pipeline_total_eligible_d > 0
         else None
     )
-    pipeline_autonomous_prs_merged = sum(
-        d.get("autonomous_prs_merged") or 0 for d in direction_progress_list
-    )
-    pipeline_assisted_prs_merged = sum(
-        d.get("assisted_prs_merged") or 0 for d in direction_progress_list
-    )
-    pipeline_operator_action_count = sum(
-        d.get("operator_action_count") or 0 for d in direction_progress_list
-    )
+    # Retired: pipeline_autonomous_prs_merged / pipeline_assisted_prs_merged /
+    # pipeline_operator_action_count were window-level sums of the per-direction
+    # autonomous_prs_merged / assisted_prs_merged / operator_action_count fields.
+    # They were emitted to /api/admin/digest but had no named consumer — no UI
+    # component or backend decision read them, and they pure-duplicated the
+    # per-direction fields already surfaced in DirectionCard. Removed to satisfy
+    # the "every emitted metric has a named consumer" invariant.
     # Retired: generalized success / health / outcome-kind rollups were computed here
     # but never surfaced to /api/admin/digest or any UI consumer.
     overall_type_distribution: Dict[str, int] = {}
@@ -2418,9 +2416,9 @@ def compute_digest_cost_economics(
         "median_cpm_by_type": median_cpm_by_type,
         "pipeline_acceptance_rate": pipeline_acceptance_rate,
         "pipeline_conversion_rate": pipeline_conversion_rate,
-        "pipeline_autonomous_prs_merged": pipeline_autonomous_prs_merged,
-        "pipeline_assisted_prs_merged": pipeline_assisted_prs_merged,
-        "pipeline_operator_action_count": pipeline_operator_action_count,
+        # Retired: pipeline_autonomous_prs_merged / pipeline_assisted_prs_merged /
+        # pipeline_operator_action_count (consumer-less digest duplicates of the
+        # per-direction outcome fields — see retirement note above).
         "overall_type_distribution": overall_type_distribution,
         "pipeline_filter_funnel": pipeline_filter_funnel,
     }

@@ -611,6 +611,9 @@ async def _check_version_promotion_readiness(
             would_promote_rate=readiness["would_promote_rate"],
             consecutive_clean_passes=readiness["consecutive_clean_passes"],
             reason=readiness["reason"],
+            validated_precision=readiness.get("validated_precision"),
+            resolved_outcome_sample=readiness.get("resolved_outcome_sample", 0),
+            ground_truth_validated=readiness.get("ground_truth_validated", False),
         )
     except Exception as exc:  # noqa: BLE001 — messaging must never break the sweep
         logger.warning(

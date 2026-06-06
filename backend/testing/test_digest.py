@@ -6484,67 +6484,10 @@ async def test_digest_needs_attention_approval_before_failed(
     assert items[1]["reason"] == "failed"
 
 
-@pytest.mark.asyncio
-async def test_digest_pipeline_autonomy_totals(client: AsyncClient, db_session):
-    """pipeline_autonomous_prs_merged, pipeline_assisted_prs_merged, pipeline_operator_action_count
-    are sums across active directions in the window."""
-    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
-
-    project = make_project(
-        directions=[
-            {
-                "id": "dir-a",
-                "text": "Direction A",
-                "status": "active",
-                "research_history": [
-                    {
-                        "timestamp": recent_ts,
-                        "prs_merged": 2,
-                        "autonomous_prs_merged": 2,
-                        "assisted_prs_merged": 0,
-                        "operator_action_count": 1,
-                    },
-                ],
-            },
-            {
-                "id": "dir-b",
-                "text": "Direction B",
-                "status": "active",
-                "research_history": [
-                    {
-                        "timestamp": recent_ts,
-                        "prs_merged": 1,
-                        "autonomous_prs_merged": 0,
-                        "assisted_prs_merged": 1,
-                        "operator_action_count": 2,
-                    },
-                ],
-            },
-        ]
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    for did in ["dir-a", "dir-b"]:
-        db_session.add(
-            make_task(
-                project_id=project.id,
-                title=f"Task {did}",
-                status=TaskStatus.COMPLETED,
-                payloads=[{"type": "research"}],
-                context={"direction_id": did},
-            )
-        )
-    await db_session.commit()
-
-    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
-    assert response.status_code == 200
-    data = response.json()
-
-    assert data["pipeline_autonomous_prs_merged"] == 2
-    assert data["pipeline_assisted_prs_merged"] == 1
-    assert data["pipeline_operator_action_count"] == 3
+# Retired: test_digest_pipeline_autonomy_totals — it asserted the window-level
+# pipeline_autonomous_prs_merged / pipeline_assisted_prs_merged /
+# pipeline_operator_action_count digest keys, which were consumer-less duplicates
+# of the per-direction outcome fields and have been removed from the payload.
 
 
 @pytest.mark.asyncio
@@ -6587,13 +6530,15 @@ async def test_digest_pipeline_autonomy_legacy_fallback(
     data = response.json()
 
     dp = data["direction_progress"][0]
-    # Legacy fallback: autonomous = prs_merged, assisted = 0
+    # Legacy fallback: autonomous = prs_merged, assisted = 0. The per-direction
+    # fields remain consumed (DirectionCard); the window-level pipeline_* rollups
+    # that summed them were retired as consumer-less.
     assert dp["autonomous_prs_merged"] == 4
     assert dp["assisted_prs_merged"] == 0
     assert dp["operator_action_count"] == 0
-    assert data["pipeline_autonomous_prs_merged"] == 4
-    assert data["pipeline_assisted_prs_merged"] == 0
-    assert data["pipeline_operator_action_count"] == 0
+    assert "pipeline_autonomous_prs_merged" not in data
+    assert "pipeline_assisted_prs_merged" not in data
+    assert "pipeline_operator_action_count" not in data
 
 
 @pytest.mark.asyncio

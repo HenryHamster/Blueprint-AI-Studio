@@ -987,6 +987,77 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.getByText(/pre-go-live dry-run calibration \(historical\)/)).toBeInTheDocument();
       expect(screen.getByText(/frozen/)).toBeInTheDocument();
     });
+
+    it('shows validated precision badge when ground_truth_validated is true with sufficient sample', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            promotion_readiness: makeReadiness({
+              ground_truth_validated: true,
+              validated_precision: 0.92,
+              resolved_outcome_sample: 12,
+              serving_confirmed_count: 11,
+              deploy_failed_count: 1,
+              caveat: 'validated against post-promotion outcomes',
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      // Should show self-approval rate
+      expect(screen.getByText(/100% self-approval rate/)).toBeInTheDocument();
+      // Should show validated precision badge with sample count
+      expect(screen.getByText(/92% validated precision \(12 resolved\)/)).toBeInTheDocument();
+      // Caveat should reflect the validated state
+      expect(screen.getByText(/validated against post-promotion outcomes/)).toBeInTheDocument();
+    });
+
+    it('shows self-approval-only framing when ground_truth_validated is false', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            promotion_readiness: makeReadiness({
+              ground_truth_validated: false,
+              validated_precision: null,
+              resolved_outcome_sample: 0,
+              caveat: 'self-approval only — no post-promotion outcome is recorded',
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      // Should NOT show validated precision badge
+      expect(screen.queryByText(/validated precision/)).not.toBeInTheDocument();
+      // Should show self-approval rate
+      expect(screen.getByText(/100% self-approval rate/)).toBeInTheDocument();
+      // Caveat should reflect self-approval-only
+      expect(screen.getByText(/self-approval only/)).toBeInTheDocument();
+    });
+
+    it('does not show validated precision badge when sample is zero even if ground_truth_validated is true', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            promotion_readiness: makeReadiness({
+              ground_truth_validated: true,
+              validated_precision: null,
+              resolved_outcome_sample: 0,
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      // Should NOT show validated precision badge (no sample yet)
+      expect(screen.queryByText(/validated precision/)).not.toBeInTheDocument();
+      // Should show self-approval rate
+      expect(screen.getByText(/100% self-approval rate/)).toBeInTheDocument();
+    });
   });
 
   describe('post-promotion serving confirmation', () => {

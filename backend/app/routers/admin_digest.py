@@ -964,9 +964,10 @@ async def _compute_digest(
     _median_cpm_by_type = _cost_econ["median_cpm_by_type"]
     pipeline_acceptance_rate = _cost_econ["pipeline_acceptance_rate"]
     pipeline_conversion_rate = _cost_econ["pipeline_conversion_rate"]
-    pipeline_autonomous_prs_merged = _cost_econ["pipeline_autonomous_prs_merged"]
-    pipeline_assisted_prs_merged = _cost_econ["pipeline_assisted_prs_merged"]
-    pipeline_operator_action_count = _cost_econ["pipeline_operator_action_count"]
+    # Retired: pipeline_autonomous_prs_merged / pipeline_assisted_prs_merged /
+    # pipeline_operator_action_count — consumer-less digest duplicates of the
+    # per-direction autonomous_prs_merged / assisted_prs_merged /
+    # operator_action_count fields (already surfaced in DirectionCard).
     overall_type_distribution = _cost_econ["overall_type_distribution"]
     pipeline_filter_funnel = _cost_econ["pipeline_filter_funnel"]
 
@@ -1115,7 +1116,11 @@ async def _compute_digest(
     # --- Latest strategic cycle + prediction calibration ---
     latest_cycle = None
     prediction_calibration: Dict[str, Any] | None = None
-    fresh_reviewer_trend: Optional[Dict[str, Any]] = None
+    # Retired: fresh_reviewer_trend digest emission — the computation stays live
+    # (sr_reviewer_trends.compute_fresh_reviewer_trend persists it to
+    # project.design_doc, and pipeline_health.py emits it on its own surface),
+    # but the digest-payload copy had no named reader (no UI component renders
+    # digest.fresh_reviewer_trend). Removed to satisfy the consumer invariant.
     edges_trend: Optional[Dict[str, Any]] = None
     self_review_prediction_accuracy_trends: Optional[Dict[str, Any]] = None
     sr_regression_risk_test_signal_trends: Optional[Dict[str, Any]] = None
@@ -1190,21 +1195,9 @@ async def _compute_digest(
                 for c in _sc_history
                 if c.get("outcome") not in (None, "in_progress")
             ]
-            # Fresh-reviewer cycle-over-cycle trend persisted by compute_fresh_reviewer_trend.
-            _fr_trends = (_proj.design_doc or {}).get("fresh_reviewer_trend") or {}
-            if _fr_trends:
-                fresh_reviewer_trend = {
-                    "computed_at": _fr_trends.get("computed_at"),
-                    "bucket_mode": _fr_trends.get("bucket_mode"),
-                    "current_cycle_id": _fr_trends.get("current_cycle_id"),
-                    "previous_cycle_id": _fr_trends.get("previous_cycle_id"),
-                    "current_sample_size": _fr_trends.get("current_sample_size"),
-                    "previous_sample_size": _fr_trends.get("previous_sample_size"),
-                    "per_category_hit_rate": _fr_trends.get("per_category_hit_rate")
-                    or {},
-                    "added_value": _fr_trends.get("added_value") or {},
-                    "approval_rate_lift": _fr_trends.get("approval_rate_lift") or {},
-                }
+            # Retired: fresh_reviewer_trend extraction from design_doc — its digest
+            # payload key had no named reader (see retirement note above). The
+            # underlying design_doc["fresh_reviewer_trend"] persistence is untouched.
             # Edges-considered cycle-over-cycle trend persisted by compute_edges_trend.
             _et = (_proj.design_doc or {}).get("edges_trend") or {}
             if _et:
@@ -1326,9 +1319,12 @@ async def _compute_digest(
         "sr_disallowed_blind_spot_rate": _sr_disallowed_blind_spot_rate,
         "review_accuracy": _review_quality["review_accuracy"],
         "fresh_reviewer_effectiveness": _review_quality["fresh_reviewer_effectiveness"],
-        "fresh_reviewer_trend": fresh_reviewer_trend,
+        # Retired: fresh_reviewer_trend / edges_considered_metrics digest keys —
+        # both were emitted without a named reader (no UI component reads them;
+        # edges_trend below IS consumed by ReviewQualitySection and stays). The
+        # _compute_edges_considered_metrics computation remains live (used by
+        # pipeline_health.py and re-exported for external importers).
         "edges_trend": edges_trend,
-        "edges_considered_metrics": _review_quality["edges_considered_metrics"],
         "merge_early_exit_count": merge_early_exit_count,
         "generated_at": _utcnow().isoformat(),
         "completed_count": len(completed_tasks),
@@ -1393,9 +1389,9 @@ async def _compute_digest(
         "prev_scope_conversion_rates": prev_scope_conversion_rates or None,
         "pipeline_acceptance_rate": pipeline_acceptance_rate,
         "pipeline_conversion_rate": pipeline_conversion_rate,
-        "pipeline_autonomous_prs_merged": pipeline_autonomous_prs_merged,
-        "pipeline_assisted_prs_merged": pipeline_assisted_prs_merged,
-        "pipeline_operator_action_count": pipeline_operator_action_count,
+        # Retired: pipeline_autonomous_prs_merged / pipeline_assisted_prs_merged /
+        # pipeline_operator_action_count — consumer-less duplicates of per-direction
+        # outcome fields (see retirement note at the extraction site above).
         "pipeline_filter_funnel": pipeline_filter_funnel or None,
         "scope_mismatch_summary": scope_mismatch_summary,
         "escalation_outcome_summary": escalation_outcome_summary,

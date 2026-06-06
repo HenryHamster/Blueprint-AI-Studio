@@ -271,7 +271,7 @@ function AuditReconciliationRow({ rec }: { rec: AuditReconciliation }) {
 
 function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadiness | null | undefined }) {
   if (!readiness) return null;
-  const { ready, reason, verdicts_evaluated, would_promote_rate, consecutive_clean_passes, recurring_blockers, caveat } = readiness;
+  const { ready, reason, verdicts_evaluated, would_promote_rate, consecutive_clean_passes, recurring_blockers, caveat, ground_truth_validated, validated_precision, resolved_outcome_sample } = readiness;
   const hasBlockers = Object.keys(recurring_blockers ?? {}).length > 0;
   // Once promotion is live, this dry-run window is frozen pre-go-live history —
   // it no longer receives verdicts, so it is NOT current readiness. Label it as a
@@ -292,16 +292,16 @@ function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadines
       </div>
     );
   }
-  // would_promote_rate is the qualifier's own confidence>=threshold rate — a
-  // self-approval rate, not a validated precision (no post-promotion outcome is
-  // recorded). Surface this honestly rather than implying a "trustworthy" verdict.
-  const selfApprovalCaveat = caveat ?? 'self-approval only — no post-promotion outcome is recorded';
+  // Determine the caveat text: use backend-provided caveat if available, otherwise default
+  const explanatoryCaveat = caveat ?? (ground_truth_validated ? 'validated against post-promotion outcomes' : 'self-approval only — no post-promotion outcome is recorded');
+  const hasValidatedPrecision = ground_truth_validated && validated_precision != null && (resolved_outcome_sample ?? 0) > 0;
+
   return (
     <div className="mt-1 pt-1 border-t border-neutral-700/50 space-y-0.5">
       <div className="flex flex-wrap items-center gap-2">
         <span
           className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${ready ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-amber-500/10 border-amber-500/30 text-amber-400'}`}
-          title={selfApprovalCaveat}
+          title={explanatoryCaveat}
         >
           {ready ? 'self-approval streak clears thresholds' : 'not ready'}
         </span>
@@ -309,14 +309,22 @@ function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadines
           <span className="text-[10px] text-neutral-500">{verdicts_evaluated} dry-run{verdicts_evaluated !== 1 ? 's' : ''}</span>
         )}
         {verdicts_evaluated > 0 && (
-          <span className="text-[10px] text-neutral-500" title={selfApprovalCaveat}>{Math.round(would_promote_rate * 100)}% self-approval rate</span>
+          <span className="text-[10px] text-neutral-500" title={explanatoryCaveat}>{Math.round(would_promote_rate * 100)}% self-approval rate</span>
+        )}
+        {hasValidatedPrecision && (
+          <span
+            className="text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-emerald-500/10 border-emerald-500/30 text-emerald-400"
+            title={`validated qualifier precision from ${resolved_outcome_sample} resolved promotion outcomes`}
+          >
+            {Math.round(validated_precision * 100)}% validated precision ({resolved_outcome_sample} resolved)
+          </span>
         )}
         {consecutive_clean_passes > 0 && (
           <span className="text-[10px] text-neutral-500">{consecutive_clean_passes} clean streak</span>
         )}
       </div>
       {ready && (
-        <p className="text-[9px] text-neutral-600 italic">{selfApprovalCaveat}</p>
+        <p className="text-[9px] text-neutral-600 italic">{explanatoryCaveat}</p>
       )}
       {!ready && reason && (
         <p className="text-[10px] text-neutral-400 line-clamp-2">{reason}</p>

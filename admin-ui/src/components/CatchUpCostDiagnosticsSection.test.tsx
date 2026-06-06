@@ -141,4 +141,44 @@ describe('CatchUpCostDiagnosticsSection', () => {
     fireEvent.click(screen.getByRole('button', { name: /rejected/i }));
     expect(onExpandFailures).toHaveBeenCalled();
   });
+
+  it('renders per-type cost-per-merge table and flags exceeds_threshold', () => {
+    render(
+      <CatchUpCostDiagnosticsSection
+        costPerMergeByType={{
+          fix: { total_cost_usd: 12, merged_count: 4, cost_per_merge: 3, exceeds_threshold: false },
+          research: { total_cost_usd: 40, merged_count: 2, cost_per_merge: 20, exceeds_threshold: true },
+        }}
+        medianCostPerMergeByType={3}
+        activeTaxonomyFilter={null}
+        activeStageFilter={null}
+        onTaxonomyFilterChange={noop}
+        onStageFilterChange={noop}
+        onExpandFailures={noop}
+      />
+    );
+    expect(screen.getByText('Cost per merge by type')).toBeInTheDocument();
+    expect(screen.getByText(/median \$3\.00/)).toBeInTheDocument();
+    // Both task types are listed, sorted by cost-per-merge descending.
+    expect(screen.getByText('fix')).toBeInTheDocument();
+    expect(screen.getByText('research')).toBeInTheDocument();
+    // The above-threshold type carries the warning marker.
+    expect(screen.getByLabelText('exceeds threshold')).toBeInTheDocument();
+  });
+
+  it('omits cost-per-merge types with no merges (null cost_per_merge)', () => {
+    const { container } = render(
+      <CatchUpCostDiagnosticsSection
+        costPerMergeByType={{
+          research: { total_cost_usd: 40, merged_count: 0, cost_per_merge: null, exceeds_threshold: false },
+        }}
+        activeTaxonomyFilter={null}
+        activeStageFilter={null}
+        onTaxonomyFilterChange={noop}
+        onStageFilterChange={noop}
+        onExpandFailures={noop}
+      />
+    );
+    expect(container.textContent).toBe('');
+  });
 });

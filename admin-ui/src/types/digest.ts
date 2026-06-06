@@ -347,6 +347,19 @@ export interface DigestData<DP = unknown> {
   cost_by_failure_class?: Record<string, number> | null;
   total_failed_cost_usd?: number | null;
   median_cost_per_merged_pr?: number | null;
+  // Per-task-type cost-per-merge attribution: total VM cost / merged-PR count
+  // for each task type, with exceeds_threshold flagging types whose CPM runs
+  // far above the per-type median. Consumed by CatchUpCostDiagnosticsSection.
+  cost_per_merge_by_type?: Record<
+    string,
+    {
+      total_cost_usd: number;
+      merged_count: number;
+      cost_per_merge: number | null;
+      exceeds_threshold: boolean;
+    }
+  > | null;
+  median_cost_per_merge_by_type?: number | null;
   // Per-effort-tier / per-actual-model efficiency rollup (additive; absent on
   // older backends that predate compute_effort_model_efficiency).
   effort_model_efficiency?: EffortModelEfficiency | null;

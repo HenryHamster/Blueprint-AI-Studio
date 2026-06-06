@@ -950,9 +950,11 @@ def test_compute_digest_cost_economics_empty():
     assert result["median_cpm_by_type"] is None
     assert result["pipeline_acceptance_rate"] is None
     assert result["pipeline_conversion_rate"] is None
-    assert result["pipeline_autonomous_prs_merged"] == 0
-    assert result["pipeline_assisted_prs_merged"] == 0
-    assert result["pipeline_operator_action_count"] == 0
+    # Retired: pipeline_autonomous/assisted_prs_merged + pipeline_operator_action_count
+    # (consumer-less digest duplicates of per-direction outcome fields).
+    assert "pipeline_autonomous_prs_merged" not in result
+    assert "pipeline_assisted_prs_merged" not in result
+    assert "pipeline_operator_action_count" not in result
     assert result["overall_type_distribution"] == {}
     assert result["pipeline_filter_funnel"] == {}
     assert "pipeline_generalized_successes" not in result
@@ -1248,9 +1250,11 @@ def test_compute_digest_cost_economics_pipeline_aggregates():
     # merged=4, rejected=2 → 4/6 = 0.667; PR-eligible=8+4=12 → 4/12 = 0.333.
     assert result["pipeline_acceptance_rate"] == 0.667
     assert result["pipeline_conversion_rate"] == 0.333
-    assert result["pipeline_autonomous_prs_merged"] == 3
-    assert result["pipeline_assisted_prs_merged"] == 1
-    assert result["pipeline_operator_action_count"] == 5
+    # Retired: pipeline_autonomous/assisted_prs_merged + pipeline_operator_action_count
+    # (consumer-less digest duplicates of per-direction outcome fields).
+    assert "pipeline_autonomous_prs_merged" not in result
+    assert "pipeline_assisted_prs_merged" not in result
+    assert "pipeline_operator_action_count" not in result
     assert result["overall_type_distribution"] == {"create": 7, "fix": 1}
     assert result["pipeline_filter_funnel"] == {"a": 3, "b": 3}
     assert "pipeline_generalized_successes" not in result

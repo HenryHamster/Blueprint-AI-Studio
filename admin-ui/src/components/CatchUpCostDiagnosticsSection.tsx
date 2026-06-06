@@ -50,6 +50,13 @@ interface RejectionPatternSummary {
   top_notes: { snippet: string; count: number }[];
 }
 
+interface CostPerMergeByType {
+  total_cost_usd: number;
+  merged_count: number;
+  cost_per_merge: number | null;
+  exceeds_threshold: boolean;
+}
+
 interface CatchUpCostDiagnosticsSectionProps {
   failureTaxonomyDistribution?: FailureTaxonomyDistribution | null;
   costByFailureClass?: Record<string, number> | null;
@@ -59,6 +66,8 @@ interface CatchUpCostDiagnosticsSectionProps {
   prevScopeConversionRates?: Record<string, ScopeConversionRate> | null;
   scopeMismatchSummary?: ScopeMismatchSummary | null;
   rejectionPatternSummary?: RejectionPatternSummary | null;
+  costPerMergeByType?: Record<string, CostPerMergeByType> | null;
+  medianCostPerMergeByType?: number | null;
   trendHistory?: TrendHistory[];
   activeTaxonomyFilter: string | null;
   activeStageFilter: string | null;
@@ -76,6 +85,8 @@ export function CatchUpCostDiagnosticsSection({
   prevScopeConversionRates,
   scopeMismatchSummary,
   rejectionPatternSummary,
+  costPerMergeByType,
+  medianCostPerMergeByType,
   trendHistory,
   activeTaxonomyFilter,
   activeStageFilter,
@@ -299,6 +310,46 @@ export function CatchUpCostDiagnosticsSection({
           )}
         </div>
       )}
+
+      {/* Per-task-type cost-per-merge attribution */}
+      {costPerMergeByType && Object.keys(costPerMergeByType).length > 0 && (() => {
+        const rows = Object.entries(costPerMergeByType)
+          .filter(([, v]) => v.cost_per_merge != null)
+          .sort((a, b) => (b[1].cost_per_merge ?? 0) - (a[1].cost_per_merge ?? 0));
+        if (rows.length === 0) return null;
+        return (
+          <div className="flex flex-col gap-1">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Cost per merge by type</span>
+              {medianCostPerMergeByType != null && (
+                <span className="text-[10px] text-neutral-500">
+                  · median ${medianCostPerMergeByType.toFixed(2)}
+                </span>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5 ml-1">
+              {rows.map(([ttype, v]) => (
+                <span
+                  key={ttype}
+                  className={`text-[10px] border px-1.5 py-0.5 rounded inline-flex items-center gap-1 ${
+                    v.exceeds_threshold
+                      ? 'bg-red-500/10 text-red-400 border-red-500/20'
+                      : 'bg-neutral-700/20 text-neutral-400 border-neutral-700/30'
+                  }`}
+                  title={`${ttype}: $${(v.cost_per_merge ?? 0).toFixed(2)}/merge · ${v.merged_count} merged · $${v.total_cost_usd.toFixed(2)} total${v.exceeds_threshold ? ' — exceeds median threshold' : ''}`}
+                >
+                  {v.exceeds_threshold && <span aria-label="exceeds threshold" className="text-red-400">⚠</span>}
+                  {ttype}
+                  <span className="inline-flex items-center font-mono font-bold">
+                    <DollarSign className="w-2.5 h-2.5" />{(v.cost_per_merge ?? 0).toFixed(2)}
+                  </span>
+                  <span className="text-neutral-500">({v.merged_count})</span>
+                </span>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
     </>
   );
 }

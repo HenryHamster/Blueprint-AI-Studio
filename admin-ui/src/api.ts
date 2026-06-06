@@ -1152,8 +1152,9 @@ export interface PromotionReadiness {
   recurring_blockers: Record<string, number>;
   blocker_counts: Record<string, number>;
   thresholds: Record<string, number>;
-  // Always false today: no post-promotion outcome is recorded, so would_promote_rate
-  // is a self-approval rate, not a validated qualifier precision. See `caveat`.
+  // True when ground truth is validated (sufficient resolved-outcome sample exists);
+  // false otherwise. When true, `validated_precision`, `serving_confirmed_count`,
+  // `deploy_failed_count`, and `resolved_outcome_sample` are populated.
   ground_truth_validated?: boolean;
   caveat?: string;
   // The readiness window only measures DRY-RUN-regime verdicts, so it reflects
@@ -1162,6 +1163,14 @@ export interface PromotionReadiness {
   regime?: 'pre_go_live_calibration' | 'live';
   is_current_readiness?: boolean;
   promotion_enabled?: boolean;
+  // Ground-truth-validated qualifier precision (when validated_precision is non-null).
+  validated_precision?: number | null;
+  // Number of promotion outcomes resolved (served or failed) used to derive validated_precision.
+  resolved_outcome_sample?: number;
+  // Number of promoted verdicts that were confirmed serving (contributing to validated_precision).
+  serving_confirmed_count?: number;
+  // Number of promoted verdicts whose deploy failed without stabilizing (contributing to validated_precision).
+  deploy_failed_count?: number;
 }
 
 export interface StagedDirection {
