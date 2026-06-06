@@ -20,6 +20,7 @@ import {
 import {
   extractJsonObjectDetailed, describeJsonExtractionResult,
 } from '../json-extract.js';
+import { fetchPriorKnowledge, buildPriorKnowledgeSection } from './prior-knowledge.js';
 
 // Reads the design progress markdown the agent writes for retry context.
 // Mirrors readWebResearchProgress but for the design kind. Returns the content
@@ -159,12 +160,22 @@ export async function handleDesign(
   const documentPath = `/tmp/design_document_${taskId}.json`;
   const progressPath = `/tmp/design_progress_${taskId}.md`;
 
+  // Pull the most relevant existing knowledge documents (topic preferred, else
+  // the prompt) so the design builds on prior knowledge instead of re-deriving
+  // from scratch and silently duplicating or contradicting an existing design.
+  // Fail-soft: an empty list yields no section and no failure.
+  const priorDocs = await fetchPriorKnowledge(topic || prompt);
+  if (priorDocs.length > 0) {
+    sendLog(ws, `Injecting ${priorDocs.length} prior knowledge document(s) into the design prompt\n`);
+  }
+  const priorKnowledgeSection = buildPriorKnowledgeSection(priorDocs);
+
   const designPrompt = `${claudeMdPrefix}${designPlaybookSection}${retryContext}${contextPrefix}You are a software design agent. Your job is to answer the design question below by GROUNDING your design in the ACTUAL code of this repository, and produce a single structured design DOCUMENT. You operate strictly read-only: you do NOT edit files, you do NOT open a pull request, and you do NOT spawn any follow-up work.
 
 ${topicLine}Design question:
 ${prompt}
 
-# HOW TO DESIGN
+${priorKnowledgeSection}# HOW TO DESIGN
 1. Explore the codebase THOROUGHLY — read the real modules, types, and call sites relevant to the question. Use subagents for parallel exploration.
 2. Ground every design decision in what the code ACTUALLY does today. Reference concrete files and symbols; do not invent structure that isn't there.
 3. Propose a concrete, reviewable design: the components involved, how they interact, the data/contract shapes, the trade-offs, and the migration/rollout path where relevant.

@@ -68,7 +68,7 @@ vi.mock('../prompt.js', async (importOriginal) => {
 });
 
 import fs from 'fs';
-import { runClaudeCode, persistAndPostStatus, getProviderRunner } from '../index.js';
+import { runClaudeCode, persistAndPostStatus, getProviderRunner, apiGet } from '../index.js';
 import { execFileSync } from 'child_process';
 import { handlePlan, handleResearch } from './research-plan.js';
 import { handleStrategic } from './strategic.js';
@@ -2104,6 +2104,84 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
     const p = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(p).toContain('related_files');
+  });
+
+  it('handleResearch prompt teaches the web_research and design knowledge finding types with a source-of-truth rubric', async () => {
+    await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('Knowledge findings');
+    expect(p).toContain('web_research');
+    expect(p).toContain('design —');
+    // Rubric must distinguish the two by source of truth (outside vs inside the repo).
+    expect(p).toContain('OUTSIDE this');
+    expect(p).toContain('FILE-GROUNDED design');
+  });
+});
+
+// ── handleResearch — prior-knowledge injection ───────────────────────────────
+// Research must read accumulated knowledge documents back at launch (the same
+// way web-research does) and inject the most relevant ones as a Prior Knowledge
+// section, fail-soft when none exist or the query errors.
+describe('handleResearch — prior-knowledge injection', () => {
+  const PK_TASK_ID = 'pk-task-001';
+  const PK_GH_TOKEN = 'gh-token';
+  const PK_OWNER = 'owner';
+  const PK_REPO = 'repo';
+  const PK_WS = null;
+  const PK_STATUS_REF = () => ({ value: '' });
+  const PK_TASK = { title: 'Test', description: 'test task', context: {}, project_context: {} };
+  const PK_PAYLOAD = { base_branch: 'main', prompt: 'analyze the caching layer' };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+  });
+
+  it('injects a Prior Knowledge section with prior-doc ids/titles when docs exist', async () => {
+    vi.mocked(apiGet).mockResolvedValue({
+      documents: [
+        { id: 'doc-aaa', title: 'Earlier caching study', summary: 'A prior look at caching.' },
+        { id: 'doc-bbb', title: 'Cache invalidation', summary: 'How invalidation works.' },
+      ],
+    });
+
+    await handleResearch(PK_TASK_ID, PK_PAYLOAD, PK_TASK, PK_GH_TOKEN, PK_OWNER, PK_REPO, PK_WS, PK_STATUS_REF());
+
+    // Query uses the research focus (prompt) and hits the agent endpoint.
+    const calledPath = vi.mocked(apiGet).mock.calls[0][0];
+    expect(calledPath).toContain('/api/agent/knowledge-documents');
+    expect(calledPath).toContain(`q=${encodeURIComponent('analyze the caching layer')}`);
+
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('## Prior Knowledge');
+    expect(p).toContain('doc-aaa');
+    expect(p).toContain('Earlier caching study');
+    expect(p).toContain('doc-bbb');
+    expect(p).toContain('supersede');
+  });
+
+  it('omits the Prior Knowledge section when the fetch returns no documents', async () => {
+    vi.mocked(apiGet).mockResolvedValue({ documents: [] });
+
+    await handleResearch(PK_TASK_ID, PK_PAYLOAD, PK_TASK, PK_GH_TOKEN, PK_OWNER, PK_REPO, PK_WS, PK_STATUS_REF());
+
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).not.toContain('## Prior Knowledge');
+  });
+
+  it('does not fail the research run when the knowledge fetch throws (fail-soft)', async () => {
+    vi.mocked(apiGet).mockRejectedValue(new Error('knowledge endpoint unreachable'));
+
+    await handleResearch(PK_TASK_ID, PK_PAYLOAD, PK_TASK, PK_GH_TOKEN, PK_OWNER, PK_REPO, PK_WS, PK_STATUS_REF());
+
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).not.toContain('## Prior Knowledge');
+    // The run still completes and posts a status.
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalled();
   });
 });
 

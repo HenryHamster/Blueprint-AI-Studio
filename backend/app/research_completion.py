@@ -2196,13 +2196,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     "perf",
                 ):
                     _prelim_task_type = finding_type
-                elif finding_type == "refactor":
-                    _prelim_task_type = "refactor"
                 elif finding_type in ("web_research", "design"):
                     # knowledge-producing types: spawn the matching knowledge
                     # task rather than falling through to the scope-based
                     # plan/create fallback below.
                     _prelim_task_type = finding_type
+                elif finding_type == "refactor":
+                    _prelim_task_type = "refactor"
                 elif scope == "large":
                     _prelim_task_type = "plan"
                 else:
@@ -2259,14 +2259,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             "perf",
         ):
             task_type = finding_type  # spawn specialized agent
+        elif finding_type in ("web_research", "design"):
+            # Knowledge findings: the work hinges on external facts/best-practices
+            # (web_research) or needs a file-grounded design document before code
+            # can land safely (design). These route to their registered knowledge
+            # task type — NOT a generic create/plan PR task — so the completion
+            # handler persists a durable knowledge document. Must come before the
+            # scope-based plan/create fallback so a large-scope knowledge finding
+            # is never mis-routed to plan/create.
+            task_type = finding_type
         elif finding_type == "refactor":
             task_type = "refactor"  # code quality improvement, no behavior change
-        elif finding_type in ("web_research", "design"):
-            # knowledge-producing types (read-only, output_kind=knowledge):
-            # commission external knowledge or a grounded design. Must come
-            # before the scope-based plan/create fallback so a large-scope
-            # knowledge finding is never mis-routed to plan/create.
-            task_type = finding_type
         elif scope == "large":
             task_type = "plan"  # large scope needs decomposition
         else:
@@ -2453,6 +2456,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if (
             _low_confidence
             and scope == "medium"
+            # Knowledge tasks (web_research/design) have no scope-based plan/create
+            # fallback — escalating them to "plan" would silently misroute the finding
+            # away from its knowledge completion handler. Keep their declared type.
+            and task_type not in ("web_research", "design")
             and not _poor_decomp_history(_pred_direction or {})
         ):
             # Exploration fraction: let a configurable share of medium findings bypass the

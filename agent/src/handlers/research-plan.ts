@@ -30,6 +30,7 @@ import { renderDirection } from './direction-renderer.js';
 import {
   writeFetchHelper, buildFetchGuidance, RESEARCH_FETCH_VERBS, PLAN_FETCH_VERBS,
 } from './strategic-helpers.js';
+import { fetchPriorKnowledge, buildPriorKnowledgeSection } from './prior-knowledge.js';
 export {
   formatCochangeHints,
   formatDecompositionOutcomes,
@@ -1508,6 +1509,19 @@ ${hotspotsSection}
     }
   }
 
+  // Pull the most relevant existing knowledge documents so research builds on
+  // accumulated knowledge instead of re-deriving the same findings from scratch.
+  // Query with the explicit research focus when present, else the current
+  // direction's text. Fail-soft: an empty list yields no section and no failure.
+  const currentDirectionText = directions.length > 0
+    ? strVal((directions.find(d => d.id === currentDirectionId) ?? directions[0]).text)
+    : '';
+  const priorDocs = await fetchPriorKnowledge(userPrompt || currentDirectionText);
+  if (priorDocs.length > 0) {
+    sendLog(ws, `Injecting ${priorDocs.length} prior knowledge document(s) into the research prompt\n`);
+  }
+  const priorKnowledgeSection = buildPriorKnowledgeSection(priorDocs);
+
   // Pipeline-wide scope conversion rates — rendered from pipeline_health.scope_conversion_rates
   // so measurement directions can read the number straight from the prompt instead
   // of hitting an admin endpoint they aren't authenticated for.
@@ -1750,7 +1764,7 @@ additional structural refinement. Don't re-propose foundations that are already 
 ${codebaseSummary}${fileTreeSection}${gitHistorySection}
 ${designDocHighlight}${designDocSection}${systemVerificationSection}${capabilityVerificationSection}# DIRECTIONS
 ${userPrompt ? `Research focus: ${userPrompt}\n\n` : ''}${directionsText}${crossDirSection}
-${pipelineScopeRatesSection}${anomalySection}
+${priorKnowledgeSection}${pipelineScopeRatesSection}${anomalySection}
 # DEDUP — do not re-propose these
 ${(() => {
   const lines: string[] = [];
@@ -1832,9 +1846,18 @@ ALSO write /tmp/research_progress_${taskId}.md — a concise markdown summary (u
 **Sub-research** — spawns another research cycle (use sparingly):
   research
 
-**Knowledge** — these spawn a read-only agent that produces a durable knowledge document (no code change), to be consumed before implementation can proceed:
-  web_research — use when the work needs external/industry knowledge: best-practices, an unfamiliar library/protocol/vendor API.
-  design — use when a grounded design (architecture, interface, data-model) is needed before implementation can proceed.
+**Knowledge findings** — these spawn a knowledge agent that produces a durable, queryable
+knowledge document (NOT a code PR). Emit ONLY when genuinely warranted, never by default:
+  web_research — emit when the work hinges on FACTS or BEST-PRACTICES that live OUTSIDE this
+    repo (an external API contract, a library's correct usage, a security/standards reference,
+    a comparison of approaches you cannot settle from the codebase alone). The deliverable is
+    sourced knowledge the implementer needs before code can be written correctly.
+  design — emit when the work needs a FILE-GROUNDED design document before implementation can
+    safely begin: the change is cross-cutting or architecturally risky enough that an implementer
+    starting straight from a prompt would likely get the structure wrong. The deliverable is a
+    design doc grounded in the actual repo files, not external facts.
+  Prefer a plain implementation finding when the work can land safely without either. Use
+  web_research vs design by SOURCE OF TRUTH: outside the repo → web_research; inside the repo → design.
 
 **Metadata** — these update the system's knowledge but do not produce code changes:
   direction_note, direction_update, direction_proposal, design_doc_observation
@@ -1886,7 +1909,7 @@ implementation findings. Add metadata alongside them when relevant.
 
 Scope: small (<50 lines, 1 file), medium (2-5 files, 50-200 lines), large (cross-component, 200+ lines).
 Risk: low (cosmetic), medium (logic/endpoints), high (core logic, auth, data models).
-Routing: large scope → plan agent (decomposition), medium → create agent (single PR), research → sub-research.
+Routing: large scope → plan agent (decomposition), medium → create agent (single PR), research → sub-research, web_research/design → knowledge agent (produces a knowledge document, not a PR).
 
 - Use scope=large for cross-component work — the pipeline has a plan agent for safe decomposition. But most product features are scope=small or scope=medium.
 - direction_update: suggest rewording/reprioritizing a direction (fields: direction_id, suggested_text, suggested_priority, suggested_paths, description). Max 1 per cycle.
