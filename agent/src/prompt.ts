@@ -1619,3 +1619,88 @@ export function formatProvenanceWarnings(
     `to invent a diff.\n\n`
   );
 }
+
+const ACCEPTANCE_TEST_DIR_SEGMENTS = new Set([
+  'tests',
+  'testing',
+  'test',
+  '__tests__',
+  '__test__',
+  'spec',
+]);
+
+const ACCEPTANCE_TEST_FILE_BASENAME_RE = /^(?:test_.*\.py|.*_test\.py|.*\.test\.[cm]?[jt]sx?|.*\.spec\.[cm]?[jt]sx?|.*_test\.go|.*_test\.exs?|.*_spec\.rb|test_.*\.rb)$/i;
+
+function looksLikeAcceptanceTestFile(path: string): boolean {
+  const candidate = path.trim();
+  if (!candidate) return false;
+  const segments = candidate.replace(/\\/g, '/').split('/').filter(Boolean);
+  if (segments.length === 0) return false;
+  const basename = segments[segments.length - 1];
+  if (!basename.includes('.')) return false;
+  const inTestDir = segments.slice(0, -1).some(seg => ACCEPTANCE_TEST_DIR_SEGMENTS.has(seg.toLowerCase()));
+  return inTestDir || ACCEPTANCE_TEST_FILE_BASENAME_RE.test(basename.toLowerCase());
+}
+
+function formatAcceptanceNamedTest(evidence: Record<string, unknown>): string {
+  const rawTestPath = typeof evidence.test_path === 'string' ? evidence.test_path.trim() : '';
+  if (!rawTestPath) return '';
+  const [declaredPath, inlineTestId = ''] = rawTestPath.split('::', 2);
+  if (!looksLikeAcceptanceTestFile(declaredPath)) return '';
+
+  const explicitTestId = typeof evidence.test_id === 'string' ? evidence.test_id.trim() : '';
+  const testId = explicitTestId || inlineTestId.trim();
+  const target = testId ? ` and target \`${testId}\`` : '';
+
+  return (
+    `- named_test: add or modify \`${declaredPath}\`${target}. ` +
+    `The test must run green under a real merge-test verdict, and the PR must also ` +
+    `change non-test production code that the test exercises. A test-only diff fails ` +
+    `the gate; an always-true assertion in isolation fails.`
+  );
+}
+
+/**
+ * Render a concrete acceptance-evidence obligation block from the first payload.
+ *
+ * Returns '' when the field is absent or malformed so the prompt stays byte-for-
+ * byte identical for tasks that do not declare acceptance evidence.
+ */
+export function formatAcceptanceEvidence(
+  firstPayload: Record<string, unknown> | undefined,
+): string {
+  if (!firstPayload || typeof firstPayload !== 'object' || Array.isArray(firstPayload)) return '';
+  const rawEvidence = firstPayload.acceptance_evidence;
+  if (!rawEvidence || typeof rawEvidence !== 'object' || Array.isArray(rawEvidence)) return '';
+
+  const evidence = rawEvidence as Record<string, unknown>;
+  const kind = typeof evidence.kind === 'string' ? evidence.kind.trim() : '';
+  if (!kind) return '';
+
+  if (kind === 'named_test') {
+    const namedTest = formatAcceptanceNamedTest(evidence);
+    if (!namedTest) return '';
+    return `## Acceptance Evidence\nThis task declared a plan-time acceptance requirement. Carry it through explicitly:\n${namedTest}\n\n`;
+  }
+
+  if (kind === 'observable_behavior') {
+    const description = typeof evidence.description === 'string' ? evidence.description.trim() : '';
+    if (description.length < 10) return '';
+    return (
+      `## Acceptance Evidence\nThis task declared a plan-time acceptance requirement. Carry it through explicitly:\n` +
+      `- observable_behavior: deliver the described behavior: \`${description}\`. The PR must ` +
+      `ship a real, non-empty diff.\n\n`
+    );
+  }
+
+  if (kind === 'downstream_artifact') {
+    const artifactId = typeof evidence.artifact_id === 'string' ? evidence.artifact_id.trim() : '';
+    if (!artifactId) return '';
+    return (
+      `## Acceptance Evidence\nThis task declared a plan-time acceptance requirement. Carry it through explicitly:\n` +
+      `- downstream_artifact: produce or deliver \`${artifactId}\`. The PR must ship a real, non-empty diff.\n\n`
+    );
+  }
+
+  return '';
+}

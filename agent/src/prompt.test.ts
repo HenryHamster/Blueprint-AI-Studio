@@ -61,6 +61,7 @@ import {
   synthesizeFailureHotspots,
   formatSelfReviewBlindSpots,
   formatProvenanceWarnings,
+  formatAcceptanceEvidence,
   formatProjectBlindSpotSummary,
   formatFixIterationHistory,
   formatSelfReviewCalibrationSection,
@@ -3050,6 +3051,56 @@ describe('formatProvenanceWarnings', () => {
       _provenance_warnings: { ungrounded_refs: [123, null, 'real ref'] },
     });
     expect(result).toContain('real ref');
+  });
+});
+
+// ── formatAcceptanceEvidence ──────────────────────────────────────────────────
+describe('formatAcceptanceEvidence', () => {
+  it('returns empty string when acceptance_evidence is absent or malformed', () => {
+    expect(formatAcceptanceEvidence(undefined)).toBe('');
+    expect(formatAcceptanceEvidence({})).toBe('');
+    expect(formatAcceptanceEvidence({ acceptance_evidence: null })).toBe('');
+    expect(formatAcceptanceEvidence({ acceptance_evidence: 'oops' })).toBe('');
+    expect(formatAcceptanceEvidence({
+      acceptance_evidence: { kind: 'named_test', test_path: 'backend/app/handler.py' },
+    })).toBe('');
+  });
+
+  it('renders named_test obligations with path, test_id, and gate conditions', () => {
+    const result = formatAcceptanceEvidence({
+      acceptance_evidence: {
+        kind: 'named_test',
+        test_path: 'testing/test_widget.py',
+        test_id: 'test_widget_handles_empty',
+      },
+    });
+
+    expect(result).toContain('## Acceptance Evidence');
+    expect(result).toContain('testing/test_widget.py');
+    expect(result).toContain('test_widget_handles_empty');
+    expect(result).toContain('real merge-test verdict');
+    expect(result).toContain('production code');
+    expect(result).toContain('test-only diff fails the gate');
+  });
+
+  it('renders observable_behavior and downstream_artifact obligations', () => {
+    const observable = formatAcceptanceEvidence({
+      acceptance_evidence: {
+        kind: 'observable_behavior',
+        description: 'the dashboard shows the live serving SHA banner',
+      },
+    });
+    expect(observable).toContain('the dashboard shows the live serving SHA banner');
+    expect(observable).toContain('real, non-empty diff');
+
+    const artifact = formatAcceptanceEvidence({
+      acceptance_evidence: {
+        kind: 'downstream_artifact',
+        artifact_id: 'release-deploy-artifact-registry',
+      },
+    });
+    expect(artifact).toContain('release-deploy-artifact-registry');
+    expect(artifact).toContain('real, non-empty diff');
   });
 });
 

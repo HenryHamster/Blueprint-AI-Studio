@@ -22,7 +22,7 @@ import {
   FIX_TASK_FOCUS, getTaskTypeFocusBlock, PARALLEL_REVIEW_GUIDANCE, PARALLEL_FIX_GUIDANCE,
   assembleFailureGuidanceBlocks,
   readClaudeMd, formatProjectContext, configureAgentPermissions, computePromptFingerprint,
-  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, formatProvenanceWarnings, type PlaybookEntry,
+  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, formatProvenanceWarnings, formatAcceptanceEvidence, type PlaybookEntry,
 } from '../prompt.js';
 import { formatProjectVision, formatStrategicIntent } from '../prompts/context-prefix.js';
 import { resolveBuildConfig } from '../build-config.js';
@@ -782,6 +782,11 @@ export async function handleFix(
   const fixProvenanceNotice = formatProvenanceWarnings(taskContext);
   if (fixProvenanceNotice) {
     basePrompt = `${fixProvenanceNotice}${basePrompt}`;
+  }
+
+  const fixAcceptanceEvidenceNotice = formatAcceptanceEvidence(payload);
+  if (fixAcceptanceEvidenceNotice) {
+    basePrompt = `${fixAcceptanceEvidenceNotice}${basePrompt}`;
   }
 
   // Parallel fix fan-out gating: per-project flag AND helper-threshold both

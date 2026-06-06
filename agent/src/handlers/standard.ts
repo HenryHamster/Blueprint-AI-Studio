@@ -17,7 +17,7 @@ import {
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
   buildAnalysisPrompt, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, extractModuleInterfaces,
   discoverAffectedConsumers, type PlaybookEntry, computePromptFingerprint,
-  formatProvenanceWarnings,
+  formatProvenanceWarnings, formatAcceptanceEvidence,
 } from '../prompt.js';
 import { writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 import {
@@ -273,12 +273,13 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   // helper that was not written.
   const stdProjectId = ((task.project_metadata as Record<string, unknown> | undefined)?.project_id as string | undefined) ?? '';
   const stdFetchGuidance = stdProjectId ? buildFetchGuidance(PLAN_FETCH_VERBS) : '';
+  const acceptanceEvidenceNotice = formatAcceptanceEvidence(payload);
   // Stale-premise/provenance notice for finding-derived tasks (create/refactor/
   // docs/qa/deps). Rendered early/prominently so the agent reproduces-first
   // before trusting a possibly-stale finding. Empty string when no warnings
   // fired, so the prompt is byte-unchanged for non-finding-derived tasks.
   const provenanceNotice = formatProvenanceWarnings(ctx);
-  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + provenanceNotice + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + buildCodeChangeHelperGuidance({ buildConfig, owner, repo }) + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${stdFetchGuidance}${DEFAULT_TOOL_GUIDANCE}` + promptSuffix + prTitlePrefixNote;
+  const finalPrompt = acceptanceEvidenceNotice + claudeMdPrefix + playbookSection + retryContext + provenanceNotice + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + buildCodeChangeHelperGuidance({ buildConfig, owner, repo }) + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${stdFetchGuidance}${DEFAULT_TOOL_GUIDANCE}` + promptSuffix + prTitlePrefixNote;
 
   const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, resolveTaskBranchNamespace(task), buildConfig);
   writePlaybookHelper(taskId);

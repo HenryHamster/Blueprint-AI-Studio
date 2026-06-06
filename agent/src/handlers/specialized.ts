@@ -18,6 +18,7 @@ import {
   getTaskTypeFocusBlock,
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, computePromptFingerprint, type PlaybookEntry,
+  formatAcceptanceEvidence,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { runCodeChangeTask } from './code-change.js';
@@ -205,13 +206,14 @@ CRITICAL RULES:
   const migrateRetryContext = buildRetryContext(task);
   const migrateFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const migratePromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
+  const migrateAcceptanceEvidenceNotice = formatAcceptanceEvidence(payload);
   statusRef.value = 'Running migration workflow...';
   const migrateBaseCommit = git(['rev-parse', 'HEAD']);
   const migrateFocusBlock = getTaskTypeFocusBlock('migrate', {
     schemaRevisionFile: migrateLayout.schemaRevisionFile,
     schemaRevisionConst: migrateLayout.schemaRevisionConst,
   });
-  const finalMigratePrompt = migrateClaudeMdSection + migrateContextSection + migratePlaybookSection + migrateRetryContext
+  const finalMigratePrompt = migrateAcceptanceEvidenceNotice + migrateClaudeMdSection + migrateContextSection + migratePlaybookSection + migrateRetryContext
     + migratePrompt + migrateFirstTaskSection
     + buildCodeChangeHelperGuidance({ buildConfig: migrateBuildConfig, owner, repo }) + migrateFocusBlock + PLAYBOOK_GUIDANCE
     + READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + PRIOR_ATTEMPT_DIVERGENCE + BEYOND_SCOPE_REPORTING

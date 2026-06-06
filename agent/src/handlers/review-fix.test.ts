@@ -1540,6 +1540,33 @@ describe('handleFix — code-change helper guidance is in prompt', () => {
   });
 });
 
+describe('handleFix — acceptance evidence is in prompt', () => {
+  it('prepends the acceptance-evidence block when declared', async () => {
+    await handleFix(
+      'task-fix-acceptance',
+      {
+        branch: 'feature/x',
+        base_branch: 'main',
+        pr_number: 7,
+        prompt: 'address review feedback',
+        acceptance_evidence: {
+          kind: 'named_test',
+          test_path: 'testing/test_widget.py',
+          test_id: 'test_widget_handles_empty',
+        },
+      },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('## Acceptance Evidence');
+    expect(prompt).toContain('testing/test_widget.py');
+    expect(prompt).toContain('test_widget_handles_empty');
+    expect(prompt).toContain('real merge-test verdict');
+  });
+});
+
 describe('handleFix — direction implementation constraints', () => {
   it('surfaces implementation_constraints from direction_context in the enriched prompt', async () => {
     await handleFix(

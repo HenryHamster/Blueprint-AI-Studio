@@ -582,6 +582,26 @@ describe('handleMigrate — stale-branch handling and runCodeChangeTask delegati
     expect(opts.noChangesMessage).toBe('No migration changes generated.');
   });
 
+  it('prepends the acceptance-evidence block when declared', async () => {
+    await handleMigrate(
+      TASK_ID,
+      {
+        ...BASE_PAYLOAD,
+        prompt: 'Add user_role column',
+        acceptance_evidence: {
+          kind: 'downstream_artifact',
+          artifact_id: 'release-deploy-artifact-registry',
+        },
+      },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const prompt = capturedMigratePrompt();
+    expect(prompt).toContain('## Acceptance Evidence');
+    expect(prompt).toContain('release-deploy-artifact-registry');
+    expect(prompt).toContain('real, non-empty diff');
+  });
+
   it('forwards a custom base_branch and disables tests-on-main accordingly', async () => {
     await handleMigrate(
       TASK_ID,

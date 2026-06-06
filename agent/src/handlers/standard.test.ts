@@ -1142,6 +1142,54 @@ describe('issue context propagation', () => {
   });
 });
 
+const STANDARD_CODE_TASKS = [
+  ['create', handleCreate],
+  ['refactor', handleRefactor],
+  ['docs', handleDocs],
+  ['qa', handleQA],
+  ['deps', handleDeps],
+] as const;
+
+describe('acceptance evidence propagation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it.each(STANDARD_CODE_TASKS)('includes the acceptance-evidence block for %s tasks', async (taskType, handler) => {
+    await handler(
+      TASK_ID,
+      {
+        prompt: 'Do something',
+        type: taskType,
+        acceptance_evidence: {
+          kind: 'named_test',
+          test_path: 'testing/test_widget.py',
+          test_id: 'test_widget_handles_empty',
+        },
+      },
+      { title: 'Task', description: '', context: {}, project_context: {} },
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('## Acceptance Evidence');
+    expect(prompt).toContain('testing/test_widget.py');
+    expect(prompt).toContain('test_widget_handles_empty');
+    expect(prompt).toContain('real merge-test verdict');
+  });
+
+  it.each(STANDARD_CODE_TASKS)('omits the acceptance-evidence block when undeclared for %s tasks', async (_taskType, handler) => {
+    await handler(
+      TASK_ID,
+      { prompt: 'Do something', type: _taskType },
+      { title: 'Task', description: '', context: {}, project_context: {} },
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    expect(capturedPrompt()).not.toContain('## Acceptance Evidence');
+  });
+});
+
 // ── buildSmallScopeCallerNote (unchanged unit tests) ──────────────────────────
 describe('buildSmallScopeCallerNote', () => {
   it('returns empty string when no related files are provided', () => {
