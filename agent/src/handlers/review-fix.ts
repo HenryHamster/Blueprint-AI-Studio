@@ -23,7 +23,12 @@ import {
   readClaudeMd, formatProjectContext, configureAgentPermissions, computePromptFingerprint,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, type PlaybookEntry,
 } from '../prompt.js';
-import { formatProjectVision, formatStrategicIntent } from '../prompts/context-prefix.js';
+import {
+  formatProjectVision,
+  formatRejectionPatternsSection,
+  formatStrategicIntent,
+  type RejectionPatternsSource,
+} from '../prompts/context-prefix.js';
 import { resolveBuildConfig } from '../build-config.js';
 import {
   REVIEW_CLAUDEMD_PROMPT_HEADER, REVIEW_CLAUDEMD_PROMPT_FOOTER,
@@ -945,6 +950,20 @@ export async function handleFix(
       `## Reviewer's Working Set\n` +
       `The reviewer Read/Edit/Grep'd these paths while forming the verdict above. Start your investigation here — they are the most likely place the cited issues live. You may look elsewhere if the trail leads there:\n${formatted}\n\n` +
       enrichedPrompt;
+  }
+
+  // Prepend the per-type rejection-patterns block (backend-injected at claim
+  // time) so fix agents see why fix-type work commonly gets rejected and avoid
+  // introducing fresh instances while addressing the review feedback. The fix
+  // path builds its prompt manually and bypasses buildContextPrefix, so wire
+  // the same formatter in directly — mirroring the Project Vision block below.
+  const fixRejectionPatterns = formatRejectionPatternsSection(
+    (task.project_context as Record<string, unknown> | undefined)
+      ?.rejection_patterns as RejectionPatternsSource | undefined,
+    'fix',
+  );
+  if (fixRejectionPatterns) {
+    enrichedPrompt = `${fixRejectionPatterns}${enrichedPrompt}`;
   }
 
   // Prepend the shared Project Vision block so review-driven fixes inherit the

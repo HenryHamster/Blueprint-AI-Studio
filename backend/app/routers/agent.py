@@ -441,7 +441,7 @@ async def verify_agent_token(
 # internals / invalidation helper) call sites keep working unchanged.
 # ---------------------------------------------------------------------------
 
-from app.github_token_resolver import (  # noqa: F401,E402
+from app.github_token_resolver import (  # noqa: F401
     _GITHUB_TOKEN_TTL,
     _github_token_cache,
     _github_token_cache_lock,
@@ -1890,14 +1890,15 @@ async def claim_task(
         # over distrusting healthy entries on a transient DB hiccup).
         _landed_lookup_failed = False
         if _candidate_source_ids:
-            _parsed_ids = []
-            for _sid in _candidate_source_ids:
-                try:
-                    _parsed_ids.append(uuid.UUID(_sid))
-                except (ValueError, TypeError):
-                    # Malformed/unresolvable id — skip; the entry will fall
-                    # through to NOT diverged (favouring low false positives).
-                    continue
+            from app.orchestrator_filters import _coerce_uuid
+
+            # Malformed/unresolvable ids are skipped (None); the entry falls
+            # through to NOT diverged (favouring low false positives).
+            _parsed_ids = [
+                _parsed
+                for _sid in _candidate_source_ids
+                if (_parsed := _coerce_uuid(_sid)) is not None
+            ]
             if _parsed_ids:
                 try:
                     _src_rows = (
@@ -3230,6 +3231,41 @@ async def claim_task(
                         logger.exception(
                             "[AGENT] Failed to track arch context injection (non-critical)"
                         )
+
+    # Inject per-type first-review rejection patterns (last 7 days, time-decayed)
+    # so the next create/fix agent sees WHY work like its own got rejected —
+    # closing the loop from task_lifecycle's _first_attempt_rejection_categories
+    # writes into the prompts of the agents that can act on them. Shape:
+    #   project_context.rejection_patterns = {task_type, window_days, sample_size,
+    #     categories: [{category, weight, task_count, share, guidance}, ...]}
+    # Rendered agent-side by context-prefix.ts:formatRejectionPatternsSection as
+    # observed frequencies (context, not a checklist). Deliberately injected LAST
+    # and packed LOW priority: inject_rejection_patterns ships the block only when
+    # the fully-assembled project_context leaves room under its soft byte budget,
+    # so under budget pressure this advisory field drops first and never displaces
+    # the mission-critical fields assembled above.
+    if task_type in ("create", "fix", "refactor", "migrate") and project_for_playbook:
+        try:
+            from app.rejection_patterns import (
+                aggregate_rejection_patterns,
+                build_rejection_patterns_block,
+                inject_rejection_patterns,
+            )
+
+            _rejection_aggregates = await aggregate_rejection_patterns(
+                session, project_for_playbook.id
+            )
+            _rejection_block = build_rejection_patterns_block(
+                _rejection_aggregates, task_type
+            )
+            if _rejection_block:
+                _rejection_target = response.get("project_context") or {}
+                if inject_rejection_patterns(_rejection_target, _rejection_block):
+                    response["project_context"] = _rejection_target
+        except Exception:
+            logger.exception(
+                "[AGENT] Failed to inject rejection_patterns (non-critical)"
+            )
 
     # Inject strategic intent so tactical agents understand the "why" behind
     # their work. Useful for every task type. Prefer the LIVE, operator-editable

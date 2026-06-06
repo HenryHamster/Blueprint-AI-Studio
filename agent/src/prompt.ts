@@ -37,6 +37,7 @@ export {
   buildContextPrefix,
   formatStrategicIntent,
   formatSelfReviewCalibrationSection,
+  formatRejectionPatternsSection,
   synthesizeSuccessPatterns,
   synthesizeFailureHotspots,
 } from './prompts/context-prefix.js';
