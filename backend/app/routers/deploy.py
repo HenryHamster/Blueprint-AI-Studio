@@ -14,6 +14,7 @@ from app.models import DeploymentState, DeploymentStatus
 from app.auth import get_current_user, require_admin
 from app.admin import build_deploy_state_payload
 from app.task_locking import deployment_state_lock
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -384,8 +385,15 @@ async def trigger_rollback(
         # The ROLLED_BACK guard above makes this a real status transition every time
         # we reach here, so the rollback_count increment and capacity snapshot are
         # taken exactly once per rollback (a re-entrant call is rejected by the guard).
+        #
+        # Capture the bad (rolled-back-FROM) SHA into a local BEFORE we advance
+        # current_sha onto the good revision below: the warning log and the JSON
+        # response's `from_sha` must still report the revision we rolled back FROM,
+        # while `to_revision`/`to_sha` report the good target now serving traffic.
+        bad_sha = state.current_sha
+        good_sha = state.last_known_good_sha
         state.status = DeploymentStatus.ROLLED_BACK
-        state.rolled_back_from_sha = state.current_sha
+        state.rolled_back_from_sha = bad_sha
         state.rollback_reason = f"Manual rollback: {analysis_reason}"
         state.rollback_count += 1
         # Idempotent capacity snapshot: only capture the genuine pre-pause capacity
@@ -403,6 +411,14 @@ async def trigger_rollback(
         # downtime. mark_paused is idempotent: if the pipeline was already paused it
         # preserves the existing paused_at/paused_kind rather than restarting the window.
         pause_clock.mark_paused(state, pause_clock.PAUSED_KIND_AUTO)
+        # Advance the live revision/SHA onto the rolled-back target so every
+        # downstream reader (activity feed, strategist deployment_state_block,
+        # admin live-SHA display, rollback-button disable comparison) immediately
+        # sees the good revision as current instead of the stale bad one. Provenance
+        # of the bad revision is preserved in rolled_back_from_sha (set above).
+        state.current_revision = rollback_revision
+        state.current_sha = good_sha
+        state.deployed_at = _utcnow()
         session.add(state)
     await session.commit()
 
@@ -411,7 +427,7 @@ async def trigger_rollback(
     deploy_monitoring["window_start"] = None
 
     logger.warning(
-        f"[ADMIN] ROLLBACK triggered: {state.current_sha[:8]} → {state.last_known_good_sha[:8]}"
+        f"[ADMIN] ROLLBACK triggered: {bad_sha[:8]} → {good_sha[:8]}"
     )
     from app.deploy_health import broadcast_deploy_state
 
@@ -419,9 +435,9 @@ async def trigger_rollback(
 
     return {
         "status": "rolled_back",
-        "from_sha": state.current_sha,
+        "from_sha": bad_sha,
         "to_revision": rollback_revision,
-        "to_sha": state.last_known_good_sha,
+        "to_sha": good_sha,
         "reason": analysis_reason,
         "gcloud_error": None,
         "pipeline_paused": True,

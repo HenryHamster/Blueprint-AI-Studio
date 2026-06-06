@@ -295,6 +295,73 @@ describe('useDeploymentState', () => {
     );
   });
 
+  it('handleRollback treats a 200 rollback_failed body as a retryable error, not success', async () => {
+    // Backend returns HTTP 200 with status='rollback_failed' when the Cloud Run
+    // traffic shift never happened (it avoids a 5xx that would quarantine the
+    // serving instance). The hook must surface this as an error/retry toast and
+    // must NOT show the rolled-back success toast.
+    fetchSpy.mockResolvedValue({
+      ok: true,
+      json: vi.fn().mockResolvedValue({
+        status: 'rollback_failed',
+        gcloud_error: 'traffic shift rejected',
+        serving_sha: 'sha123bad000000',
+        from_sha: 'sha123bad000000',
+        to_sha: 'sha123good00000',
+      }),
+    });
+    const addToast = vi.fn();
+    const { result } = renderHook(() =>
+      useDeploymentState(addToast, makeUser(), { current: vi.fn() }),
+    );
+    await result.current.handleRollback();
+    expect(addToast).toHaveBeenCalledWith(
+      expect.stringContaining('Rollback failed'),
+      'error',
+    );
+    // The error toast surfaces the still-serving SHA and the gcloud reason.
+    expect(addToast).toHaveBeenCalledWith(
+      expect.stringContaining('sha123ba'),
+      'error',
+    );
+    expect(addToast).toHaveBeenCalledWith(
+      expect.stringContaining('traffic shift rejected'),
+      'error',
+    );
+    // Crucially, no success toast was fired for the failed shift.
+    expect(addToast).not.toHaveBeenCalledWith(
+      expect.stringContaining('Rolled back:'),
+      'success',
+    );
+  });
+
+  it('handleRollback shows success toast on rolled_back status body', async () => {
+    // Positive companion to the rollback_failed test: a status='rolled_back'
+    // body (real traffic shift) still fires the success toast — guards against
+    // the failure branch matching too broadly.
+    fetchSpy.mockResolvedValue({
+      ok: true,
+      json: vi.fn().mockResolvedValue({
+        status: 'rolled_back',
+        from_sha: 'abcdef1234567890',
+        to_sha: '98765432abcdef',
+      }),
+    });
+    const addToast = vi.fn();
+    const { result } = renderHook(() =>
+      useDeploymentState(addToast, makeUser(), { current: vi.fn() }),
+    );
+    await result.current.handleRollback();
+    expect(addToast).toHaveBeenCalledWith(
+      expect.stringContaining('abcdef12'),
+      'success',
+    );
+    expect(addToast).not.toHaveBeenCalledWith(
+      expect.anything(),
+      'error',
+    );
+  });
+
   it('handleRollback ignores a second concurrent call while in flight', async () => {
     // Gate the first fetch on a promise we control so the call is still
     // in flight when the second handleRollback fires.

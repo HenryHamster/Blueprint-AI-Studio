@@ -115,6 +115,19 @@ export function useDeploymentState(
         return;
       }
       const data = await res.json();
+      // The backend returns a truthful HTTP 200 with status='rollback_failed'
+      // when the Cloud Run traffic shift never happened (it deliberately avoids a
+      // 5xx, which would quarantine the serving instance). Treat that body as a
+      // retryable failure — NOT a completed rollback — so the operator knows
+      // traffic still serves the bad revision and can retry. Still refresh deploy
+      // state so the UI reflects the untouched (STABLE) status.
+      if (data.status === 'rollback_failed') {
+        const servingSha = data.serving_sha?.slice(0, 8) ?? 'current revision';
+        const detail = data.gcloud_error ? ` (${data.gcloud_error})` : '';
+        addToast(`Rollback failed — traffic still serves ${servingSha}; retry${detail}`, 'error');
+        fetchDeployState();
+        return;
+      }
       addToast(`Rolled back: ${data.from_sha?.slice(0, 8)} → ${data.to_sha?.slice(0, 8)}`, 'success');
       fetchDeployState();
     } catch {

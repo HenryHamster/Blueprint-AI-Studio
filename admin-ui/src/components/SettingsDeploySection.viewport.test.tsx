@@ -247,6 +247,106 @@ describe('SettingsDeploySection — viewport regression', () => {
     });
   });
 
+  test('rolled-back state offers Resume and Mark Stable, hides Pause, and disables Rollback', async () => {
+    const deployState: DeployState = {
+      ...baseDeployState,
+      status: 'ROLLED_BACK',
+      rollback_reason: 'Automatic rollback triggered: failure rate 0.52 exceeded threshold 0.30 after 87 task results',
+      rollback_count: 3,
+      failure_rate: 0.52,
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => {
+      root?.render(
+        <DeploySection
+          deployState={deployState}
+          onPausePipeline={noop}
+          onResumePipeline={noop}
+          onResetHealth={noop}
+          onRollback={noop}
+          onMarkStable={noop}
+          onRepairState={noop}
+          zoneHealth={null}
+        />
+      );
+    });
+    const buttons = Array.from(host.querySelectorAll('button'));
+    const labels = buttons.map((b) => b.textContent?.trim() ?? '');
+    // ROLLED_BACK is a first-class operator state: the recovery path (Resume +
+    // Mark Stable) is offered and the misleading Pause control is suppressed.
+    expect(labels.some((l) => l.includes('Resume'))).toBe(true);
+    expect(labels.some((l) => l.includes('Mark Stable'))).toBe(true);
+    expect(labels.some((l) => l.includes('Pause'))).toBe(false);
+    // Backend rejects a re-rollback (400 "Already rolled back"); the button
+    // must not invite an action the backend will refuse.
+    const rollbackBtn = buttons.find((b) => b.textContent?.includes('Rollback'));
+    expect(rollbackBtn).toBeTruthy();
+    expect((rollbackBtn as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  test('surfaces rolled-back-from provenance and live-SHA labeling on rollback', async () => {
+    const deployState: DeployState = {
+      ...baseDeployState,
+      status: 'ROLLED_BACK',
+      current_sha: 'fedcba0987654321',
+      rolled_back_from_sha: 'abcdef1234567890',
+      rollback_reason: 'Manual rollback',
+      rollback_count: 1,
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => {
+      root?.render(
+        <DeploySection
+          deployState={deployState}
+          onPausePipeline={noop}
+          onResumePipeline={noop}
+          onResetHealth={noop}
+          onRollback={noop}
+          onMarkStable={noop}
+          onRepairState={noop}
+          zoneHealth={null}
+        />
+      );
+    });
+    const text = host.textContent ?? '';
+    // Live SHA is the rolled-back target, explicitly labeled as live.
+    expect(text).toContain('Live SHA');
+    expect(text).toContain('fedcba09');
+    // Provenance of the bad revision rolled back from is shown (short SHA).
+    expect(text).toContain('rolled back from abcdef12');
+  });
+
+  test('omits rolled-back-from provenance when status is not a rollback', async () => {
+    const deployState: DeployState = {
+      ...baseDeployState,
+      status: 'STABLE',
+      rolled_back_from_sha: 'abcdef1234567890',
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => {
+      root?.render(
+        <DeploySection
+          deployState={deployState}
+          onPausePipeline={noop}
+          onResumePipeline={noop}
+          onResetHealth={noop}
+          onRollback={noop}
+          onMarkStable={noop}
+          onRepairState={noop}
+          zoneHealth={null}
+        />
+      );
+    });
+    const text = host.textContent ?? '';
+    expect(text).not.toContain('rolled back from');
+  });
+
   test('shows escalated denominator and flapping indicator from deployState only', async () => {
     const deployState: DeployState = {
       ...baseDeployState,

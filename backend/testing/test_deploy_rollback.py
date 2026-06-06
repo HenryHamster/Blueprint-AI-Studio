@@ -101,6 +101,69 @@ async def test_rollback_from_stable_snapshots_real_capacity(
     assert state.paused_at is not None
     assert state.paused_kind == pause_clock.PAUSED_KIND_AUTO
     assert state.rollback_count == 1
+    # Live revision/SHA advanced onto the rolled-back (good) target so every
+    # downstream reader immediately sees the good revision as current.
+    assert state.current_revision == "rev-good"
+    assert state.current_sha == "sha123good"
+    # Provenance of the bad revision we rolled back FROM is preserved.
+    assert state.rolled_back_from_sha == "sha123bad"
+
+
+@pytest.mark.asyncio
+async def test_rollback_success_response_reports_from_and_to(
+    client: AsyncClient, db_session
+):
+    """On a successful rollback the response must report the BAD SHA as
+    ``from_sha`` (the revision we rolled back FROM) and the GOOD revision/SHA as
+    ``to_revision``/``to_sha`` — even though current_sha is advanced onto the
+    good SHA in the same transaction."""
+    db_session.add(_rollbackable_state())
+    await db_session.commit()
+
+    runtime_config["max_concurrent_vms"] = 5
+
+    p = _gcloud_ok()
+    try:
+        resp = await client.post("/api/admin/deploy-state/rollback")
+    finally:
+        p.stop()
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "rolled_back"
+    assert body["from_sha"] == "sha123bad"
+    assert body["to_revision"] == "rev-good"
+    assert body["to_sha"] == "sha123good"
+
+
+@pytest.mark.asyncio
+async def test_rollback_success_updates_live_deployed_at_snapshot(
+    client: AsyncClient, db_session
+):
+    """A successful manual rollback must refresh the live deploy timestamp when
+    the good revision becomes current, rather than leaving the bad deploy's
+    deployed_at behind."""
+    prior_deployed_at = datetime(2026, 1, 1, 12, 0, 0)
+    rollback_completed_at = datetime(2026, 1, 1, 12, 5, 0)
+    db_session.add(_rollbackable_state(deployed_at=prior_deployed_at))
+    await db_session.commit()
+
+    runtime_config["max_concurrent_vms"] = 5
+
+    p = _gcloud_ok()
+    try:
+        with patch("app.routers.deploy._utcnow", return_value=rollback_completed_at):
+            resp = await client.post("/api/admin/deploy-state/rollback")
+    finally:
+        p.stop()
+
+    assert resp.status_code == 200
+    state = await db_session.get(DeploymentState, 1)
+    await db_session.refresh(state)
+    assert state.current_revision == "rev-good"
+    assert state.current_sha == "sha123good"
+    assert state.deployed_at == rollback_completed_at
+    assert state.deployed_at != prior_deployed_at
 
 
 @pytest.mark.asyncio

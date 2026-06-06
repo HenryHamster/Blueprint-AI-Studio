@@ -53,6 +53,10 @@ export interface DeployState {
   deployed_at: string;
   last_known_good_revision: string;
   last_known_good_sha: string;
+  // SHA the live revision was rolled back FROM (the bad revision), preserved
+  // as provenance after a manual/auto rollback advances current_sha to the
+  // rolled-back target. Optional/nullable so older payloads still type-check.
+  rolled_back_from_sha?: string | null;
   rollback_reason: string | null;
   rollback_count: number;
   pause_reason: string | null;
