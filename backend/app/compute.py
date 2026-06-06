@@ -32,6 +32,26 @@ from pathlib import Path
 # compute.
 from app.compute_manifest import validate_payload_uri, build_agent_secret_manifest
 
+# Quota-scope classification (project-global vs regional vs zonal blast radius
+# for provisioning errors) lives in app.provision_error_scope — extracted to
+# keep this module within its size guardrail. Imported for compute's own use;
+# the names also stay reachable as `app.compute.*` (the quota state dicts are
+# only ever mutated in place, so these aliases remain live). No load-time
+# cycle: provision_error_scope imports compute._zone_lock at call time only.
+from app.provision_error_scope import (
+    QUOTA_SCOPE_GLOBAL,
+    QUOTA_SCOPE_REGIONAL,
+    _GLOBAL_QUOTA_MARKERS,
+    _clear_quota_cooldowns_after_success,
+    _global_quota_state,
+    _record_global_quota_exhaustion,
+    _record_region_quota_exhaustion,
+    _region_quota_state,
+    _zone_region,
+    classify_provision_error_scope,
+    get_quota_cooldowns,
+)
+
 logger = logging.getLogger(__name__)
 
 # --- Mode Selection ---
@@ -178,7 +198,7 @@ _zone_health: dict[str, dict] = {}
 
 
 def _zone_success_rate(zone: str) -> float:
-    """Return the recent success rate for a zone (0.0–1.0).
+    """Return the recent success rate for a zone (0.0-1.0).
 
     Reads the rolling ``recent_outcomes`` deque stored in ``_zone_health``.
     Returns the neutral rate (0.5) when no history exists so unknown zones
@@ -189,6 +209,26 @@ def _zone_success_rate(zone: str) -> float:
     if not outcomes:
         return _ZONE_NEUTRAL_RATE
     return sum(outcomes) / len(outcomes)
+
+
+def _zone_blocked_until(zone: str, now: datetime) -> datetime | None:
+    """Effective blocking expiry for a zone: the latest of its own cooldown,
+    its region's quota cooldown, and the project-global quota cooldown.
+    Returns ``None`` when the zone is not blocked. Caller must hold
+    ``_zone_lock`` when thread safety matters."""
+    candidates = []
+    zone_cd = _zone_health.get(zone, {}).get("cooldown_expires_at")
+    if zone_cd and now < zone_cd:
+        candidates.append(zone_cd)
+    region_cd = _region_quota_state.get(_zone_region(zone), {}).get(
+        "cooldown_expires_at"
+    )
+    if region_cd and now < region_cd:
+        candidates.append(region_cd)
+    global_cd = _global_quota_state.get("cooldown_expires_at")
+    if global_cd and now < global_cd:
+        candidates.append(global_cd)
+    return max(candidates) if candidates else None
 
 
 # Thread lock for zone state dicts (modified from asyncio.to_thread workers, read from event loop)
@@ -224,8 +264,7 @@ _DISABLED_REGIONS = frozenset(
 
 def _zone_in_disabled_region(zone: str) -> bool:
     """True if the zone's region is in DISABLED_REGIONS."""
-    region = "-".join(zone.split("-")[:-1])  # us-central1-f → us-central1
-    return region in _DISABLED_REGIONS
+    return _zone_region(zone) in _DISABLED_REGIONS
 
 
 def _active_fallback_zones() -> list[tuple[str, str]]:
@@ -344,7 +383,9 @@ def _validate_image_family() -> None:
         )
     except Exception as e:
         logger.exception("[STARTUP] Image family validation failed")
-        raise RuntimeError(f"AGENT_IMAGE_FAMILY '{AGENT_IMAGE_FAMILY}' not found: {e}")
+        raise RuntimeError(
+            f"AGENT_IMAGE_FAMILY '{AGENT_IMAGE_FAMILY}' not found: {e}"
+        ) from e
 
 
 _image_family_valid: bool | None = None  # None = not yet checked, True/False = result
@@ -511,13 +552,13 @@ def _ensure_image_family_valid() -> None:
                 logger.info(
                     "[COMPUTE] Image family re-validation succeeded — provisioning re-enabled"
                 )
-            except Exception:
+            except Exception as revalidate_err:
                 _image_family_last_check = now
                 logger.exception("[COMPUTE] Image family re-validation still failing")
                 raise RuntimeError(
                     f"VM provisioning disabled: image family '{AGENT_IMAGE_FAMILY}' "
                     f"failed validation. Next retry in {_IMAGE_FAMILY_RECHECK_INTERVAL}s."
-                )
+                ) from revalidate_err
         else:
             raise RuntimeError(
                 f"VM provisioning disabled: image family '{AGENT_IMAGE_FAMILY}' "
@@ -589,7 +630,9 @@ async def provision_pool_vm(
             agent_image_fingerprint=agent_image_fingerprint,
             state=PoolVmState.PROVISIONING,
         )
-        logger.info(f"[WARM-POOL] LOCAL_MODE pool VM registered (no boot): {vm_instance_id}")
+        logger.info(
+            f"[WARM-POOL] LOCAL_MODE pool VM registered (no boot): {vm_instance_id}"
+        )
         return vm_instance_id
 
     from app.compute_manifest import build_taskless_agent_secret_manifest
@@ -1079,7 +1122,7 @@ def _store_agent_secret(vm_instance_id: str, secret_payload: str) -> str:
             break
         except Aborted:
             if attempt == max_retries - 1:
-                logger.error(
+                logger.exception(
                     "[COMPUTE] IAM policy ETag retry exhausted for %s after %d attempts",
                     secret.name,
                     max_retries,
@@ -1113,7 +1156,7 @@ def _store_agent_secret(vm_instance_id: str, secret_payload: str) -> str:
                 f"Secret {version.name} verification failed: payload mismatch"
             )
     except Exception as verify_err:
-        logger.error(
+        logger.exception(
             "[COMPUTE] Secret %s failed post-create verification: %s",
             version.name,
             verify_err,
@@ -1377,16 +1420,23 @@ async def _provision_gcp(
         skipped_cooldown = []
 
         now_pre = datetime.now(timezone.utc)
+        # Project-global quota cooldown: a CPUS_ALL_REGIONS-style exhaustion
+        # blocks EVERY zone identically, so cycling zones would only burn time
+        # and re-trip the quota. Fail fast; the message contains "quota" so the
+        # orchestrator/reaper INFRA_PROVISION_PATTERNS classify it infra-wide
+        # (requeue without burning task retry budget).
+        global_quota_cd = _global_quota_state.get("cooldown_expires_at")
+        if global_quota_cd and now_pre < global_quota_cd:
+            remaining = (global_quota_cd - now_pre).total_seconds()
+            raise Exception(
+                f"Global quota cooldown active — project-wide quota exhausted "
+                f"(e.g. CPUS_ALL_REGIONS); retry in {remaining:.0f}s"
+            )
         # _active_fallback_zones() filters out admin-disabled regions (DISABLED_REGIONS env)
         # so spawn attempts skip regions with no subnet provisioned.
         active_zones = _active_fallback_zones()
         healthy_zones = [
-            (z, s)
-            for z, s in active_zones
-            if not (
-                _zone_health.get(z, {}).get("cooldown_expires_at")
-                and now_pre < _zone_health[z]["cooldown_expires_at"]
-            )
+            (z, s) for z, s in active_zones if _zone_blocked_until(z, now_pre) is None
         ]
         cooled_zones = [(z, s) for z, s in active_zones if (z, s) not in healthy_zones]
         # Sort healthy zones by recent success rate (descending) so well-performing
@@ -1407,11 +1457,11 @@ async def _provision_gcp(
             now = datetime.now(
                 timezone.utc
             )  # Refresh each iteration — zone attempts can take up to 300s
-            # Skip zones in cooldown (recently failed) — use per-zone exponential backoff expiry
-            zone_cooldown_expires = _zone_health.get(zone, {}).get(
-                "cooldown_expires_at"
-            )
-            if zone_cooldown_expires and now < zone_cooldown_expires:
+            # Skip blocked zones — per-zone exponential cooldown, region quota
+            # cooldown, or the project-global quota cooldown (a regional/global
+            # quota event earlier in THIS loop must skip the remaining zones it
+            # covers instead of burning a 240s insert on each).
+            if _zone_blocked_until(zone, now) is not None:
                 skipped_cooldown.append(zone)
                 continue
 
@@ -1467,6 +1517,7 @@ async def _provision_gcp(
                         "recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW)
                     )
                     outcomes.append(True)
+                    _clear_quota_cooldowns_after_success(zone)
                     was_in_cooldown = zone in _zone_failures
                     cooldown_since = _zone_failures.pop(zone, None)
 
@@ -1528,21 +1579,50 @@ async def _provision_gcp(
                     # if adoption didn't succeed.
                     continue
                 # Retryable zone/infra errors — try next zone
+                err_low = err_str.lower()
                 retryable = (
-                    "does not have enough resources" in err_str
-                    or "ZONE_RESOURCE_POOL_EXHAUSTED" in err_str
-                    or "QUOTA" in err_str
+                    "does not have enough resources" in err_low
+                    or "zone_resource_pool_exhausted" in err_low
+                    or "quota" in err_low
+                    or any(m in err_low for m in _GLOBAL_QUOTA_MARKERS)
                     or "subnetwork"
-                    in err_str.lower()  # Subnet not found (infra not provisioned)
+                    in err_low  # Subnet not found (infra not provisioned)
                     or "was not found" in err_str
                 )
                 if retryable:
-                    # Classify failure reason for operators
-                    if "QUOTA" in err_str:
-                        reason = "QUOTA"
-                    elif "ZONE_RESOURCE_POOL_EXHAUSTED" in err_str:
+                    # Classify the error's blast radius BEFORE charging the zone:
+                    # quota errors are project-global or regional conditions —
+                    # marking the attempted zone (let alone every zone in the
+                    # cycle) paints healthy zones failed and stacks exponential
+                    # cooldowns that outlive the quota event.
+                    scope = classify_provision_error_scope(err_str)
+                    if scope == QUOTA_SCOPE_GLOBAL:
+                        # _record_global_quota_exhaustion carries the deduped
+                        # ERROR-level operator alert; this is the per-attempt log.
+                        cooldown_secs = _record_global_quota_exhaustion(err_str)
+                        logger.warning(
+                            f"[PROVISION] Project-global quota exhausted while provisioning "
+                            f"{vm_instance_id} in {zone} — project-level cooldown "
+                            f"{cooldown_secs}s, NO zone marked: {err_str[:200]}"
+                        )
+                        # Every remaining zone would fail identically — stop cycling.
+                        raise
+                    if scope == QUOTA_SCOPE_REGIONAL:
+                        region = _zone_region(zone)
+                        cooldown_secs = _record_region_quota_exhaustion(region, err_str)
+                        logger.warning(
+                            f"Region {region} quota exhausted for {vm_instance_id} — "
+                            f"region cooldown {cooldown_secs}s, no zone marked; "
+                            f"trying zones in other regions..."
+                        )
+                        # The per-iteration _zone_blocked_until check skips the
+                        # remaining zones in this region.
+                        continue
+
+                    # Genuinely zonal — classify failure reason for operators
+                    if "zone_resource_pool_exhausted" in err_low:
                         reason = "RESOURCE_POOL_EXHAUSTED"
-                    elif "subnetwork" in err_str.lower() or "was not found" in err_str:
+                    elif "subnetwork" in err_low or "was not found" in err_str:
                         reason = "SUBNET_NOT_FOUND"
                     else:
                         reason = "RESOURCE_UNAVAILABLE"
@@ -1564,12 +1644,8 @@ async def _provision_gcp(
                             and (now_fail - last_fail_time).total_seconds()
                             < ZONE_COOLDOWN_SECONDS
                         )
-                        if within_debounce:
-                            new_failure_count = (
-                                old_cf  # Parallel failure of same event — no escalation
-                            )
-                        else:
-                            new_failure_count = old_cf + 1
+                        # Parallel failure of same event — no escalation
+                        new_failure_count = old_cf if within_debounce else old_cf + 1
                         health["last_failure"] = now_fail
                         health["consecutive_failures"] = new_failure_count
                         health["last_failure_reason"] = reason
@@ -1605,7 +1681,8 @@ async def _provision_gcp(
             soonest_zone = None
             soonest_wait = float("inf")
             for z, sn in active_zones:
-                expires = _zone_health.get(z, {}).get("cooldown_expires_at")
+                # Effective block = zone cooldown OR region/global quota cooldown
+                expires = _zone_blocked_until(z, now_check)
                 if expires:
                     remaining = (expires - now_check).total_seconds()
                     if remaining < soonest_wait:
@@ -1650,6 +1727,7 @@ async def _provision_gcp(
                             "recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW)
                         )
                         outcomes.append(True)
+                        _clear_quota_cooldowns_after_success(wait_zone)
                         _zone_failures.pop(wait_zone, None)
                     logger.info(
                         f"Successfully provisioned VM {vm_instance_id} in {wait_zone} (after cooldown wait)"
@@ -1721,6 +1799,14 @@ async def _provision_gcp(
                 f"[PROVISION] {vm_instance_id} GCP operation cancelled mid-flight "
                 f"(our outer timeout fired while insert was still running): {err_str[:200]}"
             )
+        elif "quota" in err_str.lower():
+            # Quota exhaustion (global or regional) is a known, handled
+            # condition: the quota cooldown is armed, the orchestrator/reaper
+            # classify it infra-wide and requeue without burning retry budget.
+            # WARN instead of a traceback so it stops fouling error dashboards.
+            logger.warning(
+                f"[PROVISION] {vm_instance_id} blocked by quota exhaustion: {err_str[:200]}"
+            )
         else:
             logger.exception(f"Failed to provision VM {vm_instance_id}")
         _last_provision_error[vm_instance_id] = err_str[:300]
@@ -1757,6 +1843,8 @@ async def provision_ephemeral_vm(
         startup_script_override=startup_script,
         machine_type=machine_type,
     )
+
+
 def get_vm_serial_output(vm_instance_id: str, zone: str | None = None) -> str | None:
     """Best-effort serial-port tail for a VM.
 
@@ -1990,7 +2078,7 @@ async def _delete_gcp(vm_instance_id: str):
         # delete request was already issued; the next reaper cycle re-detects
         # and retries if the VM is still alive. Demote these to a one-line
         # warning — the full traceback is noise in the dashboard.
-        from google.api_core.exceptions import (  # noqa: PLC0415
+        from google.api_core.exceptions import (
             GoogleAPICallError,
             RetryError,
         )
@@ -2169,6 +2257,7 @@ def get_zone_health_summary() -> dict:
         z: d["success_rate"] for z, d in health.items() if d["success_rate"] is not None
     }
     active_total = len(FALLBACK_ZONES) - len(disabled)
+    quota = get_quota_cooldowns()
     return {
         "total_zones": len(FALLBACK_ZONES),
         "active_zones": active_total,
@@ -2181,59 +2270,120 @@ def get_zone_health_summary() -> dict:
             if health[z].get("cooldown_expires_at")
         },
         "zone_success_rates": zone_success_rates,
+        # Quota cooldowns are NOT zone marks: when these are active the zones
+        # above can all look healthy while provisioning is paused project-wide
+        # (global) or per-region. Surfaced so "all zones healthy but nothing
+        # dispatches" is explainable from the health endpoint alone.
+        "global_quota_cooldown_until": quota["global_quota_cooldown_until"],
+        "region_quota_cooldowns": quota["region_quota_cooldowns"],
     }
 
 
 def any_zone_available() -> bool:
-    """Return True if at least one ACTIVE zone is not in cooldown.
+    """Return True if at least one ACTIVE zone is not blocked.
 
+    A zone is blocked by its own failure cooldown, by a quota cooldown on its
+    region, or by the project-global quota cooldown (which blocks every zone).
     Disabled zones are excluded — they have no subnet provisioned and cannot
     accept VMs even if not in cooldown.
     """
     now = datetime.now(timezone.utc)
     with _zone_lock:
         for zone, _ in _active_fallback_zones():
-            health = _zone_health.get(zone)
-            if health is None:
-                return True  # Unknown = available
-            cooldown = health.get("cooldown_expires_at")
-            if cooldown is None or now >= cooldown:
+            if _zone_blocked_until(zone, now) is None:
                 return True
     return False
+
+
+# Failure reasons that are AUTHORITATIVE zone-level evidence (the GCP API
+# itself reported a zone-scoped problem) — these charge the zone immediately.
+# Everything else reaching record_zone_failure (HEARTBEAT_STARVATION,
+# AGENT_STARTUP_FAILURE, PROVISION_INLINE_FAILURE, …) describes a VM that the
+# zone provisioned SUCCESSFULLY but whose agent then died silently — usually a
+# VM/image/startup-script/account failure, not zone health — so it only counts
+# toward the zone once corroborated by repeated incidents in a short window.
+_ZONE_AUTHORITATIVE_FAILURE_REASONS = frozenset(
+    {
+        "RESOURCE_POOL_EXHAUSTED",
+        "RESOURCE_UNAVAILABLE",
+        "SUBNET_NOT_FOUND",
+    }
+)
+ZONE_SUSPECT_CORROBORATION_THRESHOLD = int(
+    os.getenv("ZONE_SUSPECT_CORROBORATION_THRESHOLD", "3")
+)
+ZONE_SUSPECT_WINDOW_SECONDS = int(os.getenv("ZONE_SUSPECT_WINDOW_SECONDS", "1800"))
+# zone -> deque[datetime] of recent uncorroborated VM-death reports
+# (guarded by _zone_lock; bounded by maxlen + window pruning)
+_zone_suspect_events: dict[str, _deque] = {}
 
 
 def record_zone_failure(zone: str, reason: str = "HEARTBEAT_STARVATION") -> None:
     """Record a zone failure from outside the provisioning path (e.g. reaper).
 
     Called when a VM was provisioned in a zone but the agent died without
-    heartbeating, indicating the zone may have issues even though the GCP
-    API call succeeded.
+    heartbeating. The GCP insert demonstrably SUCCEEDED in that zone, so a
+    single silent death is weak evidence about zone health — it is far more
+    often a VM/image/startup-script/account failure. Charging each one
+    directly poisoned zone cooldowns and success rates with non-zone faults.
+
+    Reasons outside ``_ZONE_AUTHORITATIVE_FAILURE_REASONS`` are therefore
+    treated as *suspect* evidence: the zone is only charged (cooldown +
+    success-rate hit) once ``ZONE_SUSPECT_CORROBORATION_THRESHOLD`` reports
+    land in the same zone within ``ZONE_SUSPECT_WINDOW_SECONDS``; the charge
+    consumes the accumulated reports so the next charge needs fresh
+    corroboration. Authoritative zone-scoped reasons charge immediately.
     """
     with _zone_lock:
         now_fail = datetime.now(timezone.utc)
-        entering_cooldown = zone not in _zone_failures
-        _zone_failures[zone] = now_fail
-        health = _zone_health.setdefault(zone, {})
-        old_cf = health.get("consecutive_failures", 0)
-        last_fail_time = health.get("last_failure")
-        # Debounce parallel failures (same logic as inline provisioning handler)
-        within_debounce = (
-            last_fail_time is not None
-            and (now_fail - last_fail_time).total_seconds() < ZONE_COOLDOWN_SECONDS
-        )
-        if within_debounce:
-            new_failure_count = old_cf
+        suspect_count = None
+        if reason not in _ZONE_AUTHORITATIVE_FAILURE_REASONS:
+            events = _zone_suspect_events.setdefault(zone, _deque(maxlen=64))
+            cutoff = now_fail - timedelta(seconds=ZONE_SUSPECT_WINDOW_SECONDS)
+            while events and events[0] < cutoff:
+                events.popleft()
+            events.append(now_fail)
+            suspect_count = len(events)
+            if suspect_count < ZONE_SUSPECT_CORROBORATION_THRESHOLD:
+                charged = False
+            else:
+                # Corroborated — consume the evidence and charge the zone once.
+                events.clear()
+                reason = f"{reason}_CORROBORATED"
+                charged = True
         else:
-            new_failure_count = old_cf + 1
-        health["last_failure"] = now_fail
-        health["consecutive_failures"] = new_failure_count
-        health["last_failure_reason"] = reason
-        cooldown_secs = _zone_cooldown_seconds(new_failure_count)
-        health["cooldown_expires_at"] = now_fail + timedelta(seconds=cooldown_secs)
-        outcomes = health.setdefault(
-            "recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW)
+            charged = True
+
+        if charged:
+            entering_cooldown = zone not in _zone_failures
+            _zone_failures[zone] = now_fail
+            health = _zone_health.setdefault(zone, {})
+            old_cf = health.get("consecutive_failures", 0)
+            last_fail_time = health.get("last_failure")
+            # Debounce parallel failures (same logic as inline provisioning handler)
+            within_debounce = (
+                last_fail_time is not None
+                and (now_fail - last_fail_time).total_seconds() < ZONE_COOLDOWN_SECONDS
+            )
+            new_failure_count = old_cf if within_debounce else old_cf + 1
+            health["last_failure"] = now_fail
+            health["consecutive_failures"] = new_failure_count
+            health["last_failure_reason"] = reason
+            cooldown_secs = _zone_cooldown_seconds(new_failure_count)
+            health["cooldown_expires_at"] = now_fail + timedelta(seconds=cooldown_secs)
+            outcomes = health.setdefault(
+                "recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW)
+            )
+            outcomes.append(False)
+
+    if not charged:
+        logger.info(
+            f"Zone {zone}: suspect VM-death report ({reason}) "
+            f"{suspect_count}/{ZONE_SUSPECT_CORROBORATION_THRESHOLD} within "
+            f"{ZONE_SUSPECT_WINDOW_SECONDS}s — not charging zone health "
+            f"(likely VM/image/startup fault, not a zone fault)"
         )
-        outcomes.append(False)
+        return
 
     if entering_cooldown:
         logger.warning(
@@ -2243,8 +2393,11 @@ def record_zone_failure(zone: str, reason: str = "HEARTBEAT_STARVATION") -> None
 
 
 def soonest_zone_recovery() -> datetime | None:
-    """Return the earliest ACTIVE zone cooldown expiry, or None if a zone is available.
+    """Return the earliest ACTIVE zone unblock time, or None if a zone is available.
 
+    Accounts for per-zone failure cooldowns, per-region quota cooldowns, and
+    the project-global quota cooldown (a zone blocked by its region's or the
+    project's quota is NOT available even with a clean zone-failure record).
     Disabled zones are excluded — they have no subnet so a "recovered" cooldown
     in a disabled region wouldn't unlock spawning anyway.
     """
@@ -2252,14 +2405,11 @@ def soonest_zone_recovery() -> datetime | None:
     soonest = None
     with _zone_lock:
         for zone, _ in _active_fallback_zones():
-            health = _zone_health.get(zone)
-            if health is None:
-                return None  # Unknown = available now
-            cooldown = health.get("cooldown_expires_at")
-            if cooldown is None or now >= cooldown:
+            blocked_until = _zone_blocked_until(zone, now)
+            if blocked_until is None:
                 return None  # Available now
-            if soonest is None or cooldown < soonest:
-                soonest = cooldown
+            if soonest is None or blocked_until < soonest:
+                soonest = blocked_until
     return soonest
 
 

@@ -22,6 +22,7 @@ from sqlmodel import select
 from app import compute
 from app import compute_backends as compute_backends_module
 from app import compute_jobs
+from app import provision_error_scope
 from app.compute_backends import (
     ComputeCostResult,
     GcpComputeBackend,
@@ -908,11 +909,17 @@ async def test_list_compute_jobs_returns_active_and_recent_excludes_others(db_se
 @pytest.fixture(autouse=False)
 def clean_zone_health():
     """Reset zone health state before and after each test that uses this fixture."""
-    compute._zone_health.clear()
-    compute._zone_failures.clear()
+
+    def _reset():
+        compute._zone_health.clear()
+        compute._zone_failures.clear()
+        provision_error_scope._global_quota_state.clear()
+        provision_error_scope._region_quota_state.clear()
+        compute._zone_suspect_events.clear()
+
+    _reset()
     yield
-    compute._zone_health.clear()
-    compute._zone_failures.clear()
+    _reset()
 
 
 class TestZoneSuccessRate:
@@ -964,10 +971,13 @@ class TestZoneSuccessRate:
         rate = compute._zone_success_rate(zone)
         assert rate == pytest.approx(1.0 / window)
 
-    def test_record_zone_failure_appends_false(self, clean_zone_health):
-        """record_zone_failure() appends False to recent_outcomes."""
+    def test_record_zone_failure_appends_false_when_authoritative(
+        self, clean_zone_health
+    ):
+        """An authoritative zone-scoped reason appends False to recent_outcomes
+        immediately (no corroboration needed)."""
         zone = "us-central1-f"
-        compute.record_zone_failure(zone, reason="TEST")
+        compute.record_zone_failure(zone, reason="RESOURCE_POOL_EXHAUSTED")
         outcomes = compute._zone_health[zone]["recent_outcomes"]
         assert list(outcomes) == [False]
 
@@ -1420,6 +1430,391 @@ class TestZoneRecoveryWaitSeconds:
         import app.orchestrator as _orch
 
         assert _orch.zone_recovery_wait_seconds is compute.zone_recovery_wait_seconds
+
+
+# ─── Quota-scope classification (zone-failure misclassification fix) ─────────
+
+
+# Classification matrix: (error text, expected scope)
+_QUOTA_SCOPE_MATRIX = [
+    # Global: the error text literally says "globally" / names an
+    # ALL_REGIONS quota metric.
+    (
+        "403 QUOTA_EXCEEDED: Quota 'CPUS_ALL_REGIONS' exceeded. "
+        "Limit: 32.0 globally.",
+        provision_error_scope.QUOTA_SCOPE_GLOBAL,
+    ),
+    (
+        "Quota 'GPUS_ALL_REGIONS' exceeded. Limit: 0.0 globally.",
+        provision_error_scope.QUOTA_SCOPE_GLOBAL,
+    ),
+    (
+        "quota 'cpus_all_regions' exceeded. limit: 32.0 globally.",
+        provision_error_scope.QUOTA_SCOPE_GLOBAL,
+    ),
+    ("Quota exceeded. Limit: 64.0 globally.", provision_error_scope.QUOTA_SCOPE_GLOBAL),
+    # Regional: region-scoped quota metrics.
+    (
+        "403 QUOTA_EXCEEDED: Quota 'CPUS' exceeded. "
+        "Limit: 24.0 in region us-central1.",
+        provision_error_scope.QUOTA_SCOPE_REGIONAL,
+    ),
+    (
+        "Quota 'IN_USE_ADDRESSES' exceeded. Limit: 8.0 in region us-east1.",
+        provision_error_scope.QUOTA_SCOPE_REGIONAL,
+    ),
+    # Unscoped quota wording defaults to regional (the conservative middle
+    # ground: never paints other regions, never silently pauses the project).
+    ("QUOTA_EXCEEDED: quota exceeded", provision_error_scope.QUOTA_SCOPE_REGIONAL),
+    # Zonal: genuine zone stockouts / shortages.
+    (
+        "ZONE_RESOURCE_POOL_EXHAUSTED: The zone 'projects/p/zones/us-central1-f' "
+        "does not have enough resources available to fulfill the request.",
+        provision_error_scope.QUOTA_SCOPE_ZONAL,
+    ),
+    (
+        "The zone 'projects/p/zones/us-east4-b' does not have enough resources "
+        "available to fulfill the request. Try a different zone.",
+        provision_error_scope.QUOTA_SCOPE_ZONAL,
+    ),
+    # Non-quota retryables (subnet missing, etc.) stay zone-scoped.
+    (
+        "Invalid value for field 'subnetwork': resource was not found",
+        provision_error_scope.QUOTA_SCOPE_ZONAL,
+    ),
+    ("", provision_error_scope.QUOTA_SCOPE_ZONAL),
+]
+
+
+class TestQuotaScopeClassification:
+    """Matrix tests for classify_provision_error_scope().
+
+    A single CPUS_ALL_REGIONS exhaustion is a PROJECT-GLOBAL condition; the
+    old classifier treated any error containing QUOTA as a zone failure and
+    cycled every enabled zone into cooldown.
+    """
+
+    @pytest.mark.parametrize("err_str,expected", _QUOTA_SCOPE_MATRIX)
+    def test_classification_matrix(self, err_str, expected):
+        assert provision_error_scope.classify_provision_error_scope(err_str) == expected
+
+    def test_zonal_marker_wins_over_generic_quota_wording(self):
+        """A decisive zone-stockout marker stays zonal even if the message also
+        mentions quota somewhere."""
+        err = (
+            "ZONE_RESOURCE_POOL_EXHAUSTED: zone does not have enough resources; "
+            "see quota documentation"
+        )
+        assert (
+            provision_error_scope.classify_provision_error_scope(err) == provision_error_scope.QUOTA_SCOPE_ZONAL
+        )
+
+
+_GLOBAL_QUOTA_ERR = (
+    "403 QUOTA_EXCEEDED: Quota 'CPUS_ALL_REGIONS' exceeded. Limit: 32.0 globally."
+)
+_REGIONAL_QUOTA_ERR = (
+    "403 QUOTA_EXCEEDED: Quota 'IN_USE_ADDRESSES' exceeded. "
+    "Limit: 8.0 in region us-central1."
+)
+
+
+class TestGlobalQuotaBackoff:
+    """Project-level backoff for global quota exhaustion — NO zone marks."""
+
+    def test_record_sets_cooldown_and_marks_no_zones(self, clean_zone_health):
+        cooldown_secs = provision_error_scope._record_global_quota_exhaustion(_GLOBAL_QUOTA_ERR)
+        assert cooldown_secs == provision_error_scope.GLOBAL_QUOTA_COOLDOWN_SECONDS
+        expires = provision_error_scope._global_quota_state["cooldown_expires_at"]
+        assert expires > datetime.now(timezone.utc)
+        # The whole point: no zone is charged.
+        assert compute._zone_health == {}
+        assert compute._zone_failures == {}
+
+    def test_global_cooldown_blocks_every_zone(self, clean_zone_health):
+        provision_error_scope._record_global_quota_exhaustion(_GLOBAL_QUOTA_ERR)
+        assert compute.any_zone_available() is False
+        recovery = compute.soonest_zone_recovery()
+        assert recovery == provision_error_scope._global_quota_state["cooldown_expires_at"]
+        wait = compute.zone_recovery_wait_seconds()
+        assert wait is not None and wait > 0
+
+    def test_cooldown_expiry_restores_availability(self, clean_zone_health):
+        provision_error_scope._record_global_quota_exhaustion(_GLOBAL_QUOTA_ERR)
+        provision_error_scope._global_quota_state["cooldown_expires_at"] = datetime.now(
+            timezone.utc
+        ) - timedelta(seconds=1)
+        assert compute.any_zone_available() is True
+
+    def test_parallel_failures_debounced(self, clean_zone_health):
+        """Concurrent provision attempts failing on the same quota event must
+        not escalate the backoff (mirrors the per-zone debounce)."""
+        provision_error_scope._record_global_quota_exhaustion(_GLOBAL_QUOTA_ERR)
+        provision_error_scope._record_global_quota_exhaustion(_GLOBAL_QUOTA_ERR)
+        assert provision_error_scope._global_quota_state["consecutive"] == 1
+
+    def test_distinct_events_escalate_exponentially(self, clean_zone_health):
+        provision_error_scope._record_global_quota_exhaustion(_GLOBAL_QUOTA_ERR)
+        # Age the last event past the debounce window.
+        provision_error_scope._global_quota_state["last_event"] = datetime.now(
+            timezone.utc
+        ) - timedelta(seconds=provision_error_scope.GLOBAL_QUOTA_COOLDOWN_SECONDS + 1)
+        cooldown_secs = provision_error_scope._record_global_quota_exhaustion(_GLOBAL_QUOTA_ERR)
+        assert provision_error_scope._global_quota_state["consecutive"] == 2
+        assert cooldown_secs == min(
+            provision_error_scope.GLOBAL_QUOTA_COOLDOWN_SECONDS * 2,
+            provision_error_scope._QUOTA_COOLDOWN_CAP_SECONDS,
+        )
+
+    def test_backoff_capped(self):
+        assert (
+            provision_error_scope._quota_backoff_seconds(100, provision_error_scope.GLOBAL_QUOTA_COOLDOWN_SECONDS)
+            == provision_error_scope._QUOTA_COOLDOWN_CAP_SECONDS
+        )
+
+    def test_operator_alert_fired_and_deduplicated(
+        self, clean_zone_health, monkeypatch
+    ):
+        alerts = []
+        monkeypatch.setattr(
+            provision_error_scope,
+            "_post_global_quota_alert",
+            lambda err, secs, consec: alerts.append((err, secs, consec)),
+        )
+        provision_error_scope._record_global_quota_exhaustion(_GLOBAL_QUOTA_ERR)
+        assert len(alerts) == 1
+        # A storm of failures within the dedup window must not spam the operator.
+        provision_error_scope._record_global_quota_exhaustion(_GLOBAL_QUOTA_ERR)
+        provision_error_scope._record_global_quota_exhaustion(_GLOBAL_QUOTA_ERR)
+        assert len(alerts) == 1
+        # Past the dedup window the alert re-fires.
+        provision_error_scope._global_quota_state["last_alert_at"] = datetime.now(
+            timezone.utc
+        ) - timedelta(seconds=provision_error_scope._QUOTA_ALERT_DEDUP_SECONDS + 1)
+        provision_error_scope._record_global_quota_exhaustion(_GLOBAL_QUOTA_ERR)
+        assert len(alerts) == 2
+
+    def test_success_clears_global_cooldown(self, clean_zone_health):
+        provision_error_scope._record_global_quota_exhaustion(_GLOBAL_QUOTA_ERR)
+        provision_error_scope._clear_quota_cooldowns_after_success("us-central1-f")
+        assert provision_error_scope._global_quota_state == {}
+        assert compute.any_zone_available() is True
+
+    def test_summary_surfaces_global_cooldown(self, clean_zone_health):
+        summary = compute.get_zone_health_summary()
+        assert summary["global_quota_cooldown_until"] is None
+        provision_error_scope._record_global_quota_exhaustion(_GLOBAL_QUOTA_ERR)
+        summary = compute.get_zone_health_summary()
+        assert summary["global_quota_cooldown_until"] is not None
+
+
+class TestRegionQuotaBackoff:
+    """Region-level backoff for regional quota exhaustion — blocks only that
+    region's zones, marks no individual zone."""
+
+    def test_record_blocks_only_that_region(self, clean_zone_health):
+        provision_error_scope._record_region_quota_exhaustion("us-central1", _REGIONAL_QUOTA_ERR)
+        now = datetime.now(timezone.utc)
+        assert compute._zone_blocked_until("us-central1-f", now) is not None
+        assert compute._zone_blocked_until("us-central1-a", now) is not None
+        assert compute._zone_blocked_until("us-east4-b", now) is None
+        assert compute._zone_blocked_until("us-west1-a", now) is None
+        # Other regions keep the fleet available.
+        assert compute.any_zone_available() is True
+        # And no zone was charged.
+        assert compute._zone_health == {}
+
+    def test_all_regions_blocked_means_nothing_available(self, clean_zone_health):
+        regions = {provision_error_scope._zone_region(z) for z, _ in compute.FALLBACK_ZONES}
+        for region in regions:
+            provision_error_scope._record_region_quota_exhaustion(region, _REGIONAL_QUOTA_ERR)
+        assert compute.any_zone_available() is False
+
+    def test_success_in_region_clears_its_cooldown_only(self, clean_zone_health):
+        provision_error_scope._record_region_quota_exhaustion("us-central1", _REGIONAL_QUOTA_ERR)
+        provision_error_scope._record_region_quota_exhaustion("us-east4", _REGIONAL_QUOTA_ERR)
+        provision_error_scope._clear_quota_cooldowns_after_success("us-central1-f")
+        assert "us-central1" not in provision_error_scope._region_quota_state
+        assert "us-east4" in provision_error_scope._region_quota_state
+
+    def test_summary_surfaces_region_cooldowns(self, clean_zone_health):
+        provision_error_scope._record_region_quota_exhaustion("us-central1", _REGIONAL_QUOTA_ERR)
+        summary = compute.get_zone_health_summary()
+        assert "us-central1" in summary["region_quota_cooldowns"]
+
+    def test_region_debounce_and_escalation(self, clean_zone_health):
+        provision_error_scope._record_region_quota_exhaustion("us-central1", _REGIONAL_QUOTA_ERR)
+        provision_error_scope._record_region_quota_exhaustion("us-central1", _REGIONAL_QUOTA_ERR)
+        assert provision_error_scope._region_quota_state["us-central1"]["consecutive"] == 1
+        provision_error_scope._region_quota_state["us-central1"]["last_event"] = datetime.now(
+            timezone.utc
+        ) - timedelta(seconds=provision_error_scope.REGION_QUOTA_COOLDOWN_SECONDS + 1)
+        provision_error_scope._record_region_quota_exhaustion("us-central1", _REGIONAL_QUOTA_ERR)
+        assert provision_error_scope._region_quota_state["us-central1"]["consecutive"] == 2
+
+
+class TestZoneSuspectCorroboration:
+    """record_zone_failure() must not charge a zone for a single silent VM
+    death (HEARTBEAT_STARVATION / AGENT_STARTUP_FAILURE / …) — those are
+    usually VM/image/startup-script failures, not zone health. Charging
+    requires corroboration: N reports in the same zone within the window."""
+
+    def test_single_vm_death_does_not_charge_zone(self, clean_zone_health):
+        zone = "us-central1-f"
+        compute.record_zone_failure(zone, reason="HEARTBEAT_STARVATION")
+        assert zone not in compute._zone_health
+        assert zone not in compute._zone_failures
+        assert len(compute._zone_suspect_events[zone]) == 1
+        assert compute.any_zone_available() is True
+
+    def test_below_threshold_reports_do_not_charge(self, clean_zone_health):
+        zone = "us-central1-f"
+        for _ in range(compute.ZONE_SUSPECT_CORROBORATION_THRESHOLD - 1):
+            compute.record_zone_failure(zone, reason="AGENT_STARTUP_FAILURE")
+        assert zone not in compute._zone_health
+
+    def test_corroborated_reports_charge_zone_once(self, clean_zone_health):
+        zone = "us-central1-f"
+        for _ in range(compute.ZONE_SUSPECT_CORROBORATION_THRESHOLD):
+            compute.record_zone_failure(zone, reason="HEARTBEAT_STARVATION")
+        health = compute._zone_health[zone]
+        assert health["consecutive_failures"] == 1
+        assert health["cooldown_expires_at"] > datetime.now(timezone.utc)
+        assert (
+            health["last_failure_reason"] == "HEARTBEAT_STARVATION_CORROBORATED"
+        )
+        # Exactly one success-rate hit for the whole corroborated event.
+        assert list(health["recent_outcomes"]) == [False]
+        # Evidence consumed: the next charge needs fresh corroboration.
+        assert len(compute._zone_suspect_events[zone]) == 0
+
+    def test_reports_outside_window_expire(self, clean_zone_health):
+        zone = "us-central1-f"
+        stale = datetime.now(timezone.utc) - timedelta(
+            seconds=compute.ZONE_SUSPECT_WINDOW_SECONDS + 60
+        )
+        events = compute._zone_suspect_events.setdefault(zone, deque(maxlen=64))
+        for _ in range(compute.ZONE_SUSPECT_CORROBORATION_THRESHOLD - 1):
+            events.append(stale)
+        compute.record_zone_failure(zone, reason="HEARTBEAT_STARVATION")
+        # Stale evidence was pruned, so this is report 1/N — no charge.
+        assert zone not in compute._zone_health
+        assert len(compute._zone_suspect_events[zone]) == 1
+
+    def test_reports_isolated_per_zone(self, clean_zone_health):
+        """Deaths spread across different zones must not corroborate each other."""
+        for zone in ("us-central1-f", "us-central1-c", "us-east4-b"):
+            compute.record_zone_failure(zone, reason="HEARTBEAT_STARVATION")
+        assert compute._zone_health == {}
+
+    def test_authoritative_reason_charges_immediately(self, clean_zone_health):
+        zone = "us-central1-f"
+        compute.record_zone_failure(zone, reason="RESOURCE_POOL_EXHAUSTED")
+        health = compute._zone_health[zone]
+        assert health["consecutive_failures"] == 1
+        assert health["cooldown_expires_at"] > datetime.now(timezone.utc)
+        assert health["last_failure_reason"] == "RESOURCE_POOL_EXHAUSTED"
+
+
+class TestProvisionQuotaScope:
+    """Integration: the _provision_gcp zone loop must not paint zones on
+    global/regional quota errors."""
+
+    @pytest.fixture()
+    def _provision_env(self, monkeypatch):
+        async def _ok(*args, **kwargs):
+            return True
+
+        async def _noop(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(compute, "_acquire_provision_slot", _ok)
+        monkeypatch.setattr(compute, "_release_provision_slot", _noop)
+        monkeypatch.setattr(compute, "_delete_agent_secret", lambda vm_id: None)
+
+    async def test_global_quota_error_marks_no_zone_and_stops_cycling(
+        self, clean_zone_health, _provision_env
+    ):
+        with patch("google.cloud.compute_v1.InstancesClient") as mock_client:
+            mock_client.return_value.get.side_effect = Exception("404 was not found")
+            mock_client.return_value.insert.side_effect = Exception(_GLOBAL_QUOTA_ERR)
+
+            result = await compute._provision_gcp(
+                "vm-global-quota-test",
+                uuid.uuid4(),
+                secret_version_name="projects/p/secrets/s/versions/1",
+            )
+
+        assert result is False
+        # One insert only — cycling to the next zone would re-trip the same
+        # project-global quota in every remaining zone.
+        assert mock_client.return_value.insert.call_count == 1
+        # NO zone marks: the old behavior painted every enabled zone failed.
+        assert compute._zone_health == {}
+        assert compute._zone_failures == {}
+        # Project-level backoff armed instead.
+        assert "cooldown_expires_at" in provision_error_scope._global_quota_state
+        assert compute.any_zone_available() is False
+        # Error surfaced for the reaper's INFRA_PROVISION_PATTERNS classifier.
+        err = compute.get_provision_error("vm-global-quota-test")
+        assert "quota" in err.lower()
+
+    async def test_provision_fails_fast_while_global_cooldown_active(
+        self, clean_zone_health, _provision_env
+    ):
+        provision_error_scope._record_global_quota_exhaustion(_GLOBAL_QUOTA_ERR)
+        with patch("google.cloud.compute_v1.InstancesClient") as mock_client:
+            result = await compute._provision_gcp(
+                "vm-cooldown-test",
+                uuid.uuid4(),
+                secret_version_name="projects/p/secrets/s/versions/1",
+            )
+        assert result is False
+        mock_client.return_value.insert.assert_not_called()
+        err = compute.get_provision_error("vm-cooldown-test")
+        assert "quota" in err.lower()
+
+    async def test_regional_quota_skips_region_and_succeeds_elsewhere(
+        self, clean_zone_health, _provision_env
+    ):
+        # Make us-central1-f sort first (perfect success history).
+        compute._zone_health["us-central1-f"] = {
+            "recent_outcomes": deque([True] * 10, maxlen=compute.ZONE_HISTORY_WINDOW),
+        }
+        attempted = []
+
+        def _insert(*args, **kwargs):
+            zone = kwargs["zone"]
+            attempted.append(zone)
+            if zone.startswith("us-central1"):
+                raise Exception(_REGIONAL_QUOTA_ERR)
+            op = MagicMock()
+            op.name = "op-regional-test"
+            return op
+
+        with patch("google.cloud.compute_v1.InstancesClient") as mock_client:
+            mock_client.return_value.get.side_effect = Exception("404 was not found")
+            mock_client.return_value.insert.side_effect = _insert
+
+            result = await compute._provision_gcp(
+                "vm-regional-quota-test",
+                uuid.uuid4(),
+                secret_version_name="projects/p/secrets/s/versions/1",
+            )
+
+        assert result is True
+        # First attempt hit the regional quota; the OTHER us-central1 zones
+        # were skipped (region cooldown), and the very next attempt was in a
+        # different region.
+        assert attempted[0] == "us-central1-f"
+        assert len(attempted) == 2
+        assert not attempted[1].startswith("us-central1")
+        # The exhausted region is in cooldown; the failing zone was NOT charged.
+        assert "us-central1" in provision_error_scope._region_quota_state
+        f_health = compute._zone_health.get("us-central1-f", {})
+        assert f_health.get("cooldown_expires_at") is None
+        assert f_health.get("consecutive_failures", 0) == 0
+        assert list(f_health.get("recent_outcomes", [])) == [True] * 10
 
 
 class TestZoneInDisabledRegion:
