@@ -20,6 +20,12 @@ import {
   formatProvenanceWarnings,
 } from '../prompt.js';
 import { writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS } from './strategic-helpers.js';
+import {
+  fetchKnowledgeDocumentById,
+  buildPrerequisiteKnowledgeSection,
+  type PrerequisiteKnowledgePointer,
+  type PrereqKnowledgeDoc,
+} from './prior-knowledge.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { SCOPE_OVERFLOW_THRESHOLDS, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT, DEFAULT_CLONE_DEPTH } from '../constants.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
@@ -507,7 +513,38 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     analysisContext = `## Pre-Implementation Analysis\n\nBefore writing code: read the files relevant to this task, confirm the scope stays under ~50 lines across 1–3 files, and check for callers that import from files you will modify.${callerSection}\n\n`;
   }
 
-  const finalPromptWithTree = fileTree + analysisContext + finalPrompt;
+  // ── Commissioned prerequisite knowledge ──────────────────────────────────
+  // When a plan made this implementation task depend on a web_research/design
+  // prerequisite, the backend stamps a durable pointer onto
+  // ctx.knowledge_prerequisites when that prerequisite completes. Resolve each
+  // pointer to its full document body at launch (fail-soft) and frame it as
+  // commissioned input so the agent builds ON it. Empty string when none, so the
+  // prompt is byte-unchanged for tasks with no prerequisites.
+  let prerequisiteKnowledgeSection = '';
+  const rawPrereqs = ctx.knowledge_prerequisites;
+  const prereqPointers: PrerequisiteKnowledgePointer[] = Array.isArray(rawPrereqs)
+    ? (rawPrereqs as unknown[])
+        .filter((p): p is Record<string, unknown> => !!p && typeof p === 'object')
+        .map((p) => ({
+          doc_id: strVal(p.doc_id),
+          source_task_id: strVal(p.source_task_id),
+          source_kind: strVal(p.source_kind),
+          title: strVal(p.title),
+          summary: strVal(p.summary),
+        }))
+        .filter((p) => p.doc_id)
+    : [];
+  if (prereqPointers.length > 0) {
+    const resolved = new Map<string, PrereqKnowledgeDoc>();
+    for (const p of prereqPointers) {
+      const doc = await fetchKnowledgeDocumentById(p.doc_id);
+      if (doc) resolved.set(p.doc_id, doc);
+    }
+    prerequisiteKnowledgeSection = buildPrerequisiteKnowledgeSection(prereqPointers, resolved);
+    sendLog(ws, `[PrereqKnowledge] Injected ${resolved.size}/${prereqPointers.length} commissioned knowledge document(s).\n`);
+  }
+
+  const finalPromptWithTree = fileTree + analysisContext + prerequisiteKnowledgeSection + finalPrompt;
   const promptFingerprint = computePromptFingerprint(taskTypeKey, buildConfig, {
     codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig, owner, repo }),
   });

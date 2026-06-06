@@ -20,6 +20,10 @@ from sqlmodel import select
 from app import strategic_cycle
 from app.direction_metrics import _compute_direction_quality_score
 from app.direction_outcomes import verified_merged_count
+# Stopword set reused so the spawn-title redundancy check matches the project's
+# established word-overlap semantics (same tokens ignored: articles,
+# conjunctions, and verb prefixes like "feat"/"fix").
+from app.finding_deduplication import _STOPWORDS as _SPAWN_STOPWORDS
 from app.models import (
     MessageType,
     Project,
@@ -34,6 +38,74 @@ from app.task_capabilities import strategic_phase_for
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
+
+
+def spawn_budget_status(
+    per_review_count: int,
+    window_count: int,
+    *,
+    per_review_cap: int,
+    window_cap: int,
+) -> tuple[bool, str | None, str | None]:
+    """Decide whether one more strategist spawn fits within budget.
+
+    Pure policy helper (no DB) so the bound is independently unit-testable. The
+    handler counts prior spawns and passes them in; this returns whether the
+    next spawn is allowed.
+
+    ``per_review_count`` — strategic_direct spawns already created by THIS review.
+    ``window_count`` — project-wide strategic_direct spawns in the rolling window.
+
+    Returns ``(ok, scope, reason)``:
+      * ``ok`` is False when either count has reached (>=) its cap.
+      * ``scope`` is ``"per_review"`` or ``"window"`` identifying which cap was
+        hit (the per-review cap takes precedence when both are exhausted), else
+        ``None``.
+      * ``reason`` is a short human-readable explanation, or ``None`` when ok.
+
+    A non-positive cap disables that dimension (never blocks).
+    """
+    if per_review_cap > 0 and per_review_count >= per_review_cap:
+        return (
+            False,
+            "per_review",
+            f"Per-review spawn cap reached: {per_review_count}/{per_review_cap}",
+        )
+    if window_cap > 0 and window_count >= window_cap:
+        return (
+            False,
+            "window",
+            f"Rolling-window spawn cap reached: {window_count}/{window_cap}",
+        )
+    return True, None, None
+
+
+def spawn_title_is_redundant(
+    title: str,
+    existing_titles,
+    *,
+    threshold: int,
+) -> str | None:
+    """Return the first existing title that semantically duplicates ``title``.
+
+    Broadens the exact-title idempotency guard to collapse near-duplicate
+    investigations that differ only in wording. Uses the same word-overlap /
+    stopword semantics as ``finding_deduplication.is_duplicate`` (overlap of
+    non-stopword tokens at or above ``threshold`` is a match). Returns the
+    matched existing title, or ``None`` when nothing overlaps enough.
+
+    ``threshold`` must stay >=4 so genuinely distinct single-word-differing
+    titles (e.g. "Investigate A" vs "Investigate B", overlap 1) are not
+    collapsed.
+    """
+    words = set(title.lower().split()) - _SPAWN_STOPWORDS
+    if not words:
+        return None
+    for existing in existing_titles:
+        overlap = words & (set(existing.lower().split()) - _SPAWN_STOPWORDS)
+        if len(overlap) >= threshold:
+            return existing
+    return None
 
 
 async def _record_strategic_task_failure(

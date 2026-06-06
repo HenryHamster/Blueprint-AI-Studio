@@ -621,6 +621,138 @@ async def test_design_completion_sets_source_kind(db_session, _quiet_broadcast):
     assert task.status == TaskStatus.COMPLETED
 
 
+# ── knowledge-prerequisite delivery to dependents ───────────────────────────
+#
+# When a plan commissions a web_research/design prerequisite and makes an
+# implementation task depend on it, the produced document must be delivered to
+# the dependent's launch context. Linkage is established at prerequisite
+# completion (so it survives the dependent dispatching later): a compact pointer
+# is stamped onto each QUEUED dependent's context["knowledge_prerequisites"].
+
+
+async def _make_queued_dependent(db_session, *, project_id, depends_on):
+    """Create a QUEUED implementation task that depends on a prerequisite task."""
+    dep = make_task(
+        project_id=project_id,
+        title="feat: implement X (depends on prereq)",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "implement X", "base_branch": "main"}],
+        depends_on=depends_on,
+    )
+    db_session.add(dep)
+    await db_session.commit()
+    await db_session.refresh(dep)
+    return dep
+
+
+@pytest.mark.asyncio
+async def test_completion_delivers_pointer_to_queued_dependent(
+    db_session, _quiet_broadcast
+):
+    """A web_research prerequisite's completion stamps its document pointer onto a
+    QUEUED dependent that declared it in depends_on."""
+    project, task = await _make_web_research_task(db_session, project_name="WRdeliver")
+    dependent = await _make_queued_dependent(
+        db_session, project_id=project.id, depends_on=[str(task.id)]
+    )
+
+    document = {
+        "title": "State of X on the web",
+        "summary": "A concise survey of X with citations.",
+        "body": "# X\n\nDetailed markdown body explaining X in depth.",
+        "citations": ["https://example.com/x"],
+        "tags": ["survey"],
+        "topic": "X",
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    doc = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+
+    await db_session.refresh(dependent)
+    prereqs = (dependent.context or {}).get("knowledge_prerequisites")
+    assert isinstance(prereqs, list) and len(prereqs) == 1
+    pointer = prereqs[0]
+    assert pointer["doc_id"] == str(doc.id)
+    assert pointer["source_task_id"] == str(task.id)
+    assert pointer["source_kind"] == "web_research"
+    assert pointer["title"] == document["title"]
+    assert pointer["summary"] == document["summary"]
+    # The dependent stays QUEUED — delivery never advances its lifecycle.
+    assert dependent.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_completion_no_dependents_is_noop(db_session, _quiet_broadcast):
+    """A prerequisite with no declared dependents completes normally and stamps
+    nothing — and an unrelated QUEUED task is untouched."""
+    project, task = await _make_web_research_task(db_session, project_name="WRnodep")
+    unrelated = await _make_queued_dependent(
+        db_session, project_id=project.id, depends_on=[str(uuid.uuid4())]
+    )
+
+    document = {
+        "title": "State of X on the web",
+        "summary": "A concise survey of X with citations.",
+        "body": "# X\n\nDetailed markdown body explaining X in depth.",
+        "citations": ["https://example.com/x"],
+        "tags": ["survey"],
+        "topic": "X",
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    await db_session.refresh(unrelated)
+    assert "knowledge_prerequisites" not in (unrelated.context or {})
+
+
+@pytest.mark.asyncio
+async def test_design_completion_also_delivers(db_session, _quiet_broadcast):
+    """The delivery seam is shared: a design prerequisite delivers its pointer to a
+    QUEUED dependent exactly as web_research does."""
+    project, task = await _make_design_task(db_session, project_name="DSGNdeliver")
+    dependent = await _make_queued_dependent(
+        db_session, project_id=project.id, depends_on=[str(task.id)]
+    )
+
+    document = {
+        "title": "Design for X subsystem",
+        "summary": "A codebase-internal design grounded in file references.",
+        "body": "# X\n\nDetailed design rationale referencing the code.",
+        "citations": ["backend/app/models.py", "docs/design/x.md"],
+        "tags": ["design"],
+        "topic": "X",
+    }
+    await _handle_design_completion(task, json.dumps(document), db_session)
+
+    doc = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    await db_session.refresh(dependent)
+    prereqs = (dependent.context or {}).get("knowledge_prerequisites")
+    assert isinstance(prereqs, list) and len(prereqs) == 1
+    assert prereqs[0]["doc_id"] == str(doc.id)
+    assert prereqs[0]["source_kind"] == "design"
+
+
 # ── design codebase-grounding probe (file citations resolve to real paths) ──
 #
 # A design document's value is that it is grounded in the ACTUAL code. The

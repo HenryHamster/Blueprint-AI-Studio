@@ -331,6 +331,20 @@ runtime_config: Dict = {
     # decision cadence. 0 disables the fallback. Cooldown still gates duplicates.
     "strategic_max_interval_minutes": 180,
     "architecture_review_frequency": 3,  # Every Nth strategic cycle includes architecture (design doc) review
+    # Budget on the strategist's autonomous spawn_task path (research / plan /
+    # web_research / design tasks created directly from a strategic review). Each
+    # such task jumps the queue at elevated priority and can carry real per-job
+    # cost, so an unbounded review could flood the pipeline. These caps are sized
+    # generously so normal steering never trips them — they exist solely to
+    # contain runaway spawning. per_review caps one strategic review; window caps
+    # the rolling time window across consecutive reviews; dedup_overlap_threshold
+    # is the word-overlap count above which a new spawn title is treated as a
+    # semantic duplicate of a recent same-type spawn (must stay >=4 so distinct
+    # investigations like "Investigate A"/"Investigate B" are not collapsed).
+    "strategist_spawn_per_review_cap": 12,
+    "strategist_spawn_window_minutes": 60,
+    "strategist_spawn_window_cap": 20,
+    "strategist_spawn_dedup_overlap_threshold": 4,
     "max_active_directions": 10,
     # Staleness threshold (days) for staged directions whose target version has
     # NOT yet promoted. A staged direction is inert work that only begins when

@@ -47,6 +47,8 @@ from app.strategic_completion import (
     EVIDENCE_PROGRESS_CONTEXT_KEY,
     _CREATED_NOTE_PREFIX,
     _RETIRED_NOTE_PREFIX,
+    spawn_budget_status,
+    spawn_title_is_redundant,
 )
 from app.strategic_spawning import (
     _build_previous_decision_outcomes,
@@ -9993,3 +9995,85 @@ async def test_strategic_completion_note_message_not_grounded(db_session, mocker
     ).scalar_one()
     assert "_provenance_warnings" not in (msg.context or {})
     spy.assert_not_called()
+
+
+# ── Strategist autonomous spawn-path budget helpers ──────────────────────────
+
+
+def test_spawn_budget_status_under_both_caps_is_ok():
+    ok, scope, reason = spawn_budget_status(
+        3, 5, per_review_cap=12, window_cap=20
+    )
+    assert ok is True
+    assert scope is None
+    assert reason is None
+
+
+def test_spawn_budget_status_per_review_cap_exhausted():
+    ok, scope, reason = spawn_budget_status(
+        12, 5, per_review_cap=12, window_cap=20
+    )
+    assert ok is False
+    assert scope == "per_review"
+    assert "12/12" in reason
+
+
+def test_spawn_budget_status_window_cap_exhausted():
+    ok, scope, reason = spawn_budget_status(
+        2, 20, per_review_cap=12, window_cap=20
+    )
+    assert ok is False
+    assert scope == "window"
+    assert "20/20" in reason
+
+
+def test_spawn_budget_status_per_review_takes_precedence():
+    # Both exhausted — per_review reported first.
+    ok, scope, _ = spawn_budget_status(
+        12, 20, per_review_cap=12, window_cap=20
+    )
+    assert ok is False
+    assert scope == "per_review"
+
+
+def test_spawn_budget_status_nonpositive_cap_disables_dimension():
+    # Per-review disabled (cap<=0) but window still enforced.
+    ok, scope, _ = spawn_budget_status(99, 20, per_review_cap=0, window_cap=20)
+    assert ok is False
+    assert scope == "window"
+    # Both disabled — always ok.
+    ok2, scope2, _ = spawn_budget_status(99, 99, per_review_cap=0, window_cap=0)
+    assert ok2 is True
+    assert scope2 is None
+
+
+def test_spawn_title_is_redundant_overlapping_topic_matches():
+    match = spawn_title_is_redundant(
+        "Investigate the warm pool provisioning ready signal latency",
+        ["Research warm pool provisioning ready signal timing"],
+        threshold=4,
+    )
+    assert match == "Research warm pool provisioning ready signal timing"
+
+
+def test_spawn_title_is_redundant_distinct_topics_not_matched():
+    match = spawn_title_is_redundant(
+        "Investigate A",
+        ["Investigate B"],
+        threshold=4,
+    )
+    assert match is None
+
+
+def test_spawn_title_is_redundant_below_threshold_not_matched():
+    # Only "warm" + "pool" overlap (2 non-stopword words) < threshold 4.
+    match = spawn_title_is_redundant(
+        "warm pool latency under load spikes",
+        ["warm pool image bake duration regression"],
+        threshold=4,
+    )
+    assert match is None
+
+
+def test_spawn_title_is_redundant_empty_title_returns_none():
+    assert spawn_title_is_redundant("", ["anything here at all"], threshold=4) is None

@@ -41,6 +41,7 @@ import logging
 import re
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -469,6 +470,107 @@ async def _fail_gate(
     )
 
 
+# Context key under which a knowledge prerequisite's durable pointer is stamped
+# onto each dependent task that declared the producing task in its ``depends_on``.
+# The implementation handler reads this at launch and resolves each pointer to
+# full content via the agent by-id endpoint (fail-soft). Shared contract name with
+# the agent runtime (``agent/src/handlers/prior-knowledge.ts``).
+KNOWLEDGE_PREREQUISITES_KEY = "knowledge_prerequisites"
+
+# Bound the dependent scan exactly as the orchestrator's _mark_unblocked_dependents
+# does: ``depends_on`` is a JSON column filtered in Python, so the cap is on the raw
+# QUEUED-dependent pool, ordered deterministically (oldest first).
+_DEPENDENT_SCAN_CAP = 100
+
+
+async def _deliver_knowledge_to_dependents(
+    task: Task,
+    doc: KnowledgeDocument,
+    normalized: dict[str, Any],
+    session: AsyncSession,
+) -> None:
+    """Stamp a durable knowledge pointer onto every QUEUED dependent that declared
+    this producing task as a prerequisite.
+
+    When a plan commissions a ``web_research`` / ``design`` prerequisite and makes
+    an implementation task depend on it, the implementation task must receive the
+    produced knowledge when it later launches. We establish that linkage HERE — at
+    prerequisite completion — so it SURVIVES the dependent being released later: a
+    compact pointer (``doc_id`` / ``source_task_id`` / ``source_kind`` / ``title`` /
+    ``summary``) is appended to each dependent's
+    ``context["knowledge_prerequisites"]`` (deduped by ``doc_id``). The
+    implementation handler resolves the pointer to full content at launch via the
+    agent by-id endpoint, fail-soft.
+
+    Mirrors the orchestrator's ``_mark_unblocked_dependents`` Python-filter over the
+    ``depends_on`` JSON column. Purely additive: it never changes whether/how the
+    document is persisted, a project with no dependents is a no-op, and any error
+    is swallowed so delivery can never break the producing task's completion.
+    """
+    task_id_str = str(task.id)
+    try:
+        dependents = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(
+                        Task.status == TaskStatus.QUEUED,
+                        Task.project_id == task.project_id,
+                        Task.depends_on.isnot(None),
+                    )
+                    .order_by(Task.created_at)
+                    .limit(_DEPENDENT_SCAN_CAP)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    except Exception:  # noqa: BLE001 — best-effort; delivery must never break completion
+        logger.warning(
+            "[%s] dependent scan failed for task %s; knowledge not delivered",
+            _kind_tag(doc.source_kind),
+            task.id,
+            exc_info=True,
+        )
+        return
+
+    pointer = {
+        "doc_id": str(doc.id),
+        "source_task_id": task_id_str,
+        "source_kind": doc.source_kind,
+        "title": normalized["title"],
+        "summary": normalized["summary"],
+    }
+    touched = 0
+    for dep in dependents:
+        if task_id_str not in (dep.depends_on or []):
+            continue
+        ctx = dict(dep.context or {})
+        existing = ctx.get(KNOWLEDGE_PREREQUISITES_KEY)
+        prereqs = list(existing) if isinstance(existing, list) else []
+        # Dedupe by doc id so a re-entrant completion never stamps twice.
+        if any(
+            isinstance(p, dict) and p.get("doc_id") == pointer["doc_id"]
+            for p in prereqs
+        ):
+            continue
+        prereqs.append(pointer)
+        ctx[KNOWLEDGE_PREREQUISITES_KEY] = prereqs
+        dep.context = ctx
+        flag_modified(dep, "context")
+        session.add(dep)
+        touched += 1
+
+    if touched:
+        await session.commit()
+        logger.info(
+            "[%s] Delivered knowledge document %s to %d dependent task(s)",
+            _kind_tag(doc.source_kind),
+            doc.id,
+            touched,
+        )
+
+
 async def _persist_document(
     task: Task,
     document: dict[str, Any],
@@ -537,6 +639,12 @@ async def _persist_document(
     session.add(task)
     await session.commit()
     await session.refresh(doc)
+
+    # Close the knowledge-prerequisite loop: link this freshly-persisted document
+    # to any QUEUED dependent that commissioned it, so the dependent launches with
+    # the produced knowledge. Established at completion so it survives the dependent
+    # dispatching later. Best-effort — never blocks the producing task's completion.
+    await _deliver_knowledge_to_dependents(task, doc, normalized, session)
 
     await broadcast_to_project(
         str(task.project_id),

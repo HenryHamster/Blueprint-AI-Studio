@@ -7,7 +7,14 @@ vi.mock('../index.js', () => ({
 }));
 
 // ── Imports under test ────────────────────────────────────────────────────────
-import { fetchPriorKnowledge, buildPriorKnowledgeSection, PRIOR_KNOWLEDGE_LIMIT } from './prior-knowledge.js';
+import {
+  fetchPriorKnowledge,
+  buildPriorKnowledgeSection,
+  PRIOR_KNOWLEDGE_LIMIT,
+  fetchKnowledgeDocumentById,
+  buildPrerequisiteKnowledgeSection,
+  type PrereqKnowledgeDoc,
+} from './prior-knowledge.js';
 import { apiGet } from '../index.js';
 
 describe('fetchPriorKnowledge', () => {
@@ -98,5 +105,86 @@ describe('buildPriorKnowledgeSection', () => {
     // Build-on / supersede / cite instruction.
     expect(section).toContain('supersede');
     expect(section).toContain('cite');
+  });
+});
+
+describe('fetchKnowledgeDocumentById', () => {
+  beforeEach(() => {
+    vi.mocked(apiGet).mockReset();
+  });
+
+  it('resolves a document (with body) by id and hits the by-id endpoint', async () => {
+    vi.mocked(apiGet).mockResolvedValue({
+      id: 'doc-1',
+      title: 'Commissioned design',
+      summary: 'A grounded design.',
+      body: '# Design\n\nFull body here.',
+    });
+
+    const doc = await fetchKnowledgeDocumentById('doc-1');
+
+    expect(doc).toEqual({
+      id: 'doc-1',
+      title: 'Commissioned design',
+      summary: 'A grounded design.',
+      body: '# Design\n\nFull body here.',
+    });
+    const calledPath = vi.mocked(apiGet).mock.calls[0][0];
+    expect(calledPath).toBe('/api/agent/knowledge-documents/doc-1');
+  });
+
+  it('returns null for an empty/whitespace id without calling apiGet', async () => {
+    expect(await fetchKnowledgeDocumentById('   ')).toBeNull();
+    expect(apiGet).not.toHaveBeenCalled();
+  });
+
+  it('returns null when apiGet rejects (fail-soft)', async () => {
+    vi.mocked(apiGet).mockRejectedValue(new Error('404 not found'));
+    expect(await fetchKnowledgeDocumentById('doc-1')).toBeNull();
+  });
+
+  it('returns null when the response has no usable id', async () => {
+    vi.mocked(apiGet).mockResolvedValue({ title: 'no id' });
+    expect(await fetchKnowledgeDocumentById('doc-1')).toBeNull();
+  });
+});
+
+describe('buildPrerequisiteKnowledgeSection', () => {
+  it('returns "" when there are no pointers', () => {
+    expect(buildPrerequisiteKnowledgeSection([], new Map())).toBe('');
+  });
+
+  it('renders the resolved body and the commissioned framing', () => {
+    const resolved = new Map<string, PrereqKnowledgeDoc>([
+      ['doc-1', { id: 'doc-1', title: 'Commissioned design', summary: 's', body: 'FULL BODY CONTENT' }],
+    ]);
+    const section = buildPrerequisiteKnowledgeSection(
+      [{ doc_id: 'doc-1', title: 'stamped title', summary: 'stamped summary' }],
+      resolved,
+    );
+    expect(section).toContain('## Commissioned Prerequisite Knowledge');
+    expect(section).toContain('produced SPECIFICALLY to inform this task');
+    expect(section).toContain('doc-1');
+    expect(section).toContain('Commissioned design');
+    expect(section).toContain('FULL BODY CONTENT');
+  });
+
+  it('falls back to the stamped summary when the body cannot be resolved', () => {
+    const section = buildPrerequisiteKnowledgeSection(
+      [{ doc_id: 'doc-1', title: 'stamped title', summary: 'stamped summary' }],
+      new Map(),
+    );
+    expect(section).toContain('## Commissioned Prerequisite Knowledge');
+    expect(section).toContain('stamped title');
+    expect(section).toContain('stamped summary');
+    expect(section).toContain('could not be resolved');
+  });
+
+  it('skips pointers with an empty doc_id', () => {
+    const section = buildPrerequisiteKnowledgeSection(
+      [{ doc_id: '', title: 'ignored', summary: 'ignored' }],
+      new Map(),
+    );
+    expect(section).toBe('');
   });
 });

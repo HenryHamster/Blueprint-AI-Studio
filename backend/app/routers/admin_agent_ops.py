@@ -55,6 +55,8 @@ from app.strategic_completion import (
     _find_matching_direction,
     _normalize_recommended_mode,
     _reset_scaffolding_state_on_outcome_change,
+    spawn_budget_status,
+    spawn_title_is_redundant,
 )
 from app.strategic_constants import (
     MIN_HEALTHY_ACTIVE_DIRECTIONS,
@@ -1593,17 +1595,24 @@ async def strategic_operation(
         # single review run never legitimately re-spawns the identical task),
         # so this only collapses accidental retries — it does not constrain the
         # strategic agent's judgement across distinct reviews.
+        #
+        # The broadened guard also collapses semantically-redundant spawns: a
+        # near-duplicate knowledge request for the SAME review and type that
+        # differs only in wording (word overlap >= threshold) is treated as the
+        # same logical investigation, so a single review cannot spend its budget
+        # on rewordings of one question. Exact-title matches keep the original
+        # idempotency semantics; the title-similarity check is additive.
         dedup_since = _utcnow() - timedelta(minutes=30)
         dupe_stmt = (
             select(Task)
             .where(
                 Task.project_id == project.id,
                 Task.created_by == "STRATEGIC_AGENT",
-                Task.title == title,
                 Task.created_at >= dedup_since,
             )
             .order_by(Task.created_at.asc())
         )
+        same_scope_candidates: list[Task] = []
         for candidate in (await session.execute(dupe_stmt)).scalars().all():
             cctx = candidate.context or {}
             if (
@@ -1611,14 +1620,33 @@ async def strategic_operation(
                 and cctx.get("parent_strategic_task_id") == str(task.id)
                 and (candidate.first_payload or {}).get("type") == spawn_type
             ):
+                same_scope_candidates.append(candidate)
+
+        dedup_overlap_threshold = _runtime_config.get(
+            "strategist_spawn_dedup_overlap_threshold", 4
+        )
+        for candidate in same_scope_candidates:
+            exact = candidate.title == title
+            semantic = (
+                not exact
+                and spawn_title_is_redundant(
+                    title,
+                    [candidate.title or ""],
+                    threshold=dedup_overlap_threshold,
+                )
+                is not None
+            )
+            if exact or semantic:
                 logger.info(
                     "[STRATEGIC API] spawn_task idempotency: returning existing "
-                    "%s for duplicate spawn from strategic review %s "
-                    "(type=%s, title=%r)",
+                    "%s for %s spawn from strategic review %s "
+                    "(type=%s, title=%r, existing=%r)",
                     candidate.id,
+                    "duplicate" if exact else "semantic-duplicate",
                     task.id,
                     spawn_type,
                     title,
+                    candidate.title,
                 )
                 return _resp(
                     {
@@ -1630,6 +1658,84 @@ async def strategic_operation(
                         "deduplicated": True,
                     }
                 )
+
+        # Budget enforcement. The strategist's autonomous spawn path is otherwise
+        # unbounded: one review can queue any number of elevated-priority,
+        # real-cost tasks. Count this review's prior strategic_direct spawns and
+        # the project-wide spawns in the rolling window, then ask the pure policy
+        # helper whether one more fits. When exhausted, stamp an observable flag
+        # on the review, log, and refuse with 429 — never a silent swallow.
+        per_review_cap = _runtime_config.get("strategist_spawn_per_review_cap", 12)
+        window_cap = _runtime_config.get("strategist_spawn_window_cap", 20)
+        window_minutes = _runtime_config.get("strategist_spawn_window_minutes", 60)
+
+        per_review_count = (
+            await session.execute(
+                select(_func.count())
+                .select_from(Task)
+                .where(
+                    Task.project_id == project.id,
+                    Task.created_by == "STRATEGIC_AGENT",
+                    Task.context["spawned_by"].as_string() == "strategic_direct",
+                    Task.context["parent_strategic_task_id"].as_string()
+                    == str(task.id),
+                )
+            )
+        ).scalar() or 0
+        window_since = _utcnow() - timedelta(minutes=window_minutes)
+        window_count = (
+            await session.execute(
+                select(_func.count())
+                .select_from(Task)
+                .where(
+                    Task.project_id == project.id,
+                    Task.created_by == "STRATEGIC_AGENT",
+                    Task.context["spawned_by"].as_string() == "strategic_direct",
+                    Task.created_at >= window_since,
+                )
+            )
+        ).scalar() or 0
+
+        ok, scope, reason = spawn_budget_status(
+            per_review_count,
+            window_count,
+            per_review_cap=per_review_cap,
+            window_cap=window_cap,
+        )
+        if not ok:
+            ctx = task.context or {}
+            task.context = {
+                **ctx,
+                "_strategic_spawn_budget_exhausted": {
+                    "scope": scope,
+                    "reason": reason,
+                    "at": _utcnow().isoformat(),
+                },
+            }
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            logger.warning(
+                "[STRATEGIC API] spawn_task refused for strategic review %s: %s "
+                "(per_review=%s/%s, window=%s/%s)",
+                task.id,
+                reason,
+                per_review_count,
+                per_review_cap,
+                window_count,
+                window_cap,
+            )
+            return JSONResponse(
+                content=_resp(
+                    {
+                        "status": "skipped",
+                        "op": "spawn_task",
+                        "scope": scope,
+                        "reason": reason,
+                    }
+                ),
+                status_code=429,
+            )
 
         new_task_ctx: dict = {
             "spawned_by": "strategic_direct",
