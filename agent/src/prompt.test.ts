@@ -61,6 +61,7 @@ import {
   synthesizeFailureHotspots,
   formatSelfReviewBlindSpots,
   formatProvenanceWarnings,
+  formatInvestigateCitationProvenance,
   formatAcceptanceEvidence,
   formatProjectBlindSpotSummary,
   formatFixIterationHistory,
@@ -3064,6 +3065,90 @@ describe('formatProvenanceWarnings', () => {
     // ungrounded_refs has one stringifiable real ref, so the signal fires for it.
     const result = formatProvenanceWarnings({
       _provenance_warnings: { ungrounded_refs: [123, null, 'real ref'] },
+    });
+    expect(result).toContain('real ref');
+  });
+});
+
+// ── formatInvestigateCitationProvenance ───────────────────────────────────────
+describe('formatInvestigateCitationProvenance', () => {
+  it('returns empty string when context is undefined', () => {
+    expect(formatInvestigateCitationProvenance(undefined)).toBe('');
+  });
+
+  it('returns empty string when _provenance_warnings is absent', () => {
+    expect(formatInvestigateCitationProvenance({ scope: 'medium' })).toBe('');
+  });
+
+  it('returns empty string for a non-dict _provenance_warnings (defensive)', () => {
+    expect(formatInvestigateCitationProvenance({ _provenance_warnings: 'oops' })).toBe('');
+    expect(formatInvestigateCitationProvenance({ _provenance_warnings: ['a'] })).toBe('');
+    expect(formatInvestigateCitationProvenance({ _provenance_warnings: null })).toBe('');
+  });
+
+  it('returns empty string for a non-absent verdict with no stale refs', () => {
+    expect(
+      formatInvestigateCitationProvenance({
+        _provenance_warnings: { citation_state: 'present', broken_refs: [], ungrounded_refs: [] },
+      }),
+    ).toBe('');
+  });
+
+  it('renders the ABSENT discount note and the stale refs', () => {
+    const result = formatInvestigateCitationProvenance({
+      _provenance_warnings: {
+        citation_state: 'absent',
+        broken_refs: ['app/gone.py'],
+        ungrounded_refs: ['app/x.py:vanished'],
+      },
+    });
+    expect(result).toContain('## Citation-provenance notice');
+    expect(result).toContain('ABSENT on the current');
+    expect(result).toContain('discount its actionability');
+    expect(result).toContain('app/gone.py');
+    expect(result).toContain('app/x.py:vanished');
+    // Absent framing must not claim the defect is still actionable.
+    expect(result).not.toContain('NOT presumed resolved');
+  });
+
+  it('renders the ABSENT note even when no specific stale refs are present', () => {
+    const result = formatInvestigateCitationProvenance({
+      _provenance_warnings: { citation_state: 'absent', broken_refs: [], ungrounded_refs: [] },
+    });
+    expect(result).toContain('ABSENT on the current');
+    expect(result).toContain('discount its actionability');
+  });
+
+  it('renders the PARTIAL note for a grounded report with stale refs', () => {
+    const result = formatInvestigateCitationProvenance({
+      _provenance_warnings: {
+        citation_state: 'present',
+        broken_refs: ['app/moved.py'],
+        ungrounded_refs: ['app/y.py:renamed'],
+      },
+    });
+    expect(result).toContain('## Citation-provenance notice');
+    expect(result).toContain('PARTIALLY grounded');
+    expect(result).toContain('NOT presumed resolved');
+    expect(result).toContain('remains actionable');
+    expect(result).toContain('app/moved.py');
+    expect(result).toContain('app/y.py:renamed');
+    // Partial framing must not use the stronger absent discount.
+    expect(result).not.toContain('discount its actionability');
+  });
+
+  it('does not throw on malformed nested fields', () => {
+    expect(() =>
+      formatInvestigateCitationProvenance({
+        _provenance_warnings: {
+          citation_state: 'present',
+          broken_refs: 'notalist',
+          ungrounded_refs: [123, null, 'real ref'],
+        },
+      }),
+    ).not.toThrow();
+    const result = formatInvestigateCitationProvenance({
+      _provenance_warnings: { citation_state: 'present', ungrounded_refs: [123, null, 'real ref'] },
     });
     expect(result).toContain('real ref');
   });

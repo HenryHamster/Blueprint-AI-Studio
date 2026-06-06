@@ -1663,6 +1663,70 @@ export function formatProvenanceWarnings(
   );
 }
 
+/**
+ * Render a citation-provenance note for an INVESTIGATE task spawned from a
+ * bug-report message. The originating message's reproduce-on-HEAD grounding
+ * signal is carried onto the task's `context._provenance_warnings` as
+ * `{citation_state, broken_refs, ungrounded_refs}`. The strategist inbox, the
+ * strategist prompt, and the admin message UI already surface this signal; this
+ * brings the investigating agent to the same standard so it can see exactly
+ * which cited refs did not resolve on HEAD at the decision-critical moment.
+ *
+ * Two framings, by `citation_state`:
+ *  - `absent` (every cited ref gone): a STRONGER discount note — the defect may
+ *    already be fixed/refactored away; verify it still reproduces before
+ *    investing and discount actionability.
+ *  - non-absent with broken/ungrounded refs (partially grounded): a SOFTER note
+ *    — the defect is NOT presumed resolved and remains actionable; verify these
+ *    specific refs during reproduce-first and treat them as stale.
+ *
+ * Returns '' when no signal is present (no `_provenance_warnings`, or a clean
+ * verdict with no stale refs), so the static investigate prompt fingerprint is
+ * unaffected. Reads every field defensively — the dict and its keys are
+ * optional and duck-typed. This is a read-only task (the agent writes a JSON
+ * report, not a diff), so there is no `./done --already-done` off-ramp.
+ */
+export function formatInvestigateCitationProvenance(
+  context: Record<string, unknown> | undefined,
+): string {
+  const warnings = context?._provenance_warnings;
+  if (!warnings || typeof warnings !== 'object' || Array.isArray(warnings)) return '';
+  const w = warnings as Record<string, unknown>;
+
+  const brokenRefs = Array.isArray(w.broken_refs)
+    ? (w.broken_refs as unknown[]).map(r => strVal(r)).filter(Boolean)
+    : [];
+  const ungroundedRefs = Array.isArray(w.ungrounded_refs)
+    ? (w.ungrounded_refs as unknown[]).map(r => strVal(r)).filter(Boolean)
+    : [];
+  const staleRefs = [...brokenRefs, ...ungroundedRefs];
+
+  if (w.citation_state === 'absent') {
+    const refList = staleRefs.length > 0 ? ` (${staleRefs.slice(0, 20).join(', ')})` : '';
+    return (
+      `\n\n## Citation-provenance notice\n` +
+      `The originating bug report cites code that is ABSENT on the current ` +
+      `integration branch${refList}. The defect may already be fixed or ` +
+      `refactored away — verify it still reproduces on HEAD before investing, ` +
+      `and discount its actionability accordingly.\n`
+    );
+  }
+
+  if (staleRefs.length > 0) {
+    const refList = staleRefs.slice(0, 20).join(', ');
+    return (
+      `\n\n## Citation-provenance notice\n` +
+      `The originating bug report is only PARTIALLY grounded on the current ` +
+      `integration branch: some cited references are stale (${refList}). The ` +
+      `defect itself is NOT presumed resolved — it remains actionable. Verify ` +
+      `these specific references during reproduce-first and treat them as ` +
+      `outdated, but do not discount the defect on their account.\n`
+    );
+  }
+
+  return '';
+}
+
 const ACCEPTANCE_TEST_DIR_SEGMENTS = new Set([
   'tests',
   'testing',

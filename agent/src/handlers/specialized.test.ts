@@ -1278,6 +1278,59 @@ describe('specialized handler task-specific content contracts', () => {
       // Don't fabricate fixes when not_a_regression
       expect(p).toContain('do NOT fabricate a fix');
     });
+
+    it('renders the ABSENT discount note + stale refs when citation_state is absent', async () => {
+      const absentTask = {
+        ...BASE_TASK,
+        context: {
+          _provenance_warnings: {
+            citation_state: 'absent',
+            broken_refs: ['backend/app/gone.py'],
+            ungrounded_refs: ['backend/app/x.py:vanished_fn'],
+          },
+        },
+      };
+      await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, absentTask, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+      expect(p).toContain('Citation-provenance notice');
+      expect(p).toContain('ABSENT on the current');
+      expect(p).toContain('discount its actionability');
+      // The specific stale refs reach the agent.
+      expect(p).toContain('backend/app/gone.py');
+      expect(p).toContain('backend/app/x.py:vanished_fn');
+      // The absent note must NOT tell the agent the defect remains actionable.
+      expect(p).not.toContain('NOT presumed resolved');
+    });
+
+    it('renders the PARTIAL note + stale refs when grounded but some refs are broken', async () => {
+      const partialTask = {
+        ...BASE_TASK,
+        context: {
+          _provenance_warnings: {
+            citation_state: 'present',
+            broken_refs: ['backend/app/moved.py'],
+            ungrounded_refs: ['backend/app/y.py:renamed_fn'],
+          },
+        },
+      };
+      await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, partialTask, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+      expect(p).toContain('Citation-provenance notice');
+      expect(p).toContain('PARTIALLY grounded');
+      expect(p).toContain('NOT presumed resolved');
+      expect(p).toContain('remains actionable');
+      // The specific stale refs reach the agent.
+      expect(p).toContain('backend/app/moved.py');
+      expect(p).toContain('backend/app/y.py:renamed_fn');
+      // The partial note must NOT use the stronger absent discount framing.
+      expect(p).not.toContain('discount its actionability');
+    });
+
+    it('omits the provenance notice entirely when no _provenance_warnings on context', async () => {
+      await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+      expect(p).not.toContain('Citation-provenance notice');
+    });
   });
 
   // ── handleSelfAudit contract ────────────────────────────────────────────

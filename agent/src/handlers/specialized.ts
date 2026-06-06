@@ -18,7 +18,7 @@ import {
   getTaskTypeFocusBlock,
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, computePromptFingerprint, type PlaybookEntry,
-  formatAcceptanceEvidence,
+  formatAcceptanceEvidence, formatInvestigateCitationProvenance,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { runCodeChangeTask } from './code-change.js';
@@ -718,12 +718,20 @@ export async function handleInvestigate(
   // the equipping gap vs. the near-twin debug handler, which already includes it.
   const investigateContextPrefix = buildContextPrefix(task);
   const investigateContextSection = investigateContextPrefix ? `${investigateContextPrefix}\n` : '';
+  // Bug-report citation provenance carried on the spawned task's context (e.g.
+  // by admin.py / research_completion when the investigation originates from a
+  // bug-report message). Renders the specific cited refs that did not resolve on
+  // HEAD — framed as a stronger discount note for a fully-absent report and a
+  // softer "verify these refs, defect still actionable" note for a partially
+  // grounded one. Empty string when no signal is present (fingerprint-stable).
+  const investigateCtx = task.context as Record<string, unknown> | undefined;
+  const investigateCitationProvenance = formatInvestigateCitationProvenance(investigateCtx);
 
   const investigatePrompt = `${investigateContextSection}${investigateRetryContext}You are an investigation agent. You have full read access to this repository. Your job is to analyze the issue described below and produce a structured diagnosis report.
 Use the Recent changes section first to correlate the issue with the latest deploy window and recently merged changes.
 
 Issue to investigate:
-${userPrompt}${recentChangesSection}
+${userPrompt}${recentChangesSection}${investigateCitationProvenance}
 
 Instructions:
 1. Read relevant source files to understand the codebase and locate the root cause of the issue.

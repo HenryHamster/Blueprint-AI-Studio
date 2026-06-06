@@ -11942,7 +11942,10 @@ class TestBugReportCitationGate:
         assert warnings is not None
         assert warnings["citation_state"] == "absent"
         assert "backend/app/gone.py" in warnings["broken_refs"]
-        assert "Provenance warning" in task.payloads[0]["prompt"]
+        # The provenance detail is carried on task.context only; the agent renders
+        # it into the prompt at run time (formatInvestigateCitationProvenance in
+        # agent/src/prompt.ts), so the backend no longer mutates the prompt string.
+        assert "Provenance warning" not in task.payloads[0]["prompt"]
         # Cited code absent on HEAD seeds an already_resolved reproduce baseline.
         verdict = (task.context or {}).get("reproduce_verdict")
         assert verdict is not None
@@ -12057,8 +12060,10 @@ class TestBugReportCitationGate:
     ):
         """A partially-grounded bug report (one stale citation among surviving
         ones) is NOT treated as already-resolved: the verdict stays
-        `indeterminate`, but the specific stale reference is still surfaced to the
-        investigating agent as an advisory provenance note."""
+        `indeterminate`, and the specific stale reference is preserved on the
+        task context so the investigating agent can render it into its prompt
+        (formatInvestigateCitationProvenance in agent/src/prompt.ts). The backend
+        no longer bakes a prompt-string note."""
         project = await self._project_with_repo(db_session)
         msg = ProjectMessage(
             project_id=project.id,
@@ -12109,15 +12114,15 @@ class TestBugReportCitationGate:
         assert verdict is not None
         assert verdict["status"] == "indeterminate"
         assert verdict["status"] != "already_resolved"
-        # The stale reference is carried forward and named in the prompt note,
-        # without claiming the whole bug is gone.
+        # The stale reference is carried forward on the task context (broken_refs)
+        # so the agent can name it in its prompt, without claiming the whole bug
+        # is gone. The backend no longer mutates the prompt string itself.
         warnings = (task.context or {}).get("_provenance_warnings")
         assert warnings is not None
         assert warnings["citation_state"] == "present"
         assert "backend/app/gone.py" in warnings["broken_refs"]
         prompt = task.payloads[0]["prompt"]
-        assert "Provenance note" in prompt
-        assert "backend/app/gone.py" in prompt
+        assert "Provenance note" not in prompt
         assert "Provenance warning" not in prompt
 
     @pytest.mark.asyncio
