@@ -199,6 +199,15 @@ export async function handleStrategic(
     const authoritativePaused = directionCounts && typeof directionCounts.paused === 'number'
       ? directionCounts.paused
       : undefined;
+    // Authoritative per-system active-direction map (nested under the
+    // trim-proof `direction_counts`), so the portfolio per-system coverage-gap
+    // and concentration signals stay truthful when `directions_summary` is
+    // trimmed. Absent on older payloads → buildPortfolioComposition falls back.
+    const authoritativeSystemCounts = directionCounts
+      && directionCounts.by_system
+      && typeof directionCounts.by_system === 'object'
+      ? directionCounts.by_system as Record<string, number>
+      : undefined;
     const projectName = strVal(payload.project_name, 'Unknown Project');
 
     const openMessages = Array.isArray(payload.open_messages)
@@ -297,6 +306,7 @@ export async function handleStrategic(
       outcomeSystems,
       activeByScopeForPortfolio,
       authoritativeActive,
+      authoritativeSystemCounts,
     );
 
     // ── Running context from prior cycles (design doc notes/strategic-context) ──

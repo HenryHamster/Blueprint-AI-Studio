@@ -931,6 +931,86 @@ describe('buildPortfolioComposition', () => {
     expect(out).toContain('Category mix below computed from 2 of 8 active directions');
     expect(out).toContain('authoritative total of 8');
   });
+
+  it('does not report a system uncovered when its only direction was trimmed but the authoritative map covers it', () => {
+    // Only sys-a directions shipped; sys-b's lone direction was trimmed for
+    // budget but the authoritative per-system map records it as active.
+    const dirs = [
+      { id: 'd-1', category: 'product', system_id: 'sys-a', total_cycles: 1 },
+    ];
+    const systems = [
+      { id: 'sys-a', name: 'System A' },
+      { id: 'sys-b', name: 'System B' },
+    ];
+    const out = buildPortfolioComposition(dirs, systems, undefined, 4, { 'sys-a': 3, 'sys-b': 1 });
+    // sys-b has an active direction per the authoritative map → not a gap.
+    expect(out).toContain('System coverage: 2/2 vision systems have directions');
+    expect(out).not.toContain('System B (sys-b)');
+    expect(out).not.toContain('gaps:');
+  });
+
+  it('derives concentration risk from the authoritative map even when shipped rows show <3', () => {
+    // Only one sys-a row shipped, but the authoritative map says 4 are active.
+    const dirs = [
+      { id: 'd-1', category: 'product', system_id: 'sys-a', total_cycles: 1 },
+    ];
+    const out = buildPortfolioComposition(dirs, [], undefined, 4, { 'sys-a': 4 });
+    expect(out).toContain('CONCENTRATION RISK: 3+ directions on same system: sys-a=4');
+    expect(out).not.toContain('may under-count');
+  });
+
+  it('still flags a truly-uncovered system (authoritative active count 0)', () => {
+    const dirs = [
+      { id: 'd-1', category: 'product', system_id: 'sys-a', total_cycles: 1 },
+    ];
+    const systems = [
+      { id: 'sys-a', name: 'System A' },
+      { id: 'sys-b', name: 'System B' },
+    ];
+    const out = buildPortfolioComposition(dirs, systems, undefined, 1, { 'sys-a': 1 });
+    expect(out).toContain('System coverage: 1/2 vision systems have directions');
+    expect(out).toContain('System B (sys-b)');
+  });
+
+  it('suppresses false uncovered claim and marks concentration partial when map absent and list trimmed', () => {
+    // 1 shipped row but authoritative total is 5 (trimmed), no per-system map.
+    const dirs = [
+      { id: 'd-1', category: 'product', system_id: 'sys-a', total_cycles: 1 },
+      { id: 'd-2', category: 'structural', system_id: 'sys-a', total_cycles: 1 },
+      { id: 'd-3', category: 'structural', system_id: 'sys-a', total_cycles: 1 },
+    ];
+    const systems = [
+      { id: 'sys-a', name: 'System A' },
+      { id: 'sys-b', name: 'System B' },
+    ];
+    const out = buildPortfolioComposition(dirs, systems, undefined, 5);
+    // No false "uncovered" gap line for sys-b — its direction may be trimmed.
+    expect(out).toContain('System coverage: at least 1/2 vision systems have directions');
+    expect(out).toContain('coverage gaps not shown');
+    expect(out).not.toContain('System B (sys-b)');
+    // Concentration computed from shipped subset only — clearly marked partial.
+    expect(out).toContain('CONCENTRATION RISK: 3+ directions on same system: sys-a=3');
+    expect(out).toContain('may under-count trimmed directions');
+  });
+
+  it('preserves exact current behavior when map absent and list complete', () => {
+    // No authoritative map, and shipped rows == authoritative total (untrimmed).
+    const dirs = [
+      { id: 'd-1', text: 'Product A', category: 'product', system_id: 'sys-a', total_cycles: 2 },
+      { id: 'd-2', text: 'Refactor A', category: 'structural', system_id: 'sys-a', total_cycles: 1 },
+      { id: 'd-3', text: 'More A', category: 'structural', system_id: 'sys-a', total_cycles: 1 },
+    ];
+    const systems = [
+      { id: 'sys-a', name: 'System A' },
+      { id: 'sys-b', name: 'System B' },
+    ];
+    const out = buildPortfolioComposition(dirs, systems, undefined, 3);
+    expect(out).toContain('System coverage: 1/2 vision systems have directions');
+    expect(out).toContain('System B (sys-b)');
+    expect(out).toContain('CONCENTRATION RISK: 3+ directions on same system: sys-a=3');
+    expect(out).not.toContain('may under-count');
+    expect(out).not.toContain('coverage gaps not shown');
+  });
 });
 
 describe('buildEmptyRepoGuidance', () => {

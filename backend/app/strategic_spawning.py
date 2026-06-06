@@ -4562,6 +4562,22 @@ async def _spawn_strategic_review(
         1 for d in _all_directions if d.get("status") == "active"
     )
     _max_active_directions = _runtime_config.get("max_active_directions", 10)
+    # Authoritative per-system ACTIVE-direction tally, computed from the FULL
+    # direction set before any trimming. Nested under ``direction_counts`` so it
+    # inherits the same ``critical`` trim-proof packing — this lets the agent's
+    # per-system coverage-gap and concentration-risk signals stay truthful even
+    # when ``directions_summary`` is trimmed for budget. Directions with no
+    # ``system_id`` simply do not contribute.
+    _direction_active_by_system: dict[str, int] = {}
+    for _d in _all_directions:
+        if _d.get("status") != "active":
+            continue
+        _sys_id = _d.get("system_id")
+        if not _sys_id:
+            continue
+        _direction_active_by_system[_sys_id] = (
+            _direction_active_by_system.get(_sys_id, 0) + 1
+        )
     _direction_counts = {
         "active": _active_directions_count,
         "paused": sum(1 for d in _all_directions if d.get("status") == "paused"),
@@ -4571,6 +4587,7 @@ async def _spawn_strategic_review(
             if d.get("status") in ("active", "paused", "proposed")
         ),
         "max_active": _max_active_directions,
+        "by_system": _direction_active_by_system,
     }
     # Advisory: when too few directions are active the fleet's per-direction
     # fan-out leaves most VM capacity idle. Surface that cost so the agent can

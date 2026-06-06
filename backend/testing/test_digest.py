@@ -6426,6 +6426,7 @@ async def test_digest_top_level_schema_keys(client: AsyncClient):
         "success_rate",
         "trend",
         "narrative_summary",
+        "direction_portfolio",
         "total_estimated_cost_usd",
         "migration_health",
         "merge_gate_fleet_health",

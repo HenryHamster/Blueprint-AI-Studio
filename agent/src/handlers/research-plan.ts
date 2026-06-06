@@ -1047,6 +1047,7 @@ export function buildPortfolioComposition(
   systems: Array<Record<string, unknown>>,
   activeByScope: Record<string, number> | undefined,
   authoritativeActiveTotal?: number,
+  authoritativeSystemCounts?: Record<string, number>,
 ): string {
   const shipped = activeDirections.length;
   // Anchor the empty-state guard and percentage denominator on the trim-proof
@@ -1093,21 +1094,50 @@ export function buildPortfolioComposition(
   const productFlag = productPct < 30 ? ' [LOW PRODUCT RATIO — <30%]' : '';
   lines.push(`Category mix: ${catParts.join(', ')}${productFlag}`);
 
-  const mappedSystems = new Set(Object.keys(systemCounts));
+  // Per-system signals (coverage gaps + concentration risk). Prefer the
+  // authoritative per-system active map when present — it is computed from the
+  // FULL direction set before trimming, so a system whose only direction was
+  // trimmed out of the shipped rows is never falsely reported uncovered, and a
+  // trimmed direction still counts toward concentration. Fall back to the
+  // shipped-row map for older payloads/tests that omit it.
+  const hasAuthSystemCounts = authoritativeSystemCounts != null
+    && typeof authoritativeSystemCounts === 'object';
+  const effectiveSystemCounts: Record<string, number> = hasAuthSystemCounts
+    ? authoritativeSystemCounts
+    : systemCounts;
+  // The shipped detail list is incomplete when fewer active rows shipped than
+  // the authoritative total — i.e. some active directions were trimmed.
+  const listIncomplete = shipped < total;
+
   const allSystems = systems.filter(s => typeof s.id === 'string').map(s => ({
     id: s.id as string,
     name: typeof s.name === 'string' ? (s.name) : (s.id as string),
   }));
-  const uncovered = allSystems.filter(s => !mappedSystems.has(s.id));
   if (allSystems.length > 0) {
-    lines.push(`System coverage: ${mappedSystems.size}/${allSystems.length} vision systems have directions`
-      + (uncovered.length > 0 ? ` — gaps: ${uncovered.map(s => `${s.name} (${s.id})`).join(', ')}` : ''));
+    const mapped = allSystems.filter(s => (effectiveSystemCounts[s.id] || 0) > 0);
+    if (hasAuthSystemCounts || !listIncomplete) {
+      // Authoritative map present, OR the shipped rows are complete — uncovered
+      // claims are trustworthy.
+      const uncovered = allSystems.filter(s => (effectiveSystemCounts[s.id] || 0) === 0);
+      lines.push(`System coverage: ${mapped.length}/${allSystems.length} vision systems have directions`
+        + (uncovered.length > 0 ? ` — gaps: ${uncovered.map(s => `${s.name} (${s.id})`).join(', ')}` : ''));
+    } else {
+      // Map absent AND shipped rows incomplete — cannot prove a system is
+      // uncovered (its only direction may have been trimmed for budget).
+      // Suppress the false gap list; report only the verifiable lower bound.
+      lines.push(`System coverage: at least ${mapped.length}/${allSystems.length} vision systems have directions (coverage gaps not shown — per-direction detail trimmed for budget, so an unmapped system may still be covered; fetch with \`./fetch direction <id>\`)`);
+    }
   }
 
-  const concentrated = Object.entries(systemCounts).filter(([, n]) => n >= 3);
+  const concentrated = Object.entries(effectiveSystemCounts).filter(([, n]) => n >= 3);
   if (concentrated.length > 0) {
     const parts = concentrated.map(([sid, n]) => `${sid}=${n}`);
-    lines.push(`CONCENTRATION RISK: 3+ directions on same system: ${parts.join(', ')}`);
+    // When derived from the shipped subset only (no authoritative map, list
+    // trimmed), the count may under-report directions that were trimmed.
+    const partialNote = (!hasAuthSystemCounts && listIncomplete)
+      ? ' [from shipped subset only — may under-count trimmed directions]'
+      : '';
+    lines.push(`CONCENTRATION RISK: 3+ directions on same system: ${parts.join(', ')}${partialNote}`);
   }
 
   if (activeByScope) {

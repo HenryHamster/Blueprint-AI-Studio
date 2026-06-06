@@ -518,6 +518,11 @@ async def _compute_digest(
     dir_id_to_text: Dict[str, str] = {}
     scope_conversion_rates: Dict[str, Dict[str, int]] = {}
     prev_scope_conversion_rates: Dict[str, Dict[str, int]] = {}
+    direction_portfolio: Dict[str, Any] = {
+        "active_count": 0,
+        "self_sufficient_count": 0,
+        "composition": [],
+    }
 
     if project_id:
         project = await session.get(Project, project_id)
@@ -528,6 +533,7 @@ async def _compute_digest(
                 prev_scope_conversion_rates,
                 dir_id_to_text,
                 _,
+                direction_portfolio,
             ) = await compute_direction_progress(
                 session,
                 project=project,
@@ -1344,6 +1350,7 @@ async def _compute_digest(
         "failure_stage_distribution": failure_stage_distribution,
         "recent_completions": recent_completions,
         "direction_progress": direction_progress_list,
+        "direction_portfolio": direction_portfolio,
         "overall_product_ratio": overall_product_ratio,
         "median_cost_per_merged_pr": median_cost_per_merged_pr,
         "cost_per_merge_by_type": cost_per_merge_by_type,

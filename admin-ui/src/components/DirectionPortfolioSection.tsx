@@ -5,6 +5,10 @@ import { StrategicAuditPanel } from './StrategicAuditPanel';
 import { isSafeUrl } from './TaskCard';
 import { apiFetch, fetchEvictedFindings, type EvictedFinding } from '../api';
 import { timeAgo } from '../utils/time';
+import type {
+  DirectionPortfolio as DigestDirectionPortfolio,
+  DirectionPortfolioCompositionEntry,
+} from '../types/digest';
 import {
   hasNonCodeMergeOutcomes,
   healthRateColorClass,
@@ -64,6 +68,7 @@ export interface DirectionProgress {
 
 interface DirectionPortfolioSectionProps {
   directions: DirectionProgress[];
+  directionPortfolio?: DigestDirectionPortfolio;
   loading: boolean;
   productPct: number | null;
   totalDirPRs: number;
@@ -259,6 +264,28 @@ function SectionSkeleton() {
   return <div className="h-28 w-full animate-pulse rounded bg-neutral-900/50 border border-neutral-800/50" />;
 }
 
+function QuietDirectionCard({ direction }: { direction: DirectionPortfolioCompositionEntry }) {
+  return (
+    <div className="min-w-[200px] max-w-[220px] shrink-0 rounded-lg border border-dashed border-neutral-800 bg-neutral-950/50 p-3 opacity-80">
+      <div className="flex items-center gap-1.5 mb-1.5">
+        <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border bg-neutral-800/70 text-neutral-300 border-neutral-700">
+          Quiet
+        </span>
+        <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border ${priorityBadge(direction.priority)}`}>
+          {direction.priority}
+        </span>
+        <span className="text-[9px] font-medium uppercase tracking-wide text-neutral-500">
+          {direction.status ?? 'active'}
+        </span>
+      </div>
+      <p className="text-xs text-neutral-300 line-clamp-2 mb-2">{direction.direction_text}</p>
+      <div className="text-[10px] text-neutral-500">
+        Quiet this window · no cycles or new tasks
+      </div>
+    </div>
+  );
+}
+
 const EVICTED_FINDINGS_PAGE_SIZE = 10;
 
 interface EvictedDrawerState {
@@ -269,6 +296,7 @@ interface EvictedDrawerState {
 
 export function DirectionPortfolioSection({
   directions,
+  directionPortfolio,
   loading,
   productPct,
   totalDirPRs,
@@ -295,6 +323,9 @@ export function DirectionPortfolioSection({
   const [evictedIsStale, setEvictedIsStale] = useState(false);
   const evictedLoadedAtRef = useRef<number>(0);
   const evictedDrawerDirectionId = evictedDrawer?.directionId ?? null;
+  const activeDirectionCount = directionPortfolio?.active_count ?? directions.length;
+  const quietDirections = directionPortfolio?.composition.filter(d => d.quiet_this_window) ?? [];
+  const quietDirectionCount = quietDirections.length;
 
   // Aggregate generalized (cross-type) success across directions, for the
   // header summary line. Only surfaced when at least one non-code-merge lane
@@ -449,12 +480,12 @@ export function DirectionPortfolioSection({
       <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Direction Portfolio</h2>
       {loading ? (
         <SectionSkeleton />
-      ) : directions.length === 0 ? (
+      ) : activeDirectionCount === 0 ? (
         <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">No active directions</div>
       ) : (
         <>
           <div className="flex items-center gap-3 text-xs text-neutral-400 mb-2">
-            <span>{directions.length} direction{directions.length !== 1 ? 's' : ''}</span>
+            <span>{activeDirectionCount} direction{activeDirectionCount !== 1 ? 's' : ''}</span>
             {productPct != null && (
               <>
                 <span className="text-neutral-600">&middot;</span>
@@ -490,11 +521,17 @@ export function DirectionPortfolioSection({
                 <span className="text-blue-400">{totalAssistedPRs ?? 0} assisted</span>
               </>
             )}
-            {directions.length > 0 && (
+            {directionPortfolio && quietDirectionCount > 0 && (
+              <>
+                <span className="text-neutral-600">&middot;</span>
+                <span className="text-neutral-500">{quietDirectionCount} quiet this window</span>
+              </>
+            )}
+            {activeDirectionCount > 0 && (
               <>
                 <span className="text-neutral-600">&middot;</span>
                 <span className={selfSufficientCount === 0 ? 'text-neutral-500' : 'text-emerald-400'}>
-                  Self-sufficient: {selfSufficientCount} / {directions.length}
+                  Self-sufficient: {selfSufficientCount} / {activeDirectionCount}
                 </span>
               </>
             )}
@@ -634,6 +671,17 @@ export function DirectionPortfolioSection({
               );
             })}
           </div>
+
+          {directionPortfolio && quietDirectionCount > 0 && (
+            <div className="space-y-2">
+              <div className="text-[10px] font-bold uppercase tracking-widest text-neutral-500">Quiet this window</div>
+              <div className="flex gap-2 overflow-x-auto pb-1 scrollbar-hide" style={{ scrollbarWidth: 'none' }}>
+                {quietDirections.map(direction => (
+                  <QuietDirectionCard key={direction.direction_id} direction={direction} />
+                ))}
+              </div>
+            </div>
+          )}
         </>
       )}
       {!!projectId && (

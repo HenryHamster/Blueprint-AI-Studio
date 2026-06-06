@@ -4478,6 +4478,87 @@ async def test_strategic_review_packer_keeps_payload_under_cap_on_bloated_projec
 
 
 @pytest.mark.asyncio
+async def test_direction_counts_by_system_survives_directions_summary_trim(db_session):
+    """The authoritative per-system ACTIVE map (direction_counts.by_system) is
+    computed from the FULL direction set before packing, so it stays correct and
+    complete even when directions_summary is trimmed under byte-budget pressure.
+    This is what keeps the agent's per-system coverage-gap and concentration
+    signals truthful when the per-direction detail list is trimmed."""
+    import json as _json
+    from app.payload_schemas import _MAX_PAYLOAD_BYTES
+
+    # 50 active directions spread across 3 systems (plus a few with no system_id
+    # which must NOT contribute to the map), all bulky enough to force a trim.
+    systems = ["sys-a", "sys-b", "sys-c"]
+    directions = []
+    for i in range(50):
+        d = {
+            "id": f"d-sys{i:02d}",
+            "status": "active",
+            "text": f"Direction {i} " + ("filler text " * 30),
+            "priority": "medium",
+            "research_history": [
+                {
+                    "prs_merged": 1,
+                    "prs_rejected": 0,
+                    "tasks_failed": 0,
+                    "tasks_created": 1,
+                    "key_finding_descriptions": [f"finding {j} " * 20 for j in range(5)],
+                    "failed_task_details": [],
+                    "timestamp": "2026-04-01T00:00:00Z",
+                }
+                for _ in range(8)
+            ],
+            "research_context": "context narrative " * 200,
+        }
+        # Last 5 directions intentionally carry no system_id.
+        if i < 45:
+            d["system_id"] = systems[i % 3]
+        directions.append(d)
+
+    # Expected per-system active tally from the FULL set: 45 directions round
+    # -robin across 3 systems → 15 each; the 5 system-less ones contribute 0.
+    expected_by_system = {"sys-a": 15, "sys-b": 15, "sys-c": 15}
+
+    project = _make_project(
+        directions=directions,
+        vision={"purpose": "per-system trim-proofing test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    # Payload must fit under the hard cap and the detail list must have trimmed.
+    serialized_size = len(_json.dumps(payload, default=str).encode())
+    assert serialized_size < _MAX_PAYLOAD_BYTES
+    assert len(payload["directions_summary"]) <= 12, (
+        "directions_summary must be trimmed for this test to be meaningful"
+    )
+    meta = payload["_packer_meta"]
+    trimmed_keys = {entry["key"] for entry in meta["trimmed"]}
+    dropped_keys = {entry["key"] for entry in meta["dropped"]}
+    assert "directions_summary" in trimmed_keys
+
+    # The per-system map is nested under the critical direction_counts field and
+    # reflects the FULL active set (15/15/15), NOT the ≤12 trimmed shipped rows.
+    by_system = payload["direction_counts"]["by_system"]
+    assert by_system == expected_by_system, (
+        f"by_system must be the true pre-trim per-system tally, got {by_system}"
+    )
+    assert sum(by_system.values()) == 45, (
+        "system-less directions must not contribute to the per-system map"
+    )
+    # Inherits direction_counts' critical tier — never trimmed or dropped.
+    assert "direction_counts" not in trimmed_keys | dropped_keys
+
+
+@pytest.mark.asyncio
 async def test_direction_counts_survive_problem_model_floor_pressure(db_session):
     """Authoritative direction_counts survive even when a huge floor-reserved
     problem_model drops directions_summary entirely.

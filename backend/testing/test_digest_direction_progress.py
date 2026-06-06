@@ -168,6 +168,96 @@ async def test_digest_direction_progress_excludes_no_activity(
 
 
 @pytest.mark.asyncio
+async def test_digest_direction_progress_authoritative_portfolio_includes_quiet(
+    client: AsyncClient, db_session
+):
+    """Quiet active directions stay in direction_portfolio even when dropped from direction_progress."""
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-busy",
+                "text": "Busy direction",
+                "status": "active",
+                "research_history": [{"timestamp": _utcnow().isoformat(), "autonomous_prs_merged": 11}],
+                "history_aggregate": {"total_operator_actions": 0},
+            },
+            {
+                "id": "dir-quiet",
+                "text": "Quiet direction",
+                "status": "held",
+                "research_history": [{"timestamp": _utcnow().isoformat(), "autonomous_prs_merged": 12}],
+                "history_aggregate": {"total_operator_actions": 0},
+            },
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Task for busy",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-busy"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert [dp["direction_id"] for dp in data["direction_progress"]] == ["dir-busy"]
+    portfolio = data["direction_portfolio"]
+    assert portfolio["active_count"] == 2
+    assert portfolio["self_sufficient_count"] == 2
+    assert portfolio["composition"] == [
+        {
+            "direction_id": "dir-busy",
+            "direction_text": "Busy direction",
+            "status": "active",
+            "priority": "medium",
+            "quiet_this_window": False,
+        },
+        {
+            "direction_id": "dir-quiet",
+            "direction_text": "Quiet direction",
+            "status": "held",
+            "priority": "medium",
+            "quiet_this_window": True,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_authoritative_portfolio_all_quiet(
+    client: AsyncClient, db_session
+):
+    """When every active direction is quiet, direction_progress can be empty while direction_portfolio stays truthful."""
+    project = make_project(
+        directions=[
+            {"id": "dir-a", "text": "Quiet A", "status": "active"},
+            {"id": "dir-b", "text": "Quiet B", "status": "auto_paused"},
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["direction_progress"] == []
+    portfolio = data["direction_portfolio"]
+    assert portfolio["active_count"] == 2
+    assert portfolio["self_sufficient_count"] == 0
+    assert [entry["quiet_this_window"] for entry in portfolio["composition"]] == [True, True]
+
+
+@pytest.mark.asyncio
 async def test_digest_direction_progress_prs_merged(client: AsyncClient, db_session):
     """prs_merged is summed from research_history entries within the time window."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()

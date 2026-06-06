@@ -1262,6 +1262,43 @@ describe('DashboardHome', () => {
       // total_operator_actions is undefined → null, so operatorActions === 0 is false → not self-sufficient
       expect(await screen.findByText('Self-sufficient: 0 / 1')).toBeInTheDocument();
     });
+
+    it('prefers the authoritative direction_portfolio counts when present', async () => {
+      setupApiMocks({
+        digest: {
+          ...baseDigest,
+          direction_progress: [
+            {
+              direction_id: 'd1',
+              direction_text: 'Dir A',
+              priority: 'high',
+              cycles_in_window: 1,
+              tasks_created: 2,
+              prs_merged: 12,
+              possibly_saturated: false,
+              research_history: [{ autonomous_prs_merged: 12 }],
+              history_aggregate: { total_autonomous_prs_merged: 0, total_operator_actions: 0 },
+            },
+          ],
+          direction_portfolio: {
+            active_count: 3,
+            self_sufficient_count: 2,
+            composition: [
+              { direction_id: 'd1', direction_text: 'Dir A', status: 'active', priority: 'high', quiet_this_window: false },
+              { direction_id: 'd2', direction_text: 'Dir B', status: 'held', priority: 'low', quiet_this_window: true },
+              { direction_id: 'd3', direction_text: 'Dir C', status: 'auto_paused', priority: 'medium', quiet_this_window: true },
+            ],
+          },
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      expect(await screen.findByText('Self-sufficient: 2 / 3')).toBeInTheDocument();
+      expect(screen.getByText('3 directions')).toBeInTheDocument();
+      expect(screen.getByText('2 quiet this window')).toBeInTheDocument();
+    });
   });
 
   it('does not render digest data when backend returns a response that fails the contract check', async () => {

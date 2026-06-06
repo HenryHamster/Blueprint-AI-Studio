@@ -464,7 +464,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     const hasAttribution = dirs.some(d => d.autonomous_prs_merged != null || d.assisted_prs_merged != null);
     const totalAutonomousPRs = hasAttribution ? dirs.reduce((s, d) => s + (d.autonomous_prs_merged ?? 0), 0) : null;
     const totalAssistedPRs = hasAttribution ? dirs.reduce((s, d) => s + (d.assisted_prs_merged ?? 0), 0) : null;
-    const selfSufficientCount = dirs.filter(d => {
+    const selfSufficientCount = digest?.direction_portfolio?.self_sufficient_count ?? dirs.filter(d => {
       const history = d.research_history ?? [];
       const histHasAttrib = history.some(e => e.autonomous_prs_merged != null);
       const lifetimeAutonomous = histHasAttrib
@@ -474,7 +474,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       return (lifetimeAutonomous ?? 0) >= 10 && operatorActions === 0;
     }).length;
     return { directions: dirs, totalDirPRs, hasAttribution, totalAutonomousPRs, totalAssistedPRs, selfSufficientCount };
-  }, [digest?.direction_progress]);
+  }, [digest?.direction_progress, digest?.direction_portfolio]);
   const productPct = digest?.overall_product_ratio != null ? Math.round(digest.overall_product_ratio * 100) : null;
 
   const classSparkMap = useMemo(() => {
@@ -699,6 +699,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           <DirectionPortfolioSection
             directions={directions}
             loading={loading}
+            directionPortfolio={digest?.direction_portfolio}
             productPct={productPct}
             totalDirPRs={totalDirPRs}
             hasAttribution={hasAttribution}

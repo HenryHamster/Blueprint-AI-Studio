@@ -99,6 +99,20 @@ export interface RecentFailure {
   scope?: string | null;
 }
 
+export interface DirectionPortfolioCompositionEntry {
+  direction_id: string;
+  direction_text: string;
+  status: string | null;
+  priority: string;
+  quiet_this_window: boolean;
+}
+
+export interface DirectionPortfolio {
+  active_count: number;
+  self_sufficient_count: number;
+  composition: DirectionPortfolioCompositionEntry[];
+}
+
 type ScopeConversionRates = Record<string, { created: number; merged: number; calibrated_in?: number; calibrated_out?: number }>;
 
 /**
@@ -289,6 +303,7 @@ export interface DigestData<DP = unknown> {
   failed_count: number;
   pending_approval_count: number;
   direction_progress?: DP[];
+  direction_portfolio?: DirectionPortfolio;
   recent_completions?: RecentCompletion[];
   failure_groups?: FailureGroup[];
 
