@@ -522,6 +522,48 @@ async def list_pull_requests_for_commit(
     return all_prs
 
 
+# Paths whose changes trigger the agent VM image bake workflow
+# (.github/workflows/packer-agent.yml ``on.push.paths``). Keep in sync with that
+# workflow: a promoted commit that touches any of these expects a fresh Packer
+# bake of the agent VM image.
+AGENT_IMAGE_BAKE_PATHS = ("agent/", "infra/packer/")
+
+
+async def agent_image_rebake_expected(
+    token: str,
+    owner: str,
+    repo: str,
+    base_ref: str,
+    head_ref: str,
+    project_id: str | None = None,
+) -> bool | None:
+    """True iff the diff ``base_ref...head_ref`` touches a bake-triggering path.
+
+    The agent VM image bake workflow runs only when a push to the production
+    branch changes ``agent/**`` or ``infra/packer/**`` (see
+    ``.github/workflows/packer-agent.yml``).  So a promoted candidate "expects a
+    rebake" exactly when its diff against the previously-deployed SHA touches one
+    of those paths.  Reuses the existing compare helper
+    :func:`get_files_changed_between_refs` rather than re-deriving the diff.
+
+    This is a serving-gate input: a promotion whose code changed the agent image
+    but whose bake never ran (or failed) is only partially served, even though
+    the backend revision deployed cleanly.
+
+    Returns ``True``/``False`` definitively, or ``None`` when the comparison
+    could not be made (API error / ref not found) so the caller can treat
+    indeterminate as such rather than silently assuming no rebake is needed.
+    """
+    files = await get_files_changed_between_refs(
+        token, owner, repo, base_ref, head_ref, project_id=project_id
+    )
+    if files is None:
+        return None
+    return any(
+        f.startswith(prefix) for f in files for prefix in AGENT_IMAGE_BAKE_PATHS
+    )
+
+
 async def is_ancestor_of(
     token: str,
     owner: str,

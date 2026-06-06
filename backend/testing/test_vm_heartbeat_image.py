@@ -194,3 +194,138 @@ async def test_task_heartbeat_records_runtime_fingerprint_and_exposes_stale_vm(
         and vm["agent_runtime_fingerprint"] == runtime_fingerprint
         for vm in stale_vms
     )
+
+
+@pytest.mark.asyncio
+async def test_vm_heartbeat_records_source_sha(client: AsyncClient, db_session):
+    """vm-heartbeat persists agent_source_sha into compute._vm_source_shas."""
+    import app.compute as _compute
+
+    vm_id = "agent-vm-source-sha-vm-heartbeat"
+    source_sha = "abc1234def5678"
+
+    project = Project(name="VM-Heartbeat Source SHA", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _compute._vm_source_shas.pop(vm_id, None)
+
+    token = create_agent_token(str(task.id), vm_id)
+    resp = await client.post(
+        "/api/agent/vm-heartbeat",
+        json={"vm_instance_id": vm_id, "agent_source_sha": source_sha},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 204
+    assert _compute.get_vm_source_sha(vm_id) == source_sha
+
+
+@pytest.mark.asyncio
+async def test_task_heartbeat_records_source_sha(client: AsyncClient, db_session):
+    """/api/agent/heartbeat persists agent_source_sha into compute._vm_source_shas."""
+    import app.compute as _compute
+
+    vm_id = "agent-vm-source-sha-task-heartbeat"
+    source_sha = "0123456789abcdef0123456789abcdef01234567"
+
+    project = Project(name="Task Heartbeat Source SHA", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _compute._vm_source_shas.pop(vm_id, None)
+
+    token = create_agent_token(str(task.id), vm_id)
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "agent_source_sha": source_sha},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    assert _compute.get_vm_source_sha(vm_id) == source_sha
+
+
+def test_record_and_get_vm_source_sha_roundtrip():
+    """compute.record_vm_source_sha / get_vm_source_sha round-trip and clear."""
+    import app.compute as _compute
+
+    vm_id = "agent-vm-source-sha-unit"
+    _compute._vm_source_shas.pop(vm_id, None)
+    assert _compute.get_vm_source_sha(vm_id) is None
+    _compute.record_vm_source_sha(vm_id, "deadbeef1234")
+    assert _compute.get_vm_source_sha(vm_id) == "deadbeef1234"
+    # Empty vm id is a no-op, never stored under "".
+    _compute.record_vm_source_sha("", "cafe1234")
+    assert _compute.get_vm_source_sha("") is None
+    # Heartbeat-state clear drops the recorded SHA alongside the other maps.
+    _compute._clear_vm_heartbeat_state(vm_id)
+    assert _compute.get_vm_source_sha(vm_id) is None
+
+
+def test_get_image_source_git_sha_local_mode_returns_none():
+    """get_image_source_git_sha is a safe no-op in LOCAL_MODE / for empty names."""
+    import app.compute as _compute
+
+    # The test suite runs in LOCAL_MODE, so the GCP path is never hit.
+    assert _compute.get_image_source_git_sha("blueprint-agent-v2-123") is None
+    assert _compute.get_image_source_git_sha("") is None
+
+
+@pytest.mark.asyncio
+async def test_persist_pool_vm_image_state_updates_pool_member(db_session):
+    """Warm-pool members can durably mirror observed image/source identity."""
+    import app.compute as _compute
+    from app.models import PoolVm, PoolVmState, Project
+
+    project = Project(name="Pool VM Durable Image State", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    member = PoolVm(
+        vm_instance_id="agent-vm-pool-durable",
+        project_id=project.id,
+        state=PoolVmState.IDLE,
+    )
+    db_session.add(member)
+    await db_session.commit()
+    await db_session.refresh(member)
+
+    updated = await _compute.persist_pool_vm_image_state(
+        db_session,
+        member.vm_instance_id,
+        image_name="blueprint-agent-v2-20260606",
+        build_ts=1749168000,
+        runtime_fingerprint="f" * 64,
+        source_sha="0123456789abcdef0123456789abcdef01234567",
+    )
+    await db_session.commit()
+    await db_session.refresh(member)
+
+    assert updated is True
+    assert member.agent_image_name == "blueprint-agent-v2-20260606"
+    assert member.agent_image_build_ts == 1749168000
+    assert member.agent_runtime_fingerprint == "f" * 64
+    assert member.agent_source_sha == "0123456789abcdef0123456789abcdef01234567"
+    assert member.last_heartbeat_at is not None

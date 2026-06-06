@@ -1748,3 +1748,53 @@ async def test_default_provision_fn_honors_requested_account(db_session, warm_po
             db_session, project.id, account_id="acct-missing"
         )
     assert ok2 is False
+
+
+@pytest.mark.asyncio
+async def test_stale_pool_image_ids_unions_outdated(mocker):
+    """_stale_pool_image_ids unions temporal-staleness with pre-promotion
+    outdatedness (a newer valid image already exists), so the fleet converges
+    on the promoted image instead of lingering on old boots."""
+    from app.warm_pool_maintainer import _stale_pool_image_ids
+
+    mocker.patch(
+        "app.compute.get_stale_image_vms",
+        return_value=[{"vm_id": "vm-temporal-stale"}],
+    )
+    mocker.patch(
+        "app.compute.get_outdated_image_vms",
+        return_value=[{"vm_id": "vm-pre-promotion"}],
+    )
+    ids = await _stale_pool_image_ids()
+    assert ids == {"vm-temporal-stale", "vm-pre-promotion"}
+
+
+@pytest.mark.asyncio
+async def test_idle_reaper_recycles_pre_promotion_member(
+    db_session, warm_pool_on, mocker
+):
+    """A warm member booted from a pre-promotion image is recycled once a newer
+    valid image exists — even when it is NOT temporally stale and is alive."""
+    mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+    )
+    # Not temporally stale, but a newer family-target image exists → outdated.
+    mocker.patch("app.compute.get_stale_image_vms", return_value=[])
+    mocker.patch(
+        "app.compute.get_outdated_image_vms",
+        return_value=[{"vm_id": "agent-vm-pre-promo"}],
+    )
+    project = await _make_project(db_session)
+    member = await _register(
+        db_session, project, "agent-vm-pre-promo", PoolVmState.IDLE
+    )
+    member.idle_since = _utcnow()  # fresh idle — not over TTL
+    db_session.add(member)
+    await db_session.commit()
+    _shared_state.record_vm_heartbeat("agent-vm-pre-promo")  # alive — isolate reason
+
+    retired = await sweep_idle_pool_vms(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+    assert retired == 1
+    assert await db_session.get(PoolVm, member.id) is None

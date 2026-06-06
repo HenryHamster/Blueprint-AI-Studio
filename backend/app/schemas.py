@@ -227,6 +227,12 @@ class HeartbeatRequest(BaseModel):
     # recently-built image with an older agent runtime from the current one.
     # None on local dev or pre-fingerprint images.
     agent_runtime_fingerprint: str | None = Field(None, pattern="^[0-9a-f]{64}$")
+    # Git commit the agent VM image was built from, baked into the image as
+    # /opt/agent/AGENT_SOURCE_SHA during Packer bake and read at agent startup.
+    # Maps a running VM back to its exact source commit (the runtime fingerprint
+    # only identifies a content hash, not a git SHA). Permissive 7-40 hex so both
+    # abbreviated and full SHAs validate; None on local dev or pre-marker images.
+    agent_source_sha: str | None = Field(None, pattern="^[0-9a-f]{7,40}$")
     # Cumulative per-task LLM telemetry. Optional/backwards-compatible — older
     # agents that don't yet emit these fields silently skip persistence; newer
     # agents send running totals on every heartbeat. Persisted into

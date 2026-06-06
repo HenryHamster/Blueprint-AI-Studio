@@ -1733,6 +1733,24 @@ class PoolVm(SQLModel, table=True):
     agent_image_fingerprint: str | None = Field(
         default=None, sa_column=Column(String, nullable=True)
     )
+    # Durable image identity observed from task / VM heartbeats so the fleet can
+    # still be reasoned about after an orchestrator restart (the in-memory
+    # heartbeat caches are intentionally lossy).
+    agent_image_name: str | None = Field(
+        default=None, sa_column=Column(String, nullable=True)
+    )
+    agent_image_build_ts: int | None = Field(
+        default=None, sa_column=Column(Integer, nullable=True)
+    )
+    agent_runtime_fingerprint: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+    agent_source_sha: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    last_heartbeat_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
 
     state: PoolVmState = Field(
         default=PoolVmState.PROVISIONING,
@@ -2603,7 +2621,7 @@ class MaxPlanAccount(SQLModel, table=True):
                 if (now - at_dt).total_seconds() < cooldown:
                     return True
             return False
-        except Exception:
+        except Exception:  # noqa: BLE001 — documented: False on any parse failure
             return False
 
 

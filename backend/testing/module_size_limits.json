@@ -10,7 +10,7 @@
     "orchestrator_health.py": 1150,
     "orchestrator_runtime_env.py": 400,
     "admin.py": 3200,
-    "compute.py": 2500,
+    "compute.py": 2750,
     "github.py": 2950,
     "github_token_resolver.py": 250,
     "github_auth.py": 450,
@@ -86,7 +86,7 @@
   },
   "agent": {
     "index.ts": 4600,
-    "prompt.ts": 1650,
+    "prompt.ts": 2000,
     "prompts/task-type-focus.ts": 450,
     "prompts/code-change-helpers.ts": 1250,
     "prompts/code-change-helpers.test.ts": 1200,

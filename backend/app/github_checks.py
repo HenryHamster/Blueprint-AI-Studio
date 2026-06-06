@@ -453,6 +453,84 @@ async def get_check_runs(
     }
 
 
+# The agent VM image bake workflow file (.github/workflows/packer-agent.yml).
+# The control plane reads this run's conclusion to learn whether the Packer bake
+# for a promoted SHA succeeded — without changing the workflow itself.
+AGENT_BAKE_WORKFLOW_FILE = "packer-agent.yml"
+
+
+async def get_workflow_run_for_sha(
+    token: str,
+    owner: str,
+    repo: str,
+    head_sha: str,
+    *,
+    workflow_file: str = AGENT_BAKE_WORKFLOW_FILE,
+    project_id: str | None = None,
+) -> dict | None:
+    """Return the most recent GitHub Actions run of ``workflow_file`` for ``head_sha``.
+
+    Wraps ``GET /repos/{owner}/{repo}/actions/workflows/{workflow_file}/runs``
+    filtered by ``head_sha``.  Used to learn the agent VM image bake outcome for
+    a promoted commit: the serving gate needs to know whether the Packer bake
+    that a rebake-expecting SHA triggered actually ran and succeeded.
+
+    Returns a small status dict for the newest matching run::
+
+        {"run_id": int, "status": str, "conclusion": str | None, "html_url": str}
+
+    ``status`` is one of GitHub's run statuses (``queued`` / ``in_progress`` /
+    ``completed``); ``conclusion`` is ``success`` / ``failure`` / ``cancelled`` /
+    ... or ``None`` while the run is still in flight.  Returns ``None`` when no
+    run exists for the SHA, or on any API error / unparseable body — graceful
+    degradation, never raises (mirrors the other read-only github helpers).
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    response = await _github_request(
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/"
+        f"{workflow_file}/runs?head_sha={head_sha}&per_page=20",
+        headers,
+        project_id=project_id,
+    )
+    if response.status_code != 200:
+        logger.warning(
+            "[GITHUB] get_workflow_run_for_sha: %s/%s workflow=%s sha=%s returned %s",
+            owner,
+            repo,
+            workflow_file,
+            head_sha[:8] if head_sha else head_sha,
+            response.status_code,
+        )
+        return None
+    try:
+        runs = response.json().get("workflow_runs", [])
+    except (ValueError, TypeError):
+        logger.warning(
+            "[GITHUB] get_workflow_run_for_sha: unparseable body for %s/%s sha=%s",
+            owner,
+            repo,
+            head_sha[:8] if head_sha else head_sha,
+        )
+        return None
+    if not runs:
+        return None
+    # GitHub returns most-recent-first, but sort defensively by created_at
+    # (ISO-8601 sorts lexically) so a re-run / dispatch can't surface an older run.
+    runs.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+    run = runs[0]
+    return {
+        "run_id": run.get("id"),
+        "status": run.get("status"),
+        "conclusion": run.get("conclusion"),
+        "html_url": run.get("html_url", ""),
+    }
+
+
 async def rerun_failed_jobs(
     token: str, owner: str, repo: str, run_id: int
 ) -> bool:

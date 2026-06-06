@@ -1544,6 +1544,77 @@ class TestPackerFingerprintBakeContract:
         )
 
 
+class TestPackerSourceShaBakeContract:
+    """agent.pkr.hcl must record the source git commit two ways — as an image
+    label (read by the backend with no VM cooperation) and as an on-disk marker
+    the agent reads at boot — and run the production readAgentSourceSha() reader
+    at bake time so a drift between the AGENT_SOURCE_SHA write line and the strict
+    regex in agent/src/index.ts fails the bake instead of shipping a broken map."""
+
+    def test_source_git_sha_variable_defaults_to_github_sha(self):
+        """The bake must read the commit from GITHUB_SHA (set by GitHub Actions)
+        so production images carry a real SHA without a manual var."""
+        hcl = _read_packer_hcl()
+        assert 'variable "source_git_sha"' in hcl, (
+            "agent.pkr.hcl must declare a source_git_sha variable."
+        )
+        assert 'env("GITHUB_SHA")' in hcl, (
+            "source_git_sha must default to env(\"GITHUB_SHA\") so CI bakes the commit."
+        )
+
+    def test_image_label_carries_source_git_sha(self):
+        """The image must carry a source-git-sha label (signal a) with an
+        `unknown` fallback so the bake never fails on an empty commit."""
+        hcl = _read_packer_hcl()
+        assert "image_labels" in hcl and "source-git-sha" in hcl, (
+            "agent.pkr.hcl googlecompute source must set a source-git-sha image label."
+        )
+        assert "unknown" in hcl, (
+            "source-git-sha label must fall back to `unknown` on an empty SHA."
+        )
+
+    def test_marker_write_and_sentinel_present(self):
+        """The on-disk AGENT_SOURCE_SHA marker (signal b) must be written and
+        gated on a sentinel so a silent write failure is caught."""
+        hcl = _read_packer_hcl()
+        assert "/opt/agent/AGENT_SOURCE_SHA" in hcl, (
+            "agent.pkr.hcl must write the /opt/agent/AGENT_SOURCE_SHA marker."
+        )
+        assert "PACKER_SOURCE_SHA_OK" in hcl, (
+            "agent.pkr.hcl must emit PACKER_SOURCE_SHA_OK after the marker write."
+        )
+
+    def test_readback_sentinel_present(self):
+        """Build must emit PACKER_SOURCE_SHA_READBACK_OK so the provisioner can
+        gate on the sentinel; without it a silent failure passes undetected."""
+        assert "PACKER_SOURCE_SHA_READBACK_OK" in _read_packer_hcl(), (
+            "agent.pkr.hcl must emit PACKER_SOURCE_SHA_READBACK_OK after the "
+            "source-sha readback smoke. Restore the step or re-add the sentinel."
+        )
+
+    def test_readback_invokes_smoke_entrypoint(self):
+        """Smoke must invoke the dedicated agent-source-sha-bake-smoke.ts script
+        via the runtime tsx loader so the production reader path executes."""
+        hcl = _read_packer_hcl()
+        assert "agent-source-sha-bake-smoke.ts" in hcl, (
+            "agent.pkr.hcl must invoke agent-source-sha-bake-smoke.ts for the "
+            "readback smoke."
+        )
+        assert "node --import tsx" in hcl, (
+            "agent.pkr.hcl source-sha smoke must use `node --import tsx` to "
+            "exercise the production TS source path (not a separate compile)."
+        )
+
+    def test_readback_runs_as_agent_user(self):
+        """The marker file is chowned to agent:agent, so the smoke must run as
+        that user (matching production heartbeat reads)."""
+        hcl = _read_packer_hcl()
+        assert "sudo -u agent" in hcl and "agent-source-sha-bake-smoke.ts" in hcl, (
+            "agent.pkr.hcl source-sha smoke must run as the agent user "
+            "(sudo -u agent) to match post-chown file ownership."
+        )
+
+
 @pytest.mark.parametrize("path", _STATIC_PARAMS)
 def test_static_script_shellcheck(path: Path, shellcheck_available: bool):
     if not shellcheck_available:

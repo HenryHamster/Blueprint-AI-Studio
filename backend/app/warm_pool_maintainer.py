@@ -561,11 +561,22 @@ async def _default_pool_provision_fn(
 
 
 async def _stale_pool_image_ids() -> set[str]:
-    """vm_instance_ids whose heartbeat-reported image is stale (image-staleness reuse)."""
-    try:
-        from app.compute import get_stale_image_vms
+    """vm_instance_ids whose heartbeat-reported image should be recycled.
 
-        return {v["vm_id"] for v in get_stale_image_vms() if v.get("vm_id")}
+    Union of two signals so the fleet converges on the promoted image:
+      * temporal staleness (``compute.get_stale_image_vms`` — the reported image
+        aged past the fixed staleness threshold); and
+      * pre-promotion outdatedness (``compute.get_outdated_image_vms`` — a newer
+        valid image already exists in the family target), so a VM booted before a
+        promotion is recycled as soon as the newer image lands rather than
+        lingering on its old boot.
+    """
+    try:
+        from app.compute import get_outdated_image_vms, get_stale_image_vms
+
+        ids = {v["vm_id"] for v in get_stale_image_vms() if v.get("vm_id")}
+        ids |= {v["vm_id"] for v in get_outdated_image_vms() if v.get("vm_id")}
+        return ids
     except Exception:
         logger.warning("[WARM-POOL] stale-image detection failed", exc_info=True)
         return set()

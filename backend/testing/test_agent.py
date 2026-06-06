@@ -17413,3 +17413,116 @@ async def test_agent_knowledge_documents_direction_and_source_kind_filters(
     body_doc = resp.json()
     assert body_doc["id"] == str(web_doc.id)
     assert "full body" in body_doc["body"]
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_persists_image_state_to_pool_member(
+    client: AsyncClient, db_session
+):
+    """A task heartbeat from a warm-pool member durably mirrors the reported
+    image/source identity onto its PoolVm row, so fleet checks survive a
+    restart of the orchestrator (the in-memory caches do not)."""
+    from app.models import PoolVmState
+    from app.shared_state import runtime_config as _runtime_config
+    from app.warm_pool import register_pool_vm
+
+    project = Project(name="HB Image Persist", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-hb-persist"
+    member = await register_pool_vm(
+        db_session,
+        vm_instance_id=vm_id,
+        project_id=project.id,
+        state=PoolVmState.LEASED,
+    )
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    await db_session.refresh(member)
+
+    prior = _runtime_config.get("warm_pool_enabled", False)
+    _runtime_config["warm_pool_enabled"] = True
+    try:
+        token = create_agent_token(str(task.id), vm_id)
+        headers = {"x-agent-token": token}
+        payload = {
+            "task_id": str(task.id),
+            "status_message": "running",
+            "vm_image_name": "blueprint-agent-v2-20260606",
+            "vm_image_build_ts": 1749168000,
+            "agent_runtime_fingerprint": "a" * 64,
+            "agent_source_sha": "0123456789abcdef",
+        }
+        resp = await client.post("/api/agent/heartbeat", json=payload, headers=headers)
+        assert resp.status_code == 200
+    finally:
+        _runtime_config["warm_pool_enabled"] = prior
+
+    await db_session.refresh(member)
+    assert member.agent_image_name == "blueprint-agent-v2-20260606"
+    assert member.agent_image_build_ts == 1749168000
+    assert member.agent_runtime_fingerprint == "a" * 64
+    assert member.agent_source_sha == "0123456789abcdef"
+    assert member.last_heartbeat_at is not None
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_image_persist_skipped_when_pool_disabled(
+    client: AsyncClient, db_session
+):
+    """With the warm pool dark (the default), the heartbeat issues no PoolVm
+    write — the durable columns stay untouched so a dark pool keeps today's
+    zero-extra-query heartbeat."""
+    from app.models import PoolVmState
+    from app.shared_state import runtime_config as _runtime_config
+    from app.warm_pool import register_pool_vm
+
+    project = Project(name="HB Image Persist Off", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-hb-persist-off"
+    member = await register_pool_vm(
+        db_session,
+        vm_instance_id=vm_id,
+        project_id=project.id,
+        state=PoolVmState.LEASED,
+    )
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    prior = _runtime_config.get("warm_pool_enabled", False)
+    _runtime_config["warm_pool_enabled"] = False
+    try:
+        token = create_agent_token(str(task.id), vm_id)
+        headers = {"x-agent-token": token}
+        payload = {
+            "task_id": str(task.id),
+            "vm_image_name": "blueprint-agent-v2-20260606",
+            "vm_image_build_ts": 1749168000,
+        }
+        resp = await client.post("/api/agent/heartbeat", json=payload, headers=headers)
+        assert resp.status_code == 200
+    finally:
+        _runtime_config["warm_pool_enabled"] = prior
+
+    await db_session.refresh(member)
+    assert member.agent_image_name is None
+    assert member.agent_image_build_ts is None

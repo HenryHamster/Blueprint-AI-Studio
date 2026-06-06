@@ -871,7 +871,7 @@ async def claim_task(
     # chain. Additive: a claim with no reservation simply omits the key and the
     # agent falls back to local numbering, preserving backward compatibility for
     # tasks queued before the reservation rollout.
-    from app.migration_reservations import (  # noqa: PLC0415
+    from app.migration_reservations import (
         get_migration_reservation_for_task,
     )
 
@@ -3912,6 +3912,38 @@ async def agent_heartbeat(
         record_vm_runtime_fingerprint(
             token.get("vm_instance_id"), req.agent_runtime_fingerprint
         )
+
+    # Record the source git SHA baked into the image so a running VM maps back to
+    # its exact build commit. Additive provenance; no-ops when the field is absent
+    # (older images / local dev that never baked the AGENT_SOURCE_SHA marker).
+    if req.agent_source_sha is not None:
+        from app.compute import record_vm_source_sha
+
+        record_vm_source_sha(token.get("vm_instance_id"), req.agent_source_sha)
+
+    # Mirror the heartbeat-reported image identity onto the durable PoolVm row
+    # when this VM is a warm-pool member, so fleet / release-artifact checks
+    # survive an orchestrator restart (the in-memory caches above do not). No-op
+    # for non-pool task VMs (persist_pool_vm_image_state returns False when there
+    # is no PoolVm row). Gated on is_warm_pool_enabled() so a dark pool issues no
+    # extra query; shares the task heartbeat's session + commit below.
+    from app.warm_pool import is_warm_pool_enabled
+
+    if is_warm_pool_enabled():
+        from app.compute import persist_pool_vm_image_state
+
+        _img_kwargs: dict = {}
+        if req.vm_image_name is not None or req.vm_image_build_ts is not None:
+            _img_kwargs["image_name"] = req.vm_image_name
+            _img_kwargs["build_ts"] = req.vm_image_build_ts
+        if req.agent_runtime_fingerprint is not None:
+            _img_kwargs["runtime_fingerprint"] = req.agent_runtime_fingerprint
+        if req.agent_source_sha is not None:
+            _img_kwargs["source_sha"] = req.agent_source_sha
+        if _img_kwargs:
+            await persist_pool_vm_image_state(
+                session, token.get("vm_instance_id"), **_img_kwargs
+            )
 
     session.add(task)
     await session.commit()
