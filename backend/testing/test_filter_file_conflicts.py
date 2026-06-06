@@ -5,6 +5,8 @@ for the sibling filter function in the same module.
 """
 
 import uuid
+from datetime import datetime, timedelta
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
@@ -12,7 +14,11 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.models import Task, TaskStatus
-from app.orchestrator import ACTIVE_TASKS_LIGHT_COLUMNS
+from app.orchestrator import (
+    ACTIVE_TASKS_LIGHT_COLUMNS,
+    BLOCKED_CONFLICT_LIGHT_COLUMNS,
+    CANDIDATE_LIGHT_COLUMNS,
+)
 from app.orchestrator_filters import filter_file_conflicts
 from testing.factories import make_alert, make_project, make_task
 
@@ -35,6 +41,53 @@ def _in_progress(project_id, files, parent=None):
         context={"related_files": files},
         payloads=[{"type": "fix"}],
         parent_task_id=parent,
+    )
+
+
+def _now():
+    return datetime.now().astimezone()
+
+
+def _senior_queued(project_id, files, reserved, *, count=2, created_at=None, scope="large"):
+    """A QUEUED task that has already accrued file-conflict deferrals (so it has
+    earned a seniority reservation over *reserved* files)."""
+    ctx = {
+        "related_files": files,
+        "scope": scope,
+        "_precondition_defer": {
+            "key": f"file conflict on {', '.join(sorted(reserved))}",
+            "count": count,
+            "files": sorted(reserved),
+        },
+    }
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.QUEUED,
+        context=ctx,
+        payloads=[{"type": "fix"}],
+        created_at=created_at or _now(),
+    )
+
+
+def _blocked_conflict(project_id, reserved, *, created_at=None):
+    """A task parked BLOCKED on a file conflict — holds a seniority reservation
+    over *reserved* even though it is absent from the QUEUED candidate scan."""
+    ctx = {
+        "related_files": sorted(reserved),
+        "scope": "large",
+        "_precondition_defer": {
+            "key": f"file conflict on {', '.join(sorted(reserved))}",
+            "count": 3,
+            "files": sorted(reserved),
+        },
+    }
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.BLOCKED,
+        blocker_kind="file_conflict",
+        context=ctx,
+        payloads=[{"type": "fix"}],
+        created_at=created_at or _now(),
     )
 
 
@@ -648,3 +701,187 @@ class TestFilterFileConflicts:
             [c.id for c in candidates], candidates, active, db_session, AsyncMock()
         )
         assert result == [cand.id]
+
+
+class TestFileConflictSeniority:
+    """Contested-resource FIFO: a task that has waited on a file conflict earns
+    a seniority reservation over its contested files, so a stream of newer
+    same-file tasks defers behind it instead of starving it indefinitely."""
+
+    @pytest.mark.asyncio
+    async def test_newer_task_defers_behind_senior_blocked_holder(self):
+        """A senior task parked BLOCKED still reserves its contested files, so a
+        newer QUEUED task overlapping them defers even with no IN_PROGRESS work."""
+        pid = uuid.uuid4()
+        t0 = _now() - timedelta(hours=2)
+        senior = _blocked_conflict(pid, {"models.py"}, created_at=t0)
+        newer = _queued(pid, ["models.py", "x.py"], scope="large")
+        newer.created_at = _now()
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts(
+            [newer.id], [newer], [], session, broadcast_fn, [senior]
+        )
+        assert result == []
+        assert "file conflict" in (newer.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_senior_holder_itself_not_deferred_by_its_own_reservation(self):
+        """The reservation holder must never defer on its own reservation, and a
+        younger task cannot reserve against it — the senior dispatches."""
+        pid = uuid.uuid4()
+        t0 = _now() - timedelta(hours=2)
+        senior = _senior_queued(pid, ["models.py"], {"models.py"}, created_at=t0)
+        newer = _queued(pid, ["models.py", "x.py"], scope="large")
+        newer.created_at = _now()
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts(
+            [senior.id, newer.id], [senior, newer], [], session, broadcast_fn
+        )
+        assert senior.id in result
+        assert newer.id not in result
+
+    @pytest.mark.asyncio
+    async def test_old_deferred_task_wins_over_stream_of_newer(self):
+        """The required scenario: an old deferred task plus a stream of newer
+        same-file tasks — the old one wins the lock; every newer one defers."""
+        pid = uuid.uuid4()
+        base = _now() - timedelta(hours=3)
+        # Old task has already accrued deferrals → senior over models.py.
+        old = _senior_queued(pid, ["models.py"], {"models.py"}, created_at=base)
+        # A stream of newer tasks all contending for the same hot file.
+        newer = []
+        for i in range(3):
+            n = _queued(pid, ["models.py", f"n{i}.py"], scope="large")
+            n.created_at = base + timedelta(minutes=10 * (i + 1))
+            newer.append(n)
+        candidates = [old, *newer]
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts(
+            [t.id for t in candidates], candidates, [], session, broadcast_fn
+        )
+        # Old task wins; all newer same-file tasks defer behind it.
+        assert result == [old.id]
+        for n in newer:
+            assert "file conflict" in (n.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_below_threshold_does_not_reserve(self):
+        """Seniority must not over-defer: a task that has only deferred once
+        (below the threshold) earns no reservation, so a newer non-conflicting
+        candidate is NOT held when nothing is IN_PROGRESS."""
+        pid = uuid.uuid4()
+        t0 = _now() - timedelta(hours=1)
+        notyet = _senior_queued(
+            pid, ["models.py"], {"models.py"}, count=1, created_at=t0
+        )
+        newer = _queued(pid, ["models.py", "x.py"], scope="large")
+        newer.created_at = _now()
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts(
+            [notyet.id, newer.id], [notyet, newer], [], session, broadcast_fn
+        )
+        # No reservation (count<threshold) and no IN_PROGRESS → neither deferred.
+        assert set(result) == {notyet.id, newer.id}
+
+    @pytest.mark.asyncio
+    async def test_senior_does_not_defer_an_older_task(self):
+        """Seniority is strict-FIFO by age: a senior holder must NOT defer a task
+        OLDER than itself (that task outranks the holder)."""
+        pid = uuid.uuid4()
+        older = _queued(pid, ["models.py", "y.py"], scope="large")
+        older.created_at = _now() - timedelta(hours=4)
+        senior = _senior_queued(
+            pid, ["models.py"], {"models.py"}, created_at=_now() - timedelta(hours=1)
+        )
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts(
+            [older.id, senior.id], [older, senior], [], session, broadcast_fn
+        )
+        # The older task is not deferred by the younger senior's reservation.
+        assert older.id in result
+
+    @pytest.mark.asyncio
+    async def test_senior_reservation_title_no_lazy_load(self, db_session):
+        """Regression: a senior reservation holder used as ``blocking_task`` has
+        its ``.title`` read for the deferral message. Senior holders are loaded
+        via the candidate scan (CANDIDATE_LIGHT_COLUMNS) or the parked-BLOCKED
+        scan (BLOCKED_CONFLICT_LIGHT_COLUMNS); both MUST carry Task.title or the
+        ``.title`` access at orchestrator_filters.py is a sync lazy-load from
+        async context (MissingGreenlet) that crashes the ENTIRE dispatch cycle.
+
+        This exercises the feature's MAIN path: a candidate defers PURELY behind
+        a senior reservation with NO IN_PROGRESS overlap. Importing the real
+        column constants means dropping Task.title from either re-breaks here —
+        the make_task unit tests above can't catch it because their in-memory
+        objects aren't load_only-deferred ORM instances.
+        """
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        # Senior parked-BLOCKED holder (older) reserving models.py, plus a senior
+        # QUEUED holder reserving config.py — one for each load path.
+        base = _now() - timedelta(hours=2)
+        senior_blocked = _blocked_conflict(project.id, {"models.py"}, created_at=base)
+        senior_queued = _senior_queued(
+            project.id, ["config.py"], {"config.py"}, created_at=base
+        )
+        # Newer candidates that overlap each senior's reserved file (no IN_PROGRESS).
+        cand_a = _queued(project.id, ["models.py", "x.py"], scope="large")
+        cand_a.created_at = _now()
+        cand_b = _queued(project.id, ["config.py", "y.py"], scope="large")
+        cand_b.created_at = _now()
+        db_session.add_all([senior_blocked, senior_queued, cand_a, cand_b])
+        await db_session.commit()
+        db_session.expunge_all()
+
+        # Re-load EXACTLY as the dispatch loop does, with title-deferred-unless-
+        # listed load_only sets.
+        candidates = (
+            (
+                await db_session.execute(
+                    select(Task)
+                    .where(Task.status == TaskStatus.QUEUED)
+                    .options(load_only(*CANDIDATE_LIGHT_COLUMNS))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        blocked_holders = (
+            (
+                await db_session.execute(
+                    select(Task)
+                    .where(
+                        Task.status == TaskStatus.BLOCKED,
+                        Task.blocker_kind == "file_conflict",
+                    )
+                    .options(load_only(*BLOCKED_CONFLICT_LIGHT_COLUMNS))
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        # Reading blocking_task.title for the deferral message must NOT raise
+        # MissingGreenlet; both newer candidates defer behind their seniors.
+        result = await filter_file_conflicts(
+            [c.id for c in candidates],
+            candidates,
+            [],
+            db_session,
+            AsyncMock(),
+            blocked_holders,
+        )
+        cand_ids = {cand_a.id, cand_b.id}
+        assert not (cand_ids & set(result))

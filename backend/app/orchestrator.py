@@ -655,6 +655,49 @@ ACTIVE_TASKS_LIGHT_COLUMNS = (
 )
 
 
+# Light column set for the QUEUED candidate scan (Step 2.4 candidate_stmt). Drops
+# heavy JSONB (status_log_data / history blobs) but MUST carry every column a
+# downstream Step-2.5 filter reads on a candidate — including ``title``, because a
+# QUEUED candidate that becomes a senior file-conflict reservation holder is used
+# as ``blocking_task`` and its ``.title`` is read for the deferral message
+# (orchestrator_filters.py). Deferring such a column makes that access a sync
+# lazy-load from async context → MissingGreenlet that crashes the whole cycle.
+CANDIDATE_LIGHT_COLUMNS = (
+    Task.id,
+    Task.status,
+    Task.priority,
+    Task.created_at,
+    Task.requires_approval,
+    Task.retry_after_until,
+    Task.context,
+    Task.depends_on,
+    Task.launched_by_user_id,
+    Task.project_id,
+    Task.payloads,
+    Task.status_log,
+    Task.latest_status_message,
+    Task.parent_task_id,
+    Task.title,
+)
+
+
+# Light column set for parked-BLOCKED file-conflict holders (Step 2.5
+# blocked_conflict_tasks). They are absent from the QUEUED candidate scan but
+# still hold a seniority reservation; ``title`` is required because a parked
+# senior can be the ``blocking_task`` whose ``.title`` is read for the deferral
+# message (orchestrator_filters.py) — deferring it raises MissingGreenlet.
+BLOCKED_CONFLICT_LIGHT_COLUMNS = (
+    Task.id,
+    Task.status,
+    Task.created_at,
+    Task.context,
+    Task.project_id,
+    Task.blocker_kind,
+    Task.parent_task_id,
+    Task.title,
+)
+
+
 # ---------------------------------------------------------------------------
 # Cycle / health classification — extracted to ``app.orchestrator_health``.
 # Symbols below are re-exported so ``from app.orchestrator import ...`` keeps
@@ -1915,31 +1958,13 @@ async def orchestrator_worker():
                             )
                         ),
                     )
-                    .options(
-                        load_only(
-                            Task.id,
-                            Task.status,
-                            Task.priority,
-                            Task.created_at,
-                            Task.requires_approval,
-                            Task.retry_after_until,
-                            Task.context,
-                            Task.depends_on,
-                            Task.launched_by_user_id,
-                            Task.project_id,
-                            Task.payloads,
-                            Task.status_log,
-                            Task.latest_status_message,
-                            # Round 5 (2026-05-03): include parent_task_id — downstream
-                            # filter_rollup_conflicts at orchestrator_filters.py:184 reads
-                            # candidate.parent_task_id; deferring it triggers MissingGreenlet
-                            # under async and crashes the entire dispatch cycle, freezing
-                            # all QUEUED tasks. Same gotcha class as status_log per memory
-                            # `reference_load_only_event_listeners.md` — load_only that
-                            # excludes columns downstream code reads is fragile.
-                            Task.parent_task_id,
-                        )
-                    )
+                    # CANDIDATE_LIGHT_COLUMNS drops heavy JSONB but carries every
+                    # column a Step-2.5 filter reads on a candidate (status_log,
+                    # parent_task_id, title, ...). Excluding any of them makes the
+                    # downstream access a sync lazy-load from async context →
+                    # MissingGreenlet that crashes the whole dispatch cycle. See the
+                    # constant's docstring and reference_load_only_event_listeners.md.
+                    .options(load_only(*CANDIDATE_LIGHT_COLUMNS))
                     .order_by(Task.priority.desc().nullslast(), Task.created_at.asc())
                     .limit(max(slots_available * 2, 50))
                 )  # Fetch extra; NULL priority = lowest
@@ -2343,12 +2368,38 @@ async def orchestrator_worker():
                 )
 
                 # Step 2.5: File-conflict check — defer tasks that would conflict with in-progress work
+                # Parked BLOCKED file-conflict tasks are absent from the QUEUED
+                # candidate scan, but they still hold a seniority reservation on
+                # their contested files (so a stream of newer same-file tasks
+                # cannot grab the lock while a long-waiting task is parked). Load
+                # them light — only the columns filter_file_conflicts reads
+                # (context/parent_task_id/created_at/blocker_kind) — to keep this
+                # async-safe (no MissingGreenlet lazy-load) and cheap.
+                blocked_conflict_tasks = []
+                if eligible_ids:
+                    blocked_conflict_tasks = (
+                        (
+                            await session.execute(
+                                select(Task)
+                                .where(
+                                    Task.status == TaskStatus.BLOCKED,
+                                    Task.blocker_kind == "file_conflict",
+                                )
+                                .options(
+                                    load_only(*BLOCKED_CONFLICT_LIGHT_COLUMNS)
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
                 eligible_ids = await filter_file_conflicts(
                     eligible_ids,
                     candidate_tasks,
                     active_tasks_result,
                     session,
                     broadcast_to_project,
+                    blocked_conflict_tasks,
                 )
 
                 # Step 2.6: Defer tasks that overlap with pending-rollup files
