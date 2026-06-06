@@ -630,12 +630,13 @@ async def test_head_collision_multi_migration_auto_renumbers_full_tail_and_defer
     assert mock_commit.await_args.args[3] == "research/conflict-stg"
     upserts = mock_commit.await_args.kwargs["upserts"]
     deletes = mock_commit.await_args.kwargs["deletes"]
-    # The whole chain renumbered above max(0125) → 0126, 0127; main.py bumped to
-    # the new head 0127.
-    assert "backend/alembic/versions/0126_a.py" in upserts
-    assert "backend/alembic/versions/0127_b.py" in upserts
+    # The added revision ids are provisional: the chain finalizes onto the
+    # target's current head 0124, filling the next free live slots → 0125, 0126;
+    # main.py bumped to the new head 0126.
+    assert "backend/alembic/versions/0125_a.py" in upserts
+    assert "backend/alembic/versions/0126_b.py" in upserts
     assert "backend/app/main.py" in upserts
-    assert '"0127"' in upserts["backend/app/main.py"]
+    assert '"0126"' in upserts["backend/app/main.py"]
     # Both old paths deleted so the rename is clean.
     assert "backend/alembic/versions/0124_a.py" in deletes
     assert "backend/alembic/versions/0125_b.py" in deletes

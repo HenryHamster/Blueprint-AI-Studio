@@ -70,7 +70,7 @@ from app.orchestrator_filters import (
     filter_rollup_conflicts,
     filter_held_directions,
     filter_pipeline_duplicates,
-    filter_migration_serialization,
+    reserve_migration_revisions,
     filter_scope_empty,
     cap_pipeline_slots,
     reserve_slots_for_types,
@@ -630,7 +630,7 @@ _provision_coroutines: Dict[str, asyncio.Task] = {}
 # Columns the dispatch loop loads for active (PROVISIONING/IN_PROGRESS) tasks.
 # Heavy JSONB (status_log, depends_on, history) stays deferred. Anything a
 # downstream filter touches (e.g. filter_file_conflicts -> context/title,
-# filter_migration_serialization -> payloads via first_payload) MUST be here,
+# reserve_migration_revisions -> payloads via first_payload) MUST be here,
 # or attribute access triggers a sync lazy-load from async context and crashes
 # the whole dispatch cycle. Module-level so tests can mirror the exact set.
 ACTIVE_TASKS_LIGHT_COLUMNS = (
@@ -1428,7 +1428,7 @@ async def orchestrator_worker():
                 # deferred — the few stale tasks are re-read through task_lock()
                 # before mutation below.
                 # context + title are needed by filter_file_conflicts (Step 2.5).
-                # payloads is needed by filter_migration_serialization (Step 2.72)
+                # payloads is needed by reserve_migration_revisions (Step 2.72)
                 # via _is_migration_task -> task.first_payload.
                 # Without them, attribute access triggers a sync lazy-load from an
                 # async context and crashes the whole dispatch cycle.
@@ -2412,14 +2412,17 @@ async def orchestrator_worker():
                     eligible_ids, candidate_tasks, session, broadcast_to_project
                 )
 
-                # Step 2.72: Serialize migration-producing tasks per project to avoid
-                # duplicate alembic revisions racing on the same down_revision.
-                eligible_ids = await filter_migration_serialization(
+                # Step 2.72: Reserve a provisional alembic revision id for each
+                # migration-producing candidate instead of serializing them. The
+                # allocator locks distinct monotonic ids per project, so siblings
+                # no longer wait behind a holder's full execution/test lifecycle —
+                # the slot releases the moment numbering is locked. Returns
+                # eligible_ids unchanged (no deferral); the reserved id rides the
+                # agent claim and is consumed verbatim.
+                eligible_ids = await reserve_migration_revisions(
                     eligible_ids,
                     candidate_tasks,
-                    active_tasks_result,
                     session,
-                    broadcast_to_project,
                 )
 
                 # Step 2.75: Pre-dispatch dedup safety net for review/fix pipeline

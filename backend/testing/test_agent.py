@@ -214,6 +214,77 @@ async def test_agent_claim_includes_task_capability_slice(client: AsyncClient, d
 
 
 @pytest.mark.asyncio
+async def test_agent_claim_surfaces_reserved_migration_revision(
+    client: AsyncClient, db_session
+):
+    """A migration task with an ACTIVE reservation surfaces it on the claim.
+
+    Proves the reserved identifiers reach the agent end to end: the orchestrator
+    locks a provisional revision, and the claim response carries it verbatim so
+    the agent consumes it instead of deriving max+1 locally.
+    """
+    from app.models import MigrationReservation, MigrationReservationStatus
+
+    project = Project(name="Agent Claim Reservation Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "migrate", "cmd": "ls"}],
+        vm_instance_id="agent-vm-reservation",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    reservation = MigrationReservation(
+        project_id=project.id,
+        task_id=task.id,
+        provisional_revision="0153",
+        provisional_down_revision="0151",
+        status=MigrationReservationStatus.ACTIVE,
+    )
+    db_session.add(reservation)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), "agent-vm-reservation")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["migration_reservation"] == {
+        "provisional_revision": "0153",
+        "provisional_down_revision": "0151",
+    }
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_omits_reservation_when_none(client: AsyncClient, db_session):
+    """A task with no reservation omits the key (backward-compatible claim)."""
+    project = Project(name="Agent Claim No Reservation", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "migrate", "cmd": "ls"}],
+        vm_instance_id="agent-vm-no-reservation",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-no-reservation")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    assert "migration_reservation" not in resp.json()
+
+
+@pytest.mark.asyncio
 async def test_agent_claim_includes_compute_experiment_capability_slice(
     client: AsyncClient, db_session
 ):

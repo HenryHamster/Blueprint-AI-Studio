@@ -888,6 +888,7 @@ from app.reaper_sweeps import (  # noqa: E402
     sweep_queued_age_alerts,
     sweep_stalled_strategic_cycles,
     sweep_regression_scan,
+    sweep_stale_migration_reservations,
     sweep_stuck_qualifications,
     sweep_routine_message_retention,
     sweep_unblock_blocked_tasks,
@@ -2435,12 +2436,29 @@ async def reaper_service():
                                     ),
                                     non_merge_reason="merged_pr_non_integration_branch",
                                 )
-                                # Defer the direction-outcome refresh until after the
-                                # per-row commit persists this landing (a fresh
-                                # session re-fetches the task — the reaper's per-row
-                                # commit can expire ``task``, so reading its context
-                                # here would risk a sync lazy-load / MissingGreenlet).
-                                _orphan_merge_refresh_needed = True
+                            try:
+                                from app.task_completion import (  # noqa: PLC0415
+                                    _finalize_migration_reservation_after_merge,
+                                )
+
+                                await _finalize_migration_reservation_after_merge(
+                                    task,
+                                    session,
+                                    terminal_merge=_terminal_rollup_merge,
+                                )
+                            except Exception as _mr_exc:  # noqa: BLE001
+                                logger.warning(
+                                    "[MIGRATION] Failed to finalize reservation for "
+                                    "reaped merged task %s: %r",
+                                    task.id,
+                                    _mr_exc,
+                                )
+                            # Defer the direction-outcome refresh until after the
+                            # per-row commit persists this landing (a fresh
+                            # session re-fetches the task — the reaper's per-row
+                            # commit can expire ``task``, so reading its context
+                            # here would risk a sync lazy-load / MissingGreenlet).
+                            _orphan_merge_refresh_needed = True
                             session.add(task)
                             await broadcast_to_project(
                                 str(task.project_id),
@@ -3696,6 +3714,15 @@ async def reaper_service():
                     just_reaped_ids=_orphaned_task_ids,
                     progress_cb=_mark_reaper_progress,
                 )
+                try:
+                    await sweep_stale_migration_reservations(session)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Migration-reservation sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
 
                 # Step 6: QUEUED task age alerts — 3-tier INFO/WARNING/ERROR escalation.
                 _mark_reaper_progress()

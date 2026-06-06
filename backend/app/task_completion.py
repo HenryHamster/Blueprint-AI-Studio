@@ -679,6 +679,131 @@ async def _record_project_remediation_outcome(
     return True
 
 
+_MIGRATION_FINALIZATION_CONTEXT_KEY = "_migration_finalization"
+
+
+def _migration_finalized_revision_from_context(task: Task | None) -> Optional[str]:
+    if task is None:
+        return None
+    finalization = (task.context or {}).get(_MIGRATION_FINALIZATION_CONTEXT_KEY)
+    if not isinstance(finalization, dict):
+        return None
+    revision = finalization.get("finalized_revision")
+    if not isinstance(revision, str):
+        return None
+    revision = revision.strip()
+    return revision or None
+
+
+def _persist_migration_finalization_for_downstream(
+    task: Task, source_task: Task | None
+) -> bool:
+    """Carry auto-finalization rewrite metadata onto the reservation-owning task.
+
+    The review/CI auto-finalization paths store the rewritten Alembic revision
+    under ``_migration_finalization`` on the merging CI/review task's context
+    (``source_task``), not on the reservation-owning task. When a non-terminal
+    (e.g. staged-rollup) merge keeps the reservation ACTIVE, that metadata must
+    be copied onto ``task`` so the eventual downstream terminal landing — whose
+    own ``source_task`` is a *different* CI task that never saw the rewrite — can
+    still record the correct ``finalized_revision`` instead of silently falling
+    back to ``reservation.provisional_revision`` for a renumbered migration.
+
+    Returns True when metadata was persisted onto ``task``.
+    """
+    if source_task is None or source_task is task:
+        return False
+    finalization = (source_task.context or {}).get(_MIGRATION_FINALIZATION_CONTEXT_KEY)
+    if not isinstance(finalization, dict):
+        return False
+    existing = (task.context or {}).get(_MIGRATION_FINALIZATION_CONTEXT_KEY)
+    if isinstance(existing, dict) and existing.get("finalized_revision"):
+        # Owning task already carries a rewrite — don't clobber it.
+        return False
+    task.context = {
+        **(task.context or {}),
+        _MIGRATION_FINALIZATION_CONTEXT_KEY: finalization,
+    }
+    flag_modified(task, "context")
+    return True
+
+
+def _reset_review_loop_pr_head_cache(review_loop: dict | None) -> dict:
+    """Force the next CI sweep to refetch the PR head after a branch rewrite."""
+
+    refreshed = dict(review_loop or {})
+    refreshed["head_sha"] = ""
+    refreshed["polls_since_pr_fetch"] = 999
+    for key in ("mergeable_state", "last_merge_msg", "_behind_update_retries"):
+        refreshed.pop(key, None)
+    return refreshed
+
+
+async def _finalize_migration_reservation_after_merge(
+    task: Task,
+    session: AsyncSession,
+    *,
+    source_task: Task | None = None,
+    terminal_merge: bool = True,
+) -> None:
+    """Finalize the task's ACTIVE migration reservation after a terminal PR merge."""
+    from app.migration_reservations import (  # noqa: PLC0415
+        finalize_migration_reservation,
+        get_migration_reservation_for_task,
+    )
+
+    if not terminal_merge:
+        preserved = _persist_migration_finalization_for_downstream(task, source_task)
+        if preserved:
+            session.add(task)
+        logger.info(
+            "[MIGRATION] keeping reservation ACTIVE for task %s after non-terminal "
+            "merge; awaiting downstream landing%s",
+            task.id,
+            " (preserved rewrite metadata for downstream landing)" if preserved else "",
+        )
+        return
+
+    finalized_revision = _migration_finalized_revision_from_context(source_task)
+    if finalized_revision is None:
+        finalized_revision = _migration_finalized_revision_from_context(task)
+    if finalized_revision is None:
+        reservation = await get_migration_reservation_for_task(session, task_id=task.id)
+        if reservation is None:
+            return
+        finalized_revision = reservation.provisional_revision
+    finalized = await finalize_migration_reservation(
+        session,
+        task_id=task.id,
+        finalized_revision=finalized_revision,
+    )
+    if finalized is not None:
+        logger.info(
+            "[MIGRATION] finalized reservation for task %s at revision %s",
+            task.id,
+            finalized_revision,
+        )
+
+
+async def _expire_migration_reservation_if_terminal(
+    task: Task,
+    status: "TaskStatus",
+    session: AsyncSession,
+) -> None:
+    """Expire an ACTIVE reservation once its owning task terminally fails."""
+    if status not in (TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.BLOCKED):
+        return
+    from app.migration_reservations import expire_migration_reservation  # noqa: PLC0415
+
+    expired = await expire_migration_reservation(session, task_id=task.id)
+    if expired is not None:
+        logger.info(
+            "[MIGRATION] expired reservation for terminal task %s (%s)",
+            task.id,
+            getattr(status, "value", status),
+        )
+
+
 async def _release_pool_member_if_terminal(
     task: Task,
     status: "TaskStatus",
@@ -1278,6 +1403,17 @@ async def _maybe_release_safeguard_gate(
                 else:
                     _res = await merge_pull_request(gh_token, owner, repo, int(pr_num))
                     if _res.get("merged"):
+                        try:
+                            await _finalize_migration_reservation_after_merge(
+                                orig, session
+                            )
+                        except Exception as _mr_exc:  # noqa: BLE001
+                            logger.warning(
+                                "[MIGRATION] Failed to finalize reservation for "
+                                "merged task %s: %r",
+                                orig.id,
+                                _mr_exc,
+                            )
                         logger.info(
                             f"[SAFEGUARD] Fired held merge for COMPLETED orig "
                             f"{safeguard_for_id[:8]} PR #{pr_num} after gate release"

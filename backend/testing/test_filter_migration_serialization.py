@@ -1,176 +1,212 @@
-"""Unit tests for filter_migration_serialization in orchestrator_filters."""
+"""Tests for reserve_migration_revisions in orchestrator_filters.
 
-import uuid
+The old project-wide IN_PROGRESS serialization is replaced by a reserve-then-
+release flow: a dispatchable migration-producing candidate is handed a distinct
+provisional revision id up-front (locking its number) and is NOT held behind a
+sibling's full execution/test lifecycle. These tests prove the slot releases
+immediately after reservation and that distinct, monotonic ids are allocated —
+while non-migration tasks are untouched and a transient allocation failure never
+blocks dispatch.
+
+The on-disk migration head is pinned via ``_current_merged_head`` so these tests
+are independent of the live alembic chain (which grows as migrations land).
+"""
+
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from sqlmodel import select
 
-from sqlalchemy import select
-from sqlalchemy.orm import load_only
+from app import migration_reservations
+from app.migration_reservations import get_migration_reservation_for_task
+from app.models import (
+    MigrationReservation,
+    Project,
+    Task,
+    TaskStatus,
+)
+from app.orchestrator_filters import reserve_migration_revisions
 
-from app.models import Task, TaskStatus
-from app.orchestrator import ACTIVE_TASKS_LIGHT_COLUMNS
-from app.orchestrator_filters import filter_migration_serialization
-from testing.factories import make_project, make_task
 
-
-def _task(project_id, status, ttype="migrate", files=None):
-    return make_task(
-        project_id=project_id,
-        status=status,
-        context={"related_files": files or []},
-        payloads=[{"type": ttype}],
+@pytest.fixture(autouse=True)
+def _pin_head(monkeypatch):
+    """Pin the merged chain head to 0151 regardless of the live alembic dir."""
+    monkeypatch.setattr(
+        migration_reservations,
+        "_current_merged_head",
+        lambda versions_dir=None: "0151",
     )
 
 
-class TestFilterMigrationSerialization:
+async def _project(session, name="Reserve Migration"):
+    project = Project(name=name, user_id="test-user")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+    return project
+
+
+async def _task(session, project_id, *, ttype="migrate", files=None):
+    task = Task(
+        project_id=project_id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": ttype}],
+        context={"related_files": files or []},
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+class TestReserveMigrationRevisions:
     @pytest.mark.asyncio
-    async def test_concurrent_migrate_tasks_serialized(self):
-        pid = uuid.uuid4()
-        ip = _task(pid, TaskStatus.IN_PROGRESS, ttype="migrate")
-        c = _task(pid, TaskStatus.QUEUED, ttype="migrate")
-        session = MagicMock()
-        broadcast = AsyncMock()
+    async def test_concurrent_migration_tasks_both_release_with_distinct_revisions(
+        self, db_session
+    ):
+        """Two concurrent migrate tasks each get a distinct id and BOTH dispatch.
 
-        result = await filter_migration_serialization(
-            [c.id], [c], [ip], session, broadcast
-        )
-        assert result == []
-        assert "serializing migration" in (c.latest_status_message or "")
-        broadcast.assert_awaited_once()
+        This is the core of de-convoying: neither candidate is deferred behind
+        the other (the slot releases the moment numbering is locked).
+        """
+        project = await _project(db_session)
+        a = await _task(db_session, project.id, ttype="migrate")
+        b = await _task(db_session, project.id, ttype="migrate")
 
-    @pytest.mark.asyncio
-    async def test_create_task_with_alembic_file_triggers_serialization(self):
-        pid = uuid.uuid4()
-        ip = _task(
-            pid,
-            TaskStatus.IN_PROGRESS,
-            ttype="create",
-            files=["backend/alembic/versions/0042_x.py", "backend/app/models.py"],
-        )
-        c = _task(pid, TaskStatus.QUEUED, ttype="migrate")
-        session = MagicMock()
-        broadcast = AsyncMock()
+        result = await reserve_migration_revisions([a.id, b.id], [a, b], db_session)
 
-        result = await filter_migration_serialization(
-            [c.id], [c], [ip], session, broadcast
-        )
-        assert result == []
+        # Slot releases for BOTH — neither is held behind the other.
+        assert result == [a.id, b.id]
+
+        res_a = await get_migration_reservation_for_task(db_session, task_id=a.id)
+        res_b = await get_migration_reservation_for_task(db_session, task_id=b.id)
+        assert res_a is not None and res_b is not None
+        # Distinct, monotonic ids anchored on the same merged head.
+        assert {res_a.provisional_revision, res_b.provisional_revision} == {
+            "0152",
+            "0153",
+        }
+        assert res_a.provisional_down_revision == "0151"
+        assert res_b.provisional_down_revision == "0151"
 
     @pytest.mark.asyncio
-    async def test_create_task_with_models_py_serialized_behind_migrate(self):
-        pid = uuid.uuid4()
-        ip = _task(pid, TaskStatus.IN_PROGRESS, ttype="migrate")
-        c = _task(
-            pid,
-            TaskStatus.QUEUED,
+    async def test_create_task_touching_models_py_is_reserved(self, db_session):
+        """A create task that touches models.py is migration-producing → reserved."""
+        project = await _project(db_session)
+        c = await _task(
+            db_session,
+            project.id,
             ttype="create",
             files=["backend/app/models.py"],
         )
-        session = MagicMock()
-        broadcast = AsyncMock()
 
-        result = await filter_migration_serialization(
-            [c.id], [c], [ip], session, broadcast
-        )
-        assert result == []
-        assert "serializing migration" in (c.latest_status_message or "")
-        broadcast.assert_awaited_once()
+        result = await reserve_migration_revisions([c.id], [c], db_session)
 
-    @pytest.mark.asyncio
-    async def test_non_migration_task_unaffected(self):
-        pid = uuid.uuid4()
-        ip = _task(pid, TaskStatus.IN_PROGRESS, ttype="migrate")
-        c = _task(pid, TaskStatus.QUEUED, ttype="fix", files=["backend/app/foo.py"])
-        session = MagicMock()
-        broadcast = AsyncMock()
-
-        result = await filter_migration_serialization(
-            [c.id], [c], [ip], session, broadcast
-        )
         assert result == [c.id]
-        broadcast.assert_not_called()
+        res = await get_migration_reservation_for_task(db_session, task_id=c.id)
+        assert res is not None
+        assert res.provisional_revision == "0152"
+        assert res.provisional_down_revision == "0151"
 
     @pytest.mark.asyncio
-    async def test_different_projects_not_serialized(self):
-        ip = _task(uuid.uuid4(), TaskStatus.IN_PROGRESS, ttype="migrate")
-        c = _task(uuid.uuid4(), TaskStatus.QUEUED, ttype="migrate")
-        session = MagicMock()
-        broadcast = AsyncMock()
-
-        result = await filter_migration_serialization(
-            [c.id], [c], [ip], session, broadcast
+    async def test_create_task_touching_alembic_file_is_reserved(self, db_session):
+        project = await _project(db_session)
+        c = await _task(
+            db_session,
+            project.id,
+            ttype="create",
+            files=["backend/alembic/versions/0152_x.py"],
         )
+
+        result = await reserve_migration_revisions([c.id], [c], db_session)
+
         assert result == [c.id]
+        assert (
+            await get_migration_reservation_for_task(db_session, task_id=c.id)
+            is not None
+        )
 
     @pytest.mark.asyncio
-    async def test_no_in_progress_passes_through(self):
-        pid = uuid.uuid4()
-        c = _task(pid, TaskStatus.QUEUED, ttype="migrate")
-        session = MagicMock()
-        broadcast = AsyncMock()
-
-        result = await filter_migration_serialization(
-            [c.id], [c], [], session, broadcast
+    async def test_non_migration_task_gets_no_reservation(self, db_session):
+        project = await _project(db_session)
+        c = await _task(
+            db_session, project.id, ttype="fix", files=["backend/app/foo.py"]
         )
+
+        result = await reserve_migration_revisions([c.id], [c], db_session)
+
         assert result == [c.id]
+        assert (
+            await get_migration_reservation_for_task(db_session, task_id=c.id) is None
+        )
 
     @pytest.mark.asyncio
-    async def test_active_tasks_loaded_with_orchestrator_load_only_no_lazy_load(
-        self, db_session
-    ):
-        """Regression: filter must not trigger sync lazy-load on Task.payloads.
+    async def test_reservation_is_idempotent_across_cycles(self, db_session):
+        """Re-running the filter every dispatch cycle never burns a fresh id."""
+        project = await _project(db_session)
+        a = await _task(db_session, project.id, ttype="migrate")
 
-        The orchestrator dispatch loop fetches active tasks with the
-        ACTIVE_TASKS_LIGHT_COLUMNS load_only set. _is_migration_task reads
-        task.first_payload (i.e. task.payloads), so payloads MUST be in that
-        set or the access triggers a sync IO load from async context
-        (MissingGreenlet) and crashes the cycle. Importing the constant means
-        if someone drops Task.payloads from it, this test re-breaks.
-        """
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
+        await reserve_migration_revisions([a.id], [a], db_session)
+        first = await get_migration_reservation_for_task(db_session, task_id=a.id)
 
-        ip = make_task(
-            project_id=project.id,
-            status=TaskStatus.IN_PROGRESS,
-            payloads=[{"type": "migrate"}],
-        )
-        cand = make_task(
-            project_id=project.id,
-            status=TaskStatus.QUEUED,
-            payloads=[{"type": "migrate"}],
-        )
-        db_session.add_all([ip, cand])
-        await db_session.commit()
-        db_session.expunge_all()
-
-        active = (
+        await reserve_migration_revisions([a.id], [a], db_session)
+        rows = (
             (
                 await db_session.execute(
-                    select(Task)
-                    .where(
-                        Task.status.in_(
-                            [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
-                        )
+                    select(MigrationReservation).where(
+                        MigrationReservation.task_id == a.id
                     )
-                    .options(load_only(*ACTIVE_TASKS_LIGHT_COLUMNS))
                 )
             )
             .scalars()
             .all()
         )
-        candidates = (
-            (
-                await db_session.execute(
-                    select(Task).where(Task.status == TaskStatus.QUEUED)
-                )
-            )
-            .scalars()
-            .all()
+        assert len(rows) == 1
+        second = await get_migration_reservation_for_task(db_session, task_id=a.id)
+        assert second is not None and first is not None
+        assert second.id == first.id
+        assert second.provisional_revision == first.provisional_revision
+
+    @pytest.mark.asyncio
+    async def test_different_projects_each_reserve_off_their_own_head(self, db_session):
+        p1 = await _project(db_session, name="P1")
+        p2 = await _project(db_session, name="P2")
+        a = await _task(db_session, p1.id, ttype="migrate")
+        b = await _task(db_session, p2.id, ttype="migrate")
+
+        result = await reserve_migration_revisions([a.id, b.id], [a, b], db_session)
+
+        assert result == [a.id, b.id]
+        res_a = await get_migration_reservation_for_task(db_session, task_id=a.id)
+        res_b = await get_migration_reservation_for_task(db_session, task_id=b.id)
+        # Separate projects each anchor on the head independently — same id is fine.
+        assert res_a is not None and res_a.provisional_revision == "0152"
+        assert res_b is not None and res_b.provisional_revision == "0152"
+
+    @pytest.mark.asyncio
+    async def test_empty_eligible_returns_empty(self, db_session):
+        assert await reserve_migration_revisions([], [], db_session) == []
+
+    @pytest.mark.asyncio
+    async def test_allocation_failure_does_not_block_dispatch(
+        self, db_session, monkeypatch
+    ):
+        """A transient allocation failure leaves the task dispatchable.
+
+        The agent falls back to deriving max+1 locally when no reservation
+        rides the claim, so a degraded allocator must not strand the task.
+        """
+        project = await _project(db_session)
+        a = await _task(db_session, project.id, ttype="migrate")
+
+        async def _boom(session, task, **kw):
+            raise RuntimeError("allocator unavailable")
+
+        monkeypatch.setattr(
+            migration_reservations, "allocate_migration_reservation", _boom
         )
 
-        result = await filter_migration_serialization(
-            [c.id for c in candidates], candidates, active, db_session, AsyncMock()
+        result = await reserve_migration_revisions([a.id], [a], db_session)
+
+        assert result == [a.id]
+        assert (
+            await get_migration_reservation_for_task(db_session, task_id=a.id) is None
         )
-        assert result == []  # candidate deferred behind in-progress migration

@@ -803,6 +803,37 @@ describe('handleMigrate — stale-branch handling and runCodeChangeTask delegati
     expect(prompt).toContain('Task: Migration: user roles');
   });
 
+  it('injects reserved-revision guidance when the claim carries a reservation', async () => {
+    await handleMigrate(
+      TASK_ID,
+      { ...BASE_PAYLOAD, prompt: 'Add column' },
+      {
+        ...BASE_TASK,
+        migration_reservation: {
+          provisional_revision: '0153',
+          provisional_down_revision: '0151',
+        },
+      },
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const prompt = capturedMigratePrompt();
+    expect(prompt).toContain('Reserved migration revision');
+    expect(prompt).toContain('revision = "0153"');
+    expect(prompt).toContain('down_revision = "0151"');
+    expect(prompt).toContain('0153_<short_description>.py');
+    expect(prompt).toContain('EXPECTED_SCHEMA_REVISION = "0153"');
+  });
+
+  it('omits reserved-revision guidance when no reservation rides the claim', async () => {
+    await handleMigrate(
+      TASK_ID,
+      { ...BASE_PAYLOAD, prompt: 'Add column' },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const prompt = capturedMigratePrompt();
+    expect(prompt).not.toContain('Reserved migration revision');
+  });
+
   it('throws when no prompt is provided in payload or task', async () => {
     await expect(
       handleMigrate(

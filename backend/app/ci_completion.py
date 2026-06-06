@@ -183,12 +183,65 @@ async def _attempt_merge_with_retry_and_escalation(
     # mirroring the requires_approval early-return above. This runs after that
     # approval gate so gate-block behavior is unchanged.
     if ci_pr_number:
-        from app.rollup_migration_validation import enforce_premerge_migration_guard
+        from app.migration_reservations import get_migration_reservation_for_task
+        from app.rollup_management import attempt_pr_migration_finalization
+        from app.rollup_migration_validation import (
+            enforce_premerge_migration_guard,
+        )
 
         _ok_to_merge, _hold_reason = await enforce_premerge_migration_guard(
             gh_token, owner, repo, ci_pr_number, ci_base
         )
         if not _ok_to_merge:
+            reservation_task_id = (
+                uuid.UUID(ci_orig_id) if ci_orig_id else task.id
+            )
+            reservation = await get_migration_reservation_for_task(
+                session, task_id=reservation_task_id
+            )
+            if reservation is not None and ci_branch and ci_base:
+                try:
+                    finalization = await attempt_pr_migration_finalization(
+                        gh_token,
+                        owner,
+                        repo,
+                        pr_number=ci_pr_number,
+                        pr_branch=ci_branch,
+                        target_branch=ci_base,
+                        promotion_target=(
+                            get_project_promotion_target(_merge_project)
+                            if _merge_project is not None
+                            else None
+                        ),
+                        project_id=str(task.project_id),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[CI] Migration finalization attempt failed for PR #%s: %s",
+                        ci_pr_number,
+                        exc,
+                        exc_info=True,
+                    )
+                    finalization = None
+                if finalization is not None:
+                    from app.task_completion import _reset_review_loop_pr_head_cache
+
+                    review_loop = _reset_review_loop_pr_head_cache(ci_loop)
+                    review_loop.update({"ci_waiting": True, "ci_passed": False})
+                    task.context = {
+                        **(task.context or {}),
+                        "_migration_finalization": finalization,
+                        "review_loop": review_loop,
+                    }
+                    flag_modified(task, "context")
+                    task.latest_status_message = (
+                        "Merge held — auto-finalized provisional Alembic "
+                        f"migration {finalization['old_revision']}->"
+                        f"{finalization['finalized_revision']} against {ci_base}; "
+                        "awaiting fresh CI on the rewritten PR head"
+                    )[:500]
+                    session.add(task)
+                    return False
             logger.warning(
                 f"[CI] Merge held for PR #{ci_pr_number} — Alembic combined-chain "
                 f"guard: {_hold_reason}"
@@ -403,6 +456,9 @@ async def _attempt_merge_with_retry_and_escalation(
                 )
                 from app.database import AsyncSessionLocal
                 from app.models import Project
+                from app.task_completion import (
+                    _finalize_migration_reservation_after_merge,
+                )
 
                 async with AsyncSessionLocal() as _orig_session:
                     orig = await _orig_session.get(Task, uuid.UUID(ci_orig_id))
@@ -486,6 +542,12 @@ async def _attempt_merge_with_retry_and_escalation(
                                 ),
                                 non_merge_reason="merged_pr_non_integration_branch",
                             )
+                        await _finalize_migration_reservation_after_merge(
+                            orig,
+                            _orig_session,
+                            source_task=task,
+                            terminal_merge=_terminal_rollup_merge,
+                        )
                         if orig.status == TaskStatus.EVALUATING and not (
                             orig.context or {}
                         ).get("review_loop", {}).get("ci_waiting"):

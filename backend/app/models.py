@@ -209,6 +209,28 @@ class PoolVmState(str, Enum):
     RETIRING = "RETIRING"
 
 
+class MigrationReservationStatus(str, Enum):
+    """Lifecycle of a provisional Alembic revision reservation.
+
+    ACTIVE    — the reservation holds a provisional revision id for an
+                in-flight migration-producing task; it participates in
+                next-number allocation so concurrent tasks get distinct ids.
+    FINALIZED — the migration merged; ``finalized_revision`` records the id the
+                migration actually shipped under (which may differ from the
+                provisional id if a merge-time renumber moved it).
+    EXPIRED   — the reserving task was reaped/abandoned without shipping; the
+                reservation no longer participates in allocation and its
+                provisional id is free to be re-handed-out.
+
+    Stored as the enum *value* in a plain String column, mirroring
+    ``ComputeJobStatus`` / ``TaskStatus``.
+    """
+
+    ACTIVE = "ACTIVE"
+    FINALIZED = "FINALIZED"
+    EXPIRED = "EXPIRED"
+
+
 # --- Auto-pause diagnosis workflow constants ---
 # Shared values for the direction auto-pause -> investigate task spawn flow.
 # Kept here so direction_lifecycle, anomaly_detection, task_completion, and
@@ -3607,5 +3629,89 @@ class QualificationVerdict(SQLModel, table=True):
             "ix_qualificationverdict_project_created",
             "project_id",
             "created_at",
+        ),
+    )
+
+
+class MigrationReservation(SQLModel, table=True):
+    """A provisional Alembic revision id reserved for a migration-producing task.
+
+    Migration authoring serializes the whole pipeline when the orchestrator
+    holds a single "one migration-producing task at a time" slot for a task's
+    entire agent run. A reservation breaks that convoy: the moment a task needs
+    a revision id it is handed a provisional ``revision`` / ``down_revision`` off
+    the merged chain head, and concurrent tasks each get the NEXT distinct
+    monotonic id (the allocator considers both the merged head and every still
+    ``ACTIVE`` reservation). The reservation persists enough lifecycle state for
+    a later merge-time finalize (``FINALIZED`` + ``finalized_revision``) or an
+    expiry sweep (``EXPIRED``) to reconcile the provisional id against what the
+    migration actually shipped under.
+
+    The agent-facing contract is intentionally additive (the ORM row is
+    returned as-is) so a later claim-response rollout can expose the reservation
+    without breaking existing consumers.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(foreign_key="project.id")
+    # Detach-on-delete (SET NULL), NOT cascade: a reservation is durable
+    # allocation history that must outlive its originating task so a merge-time
+    # finalize/expiry can still reconcile the provisional id. Mirrors
+    # ComputeJob.task_id.
+    task_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("task.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
+
+    # The provisional revision id handed to the task, and the chain head it was
+    # anchored onto. Both are the NNNN-style Alembic ids parsed by
+    # ``migration_chain``; kept as strings to preserve zero-padding/width.
+    provisional_revision: str = Field(
+        sa_column=Column(String(64), nullable=False, index=True)
+    )
+    provisional_down_revision: str = Field(
+        sa_column=Column(String(64), nullable=False)
+    )
+
+    status: MigrationReservationStatus = Field(
+        default=MigrationReservationStatus.ACTIVE,
+        sa_column=Column(
+            String,
+            nullable=False,
+            server_default=MigrationReservationStatus.ACTIVE.value,
+        ),
+    )
+    # The revision id the migration actually shipped under, set at merge-time
+    # finalize. Usually equals ``provisional_revision``; differs only when a
+    # merge-time renumber moved the migration.
+    finalized_revision: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+
+    __table_args__ = (
+        # Hot path: scan a project's ACTIVE reservations during allocation.
+        Index(
+            "ix_migrationreservation_project_status",
+            "project_id",
+            "status",
         ),
     )

@@ -864,6 +864,27 @@ async def claim_task(
     task_capability = agent_capability_slice(task_type)
     if task_capability is not None:
         response["task_capability"] = task_capability
+
+    # Surface a reserved provisional Alembic revision (if the orchestrator
+    # allocated one for this migration-producing task) so the agent consumes the
+    # locked id verbatim instead of racing to derive max+1 against the live
+    # chain. Additive: a claim with no reservation simply omits the key and the
+    # agent falls back to local numbering, preserving backward compatibility for
+    # tasks queued before the reservation rollout.
+    from app.migration_reservations import (  # noqa: PLC0415
+        get_migration_reservation_for_task,
+    )
+
+    _migration_reservation = await get_migration_reservation_for_task(
+        session, task_id=task.id
+    )
+    if _migration_reservation is not None:
+        response["migration_reservation"] = {
+            "provisional_revision": _migration_reservation.provisional_revision,
+            "provisional_down_revision": (
+                _migration_reservation.provisional_down_revision
+            ),
+        }
     if (
         task_type in ("research", "plan", "create", "fix", "refactor", "review")
         or task_type in _PEER_CODE_ANALYSIS_TYPES

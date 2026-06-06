@@ -1126,6 +1126,12 @@ async def _process_post_commit(
                         # NOT merge — park EVALUATING with ci_waiting so the guarded
                         # CI-completion sweep retries once the collision resolves.
                         if not is_intermediate:
+                            from app.migration_reservations import (
+                                get_migration_reservation_for_task,
+                            )
+                            from app.rollup_management import (
+                                attempt_pr_migration_finalization,
+                            )
                             from app.rollup_migration_validation import (
                                 enforce_premerge_migration_guard,
                             )
@@ -1142,6 +1148,72 @@ async def _process_post_commit(
                                     f"#{pr_number} — Alembic combined-chain guard: "
                                     f"{_dh_reason}"
                                 )
+                                reservation = await get_migration_reservation_for_task(
+                                    session, task_id=task.id
+                                )
+                                if reservation is not None and branch and base_branch:
+                                    try:
+                                        _finalization = (
+                                            await attempt_pr_migration_finalization(
+                                                gh_token,
+                                                owner,
+                                                repo,
+                                                pr_number=pr_number,
+                                                pr_branch=branch,
+                                                target_branch=base_branch,
+                                                promotion_target=(
+                                                    _shared_state.get_project_promotion_target(
+                                                        _project
+                                                    )
+                                                    if _project is not None
+                                                    else None
+                                                ),
+                                                project_id=str(task.project_id),
+                                            )
+                                        )
+                                    except Exception as _mf_exc:  # noqa: BLE001
+                                        logger.warning(
+                                            "[PIPELINE] Migration finalization attempt "
+                                            "failed for PR #%s: %s",
+                                            pr_number,
+                                            _mf_exc,
+                                            exc_info=True,
+                                        )
+                                        _finalization = None
+                                    if _finalization is not None:
+                                        from app.task_completion import (  # noqa: PLC0415
+                                            _reset_review_loop_pr_head_cache,
+                                        )
+
+                                        task.status = TaskStatus.EVALUATING
+                                        task.latest_status_message = (
+                                            "Merge held — auto-finalized provisional "
+                                            "Alembic migration "
+                                            f"{_finalization['old_revision']}->"
+                                            f"{_finalization['finalized_revision']} "
+                                            f"against {base_branch}; awaiting fresh CI "
+                                            "on the rewritten PR head"
+                                        )[:500]
+                                        task.context = {
+                                            **(task.context or {}),
+                                            "_migration_finalization": _finalization,
+                                            "review_loop": {
+                                                **_reset_review_loop_pr_head_cache(
+                                                    (task.context or {}).get(
+                                                        "review_loop"
+                                                    )
+                                                ),
+                                                "ci_waiting": True,
+                                                "review_approved": True,
+                                                "ci_passed": False,
+                                                "pr_number": pr_number,
+                                                "branch": branch,
+                                                "base_branch": base_branch,
+                                            },
+                                        }
+                                        session.add(task)
+                                        await session.commit()
+                                        return {"status": "accepted"}
                                 task.status = TaskStatus.EVALUATING
                                 task.latest_status_message = (
                                     f"Merge held — Alembic dual-head guard: {_dh_reason}"
@@ -1194,6 +1266,23 @@ async def _process_post_commit(
                                         or (task.context or {}).get("hotfix")
                                     ),
                                     non_merge_reason="merged_pr_non_integration_branch",
+                                )
+                            try:
+                                from app.task_completion import (  # noqa: PLC0415
+                                    _finalize_migration_reservation_after_merge,
+                                )
+
+                                await _finalize_migration_reservation_after_merge(
+                                    task,
+                                    session,
+                                    terminal_merge=not is_intermediate,
+                                )
+                            except Exception as _mr_exc:  # noqa: BLE001
+                                logger.warning(
+                                    "[MIGRATION] Failed to finalize reservation for "
+                                    "merged task %s: %r",
+                                    task.id,
+                                    _mr_exc,
                                 )
                             session.add(task)
                             _t_ctx = task.context or {}
@@ -2481,6 +2570,12 @@ async def _process_post_commit(
                         # CI-completion path sets so the guarded sweep retries once
                         # the collision resolves.
                         if is_ci_gated_merge:
+                            from app.migration_reservations import (
+                                get_migration_reservation_for_task,
+                            )
+                            from app.rollup_management import (
+                                attempt_pr_migration_finalization,
+                            )
                             from app.rollup_migration_validation import (
                                 enforce_premerge_migration_guard,
                             )
@@ -2496,6 +2591,71 @@ async def _process_post_commit(
                                     f"[CI] Inline merge held for PR #{pr_number} — "
                                     f"Alembic combined-chain guard: {_dh_reason}"
                                 )
+                                reservation_task_id = (
+                                    uuid.UUID(original_task_id)
+                                    if original_task_id
+                                    else task.id
+                                )
+                                reservation = await get_migration_reservation_for_task(
+                                    session, task_id=reservation_task_id
+                                )
+                                if reservation is not None and branch and base_branch:
+                                    try:
+                                        _finalization = (
+                                            await attempt_pr_migration_finalization(
+                                                gh_token,
+                                                owner,
+                                                repo,
+                                                pr_number=pr_number,
+                                                pr_branch=branch,
+                                                target_branch=base_branch,
+                                                promotion_target=_promotion_target,
+                                                project_id=str(task.project_id),
+                                            )
+                                        )
+                                    except Exception as _mf_exc:  # noqa: BLE001
+                                        logger.warning(
+                                            "[CI] Migration finalization attempt failed "
+                                            "for PR #%s: %s",
+                                            pr_number,
+                                            _mf_exc,
+                                            exc_info=True,
+                                        )
+                                        _finalization = None
+                                    if _finalization is not None:
+                                        from app.task_completion import (  # noqa: PLC0415
+                                            _reset_review_loop_pr_head_cache,
+                                        )
+
+                                        task.status = TaskStatus.EVALUATING
+                                        task.latest_status_message = (
+                                            "Merge held — auto-finalized provisional "
+                                            "Alembic migration "
+                                            f"{_finalization['old_revision']}->"
+                                            f"{_finalization['finalized_revision']} "
+                                            f"against {base_branch}; awaiting fresh CI "
+                                            "on the rewritten PR head"
+                                        )[:500]
+                                        task.context = {
+                                            **(task.context or {}),
+                                            "_migration_finalization": _finalization,
+                                            "review_loop": {
+                                                **_reset_review_loop_pr_head_cache(
+                                                    review_loop
+                                                ),
+                                                "ci_waiting": True,
+                                                "review_approved": True,
+                                                "ci_passed": False,
+                                                "pr_number": pr_number,
+                                                "branch": branch,
+                                                "base_branch": base_branch,
+                                                "original_task_id": original_task_id,
+                                            },
+                                        }
+                                        session.add(task)
+                                        await session.commit()
+                                        action_taken = True
+                                        return {"status": "accepted"}
                                 task.status = TaskStatus.EVALUATING
                                 task.latest_status_message = (
                                     f"Merge held — Alembic dual-head guard: {_dh_reason}"
@@ -2650,6 +2810,24 @@ async def _process_post_commit(
                                                 non_merge_reason=(
                                                     "merged_pr_non_integration_branch"
                                                 ),
+                                            )
+                                        try:
+                                            from app.task_completion import (  # noqa: PLC0415
+                                                _finalize_migration_reservation_after_merge,
+                                            )
+
+                                            await _finalize_migration_reservation_after_merge(
+                                                orig,
+                                                session,
+                                                source_task=task,
+                                                terminal_merge=_terminal_rollup_merge,
+                                            )
+                                        except Exception as _mr_exc:  # noqa: BLE001
+                                            logger.warning(
+                                                "[MIGRATION] Failed to finalize "
+                                                "reservation for merged task %s: %r",
+                                                orig.id,
+                                                _mr_exc,
                                             )
                                         # If this was a rollup PR review, mark the
                                         # parent COMPLETED — but only if it is STILL
@@ -4247,6 +4425,22 @@ async def _process_post_commit(
             logger.error(
                 f"[LIFECYCLE] Terminal-record helper _record_remediation_if_terminal "
                 f"failed for task {task.id}: {_helper_exc!r}",
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
+        try:
+            from app.task_completion import (  # noqa: PLC0415
+                _expire_migration_reservation_if_terminal,
+            )
+
+            await _expire_migration_reservation_if_terminal(
+                task, payload.status, session
+            )
+        except Exception as _mr_exc:
+            logger.error(
+                f"[LIFECYCLE] Migration-reservation terminal cleanup failed for "
+                f"task {task.id}: {_mr_exc!r}",
                 exc_info=True,
             )
             with contextlib.suppress(Exception):

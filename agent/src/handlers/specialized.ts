@@ -23,6 +23,7 @@ import {
 import { resolveBuildConfig } from '../build-config.js';
 import { runCodeChangeTask } from './code-change.js';
 import { isParallelAuditEnabled, resolveCandidateSha } from './audits.js';
+import { extractReservedMigrationRevision, buildReservedRevisionGuidance } from './review-fix-migration.js';
 import { writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 export { resolveCandidateSha, handleSecurityAudit, handleSelfAudit, handleReleaseAudit } from './audits.js';
 
@@ -137,6 +138,19 @@ export async function handleMigrate(
   const alembicVersionsPath = `${migrateLayout.versionsDir}/`;
   const migrateModelsPath = `${migrateLayout.modelsDir}/`;
 
+  // If the orchestrator reserved a provisional revision for this task, the agent
+  // must use it verbatim rather than letting autogenerate pick the next number —
+  // that is what lets sibling migration tasks run in parallel without colliding.
+  const migrateReserved = extractReservedMigrationRevision(task);
+  const migrateReservedGuidance = migrateReserved
+    ? buildReservedRevisionGuidance(
+        migrateReserved,
+        alembicVersionsPath,
+        migrateLayout.schemaRevisionFile,
+        migrateLayout.schemaRevisionConst,
+      )
+    : '';
+
   // Schema-revision step. Only emitted when the project declares a schema
   // revision file (Blueprint: backend/app/main.py). A project with no
   // schema-revision gate sets schema_revision_file to '' and the step (and
@@ -214,7 +228,7 @@ CRITICAL RULES:
     schemaRevisionConst: migrateLayout.schemaRevisionConst,
   });
   const finalMigratePrompt = migrateAcceptanceEvidenceNotice + migrateClaudeMdSection + migrateContextSection + migratePlaybookSection + migrateRetryContext
-    + migratePrompt + migrateFirstTaskSection
+    + migrateReservedGuidance + migratePrompt + migrateFirstTaskSection
     + buildCodeChangeHelperGuidance({ buildConfig: migrateBuildConfig, owner, repo }) + migrateFocusBlock + PLAYBOOK_GUIDANCE
     + READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + PRIOR_ATTEMPT_DIVERGENCE + BEYOND_SCOPE_REPORTING
     + migratePromptSuffix + `

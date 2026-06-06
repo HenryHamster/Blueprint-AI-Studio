@@ -53,7 +53,7 @@ export type { AnnotatedIssue, AnnotatedEntry } from './review-fix-issue-dedup.js
 import type { DriftSignal } from './review-fix-history.js';
 import { computeMaxFixIterations, REVIEW_FEEDBACK_HISTORY_CHARS, formatTrajectorySection, formatDriftSection } from './review-fix-history.js';
 export { computeMaxFixIterations, REVIEW_FEEDBACK_HISTORY_CHARS, formatTrajectorySection, formatDriftSection, verifyStepsOk } from './review-fix-history.js';
-import { detectMigrationConflict, buildMigrationConflictGuidance } from './review-fix-migration.js';
+import { detectMigrationConflict, buildMigrationConflictGuidance, extractReservedMigrationRevision } from './review-fix-migration.js';
 import { resolveMigrationLayout } from './specialized.js';
 export { detectMigrationConflict, buildMigrationConflictGuidance } from './review-fix-migration.js';
 export type { MigrationConflict } from './review-fix-migration.js';
@@ -857,6 +857,7 @@ export async function handleFix(
       const guidance = buildMigrationConflictGuidance(
         migrationConflict, versionsDir,
         migrationLayout.schemaRevisionFile, migrationLayout.schemaRevisionConst,
+        extractReservedMigrationRevision(task),
       );
       enrichedPrompt = `${guidance}${enrichedPrompt}`;
       sendLog(ws, `Migration revision conflict detected: PR=${migrationConflict.prMigrations.join(',')} base-new=${migrationConflict.baseNewMigrations.join(',')}\n`);

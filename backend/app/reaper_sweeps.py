@@ -149,6 +149,39 @@ async def _purge_stale_routine_messages(session, retention_days: int = 7) -> int
     return res.rowcount
 
 
+async def sweep_stale_migration_reservations(session) -> int:
+    """Expire ACTIVE migration reservations whose owning task is gone or terminal-failed."""
+    from app.models import MigrationReservation, MigrationReservationStatus
+
+    rows = (
+        await session.execute(
+            select(MigrationReservation, Task.status)
+            .outerjoin(Task, Task.id == MigrationReservation.task_id)
+            .where(
+                MigrationReservation.status == MigrationReservationStatus.ACTIVE,
+            )
+        )
+    ).all()
+    expired = 0
+    now = _utcnow()
+    for reservation, task_status in rows:
+        if reservation.task_id is None or task_status in (
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+            TaskStatus.BLOCKED,
+        ):
+            reservation.status = MigrationReservationStatus.EXPIRED
+            reservation.updated_at = now
+            session.add(reservation)
+            expired += 1
+    if expired:
+        await session.commit()
+        logger.info(
+            "[REAPER] Expired %d stale migration reservation(s)", expired
+        )
+    return expired
+
+
 async def sweep_queued_age_alerts(
     session,
     now: datetime,

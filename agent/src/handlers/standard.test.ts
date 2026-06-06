@@ -175,6 +175,31 @@ describe('overlap warning text generation', () => {
     expect(capturedPrompt()).not.toContain('WARNING:');
   });
 
+  it('injects reserved-revision guidance for a create task with a reservation', async () => {
+    const task = {
+      title: 'Add column',
+      description: '',
+      context: { related_files: ['backend/app/models.py'] },
+      project_context: {},
+      migration_reservation: {
+        provisional_revision: '0153',
+        provisional_down_revision: '0151',
+      },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Add a column' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('Reserved migration revision');
+    expect(prompt).toContain('revision = "0153"');
+    expect(prompt).toContain('down_revision = "0151"');
+    expect(prompt).toContain('EXPECTED_SCHEMA_REVISION = "0153"');
+  });
+
+  it('omits reserved-revision guidance for a create task with no reservation', async () => {
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(capturedPrompt()).not.toContain('Reserved migration revision');
+  });
+
   it('generates no warning when file_overlap_warnings is an empty array', async () => {
     const task = {
       title: 'Task',

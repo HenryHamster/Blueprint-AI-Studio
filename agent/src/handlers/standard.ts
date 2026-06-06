@@ -27,6 +27,8 @@ import {
   type PrereqKnowledgeDoc,
 } from './prior-knowledge.js';
 import { resolveBuildConfig } from '../build-config.js';
+import { extractReservedMigrationRevision, buildReservedRevisionGuidance } from './review-fix-migration.js';
+import { resolveMigrationLayout } from './specialized.js';
 import { SCOPE_OVERFLOW_THRESHOLDS, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT, DEFAULT_CLONE_DEPTH } from '../constants.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { runCodeChangeTask } from './code-change.js';
@@ -267,6 +269,20 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const prTitlePrefixNote = prTitlePrefix
     ? `\n\nWhen you open the PR with ./pr open, start the title with ${prTitlePrefix}.`
     : '';
+  // A reserved provisional revision rides the claim only for migration-producing
+  // tasks (a create that touches models.py / an alembic file). When present, the
+  // agent must consume the locked id verbatim instead of deriving max+1, so
+  // concurrent schema work does not collide on the same revision number.
+  const reservedRevision = extractReservedMigrationRevision(task);
+  const migrationLayout = resolveMigrationLayout(buildConfig);
+  const reservedRevisionGuidance = reservedRevision
+    ? buildReservedRevisionGuidance(
+        reservedRevision,
+        `${migrationLayout.versionsDir}/`,
+        migrationLayout.schemaRevisionFile,
+        migrationLayout.schemaRevisionConst,
+      )
+    : '';
   // Read-only ./fetch (direction, section, playbook) so a create/refactor agent
   // can resolve by-reference ids and trimmed launch snapshots mid-run. Gate both
   // provisioning and guidance on project_id so the prompt never advertises a
@@ -279,7 +295,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   // before trusting a possibly-stale finding. Empty string when no warnings
   // fired, so the prompt is byte-unchanged for non-finding-derived tasks.
   const provenanceNotice = formatProvenanceWarnings(ctx);
-  const finalPrompt = acceptanceEvidenceNotice + claudeMdPrefix + playbookSection + retryContext + provenanceNotice + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + buildCodeChangeHelperGuidance({ buildConfig, owner, repo }) + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${stdFetchGuidance}${DEFAULT_TOOL_GUIDANCE}` + promptSuffix + prTitlePrefixNote;
+  const finalPrompt = acceptanceEvidenceNotice + claudeMdPrefix + playbookSection + retryContext + provenanceNotice + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + reservedRevisionGuidance + taskTypeHint + firstTaskSection + buildCodeChangeHelperGuidance({ buildConfig, owner, repo }) + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${stdFetchGuidance}${DEFAULT_TOOL_GUIDANCE}` + promptSuffix + prTitlePrefixNote;
 
   const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, resolveTaskBranchNamespace(task), buildConfig);
   writePlaybookHelper(taskId);
