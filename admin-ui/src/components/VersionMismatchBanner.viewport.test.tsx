@@ -50,6 +50,49 @@ describe('VersionMismatchBanner — viewport regression', () => {
     });
   });
 
+  test("renders null when backend SHA is the 'unknown' sentinel — no overflow at 375px", async () => {
+    // Production backend reports sha:'unknown' (no real SHA populated). This is a
+    // non-empty string but NOT a genuine version → banner must stay hidden.
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response(JSON.stringify({ sha: 'unknown' }), { status: 200 }),
+    ));
+
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '16px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<VersionMismatchBanner />);
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      });
+    });
+  });
+
+  test('renders null when backend SHA is empty/whitespace — no overflow at 375px', async () => {
+    // Absent/empty SHA is also "no comparison data" → banner must stay hidden.
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response(JSON.stringify({ sha: '   ' }), { status: 200 }),
+    ));
+
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '16px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<VersionMismatchBanner />);
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      });
+    });
+  });
+
   test('mismatch banner renders without horizontal overflow at 375px', async () => {
     // Fetch returns a different SHA → mismatch=true → banner renders.
     vi.stubGlobal('fetch', vi.fn(async () =>
