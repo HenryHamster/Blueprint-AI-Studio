@@ -11,6 +11,7 @@ Focuses on gaps not covered by test_directions.py:
 """
 
 import hashlib
+import os
 import uuid
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
@@ -33,6 +34,10 @@ from app.autonomous_research import _spawn_research_task
 from app.research_completion import _handle_research_completion
 from app.direction_outcomes import _update_direction_research_outcomes
 from app.max_plan_pool import _max_plan_pools, _account_by_id
+
+USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
 
 
 @pytest.fixture(autouse=True)
@@ -1659,6 +1664,210 @@ async def test_pipelining_blocked_while_rollup_pr_open(db_session):
     assert len(research) == 1, (
         f"A stale-EVALUATING parent with an open rollup PR is in flight — "
         f"pipelining must be suppressed (expected 1 research). Got {len(research)}."
+    )
+
+
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="true cross-session insert concurrency requires PostgreSQL",
+)
+@pytest.mark.asyncio
+async def test_concurrent_spawn_ticks_create_exactly_one_research_task(
+    db_session, mocker
+):
+    """Regression for incident 2026-06-06 (6ca2f9cf / fcedb840, 13.7s apart on
+    direction operator-levers): two concurrent autonomous ticks both read
+    "no active research on this direction" BEFORE either spawn committed, so
+    the read-based busy-direction guard (#7462) never saw the sibling and each
+    twin rolled up its own duplicate PR (#8438 / #8460). The per-process
+    asyncio spawn lock and the best-effort advisory try-lock cannot exclude a
+    sibling orchestrator process (and the xact-scoped advisory lock drops at
+    any intermediate commit), so the fix is an atomic per-direction claim:
+    the research task's idempotency_key under the partial unique index
+    ux_task_active_idempotency_key — same TOCTOU shape as the concurrent
+    self-audit fix (#8239).
+
+    Two concurrent spawn attempts for one direction → exactly one task row.
+    """
+    import asyncio
+
+    import app.anomaly_detection  # noqa: F401 — patched below
+    from app.autonomous_research import (
+        _spawn_research_task_inner,
+        research_direction_claim_key,
+    )
+
+    # IMPORTANT: import the conftest under the SAME module name pytest loaded
+    # it as ("conftest", basename import — testing/ has no __init__.py; same
+    # convention as test_admin_routers.py). `from testing.conftest import ...`
+    # resolves through the "testing" namespace package and imports a SECOND
+    # copy of the module with its OWN duplicate engine. In a full-collection
+    # run (CI shards collect everything before deselecting) that duplicate
+    # already exists — created at collection time by the module-level
+    # testing.conftest imports in test_warm_*.py — and it re-binds
+    # app.database._LazyEngine._engine to the duplicate engine, so the very
+    # first test's _dispose_production_engine_per_test teardown DISPOSES it.
+    # Engine.dispose() → pool.recreate() copies the pool's connect listeners
+    # via dispatch._update(), which does NOT re-apply _set_asyncio(): the
+    # recreated pool's first-connect gate degrades from AsyncAdaptedLock to a
+    # plain threading.Lock and is left un-run. The two concurrent session.get
+    # calls below would then be the poisoned pool's FIRST connections: tick A
+    # holds the threading lock across an await inside the dialect's
+    # first-connect init, tick B blocks the whole event loop acquiring it —
+    # deadlock until pytest-timeout kills the test (CI shard 2, run
+    # 27063938655). The canonical "conftest" module returns the engine the
+    # db_session fixture already armed, where concurrent connects are safe.
+    from conftest import TestingSessionLocal
+
+    project = Project(
+        name="Race-Safe Research Spawn",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-race0001", "Race direction")],
+        # purpose + counter preset: no strategic spawn, no vision seed write —
+        # keeps both ticks lock-free until the task INSERT under test.
+        vision={"purpose": "test", "_research_spawn_count": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Simulate the production failure mode: the advisory try-lock cannot see
+    # the sibling (different process → different PYTHONHASHSEED under the old
+    # hash()-derived key, or the xact lock was already dropped by an
+    # intermediate commit). Both ticks must reach the INSERT.
+    mocker.patch(
+        "app.autonomous_research._try_research_spawn_advisory_lock",
+        new=AsyncMock(return_value=True),
+    )
+
+    # The real lifecycle helper holds the project row lock (skip_locked) until
+    # commit, which would make the second tick skip before reaching the race
+    # window. Replace it with a lock-free eligibility read — the lifecycle is
+    # not what's under test, the claim at INSERT time is.
+    async def _lockfree_lifecycle(
+        prj, _session, _cooldown_minutes, busy_direction_ids, _now
+    ):
+        return [
+            d
+            for d in (prj.directions or [])
+            if d.get("status") == "active"
+            and d.get("id") not in busy_direction_ids
+        ]
+
+    mocker.patch(
+        "app.direction_lifecycle._process_direction_lifecycle",
+        new=_lockfree_lifecycle,
+    )
+
+    # Rendezvous AFTER the no-active-research read and BEFORE the task INSERT
+    # (check_anomaly_actions sits between the guards and the spawn loop):
+    # neither tick may insert until BOTH have read "direction is free" — the
+    # exact TOCTOU interleaving from the incident.
+    barrier = asyncio.Barrier(2)
+
+    async def _rendezvous(*_a, **_kw):
+        await barrier.wait()
+        return {"action": "none"}
+
+    mocker.patch("app.anomaly_detection.check_anomaly_actions", new=_rendezvous)
+
+    async def _tick():
+        async with TestingSessionLocal() as session:
+            tick_project = await session.get(Project, project.id)
+            await _spawn_research_task_inner(tick_project, session)
+
+    # Both ticks run concurrently on separate sessions/connections — neither
+    # raises (the loser logs and skips; it must NOT fail the tick).
+    await asyncio.gather(_tick(), _tick())
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "research"
+        and t.first_payload.get("current_direction_id") == "d-race0001"
+    ]
+    assert len(research) == 1, (
+        f"Two concurrent spawn ticks for one direction must create exactly ONE "
+        f"research task (atomic per-direction claim). Got {len(research)}."
+    )
+    assert research[0].idempotency_key == research_direction_claim_key(
+        project.id, "d-race0001"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pipelined_spawn_claims_distinct_key_alongside_stuck_parent(db_session):
+    """The per-direction claim must NOT break the pipelining exception: a
+    genuinely-stuck EVALUATING parent still holds the primary claim key
+    (EVALUATING is an active status under ux_task_active_idempotency_key), so
+    the ONE allowed pipelined spawn claims the direction under the distinct
+    ``:pipelined`` key — it must succeed, and is itself atomically capped at
+    one active pipelined research per direction."""
+    from app.autonomous_research import research_direction_claim_key
+    from app.shared_state import runtime_config as _runtime_config
+
+    _runtime_config["evaluating_pipeline_timeout_minutes"] = 30
+    _runtime_config["research_pipelining_window_minutes"] = 240
+    project = Project(
+        name="Pipelined Claim Key",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-pipekey1")],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Stuck parent in EVALUATING, holding the PRIMARY claim for the direction —
+    # exactly what a production parent spawned after this fix will hold.
+    parent = Task(
+        project_id=project.id,
+        title="Research: stuck parent holding the primary claim",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [],
+                "base_branch": "main",
+                "current_direction_id": "d-pipekey1",
+            }
+        ],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        idempotency_key=research_direction_claim_key(project.id, "d-pipekey1"),
+    )
+    db_session.add(parent)
+    await db_session.commit()
+
+    from sqlalchemy import update as _update
+
+    stale = datetime.utcnow() - timedelta(minutes=90)
+    await db_session.execute(
+        _update(Task).where(Task.id == parent.id).values(updated_at=stale)
+    )
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t
+        for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "research"
+    ]
+    assert len(research) == 2, (
+        f"The pipelined spawn must succeed alongside the stuck parent's primary "
+        f"claim (expected parent + 1 pipelined = 2). Got {len(research)}."
+    )
+    pipelined = next(t for t in research if t.id != parent.id)
+    assert pipelined.idempotency_key == research_direction_claim_key(
+        project.id, "d-pipekey1", pipelined=True
+    ), (
+        "The pipelined cycle must claim the direction under the :pipelined key "
+        "(the stuck EVALUATING parent still holds the primary claim)"
     )
 
 

@@ -978,6 +978,78 @@ async def test_manual_research_stamps_current_direction_id(
     assert created.first_payload.get("current_direction_id") == direction_id
 
 
+@pytest.mark.asyncio
+async def test_manual_research_stamps_direction_claim_key(
+    client: AsyncClient, db_session, mocker
+):
+    """The manual research task must carry the SAME per-direction idempotency
+    claim key the autonomous loop stamps, so a manual spawn and a concurrent
+    autonomous tick can never both create an active research cycle on one
+    direction (atomic under ux_task_active_idempotency_key)."""
+    from app.autonomous_research import research_direction_claim_key
+
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Claim the direction")
+    direction_id = direction["id"]
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}/research"
+    )
+    assert resp.status_code == 200, resp.text
+    task_id = resp.json()["id"]
+
+    created = await db_session.get(Task, uuid.UUID(task_id))
+    assert created is not None
+    assert created.idempotency_key == research_direction_claim_key(
+        uuid.UUID(project_id), direction_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_manual_research_409_when_concurrent_spawn_holds_claim(
+    client: AsyncClient, db_session, mocker
+):
+    """Atomic backstop for the TOCTOU window the in-flight SELECT guard cannot
+    close (same race class as the 2026-06-06 autonomous twins): a concurrent
+    spawn committed its research task AFTER this request's in-flight read but
+    BEFORE its insert. Simulated by an active claim-holder whose payload is
+    invisible to the read guard (no current_direction_id / empty directions):
+    the endpoint must hit the unique-index claim and return 409, not create a
+    duplicate research task."""
+    from app.autonomous_research import research_direction_claim_key
+
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Claim already held")
+    direction_id = direction["id"]
+
+    claim_key = research_direction_claim_key(uuid.UUID(project_id), direction_id)
+    holder = Task(
+        project_id=uuid.UUID(project_id),
+        title="Research: concurrent spawn that won the claim",
+        # Payload shape the read guard can't attribute to the direction —
+        # mimics "committed between the read and the insert".
+        payloads=[{"type": "research", "directions": [], "base_branch": "main"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        idempotency_key=claim_key,
+    )
+    db_session.add(holder)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}/research"
+    )
+    assert resp.status_code == 409, resp.text
+    assert "in progress" in resp.text.lower()
+
+    # Exactly one task holds the claim — no duplicate row was created.
+    result = await db_session.execute(
+        select(Task).where(Task.idempotency_key == claim_key)
+    )
+    assert len(result.scalars().all()) == 1
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Cooldown Filter (_spawn_research_task)
 # ─────────────────────────────────────────────────────────────────────────────
