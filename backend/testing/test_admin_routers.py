@@ -4693,6 +4693,33 @@ class TestNotificationConfigSettings:
         assert bad2.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_patch_auto_debug_enabled(self, client: AsyncClient):
+        """auto_debug_enabled accepts booleans, rejects non-booleans, and
+        round-trips on GET.
+
+        Regression: #8528 added the key to _KNOWN_SETTINGS_KEYS (so PATCH
+        validated it and returned 200) but shipped no apply block — the write
+        was silently dropped and the kill-switch could never be flipped."""
+        resp = await client.patch(
+            "/api/admin/settings", json={"auto_debug_enabled": False}
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["auto_debug_enabled"] is False
+
+        resp = await client.patch(
+            "/api/admin/settings", json={"auto_debug_enabled": True}
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["auto_debug_enabled"] is True
+
+        bad = await client.patch(
+            "/api/admin/settings", json={"auto_debug_enabled": "false"}
+        )
+        assert bad.status_code == 400
+
+    @pytest.mark.asyncio
     async def test_patch_warm_backlog_reuse_enabled(self, client: AsyncClient):
         """warm_backlog_reuse_enabled accepts booleans, rejects non-booleans,
         round-trips on GET, and is independent of warm_continuity_enabled."""
