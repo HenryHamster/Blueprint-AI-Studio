@@ -1044,3 +1044,108 @@ async def test_bug_report_citations_uses_structured_file_path(mocker):
     )
     assert signal["citation_state"] == "absent"
     assert "backend/app/annotated.py" in signal["broken_refs"]
+
+
+# ── classify_reproduction (pure reproduce-on-HEAD verdict) ────────────────────
+
+
+def test_classify_reproduction_all_absent_files_only():
+    """Every cited file gone, no symbols, a backend was available → absent."""
+    from app.source_ref_validation import classify_reproduction, CITATION_STATE_ABSENT
+
+    assert (
+        classify_reproduction(
+            present_file_count=0,
+            broken_file_count=2,
+            total_symbol_refs=0,
+            ungrounded_symbol_count=0,
+            has_backend=True,
+        )
+        == CITATION_STATE_ABSENT
+    )
+
+
+def test_classify_reproduction_all_absent_symbol_orphan():
+    """No surviving file and the only cited symbol is orphaned → absent."""
+    from app.source_ref_validation import classify_reproduction, CITATION_STATE_ABSENT
+
+    assert (
+        classify_reproduction(
+            present_file_count=0,
+            broken_file_count=0,
+            total_symbol_refs=1,
+            ungrounded_symbol_count=1,
+            has_backend=True,
+        )
+        == CITATION_STATE_ABSENT
+    )
+
+
+def test_classify_reproduction_one_present_file_is_present():
+    """A surviving file citation keeps the verdict present even with a broken one."""
+    from app.source_ref_validation import classify_reproduction, CITATION_STATE_PRESENT
+
+    assert (
+        classify_reproduction(
+            present_file_count=1,
+            broken_file_count=1,
+            total_symbol_refs=0,
+            ungrounded_symbol_count=0,
+            has_backend=True,
+        )
+        == CITATION_STATE_PRESENT
+    )
+
+
+def test_classify_reproduction_partial_symbol_grounding_is_present():
+    """A grounded symbol (not all ungrounded) keeps a deleted-file finding present."""
+    from app.source_ref_validation import classify_reproduction, CITATION_STATE_PRESENT
+
+    assert (
+        classify_reproduction(
+            present_file_count=0,
+            broken_file_count=1,
+            total_symbol_refs=2,
+            ungrounded_symbol_count=1,
+            has_backend=True,
+        )
+        == CITATION_STATE_PRESENT
+    )
+
+
+def test_classify_reproduction_no_backend_is_indeterminate():
+    """No validation backend → never absent, even with all-broken counts."""
+    from app.source_ref_validation import (
+        classify_reproduction,
+        CITATION_STATE_INDETERMINATE,
+    )
+
+    assert (
+        classify_reproduction(
+            present_file_count=0,
+            broken_file_count=2,
+            total_symbol_refs=1,
+            ungrounded_symbol_count=1,
+            has_backend=False,
+        )
+        == CITATION_STATE_INDETERMINATE
+    )
+
+
+def test_classify_reproduction_no_citations_is_indeterminate():
+    """A backend but nothing checkable (no refs at all) → indeterminate."""
+    from app.source_ref_validation import (
+        classify_reproduction,
+        CITATION_STATE_INDETERMINATE,
+    )
+
+    assert (
+        classify_reproduction(
+            present_file_count=0,
+            broken_file_count=0,
+            total_symbol_refs=0,
+            ungrounded_symbol_count=0,
+            has_backend=True,
+        )
+        == CITATION_STATE_INDETERMINATE
+    )

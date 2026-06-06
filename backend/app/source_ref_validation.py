@@ -1435,6 +1435,65 @@ CITATION_STATE_PRESENT = "present"
 CITATION_STATE_INDETERMINATE = "indeterminate"
 
 
+def classify_reproduction(
+    *,
+    present_file_count: int,
+    broken_file_count: int,
+    total_symbol_refs: int,
+    ungrounded_symbol_count: int,
+    has_backend: bool,
+) -> str:
+    """Single conservative reproduce-on-HEAD verdict shared by every gate.
+
+    The one place the "does this finding/bug-report still reproduce on the
+    integration HEAD?" question is decided, so finding ingestion, deferred-finding
+    recovery, and the bug-report citation summary all agree by construction.
+
+    Inputs are pre-computed counts from the EXISTING grounding helpers:
+      * ``present_file_count``  — file citations that resolve at HEAD (a file ref
+        not marked ``valid: False`` by :func:`validate_source_refs`; an
+        indeterminate file is counted here so an unknowable file never drives a
+        rejection).
+      * ``broken_file_count``   — file citations unambiguously absent at HEAD
+        (``broken_source_ref_count`` from :func:`summarize_broken_refs`).
+      * ``total_symbol_refs``   — distinct ``path:symbol`` references parsed from
+        the claims/excerpts (:func:`_parse_path_symbol_refs`).
+      * ``ungrounded_symbol_count`` — of those, the count unambiguously absent
+        (:func:`detect_absent_symbols`).
+      * ``has_backend``         — whether any existence/symbol check could run at
+        all (:func:`_has_validation_backend`).
+
+    Returns:
+      * :data:`CITATION_STATE_ABSENT` ONLY when at least one citation was actually
+        checkable, ZERO file citations survive, and EVERY parseable ``path:symbol``
+        reference is ungrounded — i.e. nothing the input cites still exists.
+      * :data:`CITATION_STATE_INDETERMINATE` when no backend was available or
+        nothing was checkable (no citations, or every check degraded). A
+        checkout-less prod backend therefore NEVER rejects.
+      * :data:`CITATION_STATE_PRESENT` otherwise — any surviving file or grounded
+        symbol (including a partially-grounded input) passes through.
+
+    Mirrors the conservative tri-state semantics of :func:`validate_source_refs`:
+    an indeterminate or partially-grounded input is never reported ``absent``.
+    """
+    if not has_backend:
+        return CITATION_STATE_INDETERMINATE
+    # A surviving (present-or-unknowable) file citation means cited code remains.
+    if present_file_count > 0:
+        return CITATION_STATE_PRESENT
+    # A grounded symbol (any parseable ref not proven absent) likewise survives.
+    # Indeterminate symbols count as grounded here, so an inconclusive symbol
+    # check never tips a verdict to ``absent``.
+    if (total_symbol_refs - ungrounded_symbol_count) > 0:
+        return CITATION_STATE_PRESENT
+    # Nothing survives. Reject ONLY when at least one citation came back
+    # unambiguously absent; if nothing could actually be checked, stay
+    # indeterminate so a git/API outage never spuriously rejects.
+    if broken_file_count > 0 or ungrounded_symbol_count > 0:
+        return CITATION_STATE_ABSENT
+    return CITATION_STATE_INDETERMINATE
+
+
 def _extract_bug_report_file_refs(
     content: Any, structured_context: Optional[Dict[str, Any]] = None
 ) -> List[str]:

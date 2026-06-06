@@ -1663,6 +1663,210 @@ class TestProvenanceWarningsAttachment:
         assert "_finding_cited_paths" not in ctx
 
 
+class TestReproduceOnHeadGate:
+    """Reproduce-on-HEAD GATE: a finding whose cited code is entirely gone on
+    HEAD is rejected (not spawned), counted, and scored neutral; indeterminate
+    and partially-grounded findings still pass through."""
+
+    async def _run(
+        self,
+        db_session,
+        mocker,
+        *,
+        direction_id,
+        parsed_findings,
+        prior_deferred=None,
+        has_backend=True,
+        validate=None,
+        ungrounded=None,
+    ):
+        from test_autonomous_research import _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(
+            db_session, direction_id
+        )
+        if prior_deferred is not None:
+            task.context = {
+                **(task.context or {}),
+                "prior_deferred_findings": prior_deferred,
+            }
+            db_session.add(task)
+            await db_session.commit()
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=parsed_findings,
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+        mocker.patch(
+            "app.research_completion.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        mocker.patch(
+            "app.research_completion.resolve_head_commit",
+            new=AsyncMock(return_value=None),
+        )
+        mocker.patch(
+            "app.research_completion.cited_paths_changed_since",
+            new=AsyncMock(return_value=None),
+        )
+        # Force a usable backend so the gate is active even in the Docker test
+        # env (which has no /tmp/workspace checkout); production has GitHub creds.
+        mocker.patch(
+            "app.research_completion._has_validation_backend",
+            return_value=has_backend,
+        )
+        if validate is not None:
+            mocker.patch("app.research_completion.validate_source_refs", new=validate)
+        if ungrounded is not None:
+            mocker.patch(
+                "app.research_completion._summarize_ungrounded_claims_grounded",
+                new=ungrounded,
+            )
+        else:
+            mocker.patch(
+                "app.research_completion._summarize_ungrounded_claims_grounded",
+                new=AsyncMock(return_value=None),
+            )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return task, {c.title for c in children}
+
+    @_pytest.mark.asyncio
+    async def test_fresh_finding_citing_only_deleted_files_is_rejected(
+        self, db_session, mocker
+    ):
+        """A prose-claim finding whose only file citation is gone is not spawned."""
+        from test_autonomous_research import _make_finding
+
+        finding = _make_finding(
+            title="Prose claim about deleted file", direction_id="d-repro-fresh01"
+        )
+        finding["sources"] = [{"type": "file", "ref": "backend/app/gone.py"}]
+
+        async def _validate(sources, **kw):
+            return [{**s, "valid": False} for s in sources]
+
+        task, titles = await self._run(
+            db_session,
+            mocker,
+            direction_id="d-repro-fresh01",
+            parsed_findings=[finding],
+            validate=_validate,
+        )
+        assert "Prose claim about deleted file" not in titles
+        assert (task.context or {}).get("research_reproduce_rejected") == 1
+        # Scored neutral: zero findings survived.
+        assert (task.context or {}).get("research_surviving_findings") == 0
+
+    @_pytest.mark.asyncio
+    async def test_partially_grounded_finding_still_spawns(self, db_session, mocker):
+        """One surviving file citation keeps the finding spawnable (never rejected)."""
+        from test_autonomous_research import _make_finding
+
+        finding = _make_finding(
+            title="Partially grounded finding", direction_id="d-repro-part01"
+        )
+        finding["sources"] = [
+            {"type": "file", "ref": "backend/app/present.py"},
+            {"type": "file", "ref": "backend/app/gone.py"},
+        ]
+
+        async def _validate(sources, **kw):
+            return [
+                {**s, "valid": False}
+                if s.get("ref") == "backend/app/gone.py"
+                else s
+                for s in sources
+            ]
+
+        task, titles = await self._run(
+            db_session,
+            mocker,
+            direction_id="d-repro-part01",
+            parsed_findings=[finding],
+            validate=_validate,
+        )
+        assert "Partially grounded finding" in titles
+        assert (task.context or {}).get("research_reproduce_rejected") is None
+        assert (task.context or {}).get("research_surviving_findings") == 1
+
+    @_pytest.mark.asyncio
+    async def test_indeterminate_context_never_rejects(self, db_session, mocker):
+        """No validation backend → all-broken citations still pass through."""
+        from test_autonomous_research import _make_finding
+
+        finding = _make_finding(
+            title="Indeterminate finding", direction_id="d-repro-ind01"
+        )
+        finding["sources"] = [{"type": "file", "ref": "backend/app/gone.py"}]
+
+        async def _validate(sources, **kw):
+            return [{**s, "valid": False} for s in sources]
+
+        task, titles = await self._run(
+            db_session,
+            mocker,
+            direction_id="d-repro-ind01",
+            parsed_findings=[finding],
+            has_backend=False,
+            validate=_validate,
+        )
+        assert "Indeterminate finding" in titles
+        assert (task.context or {}).get("research_reproduce_rejected") is None
+
+    @_pytest.mark.asyncio
+    async def test_deferred_finding_orphaned_symbol_is_rejected(
+        self, db_session, mocker
+    ):
+        """A deferred finding whose only cited symbol was deleted is caught on
+        recovery (re-grounded symbols), not re-spawned as fresh."""
+        from test_autonomous_research import _make_finding
+
+        deferred = _make_finding(
+            title="Orphaned symbol finding", direction_id="d-repro-orph01"
+        )
+        deferred["claims"] = ["backend/app/foo.py:gone_func drops the guard"]
+        deferred["sources"] = []
+        sentinel = _make_finding(
+            title="Fresh sentinel", direction_id="d-repro-orph01"
+        )
+
+        async def _ungrounded(claims, sources, ctx):
+            if claims and "gone_func" in (claims[0] or ""):
+                return {
+                    "ungrounded_claim_count": 1,
+                    "ungrounded_refs": ["backend/app/foo.py:gone_func"],
+                }
+            return None
+
+        task, titles = await self._run(
+            db_session,
+            mocker,
+            direction_id="d-repro-orph01",
+            parsed_findings=[sentinel],
+            prior_deferred=[deferred],
+            ungrounded=_ungrounded,
+        )
+        assert "Orphaned symbol finding" not in titles  # rejected on recovery
+        assert "Fresh sentinel" in titles  # clean finding still spawns
+        assert (task.context or {}).get("research_reproduce_rejected") == 1
+
+
 class TestKnowledgeFindingRouting:
     """web_research / design findings route to the matching knowledge child.
 

@@ -86,6 +86,10 @@ from app.source_ref_validation import (
     resolve_head_commit,
     cited_paths_changed_since,
     finding_cited_paths,
+    classify_reproduction,
+    _has_validation_backend,
+    _parse_path_symbol_refs,
+    CITATION_STATE_ABSENT,
 )
 from app.scope_complexity import _composite_complexity_score
 from app.shared_state import (
@@ -1055,6 +1059,52 @@ async def _summarize_ungrounded_claims_grounded(
     }
 
 
+def _count_total_symbol_refs(
+    claims: Optional[list], sources: Optional[list]
+) -> int:
+    """Count distinct ``path:symbol`` references across a finding's claims/excerpts.
+
+    The denominator for the reproduce-on-HEAD verdict: paired with the
+    ungrounded count from :func:`_summarize_ungrounded_claims_grounded`, it lets
+    :func:`classify_reproduction` tell "every cited symbol is absent" (reject)
+    apart from "some cited symbol still resolves" (partial grounding → pass).
+    Deduplicates ``(path, symbol)`` pairs the same way the ungrounded count does,
+    pulling from claims plus file-source excerpts (``quote``/``excerpt``).
+    """
+    seen: set = set()
+    texts: list = list(claims or [])
+    texts.extend(
+        s.get("quote") or s.get("excerpt")
+        for s in sources or []
+        if isinstance(s, dict) and str(s.get("type") or "").lower() == "file"
+    )
+    for text in texts:
+        for pair in _parse_path_symbol_refs(text):
+            seen.add(pair)
+    return len(seen)
+
+
+def _file_source_present_count(sources: Optional[list]) -> int:
+    """Count file-type sources that survive validation (not marked invalid).
+
+    A source is counted present unless :func:`validate_source_refs` stamped it
+    ``valid: False`` — so an INDETERMINATE file ref (left untouched) counts as
+    present, keeping an unknowable citation from ever driving a rejection.
+    """
+    count = 0
+    for s in sources or []:
+        if not isinstance(s, dict):
+            continue
+        if str(s.get("type") or "").lower() != "file":
+            continue
+        if not s.get("ref"):
+            continue
+        if s.get("valid") is False:
+            continue
+        count += 1
+    return count
+
+
 # Finding ``type`` values that are processed separately and never spawn an
 # implementation/child task (direction proposals/notes, design-doc observations,
 # direction updates). Used by the blast-radius predicate below.
@@ -1253,6 +1303,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             )
             _src_ref_ctx = {}
 
+    # Whether ANY existence/symbol check can actually run (GitHub creds, or a
+    # local git checkout). When neither is available every grounding check
+    # degrades to indeterminate, so the reproduce-on-HEAD verdict must NEVER
+    # be "absent" — :func:`classify_reproduction` short-circuits to
+    # indeterminate on a falsy backend. Resolved once and shared by both the
+    # fresh-ingestion gate and the deferred-recovery re-grounding below.
+    _has_backend = _has_validation_backend(
+        _src_ref_ctx.get("token"),
+        _src_ref_ctx.get("owner"),
+        _src_ref_ctx.get("repo"),
+        _src_ref_ctx.get("branch"),
+        "/tmp/workspace",
+    )
+
     # Record the integration HEAD these findings were generated against, so a
     # later re-dispatch can answer the one cheap question that gates trust: have
     # the cited files changed since? Resolved once against the same verification
@@ -1322,6 +1386,26 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         )
         if _broken_provenance or _ungrounded:
             _broken_citation_findings += 1
+        # Reproduce-on-HEAD verdict (the GATE input). A prose-claim finding whose
+        # ONLY citations are gone — every cited file deleted AND every cited
+        # path:symbol orphaned — does not reproduce on HEAD and must be rejected
+        # at the spawn loop, not merely discounted. Reuse the broken-ref +
+        # ungrounded-symbol signals already in hand (no new I/O); a partially
+        # grounded finding (some citation still resolves) and an indeterminate
+        # context (no backend) are NEVER stamped absent.
+        _repro = classify_reproduction(
+            present_file_count=_file_source_present_count(_f.get("sources")),
+            broken_file_count=(_broken_provenance or {}).get(
+                "broken_source_ref_count", 0
+            ),
+            total_symbol_refs=_count_total_symbol_refs(
+                _f.get("claims"), _f.get("sources")
+            ),
+            ungrounded_symbol_count=len((_ungrounded or {}).get("ungrounded_refs") or []),
+            has_backend=_has_backend,
+        )
+        if _repro == CITATION_STATE_ABSENT:
+            _f["_reproduce_on_head"] = "absent"
         # Reconcile the self-reported verification_basis against the validation
         # just computed: a finding cannot honestly claim a verified-against-code
         # tier while its own citations are absent at HEAD. Reuses the broken-ref
@@ -1500,18 +1584,54 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # diff (no creds + no checkout, API error) never raises the flag.
         for f in prior_actionable:
             _gen_sha = f.get("generated_head_sha")
-            if not _gen_sha:
-                continue
+            if _gen_sha:
+                try:
+                    _changed = await cited_paths_changed_since(
+                        _gen_sha, finding_cited_paths(f), **_src_ref_ctx
+                    )
+                except Exception:  # noqa: BLE001 — re-validation must never crash recovery
+                    _changed = None
+                if _changed is True:
+                    f["needs_revalidation"] = True
+                    f["needs_revalidation_reason"] = (
+                        "cited_files_changed_since_generation"
+                    )
+                _merge_provenance_warnings(f, _staleness_provenance_warning(f))
+            # Re-ground cited FILES and SYMBOLS against the CURRENT HEAD, the same
+            # way fresh ingestion does. The ingestion-time verdict was computed
+            # against an older branch tip; a finding deferred while its symbol
+            # existed, then orphaned when that symbol was deleted, would otherwise
+            # come back and spawn as if fresh (the old path re-checked files but
+            # never re-grounded symbols). The cited_paths_changed_since flag above
+            # is the softer staleness warning; this is the reproduce-on-HEAD GATE
+            # verdict. Conservative throughout: any error or indeterminate result
+            # leaves the finding unstamped.
             try:
-                _changed = await cited_paths_changed_since(
-                    _gen_sha, finding_cited_paths(f), **_src_ref_ctx
+                _re_sources = await validate_source_refs(
+                    f.get("sources") or [], **_src_ref_ctx
                 )
-            except Exception:  # noqa: BLE001 — re-validation must never crash recovery
-                _changed = None
-            if _changed is True:
-                f["needs_revalidation"] = True
-                f["needs_revalidation_reason"] = "cited_files_changed_since_generation"
-            _merge_provenance_warnings(f, _staleness_provenance_warning(f))
+            except Exception:  # noqa: BLE001 — recovery re-validation must never crash
+                _re_sources = f.get("sources") or []
+            _re_broken = summarize_broken_refs(_re_sources)
+            try:
+                _re_ungrounded = await _summarize_ungrounded_claims_grounded(
+                    f.get("claims"), f.get("sources"), _src_ref_ctx
+                )
+            except Exception:  # noqa: BLE001 — recovery re-grounding must never crash
+                _re_ungrounded = None
+            _re_repro = classify_reproduction(
+                present_file_count=_file_source_present_count(_re_sources),
+                broken_file_count=(_re_broken or {}).get("broken_source_ref_count", 0),
+                total_symbol_refs=_count_total_symbol_refs(
+                    f.get("claims"), f.get("sources")
+                ),
+                ungrounded_symbol_count=len(
+                    (_re_ungrounded or {}).get("ungrounded_refs") or []
+                ),
+                has_backend=_has_backend,
+            )
+            if _re_repro == CITATION_STATE_ABSENT:
+                f["_reproduce_on_head"] = "absent"
         if prior_actionable:
             logger.info(
                 f"[RESEARCH] Prepending {len(prior_actionable)} deferred finding(s) from previous cycle "
@@ -1958,6 +2078,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _impl_spawned = 0
     _degradation_gate_deferred: list[dict] = []
     _low_actionability_deferred: list[dict] = []
+    # Findings rejected by the reproduce-on-HEAD gate: their cited code is
+    # unambiguously gone, so they are NOT spawned into work. They are also NOT
+    # re-deferred — re-validating them next cycle would yield the same verdict
+    # (a retry loop), and they are excluded from the surviving-finding success
+    # signal so the cycle scores neutral, never a spurious success/failure.
+    _reproduce_rejected: list[dict] = []
     # compute_experiment findings whose authored launch contract was incomplete
     # or malformed — deferred loudly rather than spawning a broken compute job.
     _compute_contract_deferred: list[dict] = []
@@ -2159,6 +2285,24 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # Skip findings already directly dispatched by the research agent (scope=small+risk=low).
         # These were sent via /api/agent/spawn before research completed; no task needed here.
         if finding.get("already_spawned"):
+            continue
+
+        # Reproduce-on-HEAD GATE. A finding stamped ``_reproduce_on_head ==
+        # "absent"`` (at fresh ingestion or deferred-recovery re-grounding) cites
+        # code that is unambiguously gone — every cited file deleted and every
+        # cited symbol orphaned. Do NOT route it into a fix/create task: it would
+        # chase a defect that no longer exists. Reject it (not re-deferred, to
+        # avoid a retry loop); it is excluded from the surviving-finding success
+        # signal so the cycle scores neutral. Indeterminate/partially-grounded
+        # findings are never stamped absent and fall through untouched.
+        if finding.get("_reproduce_on_head") == "absent":
+            _reproduce_rejected.append(finding)
+            logger.warning(
+                "[RESEARCH] Rejecting finding %r (task %s): cited code is absent on "
+                "HEAD (does not reproduce); not spawning.",
+                finding.get("title") or finding.get("description", "")[:60],
+                task.id,
+            )
             continue
 
         # Spawn-time health gate: when pipeline is degraded, cap implementation task creation
@@ -3166,7 +3310,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             f"compute_contract_invalid ({len(_compute_contract_deferred)})"
         )
 
-    if _all_deferred or _scope_skip_counts or _spawned_memo_ids or _finding_give_up:
+    if (
+        _all_deferred
+        or _scope_skip_counts
+        or _spawned_memo_ids
+        or _finding_give_up
+        or _reproduce_rejected
+    ):
         ctx = dict(task.context or {})
         if _all_deferred:
             ctx["deferred_findings"] = _all_deferred
@@ -3176,6 +3326,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             ctx["skipped_low_confidence_by_scope"] = _scope_skip_counts
         if _spawned_memo_ids:
             ctx["spawned_memo_ids"] = _spawned_memo_ids
+        if _reproduce_rejected:
+            # Machine-readable count of findings the reproduce-on-HEAD gate
+            # rejected this cycle. Excluded from deferred_findings (no retry) and
+            # from the surviving-finding signal (neutral, not success/failure).
+            ctx["research_reproduce_rejected"] = len(_reproduce_rejected)
         task.context = ctx
         flag_modified(task, "context")
         session.add(task)
@@ -3199,9 +3354,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Honest success signal: count findings that SURVIVED ingestion validation +
     # dedup + actionability and were routed to work — spawned, or deferred only
     # for capacity/health reasons (batch cap, pipeline degradation). Findings
-    # dropped as low-actionability / stale-duplicate / broken-citation did NOT
-    # survive and are excluded, so a cycle whose findings were all rejected
-    # scores neutral instead of a spurious success.
+    # dropped as low-actionability / stale-duplicate / broken-citation, or
+    # rejected by the reproduce-on-HEAD gate, did NOT survive and are excluded
+    # (the gate uses `continue`, so they never reach _impl_spawned or either
+    # capacity-deferred list), so a cycle whose findings were all rejected scores
+    # neutral instead of a spurious success.
     _surviving_findings = (
         _impl_spawned + len(_batch_cap_deferred) + len(_degradation_gate_deferred)
     )

@@ -17,6 +17,7 @@ from sqlmodel import select
 
 from app import strategic_cycle
 from app.direction_metrics import _compute_direction_quality_score
+from app.direction_outcomes import verified_merged_count
 from app.direction_mode import mode_prompt_hint, normalized_recommended_mode
 from app.knowledge_query import build_knowledge_index
 from app.models import (
@@ -1533,13 +1534,20 @@ def _build_prune_candidates(
             continue
         dir_status[did] = str(d.get("status") or "active")
         history = d.get("research_history") or []
+        # Retiring a capability gap is a ground-truth "shipped" decision, so it
+        # must use the verification-aware merged count — a degraded/unverified
+        # merge (test/CI verdict blocked by an environment failure) is NOT proof
+        # the work landed. Mirror the rest of the system: verified_merged_count
+        # per entry (with its legacy prs_merged fallback) plus the verified
+        # aggregate key (falling back to total_prs_merged for pre-attribution
+        # folded history).
         merged = sum(
-            int(h.get("prs_merged", 0) or 0)
-            for h in history
-            if isinstance(h, dict)
+            verified_merged_count(h) for h in history if isinstance(h, dict)
         )
         agg = d.get("history_aggregate") or {}
-        merged += int(agg.get("total_prs_merged") or 0)
+        merged += int(
+            agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
+        )
         dir_shipped[did] = merged > 0
 
     gaps = pm.get("gaps") if isinstance(pm.get("gaps"), list) else []

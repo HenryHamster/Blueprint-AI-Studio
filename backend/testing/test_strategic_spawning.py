@@ -7851,6 +7851,35 @@ class TestBuildPruneCandidates:
         assert len(out["resolved_gaps"]) == 1
         assert out["resolved_gaps"][0]["reason"] == "direction_shipped"
 
+    def test_verified_merge_ships_gap_but_degraded_does_not(self):
+        """Gap retirement is a ground-truth decision: only a verified merge
+        retires the gap; a direction whose only merges are unverified_degraded
+        (verified_prs_merged == 0) must NOT mark the gap direction_shipped."""
+        from app.strategic_spawning import _build_prune_candidates
+
+        pm = {
+            "gaps": [
+                {"id": "g-deg", "name": "degraded only", "status": "active",
+                 "active_moves": ["d-deg"]},
+                {"id": "g-ver", "name": "verified", "status": "active",
+                 "active_moves": ["d-ver"]},
+            ],
+        }
+        directions = [
+            # Raw prs_merged>0 but the verification-aware count is 0 → not shipped.
+            {"id": "d-deg", "status": "active",
+             "research_history": [{"prs_merged": 3, "verified_prs_merged": 0}]},
+            # A genuine verified merge → still ships the gap.
+            {"id": "d-ver", "status": "active",
+             "research_history": [{"prs_merged": 1, "verified_prs_merged": 1}]},
+        ]
+        out = _build_prune_candidates(
+            pm, directions, self._LARGE, "2026-06-04T00:00:00+00:00"
+        )
+        resolved = {rg["gap_id"]: rg["reason"] for rg in out["resolved_gaps"]}
+        assert resolved == {"g-ver": "direction_shipped"}
+        assert "g-deg" not in resolved
+
     def test_surfaces_claimed_but_absent_capabilities(self):
         from app.strategic_spawning import _build_prune_candidates
 
