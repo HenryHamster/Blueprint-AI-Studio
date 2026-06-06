@@ -582,6 +582,7 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     "test_failed": CODE_ERROR,
     "lint_failed": CODE_ERROR,
     "pr_creation_failed": EXTERNAL_API,
+    "external_api": EXTERNAL_API,
     "claude_code_failed": CODE_ERROR,
     "parse_failed": CODE_ERROR,
     "fatal": CODE_ERROR,
@@ -1291,7 +1292,10 @@ def _external_api_subtype_from_message(combined: str) -> str:
             "token expired",
             "token invalid",
             "token revoked",
+            "authentication_failed",
             "authentication failed",
+            "failed to authenticate",
+            "invalid authentication credentials",
             "invalid api key",
             "oauth_org_not_allowed",
         )
@@ -1818,6 +1822,11 @@ def _classify_failure_class(
             "token expired",
             "token invalid",
             "token revoked",
+            "authentication_failed",
+            "authentication failed",
+            "failed to authenticate",
+            "invalid authentication credentials",
+            "invalid api key",
             # Anthropic 403 when an org has disabled OAuth for Claude Code —
             # an auth/infra failure, not a code defect. Specific token only.
             "oauth_org_not_allowed",

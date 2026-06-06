@@ -724,6 +724,9 @@ class TestClassifyFailureExternalApi:
             "401 Unauthorized",
             "Bad credentials returned from GitHub",
             "token expired",
+            "Claude API Error: 401 Invalid authentication credentials",
+            '{"error_status":401,"error":"authentication_failed"}',
+            "Failed to authenticate. API Error: 401 Invalid authentication credentials",
             # Anthropic 403 when an org has disabled OAuth for Claude Code:
             # an auth/infra failure, must NOT fall through to CODE_ERROR.
             "Claude subprocess exited code 1: HTTP 403 oauth_org_not_allowed",

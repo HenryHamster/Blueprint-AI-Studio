@@ -188,9 +188,16 @@ export function matchesRateLimit(text: string, provider: ProviderName = PROVIDER
 // combined stdout+stderr of the validation CLI, so every entry is lowercase.
 const AUTH_FAILURE_PATTERNS_GENERIC: readonly string[] = [
   'authentication_failed',
+  'authentication failed',
+  'failed to authenticate',
   'authentication error',
+  'invalid authentication credentials',
   'invalid api key',
   'invalid bearer token',
+  'bad credentials',
+  'token expired',
+  'token invalid',
+  'token revoked',
 ] as const;
 
 const AUTH_FAILURE_PATTERNS: Readonly<Record<ProviderName, readonly string[]>> = {
@@ -200,6 +207,7 @@ const AUTH_FAILURE_PATTERNS: Readonly<Record<ProviderName, readonly string[]>> =
     'oauth token has expired',
     'oauth token expired',
     'oauth authentication is currently not supported',
+    'oauth_org_not_allowed',
     'please run /login',
     'could not resolve authentication',
   ],
@@ -224,7 +232,6 @@ export function matchesAuthFailure(text: string, provider: ProviderName = PROVID
   if (AUTH_FAILURE_PATTERNS_GENERIC.some(p => lower.includes(p))) return true;
   return AUTH_FAILURE_PATTERNS[provider].some(p => lower.includes(p));
 }
-
 export class RateLimitError extends Error {
   constructor(message: string) {
     super(message);
@@ -246,6 +253,15 @@ export class NoProgressTimeoutError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'NoProgressTimeoutError';
+  }
+}
+
+export class AuthFailureError extends Error {
+  readonly failureCategory = 'external_api' as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'AuthFailureError';
   }
 }
 
@@ -1371,6 +1387,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
     throw err;
   }
 
+  if (exitCode !== 0 && matchesAuthFailure(combined, runner.provider)) {
+    const snippet = (stderrBuffer || allOutput.slice(-500)).slice(0, 500);
+    throw new AuthFailureError(`${runner.displayName} authentication failed — ${snippet}`);
+  }
   if (sawConfirmedRateLimit) {
     const snippet = (stderrBuffer || allOutput.slice(-500)).slice(0, 500);
     throw new RateLimitError(`${runner.displayName} API usage exhausted — ${snippet}`);
