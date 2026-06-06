@@ -318,6 +318,12 @@ async def trigger_rollback(
         rollback_revision = state.last_known_good_revision
         rollback_error = None
 
+        # Run the traffic shift FIRST, before mutating any deployment state. A
+        # manual rollback is only complete once Cloud Run actually moves traffic
+        # to the last-known-good revision; persisting ROLLED_BACK / zeroing
+        # capacity before the shift succeeds would record a completed rollback
+        # while traffic is still serving the bad revision (and the double-rollback
+        # guard would then block a retry).
         try:
 
             def _run_gcloud_rollback():
@@ -348,7 +354,33 @@ async def trigger_rollback(
             rollback_error = str(e)[:500]
             logger.error(f"[ADMIN] Rollback command failed: {e}", exc_info=True)
 
-        # Update deployment state regardless of gcloud result.
+        if rollback_error is not None:
+            # Traffic shift failed → leave ALL deployment state untouched. Do not
+            # persist ROLLED_BACK, do not increment the counter, do not snapshot
+            # capacity, do not mark the pause clock, do not pause the pipeline.
+            # The operator-facing state stays distinguishable from a completed
+            # rollback and the double-rollback guard does not block a retry. The
+            # row lock is released without a status-changing commit.
+            logger.warning(
+                f"[ADMIN] ROLLBACK NOT APPLIED — traffic shift failed for "
+                f"{state.current_sha[:8]} → {state.last_known_good_sha[:8]}; "
+                f"state left unchanged ({state.status})"
+            )
+            # Return a 200 with a distinct, truthful status rather than a 5xx:
+            # Cloud Run quarantines instances on 5xx (see _raise_for_unavailable_state),
+            # and the failure here is an operator-actionable retry, not a server fault.
+            return {
+                "status": "rollback_failed",
+                "from_sha": state.current_sha,
+                "to_revision": rollback_revision,
+                "to_sha": state.last_known_good_sha,
+                "reason": analysis_reason,
+                "gcloud_error": rollback_error,
+                "pipeline_paused": False,
+                "serving_sha": state.current_sha,
+            }
+
+        # Traffic shift SUCCEEDED — only now record the completed rollback.
         # The ROLLED_BACK guard above makes this a real status transition every time
         # we reach here, so the rollback_count increment and capacity snapshot are
         # taken exactly once per rollback (a re-entrant call is rejected by the guard).
@@ -386,12 +418,12 @@ async def trigger_rollback(
     await broadcast_deploy_state()
 
     return {
-        "status": "rolled_back" if not rollback_error else "rollback_requested",
+        "status": "rolled_back",
         "from_sha": state.current_sha,
         "to_revision": rollback_revision,
         "to_sha": state.last_known_good_sha,
         "reason": analysis_reason,
-        "gcloud_error": rollback_error,
+        "gcloud_error": None,
         "pipeline_paused": True,
     }
 

@@ -1627,18 +1627,44 @@ async def summarize_bug_report_citations(
             )
             ungrounded_refs = []
 
-    if broken_refs or ungrounded_refs:
-        state = CITATION_STATE_ABSENT
-    elif not file_paths and not symbol_pairs:
-        # Nothing parseable — never a defect, always indeterminate.
-        state = CITATION_STATE_INDETERMINATE
-    elif _has_validation_backend(token, owner, repo, branch, cwd):
-        # Refs extracted, a backend was available, and none flagged absent.
-        state = CITATION_STATE_PRESENT
-    else:
-        # Refs extracted but nothing could actually be checked — indeterminate,
-        # never reported as present.
-        state = CITATION_STATE_INDETERMINATE
+    # Delegate the absent/present/indeterminate verdict to the single shared
+    # reproduce-on-HEAD classifier so bug-report grounding agrees with finding
+    # ingestion by construction: ``absent`` only when NOTHING the report cites
+    # still exists; any surviving independent file (or grounded symbol) keeps the
+    # verdict non-absent (a partially-grounded report counts as ``present``).
+    #
+    # CRITICAL: ``_DESIGN_DOC_PATH_RE`` also surfaces the host path of a
+    # ``path:symbol`` token as a standalone file ref, so a file that appears
+    # ONLY as the host of an explicitly-cited (now-absent) symbol must NOT be
+    # counted as an independent surviving file — otherwise the symbol-locus-absent
+    # case (present host file + absent symbol) would wrongly flip to ``present``.
+    symbol_host_paths = {path for path, _symbol in symbol_pairs}
+    present_file_count = sum(
+        1
+        for path in file_paths
+        if path not in broken_refs and path not in symbol_host_paths
+    )
+    # A definitively-broken file ref or ungrounded symbol can only have been
+    # produced by a backend that actually ran, so treat their presence as proof
+    # a backend was consulted even when the credentials/local-checkout heuristic
+    # cannot see one (e.g. a checkout-less prod path whose existence check still
+    # resolved to a hard 404). ``classify_reproduction`` trusts ``has_backend``
+    # absolutely — without this, a confirmed-absent citation would be suppressed
+    # to ``indeterminate`` and never flagged. Empty broken/ungrounded sets leave
+    # ``has_backend`` driven solely by the heuristic, so an unknowable (None)
+    # check still degrades to ``indeterminate``, never ``absent``.
+    has_backend = (
+        _has_validation_backend(token, owner, repo, branch, cwd)
+        or bool(broken_refs)
+        or bool(ungrounded_refs)
+    )
+    state = classify_reproduction(
+        present_file_count=present_file_count,
+        broken_file_count=len(broken_refs),
+        total_symbol_refs=len(symbol_pairs),
+        ungrounded_symbol_count=len(ungrounded_refs),
+        has_backend=has_backend,
+    )
 
     return {
         "citation_state": state,

@@ -56,6 +56,23 @@ def _gcloud_ok():
     return p
 
 
+def _gcloud_fail(stderr="ERROR: traffic shift rejected by Cloud Run"):
+    """Patch subprocess.run to a FAILED gcloud traffic shift (non-zero exit)."""
+    p = patch("subprocess.run")
+    mock_run = p.start()
+    mock_run.return_value.returncode = 1
+    mock_run.return_value.stderr = stderr
+    return p
+
+
+def _gcloud_raises(exc=None):
+    """Patch subprocess.run to raise (e.g. timeout / gcloud not found)."""
+    p = patch("subprocess.run")
+    mock_run = p.start()
+    mock_run.side_effect = exc or RuntimeError("gcloud binary not found")
+    return p
+
+
 @pytest.mark.asyncio
 async def test_rollback_from_stable_snapshots_real_capacity(
     client: AsyncClient, db_session
@@ -176,6 +193,132 @@ async def test_rollback_double_submit_is_rejected_after_first(
     state = await db_session.get(DeploymentState, 1)
     await db_session.refresh(state)
     assert state.rollback_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Traffic-shift FAILURE path (this task).
+#
+# A manual rollback only records a COMPLETED rollback after the Cloud Run
+# traffic shift actually succeeds. When the shift fails (non-zero exit or an
+# exception), the endpoint must NOT persist ROLLED_BACK / increment the
+# counter / snapshot+zero capacity / mark the pause clock, must keep the
+# operator-facing state distinguishable from a completed rollback, must allow
+# a retry (no double-rollback-guard block), and must truthfully convey that
+# traffic is still serving the bad SHA. Every test above only patches the
+# success path (returncode 0), so the failure path was entirely untested.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rollback_failed_shift_does_not_record_rolled_back(
+    client: AsyncClient, db_session
+):
+    """A non-zero gcloud exit leaves deployment state STABLE: no ROLLED_BACK,
+    no counter bump, no capacity snapshot/zero, no pause-clock mark, and the
+    response signals failure (not a completed rollback)."""
+    db_session.add(_rollbackable_state())
+    await db_session.commit()
+
+    runtime_config["max_concurrent_vms"] = 5
+
+    p = _gcloud_fail()
+    try:
+        resp = await client.post("/api/admin/deploy-state/rollback")
+    finally:
+        p.stop()
+
+    # 200 (operator-actionable retry, not a 5xx that Cloud Run would quarantine)
+    # but a distinct, truthful failure status.
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "rollback_failed"
+    assert body["pipeline_paused"] is False
+    assert body["gcloud_error"]
+    # Traffic is still on the bad revision — convey that truthfully.
+    assert body["serving_sha"] == "sha123bad"
+
+    # Live capacity untouched — pipeline NOT paused.
+    assert runtime_config["max_concurrent_vms"] == 5
+
+    # Persisted state is unchanged from STABLE — no completed-rollback markers.
+    state = await db_session.get(DeploymentState, 1)
+    await db_session.refresh(state)
+    assert state.status == DeploymentStatus.STABLE
+    assert state.rollback_count == 0
+    assert state.pre_pause_max_vms is None
+    assert state.paused_at is None
+    assert state.paused_kind is None
+    assert state.rolled_back_from_sha is None
+
+
+@pytest.mark.asyncio
+async def test_rollback_retry_after_failed_shift_succeeds(
+    client: AsyncClient, db_session
+):
+    """After a failed shift leaves state untouched, a retry (gcloud now OK)
+    completes and records ROLLED_BACK exactly once — proving the double-rollback
+    guard no longer blocks a retry of a failed rollback."""
+    db_session.add(_rollbackable_state())
+    await db_session.commit()
+
+    runtime_config["max_concurrent_vms"] = 5
+
+    p = _gcloud_fail()
+    try:
+        first = await client.post("/api/admin/deploy-state/rollback")
+    finally:
+        p.stop()
+    assert first.status_code == 200
+    assert first.json()["status"] == "rollback_failed"
+
+    # Retry with a now-succeeding traffic shift.
+    p = _gcloud_ok()
+    try:
+        second = await client.post("/api/admin/deploy-state/rollback")
+    finally:
+        p.stop()
+
+    assert second.status_code == 200
+    assert second.json()["status"] == "rolled_back"
+    assert second.json()["pipeline_paused"] is True
+    assert runtime_config["max_concurrent_vms"] == 0
+
+    state = await db_session.get(DeploymentState, 1)
+    await db_session.refresh(state)
+    assert state.status == DeploymentStatus.ROLLED_BACK
+    # Exactly once — the failed first attempt did not increment the counter.
+    assert state.rollback_count == 1
+    assert state.pre_pause_max_vms == 5
+
+
+@pytest.mark.asyncio
+async def test_rollback_exception_during_shift_leaves_state_untouched(
+    client: AsyncClient, db_session
+):
+    """An exception from subprocess.run (timeout, gcloud missing) is treated as
+    a failed shift: state untouched, retry permitted, failure conveyed."""
+    db_session.add(_rollbackable_state())
+    await db_session.commit()
+
+    runtime_config["max_concurrent_vms"] = 5
+
+    p = _gcloud_raises()
+    try:
+        resp = await client.post("/api/admin/deploy-state/rollback")
+    finally:
+        p.stop()
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "rollback_failed"
+    assert resp.json()["pipeline_paused"] is False
+    assert runtime_config["max_concurrent_vms"] == 5
+
+    state = await db_session.get(DeploymentState, 1)
+    await db_session.refresh(state)
+    assert state.status == DeploymentStatus.STABLE
+    assert state.rollback_count == 0
+    assert state.pre_pause_max_vms is None
+    assert state.paused_at is None
 
 
 # ---------------------------------------------------------------------------

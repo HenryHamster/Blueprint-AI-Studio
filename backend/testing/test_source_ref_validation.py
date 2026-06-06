@@ -1046,6 +1046,74 @@ async def test_bug_report_citations_uses_structured_file_path(mocker):
     assert "backend/app/annotated.py" in signal["broken_refs"]
 
 
+@pytest.mark.asyncio
+async def test_bug_report_citations_partial_file_grounding_is_present(mocker):
+    """One cited file gone + another surviving → 'present' (mixed, not absent).
+
+    Regression guard: the shared reproduce-on-HEAD contract reserves 'absent'
+    for reports where NOTHING cited still exists. A still-surviving independent
+    file keeps the verdict non-absent even though a sibling ref is broken.
+    """
+    from app.source_ref_validation import summarize_bug_report_citations
+
+    mocker.patch(
+        "app.source_ref_validation._file_content_in_repo_branch",
+        new=AsyncMock(
+            side_effect=lambda path, **kw: (True, 500)
+            if "alive" in path
+            else (False, None)
+        ),
+    )
+    signal = await summarize_bug_report_citations(
+        "Crash spans backend/app/gone.py and backend/app/alive.py paths.",
+        **_CITE_CREDS,
+    )
+    assert signal["citation_state"] == "present"
+    assert "backend/app/gone.py" in signal["broken_refs"]
+
+
+@pytest.mark.asyncio
+async def test_bug_report_citations_partial_symbol_grounding_is_present(mocker):
+    """One ungrounded symbol + a surviving independent file → 'present'."""
+    from app.source_ref_validation import summarize_bug_report_citations
+
+    mocker.patch(
+        "app.source_ref_validation._file_content_in_repo_branch",
+        new=AsyncMock(return_value=(True, 500)),
+    )
+    mocker.patch(
+        "app.source_ref_validation._symbol_defined_at_head",
+        new=AsyncMock(return_value=False),
+    )
+    signal = await summarize_bug_report_citations(
+        "See backend/app/alive.py; also backend/app/host.py:gone_fn was removed.",
+        **_CITE_CREDS,
+    )
+    assert signal["citation_state"] == "present"
+    assert "backend/app/host.py:gone_fn" in signal["ungrounded_refs"]
+
+
+@pytest.mark.asyncio
+async def test_bug_report_citations_all_absent_still_absent(mocker):
+    """Every cited file and symbol gone → 'absent' (guards against over-correcting)."""
+    from app.source_ref_validation import summarize_bug_report_citations
+
+    mocker.patch(
+        "app.source_ref_validation._file_content_in_repo_branch",
+        new=AsyncMock(return_value=(False, None)),
+    )
+    mocker.patch(
+        "app.source_ref_validation._symbol_defined_at_head",
+        new=AsyncMock(return_value=False),
+    )
+    signal = await summarize_bug_report_citations(
+        "All gone: backend/app/gone1.py and backend/app/gone2.py:dead_fn.",
+        **_CITE_CREDS,
+    )
+    assert signal["citation_state"] == "absent"
+    assert "backend/app/gone1.py" in signal["broken_refs"]
+
+
 # ── classify_reproduction (pure reproduce-on-HEAD verdict) ────────────────────
 
 
