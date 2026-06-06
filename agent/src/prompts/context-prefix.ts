@@ -29,6 +29,57 @@ export function formatSelfReviewCalibrationSection(source: SRCatchRateSource | u
   return `## Self-review calibration\n${caveat}Historical pattern for this task type:\n${rows.map(({ category, miss }) => `- Historical pattern: ${category} is missing ${Math.round(miss * 100)}% of issues a reviewer catches on this project. Scrutinize this category extra carefully.`).join('\n')}\n\n`;
 }
 
+// Backend shape: routers/agent.py builds this from
+// app/rejection_patterns.py:build_rejection_patterns_block — the claiming
+// task type's top first-review rejection categories over a recent
+// time-decayed window, one line of guidance each.
+export type RejectionPatternsSource = {
+  task_type?: string;
+  window_days?: number;
+  sample_size?: number;
+  // Entries are typed nullable because the block crosses the backend→agent
+  // wire — render defensively rather than trusting the shape.
+  categories?: Array<{
+    category?: string;
+    weight?: number;
+    task_count?: number;
+    share?: number;
+    guidance?: string;
+  } | null | undefined>;
+};
+
+// Render the per-type rejection-patterns block injected by the backend at
+// claim time. Framed explicitly as context, NOT a checklist: these are
+// observed frequencies from OTHER tasks' first reviews — the agent must not
+// over-index on the listed categories or treat them as findings about its
+// own change.
+export function formatRejectionPatternsSection(
+  source: RejectionPatternsSource | null | undefined,
+  taskType = '',
+): string {
+  if (!source || typeof source !== 'object' || !Array.isArray(source.categories)) return '';
+  const rows = source.categories
+    .filter((c): c is { category: string; share?: number; task_count?: number; guidance?: string } =>
+      !!c && typeof c === 'object' && typeof c.category === 'string' && c.category.length > 0)
+    .slice(0, 3);
+  if (rows.length === 0) return '';
+  const windowDays = typeof source.window_days === 'number' && source.window_days > 0
+    ? source.window_days
+    : 7;
+  const sampleSuffix = typeof source.sample_size === 'number' && source.sample_size > 0
+    ? ` (${source.sample_size} rejected first attempts)`
+    : '';
+  const typeLabel = (typeof source.task_type === 'string' && source.task_type) || taskType || 'similar';
+  const lines = rows.map((c) => {
+    const pct = typeof c.share === 'number' && c.share > 0
+      ? ` (~${Math.round(c.share * 100)}% of recent rejections)`
+      : '';
+    const guidance = typeof c.guidance === 'string' && c.guidance ? ` — ${c.guidance}` : '';
+    return `- **${c.category}**${pct}${guidance}`;
+  });
+  return `## Recent rejection patterns (context, not a checklist)\nOver the last ${windowDays} days${sampleSuffix}, first review most often rejected ${typeLabel} tasks on this project for:\n${lines.join('\n')}\n\nThese are observed frequencies from other tasks, not findings about your change. Address this task's actual requirements first; give the categories above an honest pass, but do not over-index on them or pad your work to pre-empt every listed category.\n\n`;
+}
+
 // Detect test files across Python/JS/TS conventions used in this repo.
 function isTestFilePath(f: string): boolean {
   return /(?:^|\/)(?:tests?|testing|__tests__)\//i.test(f)
@@ -296,6 +347,14 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
           taskType,
         );
       }
+    }
+    // Per-type rejection patterns ship as an object (not an array), so they
+    // render independently of the hasData array check above.
+    if (['create', 'fix', 'refactor', 'migrate'].includes(taskType)) {
+      prefix += formatRejectionPatternsSection(
+        projectCtx.rejection_patterns as RejectionPatternsSource | undefined,
+        taskType,
+      );
     }
   }
 
