@@ -873,13 +873,13 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.queryByText('unverified finding')).not.toBeInTheDocument();
     });
 
-    it('preserves the crashed-audit affordance only for the current candidate audit', () => {
+    it('preserves the crashed-audit affordance for a terminally-failed candidate audit', () => {
       render(
         <VersionLifecyclePanel
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
               audit_evidence_state: 'current',
-              latest_audit: makeLatestAudit({ report: null }),
+              latest_audit: makeLatestAudit({ report: null, task_status: 'FAILED' }),
             }),
           })}
           loading={false}
@@ -888,6 +888,80 @@ describe('VersionLifecyclePanel', () => {
         />
       );
       expect(screen.getByText(/audit crashed — no report/)).toBeInTheDocument();
+    });
+
+    it('shows a cancelled no-report audit as crashed', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              audit_evidence_state: 'current',
+              latest_audit: makeLatestAudit({ report: null, task_status: 'CANCELLED' }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByText(/audit crashed — no report/)).toBeInTheDocument();
+    });
+
+    it.each(['IN_PROGRESS', 'QUEUED', 'PROVISIONING', 'EVALUATING'])(
+      'shows an in-flight no-report audit (%s) as running, not crashed',
+      (status) => {
+        render(
+          <VersionLifecyclePanel
+            data={makeVersionLifecycleResponse({
+              current_version: makeCurrentVersion({
+                audit_evidence_state: 'current',
+                latest_audit: makeLatestAudit({ report: null, task_status: status }),
+              }),
+            })}
+            loading={false}
+            projectId="proj-1"
+            onRefresh={mockRefresh}
+          />
+        );
+        expect(screen.getByText(/audit running — no report yet/)).toBeInTheDocument();
+        expect(screen.queryByText(/audit crashed/)).not.toBeInTheDocument();
+      }
+    );
+
+    it('shows a blocked no-report audit as blocked, distinct from crashed', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              audit_evidence_state: 'current',
+              latest_audit: makeLatestAudit({ report: null, task_status: 'BLOCKED' }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByText(/audit blocked — waiting on a precondition/)).toBeInTheDocument();
+      expect(screen.queryByText(/audit crashed/)).not.toBeInTheDocument();
+    });
+
+    it('shows a completed-but-empty no-report audit as a distinct anomaly, not a crash', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              audit_evidence_state: 'current',
+              latest_audit: makeLatestAudit({ report: null, task_status: 'COMPLETED' }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByText(/audit completed without a report/)).toBeInTheDocument();
+      expect(screen.queryByText(/audit crashed/)).not.toBeInTheDocument();
     });
 
     it('preserves the no-findings affordance only for the current candidate audit', () => {

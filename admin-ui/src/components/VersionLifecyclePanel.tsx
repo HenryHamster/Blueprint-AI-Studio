@@ -84,6 +84,57 @@ const FINDING_SEVERITY_STYLE: Record<string, string> = {
   low: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
 };
 const FINDING_SEVERITY_ORDER = ['critical', 'high', 'medium', 'low'];
+
+// Operator-readable display state for an audit that carries no report yet,
+// derived once from the underlying audit task status. Mirrors the backend's
+// terminal-vs-non-terminal task-status notion so this never disagrees with the
+// qualification-state summary rendered above (which itself splits a bare
+// 'pending' into 'qualifying' / 'in flight'):
+//   - non-terminal (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING) → still running
+//   - BLOCKED → waiting on a precondition, distinct from a crash
+//   - FAILED/CANCELLED (or unknown) → genuinely crashed, loud red affordance
+//   - COMPLETED with no report → finished-but-empty anomaly, not a crash
+type AuditNoReportKind = 'running' | 'blocked' | 'crashed' | 'completed_empty';
+
+const AUDIT_NO_REPORT_DISPLAY: Record<
+  AuditNoReportKind,
+  { label: string; className: string }
+> = {
+  running: {
+    label: 'audit running — no report yet',
+    className: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
+  },
+  blocked: {
+    label: 'audit blocked — waiting on a precondition',
+    className: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
+  },
+  crashed: {
+    label: 'audit crashed — no report',
+    className: 'bg-red-500/10 text-red-400 border-red-500/20',
+  },
+  completed_empty: {
+    label: 'audit completed without a report',
+    className: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
+  },
+};
+
+function classifyAuditNoReport(taskStatus: string | null | undefined): AuditNoReportKind {
+  switch ((taskStatus ?? '').toUpperCase()) {
+    case 'QUEUED':
+    case 'PROVISIONING':
+    case 'IN_PROGRESS':
+    case 'EVALUATING':
+      return 'running';
+    case 'BLOCKED':
+      return 'blocked';
+    case 'COMPLETED':
+      return 'completed_empty';
+    case 'FAILED':
+    case 'CANCELLED':
+    default:
+      return 'crashed';
+  }
+}
 const QUAL_STATE_STYLE: Record<string, string> = {
   qualifying: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
   promotion_in_flight: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400',
@@ -184,11 +235,12 @@ function AuditProvenance({
 
 function AuditFindingsList({ audit }: { audit: LatestAudit }) {
   if (!audit.report) {
+    const { label, className } = AUDIT_NO_REPORT_DISPLAY[classifyAuditNoReport(audit.task_status)];
     return (
       <div className="space-y-0.5">
         <AuditProvenance audit={audit} />
-        <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20">
-          audit crashed — no report
+        <span className={`text-[10px] px-1.5 py-0.5 rounded border ${className}`}>
+          {label}
         </span>
       </div>
     );
