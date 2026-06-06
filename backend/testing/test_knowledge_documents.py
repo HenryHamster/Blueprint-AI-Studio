@@ -621,6 +621,58 @@ async def test_design_completion_sets_source_kind(db_session, _quiet_broadcast):
     assert task.status == TaskStatus.COMPLETED
 
 
+@pytest.mark.asyncio
+async def test_compute_experiment_persist_sets_source_kind(
+    db_session, _quiet_broadcast
+):
+    """A persisted compute_experiment verdict records source_kind ==
+    'compute_experiment' and synthesizes its document from the measured verdict
+    (no agent-emitted title/summary/body), sharing the same durable store."""
+    from app.knowledge_completion import persist_compute_experiment_knowledge
+
+    project = make_project(name="CErecord")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="compute_experiment: measure X",
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {"type": "compute_experiment", "experiment": "X→Y", "base_branch": "main"}
+        ],
+        context={"direction_id": "d-xyz"},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    doc = await persist_compute_experiment_knowledge(
+        task,
+        outcome="SUCCESS",
+        cost=0.42,
+        criterion={
+            "metric": "accuracy",
+            "operator": ">=",
+            "threshold": 0.9,
+            "value": 0.93,
+            "met": True,
+            "measurable": True,
+        },
+        result_reference="https://storage.example.com/jobs/abc/result.json",
+        session=db_session,
+    )
+
+    assert doc is not None
+    assert doc.source_kind == "compute_experiment"
+    assert doc.direction_id == "d-xyz"
+    assert doc.source_citations == [
+        "https://storage.example.com/jobs/abc/result.json"
+    ]
+    assert "accuracy" in doc.body
+
+
 # ── knowledge-prerequisite delivery to dependents ───────────────────────────
 #
 # When a plan commissions a web_research/design prerequisite and makes an

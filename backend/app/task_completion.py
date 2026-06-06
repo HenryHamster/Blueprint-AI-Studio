@@ -1854,6 +1854,41 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
 # ---------------------------------------------------------------------------
 
 
+async def _persist_compute_experiment_knowledge_best_effort(
+    task: Task, logs: str, criterion: Optional[dict], session: AsyncSession
+) -> None:
+    """Persist a compute_experiment's measured verdict as durable knowledge.
+
+    Best-effort, additive, and self-contained: it runs only when the experiment
+    produced a measurement (terminal ``outcome`` + measured ``cost``) and records
+    the verdict — including an honest negative result when the declared criterion
+    was NOT met — as a queryable ``KnowledgeDocument`` discoverable as prior
+    knowledge by future research/strategist cycles. Wrapped so durable-knowledge
+    persistence can NEVER break the compute task's completion semantics.
+    """
+    measurement = _extract_compute_measurement(logs)
+    if measurement is None:
+        return  # No measured verdict (crash / no terminal outcome) — nothing durable to record.
+    outcome, cost = measurement
+    try:
+        from app.knowledge_completion import persist_compute_experiment_knowledge
+
+        await persist_compute_experiment_knowledge(
+            task,
+            outcome=outcome,
+            cost=cost,
+            criterion=criterion,
+            result_reference=_extract_compute_result_reference(logs),
+            session=session,
+        )
+    except Exception:  # noqa: BLE001 — knowledge persistence must never break completion
+        logger.warning(
+            "[COMPUTE] Failed to persist knowledge document for task %s",
+            task.id,
+            exc_info=True,
+        )
+
+
 async def _handle_compute_experiment_completion(
     task: Task, logs: str, session: AsyncSession
 ):
@@ -1905,6 +1940,13 @@ async def _handle_compute_experiment_completion(
             "[COMPUTE] Task %s did not clear the metric gate: %s",
             task.id,
             verdict.reason,
+        )
+        # Record an honest negative result: an experiment that produced a
+        # measurement but missed its declared criterion still becomes durable,
+        # queryable knowledge ("we tried X and it did NOT meet the bar"), so a
+        # later cycle does not re-pose the question and re-spend.
+        await _persist_compute_experiment_knowledge_best_effort(
+            task, logs, criterion, session
         )
         return
 
@@ -1961,6 +2003,12 @@ async def _handle_compute_experiment_completion(
     )
     logger.info(
         "[COMPUTE] Task %s passed the metric gate and completed", task.id
+    )
+    # Persist the measured verdict as durable, queryable knowledge so future
+    # research/strategist cycles can discover that this experiment already ran
+    # and what it found, the same way web_research/design results survive.
+    await _persist_compute_experiment_knowledge_best_effort(
+        task, logs, criterion, session
     )
 
 

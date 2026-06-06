@@ -166,15 +166,18 @@ class ArtifactType(str, Enum):
 class SourceKind(str, Enum):
     """Which task type produced a :class:`KnowledgeDocument`.
 
-    A knowledge document is written by either a codebase-internal ``design``
-    task or a web-grounded ``web_research`` task; ``UNKNOWN`` is the durable
-    fallback so pre-existing rows (and any future producer that does not stamp
-    a kind) backfill cleanly. Stored as the enum *value* in a plain String
-    column, mirroring ``ArtifactType`` / ``TaskStatus``.
+    A knowledge document is written by a codebase-internal ``design`` task, a
+    web-grounded ``web_research`` task, or a ``compute_experiment`` task whose
+    measured verdict (outcome / metric / criterion-met / cost) is persisted so
+    future research and strategist cycles can discover what was already measured.
+    ``UNKNOWN`` is the durable fallback so pre-existing rows (and any future
+    producer that does not stamp a kind) backfill cleanly. Stored as the enum
+    *value* in a plain String column, mirroring ``ArtifactType`` / ``TaskStatus``.
     """
 
     DESIGN = "design"
     WEB_RESEARCH = "web_research"
+    COMPUTE_EXPERIMENT = "compute_experiment"
     UNKNOWN = "unknown"
 
 
