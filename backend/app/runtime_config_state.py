@@ -452,6 +452,11 @@ runtime_config: Dict = {
     # admin UI response stays under Cloud Run's 32 MB body limit and analytics
     # endpoints don't OOM loading a week of rows.
     "auto_archive_enabled": True,
+    # Auto-debug spawn kill-switch (#8528): gates should_auto_debug in
+    # agent_status.py. False stops Debug:/Fix: replacement spawns fleet-wide —
+    # the storm brake for usage-exhaustion nights where debug children burn
+    # VMs re-diagnosing infra deaths.
+    "auto_debug_enabled": True,
     "auto_archive_terminal_after_days": 7,
     "auto_archive_max_terminal_tasks_per_project": 200,
     "auto_archive_interval_minutes": 60,
@@ -993,6 +998,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "auto_archive_enabled",
                         bool(config_json["auto_archive_enabled"]),
+                    )
+                if "auto_debug_enabled" in config_json:
+                    _set(
+                        "auto_debug_enabled",
+                        bool(config_json["auto_debug_enabled"]),
                     )
                 if "warm_continuity_enabled" in config_json:
                     _set(

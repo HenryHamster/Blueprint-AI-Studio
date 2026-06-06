@@ -1661,6 +1661,11 @@ async def update_agent_status(
                                 "token revoked",
                                 "bad credentials",
                                 "unauthorized",
+                                "authentication_failed",
+                                "authentication failed",
+                                "failed to authenticate",
+                                "invalid authentication credentials",
+                                "invalid api key",
                                 "401",
                                 "oauth_org_not_allowed",
                             )

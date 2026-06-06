@@ -454,6 +454,7 @@ async def get_settings(
         "compute_experiment_spend_threshold_usd": _runtime_config.get(
             "compute_experiment_spend_threshold_usd", 10.0
         ),
+        "auto_debug_enabled": _runtime_config.get("auto_debug_enabled", True),
         "auto_archive_enabled": _runtime_config.get("auto_archive_enabled", True),
         "auto_archive_terminal_after_days": _runtime_config.get(
             "auto_archive_terminal_after_days", 7
@@ -1698,6 +1699,17 @@ async def _apply_settings(
                 ),
             )
         _runtime_config["compute_experiment_spend_threshold_usd"] = val
+    if "auto_debug_enabled" in payload:
+        # #8528 added this key to _KNOWN_SETTINGS_KEYS (the auto-debug spawn
+        # kill-switch read in agent_status.should_auto_debug) but shipped no
+        # apply block — a PATCH validated, returned 200, and silently dropped
+        # the write. Apply block added as the fix-forward.
+        val = payload["auto_debug_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400, detail="auto_debug_enabled must be a boolean"
+            )
+        _runtime_config["auto_debug_enabled"] = val
     if "auto_archive_enabled" in payload:
         val = payload["auto_archive_enabled"]
         if not isinstance(val, bool):
@@ -2122,6 +2134,9 @@ async def _apply_settings(
                     ),
                     "max_parallel_research_per_project": _runtime_config.get(
                         "max_parallel_research_per_project", 3
+                    ),
+                    "auto_debug_enabled": _runtime_config.get(
+                        "auto_debug_enabled", True
                     ),
                     "auto_archive_enabled": _runtime_config.get(
                         "auto_archive_enabled", True

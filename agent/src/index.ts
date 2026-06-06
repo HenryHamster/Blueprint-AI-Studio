@@ -54,7 +54,7 @@ import {
 } from './utils/test-runners.js';
 import {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
-  parseLLMCliTranslation, matchesRateLimit, matchesAuthFailure, RateLimitError, NoProgressTimeoutError,
+  parseLLMCliTranslation, matchesRateLimit, matchesAuthFailure, RateLimitError, AuthFailureError, NoProgressTimeoutError,
   refreshRuntimeState,
   getProviderRunner, providerSupportsNativeSubagents,
   __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
@@ -65,7 +65,7 @@ import {
 
 export {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
-  parseLLMCliTranslation, matchesRateLimit, matchesAuthFailure, RateLimitError, NoProgressTimeoutError,
+  parseLLMCliTranslation, matchesRateLimit, matchesAuthFailure, RateLimitError, AuthFailureError, NoProgressTimeoutError,
   refreshRuntimeState,
   getProviderRunner, providerSupportsNativeSubagents,
   __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
@@ -75,7 +75,7 @@ export type { LLMCliTranslation, ClaudeOutput, RunnerCommand, ValidationCommand,
 export { computeRefreshDelayMs, isBootstrapToken };
 
 // ── Failure categories ───────────────────────────────────────────────────────
-export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'no_progress_timeout' | 'timeout' | 'oauth_rotation_failed' | 'reset_failed' | 'reassigned';
+export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'no_progress_timeout' | 'timeout' | 'oauth_rotation_failed' | 'reset_failed' | 'reassigned' | 'external_api';
 
 // ── Graceful-shutdown signalling (cluster C7) ────────────────────────────────
 // A non-error "shutdown requested" control signal. Thrown from the deep call
@@ -1439,7 +1439,13 @@ export function _setAgentRuntimeFingerprintForTesting(value: string | null): voi
   agentRuntimeFingerprint = value;
 }
 
-export function snapshotToolTrace(): ToolTraceEntry[] {
+export function snapshotToolTrace(options?: { refreshLastEntry?: boolean }): ToolTraceEntry[] {
+  if (options?.refreshLastEntry && _toolTrace.length > 0) {
+    _toolTrace[_toolTrace.length - 1] = {
+      ..._toolTrace[_toolTrace.length - 1],
+      t: new Date().toISOString(),
+    };
+  }
   return _toolTrace.slice();
 }
 
@@ -1588,13 +1594,15 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
   (async () => {
     const metrics = collectMetrics();
     const fix_loop_events = collectFixLoopEventsForFlush();
+    const statusMessage = getMessage();
+    const tool_trace = snapshotToolTrace({ refreshLastEntry: statusMessage.startsWith('Using tool:') });
     const start = Date.now();
     try {
       await apiPost('/api/agent/heartbeat', {
         task_id: taskId,
-        status_message: `[${metrics.heap_used_mb}MB] ${getMessage()}`,
+        status_message: `[${metrics.heap_used_mb}MB] ${statusMessage}`,
         metrics,
-        tool_trace: snapshotToolTrace(),
+        tool_trace,
         ...(fix_loop_events.length > 0 ? { fix_loop_events } : {}),
         ...(getCurrentPromptFingerprint() ? { prompt_fingerprint: getCurrentPromptFingerprint() } : {}),
         ...(agentRuntimeFingerprint ? { agent_runtime_fingerprint: agentRuntimeFingerprint } : {}),
@@ -1636,6 +1644,8 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
       }
     }
     const fix_loop_events = collectFixLoopEventsForFlush();
+    const statusMessage = getMessage();
+    const tool_trace = snapshotToolTrace({ refreshLastEntry: statusMessage.startsWith('Using tool:') });
     try {
       // Tighter heartbeat-specific retry/timeout (10s × 2 vs default 30s × 5).
       // Holding the in-flight mutex through the full 150s+ default chain on a
@@ -1644,9 +1654,9 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
       // Tighter values keep the mutex turning over.
       await apiPost('/api/agent/heartbeat', {
         task_id: taskId,
-        status_message: `[${metrics.heap_used_mb}MB] ${getMessage()}`,
+        status_message: `[${metrics.heap_used_mb}MB] ${statusMessage}`,
         metrics,
-        tool_trace: snapshotToolTrace(),
+        tool_trace,
         ...(fix_loop_events.length > 0 ? { fix_loop_events } : {}),
         ...(getCurrentPromptFingerprint() ? { prompt_fingerprint: getCurrentPromptFingerprint() } : {}),
         ...(agentRuntimeFingerprint ? { agent_runtime_fingerprint: agentRuntimeFingerprint } : {}),
@@ -1672,11 +1682,13 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
           const retryStart = Date.now();
           try {
             const retryMetrics = collectMetrics();
+            const retryStatusMessage = getMessage();
+            const retryToolTrace = snapshotToolTrace({ refreshLastEntry: retryStatusMessage.startsWith('Using tool:') });
             await apiPost('/api/agent/heartbeat', {
               task_id: taskId,
-              status_message: `[${retryMetrics.heap_used_mb}MB] ${getMessage()}`,
+              status_message: `[${retryMetrics.heap_used_mb}MB] ${retryStatusMessage}`,
               metrics: retryMetrics,
-              tool_trace: snapshotToolTrace(),
+              tool_trace: retryToolTrace,
               ...(getCurrentPromptFingerprint() ? { prompt_fingerprint: getCurrentPromptFingerprint() } : {}),
               ...getLlmTelemetry(),
             }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);

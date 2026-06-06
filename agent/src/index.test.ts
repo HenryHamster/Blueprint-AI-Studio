@@ -1265,6 +1265,15 @@ describe('matchesAuthFailure', () => {
     expect(matchesAuthFailure(rejection)).toBe(true);
   });
 
+  it('detects Claude stream 401 authentication failures', () => {
+    const msg = '{"type":"system","subtype":"api_retry","error_status":401,"error":"authentication_failed"}';
+    expect(matchesAuthFailure(msg)).toBe(true);
+  });
+
+  it('detects provider invalid credential messages', () => {
+    expect(matchesAuthFailure('Failed to authenticate. API Error: 401 Invalid authentication credentials')).toBe(true);
+  });
+
   it('detects an HTTP 401 authentication_failed body', () => {
     const body = 'API Error: 401 {"type":"error","error":{"type":"authentication_failed","message":"invalid x-api-key"}}';
     expect(matchesAuthFailure(body)).toBe(true);
@@ -1272,6 +1281,10 @@ describe('matchesAuthFailure', () => {
 
   it('detects an expired OAuth token message', () => {
     expect(matchesAuthFailure('OAuth token has expired. Please run /login.')).toBe(true);
+  });
+
+  it('detects OAuth org-disabled errors', () => {
+    expect(matchesAuthFailure('oauth_org_not_allowed')).toBe(true);
   });
 
   it('matches case-insensitively', () => {
@@ -1294,6 +1307,10 @@ describe('matchesAuthFailure', () => {
     expect(matchesAuthFailure('HTTP 401 received')).toBe(false);
   });
 
+  it('does not match unrelated numeric output', () => {
+    expect(matchesAuthFailure('processed 401 files successfully')).toBe(false);
+  });
+
   it('returns false for unrelated error output', () => {
     expect(matchesAuthFailure('TypeError: cannot read property of undefined')).toBe(false);
   });
@@ -1306,7 +1323,6 @@ describe('matchesAuthFailure', () => {
     expect(matchesAuthFailure('API key not valid', 'anthropic')).toBe(false);
   });
 });
-
 describe('RateLimitError', () => {
   it('is an instance of RateLimitError and Error', () => {
     const err = new RateLimitError('Claude API usage exhausted — banner');
@@ -2472,6 +2488,28 @@ describe('recordToolUse', () => {
     const trace = snapshotToolTrace();
     const entry = trace[trace.length - 1];
     expect(entry.input_preview).toBe('raw string value');
+  });
+
+  it('can refresh the latest entry timestamp without adding a new tool use', () => {
+    clearToolTrace();
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      recordToolUse('Bash', { command: './pr open' });
+      const initial = snapshotToolTrace();
+
+      vi.setSystemTime(new Date('2026-01-01T00:09:00.000Z'));
+      const refreshed = snapshotToolTrace({ refreshLastEntry: true });
+
+      expect(refreshed.length).toBe(1);
+      expect(refreshed[0].tool).toBe('Bash');
+      expect(refreshed[0].input_preview).toBe('{"command":"./pr open"}');
+      expect(refreshed[0].t).toBe('2026-01-01T00:09:00.000Z');
+      expect(refreshed[0].t).not.toBe(initial[0].t);
+    } finally {
+      vi.useRealTimers();
+      clearToolTrace();
+    }
   });
 });
 
