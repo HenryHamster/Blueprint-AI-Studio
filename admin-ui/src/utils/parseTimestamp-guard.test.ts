@@ -89,4 +89,32 @@ describe('parseTimestamp guard: prevent direct new Date(apiString)', () => {
     // No raw new Date() on the API string field either.
     expect(file).not.toContain('new Date(msg.created_at)');
   });
+
+  it('MessagesPanel.tsx imports parseTimestamp', () => {
+    const file = readFileSync(
+      path.join(__dirname, '../components/MessagesPanel.tsx'),
+      'utf-8'
+    );
+    expect(file).toContain("import { parseTimestamp");
+    expect(file).toContain("from '../utils/time'");
+  });
+
+  it('MessagesPanel.tsx uses parseTimestamp for the strategic-refresh receipt age gate', () => {
+    const file = readFileSync(
+      path.join(__dirname, '../components/MessagesPanel.tsx'),
+      'utf-8'
+    );
+    expect(file).toContain('parseTimestamp(lastFiredAt)');
+  });
+
+  it('MessagesPanel.tsx has no raw new Date() parsing of the receipt timestamp', () => {
+    const file = readFileSync(
+      path.join(__dirname, '../components/MessagesPanel.tsx'),
+      'utf-8'
+    );
+    // The strategic-refresh receipt age gate must not reintroduce raw
+    // `new Date(lastFiredAt)` (timezone-shifted) or a hand-rolled Z-append.
+    expect(file).not.toContain('new Date(lastFiredAt)');
+    expect(file).not.toContain("v + 'Z'");
+  });
 });

@@ -677,7 +677,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
           if (marker && typeof marker === 'object') {
             setStrategicRefresh(marker);
           } else if (lastFiredAt && typeof lastFiredAt === 'string' && lastFiredOrigin === 'operator') {
-            const ageMs = Date.now() - new Date(lastFiredAt).getTime();
+            const ageMs = Date.now() - parseTimestamp(lastFiredAt).getTime();
             if (!isNaN(ageMs) && ageMs <= STEER_RECEIPT_MAX_AGE_MS) {
               setStrategicRefresh({ last_fired_at: lastFiredAt, last_fired_origin: lastFiredOrigin });
             } else {

@@ -6,18 +6,54 @@ import os
 from collections import deque
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
 from app.models import DeploymentState, DeploymentStatus
 from app.auth import get_current_user, require_admin
 from app.admin import build_deploy_state_payload
+from app.task_locking import deployment_state_lock
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/admin", tags=["deploy"], dependencies=[Depends(get_current_user)]
 )
+
+
+async def _raise_for_unavailable_state(
+    session: AsyncSession, *, missing_404: bool = True
+) -> None:
+    """Resolve a ``deployment_state_lock`` that yielded ``None``.
+
+    ``deployment_state_lock(skip_locked=True)`` yields ``None`` for two distinct
+    reasons that callers must disambiguate: the singleton row is held by a
+    concurrent writer (the automated monitor or another operator click), or no
+    row exists at all. Probe with a non-locking read:
+
+    * row held → raise ``429`` with ``Retry-After`` (mirrors
+      ``lock_project_or_429``); a 5xx would let Cloud Run quarantine the
+      instance, so the retry-friendly 4xx is deliberate.
+    * row missing → raise ``404`` when ``missing_404`` (resume / reset-health /
+      mark-stable / rollback all require an existing row), or return so the
+      caller can preserve its own missing-row behavior (pause still zeroes
+      in-memory capacity even with no persisted row).
+    """
+    exists = (
+        await session.execute(
+            select(DeploymentState.id).where(DeploymentState.id == 1)
+        )
+    ).first()
+    if exists is None:
+        if missing_404:
+            raise HTTPException(status_code=404, detail="No deployment state found")
+        return
+    raise HTTPException(
+        status_code=429,
+        detail="Deployment state locked by a concurrent writer, retry",
+        headers={"Retry-After": "2"},
+    )
 
 
 @router.get("/deploy-state")
@@ -37,19 +73,27 @@ async def pause_pipeline(
     """Manually pause the pipeline (set max_concurrent_vms=0). Used for manual intervention."""
     from app.shared_state import runtime_config
 
-    state = await session.get(DeploymentState, 1)
-    if state:
-        from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle at module load
+    # Read AND mutate the singleton under the same row lock the automated monitor
+    # uses (deployment_state_lock == SELECT FOR UPDATE on id=1), so a concurrent
+    # auto-transition or a duplicate operator click serializes instead of being
+    # silently clobbered (lost update).
+    from app import pause_clock  # local import to avoid cycle at module load
 
-        state.status = DeploymentStatus.PAUSED
-        state.pause_reason = "Manual pause via admin"
-        pause_clock.mark_paused(state, pause_clock.PAUSED_KIND_MANUAL)
-        # Idempotent: only snapshot pre-pause capacity if not already paused
-        if state.pre_pause_max_vms is None:
-            state.pre_pause_max_vms = runtime_config["max_concurrent_vms"]
-        state.runtime_max_concurrent_vms = runtime_config["max_concurrent_vms"]
-        session.add(state)
-        await session.commit()
+    async with deployment_state_lock(session, skip_locked=True) as state:
+        if state is None:
+            # Held → 429; genuinely missing → fall through (pause still zeroes
+            # in-memory capacity even with no persisted row, as before).
+            await _raise_for_unavailable_state(session, missing_404=False)
+        else:
+            state.status = DeploymentStatus.PAUSED
+            state.pause_reason = "Manual pause via admin"
+            pause_clock.mark_paused(state, pause_clock.PAUSED_KIND_MANUAL)
+            # Idempotent: only snapshot pre-pause capacity if not already paused
+            if state.pre_pause_max_vms is None:
+                state.pre_pause_max_vms = runtime_config["max_concurrent_vms"]
+            state.runtime_max_concurrent_vms = runtime_config["max_concurrent_vms"]
+            session.add(state)
+    await session.commit()
 
     old_vms = runtime_config["max_concurrent_vms"]
     runtime_config["max_concurrent_vms"] = 0
@@ -70,36 +114,38 @@ async def resume_pipeline(
     """Resume the pipeline after a pause. Restores max_concurrent_vms to pre-pause value."""
     from app.shared_state import runtime_config
 
-    state = await session.get(DeploymentState, 1)
-    if not state:
-        raise HTTPException(status_code=404, detail="No deployment state found")
+    from app import pause_clock  # local import to avoid cycle at module load
 
-    # Validate current state — only resume from PAUSED
-    if state.status == DeploymentStatus.HALTED:
-        raise HTTPException(
-            status_code=400,
-            detail="Pipeline is HALTED (3+ consecutive rollbacks). Use mark-stable to acknowledge before resuming.",
-        )
-    if state.status not in (DeploymentStatus.PAUSED, DeploymentStatus.ROLLED_BACK):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Pipeline is {state.status}, not paused — nothing to resume",
-        )
+    # Re-check the resume precondition against the LOCKED, freshly-loaded row so a
+    # concurrent auto-pause/auto-resume can't slip between a stale read and the
+    # write. The whole read-check-mutate window collapses into one committed
+    # transaction (the legacy double-commit is gone).
+    async with deployment_state_lock(session, skip_locked=True) as state:
+        if state is None:
+            await _raise_for_unavailable_state(session)
 
-    from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle at module load
+        # Validate current state — only resume from PAUSED / ROLLED_BACK
+        if state.status == DeploymentStatus.HALTED:
+            raise HTTPException(
+                status_code=400,
+                detail="Pipeline is HALTED (3+ consecutive rollbacks). Use mark-stable to acknowledge before resuming.",
+            )
+        if state.status not in (DeploymentStatus.PAUSED, DeploymentStatus.ROLLED_BACK):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Pipeline is {state.status}, not paused — nothing to resume",
+            )
 
-    restore_vms = state.pre_pause_max_vms or state.runtime_max_concurrent_vms or 5
-    state.status = DeploymentStatus.STABLE
-    state.pause_reason = None
-    pause_clock.accumulate_pause_window(state)
-    state.pre_pause_max_vms = None
-    session.add(state)
+        restore_vms = state.pre_pause_max_vms or state.runtime_max_concurrent_vms or 5
+        state.status = DeploymentStatus.STABLE
+        state.pause_reason = None
+        pause_clock.accumulate_pause_window(state)
+        state.pre_pause_max_vms = None
+        runtime_config["max_concurrent_vms"] = restore_vms
+        state.runtime_max_concurrent_vms = restore_vms
+        session.add(state)
     await session.commit()
 
-    runtime_config["max_concurrent_vms"] = restore_vms
-    state.runtime_max_concurrent_vms = restore_vms
-    session.add(state)
-    await session.commit()
     logger.warning(f"[ADMIN] Pipeline RESUMED (max_concurrent_vms={restore_vms})")
     from app.deploy_health import broadcast_deploy_state
 
@@ -115,60 +161,63 @@ async def reset_deploy_health(
     """Force-reset health state and resume the pipeline. Emergency operator escape hatch."""
     from app.shared_state import runtime_config, external_health
 
-    state = await session.get(DeploymentState, 1)
-    if not state:
-        raise HTTPException(status_code=404, detail="No deployment state found")
+    from app import pause_clock  # local import to avoid cycle at module load
 
-    if state.status != DeploymentStatus.PAUSED:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Pipeline is {state.status}, not PAUSED — reset-health only applies to PAUSED state",
-        )
+    # Re-check the PAUSED-only precondition against the LOCKED row and perform the
+    # DB read-mutate-commit atomically; the in-memory health/streak resets below
+    # are not row-state and stay where they were.
+    async with deployment_state_lock(session, skip_locked=True) as state:
+        if state is None:
+            await _raise_for_unavailable_state(session)
 
-    restore_vms = state.pre_pause_max_vms or state.runtime_max_concurrent_vms or 5
+        if state.status != DeploymentStatus.PAUSED:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Pipeline is {state.status}, not PAUSED — reset-health only applies to PAUSED state",
+            )
 
-    # Clear external health failures
-    external_health["failed_deps"] = []
-    for key in external_health:
-        if key != "failed_deps" and isinstance(external_health[key], bool):
-            external_health[key] = True
+        restore_vms = state.pre_pause_max_vms or state.runtime_max_concurrent_vms or 5
 
-    # Reset in-memory streak counters in deploy_health.py
-    try:
-        import app.deploy_health as _dh
+        # Clear external health failures
+        external_health["failed_deps"] = []
+        for key in external_health:
+            if key != "failed_deps" and isinstance(external_health[key], bool):
+                external_health[key] = True
 
-        _dh._pause_failure_streak = 0
-        _dh._reset_health_recovery_history()
-        _dh._recent_auto_resumes.clear()
-        _dh._last_resume_was_forced = False
-        _dh._consecutive_force_resumes = 0
-    except Exception:
-        logger.exception("[DEPLOY] Failed to reset deploy_health streak counters")
+        # Reset in-memory streak counters in deploy_health.py
+        try:
+            import app.deploy_health as _dh
 
-    # Reset zone health — clear cooldowns so all zones are available
-    try:
-        from app.compute import _zone_failures, _zone_health
+            _dh._pause_failure_streak = 0
+            _dh._reset_health_recovery_history()
+            _dh._recent_auto_resumes.clear()
+            _dh._last_resume_was_forced = False
+            _dh._consecutive_force_resumes = 0
+        except Exception:
+            logger.exception("[DEPLOY] Failed to reset deploy_health streak counters")
 
-        _zone_failures.clear()
-        _zone_health.clear()
-    except Exception:
-        logger.exception("[DEPLOY] Failed to reset zone health counters")
+        # Reset zone health — clear cooldowns so all zones are available
+        try:
+            from app.compute import _zone_failures, _zone_health
 
-    # Clear failure history so failure_rate resets to 0
-    from app.shared_state import deploy_monitoring
+            _zone_failures.clear()
+            _zone_health.clear()
+        except Exception:
+            logger.exception("[DEPLOY] Failed to reset zone health counters")
 
-    deploy_monitoring["task_results"] = deque(maxlen=100)
+        # Clear failure history so failure_rate resets to 0
+        from app.shared_state import deploy_monitoring
 
-    # Restore VM count and clear pause fields
-    from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle at module load
+        deploy_monitoring["task_results"] = deque(maxlen=100)
 
-    runtime_config["max_concurrent_vms"] = restore_vms
-    state.runtime_max_concurrent_vms = restore_vms
-    state.status = DeploymentStatus.STABLE
-    state.pause_reason = None
-    pause_clock.accumulate_pause_window(state)
-    state.pre_pause_max_vms = None
-    session.add(state)
+        # Restore VM count and clear pause fields
+        runtime_config["max_concurrent_vms"] = restore_vms
+        state.runtime_max_concurrent_vms = restore_vms
+        state.status = DeploymentStatus.STABLE
+        state.pause_reason = None
+        pause_clock.accumulate_pause_window(state)
+        state.pre_pause_max_vms = None
+        session.add(state)
     await session.commit()
     try:
         from app.state_persistence import _persist_zone_health
@@ -194,16 +243,18 @@ async def mark_deploy_stable(
     """Manually mark the current deploy as stable (skip monitoring window)."""
     from app.shared_state import deploy_monitoring
 
-    state = await session.get(DeploymentState, 1)
-    if not state:
-        raise HTTPException(status_code=404, detail="No deployment state found")
+    # Read-mutate-commit the singleton atomically under the row lock so a manual
+    # mark-stable can't silently erase a concurrent auto-pause (lost update).
+    async with deployment_state_lock(session, skip_locked=True) as state:
+        if state is None:
+            await _raise_for_unavailable_state(session)
 
-    state.status = DeploymentStatus.STABLE
-    state.last_known_good_revision = state.current_revision
-    state.last_known_good_sha = state.current_sha
-    state.rollback_count = 0
-    state.rollback_reason = None
-    session.add(state)
+        state.status = DeploymentStatus.STABLE
+        state.last_known_good_revision = state.current_revision
+        state.last_known_good_sha = state.current_sha
+        state.rollback_count = 0
+        state.rollback_reason = None
+        session.add(state)
     await session.commit()
 
     deploy_monitoring["window_start"] = None
@@ -227,94 +278,100 @@ async def trigger_rollback(
     import subprocess
     from app.shared_state import runtime_config, deploy_monitoring
 
-    state = await session.get(DeploymentState, 1)
-    if not state:
-        raise HTTPException(status_code=404, detail="No deployment state found")
-
-    if (
-        not state.last_known_good_revision
-        or state.last_known_good_revision == state.current_revision
-    ):
-        raise HTTPException(
-            status_code=400, detail="No previous good revision to rollback to"
-        )
-
-    # Guard against double-rollback
-    if state.status == DeploymentStatus.ROLLED_BACK:
-        raise HTTPException(
-            status_code=400,
-            detail="Already rolled back — use resume or mark-stable first",
-        )
-
-    # Get causation analysis for the rollback reason
+    from app import pause_clock  # local import to avoid cycle at module load
     from app.deploy_health import should_rollback
 
-    _, analysis_reason, _ = should_rollback()
+    # Hold the row lock across the entire rollback: precondition re-check (no good
+    # revision / double-rollback guard), the gcloud traffic shift, and the state
+    # mutation all happen against the same locked snapshot. This makes the
+    # rollback_count increment and pre_pause snapshot exactly-once even under a
+    # concurrent auto-transition or a duplicate operator click — the second writer
+    # blocks on the lock (skip_locked monitor backs off) and re-evaluates the
+    # ROLLED_BACK guard against the committed state, so it is rejected with 400.
+    async with deployment_state_lock(session, skip_locked=True) as state:
+        if state is None:
+            await _raise_for_unavailable_state(session)
 
-    # Attempt Cloud Run traffic shift via gcloud
-    project_id = os.getenv("GCP_PROJECT_ID", "")
-    region = os.getenv("GCP_REGION", "us-central1")
-    service = os.getenv("ORCHESTRATOR_SERVICE_NAME", "blueprint-orchestrator")
-
-    rollback_revision = state.last_known_good_revision
-    rollback_error = None
-
-    try:
-
-        def _run_gcloud_rollback():
-            return subprocess.run(
-                [
-                    "gcloud",
-                    "run",
-                    "services",
-                    "update-traffic",
-                    service,
-                    "--to-revisions",
-                    f"{rollback_revision}=100",
-                    "--region",
-                    region,
-                    "--project",
-                    project_id,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
+        if (
+            not state.last_known_good_revision
+            or state.last_known_good_revision == state.current_revision
+        ):
+            raise HTTPException(
+                status_code=400, detail="No previous good revision to rollback to"
             )
 
-        result = await asyncio.to_thread(_run_gcloud_rollback)
-        if result.returncode != 0:
-            rollback_error = result.stderr[:500]
-            logger.error(f"[ADMIN] Cloud Run rollback failed: {rollback_error}")
-    except Exception as e:
-        rollback_error = str(e)[:500]
-        logger.error(f"[ADMIN] Rollback command failed: {e}", exc_info=True)
+        # Guard against double-rollback
+        if state.status == DeploymentStatus.ROLLED_BACK:
+            raise HTTPException(
+                status_code=400,
+                detail="Already rolled back — use resume or mark-stable first",
+            )
 
-    # Update deployment state regardless of gcloud result.
-    # The ROLLED_BACK guard above makes this a real status transition every time
-    # we reach here, so the rollback_count increment and capacity snapshot are
-    # taken exactly once per rollback (a re-entrant call is rejected by the guard).
-    from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle at module load
+        # Get causation analysis for the rollback reason
+        _, analysis_reason, _ = should_rollback()
 
-    state.status = DeploymentStatus.ROLLED_BACK
-    state.rolled_back_from_sha = state.current_sha
-    state.rollback_reason = f"Manual rollback: {analysis_reason}"
-    state.rollback_count += 1
-    # Idempotent capacity snapshot: only capture the genuine pre-pause capacity
-    # if no prior pause already saved it. Rolling back an already-paused pipeline
-    # (manual or auto) leaves live capacity at zero, so an unconditional snapshot
-    # would clobber the real value and a later resume would restore the wrong
-    # concurrency. Mirror the manual-pause guard in pause_pipeline.
-    if state.pre_pause_max_vms is None:
-        state.pre_pause_max_vms = (
-            runtime_config["max_concurrent_vms"]
-            or state.runtime_max_concurrent_vms
-        )
-    # Mark the pause window on the pause clock so pause-aware task timers
-    # (CI backstop, queued-age, pre-claim reaper) subtract the rollback-induced
-    # downtime. mark_paused is idempotent: if the pipeline was already paused it
-    # preserves the existing paused_at/paused_kind rather than restarting the window.
-    pause_clock.mark_paused(state, pause_clock.PAUSED_KIND_AUTO)
-    session.add(state)
+        # Attempt Cloud Run traffic shift via gcloud
+        project_id = os.getenv("GCP_PROJECT_ID", "")
+        region = os.getenv("GCP_REGION", "us-central1")
+        service = os.getenv("ORCHESTRATOR_SERVICE_NAME", "blueprint-orchestrator")
+
+        rollback_revision = state.last_known_good_revision
+        rollback_error = None
+
+        try:
+
+            def _run_gcloud_rollback():
+                return subprocess.run(
+                    [
+                        "gcloud",
+                        "run",
+                        "services",
+                        "update-traffic",
+                        service,
+                        "--to-revisions",
+                        f"{rollback_revision}=100",
+                        "--region",
+                        region,
+                        "--project",
+                        project_id,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+
+            result = await asyncio.to_thread(_run_gcloud_rollback)
+            if result.returncode != 0:
+                rollback_error = result.stderr[:500]
+                logger.error(f"[ADMIN] Cloud Run rollback failed: {rollback_error}")
+        except Exception as e:
+            rollback_error = str(e)[:500]
+            logger.error(f"[ADMIN] Rollback command failed: {e}", exc_info=True)
+
+        # Update deployment state regardless of gcloud result.
+        # The ROLLED_BACK guard above makes this a real status transition every time
+        # we reach here, so the rollback_count increment and capacity snapshot are
+        # taken exactly once per rollback (a re-entrant call is rejected by the guard).
+        state.status = DeploymentStatus.ROLLED_BACK
+        state.rolled_back_from_sha = state.current_sha
+        state.rollback_reason = f"Manual rollback: {analysis_reason}"
+        state.rollback_count += 1
+        # Idempotent capacity snapshot: only capture the genuine pre-pause capacity
+        # if no prior pause already saved it. Rolling back an already-paused pipeline
+        # (manual or auto) leaves live capacity at zero, so an unconditional snapshot
+        # would clobber the real value and a later resume would restore the wrong
+        # concurrency. Mirror the manual-pause guard in pause_pipeline.
+        if state.pre_pause_max_vms is None:
+            state.pre_pause_max_vms = (
+                runtime_config["max_concurrent_vms"]
+                or state.runtime_max_concurrent_vms
+            )
+        # Mark the pause window on the pause clock so pause-aware task timers
+        # (CI backstop, queued-age, pre-claim reaper) subtract the rollback-induced
+        # downtime. mark_paused is idempotent: if the pipeline was already paused it
+        # preserves the existing paused_at/paused_kind rather than restarting the window.
+        pause_clock.mark_paused(state, pause_clock.PAUSED_KIND_AUTO)
+        session.add(state)
     await session.commit()
 
     # Pause pipeline

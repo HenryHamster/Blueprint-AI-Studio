@@ -4041,4 +4041,28 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
     });
     expect(el.textContent).toContain('Steer picked up');
   });
+
+  test('shows receipt for a naive-UTC (no trailing Z) timestamp within 2 hours', async () => {
+    // The backend serialises naive UTC ISO strings *without* a trailing 'Z'.
+    // The age gate must parse these through parseTimestamp (UTC), not raw
+    // new Date() (which would treat them as local time and shift the age by
+    // the operator's UTC offset).
+    const recentNaive = new Date(Date.now() - 30 * 60_000).toISOString().replace('Z', ''); // 30 min ago, naive UTC
+    const el = await renderPanel({
+      _strategic_refresh_last_fired_at: recentNaive,
+      _strategic_refresh_last_fired_origin: 'operator',
+    });
+    expect(el.textContent).toContain('Steer picked up');
+  });
+
+  test('hides receipt for a naive-UTC (no trailing Z) timestamp older than 2 hours', async () => {
+    // Complementary stale case: a 3h-old naive-UTC timestamp must be suppressed.
+    // Proves the gate is parsed as UTC, not local — a stale receipt stays hidden.
+    const staleNaive = new Date(Date.now() - 3 * 3600_000).toISOString().replace('Z', ''); // 3h ago, naive UTC
+    const el = await renderPanel({
+      _strategic_refresh_last_fired_at: staleNaive,
+      _strategic_refresh_last_fired_origin: 'operator',
+    });
+    expect(el.textContent).not.toContain('Steer picked up');
+  });
 });
