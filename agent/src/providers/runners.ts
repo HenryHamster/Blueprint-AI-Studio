@@ -333,6 +333,75 @@ export class VmConfigMissingError extends Error {
   }
 }
 
+// ── Structured provider-run error report ─────────────────────────────────────
+// The truthful record of HOW the last provider CLI run terminated, captured at
+// the runner layer (which actually observes the exit code, stderr, and the
+// provider error events in the stream) instead of being reverse-engineered
+// from output-text tails by the backend. Recorded for EVERY run — success or
+// failure — and shipped with the terminal FAILED status post (see
+// enrichStatusPayload in index.ts), so backend failure classification can
+// consume it as the PRIMARY signal and only fall back to text heuristics for
+// old agents that never sent one. Provider-agnostic by construction: each
+// provider's stream parser feeds the same fields (model_output_seen /
+// result_event_seen / provider_errors), so a provider error routes to the
+// rate-limit/transient path without per-provider backend regexes.
+// Incident 2026-06-06: a create task died 5s after CLI start (exit 1, output
+// tail = init banner only — a provider error on the first API call) and was
+// classified CODE_ERROR, stripping rate-limit handling and burning all 3
+// retries in seconds.
+export interface ProviderErrorEntry {
+  /** Which stream surface emitted the error (e.g. 'claude-stream', 'codex-turn-failed'). */
+  source: string;
+  /** Provider error code/type when the event carried one. */
+  code?: string;
+  message: string;
+}
+
+export interface ProviderRunErrorReport {
+  schema: 1;
+  /** Task the run belonged to — guards against stale cross-role reuse on warm VMs. */
+  task_id: string;
+  provider: ProviderName;
+  auth_mode: AuthMode;
+  exit_code: number | null;
+  exit_signal: string | null;
+  duration_ms: number;
+  /** True once the model produced ANY top-level output (delta/assistant/result). */
+  model_output_seen: boolean;
+  /** True once the terminal result event arrived (claude `result` / codex `turn.completed`). */
+  result_event_seen: boolean;
+  /** Structured provider error events observed in the stream (bounded). */
+  provider_errors: ProviderErrorEntry[];
+  stderr_tail: string;
+  /** Last parsed stream-json event type, for forensics. */
+  last_stream_event: string | null;
+  /** Agent-side matcher verdict when one fired (rate_limit / auth_failure / …). */
+  classified?: string;
+}
+
+const RUN_REPORT_STDERR_TAIL_CHARS = 2000;
+const RUN_REPORT_MAX_PROVIDER_ERRORS = 5;
+const RUN_REPORT_ERROR_MESSAGE_CHARS = 500;
+
+let _lastRunErrorReport: ProviderRunErrorReport | null = null;
+
+/** The structured report for the most recent provider run, or null if none ran yet. */
+export function getLastProviderRunErrorReport(): ProviderRunErrorReport | null {
+  return _lastRunErrorReport;
+}
+
+/** Clear the last-run report. Called from resetPerRoleModuleState so a warm
+ *  role can never observe the prior role's run report through the getter
+ *  (enrichStatusPayload also guards attachment by task_id). */
+export function clearLastProviderRunErrorReport(): void {
+  _lastRunErrorReport = null;
+}
+
+/** Test-only: seed/clear the last-run report. */
+export function _setLastProviderRunErrorReportForTesting(report: ProviderRunErrorReport | null): void {
+  _lastRunErrorReport = report;
+}
+
 interface ClaudeOutputBlock { type: string; text?: string; name?: string; id?: string; input?: unknown }
 export interface ClaudeOutput {
   type: string;
@@ -704,6 +773,46 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   let allOutput = '';
   let lastResultText = '';
   let stderrBuffer = '';
+  // Structured-run-report tracking (see ProviderRunErrorReport). Fed by every
+  // provider's stream parser so the terminal report is provider-agnostic.
+  const runStartedAt = Date.now();
+  let modelOutputSeen = false;
+  let resultEventSeen = false;
+  let lastStreamEventType: string | null = null;
+  let closeSignalSeen: string | null = null;
+  const providerErrors: ProviderErrorEntry[] = [];
+  const recordProviderError = (source: string, message: string, code?: string): void => {
+    if (providerErrors.length >= RUN_REPORT_MAX_PROVIDER_ERRORS) return;
+    providerErrors.push({
+      source,
+      message: sanitize(message).slice(0, RUN_REPORT_ERROR_MESSAGE_CHARS),
+      ...(code ? { code: code.slice(0, 100) } : {}),
+    });
+  };
+  // Record the structured run report for THIS run (success or failure). Called
+  // on every exit path — including just before each typed throw — so whoever
+  // posts the terminal status always has the truthful exit context to ship.
+  const recordRunErrorReport = (exitCode: number | null, classified?: string): void => {
+    // Text-mode providers (gemini) have no terminal result event; a clean exit
+    // that produced output is their completed-run signal.
+    const completedTextRun =
+      runCommand.outputMode === 'text' && exitCode === 0 && modelOutputSeen;
+    _lastRunErrorReport = {
+      schema: 1,
+      task_id: process.env.TASK_ID || '',
+      provider: runner.provider,
+      auth_mode: runner.authMode,
+      exit_code: exitCode,
+      exit_signal: closeSignalSeen,
+      duration_ms: Date.now() - runStartedAt,
+      model_output_seen: modelOutputSeen,
+      result_event_seen: resultEventSeen || completedTextRun,
+      provider_errors: providerErrors,
+      stderr_tail: stderrBuffer.slice(-RUN_REPORT_STDERR_TAIL_CHARS),
+      last_stream_event: lastStreamEventType,
+      ...(classified ? { classified } : {}),
+    };
+  };
   const flags: { timedOut: boolean; providerKilledByOOM: boolean; stalledMidStream: boolean; llmNoProgressHang: boolean } = { timedOut: false, providerKilledByOOM: false, stalledMidStream: false, llmNoProgressHang: false };
   let lastToolUseAt: number | null = null;
   let toolInFlight = false;
@@ -988,6 +1097,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
             }
             linesSinceYield += 1;
             const objType = obj.type || '';
+            lastStreamEventType = objType || lastStreamEventType;
             // A nested event is one emitted by a sub-agent the parent spawned via
             // the Task/Agent/Workflow tool. It is NOT a top-level model turn and
             // its tool-result `user` event must NOT clear the parent's toolInFlight.
@@ -1017,7 +1127,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
               // not mask a genuine top-level provider hang. Act minimally (just the
               // timer reset) and do NOT log every delta — --include-partial-messages
               // multiplies event volume and per-delta logging would flood the WS.
-              if (!isNested) lastStreamEventAt = Date.now();
+              if (!isNested) {
+                lastStreamEventAt = Date.now();
+                modelOutputSeen = true;  // run report: model is actively generating
+              }
               // Any delta (top-level OR nested) is genuine in-flight activity, so
               // also count it as tool sub-progress when a tool is in flight —
               // consistent with the lastToolProgressAt logic (#6979). noteToolProgress
@@ -1028,7 +1141,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
               // (the no-progress watchdog's content signal). Nested sub-agent
               // assistant events still count as tool sub-progress (noteToolProgress
               // above) but must not mask a genuine top-level provider hang.
-              if (!isNested) lastStreamEventAt = Date.now();
+              if (!isNested) {
+                lastStreamEventAt = Date.now();
+                modelOutputSeen = true;  // run report: model produced a turn
+              }
               if (obj.message?.content) {
                 for (const block of obj.message.content) {
                   if (block.type === 'text') {
@@ -1060,7 +1176,11 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
               // Only a top-level result is the model's terminal turn. A nested
               // result (a sub-agent finishing under a workflow tool) is just more
               // sub-progress and must not arm the result-grace exit timer.
-              if (!isNested) lastStreamEventAt = Date.now();  // terminal model event — reset no-progress watchdog
+              if (!isNested) {
+                lastStreamEventAt = Date.now();  // terminal model event — reset no-progress watchdog
+                modelOutputSeen = true;
+                resultEventSeen = true;  // run report: the run completed its model turn
+              }
               lastResultText = (obj as { result?: string }).result ?? '';
               sendLog(ws, `\n--- Result ---\n${lastResultText}\n`);
               const usage = (obj as { result?: string; usage?: Record<string, unknown> }).usage;
@@ -1088,9 +1208,17 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
                 }, CLAUDE_RESULT_GRACE_MS);
               }
             } else if (objType === 'error') {
-              const errLine = `[claude-stream error] ${(obj as { error?: { message?: string } }).error?.message ?? ''}\n`;
+              const errObj = (obj as { error?: { message?: string; type?: string; code?: string } }).error;
+              const errLine = `[claude-stream error] ${errObj?.message ?? ''}\n`;
               sendLog(ws, errLine);
               stderrBuffer = appendBoundedTail(stderrBuffer, errLine, STDERR_TAIL_BYTES);
+              // Run report: a structured provider error event — the truthful
+              // "the provider rejected/aborted this call" signal.
+              recordProviderError(
+                'claude-stream',
+                errObj?.message ?? '(no message)',
+                typeof errObj?.code === 'string' ? errObj.code : (typeof errObj?.type === 'string' ? errObj.type : undefined),
+              );
             } else if (objType === 'system' || objType === 'user') {
               // A nested `user` event is a sub-agent's tool-result under a still-
               // running workflow tool; it must NOT clear the parent's toolInFlight
@@ -1205,6 +1333,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
             }
             linesSinceYield += 1;
             const eventType = typeof obj.type === 'string' ? obj.type : '';
+            lastStreamEventType = eventType || lastStreamEventType;
             // Codex items are one-shot (started → completed in sequence) with no
             // nested sub-agent stream, so tool sub-progress is tracked explicitly
             // at item.started (lastToolProgressAt set there); there is no separate
@@ -1220,6 +1349,8 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
               lastStreamEventAt = Date.now();  // model producing — reset no-progress watchdog
               sendLog(ws, '[codex] turn.completed\n');
               codexTurnCompleted = true;
+              modelOutputSeen = true;
+              resultEventSeen = true;  // run report: codex terminal turn event
               const usage = obj.usage as Record<string, unknown> | undefined;
               if (usage && typeof usage === 'object') {
                 const inputTokens = Number(usage.input_tokens ?? 0) + Number(usage.cache_creation_input_tokens ?? 0) + Number(usage.cache_read_input_tokens ?? 0);
@@ -1227,21 +1358,29 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
                 recordLlmTokens(inputTokens, outputTokens);
               }
             } else if (eventType === 'turn.failed') {
-              const err = (obj.error as { message?: string } | undefined)?.message ?? '';
+              const errEnvelope = obj.error as { message?: string; code?: string } | undefined;
+              const err = errEnvelope?.message ?? '';
               const oneLine = `[codex] turn.failed: ${err}\n`;
               sendLog(ws, oneLine);
               stderrBuffer = appendBoundedTail(stderrBuffer, oneLine, STDERR_TAIL_BYTES);
+              recordProviderError(
+                'codex-turn-failed',
+                err || '(no message)',
+                typeof errEnvelope?.code === 'string' ? errEnvelope.code : undefined,
+              );
             } else if (eventType === 'error') {
               const msg = typeof obj.message === 'string' ? obj.message : '';
               const oneLine = `[codex] error: ${msg}\n`;
               sendLog(ws, oneLine);
               stderrBuffer = appendBoundedTail(stderrBuffer, oneLine, STDERR_TAIL_BYTES);
+              recordProviderError('codex-error', msg || '(no message)');
             } else if (
               eventType === 'item.started'
               || eventType === 'item.updated'
               || eventType === 'item.completed'
             ) {
               lastStreamEventAt = Date.now();  // model producing — reset no-progress watchdog
+              modelOutputSeen = true;  // run report: codex item events are model work
               const item = obj.item as Record<string, unknown> | undefined;
               const itemType = item && typeof item.type === 'string' ? item.type : '';
               const preview = _codexItemPreview(item);
@@ -1286,6 +1425,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
                 const oneLine = `[codex] item error: ${msg}\n`;
                 sendLog(ws, oneLine);
                 stderrBuffer = appendBoundedTail(stderrBuffer, oneLine, STDERR_TAIL_BYTES);
+                recordProviderError('codex-item-error', msg || '(no message)');
               }
             }
           }
@@ -1335,6 +1475,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
         if (trimmed) {
           lastResultText = `${lastResultText}${text}`.trim();
           statusRef.value = trimmed.slice(0, 100);
+          modelOutputSeen = true;  // run report: text-mode providers have no event schema
         }
       }
     });
@@ -1383,6 +1524,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
     });
     child.on('close', (code, signal) => {
       const closeSignal = signal ?? null;
+      closeSignalSeen = closeSignal;
       clearTimeout(killTimer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
       if (resultGraceTimer) clearTimeout(resultGraceTimer);
@@ -1418,9 +1560,11 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   sendLog(ws, `\n--- ${runner.displayName} exited (code: ${exitCode}) ---\n`);
 
   if (flags.timedOut) {
+    recordRunErrorReport(exitCode, 'timeout');
     throw new ClaudeTimeoutError(`${runner.displayName} exceeded ${runCommand.timeoutMs / 60000}-minute time limit`);
   }
   if (flags.stalledMidStream) {
+    recordRunErrorReport(exitCode, 'tool_stall');
     throw new ClaudeTimeoutError(`${runner.displayName} mid-stream tool-use stall: tool in-flight for >${TOOL_USE_STALL_TIMEOUT_MS / 60000} min without result`);
   }
   // Computed up here (before the no-progress branch) so the no-progress watchdog
@@ -1444,12 +1588,15 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   //     still bounded (we SIGTERM'd + requeue), so it is never immortal.
   if (flags.llmNoProgressHang) {
     if (sawConfirmedRateLimit) {
+      recordRunErrorReport(exitCode, 'rate_limit');
       const snippet = (stderrBuffer || allOutput.slice(-500)).slice(0, 500);
       throw new RateLimitError(`${runner.displayName} produced no model output and hit a confirmed rate limit — ${snippet}`);
     }
+    recordRunErrorReport(exitCode, 'no_progress_hang');
     throw new NoProgressTimeoutError(`${runner.displayName} produced no model output (no stream deltas) for >${LLM_NO_PROGRESS_STALL_MS / 60000} min — transient provider hang, no confirmed rate-limit message`);
   }
   if (flags.providerKilledByOOM) {
+    recordRunErrorReport(exitCode, 'oom');
     const err = new ClaudeTimeoutError(`EOOM: ${runner.displayName} received external SIGKILL before agent timeout; likely cgroup OOM`);
     (err as Error & { code?: string }).code = 'EOOM';
     throw err;
@@ -1460,17 +1607,24 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   // not fall through to the generic non-zero-exit path (whose init-banner-only
   // tail the orchestrator reclassifies as usage exhaustion).
   if (exitCode !== 0 && matchesVmConfigMissing(combined)) {
+    recordRunErrorReport(exitCode, 'vm_config_missing');
     const snippet = (stderrBuffer || allOutput.slice(-500)).slice(0, 500);
     throw new VmConfigMissingError(`${runner.displayName} provider config file missing on VM (boot/retarget materialization lost) — ${snippet}`);
   }
   if (exitCode !== 0 && matchesAuthFailure(combined, runner.provider)) {
+    recordRunErrorReport(exitCode, 'auth_failure');
     const snippet = (stderrBuffer || allOutput.slice(-500)).slice(0, 500);
     throw new AuthFailureError(`${runner.displayName} authentication failed — ${snippet}`);
   }
   if (sawConfirmedRateLimit) {
+    recordRunErrorReport(exitCode, 'rate_limit');
     const snippet = (stderrBuffer || allOutput.slice(-500)).slice(0, 500);
     throw new RateLimitError(`${runner.displayName} API usage exhausted — ${snippet}`);
   }
+
+  // No agent-side matcher fired — record the unclassified run report (the
+  // backend's structured-report classifier consumes the run-shape fields).
+  recordRunErrorReport(exitCode);
 
   const stderrTail = stderrBuffer.slice(-500);
   return {

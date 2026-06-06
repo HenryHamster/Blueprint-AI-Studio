@@ -65,6 +65,14 @@ class AgentStatusPayload(BaseModel):
     logs: str | None = Field(None, max_length=500000)
     verdict_json: str | None = Field(None, max_length=10000)
     failure_category: str | None = Field(None, max_length=50)
+    # Structured provider-run error report captured by the agent runner for the
+    # last provider CLI run (exit code, stderr tail, provider error events,
+    # model_output_seen / result_event_seen run shape). Shipped on FAILED
+    # statuses; the PRIMARY failure-classification signal — text heuristics are
+    # the fallback for old agents that never sent one. Sanitized + bounded by
+    # ``app.failure_classification.sanitize_agent_error_report`` before being
+    # persisted into task.context["agent_error_report"].
+    error_report: Dict[str, Any] | None = None
     provider: str | None = Field(None, max_length=50)
     auth_mode: str | None = Field(None, max_length=50)
     model: str | None = Field(None, max_length=200)

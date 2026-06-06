@@ -1,4 +1,4 @@
-import { vi, describe, it, expect, beforeEach } from 'vitest';
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 // ── Hoisted setup ─────────────────────────────────────────────────────────────
 const { mockRecordToolUse, mockRecordCheckOutcome, mockIsCheckInvocation, mockSendLog } =
@@ -73,7 +73,11 @@ vi.mock('../prompt.js', () => ({
 
 // ── Imports (after mocks) ─────────────────────────────────────────────────────
 import { spawn } from 'child_process';
-import { runProviderAgent } from './runners.js';
+import {
+  runProviderAgent,
+  getLastProviderRunErrorReport,
+  _setLastProviderRunErrorReportForTesting,
+} from './runners.js';
 import { CLAUDE_RESULT_GRACE_MS } from '../constants.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -290,6 +294,115 @@ describe('drainJsonChunks — check-runaway detection (assistant + user events)'
     expect(arg.length).toBeLessThanOrEqual(200);
     // Confirm the raw JSON would have exceeded 200 chars — otherwise the test proves nothing
     expect(JSON.stringify({ command: longCommand }).length).toBeGreaterThan(200);
+  });
+});
+
+describe('structured provider-run error report', () => {
+  let savedTaskId: string | undefined;
+
+  beforeEach(() => {
+    vi.mocked(spawn).mockReset();
+    mockSendLog.mockClear();
+    _setLastProviderRunErrorReportForTesting(null);
+    savedTaskId = process.env.TASK_ID;
+    process.env.TASK_ID = 'task-report-1';
+  });
+
+  afterEach(() => {
+    if (savedTaskId !== undefined) process.env.TASK_ID = savedTaskId;
+    else delete process.env.TASK_ID;
+    _setLastProviderRunErrorReportForTesting(null);
+  });
+
+  it('records a startup-death report: non-zero exit with init banner only and no model output', async () => {
+    // The 2026-06-06 incident signature: the CLI prints its init system event
+    // then dies on the first API call (~5s, exit 1). The report must prove the
+    // model never produced output so the backend routes this to the
+    // rate-limit/transient path, never CODE_ERROR.
+    emitStream([JSON.stringify({ type: 'system', subtype: 'init' })], 1);
+
+    await runProviderAgent('prompt', null, { value: '' });
+
+    const report = getLastProviderRunErrorReport();
+    expect(report).toMatchObject({
+      schema: 1,
+      task_id: 'task-report-1',
+      provider: 'anthropic',
+      auth_mode: 'oauth',
+      exit_code: 1,
+      model_output_seen: false,
+      result_event_seen: false,
+      last_stream_event: 'system',
+    });
+    expect(report?.provider_errors).toEqual([]);
+  });
+
+  it('records a completed-run report: model output + terminal result event on clean exit', async () => {
+    emitStream([
+      JSON.stringify({
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: 'working on it' }] },
+      }),
+      JSON.stringify({ type: 'result', result: 'done' }),
+    ], 0);
+
+    await runProviderAgent('prompt', null, { value: '' });
+
+    const report = getLastProviderRunErrorReport();
+    expect(report).toMatchObject({
+      exit_code: 0,
+      model_output_seen: true,
+      result_event_seen: true,
+      last_stream_event: 'result',
+    });
+  });
+
+  it('a genuine failed-but-completed run reports result_event_seen=true (stays code-error territory)', async () => {
+    // Model ran, produced output, and reached its terminal result — the
+    // non-zero exit belongs to the work, not the provider. The backend must
+    // NOT treat this report as a provider death.
+    emitStream([
+      JSON.stringify({
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: 'attempting fix' }] },
+      }),
+      JSON.stringify({ type: 'result', result: 'could not complete' }),
+    ], 1);
+
+    await runProviderAgent('prompt', null, { value: '' });
+
+    const report = getLastProviderRunErrorReport();
+    expect(report).toMatchObject({
+      exit_code: 1,
+      model_output_seen: true,
+      result_event_seen: true,
+    });
+  });
+
+  it('captures structured stream error events into provider_errors with code/type', async () => {
+    emitStream([
+      JSON.stringify({ type: 'system', subtype: 'init' }),
+      JSON.stringify({ type: 'error', error: { message: 'Overloaded', type: 'overloaded_error' } }),
+    ], 1);
+
+    await runProviderAgent('prompt', null, { value: '' });
+
+    const report = getLastProviderRunErrorReport();
+    expect(report?.provider_errors).toEqual([
+      { source: 'claude-stream', message: 'Overloaded', code: 'overloaded_error' },
+    ]);
+    expect(report?.model_output_seen).toBe(false);
+  });
+
+  it('bounds provider_errors to 5 entries', async () => {
+    const errorLines = Array.from({ length: 8 }, (_, i) =>
+      JSON.stringify({ type: 'error', error: { message: `err-${i}` } }),
+    );
+    emitStream(errorLines, 1);
+
+    await runProviderAgent('prompt', null, { value: '' });
+
+    expect(getLastProviderRunErrorReport()?.provider_errors).toHaveLength(5);
   });
 });
 

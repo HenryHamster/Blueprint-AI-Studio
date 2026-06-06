@@ -965,6 +965,165 @@ def _persist_stuck_call_reclassification(
         )
 
 
+# ── Structured agent error report (primary classification signal) ────────────
+# The agent runner (agent/src/providers/runners.ts) records a structured report
+# for EVERY provider CLI run — exit code, exit signal, stderr tail, structured
+# provider error events from the stream, and the run shape (model_output_seen /
+# result_event_seen) — and ships it with the terminal FAILED status post
+# (AgentStatusPayload.error_report). agent_status.py sanitizes + persists it at
+# task.context[AGENT_ERROR_REPORT_CONTEXT_KEY]. Classification consumes it as
+# the PRIMARY signal: a report proving the provider CLI died without completing
+# a model run (a provider-layer death — usage exhaustion, auth burp, severed
+# stream) routes to the RATE_LIMIT requeue path (account rotation + cooldown,
+# no retry burn), NEVER CODE_ERROR. The output-text tail heuristics below
+# (_cli_startup_death_tail / _cli_stream_cut_tail) remain ONLY as the fallback
+# for old agents that never sent a report. Incident 2026-06-06: a create task
+# died 5s after CLI start (exit 1, init-banner-only tail — a provider error on
+# the first API call), was classified CODE_ERROR, and burned all 3 retries in
+# seconds with no account rotation.
+AGENT_ERROR_REPORT_CONTEXT_KEY = "agent_error_report"
+
+_ERROR_REPORT_STDERR_TAIL_CHARS = 2000
+_ERROR_REPORT_MAX_PROVIDER_ERRORS = 5
+_ERROR_REPORT_ERROR_MESSAGE_CHARS = 500
+
+
+def sanitize_agent_error_report(raw: object) -> dict | None:
+    """Validate and bound an agent-posted structured error report for storage.
+
+    Whitelists known keys and clamps string/list sizes so a malformed or
+    oversized report can neither bloat task.context nor smuggle unexpected
+    structure into classification. Returns None when the payload is not a dict
+    (callers then behave exactly as if no report was sent).
+    """
+    if not isinstance(raw, dict):
+        return None
+    out: dict = {}
+    schema = raw.get("schema")
+    out["schema"] = (
+        schema if isinstance(schema, int) and not isinstance(schema, bool) else 1
+    )
+    for key, limit in (
+        ("provider", 50),
+        ("auth_mode", 50),
+        ("exit_signal", 20),
+        ("last_stream_event", 100),
+        ("classified", 50),
+    ):
+        val = raw.get(key)
+        if isinstance(val, str) and val:
+            out[key] = val[:limit]
+    exit_code = raw.get("exit_code")
+    out["exit_code"] = (
+        exit_code
+        if isinstance(exit_code, int) and not isinstance(exit_code, bool)
+        else None
+    )
+    duration = raw.get("duration_ms")
+    if (
+        isinstance(duration, (int, float))
+        and not isinstance(duration, bool)
+        and duration >= 0
+    ):
+        out["duration_ms"] = int(duration)
+    out["model_output_seen"] = bool(raw.get("model_output_seen"))
+    out["result_event_seen"] = bool(raw.get("result_event_seen"))
+    stderr_tail = raw.get("stderr_tail")
+    if isinstance(stderr_tail, str) and stderr_tail:
+        out["stderr_tail"] = stderr_tail[-_ERROR_REPORT_STDERR_TAIL_CHARS:]
+    provider_errors: list[dict] = []
+    raw_errors = raw.get("provider_errors")
+    if isinstance(raw_errors, list):
+        for entry in raw_errors[:_ERROR_REPORT_MAX_PROVIDER_ERRORS]:
+            if not isinstance(entry, dict):
+                continue
+            message = entry.get("message")
+            if not isinstance(message, str) or not message:
+                continue
+            cleaned: dict = {"message": message[:_ERROR_REPORT_ERROR_MESSAGE_CHARS]}
+            source = entry.get("source")
+            if isinstance(source, str) and source:
+                cleaned["source"] = source[:50]
+            code = entry.get("code")
+            if isinstance(code, str) and code:
+                cleaned["code"] = code[:100]
+            provider_errors.append(cleaned)
+    out["provider_errors"] = provider_errors
+    return out
+
+
+def get_agent_error_report(task: "Task") -> dict | None:
+    """Return the persisted structured agent error report, or None.
+
+    Guarded so partially-loaded entities (load_only / expired attributes on
+    analytics paths) degrade to "no report" instead of raising."""
+    try:
+        ctx = task.context or {}
+    except Exception:
+        return None
+    report = ctx.get(AGENT_ERROR_REPORT_CONTEXT_KEY)
+    return report if isinstance(report, dict) else None
+
+
+def _error_report_provider_death_signal(report: dict) -> str | None:
+    """Return an inferred-from label when the structured report proves the
+    provider CLI run died without completing (a provider-layer death), or None
+    when the report shows a completed run / is unreadable.
+
+    Provider-agnostic by construction — every runner feeds the same run-shape
+    fields, so no per-provider patterns are needed here:
+      • non-zero exit + the model never produced output → the CLI died on/before
+        its first API call (the incident signature). Can never be a
+        code-authoring defect: no code was written by this run.
+      • non-zero exit + structured provider error events + no terminal result
+        event → the provider aborted the run mid-flight.
+      • non-zero exit + model output but no terminal result event → the stream
+        was severed mid-write (mid-run usage death). Mirrors
+        _cli_stream_cut_tail, from truthful run-shape instead of text.
+    A clean (zero) exit — or a non-zero exit whose run still reached its
+    terminal result event — is NOT a provider death; the failure belongs to
+    the work itself and specific labels / CODE_ERROR handling apply.
+    """
+    try:
+        exit_code = report.get("exit_code")
+        if exit_code == 0:
+            return None
+        model_output_seen = bool(report.get("model_output_seen"))
+        result_event_seen = bool(report.get("result_event_seen"))
+        provider_errors = report.get("provider_errors")
+        has_provider_errors = (
+            isinstance(provider_errors, list) and len(provider_errors) > 0
+        )
+        if not model_output_seen:
+            return "error_report_startup_death"
+        if result_event_seen:
+            return None
+        if has_provider_errors:
+            return "error_report_provider_error"
+        return "error_report_stream_cut"
+    except Exception:
+        return None
+
+
+def _agent_error_report_reclass(task: "Task") -> str | None:
+    """Consume the structured agent error report as the primary signal for a
+    generic CODE_ERROR-labelled failure.
+
+    Returns RATE_LIMIT (and persists the reclassification breadcrumb +
+    rate_limit_kind for cooldown bookkeeping) when the report proves a
+    provider-layer death; returns None when no report exists or the report
+    shows a completed run. Callers must fall back to the text heuristics ONLY
+    when no report exists (old agents)."""
+    report = get_agent_error_report(task)
+    if report is None:
+        return None
+    signal = _error_report_provider_death_signal(report)
+    if signal is None:
+        return None
+    _persist_stuck_call_reclassification(task, signal)
+    return RATE_LIMIT
+
+
 # The agent wrapper embeds the last 10KB of Claude CLI output in the ERROR_LOG
 # after this marker (agent/src/handlers/code-change.ts). The tail is the only
 # forensic record of HOW the CLI died, so the detectors below scope their
@@ -1175,6 +1334,13 @@ def normalize_agent_failure_category(
     mapped = _AGENT_CATEGORY_TO_CLASS.get(label_lower)
     if mapped:
         if mapped == CODE_ERROR and label_lower in _ALL_GENERIC_CODE_ERROR_LABELS:
+            # Structured agent error report — the PRIMARY signal. A report
+            # proving a provider-layer death (CLI died without completing a
+            # model run) routes to the RATE_LIMIT requeue path (account
+            # rotation, no retry burn) before any text heuristic runs.
+            report_class = _agent_error_report_reclass(task)
+            if report_class:
+                return report_class
             combined = (task.latest_status_message or "").lower()
             override = _text_provider_failure_override(task, combined)
             if override:
@@ -1502,18 +1668,32 @@ def classify_failure_with_confidence(
         failure_class == CODE_ERROR
         and str(agent_category or "").lower() in _ALL_GENERIC_CODE_ERROR_LABELS
     ):
-        cli_death_signal = (
-            "stuck_llm_call_no_output"
-            if _stuck_llm_call_no_progress(task)
-            else "cli_startup_death_init_only_tail"
-            if _cli_startup_death_tail(combined_lower)
-            else "cli_stream_cut_tail"
-            if _cli_stream_cut_tail(combined_lower)
-            else None
-        )
-        if cli_death_signal:
-            _persist_stuck_call_reclassification(task, cli_death_signal)
-            return FailureClassification(failure_class=RATE_LIMIT, confidence=0.7)
+        # Structured agent error report — the PRIMARY signal. When the agent
+        # shipped one, its run-shape verdict is authoritative in BOTH
+        # directions: a provider-layer death reclassifies to RATE_LIMIT at
+        # high confidence, and a report showing a completed run SUPPRESSES the
+        # text-tail guessing below (so e.g. an init banner quoted inside an
+        # otherwise-complete run's logs can no longer false-positive). The
+        # text heuristics run only when no report exists (old agents).
+        report = get_agent_error_report(task)
+        if report is not None:
+            report_signal = _error_report_provider_death_signal(report)
+            if report_signal:
+                _persist_stuck_call_reclassification(task, report_signal)
+                return FailureClassification(failure_class=RATE_LIMIT, confidence=0.9)
+        else:
+            cli_death_signal = (
+                "stuck_llm_call_no_output"
+                if _stuck_llm_call_no_progress(task)
+                else "cli_startup_death_init_only_tail"
+                if _cli_startup_death_tail(combined_lower)
+                else "cli_stream_cut_tail"
+                if _cli_stream_cut_tail(combined_lower)
+                else None
+            )
+            if cli_death_signal:
+                _persist_stuck_call_reclassification(task, cli_death_signal)
+                return FailureClassification(failure_class=RATE_LIMIT, confidence=0.7)
     if agent_category:
         return FailureClassification(failure_class=failure_class, confidence=0.9)
     if failure_class == MIGRATION_ERROR:
@@ -1679,6 +1859,13 @@ def _classify_failure_class(
         if agent_lower in _AGENT_CATEGORY_TO_CLASS:
             mapped = _AGENT_CATEGORY_TO_CLASS[agent_lower]
             if mapped == CODE_ERROR:
+                # Structured agent error report — primary signal for generic
+                # labels; a provider-layer death routes to RATE_LIMIT before
+                # any text heuristic runs.
+                if agent_lower in _ALL_GENERIC_CODE_ERROR_LABELS:
+                    report_class = _agent_error_report_reclass(task)
+                    if report_class:
+                        return report_class
                 combined = (
                     (task.latest_status_message or "").lower()
                     + " "
@@ -1996,6 +2183,15 @@ def _classify_failure_class(
     # fallthrough so it doesn't dissolve into residual fingerprints.
     if any(kw in combined for kw in _VIEWPORT_PATTERNS):
         return VIEWPORT_REGRESSION
+
+    # Structured agent error report — a generic failure (no keywords matched
+    # above, no agent category) whose report proves a provider-layer death is
+    # a RATE_LIMIT-path infra death, not a code defect. Checked before the
+    # account-correlation fallback because the report is a per-task truthful
+    # signal, not an inference from pool state.
+    report_class = _agent_error_report_reclass(task)
+    if report_class:
+        return report_class
 
     # Account-state correlation: before defaulting to CODE_ERROR, check if the
     # assigned account was in rate-limit cooldown, OR if the entire pool was blocked.

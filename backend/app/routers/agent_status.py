@@ -1066,6 +1066,32 @@ async def update_agent_status(
         not payload.artifact_type or payload.status == TaskStatus.FAILED
     ):
         task.latest_status_message = payload.logs[-8000:]
+    # Persist the structured provider-run error report BEFORE failure-category
+    # normalization so normalize_agent_failure_category consumes it as the
+    # primary classification signal. On a FAILED status WITHOUT a report (old
+    # agent, or a failure path that never ran the provider CLI), drop any stale
+    # report from a prior attempt so it can't misclassify THIS failure.
+    if payload.status == TaskStatus.FAILED:
+        from app.failure_classification import (
+            AGENT_ERROR_REPORT_CONTEXT_KEY,
+            sanitize_agent_error_report,
+        )
+
+        _sanitized_error_report = (
+            sanitize_agent_error_report(payload.error_report)
+            if payload.error_report is not None
+            else None
+        )
+        if _sanitized_error_report is not None:
+            ctx = dict(task.context or {})
+            ctx[AGENT_ERROR_REPORT_CONTEXT_KEY] = _sanitized_error_report
+            task.context = ctx
+            flag_modified(task, "context")
+        elif AGENT_ERROR_REPORT_CONTEXT_KEY in (task.context or {}):
+            ctx = dict(task.context or {})
+            ctx.pop(AGENT_ERROR_REPORT_CONTEXT_KEY, None)
+            task.context = ctx
+            flag_modified(task, "context")
     if payload.failure_category:
         from app.failure_classification import normalize_agent_failure_category
 
@@ -1842,6 +1868,29 @@ async def update_agent_status(
                     not payload.artifact_type or payload.status == TaskStatus.FAILED
                 ):
                     task.latest_status_message = payload.logs[-8000:]
+                # Re-apply the structured error report (mirrors the pre-commit
+                # block at ~line 1075) so the normalize call below still sees
+                # it as the primary signal after session recovery.
+                if payload.status == TaskStatus.FAILED:
+                    from app.failure_classification import (
+                        AGENT_ERROR_REPORT_CONTEXT_KEY,
+                        sanitize_agent_error_report,
+                    )
+
+                    _sanitized_report2 = (
+                        sanitize_agent_error_report(payload.error_report)
+                        if payload.error_report is not None
+                        else None
+                    )
+                    ctx = dict(task.context or {})
+                    if _sanitized_report2 is not None:
+                        ctx[AGENT_ERROR_REPORT_CONTEXT_KEY] = _sanitized_report2
+                        task.context = ctx
+                        flag_modified(task, "context")
+                    elif AGENT_ERROR_REPORT_CONTEXT_KEY in ctx:
+                        ctx.pop(AGENT_ERROR_REPORT_CONTEXT_KEY, None)
+                        task.context = ctx
+                        flag_modified(task, "context")
                 if payload.failure_category:
                     from app.failure_classification import (
                         normalize_agent_failure_category,

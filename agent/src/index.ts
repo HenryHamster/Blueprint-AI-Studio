@@ -61,8 +61,9 @@ import {
   getProviderRunner, providerSupportsNativeSubagents,
   __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
   runClaudeCode, runProviderAgent,
+  getLastProviderRunErrorReport, clearLastProviderRunErrorReport,
   type LLMCliTranslation, type ClaudeOutput, type RunnerCommand,
-  type ValidationCommand, type ProviderRunner,
+  type ValidationCommand, type ProviderRunner, type ProviderRunErrorReport,
 } from './providers/runners.js';
 
 export {
@@ -74,8 +75,9 @@ export {
   getProviderRunner, providerSupportsNativeSubagents,
   __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
   runClaudeCode, runProviderAgent,
+  getLastProviderRunErrorReport, clearLastProviderRunErrorReport,
 };
-export type { LLMCliTranslation, ClaudeOutput, RunnerCommand, ValidationCommand, ProviderRunner };
+export type { LLMCliTranslation, ClaudeOutput, RunnerCommand, ValidationCommand, ProviderRunner, ProviderRunErrorReport };
 export { computeRefreshDelayMs, isBootstrapToken };
 
 // ── Failure categories ───────────────────────────────────────────────────────
@@ -929,6 +931,19 @@ function enrichStatusPayload(taskId: string, payload: Record<string, unknown>): 
     // most recent terminal events (e.g. exit_reason='passed') always land.
     mergedFixLoopEvents = merged.length > 20 ? merged.slice(-20) : merged;
   }
+  // Ship the structured provider-run error report with every FAILED status so
+  // backend classification consumes the truthful exit context (exit code,
+  // stderr tail, provider error events, run shape) instead of guessing from
+  // output-text tails. The runner records a report for EVERY run (success or
+  // failure), so a multi-pass handler's terminal post always carries the LAST
+  // run's report. The task_id guard prevents a warm VM from leaking the prior
+  // role's report into a failure that never ran the provider CLI (e.g.
+  // clone_failed before any model run).
+  let errorReport: ProviderRunErrorReport | null = null;
+  if (payload.status === 'FAILED') {
+    const report = getLastProviderRunErrorReport();
+    if (report && report.task_id === taskId) errorReport = report;
+  }
   return {
     provider: PROVIDER,
     auth_mode: AUTH_MODE,
@@ -936,6 +951,7 @@ function enrichStatusPayload(taskId: string, payload: Record<string, unknown>): 
     execution_mode: LLM_EXECUTION_MODE,
     task_id: taskId,
     ...telemetry,
+    ...(errorReport ? { error_report: errorReport } : {}),
     ...payload,
     ...statusFlagsForTask(taskId),
     ...(mergedFixLoopEvents !== undefined ? { fix_loop_events: mergedFixLoopEvents } : {}),
@@ -1628,6 +1644,10 @@ export function resetPerRoleModuleState(flags: ResetPerRoleModuleStateFlags = {}
   resetCheckSynthesizerState();
   // Per-task LLM call/token telemetry (efficiency direction d-91d8dede).
   resetLlmTelemetry();
+  // Structured provider-run error report. enrichStatusPayload already guards
+  // attachment by task_id, but clear between roles anyway so a warm role can
+  // never observe the prior role's run report through the getter.
+  clearLastProviderRunErrorReport();
 }
 
 // ── Heartbeat ───────────────────────────────────────────────────────────────
