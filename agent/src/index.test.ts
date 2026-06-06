@@ -77,6 +77,10 @@ import {
   type TaskCapabilityContract,
 } from './taskCapabilities.js';
 import { buildFixtureCapabilityContract } from './testSetup.js';
+import {
+  _setLastProviderRunErrorReportForTesting,
+  type ProviderRunErrorReport,
+} from './providers/runners.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
@@ -1881,6 +1885,94 @@ describe('provider runner reliability', () => {
       { encoding: 'utf-8', mode: 0o600 },
     );
     expect(vi.mocked(fs.chmodSync)).toHaveBeenCalledWith('/tmp/agent_prompt_unknown.txt', 0o600);
+  });
+});
+
+describe('structured error report shipping (enrichStatusPayload)', () => {
+  const makeReport = (taskId: string): ProviderRunErrorReport => ({
+    schema: 1,
+    task_id: taskId,
+    provider: 'anthropic',
+    auth_mode: 'oauth',
+    exit_code: 1,
+    exit_signal: null,
+    duration_ms: 5_000,
+    model_output_seen: false,
+    result_event_seen: false,
+    provider_errors: [],
+    stderr_tail: '',
+    last_stream_event: 'system',
+  });
+
+  const stubStatusFetch = (): FetchMock => {
+    const fetchMock = makeFetchMock().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ status: 'ok' }),
+      text: () => Promise.resolve(''),
+      headers: { get: () => null },
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  };
+
+  const postedStatusBody = (fetchMock: FetchMock): Record<string, unknown> => {
+    const statusCall = fetchMock.mock.calls.find(([url]) =>
+      String(url).includes('/api/agent/status'));
+    if (!statusCall) throw new Error('expected a /api/agent/status POST');
+    const init = statusCall[1] as RequestInit;
+    if (typeof init.body !== 'string') throw new Error('expected a string request body');
+    return JSON.parse(init.body) as Record<string, unknown>;
+  };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    _setLastProviderRunErrorReportForTesting(null);
+  });
+
+  it('attaches the last run report to FAILED status posts for the same task', async () => {
+    const fetchMock = stubStatusFetch();
+    _setLastProviderRunErrorReportForTesting(makeReport('task-er-1'));
+
+    await persistAndPostStatus('task-er-1', {
+      task_id: 'task-er-1',
+      status: 'FAILED',
+      failure_category: 'claude_code_failed',
+      logs: 'Claude subprocess exited with code 1 without shipping a PR.',
+    });
+
+    const body = postedStatusBody(fetchMock);
+    expect(body.error_report).toMatchObject({
+      task_id: 'task-er-1',
+      exit_code: 1,
+      model_output_seen: false,
+      result_event_seen: false,
+    });
+  });
+
+  it('does NOT attach a report to COMPLETED posts', async () => {
+    const fetchMock = stubStatusFetch();
+    _setLastProviderRunErrorReportForTesting(makeReport('task-er-2'));
+
+    await persistAndPostStatus('task-er-2', { task_id: 'task-er-2', status: 'COMPLETED' });
+
+    expect(postedStatusBody(fetchMock).error_report).toBeUndefined();
+  });
+
+  it('does NOT leak a stale report from a different task (warm-VM guard)', async () => {
+    // A warm VM runs sequential roles in one process. A failure that never ran
+    // the provider CLI (e.g. clone_failed) must not ship the PRIOR role's
+    // report and misclassify itself as a provider death.
+    const fetchMock = stubStatusFetch();
+    _setLastProviderRunErrorReportForTesting(makeReport('task-er-prior-role'));
+
+    await persistAndPostStatus('task-er-3', {
+      task_id: 'task-er-3',
+      status: 'FAILED',
+      failure_category: 'clone_failed',
+    });
+
+    expect(postedStatusBody(fetchMock).error_report).toBeUndefined();
   });
 });
 

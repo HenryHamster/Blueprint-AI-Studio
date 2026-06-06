@@ -41,6 +41,11 @@ from app.compute import (
     ZONE_COOLDOWN_SECONDS,
     _zone_failures,
     _zone_health,
+    _zone_suspect_events,
+)
+from app.provision_error_scope import (
+    _global_quota_state,
+    _region_quota_state,
 )
 
 
@@ -50,11 +55,17 @@ from app.compute import (
 @pytest.fixture()
 def clean_zone_state():
     """Reset zone health dicts before and after each zone test."""
-    _zone_failures.clear()
-    _zone_health.clear()
+
+    def _reset():
+        _zone_failures.clear()
+        _zone_health.clear()
+        _global_quota_state.clear()
+        _region_quota_state.clear()
+        _zone_suspect_events.clear()
+
+    _reset()
     yield
-    _zone_failures.clear()
-    _zone_health.clear()
+    _reset()
 
 
 _TEST_USER = "test-user-123"
@@ -455,11 +466,16 @@ class TestZoneHealth:
             "exhausted",
             "cooldown_recovery",
             "zone_success_rates",
+            "global_quota_cooldown_until",
+            "region_quota_cooldowns",
         }
         assert isinstance(summary["disabled"], list)
         assert isinstance(summary["exhausted"], list)
         assert isinstance(summary["cooldown_recovery"], dict)
         assert isinstance(summary["zone_success_rates"], dict)
+        # Quota cooldowns (not zone marks) — None / empty when inactive.
+        assert summary["global_quota_cooldown_until"] is None
+        assert isinstance(summary["region_quota_cooldowns"], dict)
 
     def test_get_zone_health_summary_total_zones_matches_fallback_list(
         self, clean_zone_state

@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.failure_classification import (
+    AGENT_ERROR_REPORT_CONTEXT_KEY,
     AGENT_TIMEOUT,
     ALL_FAILURE_CLASSES,
     CODE_ERROR,
@@ -36,6 +37,7 @@ from app.failure_classification import (
     classify_timeout_subtype,
     normalize_agent_failure_category,
     persist_failure_category,
+    sanitize_agent_error_report,
     should_trigger_code_defect_investigation,
     should_trigger_review_quality_investigation,
     should_trigger_timeout_investigation,
@@ -390,6 +392,248 @@ class TestCliDeathReclassifiedToRateLimit:
     def test_no_tail_no_telemetry_stays_code_error(self):
         t = self._dead("Claude subprocess exited with code 1 without shipping a PR.")
         assert classify_failure(t) == CODE_ERROR
+
+
+class TestAgentErrorReportClassification:
+    """The structured agent error report (shipped by the agent runner with every
+    FAILED status) is the PRIMARY classification signal: a report proving the
+    provider CLI died without completing a model run routes to RATE_LIMIT
+    (account rotation + cooldown, no retry burn) — never CODE_ERROR — and a
+    report showing a completed run suppresses the output-text tail heuristics
+    (which remain only as the fallback for old agents without a report).
+    Incident 2026-06-06: a create task died 5s after CLI start (exit 1,
+    init-banner-only tail — a provider error on the first API call), was
+    classified CODE_ERROR, and burned all 3 retries in seconds."""
+
+    @staticmethod
+    def _report(**overrides) -> dict:
+        report = {
+            "schema": 1,
+            "provider": "anthropic",
+            "auth_mode": "oauth",
+            "exit_code": 1,
+            "exit_signal": None,
+            "duration_ms": 5000,
+            "model_output_seen": False,
+            "result_event_seen": False,
+            "provider_errors": [],
+            "stderr_tail": "",
+            "last_stream_event": "system",
+        }
+        report.update(overrides)
+        return report
+
+    def _failed(self, report: dict | None, category: str = "claude_code_failed") -> Task:
+        ctx: dict = {"failure_category": category}
+        if report is not None:
+            ctx[AGENT_ERROR_REPORT_CONTEXT_KEY] = report
+        t = _task("Claude subprocess exited with code 1 without shipping a PR.", ctx)
+        t.api_call_summary = None
+        return t
+
+    def test_startup_death_report_classifies_rate_limit(self):
+        # The incident signature: instant exit, model never produced output.
+        t = self._failed(self._report())
+        assert classify_failure(t) == RATE_LIMIT
+        assert (
+            t.context.get("rate_limit_inferred_from") == "error_report_startup_death"
+        )
+        assert t.context.get("rate_limit_kind") == "unknown"
+
+    def test_startup_death_report_via_normalize(self):
+        # The status-write boundary path (normalize_agent_failure_category) —
+        # the exact route the agent's FAILED POST takes.
+        t = self._failed(self._report())
+        assert (
+            normalize_agent_failure_category("claude_code_failed", t) == RATE_LIMIT
+        )
+        assert (
+            t.context.get("rate_limit_inferred_from") == "error_report_startup_death"
+        )
+
+    def test_provider_error_event_report_classifies_rate_limit(self):
+        t = self._failed(
+            self._report(
+                model_output_seen=True,
+                provider_errors=[
+                    {
+                        "source": "claude-stream",
+                        "code": "overloaded_error",
+                        "message": "Overloaded",
+                    }
+                ],
+            )
+        )
+        assert classify_failure(t) == RATE_LIMIT
+        assert (
+            t.context.get("rate_limit_inferred_from") == "error_report_provider_error"
+        )
+
+    def test_stream_cut_report_classifies_rate_limit(self):
+        # Model produced output but the run never reached its terminal result
+        # event and exited non-zero — the stream was severed mid-write.
+        t = self._failed(self._report(model_output_seen=True))
+        assert classify_failure(t) == RATE_LIMIT
+        assert t.context.get("rate_limit_inferred_from") == "error_report_stream_cut"
+
+    def test_completed_run_report_stays_code_error(self):
+        # Genuine code failure: the model ran, produced output, and reached its
+        # terminal result event — the non-zero exit belongs to the work. Must
+        # stay CODE_ERROR and burn the retry slot.
+        t = self._failed(self._report(model_output_seen=True, result_event_seen=True))
+        assert classify_failure(t) == CODE_ERROR
+        assert "rate_limit_inferred_from" not in t.context
+
+    def test_clean_exit_report_stays_code_error(self):
+        # exit 0 (e.g. `incomplete` — agent never shipped) is never a provider
+        # death regardless of the other fields.
+        t = self._failed(self._report(exit_code=0), category="incomplete")
+        assert classify_failure(t) == CODE_ERROR
+
+    def test_specific_label_never_overridden_by_death_report(self):
+        # test_failed is an authoritative handler verdict about the work; even
+        # a death-shaped report must not sweep it.
+        t = self._failed(self._report(), category="test_failed")
+        assert classify_failure(t) == CODE_ERROR
+
+    def test_completed_run_report_suppresses_init_banner_tail_heuristic(self):
+        # Report present and conclusive-clean → the text-tail fallback must NOT
+        # run, even when the logs happen to contain an init-banner-only tail
+        # (e.g. quoted output inside an otherwise-complete run).
+        msg = (
+            "Claude subprocess exited with code 1 without shipping a PR.\n\n"
+            "--- Claude output tail ---\n"
+            '{"type":"system","subtype":"init","cwd":"/tmp/workspace"}'
+        )
+        ctx = {
+            "failure_category": "claude_code_failed",
+            AGENT_ERROR_REPORT_CONTEXT_KEY: self._report(
+                model_output_seen=True, result_event_seen=True
+            ),
+        }
+        t = _task(msg, ctx)
+        t.api_call_summary = None
+        assert classify_failure(t) == CODE_ERROR
+
+    def test_text_tail_fallback_still_fires_without_report(self):
+        # Old agents send no report — the init-banner-only tail heuristic must
+        # keep working as the fallback.
+        msg = (
+            "Claude subprocess exited with code 1 without shipping a PR.\n\n"
+            "--- Claude output tail ---\n"
+            '{"type":"system","subtype":"init","cwd":"/tmp/workspace"}'
+        )
+        t = _task(msg, {"failure_category": "claude_code_failed"})
+        t.api_call_summary = None
+        assert classify_failure(t) == RATE_LIMIT
+        assert (
+            t.context.get("rate_limit_inferred_from")
+            == "cli_startup_death_init_only_tail"
+        )
+
+    def test_death_report_without_agent_category_classifies_rate_limit(self):
+        # A handler that posts FAILED without a failure_category still benefits:
+        # the no-category fallthrough consults the report before defaulting to
+        # CODE_ERROR.
+        t = _task(
+            "agent died after provider call",
+            {AGENT_ERROR_REPORT_CONTEXT_KEY: self._report()},
+        )
+        t.api_call_summary = None
+        assert classify_failure(t) == RATE_LIMIT
+
+    def test_malformed_report_falls_back_to_text_heuristics(self):
+        # A non-dict report value behaves exactly like "no report".
+        msg = (
+            "Claude subprocess exited with code 1 without shipping a PR.\n\n"
+            "--- Claude output tail ---\n"
+            '{"type":"system","subtype":"init"}'
+        )
+        t = _task(
+            msg,
+            {
+                "failure_category": "claude_code_failed",
+                AGENT_ERROR_REPORT_CONTEXT_KEY: "not-a-dict",
+            },
+        )
+        t.api_call_summary = None
+        assert classify_failure(t) == RATE_LIMIT
+        assert (
+            t.context.get("rate_limit_inferred_from")
+            == "cli_startup_death_init_only_tail"
+        )
+
+
+class TestSanitizeAgentErrorReport:
+    def test_non_dict_returns_none(self):
+        assert sanitize_agent_error_report(None) is None
+        assert sanitize_agent_error_report("exit 1") is None
+        assert sanitize_agent_error_report([1, 2]) is None
+
+    def test_whitelists_and_bounds_fields(self):
+        raw = {
+            "schema": 1,
+            "provider": "anthropic" * 20,
+            "auth_mode": "oauth",
+            "exit_code": 1,
+            "exit_signal": "SIGTERM",
+            "duration_ms": 5123.7,
+            "model_output_seen": False,
+            "result_event_seen": False,
+            "stderr_tail": "x" * 10_000,
+            "last_stream_event": "system",
+            "classified": "rate_limit",
+            "provider_errors": [
+                {"source": "claude-stream", "code": "c" * 500, "message": "m" * 5000}
+            ],
+            "unexpected_key": {"nested": "junk"},
+        }
+        out = sanitize_agent_error_report(raw)
+        assert out is not None
+        assert "unexpected_key" not in out
+        assert len(out["provider"]) == 50
+        assert out["exit_code"] == 1
+        assert out["duration_ms"] == 5123
+        assert len(out["stderr_tail"]) == 2000
+        assert len(out["provider_errors"]) == 1
+        assert len(out["provider_errors"][0]["message"]) == 500
+        assert len(out["provider_errors"][0]["code"]) == 100
+
+    def test_provider_errors_capped_and_invalid_entries_dropped(self):
+        raw = {
+            "exit_code": 1,
+            "provider_errors": [{"message": f"err-{i}"} for i in range(10)]
+            + ["not-a-dict", {"no_message": True}],
+        }
+        out = sanitize_agent_error_report(raw)
+        assert out is not None
+        assert len(out["provider_errors"]) == 5
+
+    def test_invalid_exit_code_becomes_none(self):
+        out = sanitize_agent_error_report({"exit_code": "1"})
+        assert out is not None
+        assert out["exit_code"] is None
+        # bool is an int subclass — must not pass as an exit code
+        out2 = sanitize_agent_error_report({"exit_code": True})
+        assert out2 is not None
+        assert out2["exit_code"] is None
+
+    def test_sanitized_death_report_still_classifies(self):
+        # End-to-end shape check: a sanitized report round-trips through the
+        # classifier (guards against the sanitizer dropping a load-bearing key).
+        out = sanitize_agent_error_report(
+            {
+                "schema": 1,
+                "exit_code": 1,
+                "model_output_seen": False,
+                "result_event_seen": False,
+                "provider_errors": [],
+            }
+        )
+        t = _task("exited 1", {"failure_category": "fatal"})
+        t.api_call_summary = None
+        t.context = {**t.context, AGENT_ERROR_REPORT_CONTEXT_KEY: out}
+        assert classify_failure(t) == RATE_LIMIT
 
 
 class TestNormalizeAgentFailureCategory:

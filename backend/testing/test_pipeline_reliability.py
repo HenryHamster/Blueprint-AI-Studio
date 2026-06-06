@@ -2025,6 +2025,170 @@ async def test_ci_polling_non_rollup_task_completes_on_conflict_fix(
     assert "$AGENT_API_TOKEN" in fix_prompt
 
 
+async def _make_dirty_ci_task_with_merge_queue_marker(session, *, marker_age_minutes):
+    """A CI-waiting rollup parent whose context carries a merge-queue
+    update-branch marker of the given age."""
+    from datetime import timedelta as _td
+
+    from app.rollup_state import _MERGE_QUEUE_UPDATE_AT_KEY
+
+    project = Project(name=f"MQ Guard {marker_age_minutes}", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "research",
+                "prompt": "rollup parent",
+                "branch": "rollup/feat-mq",
+                "base_branch": "main",
+            }
+        ],
+        status=TaskStatus.EVALUATING,
+        context={
+            "_is_rollup_review": True,
+            "rollup_pr_number": 2078,
+            "rollup_pr_url": "https://github.com/o/r/pull/2078",
+            _MERGE_QUEUE_UPDATE_AT_KEY: (
+                _naive_utcnow() - _td(minutes=marker_age_minutes)
+            ).isoformat(),
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 2078,
+                "branch": "rollup/feat-mq",
+                "base_branch": "main",
+                "ci_wait_started": _naive_utcnow().isoformat(),
+            },
+        },
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_ci_polling_dirty_within_merge_queue_window_defers_fix_spawn(
+    orch_db,
+    mocker,
+):
+    """Merge-queue double-fire guard: when a PR reports mergeable_state='dirty'
+    while a merge-queue update-branch marker is fresh (<5 min), the orchestrator
+    must defer the conflict-fix spawn — GitHub's mergeable cache lags the
+    queue's own update-branch merge commit, so the dirty read is likely stale
+    and an agent fix would double-fire against the in-flight update."""
+    session, _Session = orch_db
+    task = await _make_dirty_ci_task_with_merge_queue_marker(
+        session, marker_age_minutes=0
+    )
+    task_id = task.id
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "state": "open",
+            "merged": False,
+            "mergeable": False,
+            "mergeable_state": "dirty",
+            "head": {"sha": "mq-dirty-sha"},
+        },
+    )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock
+    )
+
+    await _run_one_cycle(mocker)
+
+    async with _Session() as verify:
+        from sqlmodel import select as _select
+
+        updated = (
+            (await verify.execute(_select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
+
+    spawn_mock.assert_not_called()
+    assert updated.status == TaskStatus.EVALUATING
+    rl = (updated.context or {}).get("review_loop", {})
+    assert rl.get("ci_waiting") is True, (
+        f"ci_waiting must stay True so the next poll re-evaluates, got rl={rl!r}"
+    )
+    assert "conflict_fix_spawned" not in rl
+    msg = (updated.latest_status_message or "").lower()
+    assert "deferring" in msg and "merge-queue" in msg
+
+
+@pytest.mark.asyncio
+async def test_ci_polling_dirty_with_stale_merge_queue_marker_spawns_fix(
+    orch_db,
+    mocker,
+):
+    """Genuine-conflict fallback: once the merge-queue marker is older than the
+    freshness window, a dirty PR takes the agent conflict-fix path unchanged."""
+    session, _Session = orch_db
+    task = await _make_dirty_ci_task_with_merge_queue_marker(
+        session, marker_age_minutes=10
+    )
+    task_id = task.id
+    project_id = task.project_id
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "state": "open",
+            "merged": False,
+            "mergeable": False,
+            "mergeable_state": "dirty",
+            "head": {"sha": "mq-stale-sha"},
+        },
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "in_progress", "details": []}),
+    )
+    fake_fix = Task(
+        project_id=project_id,
+        payloads=[{"type": "fix", "prompt": "fix conflicts", "pr_number": 2078}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    session.add(fake_fix)
+    await session.commit()
+    await session.refresh(fake_fix)
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(fake_fix, True)),
+    )
+
+    await _run_one_cycle(mocker)
+
+    async with _Session() as verify:
+        from sqlmodel import select as _select
+
+        updated = (
+            (await verify.execute(_select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
+
+    spawn_mock.assert_called_once()
+    rl = (updated.context or {}).get("review_loop", {})
+    assert rl.get("conflict_fix_spawned") == str(fake_fix.id), (
+        "a genuine dirty conflict (stale marker) must still spawn the fix task"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Test 6 — Deadlock detection cascade-cancels tasks blocked on a genuine failure
 # ══════════════════════════════════════════════════════════════════════════════

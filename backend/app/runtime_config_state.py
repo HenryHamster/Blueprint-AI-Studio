@@ -52,6 +52,13 @@ runtime_config: Dict = {
     "max_retries": int(os.getenv("MAX_RETRIES", "3")),
     "max_provision_retries": int(os.getenv("MAX_PROVISION_RETRIES", "3")),
     "max_rollup_retries": int(os.getenv("MAX_ROLLUP_RETRIES", "5")),
+    # Rollup merge train: after a rollup PR merges, the post-merge handler
+    # proactively update-branches the project's sibling rollup PRs (FIFO by PR
+    # created_at) instead of waiting for lazy CI-poll behind-recovery, and
+    # conflict-fix spawners defer dirty observations made <5 min after a queue
+    # update so the queue and the agent fix path never double-fire. Genuine
+    # dirty conflicts outlive the window and use the agent path unchanged.
+    "rollup_merge_queue_enabled": True,
     "queued_age_alert_hours": int(os.getenv("QUEUED_AGE_ALERT_HOURS", "2")),
     "retry_after_reset_alert_threshold": int(
         os.getenv("RETRY_AFTER_RESET_ALERT_THRESHOLD", "8")
@@ -1013,6 +1020,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "warm_backlog_reuse_enabled",
                         bool(config_json["warm_backlog_reuse_enabled"]),
+                    )
+                if "rollup_merge_queue_enabled" in config_json:
+                    _set(
+                        "rollup_merge_queue_enabled",
+                        bool(config_json["rollup_merge_queue_enabled"]),
                     )
                 if "cochange_decomposition_enabled" in config_json:
                     _set(

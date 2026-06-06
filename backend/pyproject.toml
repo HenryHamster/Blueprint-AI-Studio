@@ -65,6 +65,17 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # periodic worker must survive a transient per-iteration failure, not die — exactly
 # as documented for services.py above.
 "app/lifecycle.py" = ["BLE001", "PERF203"]
+# compute.py is the GCP compute substrate (provision/delete/serial-capture/orphan
+# cleanup/secret teardown). Its except Exception blocks are the intentional
+# "best-effort cloud op — log and continue, never crash the provisioning path or
+# leak a VM/secret" pattern, and PERF203 flags the deliberate per-zone try/except
+# inside the zone-probe/fallback loops (a zone miss must move to the next zone).
+"app/compute.py" = ["BLE001", "PERF203"]
+# provision_error_scope.py was extracted from compute.py (quota-scope
+# classification + global/region quota cooldowns); its broad except is the same
+# best-effort pattern — the global-quota operator-alert webhook must never
+# break the provisioning path.
+"app/provision_error_scope.py" = ["BLE001"]
 # ci_completion.py is the CI webhook + poll-fallback handler. Its except blocks are the
 # same "log and keep retrying" pattern (DB lookup races, GitHub API blips, merge retries).
 # Crashing here would leave a PR in limbo with no progress.

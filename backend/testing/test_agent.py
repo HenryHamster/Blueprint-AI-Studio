@@ -16413,6 +16413,246 @@ async def test_generic_failure_with_healthy_account_burns_retry(
     )
 
 
+# ---------------------------------------------------------------------------
+# Structured agent error report classification (primary signal)
+# ---------------------------------------------------------------------------
+
+
+def _healthy_account_pool_and_task_ctx(account_id: str) -> dict:
+    """Pool entry for a HEALTHY account (no cooldown) so any RATE_LIMIT verdict
+    in these tests can only come from the structured error report — never from
+    account/pool correlation."""
+    return {
+        account_id: {
+            "id": account_id,
+            "name": "test-account-error-report",
+            "active_tasks": 1,
+            "disabled_models": {},
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_provider_death_error_report_requeues_without_burning_retry(
+    client: AsyncClient, db_session, mocker
+):
+    """Spec test (incident 2026-06-06): a rate-limited instant exit — the CLI
+    died 5s after start (exit 1, init banner only, model never produced output)
+    — ships a structured error report proving the provider-layer death. The
+    backend must consume the report as the PRIMARY signal and classify
+    provider-transient (RATE_LIMIT requeue path: account rotation, no retry
+    burn) even though the account looks healthy and the logs contain no
+    rate-limit text for the heuristics to match.
+    """
+    import app.max_plan_pool as pool_mod
+
+    account_id = "aaaaaaaa-0001-4000-a000-00000000er01"
+    mocker.patch.object(
+        pool_mod, "_account_by_id", _healthy_account_pool_and_task_ctx(account_id)
+    )
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="Error Report Death Test", user_id="test-user-er-death-001")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test task"}],
+        vm_instance_id="agent-vm-er-death-001",
+        status=TaskStatus.IN_PROGRESS,
+        context={"llm_account_id": account_id, "llm_model": "claude-sonnet-4-6"},
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id_str = str(task.id)
+
+    token = create_agent_token(task_id_str, "agent-vm-er-death-001")
+    payload = {
+        "task_id": task_id_str,
+        "status": "FAILED",
+        "failure_category": "claude_code_failed",
+        "logs": "Claude subprocess exited with code 1 without shipping a PR.",
+        "error_report": {
+            "schema": 1,
+            "task_id": task_id_str,
+            "provider": "anthropic",
+            "auth_mode": "oauth",
+            "exit_code": 1,
+            "exit_signal": None,
+            "duration_ms": 5000,
+            "model_output_seen": False,
+            "result_event_seen": False,
+            "provider_errors": [],
+            "stderr_tail": "",
+            "last_stream_event": "system",
+        },
+    }
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED, (
+        f"error-report provider death should requeue to QUEUED, got {task.status}"
+    )
+    # Retries preserved — the whole point of the structured report.
+    assert task.attempt_count == 0, (
+        f"attempt_count must stay 0 on report-driven RATE_LIMIT requeue, got {task.attempt_count}"
+    )
+    ctx = task.context or {}
+    assert ctx.get("failure_category") == "RATE_LIMIT"
+    assert ctx.get("rate_limit_inferred_from") == "error_report_startup_death"
+    # The sanitized report is persisted for forensics.
+    assert ctx.get("agent_error_report", {}).get("exit_code") == 1
+
+
+@pytest.mark.asyncio
+async def test_completed_run_error_report_still_burns_code_error_retry(
+    client: AsyncClient, db_session, mocker
+):
+    """Spec test: a genuine code failure — the model ran to its terminal result
+    event and the run failed on the work itself — still classifies CODE_ERROR
+    and burns a retry slot. The structured report must not become a blanket
+    'never CODE_ERROR' pass."""
+    import app.max_plan_pool as pool_mod
+
+    account_id = "aaaaaaaa-0001-4000-a000-00000000er02"
+    mocker.patch.object(
+        pool_mod, "_account_by_id", _healthy_account_pool_and_task_ctx(account_id)
+    )
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="Error Report Clean Test", user_id="test-user-er-clean-001")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test task"}],
+        vm_instance_id="agent-vm-er-clean-001",
+        status=TaskStatus.IN_PROGRESS,
+        context={"llm_account_id": account_id, "llm_model": "claude-sonnet-4-6"},
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id_str = str(task.id)
+
+    token = create_agent_token(task_id_str, "agent-vm-er-clean-001")
+    payload = {
+        "task_id": task_id_str,
+        "status": "FAILED",
+        "failure_category": "claude_code_failed",
+        "logs": "Claude subprocess exited with code 1 without shipping a PR.",
+        "error_report": {
+            "schema": 1,
+            "task_id": task_id_str,
+            "provider": "anthropic",
+            "auth_mode": "oauth",
+            "exit_code": 1,
+            "exit_signal": None,
+            "duration_ms": 600_000,
+            "model_output_seen": True,
+            "result_event_seen": True,
+            "provider_errors": [],
+            "stderr_tail": "",
+            "last_stream_event": "result",
+        },
+    }
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED, (
+        f"CODE_ERROR with retries remaining should retry to QUEUED, got {task.status}"
+    )
+    assert task.attempt_count == 1, (
+        f"attempt_count must be 1 after CODE_ERROR retry burn, got {task.attempt_count}"
+    )
+    ctx = task.context or {}
+    assert ctx.get("failure_category") == "CODE_ERROR"
+    assert "rate_limit_inferred_from" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_failed_status_without_report_drops_stale_report(
+    client: AsyncClient, db_session, mocker
+):
+    """A FAILED status WITHOUT an error report (old agent / failure path that
+    never ran the provider CLI) must drop a stale report left by a prior
+    attempt so it cannot misclassify THIS failure as a provider death."""
+    import app.max_plan_pool as pool_mod
+
+    account_id = "aaaaaaaa-0001-4000-a000-00000000er03"
+    mocker.patch.object(
+        pool_mod, "_account_by_id", _healthy_account_pool_and_task_ctx(account_id)
+    )
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="Error Report Stale Test", user_id="test-user-er-stale-001")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    stale_report = {
+        "schema": 1,
+        "exit_code": 1,
+        "model_output_seen": False,
+        "result_event_seen": False,
+        "provider_errors": [],
+    }
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test task"}],
+        vm_instance_id="agent-vm-er-stale-001",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "llm_account_id": account_id,
+            "llm_model": "claude-sonnet-4-6",
+            "agent_error_report": stale_report,
+        },
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id_str = str(task.id)
+
+    token = create_agent_token(task_id_str, "agent-vm-er-stale-001")
+    payload = {
+        "task_id": task_id_str,
+        "status": "FAILED",
+        "failure_category": "claude_code_failed",
+        "logs": "Process exited with code 1",
+    }
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert "agent_error_report" not in ctx, (
+        "stale agent_error_report must be dropped on a report-less FAILED status"
+    )
+    # Without the stale report (and with a healthy account), the generic label
+    # classifies CODE_ERROR and burns the retry — same as the no-report test.
+    assert ctx.get("failure_category") == "CODE_ERROR"
+    assert task.attempt_count == 1
+
+
 @pytest.mark.asyncio
 async def test_generic_accountless_failure_uses_scoped_db_pool_rl_check(
     client: AsyncClient, db_session, mocker
