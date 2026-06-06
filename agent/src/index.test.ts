@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
 import {
   __resetTaskCapabilityContractForTesting,
   isReadOnlyTaskType,
@@ -101,6 +101,13 @@ function defined<T>(v: T | undefined | null, msg = 'expected value to be defined
   if (v === undefined || v === null) throw new Error(msg);
   return v;
 }
+
+/** fetch-shaped vi.fn: Promise-returning implementations satisfy
+ *  @typescript-eslint/no-misused-promises (a bare vi.fn() infers a
+ *  void-returning procedure, which every `.mockImplementation(() => Promise…)`
+ *  call then violates). */
+const makeFetchMock = () => vi.fn<(input: unknown, init?: RequestInit) => Promise<unknown>>();
+type FetchMock = ReturnType<typeof makeFetchMock>;
 
 const initialPoolPriorTaskId = '00000000-0000-0000-0000-000000000000';
 
@@ -1351,6 +1358,36 @@ describe('NoProgressTimeoutError', () => {
   });
 });
 
+describe('matchesVmConfigMissing', () => {
+  it('matches the Claude CLI configless death banner (case-insensitive)', () => {
+    expect(matchesVmConfigMissing('Claude configuration file not found at /home/agent/.claude.json')).toBe(true);
+    expect(matchesVmConfigMissing('claude CONFIGURATION FILE NOT FOUND')).toBe(true);
+  });
+
+  it('does not match rate-limit or auth-failure text', () => {
+    expect(matchesVmConfigMissing("you've hit your usage limit")).toBe(false);
+    expect(matchesVmConfigMissing('OAuth token has expired. Please run /login.')).toBe(false);
+  });
+
+  it('does not match unrelated file-not-found errors', () => {
+    expect(matchesVmConfigMissing('ENOENT: no such file or directory, open /tmp/foo.json')).toBe(false);
+    expect(matchesVmConfigMissing('')).toBe(false);
+  });
+});
+
+describe('VmConfigMissingError', () => {
+  it('carries the vm_config_missing failureCategory and is distinct from RateLimitError', () => {
+    const err = new VmConfigMissingError('Claude Code provider config file missing on VM');
+    expect(err).toBeInstanceOf(VmConfigMissingError);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(RateLimitError);
+    expect(err.name).toBe('VmConfigMissingError');
+    // runRoleOnce's catch reads .failureCategory; vm_config_missing maps to
+    // PROVISION_FAILURE backend-side — never RATE_LIMIT ("usage exhausted").
+    expect(err.failureCategory).toBe('vm_config_missing');
+  });
+});
+
 describe('provider runner prompt transport', () => {
   it('uses stdin for OpenAI run commands instead of argv prompts', () => {
     const runner = getProviderRunner('openai', 'api_key');
@@ -1790,6 +1827,43 @@ describe('provider runner reliability', () => {
 
   it('clean-exit with no rate-limit text resolves normally (regression)', async () => {
     mockProviderRun(['ordinary tool output\n'], 0);
+
+    await expect(runProviderAgent('prompt', null, { value: '' }))
+      .resolves.toMatchObject({ exitCode: 0 });
+  });
+
+  it('classifies a non-zero exit with "Claude configuration file not found" as VmConfigMissingError', async () => {
+    // Poisoned-VM signature (2026-06-06, tasks 1330d291 / cf28097f): the
+    // re-target destroyed ~/.claude.json, so the CLI dies in seconds. This must
+    // surface the distinct vm_config_missing infra category — NOT the generic
+    // fatal/claude_code_failed path whose init-banner-only tail the
+    // orchestrator reclassifies as usage exhaustion.
+    mockProviderRun(['Claude configuration file not found at /home/agent/.claude.json\n'], 1);
+
+    const err = await runProviderAgent('prompt', null, { value: '' }).then(
+      () => { throw new Error('expected rejection'); },
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(VmConfigMissingError);
+    expect((err as VmConfigMissingError).failureCategory).toBe('vm_config_missing');
+  });
+
+  it('config-missing wins over coincidental rate-limit text in the same tail', async () => {
+    // The whole point of the distinct signal is to stop these deaths being
+    // read as usage exhaustion — so the config-missing check must take
+    // precedence over the rate-limit pattern match.
+    mockProviderRun([
+      "Claude configuration file not found\nyou've hit your usage limit\n",
+    ], 1);
+
+    await expect(runProviderAgent('prompt', null, { value: '' }))
+      .rejects.toBeInstanceOf(VmConfigMissingError);
+  });
+
+  it('a clean exit mentioning the config phrase is NOT swept (exit-code gated)', async () => {
+    // e.g. a tool result quoting this very incident report — a zero-exit run
+    // must never be converted into an infra failure.
+    mockProviderRun(['discussing "Claude configuration file not found" handling\n'], 0);
 
     await expect(runProviderAgent('prompt', null, { value: '' }))
       .resolves.toMatchObject({ exitCode: 0 });
@@ -2555,13 +2629,13 @@ describe('flushLogBuffer', () => {
 
 // ── Phase 0 telemetry — setup_secs / warm_start / prior_role_vm_id ───────────
 describe('persistAndPostStatus telemetry enrichment', () => {
-  let fetchMock: ReturnType<typeof vi.fn>;
+  let fetchMock: FetchMock;
 
   beforeEach(() => {
     _resetTelemetryForTesting();
     _setRoleClaimTimestampForTesting(null);
     _setHandlerDurationForTesting(null);
-    fetchMock = vi.fn().mockResolvedValue({
+    fetchMock = makeFetchMock().mockResolvedValue({
       ok: true,
       status: 200,
       json: () => Promise.resolve({ ok: true }),
@@ -2660,14 +2734,14 @@ describe('persistAndPostStatus telemetry enrichment', () => {
 
 // ── pollForNextRole ──────────────────────────────────────────────────────────
 describe('pollForNextRole', () => {
-  let fetchMock: ReturnType<typeof vi.fn>;
+  let fetchMock: FetchMock;
   // Spy on the global clearInterval; widening to any is the simplest path
   // around vi.spyOn's strict object/keyof typing for ambient globals.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let clearIntervalSpy: ReturnType<typeof vi.spyOn<any, any>>;
 
   beforeEach(() => {
-    fetchMock = vi.fn();
+    fetchMock = makeFetchMock();
     vi.stubGlobal('fetch', fetchMock);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     clearIntervalSpy = vi.spyOn(globalThis as any, 'clearInterval');
@@ -2943,12 +3017,14 @@ describe('pollForNextRole', () => {
 describe('performWarmRetarget', () => {
   afterEach(() => { __setWarmRetargetDepsForTesting(null); });
 
-  it('clears creds, materializes an augmented manifest, then re-execs (in order)', async () => {
+  it('materializes an augmented manifest, verifies it, clears stale creds, then re-execs (in order)', async () => {
     const calls: string[] = [];
     let captured: { manifest?: SecretManifest; envPath?: string } = {};
+    let staleManifest: SecretManifest | undefined;
     __setWarmRetargetDepsForTesting({
-      clearCreds: () => { calls.push('clear'); return Promise.resolve(); },
       materialize: (m: SecretManifest, envPath: string) => { calls.push('materialize'); captured = { manifest: m, envPath }; },
+      verifyMaterialized: () => { calls.push('verify'); return []; },
+      clearStaleCreds: (m: SecretManifest) => { calls.push('clearStale'); staleManifest = m; return Promise.resolve(); },
       reexec: () => { calls.push('reexec'); return Promise.resolve(); },
     });
 
@@ -2958,8 +3034,10 @@ describe('performWarmRetarget', () => {
     };
     await performWarmRetarget(inputManifest, { rotatedJwt: 'ROT.JWT', taskId: 'task-42' });
 
-    // clear-then-write-then-reexec ordering is the credential-leakage guarantee.
-    expect(calls).toEqual(['clear', 'materialize', 'reexec']);
+    // Write-new-then-swap ordering: materialize (overwrite in place) BEFORE any
+    // destructive clear — the configless-window guarantee (2026-06-06 incidents)
+    // — and clear-stale BEFORE reexec — the credential-leakage guarantee.
+    expect(calls).toEqual(['materialize', 'verify', 'clearStale', 'reexec']);
     expect(captured.envPath).toBe('/etc/agent.env');
     // The backend strips AGENT_SECRET_TOKEN; the agent re-injects the rotated JWT.
     expect(captured.manifest?.env?.AGENT_SECRET_TOKEN).toBe('ROT.JWT');
@@ -2970,29 +3048,86 @@ describe('performWarmRetarget', () => {
     expect(captured.manifest?.env?.PROVIDER).toBe('openai');
     expect(captured.manifest?.env?.OPENAI_API_KEY).toBe('sk-xyz');
     expect(captured.manifest?.files).toEqual([{ path: '/opt/agent/openai/auth.json', content: '{}', mode: '0600' }]);
+    // The stale-clear receives the same manifest so it can compute the
+    // preserve set (paths the new account owns).
+    expect(staleManifest).toBe(captured.manifest);
     // The input manifest must not be mutated in place.
     expect(inputManifest.env?.AGENT_SECRET_TOKEN).toBeUndefined();
   });
 
-  it('does NOT materialize or re-exec when clearCreds throws (clear-then-write ordering held)', async () => {
+  it('does NOT clear stale creds or re-exec when materialize throws (prior config left intact)', async () => {
     const calls: string[] = [];
     __setWarmRetargetDepsForTesting({
-      clearCreds: () => { calls.push('clear'); return Promise.reject(new Error('wipe-failed')); },
-      materialize: () => { calls.push('materialize'); },
+      materialize: () => { calls.push('materialize'); throw new Error('helper-died'); },
+      verifyMaterialized: () => { calls.push('verify'); return []; },
+      clearStaleCreds: () => { calls.push('clearStale'); return Promise.resolve(); },
       reexec: () => { calls.push('reexec'); return Promise.resolve(); },
     });
     await expect(performWarmRetarget({ env: {} }, { rotatedJwt: 'j', taskId: 't' }))
-      .rejects.toThrow('wipe-failed');
-    expect(calls).toEqual(['clear']);
+      .rejects.toThrow('helper-died');
+    // Nothing was cleared: the VM still holds the prior account's complete
+    // config instead of the old ordering's configless poisoned state.
+    expect(calls).toEqual(['materialize']);
+  });
+
+  it('does NOT clear stale creds or re-exec when verification reports missing files', async () => {
+    const calls: string[] = [];
+    __setWarmRetargetDepsForTesting({
+      materialize: () => { calls.push('materialize'); },
+      verifyMaterialized: () => { calls.push('verify'); return ['/home/agent/.claude.json']; },
+      clearStaleCreds: () => { calls.push('clearStale'); return Promise.resolve(); },
+      reexec: () => { calls.push('reexec'); return Promise.resolve(); },
+    });
+    await expect(performWarmRetarget({ env: {} }, { rotatedJwt: 'j', taskId: 't' }))
+      .rejects.toThrow(/verification failed.*\/home\/agent\/\.claude\.json/);
+    expect(calls).toEqual(['materialize', 'verify']);
+  });
+
+  it('default verifyMaterialized reports the env file + manifest files missing from disk', async () => {
+    // Default deps verify via fs.existsSync; the fs mock returns false for
+    // everything, so every expected path must be reported missing and the
+    // re-target must refuse to proceed to the destructive clear.
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    const calls: string[] = [];
+    __setWarmRetargetDepsForTesting({
+      materialize: () => { calls.push('materialize'); },
+      clearStaleCreds: () => { calls.push('clearStale'); return Promise.resolve(); },
+      reexec: () => { calls.push('reexec'); return Promise.resolve(); },
+    });
+    await expect(performWarmRetarget(
+      { env: { PROVIDER: 'anthropic' }, files: [{ path: '/home/agent/.claude.json', content: '{}', mode: '0600' }] },
+      { rotatedJwt: 'j', taskId: 't' },
+    )).rejects.toThrow(/\/etc\/agent\.env.*\/home\/agent\/\.claude\.json/);
+    expect(calls).toEqual(['materialize']);
+  });
+
+  it('default verifyMaterialized passes when the materialized paths exist on disk', async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    try {
+      const calls: string[] = [];
+      __setWarmRetargetDepsForTesting({
+        materialize: () => { calls.push('materialize'); },
+        clearStaleCreds: () => { calls.push('clearStale'); return Promise.resolve(); },
+        reexec: () => { calls.push('reexec'); return Promise.resolve(); },
+      });
+      await performWarmRetarget(
+        { env: { PROVIDER: 'anthropic' }, files: [{ path: '/home/agent/.claude.json', content: '{}', mode: '0600' }] },
+        { rotatedJwt: 'j', taskId: 't' },
+      );
+      expect(calls).toEqual(['materialize', 'clearStale', 'reexec']);
+    } finally {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+    }
   });
 
   it('default materialize invokes the real helper via sudo python3 against /etc/agent.env', async () => {
     const execMock = vi.mocked(execFileSync);
     execMock.mockClear();
-    // Override only clearCreds + reexec; materialize stays the real default so
+    // Override verify/clear-stale/reexec; materialize stays the real default so
     // we exercise the sudo python3 invocation against the baked helper path.
     __setWarmRetargetDepsForTesting({
-      clearCreds: () => Promise.resolve(),
+      verifyMaterialized: () => [],
+      clearStaleCreds: () => Promise.resolve(),
       reexec: () => Promise.resolve(),
     });
     await performWarmRetarget({ env: { PROVIDER: 'anthropic' } }, { rotatedJwt: 'j', taskId: 't' });
@@ -3197,15 +3332,120 @@ describe('bootstrapPoolMode', () => {
   });
 });
 
+// ── Claim-time VM config guard (poisoned-VM defense, 2026-06-06) ─────────────
+describe('claim-time VM config guard', () => {
+  const originalVmId = process.env.VM_INSTANCE_ID;
+  const originalHome = process.env.HOME;
+
+  afterEach(() => {
+    if (originalVmId !== undefined) process.env.VM_INSTANCE_ID = originalVmId;
+    else delete process.env.VM_INSTANCE_ID;
+    if (originalHome !== undefined) process.env.HOME = originalHome;
+    else delete process.env.HOME;
+    mockReadFileSync.mockReset();
+    vi.mocked(fs.existsSync).mockReset();
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+  });
+
+  it('is inert off-VM (no VM_INSTANCE_ID): local dev and tests are never doomed', () => {
+    delete process.env.VM_INSTANCE_ID;
+    expect(missingVmProviderConfigFiles('anthropic')).toEqual([]);
+  });
+
+  it("is inert for the 'local' fallback instance id", () => {
+    process.env.VM_INSTANCE_ID = 'local';
+    expect(missingVmProviderConfigFiles('anthropic')).toEqual([]);
+  });
+
+  it('reports ~/.claude.json missing for anthropic on a real VM', () => {
+    process.env.VM_INSTANCE_ID = 'vm-guard-1';
+    process.env.HOME = '/home/agent';
+    expect(missingVmProviderConfigFiles('anthropic')).toEqual(['/home/agent/.claude.json']);
+  });
+
+  it('reports nothing for anthropic when ~/.claude.json exists on disk', () => {
+    process.env.VM_INSTANCE_ID = 'vm-guard-2';
+    process.env.HOME = '/home/agent';
+    vi.mocked(fs.existsSync).mockImplementation((p) => p === '/home/agent/.claude.json');
+    expect(missingVmProviderConfigFiles('anthropic')).toEqual([]);
+  });
+
+  it('has no confirmed file requirements for non-anthropic providers (no false dooms)', () => {
+    process.env.VM_INSTANCE_ID = 'vm-guard-3';
+    process.env.HOME = '/home/agent';
+    expect(missingVmProviderConfigFiles('openai')).toEqual([]);
+    expect(missingVmProviderConfigFiles('gemini')).toEqual([]);
+  });
+
+  it('refuses a claim with vm_config_missing when the boot snapshot cannot restore ~/.claude.json (poisoned VM)', () => {
+    // The poisoned-VM scenario: a warm re-target died mid-sequence and the
+    // process restarted, so the boot snapshot was captured AFTER ~/.claude.json
+    // was already destroyed. Re-materializing on claim (the self-heal) then has
+    // no source for the file — the claim must be refused with the distinct
+    // vm_config_missing category instead of running a role whose every Claude
+    // call dies in seconds.
+    process.env.VM_INSTANCE_ID = 'vm-guard-4';
+    process.env.HOME = '/home/agent';
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'boot-token';
+    mockReadFileSync.mockImplementation(() => { throw new Error('ENOENT'); });
+    refreshRuntimeState();
+    _captureBootCredentialSnapshotForTesting(); // snapshot has NO ~/.claude.json
+
+    let caught: unknown;
+    try {
+      _materializeClaimCredentialStateForTesting(undefined, 'warm-claim');
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain('vm_config_missing');
+    expect((caught as Error).message).toContain('/home/agent/.claude.json');
+    expect((caught as Error & { failureCategory?: FailureCategory }).failureCategory).toBe('vm_config_missing');
+  });
+
+  it('passes the claim when re-materialization restores ~/.claude.json (self-heal path)', () => {
+    process.env.VM_INSTANCE_ID = 'vm-guard-5';
+    process.env.HOME = '/home/agent';
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'boot-token';
+    vi.mocked(fs.writeFileSync).mockClear();
+    mockReadFileSync.mockImplementation((p: string) => {
+      if (p === '/home/agent/.claude.json') return '{"hasCompletedOnboarding":true}';
+      throw new Error('ENOENT');
+    });
+    refreshRuntimeState();
+    _captureBootCredentialSnapshotForTesting(); // snapshot CONTAINS ~/.claude.json
+    // The snapshot re-write puts the file back on disk; simulate that.
+    vi.mocked(fs.existsSync).mockImplementation((p) => p === '/home/agent/.claude.json');
+
+    expect(() => {
+      _materializeClaimCredentialStateForTesting(undefined, 'warm-claim');
+    }).not.toThrow();
+    // The self-heal actually re-wrote the snapshot's copy of the file.
+    expect(vi.mocked(fs.writeFileSync).mock.calls.some(
+      (c) => c[0] === '/home/agent/.claude.json',
+    )).toBe(true);
+  });
+
+  it('claims are unaffected off-VM even when the config file is absent', () => {
+    delete process.env.VM_INSTANCE_ID;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'boot-token';
+    refreshRuntimeState();
+    _captureBootCredentialSnapshotForTesting();
+    expect(() => {
+      _materializeClaimCredentialStateForTesting(undefined, 'warm-claim');
+    }).not.toThrow();
+  });
+});
+
 describe('main pool-mode startup ordering', () => {
   const originalPoolMode = process.env.BLUEPRINT_POOL_MODE;
   const originalVmInstanceId = process.env.VM_INSTANCE_ID;
   const originalTaskId = process.env.TASK_ID;
   const originalAnthropicApiKey = process.env.ANTHROPIC_API_KEY;
-  let fetchMock: ReturnType<typeof vi.fn>;
+  let fetchMock: FetchMock;
 
   beforeEach(() => {
-    fetchMock = vi.fn();
+    fetchMock = makeFetchMock();
     vi.stubGlobal('fetch', fetchMock);
     process.env.BLUEPRINT_POOL_MODE = '1';
     process.env.VM_INSTANCE_ID = 'pool-vm-main-test';
@@ -3213,12 +3453,18 @@ describe('main pool-mode startup ordering', () => {
     process.env.ANTHROPIC_API_KEY = 'anthropic-test-key';
     _setAgentTokenForTesting('vm-bootstrap-jwt');
     _setAgentRuntimeFingerprintForTesting(null);
+    // The claim-time VM config guard (vm_config_missing) verifies ~/.claude.json
+    // exists on disk for anthropic-bound VMs; this healthy-pool-boot simulation
+    // needs the file present or main() refuses to claim, by design.
+    vi.mocked(fs.existsSync).mockImplementation((p) => String(p).endsWith('.claude.json'));
   });
 
   afterEach(() => {
     _stopHeartbeatForTesting();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+    vi.mocked(fs.existsSync).mockReset();
+    vi.mocked(fs.existsSync).mockReturnValue(false);
     if (originalPoolMode !== undefined) process.env.BLUEPRINT_POOL_MODE = originalPoolMode;
     else delete process.env.BLUEPRINT_POOL_MODE;
     if (originalVmInstanceId !== undefined) process.env.VM_INSTANCE_ID = originalVmInstanceId;
@@ -3372,6 +3618,43 @@ describe('main pool-mode startup ordering', () => {
       ['/tmp/task_stale-persisted_result.json'],
       ['/tmp/task_stale-legacy_result.json'],
     ]));
+  });
+
+  it('refuses to claim and reports vm_config_missing pre-claim when ~/.claude.json is gone (poisoned VM)', async () => {
+    // The 2026-06-06 poisoned state: env credentials look healthy but the
+    // boot-materialized ~/.claude.json was destroyed. The VM must die loudly
+    // BEFORE polling for work — an explained pre-claim vm-heartbeat the
+    // orchestrator can tear down — instead of claiming tasks whose every
+    // Claude invocation fails in seconds.
+    vi.mocked(fs.existsSync).mockReturnValue(false); // config file destroyed
+    const execMock = vi.mocked(execFileSync);
+    execMock.mockClear();
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/next-role')) {
+        throw new Error('must not poll for work configless');
+      }
+      return Promise.resolve({
+        status: 204, ok: true,
+        text: () => Promise.resolve(''),
+        json: () => Promise.resolve({}),
+        headers: { get: () => null },
+      });
+    });
+
+    // vitest intercepts the deliberate process.exit(1) and surfaces it as a throw.
+    await expect(main()).rejects.toThrow(/process\.exit/);
+
+    const curlCall = execMock.mock.calls.find((c) => c[0] === 'curl');
+    expect(curlCall).toBeDefined();
+    const curlArgs = ((curlCall?.[1] ?? []) as string[]).join(' ');
+    expect(curlArgs).toContain('/api/agent/vm-heartbeat');
+    expect(curlArgs).toContain('vm_config_missing');
+    expect(curlArgs).toContain('.claude.json');
+    // The doomed VM never polled for (let alone claimed) a role.
+    const fetched = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(fetched.some((u) => u.includes('next-role'))).toBe(false);
+    expect(fetched.some((u) => u.includes('/api/agent/claim'))).toBe(false);
   });
 });
 
@@ -3569,10 +3852,10 @@ describe('clearToolTrace', () => {
 
 // ── pollForNextRole 401/403 handling — Issue 14 ──────────────────────────────
 describe('pollForNextRole auth-revoked', () => {
-  let fetchMock: ReturnType<typeof vi.fn>;
+  let fetchMock: FetchMock;
 
   beforeEach(() => {
-    fetchMock = vi.fn();
+    fetchMock = makeFetchMock();
     vi.stubGlobal('fetch', fetchMock);
   });
 
@@ -3681,10 +3964,10 @@ describe('getAgentHeaders', () => {
 // tick. A regression that drops the immediate fire (only triggers after
 // heartbeatIntervalMs) would still satisfy ">= 1" but would be wrong.
 describe('pollForNextRole vm-heartbeat timing', () => {
-  let fetchMock: ReturnType<typeof vi.fn>;
+  let fetchMock: FetchMock;
 
   beforeEach(() => {
-    fetchMock = vi.fn();
+    fetchMock = makeFetchMock();
     vi.stubGlobal('fetch', fetchMock);
   });
 
@@ -4176,7 +4459,6 @@ describe('drainJsonChunks within-chunk yielding', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const siSpy = vi.spyOn(globalThis, 'setImmediate').mockImplementation((fn: any, ...args: any[]) => {
       drainYieldCount++;
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
       return realSetImmediate(fn as (...a: unknown[]) => void, ...args);
     });
     emitData(Buffer.from(lines.join('\n') + '\n'));
@@ -4225,7 +4507,6 @@ describe('drainJsonChunks within-chunk yielding', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const siSpy = vi.spyOn(globalThis, 'setImmediate').mockImplementation((fn: any, ...args: any[]) => {
       drainYieldCount++;
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
       return realSetImmediate(fn as (...a: unknown[]) => void, ...args);
     });
     emitData(Buffer.from(lines.join('\n') + '\n'));
@@ -4921,9 +5202,9 @@ describe('final drain awaits in-flight drain before resolving (C7)', () => {
 });
 
 describe('fetchVmImageIdentity', () => {
-  let fetchMock: ReturnType<typeof vi.fn>;
+  let fetchMock: FetchMock;
   beforeEach(() => {
-    fetchMock = vi.fn();
+    fetchMock = makeFetchMock();
     vi.stubGlobal('fetch', fetchMock);
   });
   afterEach(() => { vi.unstubAllGlobals(); });
@@ -4967,11 +5248,11 @@ describe('fetchVmImageIdentity', () => {
 });
 
 describe('agent runtime fingerprint heartbeats', () => {
-  let fetchMock: ReturnType<typeof vi.fn>;
+  let fetchMock: FetchMock;
   const runtimeFingerprint = 'a'.repeat(64);
 
   beforeEach(() => {
-    fetchMock = vi.fn();
+    fetchMock = makeFetchMock();
     vi.stubGlobal('fetch', fetchMock);
     _setAgentRuntimeFingerprintForTesting(runtimeFingerprint);
   });
@@ -5011,7 +5292,7 @@ describe('agent runtime fingerprint heartbeats', () => {
       ([url]) => String(url).endsWith('/api/agent/vm-heartbeat'),
     );
     expect(vmHeartbeatCall).toBeDefined();
-    const vmHeartbeatBody = (vmHeartbeatCall?.[1] as RequestInit | undefined)?.body;
+    const vmHeartbeatBody = vmHeartbeatCall?.[1]?.body;
     expect(typeof vmHeartbeatBody).toBe('string');
     const body = JSON.parse(
       defined(typeof vmHeartbeatBody === 'string' ? vmHeartbeatBody : undefined),
@@ -5032,7 +5313,7 @@ describe('agent runtime fingerprint heartbeats', () => {
       ([url]) => String(url).endsWith('/api/agent/heartbeat'),
     );
     expect(heartbeatCall).toBeDefined();
-    const heartbeatBody = (heartbeatCall?.[1] as RequestInit | undefined)?.body;
+    const heartbeatBody = heartbeatCall?.[1]?.body;
     expect(typeof heartbeatBody).toBe('string');
     const body = JSON.parse(
       defined(typeof heartbeatBody === 'string' ? heartbeatBody : undefined),

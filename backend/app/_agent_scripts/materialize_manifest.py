@@ -16,6 +16,7 @@ inline heredoc's backslash escapes, causing SyntaxError on every VM.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import pathlib
@@ -65,6 +66,36 @@ def _env_file_escape(value: object) -> str:
     return s
 
 
+def _atomic_write_text(
+    path: pathlib.Path,
+    content: str,
+    mode: int,
+    owner: tuple[int, int] | None = None,
+) -> None:
+    """Write ``content`` to ``path`` via a same-directory temp file + rename.
+
+    The warm re-target path re-invokes this script over an ALREADY-LIVE config
+    (/etc/agent.env, ~/.claude.json, …). A plain truncate-then-write leaves a
+    partial/empty file if this process dies mid-write — a configless VM that
+    looks healthy but fails every task in seconds (2026-06-06 poisoned-VM
+    incidents). os.replace is atomic within a filesystem, so the destination
+    only ever holds the complete old content or the complete new content; mode
+    and ownership are applied to the temp file BEFORE the swap so there is no
+    instant where the final path has wrong permissions.
+    """
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        os.chmod(tmp, mode)
+        if owner is not None:
+            os.chown(tmp, owner[0], owner[1])
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 3:
         print(f"usage: {argv[0]} <manifest.json> <env.out>", file=sys.stderr)
@@ -74,14 +105,14 @@ def main(argv: list[str]) -> int:
     with open(manifest_path, encoding="utf-8") as fh:
         manifest = json.load(fh)
 
-    # 1. Write env file
+    # 1. Write env file (atomically — see _atomic_write_text)
     env = manifest.get("env") or {}
-    with open(env_path, "w", encoding="utf-8") as env_file:
-        for key, value in env.items():
-            if value is None:
-                continue
-            env_file.write(f'{key}="{_env_file_escape(value)}"\n')
-    os.chmod(env_path, 0o600)
+    env_body = "".join(
+        f'{key}="{_env_file_escape(value)}"\n'
+        for key, value in env.items()
+        if value is not None
+    )
+    _atomic_write_text(pathlib.Path(env_path), env_body, 0o600)
 
     # 2. Write any auth/config files with the right owner/mode
     files = manifest.get("files") or []
@@ -104,9 +135,12 @@ def main(argv: list[str]) -> int:
             path.parent.mkdir(parents=True, exist_ok=True)
             for created in missing_parents:
                 os.chown(created, uid, gid)
-            path.write_text(item.get("content", "") or "", encoding="utf-8")
-            os.chmod(path, int(item.get("mode", "0600"), 8))
-            os.chown(path, uid, gid)
+            _atomic_write_text(
+                path,
+                item.get("content", "") or "",
+                int(item.get("mode", "0600"), 8),
+                owner=(uid, gid),
+            )
 
     return 0
 

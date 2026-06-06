@@ -177,7 +177,13 @@ class TestFileMaterialization:
         assert str(nested.parent.parent) in chowned_paths, (
             "grandparent dir should also have been chowned when we created it"
         )
-        assert str(nested) in chowned_paths
+        # Files are written atomically (temp + rename); ownership is applied to
+        # the temp file BEFORE the swap and travels with the rename, so the
+        # chown call records the temp path, not the final one.
+        assert any(
+            p == str(nested) or p.startswith(str(nested) + ".tmp.")
+            for p in chowned_paths
+        ), f"materialized file should be chowned (via its atomic temp); got {sorted(chowned_paths)}"
 
     def test_existing_parent_dirs_are_not_chowned(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -218,7 +224,11 @@ class TestFileMaterialization:
         assert str(existing_parent) not in chowned_paths, (
             "existing parent should not be re-chowned"
         )
-        assert str(target) in chowned_paths
+        # Atomic write: the chown lands on the temp file pre-rename (see above).
+        assert any(
+            p == str(target) or p.startswith(str(target) + ".tmp.")
+            for p in chowned_paths
+        ), f"materialized file should be chowned (via its atomic temp); got {sorted(chowned_paths)}"
 
 
 class TestNssBypass:
@@ -323,6 +333,115 @@ class TestReinvocationOverwrites:
         assert cred.read_text(encoding="utf-8") == "NEW-SECRET"
         mode = os.stat(cred).st_mode & 0o777
         assert mode == 0o600
+
+
+class TestAtomicWrites:
+    """The warm re-target path re-invokes this script over an ALREADY-LIVE
+    config (/etc/agent.env, ~/.claude.json). Writes must go through a
+    same-directory temp file + os.replace so a mid-write death never leaves a
+    partial/empty config — a VM that looks healthy but fails every task in
+    seconds with "Claude configuration file not found" (2026-06-06
+    poisoned-VM incidents, tasks 1330d291 / cf28097f).
+    """
+
+    @staticmethod
+    def _current_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            materialize_manifest,
+            "_lookup_uid_gid",
+            lambda _user: (
+                (os.getuid(), os.getgid()) if hasattr(os, "getuid") else (0, 0)
+            ),
+        )
+
+    def test_no_tmp_residue_after_success(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        self._current_owner(monkeypatch)
+        cred = tmp_path / "creds" / "auth.json"
+        manifest = _write_manifest(
+            tmp_path,
+            env={"A": "1"},
+            files=[{"path": str(cred), "content": "{}", "mode": "0600"}],
+        )
+        env_out = tmp_path / "agent.env"
+        assert materialize_manifest.main(["m", str(manifest), str(env_out)]) == 0
+        assert cred.read_text(encoding="utf-8") == "{}"
+        assert list(tmp_path.rglob("*.tmp.*")) == []
+
+    def test_failed_cred_write_preserves_prior_content_and_cleans_tmp(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        self._current_owner(monkeypatch)
+        cred = tmp_path / "auth.json"
+        env_out = tmp_path / "agent.env"
+        first = _write_manifest(
+            tmp_path,
+            env={"A": "1"},
+            files=[{"path": str(cred), "content": "OLD-SECRET", "mode": "0600"}],
+        )
+        assert materialize_manifest.main(["m", str(first), str(env_out)]) == 0
+        assert cred.read_text(encoding="utf-8") == "OLD-SECRET"
+
+        # Die mid-swap on the SECOND materialization (chmod on the cred temp
+        # file raises). The live file must still hold the complete prior
+        # content — never truncated, never partial — and no temp may linger.
+        real_chmod = os.chmod
+
+        def _chmod_boom_on_cred(path, mode, *args, **kwargs):
+            if str(path).startswith(str(cred)):
+                raise OSError("simulated mid-write death")
+            return real_chmod(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "chmod", _chmod_boom_on_cred)
+        second = tmp_path / "manifest2.json"
+        second.write_text(
+            json.dumps(
+                {
+                    "env": {"A": "2"},
+                    "files": [
+                        {"path": str(cred), "content": "NEW-SECRET", "mode": "0600"}
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(OSError, match="simulated mid-write death"):
+            materialize_manifest.main(["m", str(second), str(env_out)])
+
+        assert cred.read_text(encoding="utf-8") == "OLD-SECRET"
+        assert list(tmp_path.glob("auth.json.tmp.*")) == []
+
+    def test_failed_env_write_preserves_prior_env_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        env_out = tmp_path / "agent.env"
+        first = _write_manifest(tmp_path, env={"PROVIDER": "anthropic"})
+        assert materialize_manifest.main(["m", str(first), str(env_out)]) == 0
+        body1 = env_out.read_text(encoding="utf-8")
+        assert 'PROVIDER="anthropic"' in body1
+
+        real_chmod = os.chmod
+
+        def _chmod_boom_on_env(path, mode, *args, **kwargs):
+            if str(path).startswith(str(env_out)):
+                raise OSError("simulated mid-write death")
+            return real_chmod(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "chmod", _chmod_boom_on_env)
+        second = tmp_path / "manifest2.json"
+        second.write_text(
+            json.dumps({"env": {"PROVIDER": "gemini"}, "files": []}),
+            encoding="utf-8",
+        )
+        with pytest.raises(OSError, match="simulated mid-write death"):
+            materialize_manifest.main(["m", str(second), str(env_out)])
+
+        # The live env file is byte-for-byte the COMPLETE prior config — the
+        # re-exec'd / restarted agent still boots on a valid (old) account
+        # rather than a truncated, configless one.
+        assert env_out.read_text(encoding="utf-8") == body1
+        assert list(tmp_path.glob("agent.env.tmp.*")) == []
 
 
 class TestCLIContract:

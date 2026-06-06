@@ -662,6 +662,18 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # account. A CONFIRMED rate-limit message is reported as ``rate_limited``
     # (-> RATE_LIMIT, block + cooldown) instead — see runners.ts.
     "no_progress_timeout": NO_PROGRESS_TIMEOUT,
+    # ``vm_config_missing`` — the provider CLI died because a boot/retarget-
+    # materialized config file is absent from the VM (canonical case: Claude CLI
+    # exits in seconds with "Claude configuration file not found" when
+    # ~/.claude.json was destroyed by a warm re-target that died mid-sequence).
+    # Emitted by VmConfigMissingError (agent runners.ts) and by the agent's
+    # claim-time config guard. A VM/infra fault, not a code defect and NOT usage
+    # exhaustion: route to PROVISION_FAILURE so the task gets the infra backoff +
+    # requeue on a fresh VM instead of burning the code-error retry budget or
+    # cooling down a healthy account. Incident 2026-06-06 (tasks 1330d291 /
+    # cf28097f): without this label the generic ``fatal`` + init-banner-only tail
+    # was reclassified to RATE_LIMIT ("usage exhausted") above.
+    "vm_config_missing": PROVISION_FAILURE,
 }
 
 
