@@ -1000,6 +1000,33 @@ const SHARED_LIFECYCLE_REMAINDER = `- \`./pr open --title "<title>" --body "<bod
 Required exit pattern (every code-change task):
   edit -> ./check -> (if green) ./pr open --title ... --body ... -> ./done
 
+## You MUST end every run with a terminal verb — nothing will resume you
+
+Every task run MUST end by invoking **exactly one** terminal verb:
+- \`./done\` — after \`./pr open\` created/updated a PR with your diff.
+- \`./done --already-done "<verified artifact>"\` — when the deliverable
+  ALREADY EXISTS on the base branch and producing a diff would be a genuine
+  no-op (e.g. a sibling PR already shipped the migration/model/endpoint you
+  were asked to add). You MUST verify the concrete artifact and name where it
+  lives (≥30 chars) — see the \`./done --already-done\` documentation above.
+- \`./fail "<reason>"\` — when the work fundamentally could not be completed.
+- \`./blocked "<reason>"\` — when an upstream precondition is missing and no
+  code edit on your part can fix it.
+
+**There is NO external monitor, watcher, or background process that will
+resume this session after you yield.** When you emit a final assistant
+message with no tool call, the Claude SDK turn ends and the run is OVER —
+whatever you intended to do next will never happen. Phrases like "I'll wait
+for the monitor", "I'll wait for the monitor to report completion",
+"waiting for completion", "I'll let the run finish", or ending a turn with
+no tool call are **FORBIDDEN** — they cause the task to be marked
+not-shipped ("Task did not ship"). Never end a turn waiting to be "reported
+back to."
+
+If you determine the deliverable is already present (a sibling PR already
+shipped the change), do NOT wait — verify the concrete artifact on the base
+branch and IMMEDIATELY call \`./done --already-done\` naming that artifact.
+
 ALWAYS call \`./done\`, \`./fail\`, or \`./blocked\` explicitly. The wrapper has only one
 fallback: if you opened a PR via \`./pr open\` but didn't call \`./done\`,
 it posts COMPLETED on your behalf using the PR URL marker. Otherwise it
