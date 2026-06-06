@@ -147,6 +147,36 @@ else
   PYTHON="${PYTHON:-python3}"
 fi
 
+# --- Docker Hub rate-limit resilience --------------------------------------
+# Agent VMs share egress and routinely hit Docker Hub's unauthenticated pull
+# rate limit, which kills the docker build below (FROM python:3.11-slim) and
+# fails the mandatory PR gate repo-wide regardless of the diff. Same recovery
+# as CI (ci.yml, #7434): retry the pull, then fall back to mirror.gcr.io
+# (Google's public pull-through cache of Docker Hub library images — it rides
+# a different network path) and retag so FROM / docker run resolve the image
+# locally without re-pulling. A failed pull is non-fatal when the image is
+# already in the local cache.
+ensure_image() {
+  local image="$1" src i ok=
+  for src in "$image" "mirror.gcr.io/library/$image"; do
+    for i in 1 2 3; do
+      if docker pull "$src" >/dev/null 2>&1; then ok=1; break; fi
+      echo "WARN: $src pull failed (attempt $i/3) — retrying" >&2
+      sleep $((i * 10))
+    done
+    if [ -n "$ok" ]; then
+      [ "$src" = "$image" ] || docker tag "$src" "$image"
+      return 0
+    fi
+  done
+  if docker image inspect "$image" >/dev/null 2>&1; then
+    echo "WARN: could not pull $image — using locally cached copy" >&2
+    return 0
+  fi
+  echo "ERROR: could not pull $image from Docker Hub or mirror.gcr.io" >&2
+  return 1
+}
+
 # --- Configure DATABASE_URL / ENV_ARGS based on --postgres ---
 if [ "$USE_POSTGRES" = "1" ]; then
   PG_NETWORK="blueprint-test-net-$$"
@@ -154,6 +184,7 @@ if [ "$USE_POSTGRES" = "1" ]; then
   PG_DSN="postgresql+asyncpg://test:test@${PG_CONTAINER}:5432/test_blueprint"
 
   echo "=== Starting Postgres sidecar (${PG_CONTAINER}) ==="
+  ensure_image postgres:15
   docker network create "$PG_NETWORK" >/dev/null
   docker run -d --rm --name "$PG_CONTAINER" --network "$PG_NETWORK" \
     -e POSTGRES_USER=test \
@@ -223,6 +254,7 @@ _run() {
 
 if [ "$USE_DOCKER" = "1" ]; then
   echo "=== Building backend image ==="
+  ensure_image python:3.11-slim
   docker build -t blueprint-backend-test . -q
 fi
 

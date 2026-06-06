@@ -354,3 +354,129 @@ describe('runCodeChangeTask redundant-no-op completion safeguard', () => {
     expect(payload.failure_category).toBe('claude_code_failed');
   });
 });
+
+// ── runCodeChangeTask — forced terminal-verb continuation backstop ────────────
+// A passive end_turn (Claude exits 0 with an uncommitted diff but NO terminal
+// marker) must trigger exactly ONE forced continuation that demands a terminal
+// verb, then re-inspect the markers. Only if the continuation STILL produces no
+// terminal verb / PR does the task fail as `incomplete`.
+describe('runCodeChangeTask forced terminal-verb continuation', () => {
+  const taskId = 'passive-endturn-task';
+  const baseOpts = {
+    taskId,
+    prompt: 'add a deterministic backstop',
+    ws: null,
+    statusRef: { value: '' },
+    workBranch: `blueprint/${taskId}`,
+    baseBranch: 'main',
+    owner: 'owner',
+    repo: 'repo',
+    testsOnMainBranch: true,
+    baseCommit: 'abc123',
+  };
+  const prUrlMarker = `/tmp/pr_url_${taskId}`;
+  const doneMarker = `/tmp/done_${taskId}`;
+  const validPrUrl = 'https://github.com/owner/repo/pull/123';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(fs.writeFileSync).mockImplementation(() => {});
+    vi.mocked(fs.unlinkSync).mockImplementation(() => {});
+    // Uncommitted diff present: git status returns a porcelain line → hasChanges.
+    vi.mocked(git).mockImplementation((args: string[]) => {
+      if (args[0] === 'status') return ' M agent/src/handlers/code-change.ts';
+      if (args[0] === 'rev-parse') return 'abc123';
+      if (args[0] === 'diff') return 'agent/src/handlers/code-change.ts';
+      return '';
+    });
+  });
+
+  it('completes when the forced continuation ships a PR after a passive end_turn', async () => {
+    // First run: passive end_turn — exit 0, a diff, NO markers. The forced
+    // continuation then opens a PR (writes /tmp/pr_url_<id>) and calls ./done
+    // (writes /tmp/done_<id>); the wrapper must end COMPLETED, not FAILED.
+    let continued = false;
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: "I've scheduled a check. Waiting for the gate.", lastResultText: '' })
+      .mockImplementationOnce(() => { continued = true; return Promise.resolve({ exitCode: 0, allOutput: '', lastResultText: '' }); });
+    // Markers only appear AFTER the continuation runs.
+    vi.mocked(fs.existsSync).mockImplementation((p: fs.PathLike) =>
+      continued && (String(p) === prUrlMarker || String(p) === doneMarker),
+    );
+    vi.mocked(fs.readFileSync).mockImplementation((p: fs.PathOrFileDescriptor) =>
+      String(p) === prUrlMarker ? validPrUrl : '',
+    );
+
+    await runCodeChangeTask({ ...baseOpts });
+
+    // The continuation must have fired exactly once (two total runClaudeCode calls).
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    // The done marker wins → the bash ./done already posted COMPLETED, so the
+    // wrapper must NOT post any terminal status itself, and definitely not FAILED.
+    const failedCalls = vi.mocked(persistAndPostStatus).mock.calls.filter(
+      c => c[1].status === 'FAILED',
+    );
+    expect(failedCalls).toHaveLength(0);
+  });
+
+  it('completes via the PR-URL finalizer when the continuation opens a PR but skips ./done', async () => {
+    // Continuation opens a PR (valid /tmp/pr_url_<id>) but ends without ./done.
+    // The wrapper must finalise COMPLETED on Claude's behalf.
+    let continued = false;
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'waiting for the monitor', lastResultText: '' })
+      .mockImplementationOnce(() => { continued = true; return Promise.resolve({ exitCode: 0, allOutput: '', lastResultText: '' }); });
+    vi.mocked(fs.existsSync).mockImplementation((p: fs.PathLike) =>
+      continued && String(p) === prUrlMarker,
+    );
+    vi.mocked(fs.readFileSync).mockImplementation((p: fs.PathOrFileDescriptor) =>
+      String(p) === prUrlMarker ? validPrUrl : '',
+    );
+
+    await runCodeChangeTask({ ...baseOpts });
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const completedCalls = vi.mocked(persistAndPostStatus).mock.calls.filter(
+      c => c[1].status === 'COMPLETED',
+    );
+    expect(completedCalls).toHaveLength(1);
+    expect(completedCalls[0][1].pr_url).toBe(validPrUrl);
+  });
+
+  it('FAILS as incomplete when the forced continuation still produces no terminal marker', async () => {
+    // Both the original run AND the forced continuation end with a diff but no
+    // marker. After the single capped continuation, the task must fail closed.
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: 'still just prose, no verb', lastResultText: '' });
+
+    await runCodeChangeTask({ ...baseOpts });
+
+    // Exactly one forced continuation — capped, no loop.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledTimes(1);
+    const payload = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(payload.status).toBe('FAILED');
+    expect(payload.failure_category).toBe('incomplete');
+  });
+
+  it('does NOT issue a continuation when there is no diff (nothing to rescue)', async () => {
+    // No diff: git status clean AND HEAD unchanged. The passive-rescue path must
+    // not fire — a no-diff exit has no work to ship, so it fails as incomplete
+    // via the existing safeguard without a second runClaudeCode call.
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(git).mockImplementation((args: string[]) => {
+      if (args[0] === 'status') return '';
+      if (args[0] === 'rev-parse') return 'abc123';
+      return '';
+    });
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: 'did nothing', lastResultText: '' });
+
+    await runCodeChangeTask({ ...baseOpts });
+
+    // Only the original run — no forced continuation when there's no diff.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    const payload = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(payload.status).toBe('FAILED');
+    expect(payload.failure_category).toBe('incomplete');
+  });
+});

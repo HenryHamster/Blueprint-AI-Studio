@@ -201,6 +201,94 @@ export async function maybeRunIncompleteReviewRecovery(
   }
 }
 
+/**
+ * Inspect the terminal marker files (./done, ./fail, ./blocked, PR-URL) and
+ * finalize the task when one is present.
+ *
+ * Returns 'handled' when the caller should return immediately — either a clean
+ * ./done|./fail|./blocked marker was found (the bash helper already posted the
+ * terminal status), or a well-formed PR-URL marker was finalised to COMPLETED
+ * on Claude's behalf. Returns 'unshipped' when no valid terminal signal exists
+ * (no markers, or a malformed PR-URL marker) and the caller should continue to
+ * the forced-continuation / fail-closed path.
+ *
+ * `note` is appended to operator log/status lines so the post-forced-
+ * continuation inspection is distinguishable from the first one in the logs.
+ */
+async function inspectTerminalMarkers(
+  opts: CodeChangeTaskOpts,
+  ws: WebSocket | null,
+  note: string,
+): Promise<'handled' | 'unshipped'> {
+  const { taskId } = opts;
+  const doneMarker = `/tmp/done_${taskId}`;
+  const failMarker = `/tmp/fail_${taskId}`;
+  const blockedMarker = `/tmp/blocked_${taskId}`;
+  const prUrlFile = `/tmp/pr_url_${taskId}`;
+
+  if (fs.existsSync(doneMarker)) {
+    sendLog(ws, `[wrapper] ./done marker present${note} — Claude posted COMPLETED. Exiting cleanly.\n`);
+    return 'handled';
+  }
+  if (fs.existsSync(failMarker)) {
+    sendLog(ws, `[wrapper] ./fail marker present${note} — Claude posted FAILED. Exiting cleanly.\n`);
+    return 'handled';
+  }
+  if (fs.existsSync(blockedMarker)) {
+    sendLog(ws, `[wrapper] ./blocked marker present${note} — Claude posted BLOCKED_PRECONDITION. Exiting cleanly.\n`);
+    return 'handled';
+  }
+
+  // Claude exited without calling ./done|./fail|./blocked. Did it at least open
+  // a PR? If yes, treat as success — Claude probably hung post-result-event
+  // before getting to ./done; we just complete the handshake on its behalf.
+  //
+  // Shape-validate the marker file before trusting it. ./pr open / ./pr close /
+  // verify-mode all write a canonical pull URL; any other shape means Claude
+  // (or some other code path) wrote the file directly. Production incident
+  // 2026-05-06: Claude on a retry whose ./check gate was blocked by a
+  // missing-libatk viewport failure improvised by writing a /compare/ URL
+  // here, the wrapper trusted it, and downstream PR-merge verifiers crashed
+  // 36×/cycle on int(last-path-segment) of `task-cb7bb07e`. Treat malformed
+  // contents as task-did-not-ship.
+  if (fs.existsSync(prUrlFile)) {
+    const prUrl = fs.readFileSync(prUrlFile, 'utf-8').trim();
+    const PR_URL_RE = /^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+$/;
+    if (!PR_URL_RE.test(prUrl)) {
+      sendLog(ws, `[wrapper] /tmp/pr_url_${taskId} contains malformed PR URL: ${JSON.stringify(prUrl)}. Treating as task-did-not-ship.\n`);
+      return 'unshipped';
+    }
+    // Run incomplete-review recovery before reading the SR for the status post so
+    // any fresh-reviewer findings are included in the COMPLETED payload.
+    await maybeRunIncompleteReviewRecovery(taskId, ws, opts.incompleteReviewRecoveryFn);
+    sendLog(ws, `[wrapper] PR URL marker present (${prUrl}) but no ./done marker${note}. Posting COMPLETED on Claude's behalf.\n`);
+    // Capture the diff so review-pipeline scope analysis, direction credit,
+    // and rollup management get real changed_files instead of an empty list.
+    let changedFiles: string[] = [];
+    try {
+      const out = git(['diff', '--name-only', `${opts.baseCommit}..HEAD`]);
+      changedFiles = out.split('\n').filter(Boolean).slice(0, 50);
+    } catch { /* git may be in odd state — best effort */ }
+    const selfReview = augmentSelfReview(
+      readSelfReviewOutcome(taskId, opts.existingPrNumber !== undefined ? (opts.fixIteration ?? 1) : undefined),
+      taskId,
+      opts.baseCommit,
+    );
+    await persistAndPostStatus(taskId, {
+      task_id: taskId,
+      status: 'COMPLETED',
+      artifact_type: 'PULL_REQUEST',
+      pr_url: prUrl,
+      logs: `Task completed. Claude opened PR but did not call ./done — wrapper finalised${note}.`,
+      ...(changedFiles.length > 0 ? { changed_files: changedFiles } : {}),
+      self_review_outcome: selfReview,
+    });
+    return 'handled';
+  }
+
+  return 'unshipped';
+}
+
 export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void> {
   const { taskId, prompt, ws, statusRef, model, effort, disallowedTools } = opts;
 
@@ -313,72 +401,7 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
 
   // 3. Inspect marker files written by ./done|./fail|./pr to determine
   //    terminal status without re-querying GitHub.
-  const doneMarker = `/tmp/done_${taskId}`;
-  const failMarker = `/tmp/fail_${taskId}`;
-  const blockedMarker = `/tmp/blocked_${taskId}`;
-  const prUrlFile = `/tmp/pr_url_${taskId}`;
-
-  if (fs.existsSync(doneMarker)) {
-    sendLog(ws, '[wrapper] ./done marker present — Claude posted COMPLETED. Exiting cleanly.\n');
-    return;
-  }
-  if (fs.existsSync(failMarker)) {
-    sendLog(ws, '[wrapper] ./fail marker present — Claude posted FAILED. Exiting cleanly.\n');
-    return;
-  }
-  if (fs.existsSync(blockedMarker)) {
-    sendLog(ws, '[wrapper] ./blocked marker present — Claude posted BLOCKED_PRECONDITION. Exiting cleanly.\n');
-    return;
-  }
-
-  // Claude exited without calling ./done|./fail.
-  // Did it at least open a PR? If yes, treat as success — Claude probably
-  // hung post-result-event before getting to ./done; we just complete the
-  // handshake on its behalf.
-  //
-  // Shape-validate the marker file before trusting it. ./pr open / ./pr close /
-  // verify-mode all write a canonical pull URL; any other shape means Claude
-  // (or some other code path) wrote the file directly. Production incident
-  // 2026-05-06: Claude on a retry whose ./check gate was blocked by a
-  // missing-libatk viewport failure improvised by writing a /compare/ URL
-  // here, the wrapper trusted it, and downstream PR-merge verifiers crashed
-  // 36×/cycle on int(last-path-segment) of `task-cb7bb07e`. Treat malformed
-  // contents as task-did-not-ship.
-  if (fs.existsSync(prUrlFile)) {
-    const prUrl = fs.readFileSync(prUrlFile, 'utf-8').trim();
-    const PR_URL_RE = /^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+$/;
-    if (!PR_URL_RE.test(prUrl)) {
-      sendLog(ws, `[wrapper] /tmp/pr_url_${taskId} contains malformed PR URL: ${JSON.stringify(prUrl)}. Treating as task-did-not-ship.\n`);
-      // Fall through to the FAILED path below.
-    } else {
-      // Run incomplete-review recovery before reading the SR for the status post so
-      // any fresh-reviewer findings are included in the COMPLETED payload.
-      await maybeRunIncompleteReviewRecovery(taskId, ws, opts.incompleteReviewRecoveryFn);
-      sendLog(ws, `[wrapper] PR URL marker present (${prUrl}) but no ./done marker. Posting COMPLETED on Claude's behalf.\n`);
-      // Capture the diff so review-pipeline scope analysis, direction credit,
-      // and rollup management get real changed_files instead of an empty list.
-      let changedFiles: string[] = [];
-      try {
-        const out = git(['diff', '--name-only', `${opts.baseCommit}..HEAD`]);
-        changedFiles = out.split('\n').filter(Boolean).slice(0, 50);
-      } catch { /* git may be in odd state — best effort */ }
-      const selfReview = augmentSelfReview(
-        readSelfReviewOutcome(taskId, opts.existingPrNumber !== undefined ? (opts.fixIteration ?? 1) : undefined),
-        taskId,
-        opts.baseCommit,
-      );
-      await persistAndPostStatus(taskId, {
-        task_id: taskId,
-        status: 'COMPLETED',
-        artifact_type: 'PULL_REQUEST',
-        pr_url: prUrl,
-        logs: 'Task completed. Claude opened PR but did not call ./done — wrapper finalised.',
-        ...(changedFiles.length > 0 ? { changed_files: changedFiles } : {}),
-        self_review_outcome: selfReview,
-      });
-      return;
-    }
-  }
+  if (await inspectTerminalMarkers(opts, ws, '') === 'handled') return;
 
   // No PR opened and no ./done|./fail|./blocked marker. Did Claude make any
   // changes?
@@ -388,6 +411,41 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     const head = git(['rev-parse', 'HEAD']);
     hasChanges = diff.length > 0 || head !== opts.baseCommit;
   } catch { /* git may be in odd state */ }
+
+  // ── FORCED TERMINAL-VERB CONTINUATION BACKSTOP (2026-06-06) ──────────────
+  // A passive end_turn — Claude ended its final turn with a plain assistant
+  // message and NO tool call ("I've scheduled a check. Waiting for the gate to
+  // complete.") — falsely assumes a monitor will resume the session. There is
+  // none: runClaudeCode is a single-shot SDK query invoked exactly once above.
+  // When the subprocess exits 0 with an uncommitted/HEAD-advanced diff but no
+  // terminal marker, the work would be discarded as "did not ship". The prompt
+  // guard (SHARED_LIFECYCLE_REMAINDER) is soft prose the model can ignore; this
+  // is the deterministic, model-independent backstop. Issue exactly ONE forced
+  // continuation that DEMANDS a terminal verb, then re-inspect the markers. Cap
+  // at one attempt to avoid loops. We deliberately do NOT auto-run ./pr open or
+  // auto-complete without a model turn — the repo requires an affirmative
+  // terminal verb (see the SAFEGUARD comment below), so the continuation must
+  // produce a real ./pr open + ./done|./fail|./blocked or the task fails closed.
+  if (exitCode === 0 && hasChanges) {
+    sendLog(ws, '[wrapper] passive end_turn with uncommitted diff — issuing one forced terminal-verb continuation\n');
+    const continuationPrompt =
+      'Your previous turn ended with a text message and no tool call, so the run was about ' +
+      'to be discarded. THERE IS NO MONITOR OR BACKGROUND PROCESS THAT WILL RESUME YOU. You ' +
+      'have uncommitted changes that were never shipped. RIGHT NOW, run ./pr open --title ' +
+      '"<title>" --body "<body>" then ./done. If the work cannot be completed call ./fail ' +
+      '"<reason>"; if blocked upstream call ./blocked "<reason>". Do not reply with prose — ' +
+      'invoke a terminal verb.';
+    try {
+      await runClaudeCode(continuationPrompt, ws, statusRef, model, effort, disallowedTools, true);
+    } catch (e) {
+      sendLog(ws, `[wrapper] forced continuation run failed: ${e instanceof Error ? e.message : String(e)}\n`);
+      // Non-fatal — fall through to re-inspect markers (none will exist) and
+      // then to the fail-closed path below.
+    }
+    // Re-inspect exactly as the existing code does. Only if there is STILL no
+    // terminal marker / no PR do we fall through and fail the task.
+    if (await inspectTerminalMarkers(opts, ws, ' after forced continuation') === 'handled') return;
+  }
 
   // SAFEGUARD (2026-06-01): a bare no-diff clean exit is NOT auto-completed.
   //
