@@ -186,6 +186,19 @@ if [ "$WITH_TESTS" = "1" ]; then
     echo "[pr] ./check test failed — fix lint/build/tests then re-run ./pr open."
     exit 1
   fi
+  # Gate-environment honesty (trapped tasks 22cb9d94 / 6b14ec01, 2026-06-06):
+  # ./check may have skipped a pytest gate that cannot run faithfully on this
+  # VM (no Docker for the sanctioned harness, no Postgres test env — a bare
+  # pytest would degrade to in-memory SQLite where pre-existing Postgres-only
+  # tests fail regardless of the diff). Surface the marker so the evidence
+  # trail is explicit instead of silently green; CI runs the authoritative
+  # suite on the PR.
+  if [ -s /tmp/check_gate_env_${cfg.taskId}.txt ]; then
+    echo ""
+    echo "[pr] NOTE: the test gate ran in GATE-ENVIRONMENT mode on this VM:"
+    sed 's/^/[pr]   /' /tmp/check_gate_env_${cfg.taskId}.txt
+    echo "[pr] Record your faithful test evidence (sanctioned harness run) in the PR body; CI runs the authoritative suite."
+  fi
 else
   if ! ./check; then
     echo ""
