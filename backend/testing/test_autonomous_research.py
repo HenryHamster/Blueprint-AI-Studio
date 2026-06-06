@@ -242,6 +242,103 @@ async def test_research_payload_includes_knowledge_index_scoped_to_direction(
 
 
 @pytest.mark.asyncio
+async def test_autonomous_research_stamps_idempotency_key(db_session):
+    """A spawned directed research task carries the shared direction-scoped
+    idempotency key; an undirected (cross-cutting) cycle carries the undirected
+    key namespace — so the partial unique index dedups both across spawn paths."""
+    from app.autonomous_research import research_idempotency_key
+
+    project = Project(
+        name="Idem Key Stamp",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-idem-key1")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research) == 1
+    task = research[0]
+    direction_id = task.first_payload.get("current_direction_id")
+    if direction_id:
+        assert task.idempotency_key == research_idempotency_key(
+            project.id, direction_id
+        )
+    else:
+        # Undirected cycle: key lives in the undirected namespace.
+        assert task.idempotency_key == research_idempotency_key(project.id, None)
+    # Either way, a key is always stamped — the DB index is the authoritative guard.
+    assert task.idempotency_key is not None
+
+
+@pytest.mark.asyncio
+async def test_autonomous_batch_skips_duplicate_direction(db_session):
+    """When one of several chosen directions already has an active task holding
+    its idempotency slot, the per-task savepoint rolls back ONLY that direction's
+    insert and skips it — the other directions still spawn."""
+    from app.autonomous_research import research_idempotency_key
+
+    dir_a = _active_direction("d-batch-aa1", text="Direction A")
+    dir_b = _active_direction("d-batch-bb2", text="Direction B")
+    project = Project(
+        name="Batch Skip Dup",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[dir_a, dir_b],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Pre-occupy direction A's idempotency slot with an in-flight task.
+    blocker = Task(
+        project_id=project.id,
+        title="Research: pre-existing on A",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [dir_a],
+                "current_direction_id": "d-batch-aa1",
+                "base_branch": "main",
+            }
+        ],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        idempotency_key=research_idempotency_key(project.id, "d-batch-aa1"),
+    )
+    db_session.add(blocker)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    # Active research tasks keyed per direction.
+    keys = {t.idempotency_key for t in research}
+    # Direction A's slot is held by exactly one task (the pre-existing blocker);
+    # no duplicate was inserted for it.
+    a_key = research_idempotency_key(project.id, "d-batch-aa1")
+    a_tasks = [t for t in research if t.idempotency_key == a_key]
+    assert len(a_tasks) == 1
+    assert a_tasks[0].id == blocker.id
+    # The batch still produced at least one task for a different slot (direction B
+    # or an undirected fallback) — a single collision did not nuke the whole cycle.
+    assert any(k != a_key for k in keys)
+
+
+@pytest.mark.asyncio
 async def test_spawn_blocked_by_open_circuit_breaker(db_session):
     """Circuit breaker in OPEN state (cooldown not elapsed) prevents spawning."""
     project = Project(

@@ -1061,6 +1061,16 @@ async def create_direction_research_task(
         },
         "directions:research",
     )
+    # Shared, direction-scoped idempotency key (same scheme the autonomous loop
+    # stamps). The in-app active_research scan above is the fast path / friendly
+    # 409, but the partial unique index ux_task_active_idempotency_key is the
+    # authoritative guard: it forces the DB to coalesce a concurrent duplicate —
+    # manual-vs-manual OR manual-vs-autonomous — that fired in the narrow window
+    # between that scan and this insert. Lazy import to avoid a router→service
+    # import cycle.
+    from app.autonomous_research import research_idempotency_key
+
+    idempotency_key = research_idempotency_key(project.id, direction_id)
     new_task = Task(
         project_id=project.id,
         title=f"Research: {direction_text[:200]}",
@@ -1070,9 +1080,41 @@ async def create_direction_research_task(
         status=TaskStatus.QUEUED,
         created_by="USER",
         requires_approval=False,
+        idempotency_key=idempotency_key,
     )
     session.add(new_task)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        # Concurrent spawn (another manual request or the autonomous loop) won
+        # the active idempotency slot for this direction between our scan and
+        # this insert. Coalesce onto the in-flight research rather than spawning
+        # a second VM-backed cycle or erroring — mirrors trigger_self_audit.
+        await session.rollback()
+        existing = (
+            await session.execute(
+                select(Task).where(
+                    Task.idempotency_key == idempotency_key,
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                            TaskStatus.EVALUATING,
+                            TaskStatus.BLOCKED,
+                        ]
+                    ),
+                )
+            )
+        ).scalars().first()
+        detail = (
+            f"Research is already in progress on this direction "
+            f"(task {str(existing.id)[:8]}, status {existing.status}). "
+            f"Cancel it before starting another."
+            if existing is not None
+            else "Research is already in progress on this direction."
+        )
+        raise HTTPException(status_code=409, detail=detail)
     await session.refresh(new_task)
 
     history = TaskHistory(

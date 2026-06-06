@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -62,6 +63,25 @@ _spawn_locks: dict[str, asyncio.Lock] = {}
 # site and the dedup guard below can never drift apart.
 CROSS_CUTTING_DIRECTION_TEXT = "Cross-cutting codebase analysis"
 CROSS_CUTTING_RESEARCH_TITLE = f"Research: {CROSS_CUTTING_DIRECTION_TEXT}"
+
+
+def research_idempotency_key(project_id, direction_id) -> str:
+    """Deterministic, direction-scoped idempotency key for a research Task.
+
+    Canonical home for the key string shared by BOTH research-spawn paths — the
+    autonomous loop (this module) and the manual operator endpoint
+    (routers/directions.py imports this). Both paths stamping the SAME key for a
+    given (project, direction) lets the partial unique index
+    ``ux_task_active_idempotency_key`` (over active-status tasks) force the
+    database to coalesce a concurrent duplicate instead of spawning a second
+    VM-backed research cycle on the same direction.
+
+    Directed and undirected (cross-cutting) cycles get distinct key namespaces so
+    an undirected spawn never collides with a directed one on the same project.
+    """
+    if direction_id:
+        return f"research_direction:{project_id}:{direction_id}"
+    return f"research_undirected:{project_id}"
 
 
 def _get_spawn_lock(project_id: str) -> asyncio.Lock:
@@ -1895,8 +1915,15 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
+            # Shared, direction-scoped idempotency key. The partial unique index
+            # over active-status tasks is the authoritative guard: it forces the
+            # DB to reject a concurrent duplicate (manual or autonomous) on the
+            # same direction, so at most one active research cycle exists per
+            # direction across BOTH spawn paths. Undirected cycles get their own
+            # key namespace and stay additionally guarded by the soft
+            # _undirected_research_recently_active fast path above.
+            idempotency_key=research_idempotency_key(project.id, current_dir_id),
         )
-        session.add(new_task)
         # NOTE: counter is NOT incremented here. _research_spawn_count is
         # actually a research-COMPLETION counter despite the name — the
         # strategic_research_frequency gate at autonomous_research.py:384 is
@@ -1908,12 +1935,34 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         # and the next iteration of _check_idle_research immediately spawned
         # strategic review #2 with zero findings to consume. The increment
         # now lives in _handle_research_completion (research_completion.py).
-        history = TaskHistory(
-            task_id=new_task.id,
-            action="SPAWNED",
-            details={"spawned_by": "AUTONOMOUS_LOOP", "trigger": "post_merge_or_idle"},
-        )
-        session.add(history)
+        # Per-task savepoint so one direction's idempotency-key collision (a
+        # concurrent manual or autonomous spawn already holding the active slot)
+        # rolls back ONLY that direction's insert and skips it — the rest of the
+        # batch, and any already-committed cycle bookkeeping, still land. Without
+        # the savepoint a single IntegrityError on the batch commit would abort
+        # every spawn in this cycle.
+        try:
+            async with session.begin_nested():
+                session.add(new_task)
+                await session.flush()
+                history = TaskHistory(
+                    task_id=new_task.id,
+                    action="SPAWNED",
+                    details={
+                        "spawned_by": "AUTONOMOUS_LOOP",
+                        "trigger": "post_merge_or_idle",
+                    },
+                )
+                session.add(history)
+                await session.flush()
+        except IntegrityError:
+            logger.info(
+                f"[AUTONOMOUS] Research spawn for direction "
+                f"{current_dir_id or 'undirected'} (project {project.id}) coalesced "
+                f"onto an in-flight cycle holding the same idempotency key — "
+                f"skipping this duplicate."
+            )
+            continue
         spawned_tasks.append(new_task)
 
     await session.commit()

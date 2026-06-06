@@ -1056,6 +1056,95 @@ async def test_manual_research_stamps_current_direction_id(
     assert created.first_payload.get("current_direction_id") == direction_id
 
 
+@pytest.mark.asyncio
+async def test_manual_research_stamps_idempotency_key(
+    client: AsyncClient, db_session, mocker
+):
+    """The manual research task must carry the shared, direction-scoped
+    idempotency key so the partial unique index can coalesce a concurrent
+    duplicate against the autonomous path."""
+    from app.autonomous_research import research_idempotency_key
+
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Stamp the idem key")
+    direction_id = direction["id"]
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}/research"
+    )
+    assert resp.status_code == 200, resp.text
+    task_id = resp.json()["id"]
+
+    created = await db_session.get(Task, uuid.UUID(task_id))
+    assert created is not None
+    assert created.idempotency_key == research_idempotency_key(
+        uuid.UUID(project_id), direction_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_manual_research_integrityerror_coalesces(
+    client: AsyncClient, db_session, mocker
+):
+    """When a concurrent spawn already holds the active idempotency slot (and is
+    invisible to the soft in-app scan), the DB unique index rejects the second
+    insert; the endpoint must coalesce to a friendly 409, not 500, and must NOT
+    create a second active research task."""
+    from app.autonomous_research import research_idempotency_key
+
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Race the index")
+    direction_id = direction["id"]
+
+    # Pre-insert an in-flight task that holds the idempotency slot but carries a
+    # payload the soft active_research scan does NOT match (no current_direction_id
+    # and an unrelated directions list), so only the DB index can catch the dup.
+    in_flight = Task(
+        project_id=uuid.UUID(project_id),
+        title="Research: holding the slot",
+        payloads=[{"type": "research", "directions": [], "base_branch": "main"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        idempotency_key=research_idempotency_key(
+            uuid.UUID(project_id), direction_id
+        ),
+    )
+    db_session.add(in_flight)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}/research"
+    )
+    assert resp.status_code == 409, resp.text
+    assert "in progress" in resp.text.lower()
+
+    # Exactly one active research task on the idempotency key — the pre-existing one.
+    rows = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.idempotency_key
+                    == research_idempotency_key(uuid.UUID(project_id), direction_id),
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                            TaskStatus.EVALUATING,
+                            TaskStatus.BLOCKED,
+                        ]
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].id == in_flight.id
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Cooldown Filter (_spawn_research_task)
 # ─────────────────────────────────────────────────────────────────────────────

@@ -8,6 +8,7 @@ Tests for admin routers:
 """
 
 import json
+import os
 import uuid
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, patch
@@ -10581,6 +10582,490 @@ class TestTriggerRollup:
         assert result.get("merge_blocked_reason")
         assert task.status == TaskStatus.EVALUATING
         assert "dual-head" in (task.latest_status_message or "").lower()
+
+    @pytest.mark.asyncio
+    async def test_manual_rollup_skips_when_pr_already_recorded(
+        self, db_session, mocker
+    ):
+        """Idempotency: when a rollup PR is already recorded on the task, the
+        manual trigger returns it WITHOUT POSTing a second PR — so a duplicate
+        client retry, or a manual trigger after the auto path already created
+        the PR, cannot double-apply."""
+        from app.routers.admin_operator_triggers import trigger_rollup
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Manual rollup already recorded",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context={
+                "plan_branch": "research/abc12345",
+                "parent_base": "automain",
+                "direction_id": "dir-1",
+                "rollup_pr_number": 4242,
+                "rollup_pr_url": "https://github.com/owner/repo/pull/4242",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        create_mock = mocker.patch(
+            "app.github.create_pull_request",
+            new_callable=AsyncMock,
+            return_value={"html_url": "https://x/9999", "number": 9999},
+        )
+        token_mock = mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+
+        result = await trigger_rollup(
+            task.id,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        create_mock.assert_not_called()
+        token_mock.assert_not_called()
+        assert result["rollup_pr_number"] == 4242
+        assert result["rollup_pr_url"] == "https://github.com/owner/repo/pull/4242"
+        await db_session.refresh(task)
+        assert (task.context or {}).get("rollup_pr_number") == 4242
+
+    @pytest.mark.asyncio
+    async def test_manual_rollup_defers_on_fresh_creation_claim(
+        self, db_session, mocker
+    ):
+        """A fresh in-flight creation claim (a peer mid-create) makes the manual
+        trigger return 409 instead of POSTing a duplicate PR, leaving the task
+        EVALUATING."""
+        import time as _time
+        from fastapi import HTTPException
+        from app.routers.admin_operator_triggers import trigger_rollup
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Manual rollup fresh claim",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context={
+                "plan_branch": "research/abc12345",
+                "parent_base": "automain",
+                "direction_id": "dir-1",
+                "rollup_pr_creating_at": _time.time(),
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        create_mock = mocker.patch(
+            "app.github.create_pull_request",
+            new_callable=AsyncMock,
+            return_value={"html_url": "https://x/9999", "number": 9999},
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await trigger_rollup(
+                task.id,
+                session=db_session,
+                current_user={"user_id": TEST_USER_ID},
+            )
+
+        assert exc_info.value.status_code == 409
+        create_mock.assert_not_called()
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.EVALUATING
+        assert (task.context or {}).get("rollup_pr_number") is None
+
+    @pytest.mark.asyncio
+    async def test_manual_rollup_stale_creation_claim_proceeds(
+        self, db_session, mocker
+    ):
+        """A creation claim older than the TTL is stale (peer crashed mid-create)
+        and must NOT wedge creation — the manual trigger proceeds to create the
+        PR."""
+        import time as _time
+        from app.routers.admin_operator_triggers import trigger_rollup
+        from app.rollup_management import _ROLLUP_PR_CREATE_CLAIM_TTL_S
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Manual rollup stale claim",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context={
+                "plan_branch": "research/abc12345",
+                "parent_base": "automain",
+                "direction_id": "dir-1",
+                "rollup_pr_creating_at": _time.time()
+                - (_ROLLUP_PR_CREATE_CLAIM_TTL_S + 60),
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        create_mock = mocker.patch(
+            "app.github.create_pull_request",
+            new_callable=AsyncMock,
+            return_value={
+                "html_url": "https://github.com/owner/repo/pull/777",
+                "number": 777,
+            },
+        )
+        mocker.patch(
+            "app.review_pipeline._spawn_pipeline_task",
+            new_callable=AsyncMock,
+            return_value=(None, None),
+        )
+
+        result = await trigger_rollup(
+            task.id,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        create_mock.assert_awaited_once()
+        assert result["rollup_pr_number"] == 777
+        await db_session.refresh(task)
+        assert (task.context or {}).get("rollup_pr_number") == 777
+        assert (task.context or {}).get("rollup_pr_creating_at") is None
+
+    @pytest.mark.asyncio
+    async def test_manual_rollup_empty_diff_completes_without_pr_zero_followups(
+        self, db_session, mocker
+    ):
+        """The manual path must treat GitHub's empty-diff sentinel as a terminal
+        no-op completion, not as a real PR #0 that proceeds into merge/review."""
+        from app.routers.admin_operator_triggers import trigger_rollup
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Manual rollup empty diff",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context={
+                "plan_branch": "research/abc12345",
+                "parent_base": "automain",
+                "direction_id": "dir-1",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.create_pull_request",
+            new_callable=AsyncMock,
+            return_value={
+                "empty_diff": True,
+                "merged": True,
+                "html_url": "",
+                "number": 0,
+            },
+        )
+        merge_mock = mocker.patch(
+            "app.github.merge_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merged": True},
+        )
+        spawn_mock = mocker.patch(
+            "app.review_pipeline._spawn_pipeline_task",
+            new_callable=AsyncMock,
+            return_value=(None, None),
+        )
+        delete_branch_mock = mocker.patch(
+            "app.github.delete_branch", new_callable=AsyncMock
+        )
+
+        result = await trigger_rollup(
+            task.id,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        merge_mock.assert_not_called()
+        spawn_mock.assert_not_called()
+        delete_branch_mock.assert_awaited_once()
+        assert result["rollup_pr_number"] == 0
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.COMPLETED
+        assert (task.context or {}).get("rollup_pr_number") is None
+        assert (task.context or {}).get("rollup_pr_creating_at") is None
+        assert "no new changes to merge" in (task.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_manual_rollup_create_failure_clears_claim_for_retry(
+        self, db_session, mocker
+    ):
+        """A transient create failure must drop the shared in-flight claim so a
+        manual retry or the automated rollup path can proceed immediately."""
+        from fastapi import HTTPException
+        from app.routers.admin_operator_triggers import trigger_rollup
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Manual rollup transient create failure",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context={
+                "plan_branch": "research/abc12345",
+                "parent_base": "automain",
+                "direction_id": "dir-1",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.create_pull_request",
+            new_callable=AsyncMock,
+            side_effect=HTTPException(status_code=503, detail="GitHub unavailable"),
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await trigger_rollup(
+                task.id,
+                session=db_session,
+                current_user={"user_id": TEST_USER_ID},
+            )
+
+        assert exc_info.value.status_code == 503
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.EVALUATING
+        assert (task.context or {}).get("rollup_pr_number") is None
+        assert (task.context or {}).get("rollup_pr_creating_at") is None
+
+    @pytest.mark.asyncio
+    async def test_manual_rollup_stakes_claim_before_create(
+        self, db_session, mocker
+    ):
+        """The creation claim is staked (committed) on the task BEFORE the slow
+        create_pull_request call — so a concurrent worker observes it and defers
+        — and is cleared (replaced by the durable rollup_pr_number marker) after
+        the PR is recorded."""
+        from app.routers.admin_operator_triggers import trigger_rollup
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Manual rollup stakes claim",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context={
+                "plan_branch": "research/abc12345",
+                "parent_base": "automain",
+                "direction_id": "dir-1",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        task_id = task.id
+
+        observed = {}
+
+        async def _capture_claim(*args, **kwargs):
+            # The claim must be persisted before this POST so a peer defers.
+            from sqlmodel import select as _select
+
+            row = (
+                await db_session.execute(
+                    _select(Task).where(Task.id == task_id)
+                )
+            ).scalars().first()
+            observed["claim_at_create"] = (row.context or {}).get(
+                "rollup_pr_creating_at"
+            )
+            return {
+                "html_url": "https://github.com/owner/repo/pull/555",
+                "number": 555,
+            }
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.create_pull_request",
+            new=_capture_claim,
+        )
+        mocker.patch(
+            "app.review_pipeline._spawn_pipeline_task",
+            new_callable=AsyncMock,
+            return_value=(None, None),
+        )
+
+        result = await trigger_rollup(
+            task_id,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        # Claim was visible mid-create...
+        assert observed["claim_at_create"] is not None
+        # ...and dropped (superseded by the durable PR marker) afterward.
+        assert result["rollup_pr_number"] == 555
+        await db_session.refresh(task)
+        assert (task.context or {}).get("rollup_pr_creating_at") is None
+        assert (task.context or {}).get("rollup_pr_number") == 555
+
+    @pytest.mark.skipif(
+        not (
+            os.getenv("USE_TEST_POSTGRES", "").lower() == "true"
+            and os.getenv("DATABASE_URL", "").startswith("postgresql")
+        ),
+        reason="cross-session identity-map cache race requires Postgres",
+    )
+    @pytest.mark.asyncio
+    async def test_manual_rollup_sees_peer_pr_marker_committed_after_role_check(
+        self, db_session, mocker
+    ):
+        """Regression (#7350/#7351): the FOR UPDATE precondition re-check must
+        read the row AS OF the lock, NOT the stale identity-map copy seeded by
+        the role check's ``session.get``.
+
+        With ``expire_on_commit=False`` the role check leaves the task cached in
+        the session's identity map. A peer (auto path or a second manual
+        trigger) that commits ``rollup_pr_number`` after that read but before
+        this request locks the row must be observed — otherwise the idempotency
+        guard reads the pre-lock snapshot and POSTs a DUPLICATE rollup PR. The
+        ``session.expire`` + ``populate_existing=True`` on the locked SELECT is
+        what makes the fresh marker visible; this test fails without it.
+        """
+        import json as _json
+        from sqlalchemy import text as _text
+        from sqlalchemy.ext.asyncio import AsyncSession as _AsyncSession
+        from sqlalchemy.orm import sessionmaker as _sessionmaker
+        from app.routers.admin_operator_triggers import trigger_rollup
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        base_ctx = {
+            "plan_branch": "research/abc12345",
+            "parent_base": "automain",
+            "direction_id": "dir-1",
+        }
+        task = Task(
+            project_id=project.id,
+            title="Manual rollup peer marker race",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context=dict(base_ctx),
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        task_id = task.id
+
+        # The task is now cached in db_session's identity map WITHOUT a
+        # rollup_pr_number — exactly the stale snapshot the role-check
+        # session.get would return inside trigger_rollup. End db_session's
+        # txn so the peer commit below is visible to the lock's fresh SELECT.
+        await db_session.commit()
+
+        # Peer commits the durable PR marker via a separate connection,
+        # bypassing the ORM and db_session's identity map entirely.
+        peer_ctx = dict(base_ctx)
+        peer_ctx["rollup_pr_number"] = 7373
+        peer_ctx["rollup_pr_url"] = "https://github.com/owner/repo/pull/7373"
+        _Session = _sessionmaker(
+            bind=db_session.bind,
+            class_=_AsyncSession,
+            expire_on_commit=False,
+        )
+        async with _Session() as peer_session:
+            await peer_session.execute(
+                _text("UPDATE task SET context = cast(:ctx as jsonb) WHERE id = :id"),
+                {"ctx": _json.dumps(peer_ctx), "id": task_id},
+            )
+            await peer_session.commit()
+
+        create_mock = mocker.patch(
+            "app.github.create_pull_request",
+            new_callable=AsyncMock,
+            return_value={"html_url": "https://x/9999", "number": 9999},
+        )
+        token_mock = mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+
+        # IMPORTANT: do NOT expire_all here — the point is that the fix's own
+        # session.expire + populate_existing must bypass the warm cache.
+        result = await trigger_rollup(
+            task_id,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        # Idempotent: the peer's PR is returned, no second PR is POSTed.
+        create_mock.assert_not_called()
+        token_mock.assert_not_called()
+        assert result["rollup_pr_number"] == 7373
+        assert result["rollup_pr_url"] == (
+            "https://github.com/owner/repo/pull/7373"
+        )
 
 
 class TestTriggerSelfAudit:
