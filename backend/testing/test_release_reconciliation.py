@@ -172,9 +172,7 @@ async def test_reconcile_pending_auto_merge_skips_on_single_branch(db_session, m
     is_ancestor = mocker.patch(
         "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
     )
-    get_pr = mocker.patch(
-        "app.github.get_pull_request", new=AsyncMock(return_value={})
-    )
+    get_pr = mocker.patch("app.github.get_pull_request", new=AsyncMock(return_value={}))
 
     _project, version = await _make_project_and_version(
         db_session, integration_branch="trunk", promotion_target="trunk"
@@ -332,26 +330,20 @@ async def test_reconcile_migration_carrying_candidate_reconciles_to_promoted(
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[
-                {"filename": "backend/alembic/versions/0100_add_widget.py"}
-            ]
+            return_value=[{"filename": "backend/alembic/versions/0100_add_widget.py"}]
         ),
     )
     # Target branch currently has the candidate's migration (it already merged) —
     # no duplicates, so the post-merge check sees a clean chain.
     mocker.patch(
         "app.github.list_versions_at_ref",
-        new=AsyncMock(
-            return_value=["0099_prev.py", "0100_add_widget.py"]
-        ),
+        new=AsyncMock(return_value=["0099_prev.py", "0100_add_widget.py"]),
     )
     # Full-chain health check reads each migration's source: a clean single-head
     # chain (0099 -> 0100), so the candidate's own merge is not falsely blocked.
     mocker.patch(
         "app.github.get_file_text_at_ref",
-        new=AsyncMock(
-            side_effect=_file_text_from_map({"0099": None, "0100": "0099"})
-        ),
+        new=AsyncMock(side_effect=_file_text_from_map({"0099": None, "0100": "0099"})),
     )
     mocker.patch(
         "app.github.get_branch_sha",
@@ -361,32 +353,36 @@ async def test_reconcile_migration_carrying_candidate_reconciles_to_promoted(
 
     # Test both reconcile paths (promotion_failed and pending_auto_merge).
     for build_version in [
-        lambda v, sha: v.__setattr__(
-            "last_qualification",
-            {
-                "status": "promotion_failed",
-                "candidate_sha": sha,
-                "pr_url": "https://github.com/acme/widget/pull/42",
-                "error": "merge_blocked",
-                "confidence": 0.95,
-            },
-        )
-        or v,
-        lambda v, sha: v.__setattr__(
-            "last_qualification",
-            {
-                "status": "pending",
-                "candidate_sha": sha,
-                "confidence": 0.95,
-                "promotion_pending": {
-                    "pr_number": 42,
+        lambda v, sha: (
+            v.__setattr__(
+                "last_qualification",
+                {
+                    "status": "promotion_failed",
+                    "candidate_sha": sha,
                     "pr_url": "https://github.com/acme/widget/pull/42",
-                    "auto_merge_enabled": True,
-                    "enabled_at": _utcnow().isoformat(),
+                    "error": "merge_blocked",
+                    "confidence": 0.95,
                 },
-            },
-        )
-        or v,
+            )
+            or v
+        ),
+        lambda v, sha: (
+            v.__setattr__(
+                "last_qualification",
+                {
+                    "status": "pending",
+                    "candidate_sha": sha,
+                    "confidence": 0.95,
+                    "promotion_pending": {
+                        "pr_number": 42,
+                        "pr_url": "https://github.com/acme/widget/pull/42",
+                        "auto_merge_enabled": True,
+                        "enabled_at": _utcnow().isoformat(),
+                    },
+                },
+            )
+            or v
+        ),
     ]:
         _project, version = await _make_project_and_version(
             db_session, integration_branch="trunk", promotion_target="release"
@@ -432,9 +428,7 @@ async def test_reconcile_genuine_third_party_collision_blocks(db_session, mocker
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[
-                {"filename": "backend/alembic/versions/0100_add_widget.py"}
-            ]
+            return_value=[{"filename": "backend/alembic/versions/0100_add_widget.py"}]
         ),
     )
     # Target branch has a duplicate revision id (0100 appears twice) — a genuine
@@ -453,9 +447,7 @@ async def test_reconcile_genuine_third_party_collision_blocks(db_session, mocker
     # mock it anyway so an ordering change cannot turn this into a spurious defer.
     mocker.patch(
         "app.github.get_file_text_at_ref",
-        new=AsyncMock(
-            side_effect=_file_text_from_map({"0099": None, "0100": "0099"})
-        ),
+        new=AsyncMock(side_effect=_file_text_from_map({"0099": None, "0100": "0099"})),
     )
     branch_sha_mock = mocker.patch(
         "app.github.get_branch_sha",
@@ -562,9 +554,7 @@ async def test_reconcile_distinct_id_dual_head_blocks(db_session, mocker):
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[
-                {"filename": "backend/alembic/versions/0100_add_widget.py"}
-            ]
+            return_value=[{"filename": "backend/alembic/versions/0100_add_widget.py"}]
         ),
     )
     # Distinct revision ids, every prefix unique — but 0100 and 0101 BOTH anchor
@@ -610,8 +600,7 @@ async def test_reconcile_distinct_id_dual_head_blocks(db_session, mocker):
         assert reconciled is True, f"Expected reconciled=True for status={status!r}"
         await db_session.refresh(version)
         assert version.status == "open", (
-            f"Expected status=open (not promoted) for dual head, "
-            f"got {version.status!r}"
+            f"Expected status=open (not promoted) for dual head, got {version.status!r}"
         )
         assert version.last_qualification["status"] == "promotion_failed"
         assert version.last_qualification["error"] == "migration_guard_blocked"
@@ -630,23 +619,17 @@ async def test_reconcile_dangling_down_revision_blocks(db_session, mocker):
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[
-                {"filename": "backend/alembic/versions/0100_add_widget.py"}
-            ]
+            return_value=[{"filename": "backend/alembic/versions/0100_add_widget.py"}]
         ),
     )
     mocker.patch(
         "app.github.list_versions_at_ref",
-        new=AsyncMock(
-            return_value=["0099_prev.py", "0100_add_widget.py"]
-        ),
+        new=AsyncMock(return_value=["0099_prev.py", "0100_add_widget.py"]),
     )
     # 0100 anchors to 0098, which is not present on the branch — a broken chain.
     mocker.patch(
         "app.github.get_file_text_at_ref",
-        new=AsyncMock(
-            side_effect=_file_text_from_map({"0099": None, "0100": "0098"})
-        ),
+        new=AsyncMock(side_effect=_file_text_from_map({"0099": None, "0100": "0098"})),
     )
     branch_sha_mock = mocker.patch(
         "app.github.get_branch_sha",
@@ -700,9 +683,7 @@ async def test_reconcile_duplicate_in_file_revision_blocks(db_session, mocker):
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[
-                {"filename": "backend/alembic/versions/0100_add_widget.py"}
-            ]
+            return_value=[{"filename": "backend/alembic/versions/0100_add_widget.py"}]
         ),
     )
     # Distinct filename prefixes (0099/0100/0101) — the filename-prefix dup pass
@@ -777,9 +758,7 @@ async def test_reconcile_unparseable_revision_blocks(db_session, mocker):
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[
-                {"filename": "backend/alembic/versions/0100_add_widget.py"}
-            ]
+            return_value=[{"filename": "backend/alembic/versions/0100_add_widget.py"}]
         ),
     )
     mocker.patch(
@@ -853,16 +832,12 @@ async def test_reconcile_filename_prefix_mismatch_blocks(db_session, mocker):
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[
-                {"filename": "backend/alembic/versions/0101_add_gadget.py"}
-            ]
+            return_value=[{"filename": "backend/alembic/versions/0101_add_gadget.py"}]
         ),
     )
     mocker.patch(
         "app.github.list_versions_at_ref",
-        new=AsyncMock(
-            return_value=["0099_prev.py", "0101_add_gadget.py"]
-        ),
+        new=AsyncMock(return_value=["0099_prev.py", "0101_add_gadget.py"]),
     )
     # 0101_add_gadget declares in-file revision '0100' (not '0101'): a unique,
     # parseable id and a single-head chain {0099: None, 0100: 0099} — only the
@@ -926,16 +901,12 @@ async def test_reconcile_post_merge_defers_on_source_fetch_failure(db_session, m
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(
-            return_value=[
-                {"filename": "backend/alembic/versions/0100_add_widget.py"}
-            ]
+            return_value=[{"filename": "backend/alembic/versions/0100_add_widget.py"}]
         ),
     )
     mocker.patch(
         "app.github.list_versions_at_ref",
-        new=AsyncMock(
-            return_value=["0099_prev.py", "0100_add_widget.py"]
-        ),
+        new=AsyncMock(return_value=["0099_prev.py", "0100_add_widget.py"]),
     )
     # The per-file source fetch raises — migration safety is unknown, so defer.
     mocker.patch(
@@ -1157,6 +1128,13 @@ from app.models import (  # noqa: E402
     DeploymentState,
     DeploymentStatus,
     QualificationVerdict,
+    ReleaseDeployArtifact,
+)
+from app import release_artifacts as artifact_registry  # noqa: E402
+from app.release_artifacts import (  # noqa: E402
+    BACKEND_REVISION_ARTIFACT_KIND,
+    ReleaseArtifactProvider,
+    get_or_create_release_deploy_artifact,
 )
 from app.release_reconciliation import (  # noqa: E402
     _classify_serving_outcome,
@@ -1234,7 +1212,9 @@ def test_classify_no_new_revision_only_after_deadline():
     promoted_at = datetime(2026, 6, 5, 12, 0, 0)
     deadline = datetime(2026, 6, 5, 13, 0, 0)
     # Old revision that predates the promotion never advanced; STABLE but stale.
-    ds = _ds(DeploymentStatus.STABLE, datetime(2026, 6, 5, 11, 50, 0), current_sha=_SHA_A)
+    ds = _ds(
+        DeploymentStatus.STABLE, datetime(2026, 6, 5, 11, 50, 0), current_sha=_SHA_A
+    )
     # Within the window → no decision yet.
     assert (
         _classify_serving_outcome(
@@ -1276,7 +1256,9 @@ def test_classify_monitoring_new_revision_waits_within_window():
     deadline = datetime(2026, 6, 5, 13, 0, 0)
     now = datetime(2026, 6, 5, 12, 15, 0)
     # New revision booted but still MONITORING (not yet STABLE) → wait.
-    ds = _ds(DeploymentStatus.MONITORING, promoted_at.replace(minute=5), current_sha=_SHA_A)
+    ds = _ds(
+        DeploymentStatus.MONITORING, promoted_at.replace(minute=5), current_sha=_SHA_A
+    )
     assert _classify_serving_outcome(ds, promoted_at, _SHA_A, deadline, now) is None
 
 
@@ -1326,7 +1308,16 @@ async def _make_promoted_unconfirmed_version(
                 promotion_enabled=True,
             )
         )
-        await db_session.commit()
+    await db_session.commit()
+    db_session.add(
+        ReleaseDeployArtifact(
+            version_id=version.id,
+            artifact_kind=BACKEND_REVISION_ARTIFACT_KIND,
+            serving_status="unconfirmed",
+            confirmation_deadline=deadline,
+        )
+    )
+    await db_session.commit()
     await db_session.refresh(version)
     return project, version
 
@@ -1371,7 +1362,9 @@ async def test_confirm_serving_confirmed_scenario(db_session):
     assert version.deploy_failure_reason is None
 
     state = rv.summarize_qualification_state(
-        version.last_qualification, version.serving_status, version.deploy_failure_reason
+        version.last_qualification,
+        version.serving_status,
+        version.deploy_failure_reason,
     )
     assert state["state"] == "promoted"
     assert state["serving_status"] == "serving_confirmed"
@@ -1389,6 +1382,300 @@ async def test_confirm_serving_confirmed_scenario(db_session):
     )
     assert verdict.post_promotion_outcome == "serving_confirmed"
     assert verdict.post_promotion_outcome_at is not None
+
+
+@pytest.mark.asyncio
+async def test_backend_artifact_row_confirms_and_projects_to_scalars(db_session):
+    """Backend-only registry parity: the artifact row confirms exactly as the
+    legacy scalar path did, and the scalars mirror that backend artifact row."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=20),
+    )
+    assert resolved is True
+
+    artifact = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id,
+                    ReleaseDeployArtifact.artifact_kind
+                    == BACKEND_REVISION_ARTIFACT_KIND,
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    await db_session.refresh(version)
+    assert artifact.serving_status == "serving_confirmed"
+    assert artifact.served_identifier == _SHA_A
+    assert artifact.reason_code is None
+    assert version.serving_status == artifact.serving_status
+    assert version.served_sha == artifact.served_identifier
+    assert version.served_sha == _SHA_A
+
+
+@pytest.mark.asyncio
+async def test_backend_artifact_backfill_preserves_legacy_resolved_scalars(db_session):
+    """Lazy backend-row creation must inherit the stored scalar outcome instead
+    of defaulting a historical promotion back to unconfirmed."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+
+    artifact = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id,
+                    ReleaseDeployArtifact.artifact_kind
+                    == BACKEND_REVISION_ARTIFACT_KIND,
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    await db_session.delete(artifact)
+    version.serving_status = "serving_confirmed"
+    version.served_sha = _SHA_A
+    version.served_at = promoted_at + timedelta(minutes=8)
+    version.deploy_failure_reason = None
+    db_session.add(version)
+    await db_session.commit()
+
+    artifact, created = await get_or_create_release_deploy_artifact(
+        db_session,
+        version,
+        BACKEND_REVISION_ARTIFACT_KIND,
+        confirmation_deadline=deadline,
+    )
+    await db_session.commit()
+
+    assert created is True
+    assert artifact.serving_status == "serving_confirmed"
+    assert artifact.served_identifier == _SHA_A
+    assert artifact.served_at == version.served_at
+    assert artifact.reason_code is None
+
+
+@pytest.mark.asyncio
+async def test_required_artifacts_wait_for_both_and_keep_backend_projection(
+    db_session, mocker
+):
+    """A second required provider keeps the overall outcome unresolved until it
+    confirms, while the legacy scalars continue mirroring backend_revision."""
+    synthetic_state = {"mode": "wait"}
+
+    async def _check_synthetic(_session, _version, artifact, now):
+        mode = synthetic_state["mode"]
+        if mode == "wait":
+            return None
+        if mode == "confirm":
+            return ("serving_confirmed", "vm-image-fingerprint", now)
+        raise AssertionError(f"unexpected synthetic mode: {mode}")
+
+    backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+        BACKEND_REVISION_ARTIFACT_KIND
+    ]
+    mocker.patch.dict(
+        artifact_registry._ARTIFACT_PROVIDERS,
+        {
+            BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+            "synthetic_required": ReleaseArtifactProvider(
+                artifact_kind="synthetic_required",
+                check=_check_synthetic,
+                required=True,
+            ),
+        },
+        clear=True,
+    )
+
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=20),
+    )
+    assert resolved is False
+
+    artifacts = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_kind = {artifact.artifact_kind: artifact for artifact in artifacts}
+    await db_session.refresh(version)
+    assert by_kind[BACKEND_REVISION_ARTIFACT_KIND].serving_status == "serving_confirmed"
+    assert by_kind[BACKEND_REVISION_ARTIFACT_KIND].served_identifier == _SHA_A
+    assert by_kind["synthetic_required"].serving_status == "unconfirmed"
+    assert version.serving_status == "serving_confirmed"
+    assert version.served_sha == _SHA_A
+
+    verdict = (
+        (
+            await db_session.execute(
+                _select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert verdict.post_promotion_outcome is None
+
+    synthetic_state["mode"] = "confirm"
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=30),
+    )
+    assert resolved is True
+
+    await db_session.refresh(version)
+    verdict = (
+        (
+            await db_session.execute(
+                _select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert verdict.post_promotion_outcome == "serving_confirmed"
+    assert version.serving_status == "serving_confirmed"
+    assert version.served_sha == _SHA_A
+
+
+@pytest.mark.asyncio
+async def test_required_artifact_deadline_failure_records_reason_code(
+    db_session, mocker
+):
+    """A required non-backend artifact can fail the overall outcome at its
+    deadline while the backend SHA stays projected but the scalar status flips
+    to deploy_failed for legacy readers."""
+    synthetic_state = {"mode": "wait"}
+
+    async def _check_synthetic(_session, _version, artifact, now):
+        if synthetic_state["mode"] == "confirm":
+            return ("serving_confirmed", "vm-image-fingerprint", now)
+        if (
+            artifact.confirmation_deadline is not None
+            and now >= artifact.confirmation_deadline
+        ):
+            return ("deploy_failed", "synthetic_deadline_elapsed", None)
+        return None
+
+    backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+        BACKEND_REVISION_ARTIFACT_KIND
+    ]
+    mocker.patch.dict(
+        artifact_registry._ARTIFACT_PROVIDERS,
+        {
+            BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+            "synthetic_required": ReleaseArtifactProvider(
+                artifact_kind="synthetic_required",
+                check=_check_synthetic,
+                required=True,
+            ),
+        },
+        clear=True,
+    )
+
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(minutes=10)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        deployed_at=promoted_at + timedelta(minutes=1),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=5),
+    )
+    assert resolved is False
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=15),
+    )
+    assert resolved is True
+
+    artifacts = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_kind = {artifact.artifact_kind: artifact for artifact in artifacts}
+    await db_session.refresh(version)
+    assert by_kind["synthetic_required"].serving_status == "deploy_failed"
+    assert by_kind["synthetic_required"].reason_code == "synthetic_deadline_elapsed"
+    assert by_kind[BACKEND_REVISION_ARTIFACT_KIND].serving_status == "serving_confirmed"
+    assert version.serving_status == "deploy_failed"
+    assert version.served_sha == _SHA_A
+    assert version.deploy_failure_reason == "synthetic_deadline_elapsed"
+
+    verdict = (
+        (
+            await db_session.execute(
+                _select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert verdict.post_promotion_outcome == "deploy_failed"
 
 
 @pytest.mark.asyncio
@@ -1450,7 +1737,9 @@ async def test_confirm_unobservable_sha_after_deadline_deploy_failed(db_session)
     assert version.served_sha is None
 
     state = rv.summarize_qualification_state(
-        version.last_qualification, version.serving_status, version.deploy_failure_reason
+        version.last_qualification,
+        version.serving_status,
+        version.deploy_failure_reason,
     )
     assert state["state"] == "promotion_deploy_failed"
     assert state["serving_status"] == "deploy_failed"
@@ -1484,7 +1773,9 @@ async def test_confirm_no_new_revision_deploy_failed_scenario(db_session):
     assert version.deploy_confirm_alerted_at is not None
 
     state = rv.summarize_qualification_state(
-        version.last_qualification, version.serving_status, version.deploy_failure_reason
+        version.last_qualification,
+        version.serving_status,
+        version.deploy_failure_reason,
     )
     # Distinct PROMOTION_DEPLOY_FAILED-class state — NOT a clean "promoted".
     assert state["state"] == "promotion_deploy_failed"
@@ -1803,7 +2094,9 @@ async def test_recover_deploy_failed_when_sha_serves_within_window(db_session):
 
     # The view-time summary now reports the TRUE serving_confirmed state.
     state = rv.summarize_qualification_state(
-        version.last_qualification, version.serving_status, version.deploy_failure_reason
+        version.last_qualification,
+        version.serving_status,
+        version.deploy_failure_reason,
     )
     assert state["state"] == "promoted"
     assert state["serving_status"] == "serving_confirmed"
@@ -1879,6 +2172,89 @@ async def test_recover_skips_when_sha_never_serves(db_session):
     assert version.served_sha is None
 
     # The open deploy-failed alert is untouched.
+    alerts = (
+        (
+            await db_session.execute(
+                _select(Alert).where(Alert.project_id == version.project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    deploy_alerts = [a for a in alerts if "deploy FAILED" in a.title]
+    assert len(deploy_alerts) == 1
+    assert deploy_alerts[0].dismissed_at is None
+
+    await db_session.refresh(project)
+    assert strategic_refresh_pending(project.vision) is False
+
+
+@pytest.mark.asyncio
+async def test_recover_skips_when_non_backend_required_artifact_still_failed(
+    db_session, mocker
+):
+    """Backend serving alone cannot recover an aggregate deploy_failed latch
+    while a required non-backend artifact still reports deploy_failed."""
+    backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+        BACKEND_REVISION_ARTIFACT_KIND
+    ]
+
+    async def _check_synthetic(_session, _version, _artifact, _now):
+        return None
+
+    mocker.patch.dict(
+        artifact_registry._ARTIFACT_PROVIDERS,
+        {
+            BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+            "synthetic_required": ReleaseArtifactProvider(
+                artifact_kind="synthetic_required",
+                check=_check_synthetic,
+                required=True,
+            ),
+        },
+        clear=True,
+    )
+
+    now = _utcnow()
+    promoted_at = now - timedelta(hours=5)
+    deadline = promoted_at + timedelta(hours=1)
+    alerted_at = promoted_at + timedelta(hours=1)
+    project, version = await _make_promoted_deploy_failed_version(
+        db_session,
+        promoted_at=promoted_at,
+        deadline=deadline,
+        alerted_at=alerted_at,
+        deploy_failure_reason="synthetic_deadline_elapsed",
+    )
+    db_session.add(
+        ReleaseDeployArtifact(
+            version_id=version.id,
+            artifact_kind="synthetic_required",
+            serving_status="deploy_failed",
+            reason_code="synthetic_deadline_elapsed",
+            confirmation_deadline=deadline,
+        )
+    )
+    await db_session.commit()
+
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        deployed_at=now - timedelta(minutes=10),
+    )
+
+    recovered = await _reconcile_if_deploy_failed_recovered(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=now,
+    )
+    assert recovered is False
+
+    await db_session.refresh(version)
+    assert version.serving_status == "deploy_failed"
+    assert version.deploy_failure_reason == "synthetic_deadline_elapsed"
+
     alerts = (
         (
             await db_session.execute(

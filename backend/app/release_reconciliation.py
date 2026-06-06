@@ -21,6 +21,16 @@ from app.models import (
     Project,
     QualificationVerdict,
 )
+from app.release_artifacts import (
+    BACKEND_REVISION_ARTIFACT_KIND,
+    aggregate_required_artifact_status,
+    apply_serving_decision,
+    artifact_is_unconfirmed,
+    get_or_create_release_deploy_artifact,
+    is_backend_revision_artifact,
+    iter_release_artifact_providers,
+    project_backend_revision_artifact,
+)
 from app.release_promotion import (
     _candidate_already_on_main,
     _idempotent_pr_url,
@@ -63,6 +73,79 @@ logger = logging.getLogger(__name__)
 # the 4h stall alert and any realistic CI duration so it only fires on a
 # genuinely wedged promotion, never on a slow-but-progressing one.
 _PROMOTION_PENDING_TIMEOUT_SECONDS_DEFAULT = 24 * 3600
+
+
+async def _refresh_release_artifact_rows(
+    session,
+    version: release_version.ReleaseVersion,
+    now: datetime,
+    *,
+    recheck_failed_required: bool = False,
+) -> tuple[
+    list[tuple[object, object]],
+    bool,
+    bool,
+    object | None,
+]:
+    """Refresh artifact rows from provider checks without mutating version scalars.
+
+    ``_confirm_serving_or_fail`` projects the backend artifact onto the legacy
+    ``ReleaseVersion`` scalars while the multi-artifact registry is still
+    unresolved, but recovery/admin clear paths cannot do that: they start from a
+    latched aggregate ``deploy_failed`` scalar and must not transiently rewrite
+    it back to backend-only truth before every required artifact re-confirms.
+    This helper centralizes the provider sweep and returns the backend artifact
+    for the caller to project or consume explicitly.
+    """
+
+    provider_rows = []
+    had_required_unconfirmed = False
+    mutated = False
+    backend_artifact = None
+
+    for provider in iter_release_artifact_providers():
+        artifact, created = await get_or_create_release_deploy_artifact(
+            session,
+            version,
+            provider.artifact_kind,
+            confirmation_deadline=version.deploy_confirm_deadline,
+        )
+        if created:
+            mutated = True
+        if provider.required and artifact_is_unconfirmed(artifact):
+            had_required_unconfirmed = True
+
+        should_check = artifact_is_unconfirmed(artifact) or (
+            recheck_failed_required
+            and provider.required
+            and artifact.serving_status == "deploy_failed"
+        )
+        if should_check:
+            outcome = await provider.check(session, version, artifact, now)
+            if outcome is not None:
+                if apply_serving_decision(artifact, outcome, now=now):
+                    mutated = True
+                session.add(artifact)
+        provider_rows.append((provider, artifact))
+        if is_backend_revision_artifact(provider.artifact_kind):
+            backend_artifact = artifact
+
+    return provider_rows, had_required_unconfirmed, mutated, backend_artifact
+
+
+def _aggregate_non_backend_required_artifact_status(
+    provider_rows,
+) -> tuple[str, str | None]:
+    """Aggregate required artifacts excluding backend_revision."""
+
+    return aggregate_required_artifact_status(
+        [
+            (provider, artifact)
+            for provider, artifact in provider_rows
+            if provider.required
+            and not is_backend_revision_artifact(provider.artifact_kind)
+        ]
+    )
 
 
 def _promotion_pending_timeout_seconds() -> float:
@@ -384,7 +467,10 @@ async def _reconcile_if_pending_auto_merge_landed(
             if await _candidate_already_on_main(
                 token, owner, repo, candidate_sha, version, project=project
             ):
-                alembic_status, alembic_reason = await _validate_migration_chain_post_merge(
+                (
+                    alembic_status,
+                    alembic_reason,
+                ) = await _validate_migration_chain_post_merge(
                     token,
                     owner,
                     repo,
@@ -866,25 +952,36 @@ async def _confirm_serving_or_fail(
             # Re-check under the lock: a concurrent sweep may have resolved it.
             if version.status != "promoted":
                 return False
-            if version.serving_status != "unconfirmed":
+            (
+                provider_rows,
+                had_required_unconfirmed,
+                mutated,
+                backend_artifact,
+            ) = await _refresh_release_artifact_rows(session, version, _now)
+
+            if not provider_rows:
                 return False
 
-            ds = await session.get(DeploymentState, 1)
-            outcome = _classify_serving_outcome(
-                ds,
-                version.promoted_at,
-                version.promoted_sha,
-                version.deploy_confirm_deadline,
-                _now,
+            if not had_required_unconfirmed:
+                if mutated:
+                    await session.commit()
+                return False
+
+            if backend_artifact is not None:
+                if project_backend_revision_artifact(version, backend_artifact):
+                    mutated = True
+                session.add(version)
+
+            aggregate_status, aggregate_reason = aggregate_required_artifact_status(
+                provider_rows
             )
-            if outcome is None:
+            if aggregate_status == "unconfirmed":
+                if mutated:
+                    await session.commit()
                 return False
 
-            kind, sha_or_reason, served_at = outcome
-            if kind == "serving_confirmed":
+            if aggregate_status == "serving_confirmed":
                 version.serving_status = "serving_confirmed"
-                version.served_sha = sha_or_reason
-                version.served_at = served_at or _now
                 version.deploy_failure_reason = None
                 session.add(version)
                 await _record_post_promotion_outcome(
@@ -899,9 +996,8 @@ async def _confirm_serving_or_fail(
                 )
                 return True
 
-            # kind == "deploy_failed"
             version.serving_status = "deploy_failed"
-            version.deploy_failure_reason = sha_or_reason
+            version.deploy_failure_reason = aggregate_reason
             session.add(version)
             await _record_post_promotion_outcome(
                 session, version, "deploy_failed", _now
@@ -933,7 +1029,7 @@ async def _confirm_serving_or_fail(
                 await request_strategic_refresh(
                     session,
                     version.project_id,
-                    f"promotion_deploy_failed:{sha_or_reason}",
+                    f"promotion_deploy_failed:{aggregate_reason}",
                 )
             except Exception:
                 logger.exception(
@@ -946,7 +1042,7 @@ async def _confirm_serving_or_fail(
                 "[RELEASE_QUALIFIER] promotion deploy FAILED for v%d "
                 "(reason=%s) — promoted SHA never confirmed serving",
                 version.version_number,
-                sha_or_reason,
+                aggregate_reason,
             )
             return True
         except Exception:
@@ -1010,9 +1106,19 @@ async def _recover_serving_confirmed(
     Runs entirely on the caller's already-locked session; does NOT commit (the
     caller commits under the SAME per-version row lock).
     """
-    version.serving_status = "serving_confirmed"
-    version.served_sha = served_sha
-    version.served_at = served_at or now
+    backend_artifact, _created = await get_or_create_release_deploy_artifact(
+        session,
+        version,
+        BACKEND_REVISION_ARTIFACT_KIND,
+        confirmation_deadline=version.deploy_confirm_deadline,
+    )
+    apply_serving_decision(
+        backend_artifact,
+        ("serving_confirmed", served_sha, served_at),
+        now=now,
+    )
+    session.add(backend_artifact)
+    project_backend_revision_artifact(version, backend_artifact)
     version.deploy_failure_reason = None
     session.add(version)
     await _record_post_promotion_outcome(session, version, "serving_confirmed", now)
@@ -1116,22 +1222,37 @@ async def _reconcile_if_deploy_failed_recovered(
             ):
                 return False
 
-            ds = await session.get(DeploymentState, 1)
-            outcome = _classify_serving_outcome(
-                ds,
-                version.promoted_at,
-                version.promoted_sha,
-                version.deploy_confirm_deadline,
+            (
+                provider_rows,
+                _,
+                mutated,
+                backend_artifact,
+            ) = await _refresh_release_artifact_rows(
+                session,
+                version,
                 _now,
+                recheck_failed_required=True,
             )
-            # Only an independently-observed serving confirmation recovers the
-            # version; never echo promoted_sha as a stand-in (the classifier
-            # already enforces current_sha == promoted_sha for this verdict).
-            if outcome is None or outcome[0] != "serving_confirmed":
+            aggregate_status, _ = aggregate_required_artifact_status(provider_rows)
+            backend_is_serving = (
+                backend_artifact is not None
+                and backend_artifact.serving_status == "serving_confirmed"
+                and backend_artifact.served_identifier is not None
+            )
+            # Recovery now means the FULL required-artifact registry has
+            # reconfirmed, not merely the backend-revision artifact. Commit any
+            # artifact-row truth we learned even when the aggregate version state
+            # must remain deploy_failed.
+            if aggregate_status != "serving_confirmed" or not backend_is_serving:
+                if mutated:
+                    await session.commit()
                 return False
-            _kind, served_sha, served_at = outcome
             await _recover_serving_confirmed(
-                session, version, served_sha, served_at, _now
+                session,
+                version,
+                backend_artifact.served_identifier,
+                backend_artifact.served_at,
+                _now,
             )
             await session.commit()
             logger.info(

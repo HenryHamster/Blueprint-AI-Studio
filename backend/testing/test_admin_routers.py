@@ -7458,6 +7458,76 @@ class TestClearDeployFailed:
         assert verdict.post_promotion_outcome == "serving_confirmed"
 
     @pytest.mark.asyncio
+    async def test_verify_path_refuses_when_required_non_backend_artifact_failed(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """Verified backend serving cannot clear an aggregate failure while a
+        required non-backend artifact still reports deploy_failed."""
+        from datetime import datetime, timezone
+
+        from app import release_artifacts as artifact_registry
+        from app.models import DeploymentState, DeploymentStatus, ReleaseDeployArtifact
+        from app.release_artifacts import (
+            BACKEND_REVISION_ARTIFACT_KIND,
+            ReleaseArtifactProvider,
+        )
+
+        backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+            BACKEND_REVISION_ARTIFACT_KIND
+        ]
+
+        async def _check_synthetic(_session, _version, _artifact, _now):
+            return None
+
+        mocker.patch.dict(
+            artifact_registry._ARTIFACT_PROVIDERS,
+            {
+                BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+                "synthetic_required": ReleaseArtifactProvider(
+                    artifact_kind="synthetic_required",
+                    check=_check_synthetic,
+                    required=True,
+                ),
+            },
+            clear=True,
+        )
+
+        project = await _make_project(db_session)
+        version = await self._make_deploy_failed_version(
+            db_session,
+            project.id,
+            promoted_sha="liveserving999",
+        )
+        db_session.add(
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind="synthetic_required",
+                serving_status="deploy_failed",
+                reason_code="synthetic_deadline_elapsed",
+            )
+        )
+        db_session.add(
+            DeploymentState(
+                current_sha="liveserving999",
+                status=DeploymentStatus.STABLE,
+                deployed_at=datetime(2026, 1, 1, 0, 30, 0, tzinfo=timezone.utc),
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/clear-deploy-failed",
+            json={},
+        )
+        assert resp.status_code == 409, resp.text
+        assert "required non-backend artifact" in resp.text
+        assert "synthetic_deadline_elapsed" in resp.text
+
+        await db_session.refresh(version)
+        assert version.serving_status == "deploy_failed"
+        assert version.deploy_failure_reason == "no_new_revision"
+
+    @pytest.mark.asyncio
     async def test_force_refused_without_override(
         self, client: AsyncClient, db_session
     ):
@@ -7475,6 +7545,62 @@ class TestClearDeployFailed:
 
         await db_session.refresh(version)
         assert version.serving_status == "deploy_failed"
+
+    @pytest.mark.asyncio
+    async def test_force_refused_when_required_non_backend_artifact_failed(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """force=true does not override a still-failed required non-backend
+        artifact; it only bypasses missing backend serving evidence."""
+        from app import release_artifacts as artifact_registry
+        from app.models import ReleaseDeployArtifact
+        from app.release_artifacts import (
+            BACKEND_REVISION_ARTIFACT_KIND,
+            ReleaseArtifactProvider,
+        )
+
+        backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+            BACKEND_REVISION_ARTIFACT_KIND
+        ]
+
+        async def _check_synthetic(_session, _version, _artifact, _now):
+            return None
+
+        mocker.patch.dict(
+            artifact_registry._ARTIFACT_PROVIDERS,
+            {
+                BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+                "synthetic_required": ReleaseArtifactProvider(
+                    artifact_kind="synthetic_required",
+                    check=_check_synthetic,
+                    required=True,
+                ),
+            },
+            clear=True,
+        )
+
+        project = await _make_project(db_session)
+        version = await self._make_deploy_failed_version(db_session, project.id)
+        db_session.add(
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind="synthetic_required",
+                serving_status="deploy_failed",
+                reason_code="synthetic_deadline_elapsed",
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/clear-deploy-failed",
+            json={"force": True, "reason": "manually verified live in Cloud Run"},
+        )
+        assert resp.status_code == 409, resp.text
+        assert "required non-backend artifact" in resp.text
+
+        await db_session.refresh(version)
+        assert version.serving_status == "deploy_failed"
+        assert version.deploy_failure_reason == "no_new_revision"
 
     @pytest.mark.asyncio
     async def test_force_requires_reason(self, client: AsyncClient, db_session):

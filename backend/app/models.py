@@ -3312,6 +3312,10 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(String(128), nullable=True),
     )
 
+    deploy_artifacts: List["ReleaseDeployArtifact"] = Relationship(
+        back_populates="version"
+    )
+
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
@@ -3332,6 +3336,80 @@ class ReleaseVersion(SQLModel, table=True):
             "project_id",
             "version_number",
             name="uq_releaseversion_project_version",
+        ),
+    )
+
+
+class ReleaseDeployArtifact(SQLModel, table=True):
+    """Per-artifact serving confirmation record for a promoted release version."""
+
+    __tablename__ = "releasedeployartifact"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    version_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("releaseversion.id", ondelete="CASCADE"),
+            nullable=True,
+            index=True,
+        ),
+    )
+
+    artifact_kind: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+
+    # Values: "unconfirmed" | "serving_confirmed" | "deploy_failed".
+    serving_status: str | None = Field(
+        default=None,
+        sa_column=Column(String(32), nullable=True),
+    )
+
+    # Generic observed identity for the served artifact (SHA, fingerprint, etc).
+    served_identifier: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True),
+    )
+
+    confirmation_deadline: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    reason_code: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True),
+    )
+
+    served_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    created_at: datetime | None = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=True, server_default=func.now()),
+    )
+    updated_at: datetime | None = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=True,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+
+    version: ReleaseVersion | None = Relationship(back_populates="deploy_artifacts")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "version_id",
+            "artifact_kind",
+            name="uq_releasedeployartifact_version_kind",
         ),
     )
 

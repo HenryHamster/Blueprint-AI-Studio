@@ -14909,6 +14909,51 @@ async def test_record_promotion_success_leaves_serving_null_for_non_self_repo(
     assert version.deploy_confirm_deadline is None
 
 
+@pytest.mark.asyncio
+async def test_sweep_skips_non_self_repo_promotions_without_artifact_rows(
+    db_session, mocker
+):
+    """Non-self-repo promotions stay out of the serving-confirmation sweep when
+    they have NULL serving scalars and no artifact registry participation."""
+    from app.time_utils import _utcnow
+
+    project = Project(
+        name="Other-Repo",
+        user_id="or-user-2",
+        github_owner="acme",
+        github_repo="other-2",
+        integration_branch="automain",
+        promotion_target="main",
+        is_self_repo=False,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    version.status = "promoted"
+    version.promoted_at = _utcnow()
+    version.promoted_sha = "p" * 40
+    version.last_qualification = {"status": "promoted", "promoted_sha": "p" * 40}
+    db_session.add(version)
+    await db_session.commit()
+
+    confirm = mocker.patch(
+        "app.release_qualifier_sweep._confirm_serving_or_fail",
+        new=AsyncMock(return_value=False),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert count == 0
+    confirm.assert_not_called()
+    await db_session.refresh(version)
+    assert version.serving_status is None
+    assert version.deploy_confirm_deadline is None
+
+
 # ---------------------------------------------------------------------------
 # Per-attempt evidence mirroring onto QualificationVerdict (durable history).
 #

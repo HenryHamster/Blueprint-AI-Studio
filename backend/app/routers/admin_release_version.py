@@ -797,27 +797,30 @@ async def clear_deploy_failed(
 
     Behavior:
 
-    * FIRST attempt an independent live-verify by re-running the pure
-      ``_classify_serving_outcome`` against the live DeploymentState. If the
-      promoted SHA is genuinely observed serving, clear via the shared
-      ``_recover_serving_confirmed`` helper (flip to serving_confirmed, stamp the
-      observed served_sha/served_at, clear deploy_failure_reason, update the
-      verdict outcome, resolve the alert, arm a strategic refresh).
-    * If the live serving SHA is unobservable or does not yet match (the
+    * FIRST refresh the required-artifact registry. A clear is only legal when
+      every REQUIRED non-backend artifact is already ``serving_confirmed``.
+    * If the backend-revision artifact is independently observed serving, clear
+      via the shared ``_recover_serving_confirmed`` helper (flip to
+      serving_confirmed, stamp the observed served_sha/served_at, clear
+      deploy_failure_reason, update the verdict outcome, resolve the alert, arm
+      a strategic refresh).
+    * If the backend serving SHA is unobservable or does not yet match (the
       pre-Cloud-Run-API interim), require an explicit ``force=true`` plus a
       recorded operator ``reason``, then clear via the SAME helper using the
       promoted SHA as the attested served SHA and record the operator
-      attestation in the version audit trail.
+      attestation in the version audit trail. The force path only attests the
+      backend-serving signal; it does NOT override any still-failed required
+      non-backend artifact.
     * Without the override and without an independent confirmation, return 409
       explaining the deploy could not be independently verified live.
 
     Returns 404 when no promoted deploy_failed version exists for the project.
     """
     from app.release_reconciliation import (  # noqa: PLC0415
-        _classify_serving_outcome,
+        _aggregate_non_backend_required_artifact_status,
         _recover_serving_confirmed,
+        _refresh_release_artifact_rows,
     )
-    from app.models import DeploymentState  # noqa: PLC0415
     from app.time_utils import _utcnow  # noqa: PLC0415
 
     version = (
@@ -844,21 +847,45 @@ async def clear_deploy_failed(
         )
 
     now = _utcnow()
-    ds = await session.get(DeploymentState, 1)
-    outcome = _classify_serving_outcome(
-        ds,
-        version.promoted_at,
-        version.promoted_sha,
-        version.deploy_confirm_deadline,
+    (
+        provider_rows,
+        _,
+        _,
+        backend_artifact,
+    ) = await _refresh_release_artifact_rows(
+        session,
+        version,
         now,
+        recheck_failed_required=True,
+    )
+    non_backend_status, non_backend_reason = (
+        _aggregate_non_backend_required_artifact_status(provider_rows)
     )
 
     operator_id = current_user.get("email") or current_user["user_id"]
 
-    if outcome is not None and outcome[0] == "serving_confirmed":
+    if non_backend_status != "serving_confirmed":
+        detail = (
+            "deploy could not be cleared because a required non-backend artifact "
+            "is not serving_confirmed"
+        )
+        if non_backend_reason:
+            detail = f"{detail}: {non_backend_reason}"
+        raise HTTPException(status_code=409, detail=detail)
+
+    if (
+        backend_artifact is not None
+        and backend_artifact.serving_status == "serving_confirmed"
+        and backend_artifact.served_identifier is not None
+    ):
         # Independently confirmed serving — clear with the OBSERVED served SHA.
-        _kind, served_sha, served_at = outcome
-        await _recover_serving_confirmed(session, version, served_sha, served_at, now)
+        await _recover_serving_confirmed(
+            session,
+            version,
+            backend_artifact.served_identifier,
+            backend_artifact.served_at,
+            now,
+        )
         clear_mode = "verified"
         attestation_reason = None
     else:

@@ -18,13 +18,14 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app import release_version
 from app.database import AsyncSessionLocal
-from app.models import Alert, AlertSeverity
+from app.models import Alert, AlertSeverity, ReleaseDeployArtifact
+from app.release_artifacts import required_release_artifact_kinds
 from app.release_promotion import _notify_operator
 from app.release_reconciliation import (
     _confirm_serving_or_fail,
@@ -475,12 +476,47 @@ async def sweep_stuck_qualifications(
     # dedicated session, and either confirm it serving or land a distinct loud
     # deploy-failed state.  Unlike the loops above this scans PROMOTED versions
     # (the rest target ``open`` ones), so it runs its own narrow query.
+    required_artifact_kinds = required_release_artifact_kinds()
+    unresolved_filter = release_version.ReleaseVersion.serving_status == "unconfirmed"
+    if required_artifact_kinds:
+        required_artifact_exists = exists(
+            select(ReleaseDeployArtifact.id).where(
+                ReleaseDeployArtifact.version_id == release_version.ReleaseVersion.id,
+                ReleaseDeployArtifact.artifact_kind.in_(required_artifact_kinds),
+            )
+        )
+        pending_artifact_exists = exists(
+            select(ReleaseDeployArtifact.id).where(
+                ReleaseDeployArtifact.version_id == release_version.ReleaseVersion.id,
+                ReleaseDeployArtifact.artifact_kind.in_(required_artifact_kinds),
+                or_(
+                    ReleaseDeployArtifact.serving_status.is_(None),
+                    ReleaseDeployArtifact.serving_status == "unconfirmed",
+                ),
+            )
+        )
+        required_artifact_count = (
+            select(func.count(ReleaseDeployArtifact.id))
+            .where(
+                ReleaseDeployArtifact.version_id == release_version.ReleaseVersion.id,
+                ReleaseDeployArtifact.artifact_kind.in_(required_artifact_kinds),
+            )
+            .scalar_subquery()
+        )
+        unresolved_filter = or_(
+            unresolved_filter,
+            pending_artifact_exists,
+            and_(
+                required_artifact_exists,
+                required_artifact_count < len(required_artifact_kinds),
+            ),
+        )
     unconfirmed_ids = list(
         (
             await session.execute(
                 select(release_version.ReleaseVersion.id).where(
                     release_version.ReleaseVersion.status == "promoted",
-                    release_version.ReleaseVersion.serving_status == "unconfirmed",
+                    unresolved_filter,
                 )
             )
         )
@@ -576,8 +612,7 @@ async def sweep_stuck_qualifications(
                 )
                 alerted = await _check_version_build_stall(alert_session, v) or alerted
                 alerted = (
-                    await _check_version_stabilize_stall(alert_session, v)
-                    or alerted
+                    await _check_version_stabilize_stall(alert_session, v) or alerted
                 )
                 alerted = (
                     await _check_version_promotion_readiness(alert_session, v)

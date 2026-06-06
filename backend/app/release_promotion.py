@@ -38,6 +38,10 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app import github, release_version
 from app.models import Project, QualificationVerdict
+from app.release_artifacts import (
+    BACKEND_REVISION_ARTIFACT_KIND,
+    get_or_create_release_deploy_artifact,
+)
 from app.notification_dispatch import post_event_message
 from app.shared_state import (
     get_project_integration_branch as _get_project_integration_branch,
@@ -1579,6 +1583,12 @@ async def _record_promotion_success(
         version.deploy_confirm_alerted_at = None
         version.deploy_confirm_deadline = now + timedelta(
             seconds=_DEPLOY_CONFIRM_WINDOW_SECONDS
+        )
+        await get_or_create_release_deploy_artifact(
+            session,
+            version,
+            BACKEND_REVISION_ARTIFACT_KIND,
+            confirmation_deadline=version.deploy_confirm_deadline,
         )
     session.add(version)
     # Phase 4: durable verdict-history row for a successful promotion.  This
