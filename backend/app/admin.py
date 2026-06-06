@@ -633,6 +633,11 @@ async def _bulk_retry_one_task(
                 bulk_ctx.pop("provision_failed_accounts", None)
                 bulk_ctx.pop("_slot_released", None)
                 bulk_ctx.pop("_api_failure_retries", None)
+                # Clear the previous attempt's failure verdict — see the
+                # single-task requeue path (admin_task_mutations.py) for why a
+                # stale failure_class/failure_category poisons reclassification.
+                bulk_ctx.pop("failure_class", None)
+                bulk_ctx.pop("failure_category", None)
                 task.context = bulk_ctx
             history = TaskHistory(
                 task_id=task.id,

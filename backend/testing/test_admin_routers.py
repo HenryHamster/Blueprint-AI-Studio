@@ -4731,6 +4731,33 @@ class TestNotificationConfigSettings:
         assert bad2.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_patch_auto_debug_enabled(self, client: AsyncClient):
+        """auto_debug_enabled accepts booleans, rejects non-booleans, and
+        round-trips on GET.
+
+        Regression: #8528 added the key to _KNOWN_SETTINGS_KEYS (so PATCH
+        validated it and returned 200) but shipped no apply block — the write
+        was silently dropped and the kill-switch could never be flipped."""
+        resp = await client.patch(
+            "/api/admin/settings", json={"auto_debug_enabled": False}
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["auto_debug_enabled"] is False
+
+        resp = await client.patch(
+            "/api/admin/settings", json={"auto_debug_enabled": True}
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["auto_debug_enabled"] is True
+
+        bad = await client.patch(
+            "/api/admin/settings", json={"auto_debug_enabled": "false"}
+        )
+        assert bad.status_code == 400
+
+    @pytest.mark.asyncio
     async def test_patch_warm_backlog_reuse_enabled(self, client: AsyncClient):
         """warm_backlog_reuse_enabled accepts booleans, rejects non-booleans,
         round-trips on GET, and is independent of warm_continuity_enabled."""
@@ -10396,6 +10423,52 @@ class TestRequeueClearsBlockerMetadata:
         assert task.blocked_at is None
         assert task.recheck_after is None
         # Clean attempt: counter reset like any leaf requeue.
+        assert task.attempt_count == 0
+
+
+class TestRequeueClearsStaleFailureVerdict:
+    @pytest.mark.asyncio
+    async def test_manual_requeue_pops_failure_class_and_category(self, db_session):
+        """An admin requeue must clear the previous attempt's persisted failure
+        verdict: classify_failure short-circuits on a persisted failure_class /
+        failure_category, so a stale CODE_ERROR from the pre-requeue attempt
+        would mask the NEXT failure's real cause (e.g. an infra death
+        re-labelled CODE_ERROR at 0.9 confidence, burning the fresh budget)."""
+        from fastapi import BackgroundTasks
+
+        from app.admin_task_mutations import modify_task_apply
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="Failed then requeued",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.FAILED,
+            vm_instance_id="agent-vm-old",
+            attempt_count=3,
+            context={
+                "failure_class": "CODE_ERROR",
+                "failure_category": "claude_code_failed",
+                "_api_failure_retries": 2,
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await modify_task_apply(
+            task,
+            {"status": TaskStatus.QUEUED.value},
+            BackgroundTasks(),
+            db_session,
+        )
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        ctx = task.context or {}
+        assert "failure_class" not in ctx
+        assert "failure_category" not in ctx
+        assert "_api_failure_retries" not in ctx
         assert task.attempt_count == 0
 
 
