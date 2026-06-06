@@ -9536,6 +9536,52 @@ class TestRequeueClearsBlockerMetadata:
         assert task.attempt_count == 0
 
 
+class TestRequeueClearsStaleFailureVerdict:
+    @pytest.mark.asyncio
+    async def test_manual_requeue_pops_failure_class_and_category(self, db_session):
+        """An admin requeue must clear the previous attempt's persisted failure
+        verdict: classify_failure short-circuits on a persisted failure_class /
+        failure_category, so a stale CODE_ERROR from the pre-requeue attempt
+        would mask the NEXT failure's real cause (e.g. an infra death
+        re-labelled CODE_ERROR at 0.9 confidence, burning the fresh budget)."""
+        from fastapi import BackgroundTasks
+
+        from app.admin_task_mutations import modify_task_apply
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="Failed then requeued",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.FAILED,
+            vm_instance_id="agent-vm-old",
+            attempt_count=3,
+            context={
+                "failure_class": "CODE_ERROR",
+                "failure_category": "claude_code_failed",
+                "_api_failure_retries": 2,
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await modify_task_apply(
+            task,
+            {"status": TaskStatus.QUEUED.value},
+            BackgroundTasks(),
+            db_session,
+        )
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        ctx = task.context or {}
+        assert "failure_class" not in ctx
+        assert "failure_category" not in ctx
+        assert "_api_failure_retries" not in ctx
+        assert task.attempt_count == 0
+
+
 class TestTriggerRollup:
     @pytest.mark.asyncio
     async def test_intermediate_rollup_auto_merge_keeps_custom_staged_root_evaluating(

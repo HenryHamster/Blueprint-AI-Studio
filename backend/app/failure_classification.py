@@ -933,21 +933,82 @@ def _stuck_llm_call_no_progress(task: "Task") -> bool:
     return calls >= 1 and out_tokens == 0
 
 
-def _persist_stuck_call_reclassification(task: "Task") -> None:
-    """Mark a task whose AGENT_TIMEOUT/agent_stalled was reclassified to
-    RATE_LIMIT because of a stuck (0-output-token) LLM call. Sets the
-    ``rate_limit_kind`` key the requeue path needs for cooldown bookkeeping plus
-    an operator breadcrumb explaining the inference."""
+def _persist_stuck_call_reclassification(
+    task: "Task", inferred_from: str = "stuck_llm_call_no_output"
+) -> None:
+    """Mark a task whose failure was reclassified to RATE_LIMIT from an
+    infra-death signal (stuck 0-output-token LLM call, init-banner-only CLI
+    death, or a mid-stream cut). Sets the ``rate_limit_kind`` key the requeue
+    path needs for cooldown bookkeeping plus an operator breadcrumb explaining
+    the inference."""
     try:
         ctx = dict(task.context or {})
         ctx.setdefault("rate_limit_kind", "unknown")
         ctx["rate_limit_correlation_reclassified"] = True
-        ctx["rate_limit_inferred_from"] = "stuck_llm_call_no_output"
+        ctx["rate_limit_inferred_from"] = inferred_from
         task.context = ctx
     except Exception:
         logger.exception(
             "[FAILURE_CLASS] Failed to persist stuck-call reclassification marker"
         )
+
+
+# The agent wrapper embeds the last 10KB of Claude CLI output in the ERROR_LOG
+# after this marker (agent/src/handlers/code-change.ts). The tail is the only
+# forensic record of HOW the CLI died, so the detectors below scope their
+# pattern checks to it rather than the whole combined text.
+_CLI_OUTPUT_TAIL_MARKER = "--- claude output tail ---"
+
+# Stream-json markers proving the model produced real output in the tail.
+_TAIL_MODEL_OUTPUT_MARKERS = (
+    '"type":"assistant"',
+    '"type": "assistant"',
+    "content_block_start",
+    '"tool_use"',
+)
+
+
+def _cli_output_tail(combined_lower: str) -> str | None:
+    """Return the captured CLI output tail (lowercased), or None if absent."""
+    idx = combined_lower.rfind(_CLI_OUTPUT_TAIL_MARKER)
+    if idx < 0:
+        return None
+    return combined_lower[idx + len(_CLI_OUTPUT_TAIL_MARKER):]
+
+
+def _cli_startup_death_tail(combined_lower: str) -> bool:
+    """True when the CLI died at startup: the init banner is in the output
+    tail but no assistant/tool output ever followed.
+
+    A Claude CLI that prints its init system event and then exits (typically
+    ~2s in, exit code 1) died on its first API call — usage exhaustion, auth
+    rejection, or provider error — before the model produced a single token.
+    That can never be a code-authoring defect. Incident 2026-06-06: this
+    signature burned full 3-attempt budgets across multiple lineages while
+    classified CODE_ERROR."""
+    tail = _cli_output_tail(combined_lower)
+    if tail is None:
+        return False
+    if '"subtype":"init"' not in tail and '"subtype": "init"' not in tail:
+        return False
+    return not any(m in tail for m in _TAIL_MODEL_OUTPUT_MARKERS)
+
+
+def _cli_stream_cut_tail(combined_lower: str) -> bool:
+    """True when the CLI died mid-stream: content deltas present in the output
+    tail but no terminal ``result`` event ever arrived.
+
+    A normal run — even a failed one — ends with a stream-json
+    ``{"type":"result",...}`` event inside the captured 10KB tail. Raw
+    content_block/signature deltas as the final output mean the provider
+    stream was severed mid-write (mid-run usage death), not that the agent
+    wrote bad code."""
+    tail = _cli_output_tail(combined_lower)
+    if tail is None:
+        return False
+    has_delta = "content_block_delta" in tail or '"signature_delta"' in tail
+    has_result = '"type":"result"' in tail or '"type": "result"' in tail
+    return has_delta and not has_result
 
 
 # Execution-stall text signatures. Combined with a stuck (0-output-token) LLM
@@ -1412,6 +1473,35 @@ def classify_failure_with_confidence(
     ):
         _persist_stuck_call_reclassification(task)
         return FailureClassification(failure_class=RATE_LIMIT, confidence=0.7)
+    # CLI-death reclassification for CODE_ERROR. A Claude CLI process that died
+    # without the model ever producing output (init-banner-only tail,
+    # 0-output-token telemetry) or that was severed mid-stream (delta events
+    # with no terminal result) is an infra/provider death — usage exhaustion,
+    # auth rejection, or a cut stream — not an agent code defect. The wrapper
+    # can only label these with generic categories (claude_code_failed /
+    # incomplete / fatal), and CODE_ERROR retries burn the attempt budget with
+    # no account blacklist or backoff; RATE_LIMIT routes them to the canonical
+    # cooldown + blacklist + budget-free requeue instead. Scoped to the generic
+    # labels so specific code-error signals (test/lint/merge text) are never
+    # swept. Runs before the agent_category early-exit for the same reason as
+    # the AGENT_TIMEOUT rule above. Incident 2026-06-06: 24 infra deaths burned
+    # 3-attempt budgets across 8 lineages overnight as CODE_ERROR.
+    if (
+        failure_class == CODE_ERROR
+        and str(agent_category or "").lower() in _ALL_GENERIC_CODE_ERROR_LABELS
+    ):
+        cli_death_signal = (
+            "stuck_llm_call_no_output"
+            if _stuck_llm_call_no_progress(task)
+            else "cli_startup_death_init_only_tail"
+            if _cli_startup_death_tail(combined_lower)
+            else "cli_stream_cut_tail"
+            if _cli_stream_cut_tail(combined_lower)
+            else None
+        )
+        if cli_death_signal:
+            _persist_stuck_call_reclassification(task, cli_death_signal)
+            return FailureClassification(failure_class=RATE_LIMIT, confidence=0.7)
     if agent_category:
         return FailureClassification(failure_class=failure_class, confidence=0.9)
     if failure_class == MIGRATION_ERROR:

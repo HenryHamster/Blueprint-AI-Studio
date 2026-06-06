@@ -295,10 +295,100 @@ class TestStuckLlmCallReclassifiedToRateLimit:
     def test_code_error_not_reclassified_even_with_zero_output(self):
         # Reclassification is gated on AGENT_TIMEOUT — a real code error must stay
         # CODE_ERROR even with a 0-output-token summary + a time-limit substring.
+        # (The CLI-death CODE_ERROR rule below doesn't fire either: this task has
+        # no generic agent failure_category.)
         t = self._stalled(
             "AssertionError: expected 1 got 2",
             {"llm_call_count": 1, "total_input_tokens": 100, "total_output_tokens": 0},
         )
+        assert classify_failure(t) == CODE_ERROR
+
+
+class TestCliDeathReclassifiedToRateLimit:
+    """A CODE_ERROR whose agent label is generic (claude_code_failed /
+    incomplete / fatal / …) and whose CLI output tail shows the process died
+    without the model ever producing output (init-banner-only tail) or died
+    mid-stream (content deltas with no terminal result event) is an
+    infra/provider death — usage exhaustion, auth rejection, or a severed
+    stream — not a code defect. It must classify RATE_LIMIT (canonical
+    cooldown + account blacklist + budget-free requeue) instead of burning
+    CODE_ERROR retries. Incident 2026-06-06: this signature burned full
+    3-attempt budgets across multiple lineages overnight."""
+
+    _INIT_ONLY_TAIL = (
+        "Claude subprocess exited with code 1 without shipping a PR.\n\n"
+        "--- Claude output tail ---\n"
+        '{"type":"system","subtype":"init","cwd":"/tmp/workspace","session_id":"abc123"}'
+    )
+    _STREAM_CUT_TAIL = (
+        "Claude exited without calling ./done, ./fail, or opening a PR.\n\n"
+        "--- Claude output tail ---\n"
+        '{"type":"stream_event","event":{"type":"content_block_delta",'
+        '"delta":{"type":"signature_delta","signature":"d7nCuJvWDPvT/UFq"}}}'
+    )
+
+    def _dead(self, msg: str, category: str = "claude_code_failed", summary=None) -> Task:
+        t = _task(msg, {"failure_category": category})
+        t.api_call_summary = summary
+        return t
+
+    def test_init_banner_only_tail_reclassifies(self):
+        t = self._dead(self._INIT_ONLY_TAIL)
+        assert classify_failure(t) == RATE_LIMIT
+        assert (
+            t.context.get("rate_limit_inferred_from")
+            == "cli_startup_death_init_only_tail"
+        )
+        assert t.context.get("rate_limit_kind") == "unknown"
+
+    def test_stream_cut_tail_reclassifies(self):
+        t = self._dead(self._STREAM_CUT_TAIL, category="incomplete")
+        assert classify_failure(t) == RATE_LIMIT
+        assert t.context.get("rate_limit_inferred_from") == "cli_stream_cut_tail"
+
+    def test_zero_output_telemetry_reclassifies_without_tail(self):
+        # Telemetry alone (no output tail captured) is sufficient: an LLM call
+        # started but 0 output tokens ever arrived.
+        t = self._dead(
+            "Claude subprocess exited with code 1 without shipping a PR.",
+            summary={"llm_call_count": 1, "total_output_tokens": 0},
+        )
+        assert classify_failure(t) == RATE_LIMIT
+        assert t.context.get("rate_limit_inferred_from") == "stuck_llm_call_no_output"
+
+    def test_real_output_after_init_stays_code_error(self):
+        # The model produced assistant output and the run reached a terminal
+        # result event — a genuine agent failure, not a startup death.
+        msg = (
+            "Claude subprocess exited with code 1 without shipping a PR.\n\n"
+            "--- Claude output tail ---\n"
+            '{"type":"system","subtype":"init","cwd":"/tmp/workspace"}\n'
+            '{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}\n'
+            '{"type":"result","subtype":"error_during_execution"}'
+        )
+        t = self._dead(msg)
+        assert classify_failure(t) == CODE_ERROR
+
+    def test_stream_with_terminal_result_stays_code_error(self):
+        # Deltas in the tail are fine when the stream completed (result event
+        # present) — the cut detector must not sweep normal runs.
+        msg = (
+            "Claude exited without calling ./done, ./fail, or opening a PR.\n\n"
+            "--- Claude output tail ---\n"
+            '{"type":"stream_event","event":{"type":"content_block_delta","delta":{}}}\n'
+            '{"type":"result","subtype":"success"}'
+        )
+        t = self._dead(msg, category="incomplete")
+        assert classify_failure(t) == CODE_ERROR
+
+    def test_specific_category_never_swept(self):
+        # A specific (non-generic) agent label is a real failure signal — even
+        # an init-only tail must not reclassify it.
+        t = self._dead(self._INIT_ONLY_TAIL, category="test_failed")
+        assert classify_failure(t) == CODE_ERROR
+
+    def test_no_tail_no_telemetry_stays_code_error(self):
+        t = self._dead("Claude subprocess exited with code 1 without shipping a PR.")
         assert classify_failure(t) == CODE_ERROR
 
 

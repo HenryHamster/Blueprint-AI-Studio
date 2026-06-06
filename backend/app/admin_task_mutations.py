@@ -223,7 +223,7 @@ async def _apply_status_mutation(
     try:
         new_status = TaskStatus(payload["status"])
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid status")
+        raise HTTPException(status_code=400, detail="Invalid status") from None
 
     admin_allowed = {TaskStatus.QUEUED, TaskStatus.CANCELLED}
     if new_status not in admin_allowed and task.status in _TERMINAL_STATUSES:
@@ -370,6 +370,13 @@ async def _apply_status_mutation(
             requeue_ctx.pop("provision_failed_accounts", None)
             requeue_ctx.pop("_slot_released", None)
             requeue_ctx.pop("_api_failure_retries", None)
+            # Clear the previous attempt's failure verdict too: classify_failure
+            # short-circuits on a persisted failure_class/failure_category, so a
+            # stale CODE_ERROR from the pre-requeue attempt would mask the NEXT
+            # failure's real cause (e.g. an infra death re-labelled CODE_ERROR
+            # at 0.9 confidence, burning the fresh attempt budget).
+            requeue_ctx.pop("failure_class", None)
+            requeue_ctx.pop("failure_category", None)
             task.context = requeue_ctx
             changes["attempt_count"] = 0
             changes["vm_instance_id"] = task.vm_instance_id
@@ -988,7 +995,9 @@ async def _apply_depends_on_mutation(
         try:
             dep_uuids = [uuid.UUID(d) for d in new_deps]
         except (ValueError, AttributeError):
-            raise HTTPException(status_code=400, detail="Invalid UUID in depends_on")
+            raise HTTPException(
+                status_code=400, detail="Invalid UUID in depends_on"
+            ) from None
 
         existing_tasks = (
             (await session.execute(select(Task).where(Task.id.in_(dep_uuids))))
