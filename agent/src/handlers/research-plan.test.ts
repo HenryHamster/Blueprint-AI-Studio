@@ -2056,6 +2056,33 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     expect(p).toContain('"type"');
   });
 
+  // ── handlePlan atomic schema-change rule (no split model/migrate subtasks) ────
+  // Regression: the plan prompt previously told the agent that any subtask
+  // touching backend/app/models.py (or adding tables/columns) must spawn a
+  // SEPARATE dependent type="migrate" subtask. That manufactured dead
+  // serialization and shipped model PRs with no migration. The corrected
+  // guidance keeps the schema edit, its Alembic migration, and the revision
+  // bump in ONE atomic subtask/PR.
+  it('handlePlan prompt no longer instructs a separate dependent migrate subtask for model changes', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // The old split-the-migration instruction must be gone.
+    expect(p).not.toContain('include a separate subtask with set type="migrate"');
+    expect(p).not.toContain('This subtask should depend on the model change subtask');
+  });
+
+  it('handlePlan prompt states the atomic schema-change rule (model + migration + revision bump in one subtask)', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('ATOMIC SCHEMA RULE');
+    // The atomic subtask owns the model file, the Alembic migration, and the
+    // EXPECTED_SCHEMA_REVISION bump together.
+    expect(p).toContain('backend/alembic/versions/');
+    expect(p).toContain('EXPECTED_SCHEMA_REVISION');
+    // And it explicitly forbids splitting the migration into a dependent subtask.
+    expect(p).toContain('Do NOT emit a separate dependent type="migrate" subtask');
+  });
+
   // ── handlePlan affirmative no-op (#7021 principle one layer up) ───────────────
   // The plan prompt must instruct the agent to emit an affirmative no_op_reason
   // sentinel when there is genuinely nothing to decompose, NOT a silent empty
