@@ -56,7 +56,7 @@ import {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
   parseLLMCliTranslation, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing,
   RateLimitError, AuthFailureError, NoProgressTimeoutError, VmConfigMissingError,
-  missingProviderConfigFiles,
+  missingProviderConfigFiles, requiredProviderConfigFiles,
   refreshRuntimeState,
   getProviderRunner, providerSupportsNativeSubagents,
   __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
@@ -70,7 +70,7 @@ export {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
   parseLLMCliTranslation, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing,
   RateLimitError, AuthFailureError, NoProgressTimeoutError, VmConfigMissingError,
-  missingProviderConfigFiles,
+  missingProviderConfigFiles, requiredProviderConfigFiles,
   refreshRuntimeState,
   getProviderRunner, providerSupportsNativeSubagents,
   __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
@@ -332,6 +332,16 @@ const KNOWN_MANAGED_CREDENTIAL_FILE_PATHS = [
 let bootCredentialSnapshot: MaterializedCredentialState | null = null;
 let lastMaterializedCredentialPaths = new Set<string>();
 let activeCredentialStateSource: 'boot' | 'retarget' = 'boot';
+// Which managed provider config files existed on disk when this PROCESS
+// started — captured at the top of main(), BEFORE provider validation or any
+// claim work can run. This is the "what did boot actually materialize?"
+// baseline the vm_config_missing guards compare against: claude_config_json is
+// an OPTIONAL per-account pool field, so a path like ~/.claude.json that was
+// NEVER materialized on this VM is a healthy state (the CLI runs on env/OAuth
+// alone), while a path that existed here and is now gone is a genuinely
+// poisoned VM. null until captured (local dev / unit tests) — the guards
+// treat null as "no expectations", never as "everything is missing".
+let bootProviderConfigPathsPresent: Set<string> | null = null;
 
 function parseSecretFileMode(raw: unknown): number {
   if (typeof raw === 'number' && Number.isInteger(raw) && raw > 0) return raw;
@@ -465,31 +475,81 @@ function captureBootCredentialSnapshot(): void {
   activeCredentialStateSource = 'boot';
 }
 
+// Record which managed provider config files exist on disk RIGHT NOW.
+// Idempotent — first capture wins, so it records the state at process start
+// even if a later code path calls it again. Candidates cover the known
+// managed credential files plus whatever the boot provider hard-requires.
+function captureBootProviderConfigPresence(): void {
+  if (bootProviderConfigPathsPresent !== null) return;
+  const candidates = new Set<string>([
+    ...KNOWN_MANAGED_CREDENTIAL_FILE_PATHS,
+    ...requiredProviderConfigFiles(PROVIDER),
+  ]);
+  bootProviderConfigPathsPresent = new Set([...candidates].filter(p => {
+    try {
+      return fs.existsSync(p);
+    } catch {
+      // A failed stat must not fabricate a "this file existed" expectation.
+      return false;
+    }
+  }));
+}
+
+// The provider config files the CURRENT credential state is supposed to have
+// on disk — the expected-set the vm_config_missing guards check against:
+//   - after any in-process materialization (boot snapshot re-write or retarget
+//     manifest), the just-materialized file set is the authority: exactly what
+//     the active source promised to write, nothing more;
+//   - before the first materialization (the pre-claim window), the boot
+//     presence snapshot is: whatever the VM's provision-time boot
+//     materialization actually put on disk.
+// A required-by-provider path that is in NEITHER set never existed on this VM
+// (claude_config_json is an optional per-account field) and must not be
+// treated as lost.
+function expectedProviderConfigPaths(): ReadonlySet<string> {
+  if (bootCredentialSnapshot !== null || activeCredentialStateSource === 'retarget') {
+    return lastMaterializedCredentialPaths;
+  }
+  return bootProviderConfigPathsPresent ?? new Set<string>();
+}
+
 // Poisoned-VM claim guard (2026-06-06 incidents, tasks 1330d291 / cf28097f):
-// the disk check only applies on a real VM — local dev / unit tests never have
-// /home/agent/.claude.json and must not be doomed for it. The orchestrator's
-// startup script always bakes a real VM_INSTANCE_ID into /etc/agent.env;
-// 'local' is the module-level fallback for dev machines.
+// reports provider-required config files that were materialized on this VM
+// (boot or retarget) but are now ABSENT — i.e. genuine "boot materialization
+// lost". A file that never existed on this VM is NOT reported: the
+// claude_config_json pool field is optional ("Not required for most setups"),
+// so accounts without it boot perfectly healthy VMs that never have
+// ~/.claude.json (the CLI runs on env/OAuth alone). Treating never-existed as
+// lost terminally FAILED 49 tasks on 2026-06-06 (~19:42-20:58 UTC) — every
+// fresh provision for such accounts died pre-claim across all 3 attempts.
+// The disk check only applies on a real VM — local dev / unit tests never
+// have /home/agent/.claude.json and must not be doomed for it. The
+// orchestrator's startup script always bakes a real VM_INSTANCE_ID into
+// /etc/agent.env; 'local' is the module-level fallback for dev machines.
 export function missingVmProviderConfigFiles(provider = PROVIDER): string[] {
   const vmId = process.env.VM_INSTANCE_ID;
   if (!vmId || vmId === 'local') return [];
-  return missingProviderConfigFiles(provider);
+  const expected = expectedProviderConfigPaths();
+  return missingProviderConfigFiles(provider).filter(p => expected.has(p));
 }
 
-// Refuse to hand a claimed role to a configless VM. Runs AFTER
+// Refuse to hand a claimed role to a poisoned VM. Runs AFTER
 // materializeClaimCredentialState has re-written every credential file it
 // knows about (boot snapshot or retarget manifest) — that re-write IS the
-// self-heal; if the required config is still absent afterwards, no source on
+// self-heal; if a config file the active source PROMISED (it is in the
+// just-materialized expected-set) is still absent afterwards, no source on
 // this VM can recreate it (the poisoned post-retarget state), so the only safe
 // move is to fail the claim with the distinct vm_config_missing category. The
 // orchestrator requeues the task as an infra failure (PROVISION_FAILURE) and
 // cold-provisions instead of letting every claim die in seconds with
-// "Claude configuration file not found".
+// "Claude configuration file not found". A file the active source never
+// promised (account without the optional claude_config_json) is NOT a refusal
+// condition — see missingVmProviderConfigFiles.
 function assertVmProviderConfigPresent(context: string): void {
   const missing = missingVmProviderConfigFiles();
   if (missing.length === 0) return;
   const err = new Error(
-    `${context}: vm_config_missing — required provider config absent after re-materialization: ${missing.join(', ')}; refusing to run a role configless`,
+    `${context}: vm_config_missing — materialized provider config absent after re-materialization: ${missing.join(', ')}; refusing to run a role configless`,
   ) as Error & { failureCategory: FailureCategory };
   err.failureCategory = 'vm_config_missing';
   throw err;
@@ -514,11 +574,16 @@ export function _resetCredentialStateForTesting(): void {
   bootCredentialSnapshot = null;
   lastMaterializedCredentialPaths = new Set();
   activeCredentialStateSource = 'boot';
+  bootProviderConfigPathsPresent = null;
   refreshRuntimeState();
 }
 
 export function _captureBootCredentialSnapshotForTesting(): void {
   captureBootCredentialSnapshot();
+}
+
+export function _captureBootProviderConfigPresenceForTesting(): void {
+  captureBootProviderConfigPresence();
 }
 
 export function _materializeClaimCredentialStateForTesting(secretManifest?: unknown, context = 'test'): void {
@@ -2547,17 +2612,22 @@ async function validateProviderAuth(runner: ProviderRunner, reportPreClaimFailur
     process.exit(1);
   }
   // Boot-materialized config-file presence (poisoned-VM guard, 2026-06-06).
-  // On a VM whose ~/.claude.json was destroyed (e.g. a warm re-target that died
-  // mid-sequence under the OLD clear-then-write ordering, then got restarted by
-  // systemd), the env credentials look perfectly healthy but every Claude
-  // invocation dies in seconds with "Claude configuration file not found".
-  // Nothing on the VM can recreate the file pre-claim (the boot manifest is not
-  // retained on disk), so fail HERE — before any claim — with an explained
-  // pre-claim death the orchestrator can tear down, instead of claiming tasks
-  // that are doomed to fail. Gated to real VMs via missingVmProviderConfigFiles.
+  // On a VM whose boot-materialized ~/.claude.json was destroyed mid-run, the
+  // env credentials look perfectly healthy but every Claude invocation dies in
+  // seconds with "Claude configuration file not found". Nothing on the VM can
+  // recreate the file pre-claim (the boot manifest is not retained on disk),
+  // so fail HERE — before any claim — with an explained pre-claim death the
+  // orchestrator can tear down, instead of claiming tasks that are doomed.
+  // IMPORTANT: this fires ONLY for files that existed at process start (or
+  // that the active retarget manifest promised) and are now absent — genuine
+  // loss. claude_config_json is an OPTIONAL per-account pool field; accounts
+  // without it boot healthy VMs that never have the file (the CLI runs on
+  // env/OAuth alone), and refusing those terminally FAILED 49 tasks on
+  // 2026-06-06. Gated to real VMs + the expected-set inside
+  // missingVmProviderConfigFiles.
   const missingConfig = missingVmProviderConfigFiles(runner.provider);
   if (missingConfig.length > 0) {
-    const reason = `vm_config_missing: required provider config file(s) absent on disk: ${missingConfig.join(', ')} — boot materialization lost; refusing to claim work configless`;
+    const reason = `vm_config_missing: provider config file(s) present at boot now absent on disk: ${missingConfig.join(', ')} — boot materialization lost; refusing to claim work configless`;
     log(reason);
     reportPreClaimFailure(reason);
     process.exit(1);
@@ -2721,6 +2791,15 @@ export async function main() {
   log(`Blueprint Agent starting (VM: ${VM_INSTANCE_ID})`);
   log(`Registered handlers (${Object.keys(handlers).length}): ${Object.keys(handlers).join(', ')}`);
   log(`Agent source: ${import.meta.url}`);
+
+  // Snapshot which managed provider config files exist on disk at process
+  // start, BEFORE provider validation or any claim work can touch them. The
+  // pre-claim poisoned-VM guard in validateProviderAuth compares against this
+  // baseline so it only refuses on genuine LOSS (file materialized at boot,
+  // now gone) and never on never-existed (accounts without the optional
+  // claude_config_json boot healthy VMs that never have ~/.claude.json).
+  captureBootProviderConfigPresence();
+
   if (!AGENT_TOKEN) throw new Error('AGENT_SECRET_TOKEN is required');
 
   // Distinguish a genuine cold boot from a warm re-target re-exec. The

@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
 import {
   __resetTaskCapabilityContractForTesting,
   isReadOnlyTaskType,
@@ -3449,9 +3449,24 @@ describe('claim-time VM config guard', () => {
     expect(missingVmProviderConfigFiles('anthropic')).toEqual([]);
   });
 
-  it('reports ~/.claude.json missing for anthropic on a real VM', () => {
+  it('does NOT report a ~/.claude.json that never existed on this VM (optional claude_config_json account)', () => {
+    // 2026-06-06 false-positive incident (49 terminally FAILED tasks):
+    // claude_config_json is an OPTIONAL per-account pool field. Accounts
+    // without it boot perfectly healthy fresh VMs that never have
+    // ~/.claude.json — the CLI runs on env/OAuth alone. Never-existed must
+    // not be reported as "boot materialization lost".
     process.env.VM_INSTANCE_ID = 'vm-guard-1';
     process.env.HOME = '/home/agent';
+    _captureBootProviderConfigPresenceForTesting(); // file absent at boot too
+    expect(missingVmProviderConfigFiles('anthropic')).toEqual([]);
+  });
+
+  it('reports ~/.claude.json when it existed at boot and is now gone (boot materialization lost)', () => {
+    process.env.VM_INSTANCE_ID = 'vm-guard-1b';
+    process.env.HOME = '/home/agent';
+    vi.mocked(fs.existsSync).mockImplementation((p) => p === '/home/agent/.claude.json');
+    _captureBootProviderConfigPresenceForTesting(); // file present at boot
+    vi.mocked(fs.existsSync).mockReturnValue(false); // ...then destroyed
     expect(missingVmProviderConfigFiles('anthropic')).toEqual(['/home/agent/.claude.json']);
   });
 
@@ -3459,6 +3474,7 @@ describe('claim-time VM config guard', () => {
     process.env.VM_INSTANCE_ID = 'vm-guard-2';
     process.env.HOME = '/home/agent';
     vi.mocked(fs.existsSync).mockImplementation((p) => p === '/home/agent/.claude.json');
+    _captureBootProviderConfigPresenceForTesting();
     expect(missingVmProviderConfigFiles('anthropic')).toEqual([]);
   });
 
@@ -3469,19 +3485,42 @@ describe('claim-time VM config guard', () => {
     expect(missingVmProviderConfigFiles('gemini')).toEqual([]);
   });
 
-  it('refuses a claim with vm_config_missing when the boot snapshot cannot restore ~/.claude.json (poisoned VM)', () => {
-    // The poisoned-VM scenario: a warm re-target died mid-sequence and the
-    // process restarted, so the boot snapshot was captured AFTER ~/.claude.json
-    // was already destroyed. Re-materializing on claim (the self-heal) then has
-    // no source for the file — the claim must be refused with the distinct
-    // vm_config_missing category instead of running a role whose every Claude
-    // call dies in seconds.
+  it('passes the claim when ~/.claude.json never existed on this VM (account without the optional claude_config_json)', () => {
+    // 2026-06-06 false-positive incident: the boot snapshot legitimately has
+    // NO ~/.claude.json because the account's pool entry has no
+    // claude_config_json (an optional field — "Not required for most
+    // setups"). The CLI runs on env/OAuth alone; the claim must proceed
+    // instead of refusing every role on a perfectly healthy VM.
     process.env.VM_INSTANCE_ID = 'vm-guard-4';
     process.env.HOME = '/home/agent';
     process.env.CLAUDE_CODE_OAUTH_TOKEN = 'boot-token';
     mockReadFileSync.mockImplementation(() => { throw new Error('ENOENT'); });
     refreshRuntimeState();
+    _captureBootProviderConfigPresenceForTesting(); // file absent at boot — never existed
     _captureBootCredentialSnapshotForTesting(); // snapshot has NO ~/.claude.json
+
+    expect(() => {
+      _materializeClaimCredentialStateForTesting(undefined, 'warm-claim');
+    }).not.toThrow();
+  });
+
+  it('refuses a claim with vm_config_missing when the boot snapshot materialized ~/.claude.json but it is absent afterwards (poisoned VM)', () => {
+    // The original poisoned-VM protection, kept intact: the boot snapshot
+    // CONTAINS ~/.claude.json (it WAS materialized on this VM), but after the
+    // claim-time re-write — the self-heal — the file is still absent on disk.
+    // No source on this VM can restore it, so the claim must be refused with
+    // the distinct vm_config_missing category instead of running a role whose
+    // every Claude call dies in seconds.
+    process.env.VM_INSTANCE_ID = 'vm-guard-4b';
+    process.env.HOME = '/home/agent';
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'boot-token';
+    mockReadFileSync.mockImplementation((p: string) => {
+      if (p === '/home/agent/.claude.json') return '{"hasCompletedOnboarding":true}';
+      throw new Error('ENOENT');
+    });
+    refreshRuntimeState();
+    _captureBootCredentialSnapshotForTesting(); // snapshot CONTAINS ~/.claude.json
+    // existsSync stays false: the re-written file does not land on disk.
 
     let caught: unknown;
     try {
@@ -3493,6 +3532,52 @@ describe('claim-time VM config guard', () => {
     expect((caught as Error).message).toContain('vm_config_missing');
     expect((caught as Error).message).toContain('/home/agent/.claude.json');
     expect((caught as Error & { failureCategory?: FailureCategory }).failureCategory).toBe('vm_config_missing');
+  });
+
+  it('refuses a claim with vm_config_missing when the retarget manifest promises ~/.claude.json but it is absent post-materialization', () => {
+    // Claim-path counterpart of the lost-after-boot semantics: the retarget
+    // manifest says the file MUST exist (the new account ships
+    // claude_config_json), but after materialization it is absent on disk —
+    // genuine loss, refuse. A manifest WITHOUT the file (account without the
+    // optional field) would not be a refusal condition.
+    process.env.VM_INSTANCE_ID = 'vm-guard-4c';
+    process.env.HOME = '/home/agent';
+    mockReadFileSync.mockImplementation(() => { throw new Error('ENOENT'); });
+    refreshRuntimeState();
+    _captureBootProviderConfigPresenceForTesting(); // fresh VM — file never existed at boot
+    _captureBootCredentialSnapshotForTesting();
+
+    let caught: unknown;
+    try {
+      _materializeClaimCredentialStateForTesting({
+        metadata: { retarget: true },
+        env: { PROVIDER: 'anthropic', AUTH_MODE: 'oauth', CLAUDE_CODE_OAUTH_TOKEN: 'retarget-token' },
+        files: [{ path: '/home/agent/.claude.json', content: '{"hasCompletedOnboarding":true}' }],
+      }, 'warm-retarget-claim');
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain('vm_config_missing');
+    expect((caught as Error).message).toContain('/home/agent/.claude.json');
+    expect((caught as Error & { failureCategory?: FailureCategory }).failureCategory).toBe('vm_config_missing');
+  });
+
+  it('passes a retarget claim whose manifest has no ~/.claude.json (new account without the optional field)', () => {
+    process.env.VM_INSTANCE_ID = 'vm-guard-4d';
+    process.env.HOME = '/home/agent';
+    mockReadFileSync.mockImplementation(() => { throw new Error('ENOENT'); });
+    refreshRuntimeState();
+    _captureBootProviderConfigPresenceForTesting();
+    _captureBootCredentialSnapshotForTesting();
+
+    expect(() => {
+      _materializeClaimCredentialStateForTesting({
+        metadata: { retarget: true },
+        env: { PROVIDER: 'anthropic', AUTH_MODE: 'oauth', CLAUDE_CODE_OAUTH_TOKEN: 'retarget-token' },
+        files: [],
+      }, 'warm-retarget-claim');
+    }).not.toThrow();
   });
 
   it('passes the claim when re-materialization restores ~/.claude.json (self-heal path)', () => {
@@ -3545,9 +3630,11 @@ describe('main pool-mode startup ordering', () => {
     process.env.ANTHROPIC_API_KEY = 'anthropic-test-key';
     _setAgentTokenForTesting('vm-bootstrap-jwt');
     _setAgentRuntimeFingerprintForTesting(null);
-    // The claim-time VM config guard (vm_config_missing) verifies ~/.claude.json
-    // exists on disk for anthropic-bound VMs; this healthy-pool-boot simulation
-    // needs the file present or main() refuses to claim, by design.
+    // Healthy-pool-boot simulation: ~/.claude.json is on disk from boot
+    // materialization and stays there. The vm_config_missing guards compare
+    // disk state against the boot-presence baseline, so a stable file means
+    // no refusal anywhere (and individual tests flip this mock to simulate
+    // loss / never-existed).
     vi.mocked(fs.existsSync).mockImplementation((p) => String(p).endsWith('.claude.json'));
   });
 
@@ -3712,13 +3799,17 @@ describe('main pool-mode startup ordering', () => {
     ]));
   });
 
-  it('refuses to claim and reports vm_config_missing pre-claim when ~/.claude.json is gone (poisoned VM)', async () => {
+  it('refuses to claim and reports vm_config_missing pre-claim when a boot-materialized ~/.claude.json is gone (poisoned VM)', async () => {
     // The 2026-06-06 poisoned state: env credentials look healthy but the
     // boot-materialized ~/.claude.json was destroyed. The VM must die loudly
     // BEFORE polling for work — an explained pre-claim vm-heartbeat the
     // orchestrator can tear down — instead of claiming tasks whose every
     // Claude invocation fails in seconds.
-    vi.mocked(fs.existsSync).mockReturnValue(false); // config file destroyed
+    // Capture the boot presence baseline while the file is still on disk
+    // (the beforeEach existsSync mock has it present) — modelling main()'s
+    // process-start snapshot — then destroy the file. Genuine loss, refuse.
+    _captureBootProviderConfigPresenceForTesting(); // boot baseline: file present
+    vi.mocked(fs.existsSync).mockReturnValue(false); // ...config file destroyed
     const execMock = vi.mocked(execFileSync);
     execMock.mockClear();
     fetchMock.mockImplementation((input: unknown) => {
@@ -3747,6 +3838,54 @@ describe('main pool-mode startup ordering', () => {
     const fetched = fetchMock.mock.calls.map((c) => String(c[0]));
     expect(fetched.some((u) => u.includes('next-role'))).toBe(false);
     expect(fetched.some((u) => u.includes('/api/agent/claim'))).toBe(false);
+  });
+
+  it('proceeds to poll for work when ~/.claude.json never existed on this VM (account without the optional claude_config_json)', async () => {
+    // 2026-06-06 false-positive incident (49 terminally FAILED tasks):
+    // claude_config_json is an OPTIONAL per-account pool field. An account
+    // without it boots a perfectly healthy fresh VM that NEVER has
+    // ~/.claude.json — the CLI runs on env/OAuth alone. The pre-claim guard
+    // must not refuse: never-existed is not "boot materialization lost".
+    vi.mocked(fs.existsSync).mockReturnValue(false); // file never existed on this VM
+    const execMock = vi.mocked(execFileSync);
+    execMock.mockClear();
+    (spawn as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      stdout: { on: vi.fn() },
+      stderr: { on: vi.fn() },
+      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+        if (event === 'close') void Promise.resolve().then(() => { handler(0); });
+      }),
+      kill: vi.fn(),
+    }));
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/next-role')) {
+        return Promise.resolve({
+          status: 200,
+          json: () => Promise.resolve({ action: 'exit', reason: 'test-complete' }),
+        });
+      }
+      return Promise.resolve({
+        status: 204, ok: true,
+        text: () => Promise.resolve(''),
+        json: () => Promise.resolve({}),
+        headers: { get: () => null },
+      });
+    });
+
+    // main() exits the pool cleanly via the next-role 'exit' action — it was
+    // NOT killed pre-claim by the config guard.
+    await expect(main()).resolves.toBeUndefined();
+
+    // The healthy configless VM DID poll for work.
+    const fetched = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(fetched.some((u) => u.includes('next-role'))).toBe(true);
+    // And no pre-claim vm_config_missing report was emitted.
+    const curlReports = execMock.mock.calls
+      .filter((c) => c[0] === 'curl')
+      .map((c) => ((c[1] ?? []) as string[]).join(' '))
+      .join('\n');
+    expect(curlReports).not.toContain('vm_config_missing');
   });
 });
 
