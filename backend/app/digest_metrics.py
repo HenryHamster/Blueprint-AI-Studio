@@ -2182,6 +2182,7 @@ def compute_digest_cost_economics(
     window_start: "datetime",
     now: "datetime",
     daily_cost_ceiling_usd: float,
+    compute_job_daily_cost_usd: float = 0.0,
 ) -> Dict[str, Any]:
     """Compute the digest's entire cost/economics section.
 
@@ -2263,9 +2264,12 @@ def compute_digest_cost_economics(
         else None
     )
 
-    # Compute today's cost for cost ceiling warning
+    # Compute today's cost for cost ceiling warning. The VM figure comes from
+    # task VM-runtime; off-VM compute-job spend is passed in pre-aggregated by
+    # the caller (admin_digest) from the ComputeJob ledger so daily_cost_usd
+    # means total spend, not just VM runtime.
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    daily_cost_usd = round(
+    daily_vm_cost_usd = round(
         sum(
             ((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE)
             * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
@@ -2276,6 +2280,8 @@ def compute_digest_cost_economics(
         ),
         2,
     )
+    daily_compute_cost_usd = round(float(compute_job_daily_cost_usd or 0.0), 2)
+    daily_cost_usd = round(daily_vm_cost_usd + daily_compute_cost_usd, 2)
 
     # Compute overall product_ratio and type_distribution across all directions
     all_product_ratios = [
@@ -2403,6 +2409,8 @@ def compute_digest_cost_economics(
         "provisioning_overhead_usd": provisioning_overhead_usd,
         "provisioning_overhead_pct": provisioning_overhead_pct,
         "daily_cost_usd": daily_cost_usd,
+        "daily_vm_cost_usd": daily_vm_cost_usd,
+        "daily_compute_cost_usd": daily_compute_cost_usd,
         "daily_cost_ceiling_usd": daily_cost_ceiling_usd,
         "overall_product_ratio": overall_product_ratio,
         "median_cost_per_merged_pr": median_cost_per_merged_pr,

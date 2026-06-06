@@ -1569,6 +1569,218 @@ async def test_evaluating_approval_gate_within_window_not_failed(eval_db, mocker
     assert parent.status == TaskStatus.EVALUATING
 
 
+# ── Spend/budget approval holds: clean non-failure decline ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_review_escalation_hold_past_2h_still_fails_and_records(eval_db, mocker):
+    """A review-escalation hold (requires_approval=True, NO approval_hold_reason
+    marker) past the 2h gate must keep today's behavior EXACTLY: FAILED and a
+    failed task result recorded. Absence of the marker preserves the legacy path."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    rec = mocker.patch("app.routers.agent_status.record_task_result")
+
+    project = Project(name="Review Escalation Hold", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "prompt": "review escalation churn"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={"_approval_set_at": _naive_utc_ago(hours=3).isoformat()},
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    # A review-escalation hold IS counted as a task failure.
+    rec.assert_called_once()
+    assert rec.call_args.kwargs.get("success") is False
+
+
+@pytest.mark.asyncio
+async def test_spend_hold_first_sweep_fires_created_alert_and_notification(
+    eval_db, mocker
+):
+    """First sweep over a fresh spend/budget hold (no _approval_set_at) stamps the
+    timer, fires SPEND_HOLD_CREATED + a non-failure WARNING alert once, and leaves
+    the task EVALUATING — it is NOT counted as a failure."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    fail_alert = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    rec = mocker.patch("app.routers.agent_status.record_task_result")
+    notify = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(name="Spend Hold Created", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "large-scope budget mismatch"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={"approval_hold_reason": "spend_budget"},
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    # Still held — operators have the full window to decide.
+    assert parent.status == TaskStatus.EVALUATING
+    assert parent.requires_approval is True
+    assert parent.context.get("_approval_set_at")
+    assert parent.context.get("_spend_hold_created_notified") is True
+    # NOT a failure.
+    fail_alert.assert_not_called()
+    rec.assert_not_called()
+    # Non-failure WARNING alert created.
+    alerts = (
+        (
+            await eval_db.execute(
+                select(Alert).where(Alert.task_id == parent.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    # SPEND_HOLD_CREATED notification dispatched.
+    assert notify.called
+    created_events = [c.args[1] for c in notify.call_args_list]
+    assert "SPEND_HOLD_CREATED" in created_events
+
+
+@pytest.mark.asyncio
+async def test_spend_hold_past_window_declines_cleanly_not_failed(eval_db, mocker):
+    """A spend/budget hold past the configured window resolves to a CLEAN
+    NON-FAILURE CANCELLED terminal: requires_approval cleared, declined message,
+    NOT counted as a task failure (no record_task_result(success=False), no
+    failure alert)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    fail_alert = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    rec = mocker.patch("app.routers.agent_status.record_task_result")
+
+    project = Project(name="Spend Hold Decline", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "large-scope budget mismatch"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={
+            "approval_hold_reason": "spend_budget",
+            # 25h ago — past the default 24h spend window.
+            "_approval_set_at": _naive_utc_ago(hours=25).isoformat(),
+            # Pretend the created/expiring nudges already fired so this sweep
+            # exercises only the decline branch.
+            "_spend_hold_created_notified": True,
+            "_spend_hold_expiring_notified": True,
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.CANCELLED, (
+        f"Expected CANCELLED clean decline, got {parent.status}: "
+        f"{parent.latest_status_message!r}"
+    )
+    assert parent.requires_approval is False
+    assert "declined" in (parent.latest_status_message or "").lower()
+    assert parent.context.get("spend_approval_declined") is True
+    # MUST NOT be counted as a task failure.
+    rec.assert_not_called()
+    fail_alert.assert_not_called()
+    # No failure (ERROR) alert row was created for this task either.
+    alerts = (
+        (
+            await eval_db.execute(
+                select(Alert).where(Alert.task_id == parent.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert all(a.severity != AlertSeverity.ERROR for a in alerts)
+
+
+@pytest.mark.asyncio
+async def test_spend_hold_expiring_notifies_once_within_lead(eval_db, mocker):
+    """A spend/budget hold whose elapsed time is within the warning-lead window
+    (but not yet expired) fires SPEND_HOLD_EXPIRING once and stays EVALUATING."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    notify = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(name="Spend Hold Expiring", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    # Default window 24h; lead = max(24h*0.2, 1h) = 4.8h. 22h elapsed is inside
+    # the lead window (22 >= 24-4.8=19.2) but not expired (< 24).
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "large-scope budget mismatch"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={
+            "approval_hold_reason": "spend_budget",
+            "_approval_set_at": _naive_utc_ago(hours=22).isoformat(),
+            "_spend_hold_created_notified": True,
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    assert parent.context.get("_spend_hold_expiring_notified") is True
+    expiring_events = [c.args[1] for c in notify.call_args_list]
+    assert "SPEND_HOLD_EXPIRING" in expiring_events
+
+    # Idempotent: a second sweep does NOT re-emit the expiring notification.
+    notify.reset_mock()
+    await _check_evaluating_timeouts()
+    expiring_events2 = [c.args[1] for c in notify.call_args_list]
+    assert "SPEND_HOLD_EXPIRING" not in expiring_events2
+
+
 # ── Backstop recovery: supersede long-queued blocking pipeline tasks ──────────
 
 

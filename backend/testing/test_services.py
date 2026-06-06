@@ -33,6 +33,8 @@ from app.models import (
     Alert,
     AlertSeverity,
     DeploymentState,
+    ComputeJob,
+    ComputeJobStatus,
 )
 from app.routers.agent_status import _check_daily_cost_ceiling
 from app.services import (
@@ -1277,6 +1279,101 @@ async def test_cost_ceiling_budget_exceeded_webhook_enriched(cost_db, mocker):
         abs(sum(payload["cost_by_failure_class"].values()) - payload["daily_total_usd"])
         < 0.01
     )
+
+
+def _make_terminal_compute_job(
+    project_id, final_cost_usd, *, stopped_today=True
+) -> ComputeJob:
+    """Build a terminal, costed compute job completed within today (default)."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    completed = now if stopped_today else today_start - timedelta(seconds=1)
+    return ComputeJob(
+        project_id=project_id,
+        backend="local",
+        machine_type="e2-standard-2",
+        status=ComputeJobStatus.SUCCEEDED,
+        final_cost_usd=final_cost_usd,
+        accrued_cost_usd=final_cost_usd,
+        completed_at=completed,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cost_ceiling_alert_when_compute_spend_pushes_over(cost_db, mocker):
+    """Under ceiling on VM alone, but terminal compute-job spend crosses it."""
+    project = await _make_project(cost_db)
+
+    # 1 hour on-demand VM ≈ $0.067 — under a $0.50 ceiling on its own.
+    task = _make_cost_task(project.id, vm_secs=3600, is_spot=False)
+    cost_db.add(task)
+    # Terminal compute-job spend today: $0.60 pushes total over $0.50.
+    cost_db.add(_make_terminal_compute_job(project.id, 0.60))
+    # A still-running job must NOT count toward the ceiling.
+    running = ComputeJob(
+        project_id=project.id,
+        backend="local",
+        machine_type="e2-standard-2",
+        status=ComputeJobStatus.RUNNING,
+        accrued_cost_usd=99.0,
+        final_cost_usd=None,
+        completed_at=None,
+    )
+    cost_db.add(running)
+    await cost_db.commit()
+    await cost_db.refresh(task)
+
+    dispatch_mock = AsyncMock()
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        dispatch_mock,
+    )
+
+    with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 0.50}):
+        await _check_daily_cost_ceiling(task, cost_db)
+
+    await cost_db.flush()
+    alerts = (
+        (await cost_db.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].title == "Daily cost ceiling exceeded"
+
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert dispatch_mock.call_count >= 1
+    payload = dispatch_mock.call_args[0][2]
+    # Additive split keys present; total = VM + compute.
+    assert payload["daily_compute_cost_usd"] == pytest.approx(0.60, abs=0.01)
+    assert 0.06 < payload["daily_vm_cost_usd"] < 0.08
+    assert payload["daily_total_usd"] == pytest.approx(
+        payload["daily_vm_cost_usd"] + payload["daily_compute_cost_usd"], abs=0.01
+    )
+
+
+@pytest.mark.asyncio
+async def test_cost_ceiling_disabled_ignores_compute_spend(cost_db, mocker):
+    """A zero ceiling disables the guard even with terminal compute spend present."""
+    project = await _make_project(cost_db)
+
+    task = _make_cost_task(project.id, vm_secs=3600, is_spot=False)
+    cost_db.add(task)
+    cost_db.add(_make_terminal_compute_job(project.id, 100.0))
+    await cost_db.commit()
+    await cost_db.refresh(task)
+
+    with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 0}):
+        await _check_daily_cost_ceiling(task, cost_db)
+
+    await cost_db.flush()
+    alerts = (
+        (await cost_db.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════

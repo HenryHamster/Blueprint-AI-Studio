@@ -940,6 +940,9 @@ def test_compute_digest_cost_economics_empty():
     assert result["provisioning_overhead_usd"] == 0.0
     assert result["provisioning_overhead_pct"] is None
     assert result["daily_cost_usd"] == 0.0
+    # Default compute-job spend is 0.0, so total == VM == 0.0 and split keys exist.
+    assert result["daily_vm_cost_usd"] == 0.0
+    assert result["daily_compute_cost_usd"] == 0.0
     assert result["daily_cost_ceiling_usd"] == 12.5
     assert result["overall_product_ratio"] is None
     assert result["median_cost_per_merged_pr"] is None
@@ -955,6 +958,35 @@ def test_compute_digest_cost_economics_empty():
     assert "pipeline_generalized_successes" not in result
     assert "pipeline_generalized_health_rate" not in result
     assert "pipeline_outcome_kind_breakdown" not in result
+
+
+def test_compute_digest_cost_economics_includes_compute_job_spend():
+    """compute_job_daily_cost_usd folds into daily_cost_usd as total spend."""
+    from app.routers.admin_analytics import ON_DEMAND_RATE
+
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+    # A task that stopped earlier today (within today_start..now).
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    od_task = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix"}],
+        vm_spot=False,
+        vm_provisioned_at=max(window_start, today_start) + timedelta(seconds=0),
+        vm_stopped_at=max(window_start, today_start) + timedelta(seconds=3600),
+    )
+    result = compute_digest_cost_economics(
+        all_tasks=[od_task],
+        direction_progress_list=[],
+        window_start=window_start,
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+        compute_job_daily_cost_usd=2.5,
+    )
+    expected_vm = round(ON_DEMAND_RATE * 3600, 2)
+    assert result["daily_vm_cost_usd"] == expected_vm
+    assert result["daily_compute_cost_usd"] == 2.5
+    assert result["daily_cost_usd"] == round(expected_vm + 2.5, 2)
 
 
 def test_compute_digest_cost_economics_spot_on_demand_split():

@@ -1638,3 +1638,96 @@ class TestBootDiskType:
         )
         # Disk zone must track the machine-type zone (same insert target).
         assert f"zones/{captured['zone']}/" in captured["machine_type"]
+
+
+@pytest.mark.asyncio
+async def test_get_recent_terminal_compute_spend_terminal_only_and_windowed(db_session):
+    """Helper sums final_cost_usd for terminal, costed jobs in [since, until)."""
+    project = Project(name="Compute Spend Window", user_id="test-user")
+    other = Project(name="Other Project", user_id="test-user")
+    db_session.add_all([project, other])
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(other)
+
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def _job(*, proj_id, status, final_cost, completed_at):
+        return ComputeJob(
+            project_id=proj_id,
+            backend="local",
+            machine_type="e2-standard-2",
+            status=status,
+            final_cost_usd=final_cost,
+            accrued_cost_usd=final_cost or 0.0,
+            completed_at=completed_at,
+        )
+
+    jobs = [
+        # In-window terminal jobs with cost — counted.
+        _job(
+            proj_id=project.id,
+            status=ComputeJobStatus.SUCCEEDED,
+            final_cost=0.50,
+            completed_at=today_start + timedelta(hours=1),
+        ),
+        _job(
+            proj_id=project.id,
+            status=ComputeJobStatus.TIMED_OUT,
+            final_cost=0.25,
+            completed_at=today_start + timedelta(hours=2),
+        ),
+        # Running job (in-flight) — ignored even though it accrued cost.
+        ComputeJob(
+            project_id=project.id,
+            backend="local",
+            machine_type="e2-standard-2",
+            status=ComputeJobStatus.RUNNING,
+            accrued_cost_usd=99.0,
+            final_cost_usd=None,
+            completed_at=None,
+        ),
+        # Terminal but no final_cost_usd — ignored.
+        _job(
+            proj_id=project.id,
+            status=ComputeJobStatus.FAILED,
+            final_cost=None,
+            completed_at=today_start + timedelta(hours=3),
+        ),
+        # Before the window — ignored.
+        _job(
+            proj_id=project.id,
+            status=ComputeJobStatus.SUCCEEDED,
+            final_cost=7.0,
+            completed_at=today_start - timedelta(hours=1),
+        ),
+        # Different project — ignored when scoped.
+        _job(
+            proj_id=other.id,
+            status=ComputeJobStatus.SUCCEEDED,
+            final_cost=4.0,
+            completed_at=today_start + timedelta(hours=1),
+        ),
+    ]
+    db_session.add_all(jobs)
+    await db_session.commit()
+
+    total = await compute_jobs.get_recent_terminal_compute_spend_usd(
+        db_session, project_id=project.id, since=today_start
+    )
+    assert total == pytest.approx(0.75)
+
+    # until is exclusive: a window ending before the 2h job drops it.
+    windowed = await compute_jobs.get_recent_terminal_compute_spend_usd(
+        db_session,
+        project_id=project.id,
+        since=today_start,
+        until=today_start + timedelta(hours=2),
+    )
+    assert windowed == pytest.approx(0.50)
+
+    # project_id=None aggregates across projects (0.75 + 4.0).
+    cross = await compute_jobs.get_recent_terminal_compute_spend_usd(
+        db_session, project_id=None, since=today_start
+    )
+    assert cross == pytest.approx(4.75)

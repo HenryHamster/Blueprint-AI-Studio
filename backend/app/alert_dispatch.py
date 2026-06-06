@@ -322,6 +322,46 @@ async def _maybe_create_failure_alert(
         logger.warning(f"[NOTIFY] TASK_FAILED dispatch setup failed: {_ne}")
 
 
+_SPEND_HOLD_ALERT_TITLE = "Spend/budget approval hold awaiting operator"
+
+
+async def _maybe_create_spend_hold_alert(
+    task: "Task",
+    session: AsyncSession,
+    message: str,
+) -> None:
+    """Create a non-failure WARNING alert when a spend/budget approval hold opens.
+
+    Distinct from ``_maybe_create_failure_alert`` (ERROR / failure semantics): a
+    deliberate spend/budget hold is NOT a failure, so it carries WARNING severity
+    and never records a failed task result. Deduplicates on (task, stable title)
+    so repeated recovery-sweep passes don't create a second row for the same hold.
+    Mirrors the INFO/WARNING alert pattern (e.g. circuit-breaker) — the caller
+    commits the session; this only stages the row and broadcasts ``alert_created``.
+    """
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task.id,
+            Alert.title == _SPEND_HOLD_ALERT_TITLE,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    alert = Alert(
+        project_id=task.project_id,
+        severity=AlertSeverity.WARNING,
+        title=_SPEND_HOLD_ALERT_TITLE,
+        message=message,
+        task_id=task.id,
+    )
+    session.add(alert)
+    await broadcast_to_project(
+        str(task.project_id),
+        "alert_created",
+        {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
+    )
+
+
 # Human-readable labels for the no-CI UNVERIFIED-merge reasons. The orchestrator
 # writes the reason KEY into review_loop["unverified_merge_reason"] at the two
 # UNVERIFIED decision sites, so keep these keys stable. The reason is NOT part of

@@ -137,6 +137,16 @@ runtime_config: Dict = {
     # default cascade-killed otherwise-recoverable children during operator-
     # intervention windows; bumped to 48h while silent-death stabilizes.
     "evaluating_fail_hours": int(os.getenv("EVALUATING_FAIL_HOURS", "48")),
+    # Recovery-sweep window for DELIBERATE spend/budget approval holds
+    # (tasks held with requires_approval=True AND
+    # context.approval_hold_reason="spend_budget"). Distinct from the review-
+    # escalation 2h hard-FAIL: an out-of-band cost decision an operator simply
+    # has not reached is not a pipeline failure, so this window is longer and,
+    # on expiry, resolves to a CLEAN NON-FAILURE CANCELLED terminal (not FAILED).
+    # Default 24h; PATCH endpoint validates 1..168.
+    "spend_approval_timeout_hours": int(
+        os.getenv("SPEND_APPROVAL_TIMEOUT_HOURS", "24")
+    ),
     # Total research tasks (any non-terminal state, *including* EVALUATING)
     # allowed per project. Distinct from max_parallel_research_per_project,
     # which counts only QUEUED/PROVISIONING/IN_PROGRESS — that cap controls
@@ -1036,6 +1046,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "evaluating_pipeline_timeout_minutes",
                     "ci_backstop_timeout_minutes",
                     "evaluating_fail_hours",
+                    "spend_approval_timeout_hours",
                     "max_total_research_per_project",
                     "productive_direction_cooldown_minutes",
                     "next_role_poll_timeout_secs",

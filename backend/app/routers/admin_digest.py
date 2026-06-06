@@ -933,12 +933,23 @@ async def _compute_digest(
         outer_loop_convergence_trend=outer_loop_convergence_trend,
     )
 
+    # Today's settled off-VM compute-job spend so daily_cost_usd reflects total
+    # spend, not just VM runtime. Mirrors the today_start the pure function uses.
+    from app.compute_jobs import get_recent_terminal_compute_spend_usd
+
+    _cost_now = _utcnow()
+    _today_start = _cost_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    compute_job_daily_cost_usd = await get_recent_terminal_compute_spend_usd(
+        session, project_id=project_id, since=_today_start
+    )
+
     _cost_econ = compute_digest_cost_economics(
         all_tasks=all_tasks,
         direction_progress_list=direction_progress_list,
         window_start=window_start,
-        now=_utcnow(),
+        now=_cost_now,
         daily_cost_ceiling_usd=float(_runtime_config.get("daily_cost_ceiling_usd", 0)),
+        compute_job_daily_cost_usd=compute_job_daily_cost_usd,
     )
     total_estimated_cost_usd = _cost_econ["total_estimated_cost_usd"]
     total_spot_cost_usd = _cost_econ["total_spot_cost_usd"]
@@ -1362,6 +1373,8 @@ async def _compute_digest(
         "retry_success_rate_by_class": retry_success_rate_by_class,
         "retry_wasted_rate": retry_wasted_rate,
         "daily_cost_usd": daily_cost_usd,
+        "daily_vm_cost_usd": _cost_econ["daily_vm_cost_usd"],
+        "daily_compute_cost_usd": _cost_econ["daily_compute_cost_usd"],
         "daily_cost_ceiling_usd": daily_cost_ceiling_usd,
         "narrative_summary": narrative_summary,
         "prev_completed_count": prev_completed_count,

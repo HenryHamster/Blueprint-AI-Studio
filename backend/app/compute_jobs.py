@@ -15,9 +15,10 @@ import json
 import logging
 import os
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
+from sqlalchemy import func
 from sqlmodel import select
 
 from app.compute_backends import (
@@ -346,6 +347,42 @@ async def list_compute_jobs(
         .order_by(ComputeJob.created_at.desc())
     )
     return list(result.scalars().all())
+
+
+async def get_recent_terminal_compute_spend_usd(
+    session,
+    *,
+    project_id: uuid.UUID | None,
+    since: datetime,
+    until: datetime | None = None,
+) -> float:
+    """Sum ``final_cost_usd`` over terminal compute jobs in a time window.
+
+    The single source of truth for "how much off-VM compute did we spend
+    recently". Counts only jobs that have reached a terminal status
+    (``_COMPUTE_JOB_TERMINAL_STATUSES``) and carry a recorded
+    ``final_cost_usd``, whose ``completed_at`` falls in ``[since, until)``
+    (``until`` is exclusive; omit it for an open-ended upper bound). In-flight
+    jobs — non-terminal status, no ``completed_at``, or ``final_cost_usd``
+    still ``None`` — are ignored so the figure reflects settled spend only.
+    Scoped to ``project_id`` when provided; ``None`` aggregates across projects.
+    """
+    conditions = [
+        ComputeJob.status.in_(_COMPUTE_JOB_TERMINAL_STATUSES),
+        ComputeJob.completed_at.is_not(None),
+        ComputeJob.completed_at >= since,
+        ComputeJob.final_cost_usd.is_not(None),
+    ]
+    if project_id is not None:
+        conditions.append(ComputeJob.project_id == project_id)
+    if until is not None:
+        conditions.append(ComputeJob.completed_at < until)
+    result = await session.execute(
+        select(func.coalesce(func.sum(ComputeJob.final_cost_usd), 0.0)).where(
+            *conditions
+        )
+    )
+    return float(result.scalar_one() or 0.0)
 
 
 async def active_compute_job_vm_ids(session) -> set[str]:

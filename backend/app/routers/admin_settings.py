@@ -132,6 +132,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "residual_audit_defer_escalation_threshold",
         "residual_remediation_cooldown_hours",
         "smoketest_enabled",
+        "spend_approval_timeout_hours",
         "strategic_max_interval_minutes",
         "strategic_research_frequency",
         "task_type_categories",
@@ -249,6 +250,8 @@ def _build_notification_config_response(config: dict, *, is_admin: bool) -> dict
                 "RESIDUAL_FIX_ESCALATED",
                 "DIRECTION_BURN_PAUSE",
                 "MERGE_UNVERIFIED",
+                "SPEND_HOLD_CREATED",
+                "SPEND_HOLD_EXPIRING",
             ],
         ),
         "throttle_seconds": config.get("throttle_seconds", 30),
@@ -350,6 +353,9 @@ async def get_settings(
             "evaluating_pipeline_timeout_minutes", 120
         ),
         "evaluating_fail_hours": _runtime_config.get("evaluating_fail_hours", 48),
+        "spend_approval_timeout_hours": _runtime_config.get(
+            "spend_approval_timeout_hours", 24
+        ),
         "ci_backstop_timeout_minutes": _runtime_config.get(
             "ci_backstop_timeout_minutes", 60
         ),
@@ -468,6 +474,8 @@ async def get_settings(
                         "RESIDUAL_FIX_ESCALATED",
                         "DIRECTION_BURN_PAUSE",
                         "MERGE_UNVERIFIED",
+                        "SPEND_HOLD_CREATED",
+                        "SPEND_HOLD_EXPIRING",
                     ],
                     "throttle_seconds": 30,
                 },
@@ -792,6 +800,23 @@ async def _apply_settings(
                 detail="evaluating_fail_hours must be between 1 and 168",
             )
         _runtime_config["evaluating_fail_hours"] = val
+    if "spend_approval_timeout_hours" in payload:
+        try:
+            val = int(payload["spend_approval_timeout_hours"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="spend_approval_timeout_hours must be a number",
+            )
+        # Deliberate spend/budget holds get a longer, out-of-band window than
+        # the review-escalation 2h gate. Cap at 168h (1 week) like
+        # evaluating_fail_hours; min 1h.
+        if not (1 <= val <= 168):
+            raise HTTPException(
+                status_code=400,
+                detail="spend_approval_timeout_hours must be between 1 and 168",
+            )
+        _runtime_config["spend_approval_timeout_hours"] = val
     if "max_total_research_per_project" in payload:
         try:
             val = int(payload["max_total_research_per_project"])
@@ -1857,6 +1882,13 @@ async def _apply_settings(
                 # fallback). The operator who turned off required CI checks needs to
                 # know when a merge proceeds without tests, so it is default-on.
                 "MERGE_UNVERIFIED",
+                # A task was held out of dispatch for a DELIBERATE spend/budget
+                # decision (requires_approval + approval_hold_reason="spend_budget").
+                # CREATED fires when the hold is first seen; EXPIRING fires once as
+                # the configured spend_approval_timeout_hours window nears its end.
+                # Both are operator-actionable, so they join the default-on list.
+                "SPEND_HOLD_CREATED",
+                "SPEND_HOLD_EXPIRING",
             ]
         )
         enabled_events = val.get(
@@ -1870,6 +1902,8 @@ async def _apply_settings(
                 "RESIDUAL_FIX_ESCALATED",
                 "DIRECTION_BURN_PAUSE",
                 "MERGE_UNVERIFIED",
+                "SPEND_HOLD_CREATED",
+                "SPEND_HOLD_EXPIRING",
             ],
         )
         if not isinstance(enabled_events, list):
@@ -2061,6 +2095,9 @@ async def _apply_settings(
                     "ci_backstop_timeout_minutes": _runtime_config.get(
                         "ci_backstop_timeout_minutes", 60
                     ),
+                    "spend_approval_timeout_hours": _runtime_config.get(
+                        "spend_approval_timeout_hours", 24
+                    ),
                     "max_total_research_per_project": _runtime_config.get(
                         "max_total_research_per_project", 5
                     ),
@@ -2174,6 +2211,8 @@ async def _apply_settings(
                                 "RESIDUAL_FIX_ESCALATED",
                                 "DIRECTION_BURN_PAUSE",
                                 "MERGE_UNVERIFIED",
+                                "SPEND_HOLD_CREATED",
+                                "SPEND_HOLD_EXPIRING",
                             ],
                             "throttle_seconds": 30,
                         },

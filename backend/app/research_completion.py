@@ -106,6 +106,7 @@ from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/call
     _poor_decomp_history,
     predict_spawn_success,
     check_scope_budget_mismatch,
+    SPEND_BUDGET_APPROVAL_HOLD_REASON,
 )
 from app.task_completion import (
     _extract_json_array,
@@ -2985,6 +2986,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 **(
                     {"scope_budget_warning": _scope_budget_warning}
                     if _scope_budget_warning
+                    else {}
+                ),
+                # Record WHY this task is held out of dispatch when the
+                # scope-budget gate set requires_approval=True: this is a
+                # deliberate SPEND/BUDGET decision (large scope far over the
+                # file budget needs operator confirmation), NOT a review-
+                # pipeline escalation. The recovery sweep reads this marker to
+                # apply the longer, operator-configurable window and resolve to
+                # a clean non-failure CANCELLED terminal rather than 2h→FAILED.
+                # Reuse SPEND_BUDGET_APPROVAL_HOLD_REASON for any future
+                # spend-threshold hold (e.g. compute_experiment) — see the
+                # marker-convention note in spawn_calibration.py.
+                **(
+                    {"approval_hold_reason": SPEND_BUDGET_APPROVAL_HOLD_REASON}
+                    if _budget_requires_approval
                     else {}
                 ),
                 **(

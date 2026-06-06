@@ -195,6 +195,18 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
         secs = (task.vm_stopped_at - task.vm_provisioned_at).total_seconds()
         daily_total += secs * (SPOT_RATE if task.vm_spot else ON_DEMAND_RATE)
 
+    vm_total = daily_total
+
+    # Off-VM compute jobs accrue their own durable spend ledger. Fold today's
+    # settled (terminal, costed) compute-job spend into the daily total so the
+    # ceiling reflects total project spend, not just agent-VM runtime.
+    from app.compute_jobs import get_recent_terminal_compute_spend_usd
+
+    compute_total = await get_recent_terminal_compute_spend_usd(
+        session, project_id=task.project_id, since=today_start
+    )
+    daily_total = vm_total + compute_total
+
     if daily_total <= ceiling:
         return
 
@@ -221,7 +233,10 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
         project_id=task.project_id,
         severity=AlertSeverity.WARNING,
         title=alert_title,
-        message=f"Daily VM cost ${daily_total:.2f} exceeds ceiling ${ceiling:.2f}.",
+        message=(
+            f"Daily total spend ${daily_total:.2f} exceeds ceiling ${ceiling:.2f} "
+            f"(VM ${vm_total:.2f} + compute ${compute_total:.2f})."
+        ),
     )
     session.add(alert)
     await broadcast_to_project(
@@ -231,7 +246,8 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
     )
     logger.warning(
         f"[COST] Daily cost ceiling exceeded for project {task.project_id}: "
-        f"${daily_total:.2f} > ${ceiling:.2f}"
+        f"total ${daily_total:.2f} > ${ceiling:.2f} "
+        f"(VM ${vm_total:.2f} + compute ${compute_total:.2f})"
     )
     try:
         from app.notification_dispatch import dispatch_external_notification
@@ -294,6 +310,8 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
                 {
                     "task_id": str(task.id),
                     "daily_total_usd": round(daily_total, 2),
+                    "daily_vm_cost_usd": round(vm_total, 2),
+                    "daily_compute_cost_usd": round(compute_total, 2),
                     "ceiling_usd": round(ceiling, 2),
                     "direction_text": direction_text[:200],
                     "cost_by_failure_class": cost_by_failure_class,
