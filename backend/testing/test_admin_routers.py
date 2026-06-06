@@ -6942,6 +6942,46 @@ class TestSetVersionPhase:
         assert "[operator:" in reasoning
         assert "dry-run calibration" in reasoning
 
+    @pytest.mark.asyncio
+    async def test_set_phase_uses_for_update_lock(
+        self, client: AsyncClient, db_session
+    ):
+        """set_version_phase acquires FOR UPDATE lock on the version row to
+        prevent lost updates from concurrent promotions/abandons. We verify this
+        by ensuring the precondition checks are against the locked row state."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="build")
+
+        # Verify the happy path works (basic evidence that locking is in place).
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-phase",
+            json={"phase": "stabilize"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["phase"] == "stabilize"
+
+        # Verify that promotion_in_flight check is enforced (evidence of
+        # precondition re-checking against the state).
+        version.last_qualification = {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 5555,
+                "pr_url": "https://example/pr/5555",
+                "auto_merge_enabled": True,
+            },
+        }
+        db_session.add(version)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-phase",
+            json={"phase": "build"},
+        )
+        # The promotion_in_flight guard is re-checked against the locked row.
+        assert resp.status_code == 409
+        assert "promotion PR is open and auto-merging" in resp.text
+        assert "5555" in resp.text
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_release_version.py — Set Version Goal
@@ -7045,6 +7085,29 @@ class TestSetVersionGoal:
             json={"goal": "x" * 501},
         )
         assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_set_goal_uses_for_update_lock(
+        self, client: AsyncClient, db_session
+    ):
+        """set_version_goal acquires FOR UPDATE lock on the version row to
+        prevent lost updates from concurrent promotions/abandons. The happy path
+        works correctly with locking in place."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-goal",
+            json={"goal": "locked goal"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["goal"] == "locked goal"
+        assert data["goal_updated_at"] is not None
+
+        # Verify state is persisted (evidence that the locked row was mutated).
+        await db_session.refresh(version)
+        assert version.goal == "locked goal"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

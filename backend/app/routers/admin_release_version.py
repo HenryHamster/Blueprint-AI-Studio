@@ -343,7 +343,25 @@ async def set_version_phase(
         project_id, current_user["user_id"], session, "member"
     )
 
-    open_ver = await _release_version.current_open_version(session, project_id)
+    # Acquire the open version under FOR UPDATE lock, then re-check preconditions
+    # against the freshly-locked row. Between the initial read and this lock,
+    # a concurrent promotion/abandon could have changed the version's state.
+    open_ver = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "open",
+                )
+                .order_by(ReleaseVersion.opened_at.desc())
+                .limit(1)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
     if open_ver is None:
         raise HTTPException(
             status_code=404,
@@ -358,6 +376,7 @@ async def set_version_phase(
     # predicate. (Only the operator endpoint guards this — the internal
     # set_version_phase helper stays open for finalize/sweep/promotion flows that
     # legitimately flip phase mid-promotion.)
+    # Re-check this against the LOCKED row's last_qualification, not a stale read.
     _qual_state = _release_version.summarize_qualification_state(
         open_ver.last_qualification
     )
@@ -418,7 +437,25 @@ async def set_version_goal(
         project_id, current_user["user_id"], session, "member"
     )
 
-    open_ver = await _release_version.current_open_version(session, project_id)
+    # Acquire the open version under FOR UPDATE lock, then re-check preconditions
+    # against the freshly-locked row. Between the initial read and this lock,
+    # a concurrent promotion/abandon could have changed the version's state.
+    open_ver = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "open",
+                )
+                .order_by(ReleaseVersion.opened_at.desc())
+                .limit(1)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
     if open_ver is None:
         raise HTTPException(
             status_code=404,
