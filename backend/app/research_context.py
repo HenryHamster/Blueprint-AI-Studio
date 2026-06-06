@@ -155,8 +155,8 @@ def _parse_established_entry(entry_text: str) -> dict:
     source_refs: list = []
     status: str = "established"
 
-    # Extract status tag: (proposed), (merged), (failed: category)
-    status_m = re.search(r"\((proposed|merged|failed:[^)]*)\)", entry_text)
+    # Extract status tag: (proposed), (merged), (stale), (failed: category)
+    status_m = re.search(r"\((proposed|merged|stale|failed:[^)]*)\)", entry_text)
     if status_m:
         status = status_m.group(1).strip()
 
@@ -165,7 +165,7 @@ def _parse_established_entry(entry_text: str) -> dict:
     if scope_m:
         title = scope_m.group(1).strip()
     else:
-        paren_m = re.search(r"\s*\((?:proposed|merged|failed)", entry_text)
+        paren_m = re.search(r"\s*\((?:proposed|merged|stale|failed)", entry_text)
         if paren_m:
             title = entry_text[: paren_m.start()].strip()
 
@@ -188,11 +188,13 @@ def _parse_established_entry(entry_text: str) -> dict:
 
 
 def _apply_prior_outcomes(established: list, prior_history: list) -> list:
-    """Retag '(proposed)' entries as '(merged)' or '(failed: CATEGORY)' from prior outcomes.
+    """Retag '(proposed)' entries from prior outcomes.
 
     Matches the title prefix of each established entry against prior cycles'
-    finding_titles and failed_task_details so agents can see which findings
-    actually shipped vs failed.
+    finding_titles and failed_task_details / no_op_task_details so agents can
+    see which findings actually shipped ('(merged)'), failed
+    ('(failed: CATEGORY)'), or no-op'd as already-resolved / non-reproducing on
+    HEAD ('(stale)'). failed/merged take precedence over stale.
     """
     if not prior_history:
         return established
@@ -203,6 +205,17 @@ def _apply_prior_outcomes(established: list, prior_history: list) -> list:
             (f.get("title") or "").strip(): (f.get("category") or "")
             for f in failed
             if f.get("title")
+        }
+        # Affirmative-no-op findings: the only child task no-op'd as
+        # already-resolved / non-reproducing on HEAD. Tagged '(stale)' so the
+        # research agent stops re-chasing a defect that was already gone.
+        # failed/merged take precedence (handled by the 'tn in outcomes' /
+        # ordering below), so a finding that also failed or shipped keeps that tag.
+        no_op = entry.get("no_op_task_details") or []
+        no_op_map = {
+            (n.get("title") or "").strip()
+            for n in no_op
+            if n.get("title")
         }
         prs_merged = entry.get("prs_merged", 0) or 0
         # 'settled' tracks whether every created task reached a terminal state
@@ -226,6 +239,8 @@ def _apply_prior_outcomes(established: list, prior_history: list) -> list:
                 outcomes[tn] = f"failed: {cat}"
             elif settled and verified_merged > 0:
                 outcomes[tn] = "merged"
+            elif tn in no_op_map:
+                outcomes[tn] = "stale"
     if not outcomes:
         return established
     updated = []
@@ -452,7 +467,8 @@ def filter_direction_evidence(
     """Filter recent_findings_evidence to merged/proposed findings only.
 
     Cross-references titles against research_context status tags. Findings with
-    status starting with 'failed' are excluded. Returns capped evidence entries.
+    status starting with 'failed' or equal to 'stale' (already-resolved /
+    non-reproducing on HEAD) are excluded. Returns capped evidence entries.
     """
     if not raw_evidence:
         return []
@@ -467,7 +483,10 @@ def filter_direction_evidence(
     for ev in raw_evidence:
         title = (ev.get("title") or "").strip()
         status = status_map.get(title, "proposed")
-        if status.startswith("failed"):
+        # Exclude proven-failed AND proven-stale (already-resolved / non-
+        # reproducing on HEAD) findings so they are not re-surfaced as fresh
+        # evidence the strategist would chase again.
+        if status.startswith("failed") or status == "stale":
             continue
         entry = {
             "title": title,

@@ -605,6 +605,30 @@ async def _update_direction_research_outcomes(
     entry["tasks_failed_infra"] = infra_failures
     entry["taxonomy_summary"] = taxonomy_summary
 
+    # Capture affirmative-no-op task details (mirror of failed_task_details) so
+    # the research layer can tell "we already tried this and the defect was gone"
+    # from "this is new and unattempted". A child that COMPLETED with a verified
+    # ``no_op_reason`` (the agent ran ``./done --already-done`` because the cited
+    # defect was absent / already resolved on HEAD) is scored neutral — neither a
+    # merged success nor a failure. We record title + the (truncated) reason so
+    # the prior-outcomes retagger can mark the originating finding '(stale)'.
+    # Merged completions are excluded so a finding that also shipped a verified
+    # fix keeps its merged tag, not a stale one.
+    no_op_details = []
+    for ct in child_tasks_rows:
+        if ct.status != TaskStatus.COMPLETED:
+            continue
+        no_op_reason = (ct.context or {}).get("no_op_reason")
+        if not no_op_reason or is_merged_completion(ct):
+            continue
+        no_op_details.append(
+            {
+                "title": ct.title or "",
+                "no_op_reason": str(no_op_reason)[:120],
+            }
+        )
+    entry["no_op_task_details"] = no_op_details[:5]  # cap at 5 to avoid bloat
+
     # Stage dropout: per-cycle breakdown of why tasks didn't reach main
     sd_code_error = 0
     sd_infra = 0
@@ -1091,6 +1115,18 @@ async def _update_direction_research_outcomes(
                         new_established.append(
                             item.replace("(proposed)", "(confirmed)")
                         )
+                    else:
+                        new_established.append(item)
+                parsed["established"] = new_established
+            elif (ct.context or {}).get("no_op_reason"):
+                # Affirmative no-op (./done --already-done): the cited defect was
+                # absent / already resolved on HEAD. Retag the matching proposed
+                # finding to (stale) so this cycle's context already reflects that
+                # the area was clean and the research agent won't re-chase it.
+                new_established = []
+                for item in parsed["established"]:
+                    if title.lower() in item.lower() and "(proposed)" in item:
+                        new_established.append(item.replace("(proposed)", "(stale)"))
                     else:
                         new_established.append(item)
                 parsed["established"] = new_established

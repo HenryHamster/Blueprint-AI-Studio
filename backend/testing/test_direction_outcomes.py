@@ -4128,3 +4128,141 @@ async def test_verified_prs_merged_excludes_degraded(db_session: AsyncSession):
     assert entry["prs_merged"] == 3
     # Only verified + benign count as verified merges (degraded excluded).
     assert entry["verified_prs_merged"] == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# no_op_task_details — affirmative no-op (already-resolved / non-reproducing)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_no_op_task_details_populated(db_session: AsyncSession):
+    """A COMPLETED child with a no_op_reason populates no_op_task_details."""
+    direction_id = "d-noop"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
+    await db_session.flush()
+
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"no_op_reason": "defect already resolved on HEAD"},
+        title="stale-finding",
+    )
+    # A plain COMPLETED child with no no_op_reason must NOT appear.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={},
+        title="plain-complete",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["no_op_task_details"] == [
+        {"title": "stale-finding", "no_op_reason": "defect already resolved on HEAD"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_no_op_task_details_excludes_merged_and_failed(
+    db_session: AsyncSession,
+):
+    """A merged-and-no-op'd child keeps its merge (no stale); failed is excluded."""
+    direction_id = "d-noop-excl"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
+    await db_session.flush()
+
+    # Merged completion that also carries a no_op_reason must NOT be tallied as
+    # a no-op (a verified merge keeps its merged tag).
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "no_op_reason": "should be ignored"},
+        title="merged-finding",
+    )
+    # A FAILED child with a no_op_reason is not COMPLETED — excluded.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={"no_op_reason": "irrelevant"},
+        title="failed-finding",
+        latest_status_message="boom",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["no_op_task_details"] == []
+
+
+@pytest.mark.asyncio
+async def test_no_op_task_details_capped_and_truncated(db_session: AsyncSession):
+    """no_op_task_details caps at 5 entries and truncates reason to 120 chars."""
+    direction_id = "d-noop-cap"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=7)
+    ]
+    await db_session.flush()
+
+    long_reason = "Y" * 200
+    for i in range(7):
+        await _create_child_task(
+            db_session,
+            research_task.id,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            context={"no_op_reason": long_reason},
+            title=f"noop-{i}",
+        )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert len(entry["no_op_task_details"]) == 5
+    assert all(len(d["no_op_reason"]) == 120 for d in entry["no_op_task_details"])

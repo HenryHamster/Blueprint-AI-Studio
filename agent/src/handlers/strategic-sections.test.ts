@@ -573,6 +573,61 @@ describe('buildOpenMessagesText', () => {
     expect(result).toContain('id: x1');
     expect(result).toContain('hello');
   });
+
+  it('renders a STALE warning naming broken and ungrounded refs for an absent-citation bug report', () => {
+    const result = buildOpenMessagesText([
+      {
+        id: 'b1',
+        type: 'BUG_REPORT',
+        content: 'something is broken',
+        from: 'agent',
+        created_at: new Date().toISOString(),
+        citation_state: 'absent',
+        broken_refs: ['backend/app/x.py'],
+        ungrounded_refs: ['backend/app/y.py:foo'],
+      },
+    ]);
+    expect(result).toContain('⚠ STALE');
+    expect(result).toContain('files backend/app/x.py');
+    expect(result).toContain('symbols backend/app/y.py:foo');
+    expect(result).toContain('do NOT route into a fix/investigation');
+    // base line still rendered unchanged
+    expect(result).toContain('[BUG_REPORT]');
+    expect(result).toContain('id: b1');
+  });
+
+  it('does NOT render a STALE warning for a message with no citation_state', () => {
+    const result = buildOpenMessagesText([
+      { id: 'x2', type: 'BUG_REPORT', content: 'still broken', from: 'agent', created_at: new Date().toISOString() },
+    ]);
+    expect(result).not.toContain('STALE');
+    expect(result).toContain('[BUG_REPORT]');
+  });
+
+  it('does NOT render a STALE warning for a present citation_state', () => {
+    const result = buildOpenMessagesText([
+      { id: 'x3', type: 'BUG_REPORT', content: 'present', from: 'agent', created_at: new Date().toISOString(), citation_state: 'present' },
+    ]);
+    expect(result).not.toContain('STALE');
+  });
+
+  it('renders the STALE marker without a ref list when ref arrays are empty', () => {
+    const result = buildOpenMessagesText([
+      {
+        id: 'b2',
+        type: 'BLOCKER',
+        content: 'gone',
+        from: 'agent',
+        created_at: new Date().toISOString(),
+        citation_state: 'absent',
+        broken_refs: [],
+        ungrounded_refs: [],
+      },
+    ]);
+    expect(result).toContain('⚠ STALE — cited code gone on HEAD.');
+    expect(result).not.toContain('files ');
+    expect(result).not.toContain('symbols ');
+  });
 });
 
 describe('buildDirSummaryText', () => {
