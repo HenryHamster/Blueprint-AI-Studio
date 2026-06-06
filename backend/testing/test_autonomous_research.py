@@ -2029,6 +2029,167 @@ async def test_pipelined_spawn_claims_distinct_key_alongside_stuck_parent(db_ses
     )
 
 
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="direction-spawn advisory lock coverage requires PostgreSQL",
+)
+@pytest.mark.asyncio
+async def test_pipelined_holder_blocks_later_primary_claim_under_direction_lock(
+    db_session,
+):
+    """Regression for the remaining primary-vs-pipelined race: once a
+    pipelined research task has committed under ``...:pipelined``, a later
+    primary claimant on the same direction must serialize on the shared
+    direction lock and re-read current state before inserting.
+
+    This models the manual ``POST /research`` / autonomous-primary
+    read-before-write path after a pipelined child exists but no active primary
+    claim-holder remains. Without the lock, the later primary insert can miss
+    the already-committed pipelined task and create a duplicate active cycle
+    because ``ux_task_active_idempotency_key`` only compares exact key strings.
+    """
+    import asyncio
+
+    from app.autonomous_research import research_direction_claim_key
+    from app.task_locking import acquire_direction_research_spawn_lock
+
+    # IMPORTANT: import the canonical pytest-loaded module, not
+    # testing.conftest; see test_concurrent_spawn_ticks_create_exactly_one_...
+    from conftest import TestingSessionLocal
+
+    project = Project(
+        name="Pipelined Holder Blocks Primary",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-pipelock1")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    holder_has_lock = asyncio.Event()
+    release_holder = asyncio.Event()
+    commit_finished = asyncio.Event()
+
+    async def _commit_pipelined_holder():
+        async with TestingSessionLocal() as session:
+            await acquire_direction_research_spawn_lock(
+                session, project.id, "d-pipelock1"
+            )
+            holder = Task(
+                project_id=project.id,
+                title="Research: pipelined holder",
+                payloads=[
+                    {
+                        "type": "research",
+                        "directions": [],
+                        "base_branch": "main",
+                        "current_direction_id": "d-pipelock1",
+                    }
+                ],
+                status=TaskStatus.IN_PROGRESS,
+                created_by="ORCHESTRATOR",
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                idempotency_key=research_direction_claim_key(
+                    project.id, "d-pipelock1", pipelined=True
+                ),
+            )
+            session.add(holder)
+            await session.flush()
+            holder_has_lock.set()
+            await release_holder.wait()
+            await session.commit()
+            commit_finished.set()
+
+    async def _manual_like_primary_attempt() -> str:
+        async with TestingSessionLocal() as session:
+            await acquire_direction_research_spawn_lock(
+                session, project.id, "d-pipelock1"
+            )
+            active_rows = (
+                (
+                    await session.execute(
+                        select(Task).where(
+                            Task.project_id == project.id,
+                            Task.status.in_(
+                                [
+                                    TaskStatus.QUEUED,
+                                    TaskStatus.PROVISIONING,
+                                    TaskStatus.IN_PROGRESS,
+                                    TaskStatus.EVALUATING,
+                                    TaskStatus.BLOCKED,
+                                ]
+                            ),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            same_direction = [
+                task
+                for task in active_rows
+                if task.first_payload.get("type") == "research"
+                and task.first_payload.get("current_direction_id") == "d-pipelock1"
+            ]
+            if same_direction:
+                await session.rollback()
+                return "blocked"
+            session.add(
+                Task(
+                    project_id=project.id,
+                    title="Research: primary claimant",
+                    payloads=[
+                        {
+                            "type": "research",
+                            "directions": [],
+                            "base_branch": "main",
+                            "current_direction_id": "d-pipelock1",
+                        }
+                    ],
+                    status=TaskStatus.QUEUED,
+                    created_by="USER",
+                    vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                    idempotency_key=research_direction_claim_key(
+                        project.id, "d-pipelock1"
+                    ),
+                )
+            )
+            await session.commit()
+            return "inserted"
+
+    holder_task = asyncio.create_task(_commit_pipelined_holder())
+    await holder_has_lock.wait()
+
+    primary_task = asyncio.create_task(_manual_like_primary_attempt())
+    await asyncio.sleep(0.1)
+    release_holder.set()
+
+    result = await primary_task
+    await commit_finished.wait()
+    await holder_task
+
+    assert result == "blocked"
+
+    rows = await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )
+    research = [
+        task
+        for task in rows.scalars().all()
+        if task.first_payload.get("type") == "research"
+        and task.first_payload.get("current_direction_id") == "d-pipelock1"
+    ]
+    assert len(research) == 1, (
+        "A committed pipelined holder must block a later primary claimant on "
+        "the same direction under the shared advisory lock."
+    )
+    assert research[0].idempotency_key == research_direction_claim_key(
+        project.id, "d-pipelock1", pipelined=True
+    )
+
+
 @pytest.mark.asyncio
 async def test_failed_resurrection_eligible_blocks_direction(db_session):
     """Regression for race 2026-05-05 (3d4bc05a + 88c7d5c8 on d-3878da01):

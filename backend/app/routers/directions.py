@@ -25,7 +25,11 @@ from app.models import (
 from app.auth import get_current_user
 from app.admin import _get_user_project, _get_user_project_with_role
 from app.payload_schemas import validate_internal_payload
-from app.task_locking import lock_project_or_429, with_directions_locked
+from app.task_locking import (
+    acquire_direction_research_spawn_lock,
+    lock_project_or_429,
+    with_directions_locked,
+)
 from app.direction_lifecycle import _reset_outcome_detection_state
 from app.strategic_events import STRATEGIC_KIND_DIRECTIONS, emit_strategic_updated
 from app.problem_model import compute_model_size_signal, ProblemModel
@@ -993,6 +997,12 @@ async def create_direction_research_task(
         get_project_integration_branch as _get_project_integration_branch,
     )
     from app.shared_state import runtime_config as _runtime_config
+    from app.autonomous_research import research_direction_claim_key
+
+    # Serialize same-direction spawns before the in-flight scan so a
+    # concurrently-committing pipelined research task can never slip between
+    # the read guard and this handler's insert under a different claim key.
+    await acquire_direction_research_spawn_lock(session, project.id, direction_id)
 
     # In-flight guard: never spawn a second research on a direction that already
     # has one in progress. Two concurrent research cycles produce two rollup PRs
@@ -1013,6 +1023,7 @@ async def create_direction_research_task(
                             TaskStatus.PROVISIONING,
                             TaskStatus.IN_PROGRESS,
                             TaskStatus.EVALUATING,
+                            TaskStatus.BLOCKED,
                         ]
                     ),
                 )
@@ -1087,8 +1098,6 @@ async def create_direction_research_task(
     # never BOTH create an active research cycle on this direction. The in-app
     # scan above is only the friendly fast path; the partial unique index
     # ux_task_active_idempotency_key is the concurrency-safe backstop.
-    from app.autonomous_research import research_direction_claim_key
-
     idempotency_key = research_direction_claim_key(project.id, direction_id)
     new_task = Task(
         project_id=project.id,

@@ -35,7 +35,10 @@ from app.shared_state import (
 )
 from app.max_plan_pool import _max_plan_pools, _account_available_for_model
 from app.task_capabilities import STRATEGIC_TASK_TYPES
-from app.task_locking import with_vision_locked
+from app.task_locking import (
+    acquire_direction_research_spawn_lock,
+    with_vision_locked,
+)
 from app.time_utils import _utcnow
 from app.direction_mode import (
     append_prompt_suffix,
@@ -1962,6 +1965,111 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 f"[AUTONOMOUS] Injecting {len(dir_deferred)} deferred finding(s) from previous "
                 f"research cycle(s) into new research task for direction {current_dir_id or 'undirected'}"
             )
+
+        await acquire_direction_research_spawn_lock(
+            session, project.id, current_dir_id
+        )
+        if current_dir_id is not None:
+            locked_direction_research = [
+                task
+                for task in (
+                    (
+                        await session.execute(
+                            select(Task).where(
+                                Task.project_id == project.id,
+                                Task.status.in_(
+                                    [
+                                        TaskStatus.QUEUED,
+                                        TaskStatus.PROVISIONING,
+                                        TaskStatus.IN_PROGRESS,
+                                        TaskStatus.EVALUATING,
+                                        TaskStatus.BLOCKED,
+                                    ]
+                                ),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                if task.first_payload.get("type") == "research"
+                and task.first_payload.get("current_direction_id") == current_dir_id
+            ]
+            is_pipelined_spawn = current_dir_id in pipelined_direction_ids
+            if is_pipelined_spawn:
+                if len(locked_direction_research) != 1:
+                    logger.info(
+                        "[AUTONOMOUS] Skipping pipelined research for project %s "
+                        "direction %s under lock — expected one stuck parent, found %s active task(s)",
+                        project.id,
+                        current_dir_id,
+                        len(locked_direction_research),
+                    )
+                    continue
+                locked_parent = locked_direction_research[0]
+                if locked_parent.status != TaskStatus.EVALUATING:
+                    logger.info(
+                        "[AUTONOMOUS] Skipping pipelined research for project %s "
+                        "direction %s under lock — active holder is %s, not stale EVALUATING",
+                        project.id,
+                        current_dir_id,
+                        locked_parent.status,
+                    )
+                    continue
+                locked_updated = locked_parent.updated_at
+                if locked_updated is not None and locked_updated.tzinfo is not None:
+                    locked_updated = locked_updated.replace(tzinfo=None)
+                if locked_updated is None or (
+                    (now - locked_updated).total_seconds() / 60
+                ) < evaluating_timeout_minutes:
+                    logger.info(
+                        "[AUTONOMOUS] Skipping pipelined research for project %s "
+                        "direction %s under lock — parent is no longer stale enough",
+                        project.id,
+                        current_dir_id,
+                    )
+                    continue
+                locked_parent_has_active_children = (
+                    (
+                        await session.execute(
+                            select(Task.id).where(
+                                Task.parent_task_id == locked_parent.id,
+                                Task.status.in_(
+                                    [
+                                        TaskStatus.QUEUED,
+                                        TaskStatus.PROVISIONING,
+                                        TaskStatus.IN_PROGRESS,
+                                        TaskStatus.EVALUATING,
+                                    ]
+                                ),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .first()
+                    is not None
+                )
+                locked_parent_has_open_pr = bool(
+                    ((locked_parent.context or {}).get("review_loop") or {}).get(
+                        "pr_number"
+                    )
+                )
+                if locked_parent_has_active_children or locked_parent_has_open_pr:
+                    logger.info(
+                        "[AUTONOMOUS] Skipping pipelined research for project %s "
+                        "direction %s under lock — parent resumed progress",
+                        project.id,
+                        current_dir_id,
+                    )
+                    continue
+            elif locked_direction_research:
+                logger.info(
+                    "[AUTONOMOUS] Skipping research for project %s direction %s "
+                    "under lock — a concurrent task already holds the direction",
+                    project.id,
+                    current_dir_id,
+                )
+                continue
 
         new_task = Task(
             project_id=project.id,
