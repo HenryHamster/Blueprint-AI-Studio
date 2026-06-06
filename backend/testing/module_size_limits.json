@@ -106,7 +106,7 @@
     "handlers/specialized.ts": 800,
     "handlers/audits.ts": 700,
     "handlers/memo.ts": 400,
-    "handlers/code-change.ts": 450,
+    "handlers/code-change.ts": 600,
     "prompts/discovery.ts": 750,
     "prompts/project-context.ts": 850,
     "prompts/self-review.ts": 500,
