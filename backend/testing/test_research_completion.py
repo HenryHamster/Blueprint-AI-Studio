@@ -1492,6 +1492,18 @@ class TestProvenanceWarningsAttachment:
             ("app.research_completion._summarize_ungrounded_claims_grounded", None),
         ):
             mocker.patch(path, new=AsyncMock(return_value=value))
+        # The deferred-recovery flow re-grounds cited FILE refs against HEAD
+        # (reproduce-on-HEAD gate). These provenance tests cite placeholder paths
+        # that are absent on HEAD, which would trip the gate and reject the finding
+        # before it spawns its child. Echo the sources back unchanged (no
+        # ``valid: False`` stamp → counted present) so the finding survives the
+        # gate and we exercise only the staleness-provenance propagation under
+        # test here. The gate's own absent-rejection behavior is covered by
+        # TestReproduceOnHeadGate.
+        mocker.patch(
+            "app.research_completion.validate_source_refs",
+            new=AsyncMock(side_effect=lambda sources, **kwargs: sources),
+        )
 
         await _handle_research_completion(task, "", db_session)
 
@@ -1971,6 +1983,63 @@ class TestReproduceOnHeadGate:
         assert "Orphaned symbol finding" not in titles  # rejected on recovery
         assert "Fresh sentinel" in titles  # clean finding still spawns
         assert (task.context or {}).get("research_reproduce_rejected") == 1
+
+    @_pytest.mark.asyncio
+    async def test_reproduce_rejected_finding_spawns_memo_with_absent_refs(
+        self, db_session, mocker
+    ):
+        """A reproduce-rejected finding spawns exactly one terminal memo that
+        names the absent cited refs and is tagged with the distinct
+        reproduce-on-HEAD drop reason, while the cycle still scores neutral
+        (the rejected finding is not re-counted as surviving work)."""
+        from test_autonomous_research import _make_finding
+
+        finding = _make_finding(
+            title="Claim about deleted module", direction_id="d-repro-memo01"
+        )
+        finding["sources"] = [{"type": "file", "ref": "backend/app/gone.py"}]
+
+        async def _validate(sources, **kw):
+            return [{**s, "valid": False} for s in sources]
+
+        task, titles = await self._run(
+            db_session,
+            mocker,
+            direction_id="d-repro-memo01",
+            parsed_findings=[finding],
+            validate=_validate,
+        )
+        # Rejected (not spawned as impl work) and scored neutral.
+        assert "Claim about deleted module" not in titles
+        assert (task.context or {}).get("research_reproduce_rejected") == 1
+        assert (task.context or {}).get("research_surviving_findings") == 0
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        memos = [
+            c
+            for c in children
+            if (c.context or {}).get("memo_drop_reason")
+            == "reproduce_on_head_absent"
+        ]
+        # Exactly one memo, carrying the absent reference in its payload and its
+        # synthesized reasoning, and the cycle records it in spawned_memo_ids.
+        assert len(memos) == 1
+        memo = memos[0]
+        source_finding = memo.first_payload.get("source_finding") or {}
+        assert "backend/app/gone.py" in (
+            source_finding.get("absent_references") or []
+        )
+        assert (task.context or {}).get("spawned_memo_ids") == [str(memo.id)]
+        memo_reasoning = (memo.plan_output or {}).get("memo", {}).get("reasoning", "")
+        assert "backend/app/gone.py" in memo_reasoning
 
 
 class TestKnowledgeFindingRouting:

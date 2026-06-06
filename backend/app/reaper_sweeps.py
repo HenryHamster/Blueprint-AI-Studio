@@ -2574,3 +2574,188 @@ async def sweep_resolve_open_owned_bug_messages(
         )
 
     return resolved
+
+
+# ── Step 18: negatively resolve OPEN bug-class messages confirmed stale on HEAD ─
+#
+# Step 17 (above) is the POSITIVE half: it resolves an open owned bug-class
+# message when its owning outcome genuinely LANDS. This step is the symmetric
+# NEGATIVE half: it resolves an open bug-class message whose cited code is
+# unambiguously ABSENT on the CURRENT integration HEAD — i.e. the defect no
+# longer reproduces — even though nothing "owns" or landed a fix for it.
+#
+# Until this sweep, such a message was only deprioritised in the strategist
+# inbox and tagged with a STALE marker, relying entirely on the strategist LLM
+# to remember to close it; until it did, the message stayed open, was re-fetched
+# every strategic cycle, and re-consumed scarce inbox-attention budget. This is
+# the message-lifecycle equivalent of the reproduce-on-HEAD gate the
+# research-finding ingestion path already enforces.
+#
+# CONSERVATIVE, by construction:
+#   - Citations are re-grounded FRESH against the current HEAD at sweep time via
+#     ``compute_message_citation_warning`` — the ingestion-time provenance stamp
+#     is NEVER trusted (the code may have been re-added since).
+#   - That helper honours a tri-state and returns a non-None signal ONLY on an
+#     unambiguous ``absent`` verdict; a ``present`` or ``indeterminate`` (no
+#     backend / no creds / nothing parseable / partially-grounded) verdict yields
+#     None and leaves the message OPEN. We resolve on a non-None signal alone.
+#
+# Ordering: this runs AFTER Step 17 in the reaper cycle, so an owner that
+# genuinely landed is positively resolved first (the better, more specific
+# reason) before this negative sweep ever sees it. The two never race because
+# both filter on ``status == 'open'`` and Step 17 commits before Step 18 runs.
+#
+# Fail-safe: per-message grounding is wrapped so one bad row (or one grounding
+# error) can never abort the batch, and any error/indeterminate verdict leaves
+# the message OPEN. Idempotent: resolution moves status off 'open', so the next
+# pass skips it. Reversible: an operator reopening the message (status back to
+# 'open') makes it eligible again, exactly like the Step-17 path.
+
+# Context audit keys stamped on a stale auto-resolution — DISTINCT from the
+# Step-17 owner-landed keys so the two resolution kinds are distinguishable in
+# audit. The stored citation signal records what was absent on HEAD.
+_STALE_AUTO_RESOLVED_AT_KEY = "_stale_auto_resolved_at"
+_STALE_AUTO_RESOLUTION_KEY = "_stale_auto_resolution"
+_STALE_AUTO_CITATION_SIGNAL_KEY = "_stale_auto_citation_signal"
+
+
+async def _stale_bug_message_resolution(session, msg, project_cache) -> tuple[str, dict] | None:
+    """`(audit, signal)` when ``msg``'s citations are absent on HEAD, else None.
+
+    Re-grounds the message's citations FRESH against the current integration
+    HEAD via :func:`compute_message_citation_warning`, which returns a signal
+    ONLY on an unambiguous ``absent`` verdict (a ``present`` or ``indeterminate``
+    verdict yields None). The ingestion-time provenance stamp is never consulted.
+    Returns None — fail-safe, leaving the message open — for any present,
+    indeterminate, or partially-grounded verdict.
+
+    ``project_cache`` memoises ``Project`` lookups across the batch by project_id.
+    """
+    from app.models import Project
+    from app.source_ref_validation import compute_message_citation_warning
+
+    pid = msg.project_id
+    if pid not in project_cache:
+        project_cache[pid] = await session.get(Project, pid)
+    project = project_cache[pid]
+    if project is None:
+        return None
+
+    signal = await compute_message_citation_warning(
+        session,
+        project,
+        msg.content,
+        structured_context=msg.context if isinstance(msg.context, dict) else None,
+    )
+    if not signal:
+        # present / indeterminate / partially-grounded — never resolve.
+        return None
+    audit = (
+        "Auto-resolved as stale: cited code is absent on the current integration "
+        "HEAD and the defect no longer reproduces"
+    )
+    return audit, signal
+
+
+async def sweep_resolve_stale_open_bug_messages(
+    session,
+    now: datetime,
+    *,
+    batch_size: int = 200,
+) -> int:
+    """Step 18: negatively resolve OPEN bug-class messages confirmed stale on HEAD.
+
+    Selects the SAME OPEN, system/agent-authored bug-class set as Step 17 and
+    resolves each message whose citations re-validate as unambiguously ABSENT
+    against the current integration HEAD (re-checked fresh, never trusting the
+    ingestion-time stamp). A present, indeterminate, or partially-grounded
+    verdict — or any grounding error — leaves the message OPEN. Disjoint in
+    effect from Step 17 (which runs first and positively resolves landed owners).
+
+    Returns the number of messages auto-resolved as stale.
+    """
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.models import ProjectMessage
+    from app.message_convergence import BUG_CLASS_TYPES, OPEN_STATUS, SYSTEM_AUTHORED_FROM_TYPES
+
+    msgs = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.status == OPEN_STATUS,
+                    ProjectMessage.from_type.in_(list(SYSTEM_AUTHORED_FROM_TYPES)),
+                    ProjectMessage.message_type.in_(list(BUG_CLASS_TYPES)),
+                )
+                .order_by(ProjectMessage.created_at)
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(msgs) >= batch_size:
+        logger.warning(
+            "[REAPER] stale-bug-message sweep hit cap=%d open bug-class messages — "
+            "result truncated; next cycle continues",
+            batch_size,
+        )
+
+    if not msgs:
+        return 0
+
+    resolved = 0
+    project_cache: dict = {}
+    pending_broadcasts: list[tuple[str, dict]] = []
+    for msg in msgs:
+        # Fail-safe: one malformed row or one grounding error must never abort
+        # the batch, and any error leaves the message open.
+        try:
+            outcome = await _stale_bug_message_resolution(session, msg, project_cache)
+        except Exception:
+            logger.warning(
+                "[REAPER] Step 18: stale grounding failed for message %s — "
+                "leaving open",
+                msg.id,
+                exc_info=True,
+            )
+            continue
+        if outcome is None:
+            continue
+        audit, signal = outcome
+        msg.status = "resolved"
+        msg.resolution = audit
+        msg.resolved_at = now
+        ctx = dict(msg.context or {})
+        ctx[_STALE_AUTO_RESOLVED_AT_KEY] = now.isoformat()
+        ctx[_STALE_AUTO_RESOLUTION_KEY] = audit
+        ctx[_STALE_AUTO_CITATION_SIGNAL_KEY] = signal
+        msg.context = ctx
+        session.add(msg)
+        resolved += 1
+        pending_broadcasts.append(
+            (str(msg.project_id), {"message_id": str(msg.id)})
+        )
+        logger.info(
+            "[REAPER] Step 18: auto-resolved stale message %s — %s",
+            msg.id,
+            audit,
+        )
+
+    if resolved:
+        await session.commit()
+        for project_id, payload in pending_broadcasts:
+            try:
+                await _bcast(project_id, "message_updated", payload)
+            except Exception as _bcast_err:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] Step 18: broadcast failed for message %s: %s",
+                    payload.get("message_id"),
+                    _bcast_err,
+                )
+        logger.info(
+            "[REAPER] Step 18: auto-resolved %d stale open bug-class message(s)",
+            resolved,
+        )
+
+    return resolved

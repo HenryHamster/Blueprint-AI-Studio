@@ -158,6 +158,12 @@ MEDIUM_EXPLORATION_FLOOR = 0.05
 # than stampeding memo creation.
 MEMO_SPAWN_CAP_PER_CYCLE = 5
 
+# Drop reason stamped on the memo a reproduce-on-HEAD rejection spawns. Distinct
+# from the capacity/quality drop reasons (low_actionability / degradation_gate)
+# so strategic review can tell "the cited code is unambiguously gone" — the
+# strongest truthfulness signal — apart from a merely deferred finding.
+_REPRODUCE_REJECTED_DROP_REASON = "reproduce_on_head_absent"
+
 # Verification-basis tiers, ordered from highest evidence (the finding's claim
 # was checked against real code) to lowest (asserted/deduced). Defined once here
 # so the normalization and the HEAD-reconciliation below share a single source
@@ -337,6 +343,16 @@ def _trim_finding_for_memo(finding: Dict[str, Any]) -> Dict[str, Any]:
     related = finding.get("related_files")
     if isinstance(related, list) and related:
         trimmed["related_files"] = [str(f) for f in related[:20]]
+    # Carry the cited refs found absent on HEAD — broken file paths + ungrounded
+    # path:symbol refs already computed during grounding and merged onto the
+    # finding's _provenance_warnings — so a reproduce-on-HEAD memo can name
+    # exactly what was stale without strategic review re-deriving it.
+    prov = finding.get("_provenance_warnings")
+    if isinstance(prov, dict):
+        absent: list[str] = [str(r) for r in (prov.get("broken_refs") or [])]
+        absent += [str(r) for r in (prov.get("ungrounded_refs") or [])]
+        if absent:
+            trimmed["absent_references"] = absent[:20]
     return trimmed
 
 
@@ -358,6 +374,11 @@ def _synthesize_deferred_finding_memo(
     parts.append(f"Reason: {drop_reason}")
     if description:
         parts.append(f"Description: {description}")
+    absent = sf.get("absent_references")
+    if isinstance(absent, list) and absent:
+        parts.append(
+            "Cited code absent on HEAD: " + ", ".join(str(r) for r in absent)
+        )
     return {
         "summary": (title or description)[:200],
         "reasoning": "\n\n".join(parts),
@@ -3340,14 +3361,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         ]
     )
     # Spawn memo tasks for findings dropped for outcome-blind reasons
-    # (low_actionability / degradation_gate). These would otherwise vanish
-    # without a trace; a terminal memo records the reasoning so strategic
-    # review can cite it by id. Bounded by MEMO_SPAWN_CAP_PER_CYCLE, which is
-    # independent of the implementation-task spawn caps (memos are read-only).
+    # (low_actionability / degradation_gate / reproduce-on-HEAD rejection). These
+    # would otherwise vanish leaving only an aggregate count; a terminal memo
+    # records the reasoning — including, for a reproduce-on-HEAD rejection, WHICH
+    # cited files/symbols were found absent — so strategic review can cite it by
+    # id. Bounded by MEMO_SPAWN_CAP_PER_CYCLE, which is independent of the
+    # implementation-task spawn caps (memos are read-only). A repeatedly-rejected
+    # finding does not re-spawn: the duplicate-memo guard below keys on the
+    # finding hash already recorded by an earlier cycle's memo.
     _spawned_memo_ids: list[str] = []
-    _memo_candidates: list[tuple[dict, str]] = [
-        (f, "low_actionability") for f in _low_actionability_deferred
-    ] + [(f, "degradation_gate") for f in _degradation_gate_deferred]
+    _memo_candidates: list[tuple[dict, str]] = (
+        [(f, "low_actionability") for f in _low_actionability_deferred]
+        + [(f, "degradation_gate") for f in _degradation_gate_deferred]
+        + [(f, _REPRODUCE_REJECTED_DROP_REASON) for f in _reproduce_rejected]
+    )
     _research_direction_id = (task.context or {}).get("direction_id")
     for _mf, _drop_reason in _memo_candidates[:MEMO_SPAWN_CAP_PER_CYCLE]:
         _mf_hash = _mf.get("finding_hash") or _finding_hash(

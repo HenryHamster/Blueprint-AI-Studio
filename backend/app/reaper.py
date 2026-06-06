@@ -897,6 +897,7 @@ from app.reaper_sweeps import (  # noqa: E402
     sweep_converge_linked_bug_messages,
     sweep_converge_duplicate_foundations,
     sweep_resolve_open_owned_bug_messages,
+    sweep_resolve_stale_open_bug_messages,
 )
 
 # Zero-cycle starvation: a project that should be running the strategic loop but
@@ -3897,6 +3898,23 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Open-owned-message resolve sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 18: Negatively resolve OPEN bug-class messages confirmed
+                # stale on HEAD — resolve an open system/agent BUG_REPORT/BLOCKER
+                # whose cited code is unambiguously ABSENT on the current
+                # integration HEAD (re-grounded fresh, conservative tri-state;
+                # indeterminate/present leaves it open). Runs AFTER Step 17 so a
+                # landed owner is positively resolved first. Fail-safe per message.
+                _mark_reaper_progress()
+                try:
+                    await sweep_resolve_stale_open_bug_messages(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Stale-bug-message resolve sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

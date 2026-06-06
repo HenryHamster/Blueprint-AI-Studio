@@ -10755,6 +10755,199 @@ async def test_open_owned_one_bad_row_does_not_abort_batch(reaper_db):
     assert good.status == "resolved"
 
 
+# ── Step 18: negatively resolve OPEN bug-class messages confirmed stale on HEAD ─
+
+from app.reaper_sweeps import sweep_resolve_stale_open_bug_messages  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_stale_open_bug_resolves_when_citations_absent(reaper_db, monkeypatch):
+    """An open bug message whose citations re-validate as ABSENT on HEAD is
+    resolved with the distinct stale reason + distinct audit keys + stored signal."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(reaper_db, project, context={"source": "x"})
+
+    absent_signal = {
+        "citation_state": "absent",
+        "broken_refs": ["app/gone.py"],
+        "ungrounded_refs": ["app/gone.py:vanished"],
+    }
+
+    async def _absent(_session, _project, _content, *, structured_context=None):
+        return absent_signal
+
+    monkeypatch.setattr(_rs, "compute_message_citation_warning", _absent, raising=False)
+    monkeypatch.setattr(
+        "app.source_ref_validation.compute_message_citation_warning",
+        _absent,
+        raising=False,
+    )
+
+    resolved = await sweep_resolve_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert "stale" in (msg.resolution or "").lower()
+    assert "no longer reproduce" in (msg.resolution or "")
+    assert msg.resolved_at is not None
+    # Distinct audit keys — NOT the Step-17 owner-landed keys.
+    assert msg.context.get("_stale_auto_resolved_at") is not None
+    assert msg.context.get("_stale_auto_resolution") == msg.resolution
+    assert msg.context.get("_stale_auto_citation_signal") == absent_signal
+    assert "_owned_auto_resolution" not in msg.context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["present", "indeterminate"])
+async def test_stale_open_bug_stays_open_when_not_absent(reaper_db, monkeypatch, state):
+    """A present or indeterminate citation verdict leaves the message OPEN — the
+    helper returns None for anything but an unambiguous 'absent' verdict."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(reaper_db, project)
+
+    # The real helper returns None for present/indeterminate; mirror that here.
+    async def _not_absent(_session, _project, _content, *, structured_context=None):
+        return None
+
+    monkeypatch.setattr(_rs, "compute_message_citation_warning", _not_absent, raising=False)
+    monkeypatch.setattr(
+        "app.source_ref_validation.compute_message_citation_warning",
+        _not_absent,
+        raising=False,
+    )
+
+    resolved = await sweep_resolve_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+    assert msg.resolution is None
+
+
+@pytest.mark.asyncio
+async def test_stale_open_bug_rechecks_fresh_not_ingestion_stamp(reaper_db, monkeypatch):
+    """A message carrying an ingestion-time absent stamp is NOT trusted: the code
+    is PRESENT on HEAD now, the fresh re-check returns None, and it stays open."""
+    project = await _make_project(reaper_db)
+    # Stale ingestion stamp claims absent, but fresh grounding (below) says present.
+    msg = await _make_bug_message(
+        reaper_db,
+        project,
+        context={"_provenance_warnings": {"citation_state": "absent"}},
+    )
+
+    async def _present_now(_session, _project, _content, *, structured_context=None):
+        return None  # present on HEAD → helper returns None
+
+    monkeypatch.setattr(_rs, "compute_message_citation_warning", _present_now, raising=False)
+    monkeypatch.setattr(
+        "app.source_ref_validation.compute_message_citation_warning",
+        _present_now,
+        raising=False,
+    )
+
+    resolved = await sweep_resolve_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_stale_open_bug_resolution_is_idempotent(reaper_db, monkeypatch):
+    """Re-running the sweep on an already-stale-resolved message is a no-op."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(reaper_db, project)
+
+    async def _absent(_session, _project, _content, *, structured_context=None):
+        return {"citation_state": "absent", "broken_refs": ["x.py"], "ungrounded_refs": []}
+
+    monkeypatch.setattr(_rs, "compute_message_citation_warning", _absent, raising=False)
+    monkeypatch.setattr(
+        "app.source_ref_validation.compute_message_citation_warning",
+        _absent,
+        raising=False,
+    )
+
+    first = await sweep_resolve_stale_open_bug_messages(reaper_db, _utcnow())
+    assert first == 1
+    second = await sweep_resolve_stale_open_bug_messages(reaper_db, _utcnow())
+    assert second == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_stale_open_bug_degrades_safely_on_grounding_error(reaper_db, monkeypatch):
+    """A grounding exception leaves the offending message open and never aborts the
+    batch — a sibling absent message in the same batch still resolves."""
+    project = await _make_project(reaper_db)
+    boom = await _make_bug_message(reaper_db, project, context={"tag": "boom"})
+    good = await _make_bug_message(reaper_db, project, context={"tag": "good"})
+
+    async def _maybe_raise(_session, _project, content, *, structured_context=None):
+        if (structured_context or {}).get("tag") == "boom":
+            raise RuntimeError("grounding backend exploded")
+        return {"citation_state": "absent", "broken_refs": ["g.py"], "ungrounded_refs": []}
+
+    monkeypatch.setattr(_rs, "compute_message_citation_warning", _maybe_raise, raising=False)
+    monkeypatch.setattr(
+        "app.source_ref_validation.compute_message_citation_warning",
+        _maybe_raise,
+        raising=False,
+    )
+
+    resolved = await sweep_resolve_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 1
+    await reaper_db.refresh(boom)
+    await reaper_db.refresh(good)
+    assert boom.status == "open"
+    assert good.status == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_stale_open_bug_sweep_ignores_non_eligible_messages(reaper_db, monkeypatch):
+    """Disjointness: non-open, non-bug-class, and user-authored messages are never
+    touched even when grounding would report absent."""
+    project = await _make_project(reaper_db)
+    linked = await _make_bug_message(reaper_db, project, status="linked")
+    note = await _make_bug_message(
+        reaper_db, project, msg_type=MessageType.NOTE
+    )
+    user_msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BUG_REPORT,
+        from_type="user",
+        content="operator bug",
+        status="open",
+        context={},
+    )
+    reaper_db.add(user_msg)
+    await reaper_db.commit()
+    await reaper_db.refresh(user_msg)
+
+    async def _absent(_session, _project, _content, *, structured_context=None):
+        return {"citation_state": "absent", "broken_refs": ["x.py"], "ungrounded_refs": []}
+
+    monkeypatch.setattr(_rs, "compute_message_citation_warning", _absent, raising=False)
+    monkeypatch.setattr(
+        "app.source_ref_validation.compute_message_citation_warning",
+        _absent,
+        raising=False,
+    )
+
+    resolved = await sweep_resolve_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 0
+    for m in (linked, note, user_msg):
+        await reaper_db.refresh(m)
+    assert linked.status == "linked"
+    assert note.status == "open"
+    assert user_msg.status == "open"
+
+
 # ── sweep_merge_gate_verification_degradation (fleet-wide alert) ──────────────
 
 
