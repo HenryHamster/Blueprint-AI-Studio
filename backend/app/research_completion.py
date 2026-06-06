@@ -1146,6 +1146,12 @@ _NON_SPAWNING_FINDING_TYPES = frozenset(
     }
 )
 
+# Research findings only seed a reproduce-on-HEAD verdict when the finding is an
+# explicit defect claim. Other finding types (feature/improvement/refactor/etc.)
+# keep the legacy "no verdict" semantics so merged implementation work still
+# scores as success instead of shipped-but-unproven.
+_REPRODUCE_VERDICT_FINDING_TYPES = frozenset({"bug"})
+
 
 def _research_findings_would_spawn(findings: List[Dict[str, Any]]) -> bool:
     """True if at least one finding would spawn downstream implementation work.
@@ -3254,6 +3260,52 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 **(
                     {"_provenance_warnings": finding["_provenance_warnings"]}
                     if finding.get("_provenance_warnings")
+                    else {}
+                ),
+                **(
+                    {
+                        # Baseline reproduce-on-HEAD verdict seeded from the
+                        # already-computed citation-grounding signal (no new
+                        # validation pass): a defect finding whose cited code is
+                        # absent on HEAD definitionally does not reproduce there,
+                        # so seed `already_resolved`; otherwise the defect-truth
+                        # is not yet established, so seed `indeterminate`.
+                        # Non-underscore key so the review/fix respawn
+                        # carry-forward preserves it, and the agent overwrites it
+                        # with a determined verdict on terminal status. See
+                        # schemas.ReproduceVerdict.
+                        "reproduce_verdict": {
+                            "status": (
+                                "already_resolved"
+                                if (
+                                    isinstance(
+                                        finding.get("_provenance_warnings"), dict
+                                    )
+                                    and finding["_provenance_warnings"].get(
+                                        "citation_state"
+                                    )
+                                    == "absent"
+                                )
+                                else "indeterminate"
+                            ),
+                            "reason": (
+                                "seeded from research citation grounding: cited "
+                                "code absent on HEAD"
+                                if (
+                                    isinstance(
+                                        finding.get("_provenance_warnings"), dict
+                                    )
+                                    and finding["_provenance_warnings"].get(
+                                        "citation_state"
+                                    )
+                                    == "absent"
+                                )
+                                else "seeded baseline: reproduce-on-HEAD not yet "
+                                "determined"
+                            ),
+                        }
+                    }
+                    if finding_type in _REPRODUCE_VERDICT_FINDING_TYPES
                     else {}
                 ),
                 # Provenance the launch-time staleness recompute needs: the

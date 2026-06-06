@@ -54,13 +54,13 @@ from app.ci_resolution import (
     classify_merge_test_verdict,
 )
 from app.direction_outcomes import _counts_as_failure
-from app.landed_signal import is_merged_completion, merge_verification_status
+from app.landed_signal import (
+    is_merged_completion,
+    merge_verification_status,
+    reproduce_verdict_status,
+)
 from app.models import Task
 from app.payload_schemas import parse_acceptance_evidence
-from app.reproduction_scoring import (
-    TARGET_DEFECT_REPRODUCTION_KEY,
-    reproduction_blocks_success,
-)
 from app.task_capabilities import WRITE_TASK_TYPES, get_task_capability
 
 OutcomeStatus = Literal["success", "neutral", "failure"]
@@ -126,26 +126,32 @@ def _evaluate_write(task: Task) -> TaskOutcome:
     """Outcome for a write/PR task type.
 
     ``success`` iff the task is a verified (or benign-unverified) merged
-    completion, ``failure`` iff it counts as a genuine failure for direction
-    metrics, else ``neutral`` (e.g. a COMPLETED task that opened no PR, a
-    BLOCKED holding state, or a merge that fell open for a *degraded* reason —
-    environment/setup failure blocked real verification, so the claim is not
-    proven on HEAD and must not score as a verified fix).
+    completion whose defect claim — when it carries a reproduce-on-HEAD verdict —
+    actually ``reproduced``. ``failure`` iff it counts as a genuine failure for
+    direction metrics, else ``neutral``.
+
+    A merged PR always SHIPS code, but shipping is necessary, not sufficient, to
+    call a *fix* proven:
+
+    * A merge that fell open for a *degraded* reason (environment/setup failure
+      blocked real verification) is ``neutral`` — never verified on HEAD.
+    * A bug-report-/finding-derived task whose reproduce verdict is
+      ``already_resolved`` or ``indeterminate`` is ``neutral`` — the code shipped
+      (and still counts toward shipped/merge-rate metrics, which read
+      :func:`is_merged_completion`/``verified_merged_count``), but the defect was
+      never reproduced, so it must not inflate proven-fix success accounting.
+    * A COMPLETED task that opened no PR, or a BLOCKED holding state, is
+      ``neutral``.
+
+    Tasks with NO reproduce verdict (features/refactors, and any task that
+    predates the verdict) keep the prior merged-PR == success semantics exactly,
+    because :func:`reproduce_verdict_status` returns ``None`` for them.
     """
     if is_merged_completion(task):
         vs = merge_verification_status(task)
         if vs == "unverified_degraded":
             return TaskOutcome("neutral", KIND_CODE_MERGE)
-        # Reproduce-on-HEAD scoring gate. A fix spawned to resolve a defect carries
-        # that defect's reproduce-on-HEAD verdict (recorded at spawn under
-        # ``target_defect_reproduction``). When a verdict was recorded but the
-        # defect was NOT positively established to reproduce on HEAD (absent or
-        # indeterminate), a bare merge does not prove a real defect was fixed —
-        # score neutral, not success, so it does not count as direction progress.
-        # Tasks with no recorded verdict (feature creates, legacy rows) are
-        # unaffected and keep their merged-success credit.
-        ctx = _task_local_attr(task, "context") or {}
-        if reproduction_blocks_success(ctx.get(TARGET_DEFECT_REPRODUCTION_KEY)):
+        if reproduce_verdict_status(task) in ("already_resolved", "indeterminate"):
             return TaskOutcome("neutral", KIND_CODE_MERGE)
         # Code-task acceptance gate. A code task that DECLARED acceptance
         # evidence carries a durable verdict (recorded at merge under
@@ -155,6 +161,7 @@ def _evaluate_write(task: Task) -> TaskOutcome:
         # shipped nothing — a bare merge does not prove the claimed behavior, so
         # score neutral rather than success. Tasks with no recorded verdict
         # (no declaration, legacy rows) are unaffected and keep merged-success.
+        ctx = _task_local_attr(task, "context") or {}
         if acceptance_blocks_success(ctx.get(CODE_ACCEPTANCE_VERDICT_KEY)):
             return TaskOutcome("neutral", KIND_CODE_MERGE)
         return TaskOutcome("success", KIND_CODE_MERGE)
@@ -845,6 +852,59 @@ def _build_panel_review_summary(
     return _summary_dict(task, verdict, evidence, highlights)
 
 
+def _build_write_summary(task: Task, ctx: SummaryContext) -> dict[str, Any] | None:
+    """Operator summary for a write/PR task — shipped state, merge verification,
+    and the reproduce-on-HEAD verdict for bug-report-/finding-derived work.
+
+    The verdict label distinguishes the scoring outcomes the operator
+    surfaces care about: ``verified_fix`` (merged AND the defect reproduced on
+    HEAD), ``shipped_unproven`` (merged, but the defect was already-resolved /
+    non-reproducing / indeterminate — code shipped, fix not proven),
+    ``shipped_unverified`` (merged via a degraded fall-open, never verified), and
+    a plain ``merged`` for shipped work that carries no defect claim. A
+    non-merged task that still recorded a verdict renders the verdict status
+    directly (an ``already_resolved`` no-op or an ``indeterminate``
+    investigation).
+
+    Returns ``None`` for a write task that neither shipped nor carries a verdict
+    (an in-flight or dropped no-PR write task) so the prior no-summary contract
+    for write types is preserved — this builder only ADDS a summary where there
+    is real signal.
+    """
+    merged = is_merged_completion(task)
+    rv_status = reproduce_verdict_status(task)
+    if not merged and rv_status is None:
+        return None
+
+    evidence: list[dict[str, str]] = []
+    highlights: list[dict[str, str]] = []
+    mvs = merge_verification_status(task) if merged else None
+    if merged:
+        evidence.append(_summary_item("Merge", "landed on integration"))
+        if mvs is not None:
+            evidence.append(_summary_item("Verification", mvs))
+    if rv_status is not None:
+        evidence.append(_summary_item("Reproduce verdict", rv_status))
+        raw_verdict = (task.context or {}).get("reproduce_verdict")
+        reason = raw_verdict.get("reason") if isinstance(raw_verdict, dict) else None
+        if reason:
+            highlights.append(_summary_item("Verdict reason", reason))
+
+    if merged and mvs == "unverified_degraded":
+        verdict = "shipped_unverified"
+    elif merged and rv_status == "reproduced":
+        verdict = "verified_fix"
+    elif merged and rv_status in ("already_resolved", "indeterminate"):
+        verdict = "shipped_unproven"
+    elif merged:
+        verdict = "merged"
+    else:
+        # Not merged but carries a verdict: an affirmative no-op or an
+        # indeterminate investigation. Surface the verdict status as the label.
+        verdict = rv_status or "neutral"
+    return _summary_dict(task, verdict, evidence, highlights)
+
+
 def _build_findings_summary(task: Task, ctx: SummaryContext) -> dict[str, Any] | None:
     """Shared builder for the structured-findings task types (security_audit,
     perf, release_audit, …) and the fallback for any unregistered type whose
@@ -996,6 +1056,12 @@ def build_task_evaluation_summary(
     """
     task_type = _task_type(task) or ""
     ctx = SummaryContext(merge_test_result=merge_test_result)
+    # Write/PR task types never carried a dedicated summary (they fell through to
+    # the findings fallback and returned None). Route them to the write-summary
+    # builder so a merged PR's verification + reproduce-on-HEAD verdict are
+    # surfaced — additive: in-flight / no-op write tasks still return None.
+    if task_type in WRITE_TASK_TYPES:
+        return _apply_acceptance_evidence(task, _build_write_summary(task, ctx))
     builder = SUMMARY_BUILDERS.get(task_type, _build_findings_summary)
     summary = builder(task, ctx)
     return _apply_acceptance_evidence(task, summary)

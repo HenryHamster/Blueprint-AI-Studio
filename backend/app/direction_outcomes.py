@@ -1201,6 +1201,11 @@ async def _update_direction_research_outcomes(
     await with_directions_locked(session, project_id, _apply_direction_outcomes)
 
     if merged_files_lists:
+        # Flush the directions mutation before reacquiring the same Project row
+        # for the design_doc/cochange write. Without this, the second
+        # populate_existing refresh can reload a pre-mutation directions blob and
+        # clobber the newly-added research_history metrics in the same session.
+        await session.flush()
         session.expire(project, ["design_doc"])
         await with_design_doc_locked(
             session,

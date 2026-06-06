@@ -2251,6 +2251,21 @@ describe('getTaskTypeHints', () => {
     expect(hint).toContain('./done --already-done');
   });
 
+  it('fix hint references the structured reproduce verdict and names all three outcomes', () => {
+    const hint = TASK_TYPE_HINTS['fix'];
+    expect(hint).toContain('already_resolved');
+    expect(hint).toContain('reproduce-on-HEAD verdict');
+    expect(hint).toContain('indeterminate');
+    expect(hint).toContain('./done --reproduced');
+    expect(hint).toContain('./done --indeterminate');
+  });
+
+  it('investigate hint asks for the canonical reproduce verdict, not free-text only', () => {
+    const hint = TASK_TYPE_HINTS['investigate'];
+    expect(hint).toContain('reproduce-on-HEAD verdict');
+    expect(hint).toContain('indeterminate');
+  });
+
   it('returns static hint when buildConfig has empty directories array', () => {
     const result = getTaskTypeHints({ directories: [] })['create'];
     expect(result).toBe(TASK_TYPE_HINTS['create']);

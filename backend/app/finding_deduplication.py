@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
 from app.failure_classification import INFRA_CLASSES, classify_failure
+from app.landed_signal import suppresses_redispatch
 from app.models import Task, TaskStatus
 from app.time_utils import _utcnow
 
@@ -312,15 +313,17 @@ def build_dedup_state(
             failed_hashes[fhash] = t.status
         # COMPLETED without pr_merged: code was never shipped. Normally this
         # leaves the finding eligible for re-dispatch — BUT an affirmative
-        # no-op completion is the exception. When an implementation task takes
-        # the reproduce-on-HEAD off-ramp (`./done --already-done`), it records
-        # a ``no_op_reason`` in its context: the agent verified the asserted
-        # defect does not reproduce / is already resolved. Suppress that
-        # finding hash so the same non-reproducing finding is not re-parsed and
-        # re-dispatched every research cycle. A dropped/abandoned no-PR
-        # completion carries NO ``no_op_reason`` and stays eligible for retry.
+        # non-reproducing completion is the exception. When an implementation
+        # task takes the reproduce-on-HEAD off-ramp it records the canonical
+        # verdict ``reproduce_verdict.status == "already_resolved"`` (or, for
+        # tasks predating the verdict, a legacy ``no_op_reason`` stamped by
+        # ``./done --already-done``): the agent verified the asserted defect does
+        # not reproduce / is already resolved. Suppress that finding hash so the
+        # same non-reproducing finding is not re-parsed and re-dispatched every
+        # research cycle. An ``indeterminate`` verdict or a dropped/abandoned
+        # no-PR completion carries neither signal and stays eligible for retry.
         if t.status == TaskStatus.COMPLETED and not ctx.get("pr_merged"):
-            if ctx.get("no_op_reason"):
+            if suppresses_redispatch(t):
                 recent_finding_hashes.add(fhash)
                 failed_hashes.setdefault(fhash, "no-op (not reproducing)")
             continue

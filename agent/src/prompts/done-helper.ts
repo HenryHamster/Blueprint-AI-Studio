@@ -50,17 +50,30 @@ export function writeDoneHelper(cfg: CodeChangeHelperConfig): void {
 #       (errored, gave up, ran out of ideas) use ./fail. If an upstream
 #       precondition blocks you use ./blocked. --already-done is strictly for
 #       "I checked and the work is genuinely already done."
+#   ./done --reproduced "<reason>"             # finding-derived fix path:
+#       you confirmed the cited defect reproduced on current HEAD and this PR
+#       fixes that reproduced defect. Posts the durable reproduce-on-HEAD
+#       verdict {status:"reproduced"} alongside the normal COMPLETED payload.
+#   ./done --indeterminate "<reason>"          # finding-derived shipped-but-
+#       unproven path: you landed code but could not prove the defect
+#       reproduced on current HEAD. Posts the durable verdict
+#       {status:"indeterminate"} so scoring stays neutral rather than
+#       incorrectly inferring a proven fix.
 
 set -uo pipefail
 
 WARN_OUT_OF_SCOPE_REASON=""
 ALREADY_DONE_REASON=""
+REPRODUCED_REASON=""
+INDETERMINATE_REASON=""
 SKIP_NEXT_KIND=""
 for i in "$@"; do
   if [ -n "$SKIP_NEXT_KIND" ]; then
     case "$SKIP_NEXT_KIND" in
       warn) WARN_OUT_OF_SCOPE_REASON="$i" ;;
       already) ALREADY_DONE_REASON="$i" ;;
+      reproduced) REPRODUCED_REASON="$i" ;;
+      indeterminate) INDETERMINATE_REASON="$i" ;;
     esac
     SKIP_NEXT_KIND=""
     continue
@@ -78,6 +91,18 @@ for i in "$@"; do
     --already-done=*)
       ALREADY_DONE_REASON="\${i#--already-done=}"
       ;;
+    --reproduced)
+      SKIP_NEXT_KIND="reproduced"
+      ;;
+    --reproduced=*)
+      REPRODUCED_REASON="\${i#--reproduced=}"
+      ;;
+    --indeterminate)
+      SKIP_NEXT_KIND="indeterminate"
+      ;;
+    --indeterminate=*)
+      INDETERMINATE_REASON="\${i#--indeterminate=}"
+      ;;
   esac
 done
 if [ "$SKIP_NEXT_KIND" = "warn" ] && [ -z "$WARN_OUT_OF_SCOPE_REASON" ]; then
@@ -90,6 +115,16 @@ if [ "$SKIP_NEXT_KIND" = "already" ] && [ -z "$ALREADY_DONE_REASON" ]; then
   echo "Usage: ./done --already-done \\"<reason naming the artifact you verified>\\"" >&2
   exit 2
 fi
+if [ "$SKIP_NEXT_KIND" = "reproduced" ] && [ -z "$REPRODUCED_REASON" ]; then
+  echo "Error: --reproduced requires a reason argument" >&2
+  echo "Usage: ./done --reproduced \\"<what reproduced on HEAD and what this PR fixes>\\"" >&2
+  exit 2
+fi
+if [ "$SKIP_NEXT_KIND" = "indeterminate" ] && [ -z "$INDETERMINATE_REASON" ]; then
+  echo "Error: --indeterminate requires a reason argument" >&2
+  echo "Usage: ./done --indeterminate \\"<why reproduce-on-HEAD remained ambiguous>\\"" >&2
+  exit 2
+fi
 if [ -n "$WARN_OUT_OF_SCOPE_REASON" ] && [ \${#WARN_OUT_OF_SCOPE_REASON} -lt 30 ]; then
   echo "Error: --warn-out-of-scope reason must be at least 30 chars (you gave \${#WARN_OUT_OF_SCOPE_REASON})." >&2
   echo "       Be specific: which gates failed, which files, why fixing is out of scope." >&2
@@ -98,6 +133,15 @@ fi
 if [ -n "$WARN_OUT_OF_SCOPE_REASON" ] && [ -n "$ALREADY_DONE_REASON" ]; then
   echo "Error: --warn-out-of-scope and --already-done are mutually exclusive." >&2
   echo "       --already-done means there is no diff/PR; --warn-out-of-scope ships a PR." >&2
+  exit 2
+fi
+_VERDICT_FLAG_COUNT=0
+[ -n "$ALREADY_DONE_REASON" ] && _VERDICT_FLAG_COUNT=$((_VERDICT_FLAG_COUNT + 1))
+[ -n "$REPRODUCED_REASON" ] && _VERDICT_FLAG_COUNT=$((_VERDICT_FLAG_COUNT + 1))
+[ -n "$INDETERMINATE_REASON" ] && _VERDICT_FLAG_COUNT=$((_VERDICT_FLAG_COUNT + 1))
+if [ "$_VERDICT_FLAG_COUNT" -gt 1 ]; then
+  echo "Error: --already-done, --reproduced, and --indeterminate are mutually exclusive." >&2
+  echo "       Pick exactly one reproduce-on-HEAD verdict for this completion." >&2
   exit 2
 fi
 
@@ -126,8 +170,14 @@ if [ -n "$ALREADY_DONE_REASON" ]; then
     exit 0
   fi
   ND_LOGS="Completed: no changes needed — deliverable already present. $ALREADY_DONE_REASON"
+  # Also emit the canonical reproduce-on-HEAD verdict: an affirmative no-op exit
+  # means the deliverable already exists / the reported defect did not reproduce
+  # on current HEAD, which is exactly the "already_resolved" verdict. The reason
+  # ($r, ≥30 chars) doubles as the verdict reason. Additive + backward-compatible:
+  # no_op_reason is still emitted for older backends, and backends that predate
+  # ReproduceVerdict drop the unknown field via extra="ignore".
   ND_PAYLOAD=$(jq -n --arg tid "$TASK" --arg r "$ALREADY_DONE_REASON" --arg logs "$ND_LOGS" \\
-    '{task_id: $tid, status: "COMPLETED", no_op_reason: $r, logs: $logs}')
+    '{task_id: $tid, status: "COMPLETED", no_op_reason: $r, logs: $logs, reproduce_verdict: {status: "already_resolved", reason: $r}}')
   # Stale-result envelope: persist BEFORE the POST so a mid-retry VM kill can
   # be replayed by the next agent boot (mirrors the PR path below).
   ND_ENVELOPE="/tmp/task_${cfg.taskId}_result.json"
@@ -351,16 +401,29 @@ referenced files/gates. The PR itself is intended to merge as-is."
     echo "[done] warn-out-of-scope FEEDBACK message post failed (best-effort) — see /tmp/done_warn_msg_${cfg.taskId}.log" >&2
 fi
 
+REPRODUCE_VERDICT_STATUS=""
+REPRODUCE_VERDICT_REASON=""
+if [ -n "$REPRODUCED_REASON" ]; then
+  REPRODUCE_VERDICT_STATUS="reproduced"
+  REPRODUCE_VERDICT_REASON="$REPRODUCED_REASON"
+elif [ -n "$INDETERMINATE_REASON" ]; then
+  REPRODUCE_VERDICT_STATUS="indeterminate"
+  REPRODUCE_VERDICT_REASON="$INDETERMINATE_REASON"
+fi
+
 PAYLOAD=$(jq -n --arg tid "$TASK" --arg pr "$PR_URL" \\
   --argjson fix_responses "\${FIX_RESPONSES_JSON:-null}" \\
   --argjson self_review "$SELF_REVIEW_JSON" \\
   --argjson changed_files "\${CHANGED_FILES_JSON:-null}" \\
   --arg warn_reason "\${WARN_OUT_OF_SCOPE_REASON:-}" \\
+  --arg reproduce_status "\${REPRODUCE_VERDICT_STATUS:-}" \\
+  --arg reproduce_reason "\${REPRODUCE_VERDICT_REASON:-}" \\
   '{task_id: $tid, status: "COMPLETED", artifact_type: "PULL_REQUEST", pr_url: $pr, logs: ("Task complete. PR: " + $pr)}
    + (if $fix_responses then {fix_agent_responses: $fix_responses} else {} end)
    + {self_review_outcome: $self_review}
    + (if $changed_files then {changed_files: $changed_files} else {} end)
-   + (if ($warn_reason | length) > 0 then {warn_out_of_scope_reason: $warn_reason} else {} end)')
+   + (if ($warn_reason | length) > 0 then {warn_out_of_scope_reason: $warn_reason} else {} end)
+   + (if ($reproduce_status | length) > 0 then {reproduce_verdict: {status: $reproduce_status, reason: $reproduce_reason}} else {} end)')
 
 # Stale-result envelope: persist BEFORE attempting the POST so that if
 # the VM is killed mid-retry, the next agent boot can scan for the

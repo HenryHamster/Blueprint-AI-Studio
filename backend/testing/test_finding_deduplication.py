@@ -119,6 +119,42 @@ def test_build_dedup_state_suppresses_completed_no_op_reproduce_off_ramp():
     assert failed["noop1"] == "no-op (not reproducing)"
 
 
+def test_build_dedup_state_suppresses_completed_already_resolved_verdict():
+    # COMPLETED-without-pr_merged carrying the canonical reproduce verdict
+    # ``already_resolved`` (the durable signal, no legacy no_op_reason): the
+    # agent verified the defect does not reproduce on HEAD. The finding hash MUST
+    # be suppressed even though no_op_reason is absent.
+    t = _make_task(
+        status=TaskStatus.COMPLETED,
+        context={
+            "finding_hash": "verdict_resolved",
+            "reproduce_verdict": {
+                "status": "already_resolved",
+                "reason": "cited symbol absent on HEAD; refactored away",
+            },
+        },
+    )
+    hashes, failed, _ = build_dedup_state([t], failed_parent_ids=set())
+    assert "verdict_resolved" in hashes
+    assert failed["verdict_resolved"] == "no-op (not reproducing)"
+
+
+def test_build_dedup_state_indeterminate_verdict_stays_eligible():
+    # COMPLETED-without-pr_merged with an ``indeterminate`` verdict: the defect
+    # could NOT be ruled out, so the finding stays eligible for retry — only an
+    # affirmative already_resolved (or legacy no_op_reason) suppresses it.
+    t = _make_task(
+        status=TaskStatus.COMPLETED,
+        context={
+            "finding_hash": "verdict_indet",
+            "reproduce_verdict": {"status": "indeterminate"},
+        },
+    )
+    hashes, failed, _ = build_dedup_state([t], failed_parent_ids=set())
+    assert "verdict_indet" not in hashes
+    assert failed == {}
+
+
 def test_build_dedup_state_incomplete_no_pr_completion_stays_eligible():
     # COMPLETED-without-pr_merged and WITHOUT a no_op_reason = a dropped /
     # abandoned no-PR completion (work was left incomplete). It must remain

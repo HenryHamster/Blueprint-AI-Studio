@@ -11412,6 +11412,59 @@ class TestBugReportCitationGate:
         assert warnings["citation_state"] == "absent"
         assert "backend/app/gone.py" in warnings["broken_refs"]
         assert "Provenance warning" in task.payloads[0]["prompt"]
+        # Cited code absent on HEAD seeds an already_resolved reproduce baseline.
+        verdict = (task.context or {}).get("reproduce_verdict")
+        assert verdict is not None
+        assert verdict["status"] == "already_resolved"
+
+    @pytest.mark.asyncio
+    async def test_investigate_task_present_citation_seeds_indeterminate_verdict(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """An investigate task whose cited code is present on HEAD seeds an
+        `indeterminate` reproduce-on-HEAD baseline (defect-truth not yet
+        established) and adds no provenance warning / prompt note."""
+        project = await self._project_with_repo(db_session)
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            from_type="user",
+            content="The handler in backend/app/present.py drops the guard.",
+        )
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+
+        mocker.patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value={}),
+        )
+        mocker.patch(
+            "app.source_ref_validation._file_exists_at_head",
+            new=AsyncMock(return_value=True),
+        )
+        resp = await client.post(
+            "/api/admin/tasks",
+            json={
+                "github_repo": "acme/citegate",
+                "title": "Investigate present guard",
+                "prompt": "Investigate the reported dropped guard.",
+                "task_type": "investigate",
+                "source_message_id": str(msg.id),
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project.id)
+            )
+        ).scalar_one()
+        verdict = (task.context or {}).get("reproduce_verdict")
+        assert verdict is not None
+        assert verdict["status"] == "indeterminate"
+        # Present citations leave the report untouched — no provenance warning.
+        assert "_provenance_warnings" not in (task.context or {})
+        assert "Provenance warning" not in task.payloads[0]["prompt"]
 
     @pytest.mark.asyncio
     async def test_investigate_task_no_source_message_is_unaffected(

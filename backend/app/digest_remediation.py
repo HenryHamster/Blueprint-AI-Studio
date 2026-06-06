@@ -26,7 +26,11 @@ from app.models import (
     TaskStatus,
     _utcnow,
 )
-from app.landed_signal import is_merged_completion, landed_signal_predicate
+from app.landed_signal import (
+    is_merged_completion,
+    is_verified_merge,
+    landed_signal_predicate,
+)
 from app.time_utils import _to_naive_utc
 
 logger = logging.getLogger(__name__)
@@ -215,10 +219,24 @@ async def compute_remediation_and_patterns(
         if not _fp_:
             continue
         _entry = _fp_task_states.setdefault(
-            str(_fp_), {"inflight": False, "merged": False, "proactive": False}
+            str(_fp_),
+            {
+                "inflight": False,
+                "landed": False,
+                "verified": False,
+                "proactive": False,
+            },
         )
-        if _t.status == TaskStatus.COMPLETED and _ctx.get("pr_url"):
-            _entry["merged"] = True
+        # Use the canonical landed/verified predicates the rest of the
+        # remediation funnel relies on — NOT a loose "completed + pr_url"
+        # proxy. ``landed`` means the PR actually landed on integration
+        # (``is_merged_completion``); ``verified`` additionally requires the
+        # system's verification standard (``is_verified_merge``: a merged
+        # completion with no fall-open / degraded unverified-merge reason).
+        if is_merged_completion(_t):
+            _entry["landed"] = True
+        if is_verified_merge(_t):
+            _entry["verified"] = True
         if _t.status in _inflight_statuses:
             _entry["inflight"] = True
         if _ctx.get("proactive") or _ctx.get("proactive_investigation"):
@@ -275,9 +293,13 @@ async def compute_remediation_and_patterns(
             )
             _state = _fp_task_states.get(_fp_key, {})
             _recent = _fp_count_48h.get(_fp_key, 0)
-            if _state.get("merged") and _recent == 0:
+            # Status ladder grounded in real signals: ``fix_verified`` needs the
+            # stronger verification standard AND no recurrence in the last 48h;
+            # ``fix_shipped`` needs only a real landed remediation; otherwise
+            # in-flight work reads as ``investigating``, else ``unaddressed``.
+            if _state.get("verified") and _recent == 0:
                 _status = "fix_verified"
-            elif _state.get("merged"):
+            elif _state.get("landed"):
                 _status = "fix_shipped"
             elif _state.get("inflight"):
                 _status = "investigating"

@@ -1461,20 +1461,43 @@ async def create_task_manually(
                     exc_info=True,
                 )
                 signal = None
-            if signal and signal.get("citation_state") == "absent":
-                citation_task_context = {"_provenance_warnings": signal}
-                refs = list(signal.get("broken_refs") or []) + list(
-                    signal.get("ungrounded_refs") or []
-                )
-                ref_note = f" ({', '.join(refs[:5])})" if refs else ""
-                task_payload["prompt"] = (
-                    task_payload["prompt"]
-                    + "\n\n[Provenance warning] The originating bug report cites "
-                    "code that is ABSENT on the current integration branch"
-                    f"{ref_note}. The defect may already be fixed or refactored "
-                    "away — verify it still reproduces on HEAD before investing, "
-                    "and discount its actionability accordingly."
-                )
+            if signal:
+                _citation_absent = signal.get("citation_state") == "absent"
+                # Seed a baseline reproduce-on-HEAD verdict from the citation-
+                # grounding signal (no new validation pass): cited code absent
+                # on HEAD definitionally does not reproduce there, so seed
+                # `already_resolved`; otherwise the defect-truth is not yet
+                # established, so seed `indeterminate`. Non-underscore key so the
+                # review/fix respawn carry-forward preserves it and the agent
+                # overwrites it with a determined verdict on terminal status.
+                # See schemas.ReproduceVerdict.
+                citation_task_context = {
+                    "reproduce_verdict": {
+                        "status": (
+                            "already_resolved" if _citation_absent else "indeterminate"
+                        ),
+                        "reason": (
+                            "seeded from bug-report citation grounding: cited code "
+                            "absent on HEAD"
+                            if _citation_absent
+                            else "seeded baseline: reproduce-on-HEAD not yet determined"
+                        ),
+                    }
+                }
+                if _citation_absent:
+                    citation_task_context["_provenance_warnings"] = signal
+                    refs = list(signal.get("broken_refs") or []) + list(
+                        signal.get("ungrounded_refs") or []
+                    )
+                    ref_note = f" ({', '.join(refs[:5])})" if refs else ""
+                    task_payload["prompt"] = (
+                        task_payload["prompt"]
+                        + "\n\n[Provenance warning] The originating bug report cites "
+                        "code that is ABSENT on the current integration branch"
+                        f"{ref_note}. The defect may already be fixed or refactored "
+                        "away — verify it still reproduces on HEAD before investing, "
+                        "and discount its actionability accordingly."
+                    )
 
     try:
         task_payload = validate_task_payload(task_payload)

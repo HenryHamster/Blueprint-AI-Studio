@@ -207,6 +207,17 @@ describe('FIX_TASK_FOCUS — content invariants', () => {
     const { FIX_TASK_FOCUS } = await import('./task-type-focus.js');
     expect(FIX_TASK_FOCUS).toContain('not-reproducible bar HIGH');
   });
+
+  it('names all three canonical reproduce-on-HEAD outcomes and ties the off-ramp to the structured verdict', async () => {
+    const { FIX_TASK_FOCUS } = await import('./task-type-focus.js');
+    expect(FIX_TASK_FOCUS).toContain('reproduced');
+    expect(FIX_TASK_FOCUS).toContain('already_resolved');
+    expect(FIX_TASK_FOCUS).toContain('indeterminate');
+    // The --already-done off-ramp now emits the structured already_resolved verdict.
+    expect(FIX_TASK_FOCUS).toContain('emits the structured `already_resolved` reproduce verdict');
+    expect(FIX_TASK_FOCUS).toContain('./done --reproduced');
+    expect(FIX_TASK_FOCUS).toContain('./done --indeterminate');
+  });
 });
 
 describe('DOCS_TASK_FOCUS — content invariants', () => {

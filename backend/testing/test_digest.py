@@ -944,6 +944,215 @@ async def test_digest_recurring_patterns_remediation_status_investigating(
 
 
 @pytest.mark.asyncio
+async def test_digest_recurring_patterns_remediation_status_fix_verified(
+    client: AsyncClient, db_session
+):
+    """A verified merged completion with no 48h recurrence marks status=fix_verified."""
+    from app import shared_state as _ss
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    proj_key = str(project.id)
+    _ss.persistent_anomalies[proj_key] = {
+        "CrossDirectionFingerprint_fp-ver-001": {
+            "first_seen": "2026-04-18T00:00:00+00:00",
+            "last_seen": "2026-04-19T00:00:00+00:00",
+            "occurrence_count": 3,
+            "severity": "high",
+            "latest_details": "fp-ver-001 pattern",
+        },
+    }
+    try:
+        # Landed AND verified (pr_merged with no unverified_merge_reason), and no
+        # recent failed task with this fingerprint → fix_verified.
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="Verified fix",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={
+                    "error_fingerprint": "fp-ver-001",
+                    "pr_merged": True,
+                },
+            )
+        )
+        await db_session.commit()
+
+        response = await client.get(f"/api/admin/digest?project_id={project.id}")
+        assert response.status_code == 200
+        data = response.json()
+        patterns = data["recurring_patterns"]
+        assert len(patterns) == 1
+        assert patterns[0]["remediation_status"] == "fix_verified"
+    finally:
+        _ss.persistent_anomalies.pop(proj_key, None)
+
+
+@pytest.mark.asyncio
+async def test_digest_recurring_patterns_fix_shipped_when_recurs(
+    client: AsyncClient, db_session
+):
+    """A landed+verified merge still recurring in 48h marks fix_shipped, not fix_verified."""
+    from app import shared_state as _ss
+    from app.anomaly_detection import _error_fingerprint
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    proj_key = str(project.id)
+    actual_fp = _error_fingerprint("boom: shipped but recurring")
+    _ss.persistent_anomalies[proj_key] = {
+        f"CrossDirectionFingerprint_{actual_fp}": {
+            "first_seen": "2026-04-18T00:00:00+00:00",
+            "last_seen": "2026-04-19T00:00:00+00:00",
+            "occurrence_count": 3,
+            "severity": "high",
+            "latest_details": "recurring pattern",
+        },
+    }
+    try:
+        # Verified merged completion for this fingerprint...
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="Shipped fix",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={"error_fingerprint": actual_fp, "pr_merged": True},
+            )
+        )
+        # ...but the same failure recurred within the last 48h → recurrence gate
+        # downgrades fix_verified to fix_shipped.
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="Recurred again",
+                status=TaskStatus.FAILED,
+                payloads=[{"type": "create"}],
+                context={"direction_id": "dir-recur"},
+                latest_status_message="boom: shipped but recurring",
+            )
+        )
+        await db_session.commit()
+
+        response = await client.get(f"/api/admin/digest?project_id={project.id}")
+        assert response.status_code == 200
+        data = response.json()
+        patterns = data["recurring_patterns"]
+        entry = next(p for p in patterns if p["fingerprint"] == actual_fp)
+        assert entry["remediation_status"] == "fix_shipped"
+    finally:
+        _ss.persistent_anomalies.pop(proj_key, None)
+
+
+@pytest.mark.asyncio
+async def test_digest_recurring_patterns_fix_shipped_not_verified_when_unverified(
+    client: AsyncClient, db_session
+):
+    """A landed merge with a degraded unverified-merge reason is fix_shipped, never fix_verified."""
+    from app import shared_state as _ss
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    proj_key = str(project.id)
+    _ss.persistent_anomalies[proj_key] = {
+        "CrossDirectionFingerprint_fp-unv-001": {
+            "first_seen": "2026-04-18T00:00:00+00:00",
+            "last_seen": "2026-04-19T00:00:00+00:00",
+            "occurrence_count": 3,
+            "severity": "high",
+            "latest_details": "fp-unv-001 pattern",
+        },
+    }
+    try:
+        # Landed (pr_merged) but the no-CI gate fell open in a *degraded* way, so
+        # the verification standard is NOT met even with no recurrence.
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="Unverified shipped fix",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={
+                    "error_fingerprint": "fp-unv-001",
+                    "pr_merged": True,
+                    "review_loop": {
+                        "unverified_merge_reason": "verify_setup_failed"
+                    },
+                },
+            )
+        )
+        await db_session.commit()
+
+        response = await client.get(f"/api/admin/digest?project_id={project.id}")
+        assert response.status_code == 200
+        data = response.json()
+        patterns = data["recurring_patterns"]
+        assert len(patterns) == 1
+        assert patterns[0]["remediation_status"] == "fix_shipped"
+    finally:
+        _ss.persistent_anomalies.pop(proj_key, None)
+
+
+@pytest.mark.asyncio
+async def test_digest_recurring_patterns_completed_pr_url_only_is_unaddressed(
+    client: AsyncClient, db_session
+):
+    """A completed task with only a pr_url (no landed signal) no longer counts as merged."""
+    from app import shared_state as _ss
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    proj_key = str(project.id)
+    _ss.persistent_anomalies[proj_key] = {
+        "CrossDirectionFingerprint_fp-url-001": {
+            "first_seen": "2026-04-18T00:00:00+00:00",
+            "last_seen": "2026-04-19T00:00:00+00:00",
+            "occurrence_count": 3,
+            "severity": "high",
+            "latest_details": "fp-url-001 pattern",
+        },
+    }
+    try:
+        # COMPLETED with a PR URL but NO landed signal — the old loose proxy would
+        # have marked this fix_shipped; the canonical predicates do not.
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="Completed but never landed",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={
+                    "error_fingerprint": "fp-url-001",
+                    "pr_url": "https://github.com/example/repo/pull/1",
+                },
+            )
+        )
+        await db_session.commit()
+
+        response = await client.get(f"/api/admin/digest?project_id={project.id}")
+        assert response.status_code == 200
+        data = response.json()
+        patterns = data["recurring_patterns"]
+        assert len(patterns) == 1
+        assert patterns[0]["remediation_status"] == "unaddressed"
+    finally:
+        _ss.persistent_anomalies.pop(proj_key, None)
+
+
+@pytest.mark.asyncio
 async def test_digest_early_warnings_affected_direction_count_per_class(
     client: AsyncClient, db_session
 ):

@@ -1138,6 +1138,19 @@ async def update_agent_status(
         ctx["no_op_reason"] = payload.no_op_reason[:2000]
         task.context = ctx
         flag_modified(task, "context")
+    if payload.reproduce_verdict:
+        # Durable reproduce-on-HEAD verdict for bug-report-/finding-derived
+        # work. The agent determined whether the cited defect actually
+        # reproduces against HEAD (reproduced / already_resolved /
+        # indeterminate); persist it under a non-underscore key so the
+        # review/fix respawn carry-forward preserves it across iterations and
+        # task-outcome / digest / strategic scoring can consume verified
+        # defect-truth instead of guessing from output text. Additive: older
+        # agents that omit it (sending only no_op_reason) are unaffected.
+        ctx = dict(task.context or {})
+        ctx["reproduce_verdict"] = payload.reproduce_verdict.model_dump()
+        task.context = ctx
+        flag_modified(task, "context")
     if payload.file_change_details:
         ctx = dict(task.context or {})
         ctx["_file_change_details"] = payload.file_change_details[:50]

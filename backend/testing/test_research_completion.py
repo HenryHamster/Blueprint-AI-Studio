@@ -1617,6 +1617,7 @@ class TestProvenanceWarningsAttachment:
         deferred["generated_head_sha"] = "deadbeef"
         deferred["sources"] = [{"type": "file", "ref": "backend/app/missing.py"}]
         deferred["_provenance_warnings"] = {
+            "citation_state": "absent",
             "broken_source_ref_count": 1,
             "broken_refs": ["backend/app/missing.py"],
         }
@@ -1627,6 +1628,7 @@ class TestProvenanceWarningsAttachment:
             deferred=deferred,
         )
         assert (deferred_child.context or {}).get("_provenance_warnings") == {
+            "citation_state": "absent",
             "broken_source_ref_count": 1,
             "broken_refs": ["backend/app/missing.py"],
             "cited_files_changed_since_generation": True,
@@ -1673,6 +1675,113 @@ class TestProvenanceWarningsAttachment:
         ctx = child.context or {}
         assert "generated_head_sha" not in ctx
         assert "_finding_cited_paths" not in ctx
+
+    @_pytest.mark.asyncio
+    async def test_spawned_child_seeds_already_resolved_for_broken_citation(
+        self, db_session, mocker
+    ):
+        """A finding whose cited code is absent on HEAD seeds an
+        `already_resolved` reproduce-on-HEAD baseline (it definitionally does
+        not reproduce there)."""
+        from test_autonomous_research import _make_finding
+
+        deferred = _make_finding(
+            title="Deferred broken citation repro",
+            direction_id="d-repro-abs01",
+            finding_type="bug",
+        )
+        deferred["generated_head_sha"] = "deadbeef"
+        deferred["sources"] = [{"type": "file", "ref": "backend/app/missing.py"}]
+        deferred["_provenance_warnings"] = {
+            "citation_state": "absent",
+            "broken_source_ref_count": 1,
+            "broken_refs": ["backend/app/missing.py"],
+        }
+        child = await self._spawn_deferred_child(
+            db_session, mocker, direction_id="d-repro-abs01", deferred=deferred
+        )
+        verdict = (child.context or {}).get("reproduce_verdict")
+        assert verdict is not None
+        assert verdict["status"] == "already_resolved"
+
+    @_pytest.mark.asyncio
+    async def test_spawned_child_keeps_non_absence_warnings_indeterminate(
+        self, db_session, mocker
+    ):
+        """Non-absence provenance warnings stay indeterminate: a stale citation
+        is not the same thing as cited code being definitively absent on HEAD."""
+        from test_autonomous_research import _make_finding
+
+        deferred = _make_finding(
+            title="Deferred stale citation repro",
+            direction_id="d-repro-ind-stale01",
+            finding_type="bug",
+        )
+        deferred["generated_head_sha"] = "deadbeef"
+        deferred["sources"] = [{"type": "file", "ref": "backend/app/foo.py"}]
+        deferred["_provenance_warnings"] = {
+            "cited_files_changed_since_generation": True
+        }
+        child = await self._spawn_deferred_child(
+            db_session,
+            mocker,
+            direction_id="d-repro-ind-stale01",
+            deferred=deferred,
+        )
+        verdict = (child.context or {}).get("reproduce_verdict")
+        assert verdict is not None
+        assert verdict["status"] == "indeterminate"
+
+    @_pytest.mark.asyncio
+    async def test_spawned_child_seeds_indeterminate_when_citations_clean(
+        self, db_session, mocker
+    ):
+        """A finding with no provenance warnings seeds an `indeterminate`
+        reproduce-on-HEAD baseline — the defect-truth is not yet established."""
+        from test_autonomous_research import _make_finding
+
+        deferred = _make_finding(
+            title="Deferred clean repro",
+            direction_id="d-repro-ind01",
+            finding_type="bug",
+        )
+        deferred.pop("generated_head_sha", None)
+        deferred["sources"] = []
+        child = await self._spawn_deferred_child(
+            db_session, mocker, direction_id="d-repro-ind01", deferred=deferred
+        )
+        verdict = (child.context or {}).get("reproduce_verdict")
+        assert verdict is not None
+        assert verdict["status"] == "indeterminate"
+
+    @_pytest.mark.asyncio
+    @_pytest.mark.parametrize("finding_type", ["feature", "improvement", "refactor"])
+    async def test_spawned_non_defect_child_omits_reproduce_verdict(
+        self, db_session, mocker, finding_type
+    ):
+        """Non-defect research findings must not carry a reproduce verdict.
+
+        Outcome scoring treats an absent verdict as the legacy success path for
+        merged implementation work; seeding `indeterminate` here would
+        incorrectly downgrade shipped feature/refactor work to neutral.
+        """
+        from test_autonomous_research import _make_finding
+
+        deferred = _make_finding(
+            title=f"Deferred non-defect {finding_type}",
+            direction_id=f"d-repro-nondef-{finding_type}",
+            finding_type=finding_type,
+        )
+        deferred["generated_head_sha"] = "deadbeef"
+        deferred["sources"] = [{"type": "file", "ref": "backend/app/foo.py"}]
+        deferred["_provenance_warnings"] = {"citation_state": "absent"}
+        child = await self._spawn_deferred_child(
+            db_session,
+            mocker,
+            direction_id=f"d-repro-nondef-{finding_type}",
+            deferred=deferred,
+        )
+        assert "reproduce_verdict" not in (child.context or {})
 
 
 class TestReproduceOnHeadGate:

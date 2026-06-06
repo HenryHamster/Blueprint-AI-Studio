@@ -9995,6 +9995,81 @@ async def test_already_done_no_op_completion_lands_completed_with_reason(
 
 
 @pytest.mark.asyncio
+async def test_terminal_status_persists_reproduce_verdict(
+    client: AsyncClient, db_session, mocker
+):
+    """A terminal status carrying reproduce_verdict persists it into task.context.
+
+    The agent determined the cited defect's reproduce-on-HEAD truth; the status
+    endpoint must durably store the verdict (status + reason + evidence) under
+    the non-underscore key task.context["reproduce_verdict"] so task-outcome /
+    digest / strategic scoring can consume verified defect-truth.
+    """
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    project = Project(name="Reproduce Verdict", user_id="test-user-repro-verdict")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "investigate", "prompt": "verify reported NPE reproduces"}],
+        vm_instance_id="agent-vm-repro-1",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-repro-1")
+    resp = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "status": "COMPLETED",
+            "reproduce_verdict": {
+                "status": "reproduced",
+                "reason": "NPE reproduced on HEAD at handler.py:42",
+                "evidence": {"file": "handler.py", "line": 42},
+            },
+            "logs": "Investigation complete: defect reproduces on HEAD.",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    verdict = (task.context or {}).get("reproduce_verdict")
+    assert verdict is not None
+    assert verdict["status"] == "reproduced"
+    assert verdict["reason"] == "NPE reproduced on HEAD at handler.py:42"
+    assert verdict["evidence"] == {"file": "handler.py", "line": 42}
+
+
+def test_reproduce_verdict_schema_validation():
+    """AgentStatusPayload.reproduce_verdict accepts the three canonical statuses,
+    is optional (older agents omit it), and rejects unknown status values."""
+    from app.schemas import AgentStatusPayload
+
+    base = {"task_id": str(uuid.uuid4()), "status": "COMPLETED"}
+    # Optional — absent payloads behave identically to today.
+    assert AgentStatusPayload(**base).reproduce_verdict is None
+    for status in ("reproduced", "already_resolved", "indeterminate"):
+        parsed = AgentStatusPayload(
+            **base, reproduce_verdict={"status": status, "reason": "x"}
+        )
+        assert parsed.reproduce_verdict.status == status
+    # Reason/evidence are optional.
+    minimal = AgentStatusPayload(**base, reproduce_verdict={"status": "reproduced"})
+    assert minimal.reproduce_verdict.reason is None
+    # Unknown status is rejected.
+    with pytest.raises(Exception):
+        AgentStatusPayload(**base, reproduce_verdict={"status": "maybe"})
+
+
+@pytest.mark.asyncio
 async def test_playbook_recent_outcomes_flipped_on_first_attempt_success(
     client: AsyncClient, db_session, mocker
 ):

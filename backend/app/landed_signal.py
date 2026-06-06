@@ -52,6 +52,17 @@ MergeVerificationStatus = Literal[
     "verified", "unverified_benign", "unverified_degraded"
 ]
 
+# Where the durable reproduce-on-HEAD verdict is persisted for
+# bug-report-/finding-derived work. Written by the agent terminal-status path
+# (``routers/agent_status``) and seeded by research/bug-report ingestion. The
+# canonical defect-truth signal success scoring reads to tell a *proven* fix
+# from a merely-shipped one. Mirrors ``schemas.ReproduceVerdict``.
+REPRODUCE_VERDICT_KEY = "reproduce_verdict"
+ReproduceVerdictStatus = Literal["reproduced", "already_resolved", "indeterminate"]
+_REPRODUCE_VERDICT_STATUSES = frozenset(
+    ("reproduced", "already_resolved", "indeterminate")
+)
+
 
 def has_merge_unblock_signal(task: Task) -> bool:
     """Canonical read of the rollup-unblock / merge-equivalent signal."""
@@ -148,6 +159,41 @@ def is_verified_merge(task: Task) -> bool:
     return False, so success-scoring can gate a "proven fix" credit on this.
     """
     return merge_verification_status(task) == "verified"
+
+
+def reproduce_verdict_status(task: Task) -> "ReproduceVerdictStatus | None":
+    """Read the canonical reproduce-on-HEAD verdict status off *task*, or None.
+
+    Returns the persisted ``task.context["reproduce_verdict"]["status"]`` when it
+    is one of the canonical values (``reproduced`` / ``already_resolved`` /
+    ``indeterminate``), else ``None``. ``None`` deliberately covers three cases
+    that must all fall back to merge-based scoring: a task that predates the
+    verdict (historical), a task that is not bug-report-/finding-derived (no
+    defect claim to prove), and any malformed/partial context shape. Mirrors the
+    defensive nested-read of :func:`_unverified_merge_reason`.
+    """
+    verdict = (task.context or {}).get(REPRODUCE_VERDICT_KEY)
+    if not isinstance(verdict, dict):
+        return None
+    status = verdict.get("status")
+    return status if status in _REPRODUCE_VERDICT_STATUSES else None
+
+
+def suppresses_redispatch(task: Task) -> bool:
+    """True when a non-shipping completion affirmatively determined its defect is
+    already resolved / non-reproducing on HEAD, so its source finding must NOT be
+    re-dispatched.
+
+    The canonical signal is a reproduce verdict of ``already_resolved``. The
+    legacy ``no_op_reason`` marker (stamped by ``./done --already-done`` before
+    the verdict existed) is honored as a fallback so historical no-op completions
+    keep suppressing re-dispatch. An ``indeterminate`` verdict is deliberately
+    NOT suppressed — the defect could not be ruled out, so the finding stays
+    eligible for retry.
+    """
+    if reproduce_verdict_status(task) == "already_resolved":
+        return True
+    return bool((task.context or {}).get("no_op_reason"))
 
 
 def landed_signal_predicate(session: AsyncSession) -> ColumnElement[bool]:

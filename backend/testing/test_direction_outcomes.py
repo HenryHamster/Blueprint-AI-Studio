@@ -398,6 +398,69 @@ async def test_pr_metrics_basic(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_generalized_success_gates_on_reproduce_verdict(db_session: AsyncSession):
+    """A merged fix still counts as a shipped merge, but only a *reproduced*
+    defect scores as a generalized (proven-fix) success; an already_resolved
+    merge ships code without inflating generalized_successes."""
+    direction_id = "d-reproduce"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
+    await db_session.flush()
+
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "reproduce_verdict": {"status": "reproduced"},
+        },
+        payloads=[{"type": "fix", "scope": "small"}],
+        title="reproduced-fix",
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "reproduce_verdict": {"status": "already_resolved"},
+        },
+        payloads=[{"type": "fix", "scope": "small"}],
+        title="already-resolved-merge",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    # Both merged PRs still count as shipped code (merge-rate metrics unchanged).
+    assert entry["prs_merged"] == 2
+    assert entry["verified_prs_merged"] == 2
+    assert entry["conversion_rate"] == 1.0
+    # ...but only the reproduced defect is a proven-fix generalized success.
+    assert entry["generalized_successes"] == 1
+    code_merge = entry["outcome_kind_breakdown"]["code_merge"]
+    assert code_merge["success"] == 1
+    assert code_merge["neutral"] == 1
+
+
+@pytest.mark.asyncio
 async def test_pr_metrics_exclude_non_merge_unblocks(db_session: AsyncSession):
     """Staging/no-op success paths should not inflate prs_merged analytics."""
     direction_id = "d-prs-non-merge"
