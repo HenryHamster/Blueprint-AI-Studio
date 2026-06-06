@@ -1057,16 +1057,17 @@ async def test_manual_research_stamps_current_direction_id(
 
 
 @pytest.mark.asyncio
-async def test_manual_research_stamps_idempotency_key(
+async def test_manual_research_stamps_direction_claim_key(
     client: AsyncClient, db_session, mocker
 ):
-    """The manual research task must carry the shared, direction-scoped
-    idempotency key so the partial unique index can coalesce a concurrent
-    duplicate against the autonomous path."""
-    from app.autonomous_research import research_idempotency_key
+    """The manual research task must carry the SAME per-direction idempotency
+    claim key the autonomous loop stamps, so a manual spawn and a concurrent
+    autonomous tick can never both create an active research cycle on one
+    direction (atomic under ux_task_active_idempotency_key)."""
+    from app.autonomous_research import research_direction_claim_key
 
     project_id = await _deploy_project(client, mocker)
-    direction = await _add_direction(client, project_id, text="Stamp the idem key")
+    direction = await _add_direction(client, project_id, text="Claim the direction")
     direction_id = direction["id"]
 
     resp = await client.post(
@@ -1077,40 +1078,41 @@ async def test_manual_research_stamps_idempotency_key(
 
     created = await db_session.get(Task, uuid.UUID(task_id))
     assert created is not None
-    assert created.idempotency_key == research_idempotency_key(
+    assert created.idempotency_key == research_direction_claim_key(
         uuid.UUID(project_id), direction_id
     )
 
 
 @pytest.mark.asyncio
-async def test_manual_research_integrityerror_coalesces(
+async def test_manual_research_409_when_concurrent_spawn_holds_claim(
     client: AsyncClient, db_session, mocker
 ):
-    """When a concurrent spawn already holds the active idempotency slot (and is
-    invisible to the soft in-app scan), the DB unique index rejects the second
-    insert; the endpoint must coalesce to a friendly 409, not 500, and must NOT
-    create a second active research task."""
-    from app.autonomous_research import research_idempotency_key
+    """Atomic backstop for the TOCTOU window the in-flight SELECT guard cannot
+    close (same race class as the 2026-06-06 autonomous twins): a concurrent
+    spawn committed its research task AFTER this request's in-flight read but
+    BEFORE its insert. Simulated by an active claim-holder whose payload is
+    invisible to the read guard (no current_direction_id / empty directions):
+    the endpoint must hit the unique-index claim and return 409, not create a
+    duplicate research task."""
+    from app.autonomous_research import research_direction_claim_key
 
     project_id = await _deploy_project(client, mocker)
-    direction = await _add_direction(client, project_id, text="Race the index")
+    direction = await _add_direction(client, project_id, text="Claim already held")
     direction_id = direction["id"]
 
-    # Pre-insert an in-flight task that holds the idempotency slot but carries a
-    # payload the soft active_research scan does NOT match (no current_direction_id
-    # and an unrelated directions list), so only the DB index can catch the dup.
-    in_flight = Task(
+    claim_key = research_direction_claim_key(uuid.UUID(project_id), direction_id)
+    holder = Task(
         project_id=uuid.UUID(project_id),
-        title="Research: holding the slot",
+        title="Research: concurrent spawn that won the claim",
+        # Payload shape the read guard can't attribute to the direction —
+        # mimics "committed between the read and the insert".
         payloads=[{"type": "research", "directions": [], "base_branch": "main"}],
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-        idempotency_key=research_idempotency_key(
-            uuid.UUID(project_id), direction_id
-        ),
+        idempotency_key=claim_key,
     )
-    db_session.add(in_flight)
+    db_session.add(holder)
     await db_session.commit()
 
     resp = await client.post(
@@ -1118,31 +1120,13 @@ async def test_manual_research_integrityerror_coalesces(
     )
     assert resp.status_code == 409, resp.text
     assert "in progress" in resp.text.lower()
+    assert str(holder.id)[:8] in resp.text
 
-    # Exactly one active research task on the idempotency key — the pre-existing one.
-    rows = (
-        (
-            await db_session.execute(
-                select(Task).where(
-                    Task.idempotency_key
-                    == research_idempotency_key(uuid.UUID(project_id), direction_id),
-                    Task.status.in_(
-                        [
-                            TaskStatus.QUEUED,
-                            TaskStatus.PROVISIONING,
-                            TaskStatus.IN_PROGRESS,
-                            TaskStatus.EVALUATING,
-                            TaskStatus.BLOCKED,
-                        ]
-                    ),
-                )
-            )
-        )
-        .scalars()
-        .all()
+    # Exactly one task holds the claim — no duplicate row was created.
+    result = await db_session.execute(
+        select(Task).where(Task.idempotency_key == claim_key)
     )
-    assert len(rows) == 1
-    assert rows[0].id == in_flight.id
+    assert len(result.scalars().all()) == 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
