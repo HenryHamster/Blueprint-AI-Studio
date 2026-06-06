@@ -899,6 +899,30 @@ async def _confirm_serving_or_fail(
                     "(non-fatal)",
                     version.version_number,
                 )
+            # Wake the strategist now instead of leaving it to discover the
+            # failed deploy on its next natural cycle (gated behind the
+            # strategic-spawn cooldown). A failed production deploy is the
+            # loudest release signal, so arm the same coalescing refresh marker
+            # the post-qualification path uses. Best-effort and non-fatal:
+            # request_strategic_refresh swallows its own errors, does NOT commit
+            # (rides this transaction), and the single-slot marker coalesces, so
+            # arming can never abort the deploy-failed write and a re-scanned
+            # version cannot re-fire (the serving_status!=unconfirmed guard above
+            # means this branch runs exactly once per version).
+            try:
+                from app.strategic_trigger import request_strategic_refresh
+
+                await request_strategic_refresh(
+                    session,
+                    version.project_id,
+                    f"promotion_deploy_failed:{sha_or_reason}",
+                )
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] strategic refresh arm raised for v%d "
+                    "(non-fatal)",
+                    version.version_number,
+                )
             await session.commit()
             logger.error(
                 "[RELEASE_QUALIFIER] promotion deploy FAILED for v%d "

@@ -1162,6 +1162,11 @@ from app.release_reconciliation import (  # noqa: E402
     _classify_serving_outcome,
     _confirm_serving_or_fail,
 )
+from app.strategic_trigger import (  # noqa: E402
+    ORIGIN_QUALIFICATION,
+    strategic_refresh_origin,
+    strategic_refresh_pending,
+)
 from sqlalchemy import select as _select  # noqa: E402
 
 _SHA_A = "a" * 40
@@ -1461,6 +1466,98 @@ async def test_confirm_rollback_after_promotion_deploy_failed_scenario(db_sessio
         .all()
     )
     assert any("deploy FAILED" in a.title for a in alerts)
+
+
+@pytest.mark.asyncio
+async def test_confirm_deploy_failed_arms_strategic_refresh(db_session):
+    """A deploy_failed resolution wakes the strategist: it arms exactly one
+    coalescing strategic-refresh marker (qualification origin, deploy-failed
+    reason) so recovery is not gated behind the strategic-spawn cooldown."""
+    promoted_at = _utcnow() - timedelta(hours=2)
+    deadline = promoted_at + timedelta(hours=1)  # already elapsed
+    project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha="c" * 40,  # stale revision, never advanced
+        deployed_at=promoted_at - timedelta(minutes=30),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "deploy_failed"
+
+    await db_session.refresh(project)
+    assert strategic_refresh_pending(project.vision) is True
+    # Automated trigger (respects the failure breaker), not operator origin.
+    assert strategic_refresh_origin(project.vision) == ORIGIN_QUALIFICATION
+    marker = project.vision["_strategic_refresh"]
+    assert str(marker.get("reason", "")).startswith("promotion_deploy_failed:")
+    # Single-slot / coalescing: exactly one refresh was armed, not stacked.
+    assert int(marker.get("count") or 1) == 1
+
+
+@pytest.mark.asyncio
+async def test_confirm_serving_confirmed_does_not_arm_refresh(db_session):
+    """A clean serving_confirmed resolution must NOT wake the strategist —
+    only failed deploys arm the refresh via this path."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_A,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=40),
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "serving_confirmed"
+
+    await db_session.refresh(project)
+    assert strategic_refresh_pending(project.vision) is False
+
+
+@pytest.mark.asyncio
+async def test_confirm_within_window_unconfirmed_does_not_arm_refresh(db_session):
+    """A still-in-window MONITORING no-op leaves the version unconfirmed and
+    arms no refresh — the strategist is only woken on a terminal failure."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.MONITORING,
+        current_sha=_SHA_A,
+        deployed_at=promoted_at + timedelta(minutes=5),
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=15),
+    )
+    assert resolved is False
+    await db_session.refresh(version)
+    assert version.serving_status == "unconfirmed"
+
+    await db_session.refresh(project)
+    assert strategic_refresh_pending(project.vision) is False
 
 
 @pytest.mark.asyncio

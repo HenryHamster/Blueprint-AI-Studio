@@ -5587,6 +5587,55 @@ class TestNotificationConfigStartupRestore:
                 await conn.run_sync(SQLModel.metadata.drop_all)
             await _engine.dispose()
 
+    @pytest.mark.asyncio
+    async def test_init_deployment_state_adopts_resolved_sha(self, mocker):
+        """On Cloud Run the resolver returns the real serving SHA; _init_deployment_state
+        must adopt it into _current_sha (and therefore the singleton row /
+        /api/version) before initializing deployment state."""
+        from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+        from sqlmodel import SQLModel
+        from unittest.mock import AsyncMock
+        from app.models import DeploymentState
+        from app.main import _init_deployment_state
+        import app.main as _main
+
+        _engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        async with _engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.create_all)
+        _Session = sessionmaker(
+            bind=_engine,
+            class_=AsyncSession,
+            autocommit=False,
+            autoflush=False,
+            expire_on_commit=False,
+        )
+        mocker.patch("app.main.AsyncSessionLocal", _Session)
+        mocker.patch.object(_main, "_current_sha", "unknown")
+        mocker.patch.object(
+            _main,
+            "resolve_deployed_sha",
+            new=AsyncMock(return_value="cafebabe123"),
+        )
+
+        try:
+            # First boot — no existing row, so it creates the singleton.
+            await _init_deployment_state()
+            assert _main._current_sha == "cafebabe123"
+            async with _Session() as session:
+                row = await session.get(DeploymentState, 1)
+                assert row is not None
+                assert row.current_sha == "cafebabe123"
+        finally:
+            async with _engine.begin() as conn:
+                await conn.run_sync(SQLModel.metadata.drop_all)
+            await _engine.dispose()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_settings.py — repair-state stuck task persists failure_category

@@ -5,10 +5,14 @@ export function VersionMismatchBanner() {
   const [mismatch, setMismatch] = useState(false);
   useEffect(() => {
     const expectedSha = import.meta.env.VITE_EXPECTED_BACKEND_SHA;
-    if (!expectedSha) return;
+    if (!expectedSha || expectedSha === 'unknown') return;
     fetch('/api/version')
       .then(r => r.json())
-      .then(data => { if (data.sha && data.sha !== expectedSha) setMismatch(true); })
+      .then(data => {
+        if (data.sha && data.sha !== 'unknown' && data.sha !== expectedSha) {
+          setMismatch(true);
+        }
+      })
       .catch(() => {});
   }, []);
 

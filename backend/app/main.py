@@ -39,6 +39,7 @@ from app.models import (
     DeploymentStatus,
 )
 from app.compute import provision_agent_vm  # noqa: F401  (re-exported for test patches; see main.py:108 docstring)
+from app.deployed_sha import resolve_deployed_sha
 from app.auth import get_current_user
 from app.admin import router as admin_router
 from app.routers.admin_projects import router as admin_projects_router
@@ -138,6 +139,9 @@ from app.max_plan_pool import (  # noqa: F401
 
 # Current revision from Cloud Run (set on startup)
 _current_revision: str = os.getenv("K_REVISION", "local-dev")
+# Default SHA; overwritten at startup by resolve_deployed_sha() when running on
+# Cloud Run (DEPLOY_SHA is never set by the deploy pipeline, so this is "unknown"
+# until _init_deployment_state resolves the real serving SHA from the revision).
 _current_sha: str = os.getenv("DEPLOY_SHA", "unknown")
 
 
@@ -256,6 +260,15 @@ async def _best_effort_deploy_state_commit(session) -> bool:
 
 async def _init_deployment_state():
     """Check/initialize deployment state on startup. Detects new deploys and rollbacks."""
+    # Resolve the real serving SHA from the running Cloud Run revision before any
+    # use of _current_sha (deploy-detection, the singleton row, /api/version all
+    # read it). Best-effort: returns None off Cloud Run or on any failure, in
+    # which case we keep the existing default ("unknown") and never block startup.
+    global _current_sha
+    resolved = await resolve_deployed_sha()
+    if resolved:
+        _current_sha = resolved
+
     async with AsyncSessionLocal() as session:
         state = await session.get(DeploymentState, 1)
 
