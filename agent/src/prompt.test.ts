@@ -4224,6 +4224,14 @@ describe('buildCodeChangeHelperGuidance', () => {
     expect(g).toContain('scope-drift');
     expect(g).toContain('regression_risk');
     expect(g).toContain('cross-system-contract');
+    // Terminal-verb guarantee: every run must end with a terminal verb, and the
+    // prompt must explicitly state there is no monitor/watcher that resumes the
+    // session (regression guard for the passive "I'll wait for the monitor" exit).
+    expect(g).toContain('You MUST end every run with a terminal verb');
+    expect(g).toContain('NO external monitor');
+    expect(g).toMatch(/will resume (this session|you)/i);
+    expect(g).toContain("I'll wait for the monitor");
+    expect(g).toContain('not-shipped');
   };
 
   // Isolate the stack-specific ./check intro (between the preamble and the
