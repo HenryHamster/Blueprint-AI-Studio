@@ -185,6 +185,84 @@ async def test_create_direction_is_idempotent_with_idempotency_key(
 
 
 @pytest.mark.asyncio
+async def test_create_staged_direction_duplicate_replay_preserves_staging(
+    client: AsyncClient, db_session, mocker
+):
+    """A duplicate replay of a born-staged create returns the same staged
+    direction verbatim (preserving staged_for_version and completion_criteria)
+    and does not create a second lane."""
+    project_id = await _deploy_project(client, mocker)
+    project_uuid = uuid.UUID(project_id)
+    from app import release_version as rv
+
+    await rv.open_version(db_session, project_uuid, version_number=7)
+    await db_session.commit()
+
+    idem_key = "staged-replay-key"
+    body = {
+        "text": "Stage this for next version",
+        "priority": "medium",
+        "staged": True,
+        "completion_criteria": "All staged checks pass",
+        "idempotency_key": idem_key,
+    }
+    resp1 = await client.post(
+        f"/api/admin/projects/{project_id}/directions", json=body
+    )
+    assert resp1.status_code == 200
+    d1 = resp1.json()["direction"]
+    assert d1["status"] == "staged"
+    assert d1["staged_for_version"] == 7
+    assert d1["completion_criteria"] == "All staged checks pass"
+
+    # Replay with the same key returns the stored staged direction verbatim.
+    resp2 = await client.post(
+        f"/api/admin/projects/{project_id}/directions", json=body
+    )
+    assert resp2.status_code == 200
+    assert resp2.json().get("status") == "duplicate"
+    d2 = resp2.json()["direction"]
+    assert d2["id"] == d1["id"]
+    assert d2["status"] == "staged"
+    assert d2["staged_for_version"] == 7
+    assert d2["completion_criteria"] == "All staged checks pass"
+
+    # Exactly one direction exists after the replay.
+    resp_list = await client.get(f"/api/admin/projects/{project_id}/directions")
+    directions = resp_list.json()["directions"]
+    assert len(directions) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_direction_duplicate_replay_does_not_double_count_cap(
+    client: AsyncClient, mocker
+):
+    """A duplicate replay carrying an existing key does not consume an extra
+    active-direction slot — the cap counts the single underlying direction once."""
+    project_id = await _deploy_project(client, mocker)
+    from app.shared_state import runtime_config
+
+    mocker.patch.dict(runtime_config, {"max_active_directions": 1})
+
+    idem_key = "cap-replay-key"
+    body = {"text": "Only lane", "priority": "high", "idempotency_key": idem_key}
+    resp1 = await client.post(
+        f"/api/admin/projects/{project_id}/directions", json=body
+    )
+    assert resp1.status_code == 200
+
+    # Replaying the same key returns the duplicate, not a 409 cap error.
+    resp2 = await client.post(
+        f"/api/admin/projects/{project_id}/directions", json=body
+    )
+    assert resp2.status_code == 200
+    assert resp2.json().get("status") == "duplicate"
+
+    resp_list = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert len(resp_list.json()["directions"]) == 1
+
+
+@pytest.mark.asyncio
 async def test_get_directions_returns_created(client: AsyncClient, mocker):
     """GET returns directions that were previously POSTed."""
     project_id = await _deploy_project(client, mocker)
@@ -8258,6 +8336,120 @@ async def test_get_directions_includes_context_fields_when_set(
     ctx = target["context"]
     assert ctx.get("success_evidence") == "All tests passing"
     assert ctx.get("retirement_condition") == "Zero failures for 4 weeks"
+
+
+@pytest.mark.asyncio
+async def test_create_direction_with_acceptance_evidence(
+    client: AsyncClient, mocker
+):
+    """POST can author success_evidence/retirement_condition at create time;
+    they round-trip into context exactly as the PATCH path stores them."""
+    project_id = await _deploy_project(client, mocker)
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions",
+        json={
+            "text": "Author acceptance at create",
+            "priority": "high",
+            "success_evidence": "Operators see truthful status labels",
+            "retirement_condition": "One promotion cycle runs without workarounds",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    d = resp.json()["direction"]
+    ctx = d.get("context") or {}
+    assert ctx.get("success_evidence") == "Operators see truthful status labels"
+    assert (
+        ctx.get("retirement_condition")
+        == "One promotion cycle runs without workarounds"
+    )
+
+    # Round-trips through GET inside context, same shape PATCH produces.
+    resp_list = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp_list.status_code == 200
+    target = next(
+        (x for x in resp_list.json()["directions"] if x["id"] == d["id"]), None
+    )
+    assert target is not None
+    assert target["context"]["success_evidence"] == (
+        "Operators see truthful status labels"
+    )
+    assert target["context"]["retirement_condition"] == (
+        "One promotion cycle runs without workarounds"
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_direction_without_acceptance_evidence_has_no_empty_context(
+    client: AsyncClient, mocker
+):
+    """POST omitting the acceptance fields introduces no empty context entry."""
+    project_id = await _deploy_project(client, mocker)
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions",
+        json={"text": "No acceptance authored", "priority": "medium"},
+    )
+    assert resp.status_code == 200, resp.text
+    d = resp.json()["direction"]
+    # No context key at all (or, if present, it carries neither acceptance key).
+    ctx = d.get("context")
+    assert ctx is None or (
+        "success_evidence" not in ctx and "retirement_condition" not in ctx
+    )
+
+    resp_list = await client.get(f"/api/admin/projects/{project_id}/directions")
+    target = next(
+        (x for x in resp_list.json()["directions"] if x["id"] == d["id"]), None
+    )
+    assert target is not None
+    ctx = target.get("context")
+    assert ctx is None or (
+        "success_evidence" not in ctx and "retirement_condition" not in ctx
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_direction_acceptance_evidence_revisable_via_patch(
+    client: AsyncClient, mocker
+):
+    """A direction authored with acceptance fields at create can still be
+    revised by a subsequent PATCH."""
+    project_id = await _deploy_project(client, mocker)
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions",
+        json={
+            "text": "Revisable acceptance",
+            "success_evidence": "Initial evidence",
+            "retirement_condition": "Initial condition",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    direction_id = resp.json()["direction"]["id"]
+
+    patch_resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"success_evidence": "Revised evidence"},
+    )
+    assert patch_resp.status_code == 200, patch_resp.text
+    ctx = patch_resp.json()["direction"].get("context") or {}
+    assert ctx.get("success_evidence") == "Revised evidence"
+    # Untouched field from create is preserved.
+    assert ctx.get("retirement_condition") == "Initial condition"
+
+
+@pytest.mark.asyncio
+async def test_create_direction_rejects_oversized_acceptance_evidence(
+    client: AsyncClient, mocker
+):
+    """POST enforces the same 500-char cap the PATCH path applies."""
+    project_id = await _deploy_project(client, mocker)
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions",
+        json={
+            "text": "Oversized evidence",
+            "success_evidence": "x" * 501,
+        },
+    )
+    assert resp.status_code == 422
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -115,6 +115,25 @@ class DirectionPayload(BaseModel):
             "existing direction instead of creating a duplicate."
         ),
     )
+    success_evidence: Optional[str] = Field(
+        default=None,
+        max_length=DIRECTION_CONTEXT_FIELD_MAX,
+        description=(
+            "Acceptance evidence: the observable signal that proves this "
+            "direction succeeded. Stored under context['success_evidence'], "
+            "matching the PATCH/update convention."
+        ),
+    )
+    retirement_condition: Optional[str] = Field(
+        default=None,
+        max_length=DIRECTION_CONTEXT_FIELD_MAX,
+        description=(
+            "Retirement condition: the explicit state under which this "
+            "direction may be retired. Stored under "
+            "context['retirement_condition'], matching the PATCH/update "
+            "convention."
+        ),
+    )
 
 
 @router.get("/projects/{project_id}/directions")
@@ -319,6 +338,19 @@ async def add_direction(
         direction["cost_budget_usd"] = float(payload.cost_budget_usd)
     if idem_key:
         direction["idempotency_key"] = idem_key
+    # Acceptance-evidence contract: stamp success_evidence / retirement_condition
+    # into the nested context dict exactly the way update_direction (PATCH) does,
+    # so create and patch produce identical shapes. Only set keys that were
+    # provided, and only attach `context` at all when at least one is present —
+    # an omitted field introduces no empty context entry. Pydantic's max_length
+    # already enforces the 500-char cap that PATCH checks manually.
+    context: Dict[str, Any] = {}
+    if payload.success_evidence is not None:
+        context["success_evidence"] = payload.success_evidence
+    if payload.retirement_condition is not None:
+        context["retirement_condition"] = payload.retirement_condition
+    if context:
+        direction["context"] = context
 
     existing_direction: list = []  # Will be populated if we find a duplicate
 

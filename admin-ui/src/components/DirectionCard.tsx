@@ -76,6 +76,8 @@ export interface DirectionCardProps {
   editPathTags: string[];
   editPathInput: string;
   editCompletionCriteria: string;
+  editSuccessEvidence: string;
+  editRetirementCondition: string;
   editCostBudget?: string;
   setEditingId: React.Dispatch<React.SetStateAction<string | null>>;
   setEditText: React.Dispatch<React.SetStateAction<string>>;
@@ -85,6 +87,8 @@ export interface DirectionCardProps {
   setEditPathTags: React.Dispatch<React.SetStateAction<string[]>>;
   setEditPathInput: React.Dispatch<React.SetStateAction<string>>;
   setEditCompletionCriteria: React.Dispatch<React.SetStateAction<string>>;
+  setEditSuccessEvidence: React.Dispatch<React.SetStateAction<string>>;
+  setEditRetirementCondition: React.Dispatch<React.SetStateAction<string>>;
   setEditCostBudget?: React.Dispatch<React.SetStateAction<string>>;
   startEdit: (d: Direction) => void;
   // Action handlers
@@ -126,8 +130,8 @@ function DirectionCardImpl({
   direction: d,
   statusKey: key,
   activeItems,
-  editingId, editText, editPriority, editStatus, editCategory, editPathTags, editPathInput, editCompletionCriteria, editCostBudget,
-  setEditingId, setEditText, setEditPriority, setEditStatus, setEditCategory, setEditPathTags, setEditPathInput, setEditCompletionCriteria, setEditCostBudget,
+  editingId, editText, editPriority, editStatus, editCategory, editPathTags, editPathInput, editCompletionCriteria, editSuccessEvidence, editRetirementCondition, editCostBudget,
+  setEditingId, setEditText, setEditPriority, setEditStatus, setEditCategory, setEditPathTags, setEditPathInput, setEditCompletionCriteria, setEditSuccessEvidence, setEditRetirementCondition, setEditCostBudget,
   startEdit,
   updateDirection, approveProposal, rejectProposal, reviveProposal,
   reactivateDirection, activateStagedDirection, retargetStagedDirection, cancelStagedDirection, unholdDirection, markDirectionComplete, quickToggleStatus, deleteDirection,
@@ -480,6 +484,24 @@ function DirectionCardImpl({
             rows={2}
             className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600 resize-y"
           />
+          {/* Acceptance-evidence contract editable inline; 500-char limit
+              mirrors the backend create/update endpoint. */}
+          <textarea
+            value={editSuccessEvidence}
+            onChange={e => setEditSuccessEvidence(e.target.value)}
+            placeholder="Success evidence..."
+            rows={2}
+            maxLength={500}
+            className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600 resize-y"
+          />
+          <textarea
+            value={editRetirementCondition}
+            onChange={e => setEditRetirementCondition(e.target.value)}
+            placeholder="Retirement condition..."
+            rows={2}
+            maxLength={500}
+            className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600 resize-y"
+          />
           <div className="bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 flex flex-wrap gap-1 items-center focus-within:ring-1 focus-within:ring-neutral-600">
             {editPathTags.map(tag => (
               <span key={tag} className="bg-neutral-800 border border-neutral-700 text-neutral-300 text-[10px] font-mono px-1.5 py-0.5 rounded flex items-center gap-1">
@@ -699,6 +721,12 @@ function DirectionCardImpl({
             <p className="mt-1.5 text-[11px] text-neutral-500 leading-relaxed">
               <span className="font-medium text-neutral-600">Success evidence: </span>
               <span className="italic">{d.context.success_evidence}</span>
+            </p>
+          )}
+          {d.context?.retirement_condition && (
+            <p className="mt-1.5 text-[11px] text-neutral-500 leading-relaxed">
+              <span className="font-medium text-neutral-600">Retirement condition: </span>
+              <span className="italic">{d.context.retirement_condition}</span>
             </p>
           )}
           {/* Last researched / cooldown subtitle */}

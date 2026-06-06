@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { apiFetch, fetchVersionLifecycle } from '../api';
+import { generateIdempotencyKey } from '../utils/idempotencyKey';
 import { useDirectionForm } from './useDirectionForm';
 import { useAutonomousConfig } from './useAutonomousConfig';
 import { usePoller } from './usePoller';
@@ -173,19 +174,32 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       const body: Record<string, unknown> = { text: form.newText.trim(), priority: form.newPriority, paths: form.newPathTags };
       if (form.newCategory) body.category = form.newCategory;
       body.completion_criteria = form.newCompletionCriteria.trim() || null;
+      body.success_evidence = form.newSuccessEvidence.trim() || null;
+      body.retirement_condition = form.newRetirementCondition.trim() || null;
       // Atomic born-staged create: when the operator opted to stage for the next
       // version, the backend stamps staged_for_version from the open version in a
       // single create call (404s if none is open), so the direction never passes
       // through a research-eligible active state (no create-then-edit race).
       if (form.newStaged && openVersionNumber != null) body.staged = true;
+      // Reuse one client idempotency identity across double-clicks / failed
+      // retries / lost-response replays so the backend collapses them into a
+      // single direction. The key is minted lazily here and held until the add
+      // succeeds; resetAddForm() clears it so the next logical add mints a fresh
+      // one. A thrown error leaves the key in place for the retry.
+      form.addIdempotencyKeyRef.current ??= generateIdempotencyKey();
+      body.idempotency_key = form.addIdempotencyKeyRef.current;
       const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions`, {
         method: 'POST',
         body: JSON.stringify(body),
       });
       if (!res.ok) throw new Error('Failed to add direction');
+      // A duplicate replay (`status: "duplicate"`) is the backend telling us the
+      // logical add already landed — that is a clean success, not an error.
+      await res.json().catch(() => ({}));
       form.resetAddForm();
       fetchDirections();
     } catch {
+      form.markAddAttemptFailed();
       setError('Failed to add direction. Please try again.');
     }
   }
@@ -195,7 +209,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     try {
       const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
         method: 'PATCH',
-        body: JSON.stringify({ text: form.editText, priority: form.editPriority, status: form.editStatus, paths: form.editPathTags, category: form.editCategory ?? null, completion_criteria: form.editCompletionCriteria.trim() || null }),
+        body: JSON.stringify({ text: form.editText, priority: form.editPriority, status: form.editStatus, paths: form.editPathTags, category: form.editCategory ?? null, completion_criteria: form.editCompletionCriteria.trim() || null, success_evidence: form.editSuccessEvidence.trim() || null, retirement_condition: form.editRetirementCondition.trim() || null }),
       });
       if (!res.ok) throw new Error('Failed to update direction');
       form.setEditingId(null);

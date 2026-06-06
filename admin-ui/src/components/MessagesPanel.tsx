@@ -18,6 +18,7 @@ import { MessagesComposer } from './MessagesComposer';
 import { armingToastCopy, parseArmingOutcome, type ArmingOutcome } from './messageArming';
 import { MessagesBatchActionBar } from './MessagesBatchActionBar';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
+import { generateIdempotencyKey } from '../utils/idempotencyKey';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -25,15 +26,6 @@ const DEFAULT_VIEW_ID = '__default__';
 // messages that grow without bound, and blocking stale receipts from resurfacing after
 // an operator cancels a fresh steer.
 const STEER_RECEIPT_MAX_AGE_MS = 7_200_000;
-
-// Generate a client idempotency key for a message send. Prefers the native
-// UUID generator and falls back to a timestamp+random token for older runtimes
-// (and JSDOM, where crypto.randomUUID may be absent).
-function generateIdempotencyKey(): string {
-  const c = typeof globalThis !== 'undefined' ? globalThis.crypto : undefined;
-  if (c && typeof c.randomUUID === 'function') return c.randomUUID();
-  return `idem-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-}
 
 function viewSummaryLine(query: string, prefs: Record<string, EventPref>, sort: 'importance' | 'recent', showResolved: boolean, showOnlyNew?: boolean): string {
   const parts: string[] = [];
@@ -150,6 +142,12 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // them to one logical message; cleared after a successful send so the next
   // distinct message gets a fresh key.
   const idempotencyKeyRef = useRef<string | null>(null);
+  // Per-message idempotency identity for the feedback→direction conversion.
+  // Keyed by source message id so a retried (or batch-replayed) convert of the
+  // same message reuses one key and the backend collapses it to a single
+  // direction; cleared only after the message is resolved/created so a failed
+  // attempt keeps its key for the retry.
+  const directionIdempotencyKeysRef = useRef<Map<string, string>>(new Map());
 
   // Per-message action state
   const [resolvingId, setResolvingId] = useState<string | null>(null);
@@ -877,19 +875,31 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     setCreatingDirectionIds(prev => new Set(prev).add(msg.id));
     try {
       const text = msg.content.slice(0, 2000);
+      // Reuse one idempotency identity per source message so a retry / batch
+      // replay of the same conversion collapses to a single direction; a
+      // duplicate replay returns the existing direction as a clean success.
+      let idemKey = directionIdempotencyKeysRef.current.get(msg.id);
+      if (!idemKey) {
+        idemKey = generateIdempotencyKey();
+        directionIdempotencyKeysRef.current.set(msg.id, idemKey);
+      }
       const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}/directions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, priority: 'medium' }),
+        body: JSON.stringify({ text, priority: 'medium', idempotency_key: idemKey }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       const directionId: string = data.direction?.id ?? '';
-      await apiFetch(`${API_BASE_URL}/api/admin/messages/${msg.id}`, {
+      const resolveRes = await apiFetch(`${API_BASE_URL}/api/admin/messages/${msg.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ resolution: `Direction created: ${directionId}` }),
       });
+      if (!resolveRes.ok) throw new Error(`HTTP ${resolveRes.status}`);
+      // Resolved/created cleanly — drop the per-message key so a genuinely
+      // distinct future convert of the same message id mints a fresh identity.
+      directionIdempotencyKeysRef.current.delete(msg.id);
       if (!silent) addToast('Direction created', 'success');
       await fetchMessages();
       return true;

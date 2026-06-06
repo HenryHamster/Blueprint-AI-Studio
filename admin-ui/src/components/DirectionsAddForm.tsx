@@ -92,6 +92,27 @@ export function DirectionsAddForm({ form, addDirection, stageTargetVersion }: Di
         rows={2}
         className="mt-1.5 w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600 resize-y"
       />
+      {/* Acceptance-evidence contract: the same success_evidence /
+          retirement_condition fields the system expects directions to carry,
+          authored directly. 500-char limit mirrors the backend create endpoint. */}
+      <label className="block mt-1.5 text-[10px] text-neutral-500">Success evidence</label>
+      <textarea
+        value={form.newSuccessEvidence}
+        onChange={e => form.setNewSuccessEvidence(e.target.value)}
+        placeholder="Success evidence (what observable outcome proves this direction succeeded)..."
+        rows={2}
+        maxLength={500}
+        className="mt-0.5 w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600 resize-y"
+      />
+      <label className="block mt-1.5 text-[10px] text-neutral-500">Retirement condition</label>
+      <textarea
+        value={form.newRetirementCondition}
+        onChange={e => form.setNewRetirementCondition(e.target.value)}
+        placeholder="Retirement condition (when this direction can be retired)..."
+        rows={2}
+        maxLength={500}
+        className="mt-0.5 w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600 resize-y"
+      />
       {/* Born-staged create: stage the new direction for the next version in a
           single create call. Disabled (and explained) when no version is open to
           stage against, mirroring the edit-form "Staged" status option. */}

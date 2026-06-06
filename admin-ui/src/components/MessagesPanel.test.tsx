@@ -3658,6 +3658,164 @@ describe('MessagesPanel send arming receipt', () => {
   });
 });
 
+// ── Feedback → direction conversion idempotency ───────────────────────────────
+// The operator can convert a FEEDBACK message into a steering direction. A
+// retried (or batch-replayed) conversion of the SAME message must reuse one
+// client idempotency identity so the backend collapses it to a single
+// direction, and a backend duplicate replay (`status: "duplicate"`) is a clean
+// success — not an error. (The POST /directions backend dedup is covered in
+// test_directions.py; these tests lock the client key reuse + replay handling.)
+
+describe('MessagesPanel handleCreateDirection idempotency', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  beforeEach(() => { localStorage.clear(); });
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  // Installs an apiFetch mock that serves a single FEEDBACK message on the list
+  // GET and records every POST /directions body. `failFirstPost` makes the first
+  // create POST fail (500) so the retry path can be exercised; `duplicate` makes
+  // the create response carry `status: "duplicate"`.
+  function _setupDirectionMock(opts: { failFirstPost?: boolean; failFirstPatch?: boolean; duplicate?: boolean } = {}): {
+    postBodies: Record<string, unknown>[];
+    patchBodies: Record<string, unknown>[];
+  } {
+    const postBodies: Record<string, unknown>[] = [];
+    const patchBodies: Record<string, unknown>[] = [];
+    let postCount = 0;
+    let patchCount = 0;
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/directions') && method === 'POST') {
+        postBodies.push(JSON.parse(String((init as RequestInit).body)));
+        postCount += 1;
+        if (opts.failFirstPost && postCount === 1) return new Response('boom', { status: 500 });
+        return new Response(
+          JSON.stringify({ direction: { id: 'd-xyz' }, ...(opts.duplicate ? { status: 'duplicate' } : {}) }),
+          { status: 200 },
+        );
+      }
+      if (urlStr.includes('/api/admin/messages/fb-1') && method === 'PATCH') {
+        patchBodies.push(JSON.parse(String((init as RequestInit).body)));
+        patchCount += 1;
+        if (opts.failFirstPatch && patchCount === 1) return new Response('boom', { status: 500 });
+        return new Response(JSON.stringify({}), { status: 200 });
+      }
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [makeMsg({ id: 'fb-1', message_type: 'FEEDBACK', from_type: 'operator' })] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    return { postBodies, patchBodies };
+  }
+
+  async function renderPanel(addToast: (message: string, type: 'success' | 'error' | 'info') => void = () => {}) {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={addToast}
+          onMessageCountChange={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    return host as HTMLDivElement;
+  }
+
+  function createDirectionButton(el: HTMLElement): HTMLButtonElement {
+    const btn = el.querySelector('button[title="Create Direction"]') as HTMLButtonElement | null;
+    if (!btn) throw new Error('test setup: expected a Create Direction button on the feedback message');
+    return btn;
+  }
+
+  test('sends an idempotency_key with the direction create POST', async () => {
+    const { postBodies } = _setupDirectionMock();
+    const el = await renderPanel();
+    const btn = createDirectionButton(el);
+    await act(async () => { btn.click(); });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+
+    expect(postBodies.length).toBe(1);
+    expect(typeof postBodies[0].idempotency_key).toBe('string');
+    expect((postBodies[0].idempotency_key as string).length).toBeGreaterThan(0);
+  });
+
+  test('reuses one idempotency_key per message id when a failed conversion is retried', async () => {
+    const { postBodies } = _setupDirectionMock({ failFirstPost: true });
+    const el = await renderPanel();
+    const btn = createDirectionButton(el);
+
+    await act(async () => { btn.click(); }); // first attempt fails — key retained
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+    await act(async () => { btn.click(); }); // retry — same message id, same key
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+
+    expect(postBodies.length).toBe(2);
+    expect(postBodies[0].idempotency_key).toBeTruthy();
+    expect(postBodies[0].idempotency_key).toBe(postBodies[1].idempotency_key);
+  });
+
+  test('keeps one idempotency_key until the resolution PATCH succeeds', async () => {
+    const addToast = vi.fn();
+    const { postBodies, patchBodies } = _setupDirectionMock({ failFirstPatch: true, duplicate: true });
+    const el = await renderPanel(addToast);
+    const btn = createDirectionButton(el);
+
+    await act(async () => { btn.click(); }); // create succeeds, resolution PATCH fails
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+    await act(async () => { btn.click(); }); // retry replays the same create idempotency key
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+
+    expect(postBodies.length).toBe(2);
+    expect(postBodies[0].idempotency_key).toBeTruthy();
+    expect(postBodies[0].idempotency_key).toBe(postBodies[1].idempotency_key);
+    expect(patchBodies).toEqual([
+      { resolution: 'Direction created: d-xyz' },
+      { resolution: 'Direction created: d-xyz' },
+    ]);
+    expect(addToast).toHaveBeenCalledWith('Failed to create direction', 'error');
+    expect(addToast).toHaveBeenCalledWith('Direction created', 'success');
+  });
+
+  test('treats a status:"duplicate" create response as a clean success', async () => {
+    const { postBodies } = _setupDirectionMock({ duplicate: true });
+    const el = await renderPanel();
+    const btn = createDirectionButton(el);
+    await act(async () => { btn.click(); });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+
+    // One create, and the message was resolved (PATCH) — the duplicate replay
+    // routed through the success path rather than throwing.
+    expect(postBodies.length).toBe(1);
+    const patched = vi.mocked(apiFetch).mock.calls.some((c) => {
+      const init = c[1] as RequestInit | undefined;
+      return String(c[0]).includes('/api/admin/messages/fb-1') && init?.method === 'PATCH';
+    });
+    expect(patched).toBe(true);
+  });
+});
+
 
 describe('MessagesPanel strategic-refresh pending badge', () => {
   let root: Root | null = null;
