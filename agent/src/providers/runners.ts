@@ -167,6 +167,64 @@ export function matchesRateLimit(text: string, provider: ProviderName = PROVIDER
   return STRUCTURED_429_PATTERNS.some(p => text.includes(p));
 }
 
+// Authentication-failure signatures emitted by a provider CLI when the supplied
+// credential is ABSENT, MALFORMED, EXPIRED, or REVOKED — i.e. the account is not
+// authenticated at all. This is categorically different from a rate-limit (a
+// valid account that is throttled). When the pre-task credential validation hits
+// one of these, the VM has no usable auth source: the task must be reported as a
+// provisioning/auth pre-claim failure and NOT consumed as a code failure (which
+// would burn the retry budget on a credential problem no code edit can fix).
+//
+// NOTE on `apiKeySource:"none"`: this is NOT a rejection signal and must NOT be
+// matched here. The project's documented default auth mode is a Max-plan
+// subscription / OAuth session (.env.example AUTH_MODE=oauth), which uses no API
+// key — so the Claude CLI init event reports `"apiKeySource":"none"` in EVERY
+// init event, including perfectly healthy ones. Matching it would misclassify any
+// non-zero-exit validation on a healthy OAuth VM (transient overload / network /
+// timeout) as an auth rejection and fail the VM pre-claim. A genuine rejection is
+// always accompanied by an explicit signal — the HTTP 401 `authentication_failed`
+// body or the provider-specific patterns below — so those carry full detection
+// coverage on their own. Patterns are checked case-insensitively against the
+// combined stdout+stderr of the validation CLI, so every entry is lowercase.
+const AUTH_FAILURE_PATTERNS_GENERIC: readonly string[] = [
+  'authentication_failed',
+  'authentication error',
+  'invalid api key',
+  'invalid bearer token',
+] as const;
+
+const AUTH_FAILURE_PATTERNS: Readonly<Record<ProviderName, readonly string[]>> = {
+  anthropic: [
+    'invalid x-api-key',
+    'x-api-key header is required',
+    'oauth token has expired',
+    'oauth token expired',
+    'oauth authentication is currently not supported',
+    'please run /login',
+    'could not resolve authentication',
+  ],
+  openai: [
+    'invalid_api_key',
+    'incorrect api key provided',
+    "you didn't provide an api key",
+    'invalid authentication',
+    'missing bearer or basic authentication',
+  ],
+  gemini: [
+    'api key not valid',
+    'api_key_invalid',
+    'unauthenticated',
+    'permission_denied',
+    'invalid authentication credentials',
+  ],
+} as const;
+
+export function matchesAuthFailure(text: string, provider: ProviderName = PROVIDER): boolean {
+  const lower = text.toLowerCase();
+  if (AUTH_FAILURE_PATTERNS_GENERIC.some(p => lower.includes(p))) return true;
+  return AUTH_FAILURE_PATTERNS[provider].some(p => lower.includes(p));
+}
+
 export class RateLimitError extends Error {
   constructor(message: string) {
     super(message);

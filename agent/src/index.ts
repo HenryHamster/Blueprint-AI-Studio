@@ -54,7 +54,7 @@ import {
 } from './utils/test-runners.js';
 import {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
-  parseLLMCliTranslation, matchesRateLimit, RateLimitError, NoProgressTimeoutError,
+  parseLLMCliTranslation, matchesRateLimit, matchesAuthFailure, RateLimitError, NoProgressTimeoutError,
   refreshRuntimeState,
   getProviderRunner, providerSupportsNativeSubagents,
   __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
@@ -65,7 +65,7 @@ import {
 
 export {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
-  parseLLMCliTranslation, matchesRateLimit, RateLimitError, NoProgressTimeoutError,
+  parseLLMCliTranslation, matchesRateLimit, matchesAuthFailure, RateLimitError, NoProgressTimeoutError,
   refreshRuntimeState,
   getProviderRunner, providerSupportsNativeSubagents,
   __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
@@ -2445,6 +2445,20 @@ ${result.stdout}`;
       const snippet = combined.slice(0, 200);
       log(`${runner.displayName} validation failed — account rate-limited: ${snippet}`);
       reportPreClaimFailure(`token validation rate-limited: ${snippet}`);
+      process.exit(1);
+    }
+    // A validation exit that carries an explicit authentication-rejection signature
+    // (HTTP 401 authentication_failed, expired/invalid token, provider-specific
+    // invalid-key message) means this VM has no usable credential. Fail BEFORE
+    // claiming/running so the task is attributed to a provisioning/auth fault — not
+    // silently "continued" into a real task run that dies on the first model call and
+    // gets misclassified as a code failure. Note: a bare apiKeySource=none is NOT a
+    // rejection (it is normal for the OAuth/Max-plan default), so it is deliberately
+    // not matched — see AUTH_FAILURE_PATTERNS_GENERIC in providers/runners.ts.
+    if (result.exitCode !== 0 && matchesAuthFailure(combined, runner.provider)) {
+      const snippet = combined.slice(0, 200);
+      log(`${runner.displayName} validation failed — provider authentication rejected (credentials invalid or unauthorized): ${snippet}`);
+      reportPreClaimFailure(`provider auth rejected — credentials invalid or unauthorized: ${snippet}`);
       process.exit(1);
     }
     if (result.exitCode !== 0) {

@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
 import {
   __resetTaskCapabilityContractForTesting,
   isReadOnlyTaskType,
@@ -1244,6 +1244,66 @@ describe('matchesRateLimit', () => {
 
   it('does not match bare 429 without JSON key context', () => {
     expect(matchesRateLimit('HTTP 429 received')).toBe(false);
+  });
+});
+
+describe('matchesAuthFailure', () => {
+  it('does NOT treat a bare apiKeySource=none init event as an auth failure (normal for OAuth/Max-plan)', () => {
+    // The documented default auth mode (AUTH_MODE=oauth / Max-plan subscription)
+    // uses no API key, so EVERY healthy init event reports apiKeySource:"none".
+    // Matching on it alone would misclassify healthy OAuth VMs on any transient
+    // non-zero-exit validation.
+    const init = '{"type":"system","subtype":"init","apiKeySource":"none","model":"claude-opus-4-8"}';
+    expect(matchesAuthFailure(init)).toBe(false);
+  });
+
+  it('detects the canonical apiKeySource=none + 401 authentication_failed rejection', () => {
+    // The real rejection signature is apiKeySource:none accompanied by an explicit
+    // HTTP 401 authentication_failed — the authentication_failed token is what makes
+    // it a confirmed rejection rather than a healthy OAuth init.
+    const rejection = '{"type":"system","subtype":"init","apiKeySource":"none"}\nAPI Error: 401 {"type":"error","error":{"type":"authentication_failed"}}';
+    expect(matchesAuthFailure(rejection)).toBe(true);
+  });
+
+  it('detects an HTTP 401 authentication_failed body', () => {
+    const body = 'API Error: 401 {"type":"error","error":{"type":"authentication_failed","message":"invalid x-api-key"}}';
+    expect(matchesAuthFailure(body)).toBe(true);
+  });
+
+  it('detects an expired OAuth token message', () => {
+    expect(matchesAuthFailure('OAuth token has expired. Please run /login.')).toBe(true);
+  });
+
+  it('matches case-insensitively', () => {
+    expect(matchesAuthFailure('AUTHENTICATION_FAILED')).toBe(true);
+  });
+
+  it('detects OpenAI invalid_api_key for the openai provider', () => {
+    expect(matchesAuthFailure('Error code: 401 - invalid_api_key', 'openai')).toBe(true);
+  });
+
+  it('detects Gemini "API key not valid" for the gemini provider', () => {
+    expect(matchesAuthFailure('API key not valid. Please pass a valid API key.', 'gemini')).toBe(true);
+  });
+
+  it('does not classify a rate-limit body as an auth failure', () => {
+    expect(matchesAuthFailure('API Error: Rate limit reached. Please retry later.')).toBe(false);
+  });
+
+  it('returns false for a bare 401 with no auth context', () => {
+    expect(matchesAuthFailure('HTTP 401 received')).toBe(false);
+  });
+
+  it('returns false for unrelated error output', () => {
+    expect(matchesAuthFailure('TypeError: cannot read property of undefined')).toBe(false);
+  });
+
+  it('returns false for an empty string', () => {
+    expect(matchesAuthFailure('')).toBe(false);
+  });
+
+  it('does not cross-match provider-specific auth failures', () => {
+    expect(matchesAuthFailure('API key not valid', 'anthropic')).toBe(false);
   });
 });
 
