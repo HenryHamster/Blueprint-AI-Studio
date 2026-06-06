@@ -1,6 +1,7 @@
 """Autonomous research spawning functions."""
 
 import asyncio
+import hashlib
 import logging
 import os
 import uuid
@@ -65,29 +66,83 @@ CROSS_CUTTING_DIRECTION_TEXT = "Cross-cutting codebase analysis"
 CROSS_CUTTING_RESEARCH_TITLE = f"Research: {CROSS_CUTTING_DIRECTION_TEXT}"
 
 
-def research_idempotency_key(project_id, direction_id) -> str:
-    """Deterministic, direction-scoped idempotency key for a research Task.
-
-    Canonical home for the key string shared by BOTH research-spawn paths — the
-    autonomous loop (this module) and the manual operator endpoint
-    (routers/directions.py imports this). Both paths stamping the SAME key for a
-    given (project, direction) lets the partial unique index
-    ``ux_task_active_idempotency_key`` (over active-status tasks) force the
-    database to coalesce a concurrent duplicate instead of spawning a second
-    VM-backed research cycle on the same direction.
-
-    Directed and undirected (cross-cutting) cycles get distinct key namespaces so
-    an undirected spawn never collides with a directed one on the same project.
-    """
-    if direction_id:
-        return f"research_direction:{project_id}:{direction_id}"
-    return f"research_undirected:{project_id}"
-
-
 def _get_spawn_lock(project_id: str) -> asyncio.Lock:
     if project_id not in _spawn_locks:
         _spawn_locks[project_id] = asyncio.Lock()
     return _spawn_locks[project_id]
+
+
+# Sentinel segment for undirected (cross-cutting) research claims — undirected
+# cycles target no direction id but must still be claimable one-at-a-time.
+_CLAIM_UNDIRECTED = "cross-cutting"
+
+
+def research_direction_claim_key(
+    project_id, direction_id: str | None, *, pipelined: bool = False
+) -> str:
+    """Idempotency key that atomically claims a direction for ONE active research.
+
+    Stamped on every top-level research spawn (the autonomous loop AND the
+    manual ``POST /directions/{id}/research`` endpoint). The partial unique
+    index ``ux_task_active_idempotency_key`` (non-NULL keys in active statuses)
+    turns the claim into a database-level invariant: two concurrent ticks that
+    both read "no active research on this direction" can never BOTH insert —
+    the loser hits ``IntegrityError`` and skips. Same TOCTOU class and fix
+    shape as the concurrent self-audit trigger (#8239); incident 2026-06-06:
+    twins 6ca2f9cf / fcedb840 created 13.7s apart on one direction, each
+    rolling up its own duplicate PR. The claim frees automatically when the
+    holding task reaches a terminal status (the index only covers active
+    rows), so completed/failed/cancelled research never blocks a new cycle.
+
+    ``pipelined=True`` namespaces the ONE deliberately-pipelined cycle allowed
+    alongside a genuinely-stuck EVALUATING parent (which still holds the
+    primary claim while EVALUATING) — the pipelining exception keeps working,
+    and is itself atomically capped at one active pipelined research per
+    direction.
+    """
+    base = f"research-direction:{project_id}:{direction_id or _CLAIM_UNDIRECTED}"
+    return f"{base}:pipelined" if pipelined else base
+
+
+def research_idempotency_key(project_id, direction_id) -> str:
+    """Compatibility wrapper for the canonical primary research claim key."""
+    return research_direction_claim_key(project_id, direction_id)
+
+
+def _research_spawn_lock_key(project_id) -> int:
+    """Stable 31-bit advisory-lock key for a project's research spawn.
+
+    Deliberately NOT Python ``hash()``: string hashing is salted per process
+    (PYTHONHASHSEED), so two orchestrator processes computed DIFFERENT lock
+    keys for the same project and the advisory lock never excluded anything
+    across instances — one factor in the 2026-06-06 duplicate-research twins.
+    """
+    digest = hashlib.sha256(f"research_spawn:{project_id}".encode()).digest()
+    return int.from_bytes(digest[:4], "big") % (2**31)
+
+
+async def _try_research_spawn_advisory_lock(session: AsyncSession, project_id) -> bool:
+    """Try to take the per-project research-spawn advisory lock (Postgres).
+
+    Transaction-scoped (``pg_try_advisory_xact_lock``) and therefore
+    BEST-EFFORT: any intermediate commit on ``session`` releases it mid-flow,
+    so this only reduces wasted duplicate work between concurrently-ticking
+    orchestrator instances. The hard anti-duplicate guarantee is the
+    per-direction idempotency-key claim (see ``research_direction_claim_key``).
+    Non-Postgres dialects (tests) report no contention.
+    """
+    from sqlalchemy import text as _sql_text
+
+    try:
+        got = (
+            await session.execute(
+                _sql_text("SELECT pg_try_advisory_xact_lock(:k)"),
+                {"k": _research_spawn_lock_key(project_id)},
+            )
+        ).scalar()
+    except Exception:  # noqa: BLE001 — SQLite/test dialects raise NotSupportedError; treat as "no contention"
+        return True
+    return bool(got)
 
 
 async def _undirected_research_recently_active(project_id, session) -> bool:
@@ -462,6 +517,11 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     from app.failure_classification import INFRA_CLASSES
 
     busy_direction_ids: set = set()
+    # Directions whose spawn this cycle is the ONE pipelined cycle allowed
+    # alongside a genuinely-stuck EVALUATING parent. Tracked so the spawn loop
+    # claims them under the ``:pipelined`` idempotency key — the stuck parent
+    # still holds the primary per-direction claim while EVALUATING.
+    pipelined_direction_ids: set = set()
     resurrection_lookback = now - timedelta(hours=2)
     # ``~has_key`` compiles to the Postgres-only JSONB ``?`` (key-existence)
     # operator, which raises ``sqlite3.OperationalError`` on the SQLite smoke
@@ -630,7 +690,12 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                             if rid != t.id
                         ]
                         if not recent_others:
-                            continue  # No prior pipelined spawn — allow one
+                            # No prior pipelined spawn — allow one. Record the
+                            # direction so the spawn loop claims it under the
+                            # :pipelined idempotency key (the stuck EVALUATING
+                            # parent still holds the primary claim).
+                            pipelined_direction_ids.add(current_did)
+                            continue
                         # Already pipelined within the window — treat as busy.
                     # else: progressing (children active or PR open) → busy
             busy_direction_ids.add(current_did)
@@ -817,19 +882,11 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 blocked_ids.add(d.get("id"))
 
         # Cross-instance serialization for concurrent orchestrator instances.
-        from sqlalchemy import text as _sql_text
-
-        _lock_key = abs(hash(f"research_spawn:{project.id}")) % (2**31)
-        try:
-            _got_lock = (
-                await session.execute(
-                    _sql_text("SELECT pg_try_advisory_xact_lock(:k)"),
-                    {"k": _lock_key},
-                )
-            ).scalar()
-        except Exception:  # noqa: BLE001 — SQLite/test dialects raise NotSupportedError; treat as "no contention"
-            _got_lock = True  # non-Postgres dialect (tests) — skip serialization
-        if not _got_lock:
+        # Best-effort only: the xact-scoped lock drops at the next commit (and
+        # several paths below commit mid-flow), so the hard guarantee against
+        # duplicate spawns is the per-direction idempotency-key claim stamped
+        # on the Task rows in the spawn loop below.
+        if not await _try_research_spawn_advisory_lock(session, project.id):
             logger.info(
                 f"[AUTONOMOUS] Research spawn for project {project.id} skipped — "
                 f"another instance holds the advisory lock"
@@ -1915,14 +1972,13 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
-            # Shared, direction-scoped idempotency key. The partial unique index
-            # over active-status tasks is the authoritative guard: it forces the
-            # DB to reject a concurrent duplicate (manual or autonomous) on the
-            # same direction, so at most one active research cycle exists per
-            # direction across BOTH spawn paths. Undirected cycles get their own
-            # key namespace and stay additionally guarded by the soft
-            # _undirected_research_recently_active fast path above.
-            idempotency_key=research_idempotency_key(project.id, current_dir_id),
+            # Atomic per-direction claim (ux_task_active_idempotency_key):
+            # see research_direction_claim_key.
+            idempotency_key=research_direction_claim_key(
+                project.id,
+                current_dir_id,
+                pipelined=current_dir_id in pipelined_direction_ids,
+            ),
         )
         # NOTE: counter is NOT incremented here. _research_spawn_count is
         # actually a research-COMPLETION counter despite the name — the
@@ -1935,32 +1991,35 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         # and the next iteration of _check_idle_research immediately spawned
         # strategic review #2 with zero findings to consume. The increment
         # now lives in _handle_research_completion (research_completion.py).
-        # Per-task savepoint so one direction's idempotency-key collision (a
-        # concurrent manual or autonomous spawn already holding the active slot)
-        # rolls back ONLY that direction's insert and skips it — the rest of the
-        # batch, and any already-committed cycle bookkeeping, still land. Without
-        # the savepoint a single IntegrityError on the batch commit would abort
-        # every spawn in this cycle.
+        history = TaskHistory(
+            task_id=new_task.id,
+            action="SPAWNED",
+            details={"spawned_by": "AUTONOMOUS_LOOP", "trigger": "post_merge_or_idle"},
+        )
+        # Insert under a SAVEPOINT so losing the per-direction claim race only
+        # skips THIS direction (and its history row) instead of aborting the
+        # whole batch/transaction. The flush before the savepoint pushes any
+        # earlier staged state (e.g. anomaly Alerts) into the outer
+        # transaction so a claim-race rollback can never drop it.
+        await session.flush()
         try:
             async with session.begin_nested():
                 session.add(new_task)
-                await session.flush()
-                history = TaskHistory(
-                    task_id=new_task.id,
-                    action="SPAWNED",
-                    details={
-                        "spawned_by": "AUTONOMOUS_LOOP",
-                        "trigger": "post_merge_or_idle",
-                    },
-                )
                 session.add(history)
                 await session.flush()
-        except IntegrityError:
-            logger.info(
-                f"[AUTONOMOUS] Research spawn for direction "
-                f"{current_dir_id or 'undirected'} (project {project.id}) coalesced "
-                f"onto an in-flight cycle holding the same idempotency key — "
-                f"skipping this duplicate."
+        except IntegrityError as exc:
+            # A sibling tick (another orchestrator instance, or the manual
+            # research endpoint) committed a research task for this direction
+            # between our no-active-research read and this insert — exactly
+            # the TOCTOU window behind the 2026-06-06 duplicate twins
+            # (6ca2f9cf / fcedb840, 13.7s apart). The committed sibling IS
+            # the research cycle we wanted; skip, don't retry.
+            logger.warning(
+                "[AUTONOMOUS] Lost the research spawn race for project %s "
+                "direction %s — a concurrent spawn already claimed it (%s)",
+                project.id,
+                current_dir_id or "undirected",
+                exc.orig,
             )
             continue
         spawned_tasks.append(new_task)

@@ -81,19 +81,19 @@ def _clear_direction_reactivation_state(direction: dict) -> None:
 class DirectionPayload(BaseModel):
     text: str = Field(..., min_length=1, max_length=DIRECTION_TEXT_MAX)
     priority: str = Field(default="medium", pattern=r"^(high|medium|low)$")
-    paths: Optional[List[str]] = None
-    completion_criteria: Optional[str] = Field(
+    paths: List[str] | None = None
+    completion_criteria: str | None = Field(
         default=None, max_length=COMPLETION_CRITERIA_MAX
     )
-    conflicts_with: Optional[List[str]] = Field(
+    conflicts_with: List[str] | None = Field(
         default=None,
         description="Direction IDs that shouldn't run in parallel with this one",
     )
-    category: Optional[str] = Field(
+    category: str | None = Field(
         default=None,
         description="Direction category: 'product', 'structural', or 'mixed'",
     )
-    cost_budget_usd: Optional[float] = Field(
+    cost_budget_usd: float | None = Field(
         default=None,
         ge=0,
         description="Optional cost budget ceiling in USD for this direction",
@@ -106,7 +106,7 @@ class DirectionPayload(BaseModel):
             "research-eligible active state. Requires an open version (404 if none)."
         ),
     )
-    idempotency_key: Optional[str] = Field(
+    idempotency_key: str | None = Field(
         default=None,
         max_length=255,
         description=(
@@ -142,19 +142,19 @@ async def get_directions(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    from app.shared_state import get_direction_hold_info as _get_direction_hold_info  # noqa: PLC0415
-    from app.shared_state import runtime_config as _runtime_config  # noqa: PLC0415
-    from app.direction_metrics import (  # noqa: PLC0415
+    from app.shared_state import get_direction_hold_info as _get_direction_hold_info
+    from app.shared_state import runtime_config as _runtime_config
+    from app.direction_metrics import (
         _compute_direction_quality_score,
         _compute_lifetime_generalized_outcome_state,
     )
     from app.strategic_completion import (
         _compute_churn_metrics,
         _compute_lifetime_burn_metrics,
-    )  # noqa: PLC0415
+    )
     from app.running_update_merge import (
         summarize_running_update_reconciliation,
-    )  # noqa: PLC0415
+    )
 
     project = await _get_user_project(project_id, current_user["user_id"], session)
     directions = project.directions or []
@@ -162,8 +162,8 @@ async def get_directions(
     # Per-direction count of durable knowledge documents accumulated by
     # web_research tasks. One grouped query, scoped to this project; keyed by
     # the string direction id stamped on KnowledgeDocument.direction_id.
-    from app.models import KnowledgeDocument  # noqa: PLC0415
-    from sqlalchemy import func as _sa_func  # noqa: PLC0415
+    from app.models import KnowledgeDocument
+    from sqlalchemy import func as _sa_func
 
     knowledge_counts: dict[str, int] = {}
     count_rows = (
@@ -250,8 +250,12 @@ async def get_directions(
         try:
             pm = ProblemModel(**problem_model_dict)
             problem_model_size_health = compute_model_size_signal(pm)
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001 — best-effort enrichment; a malformed stored problem_model must not 500 the directions listing
+            logger.debug(
+                "[DIRECTIONS] problem_model size-health computation skipped "
+                "(malformed stored problem_model)",
+                exc_info=True,
+            )
     return {
         "directions": enriched,
         "autonomous_enabled": project.autonomous_enabled,
@@ -305,7 +309,7 @@ async def add_direction(
     # rather than silently creating active.
     staged_for_version: int | None = None
     if payload.staged:
-        from app.release_version import current_open_version  # noqa: PLC0415
+        from app.release_version import current_open_version
 
         open_version = await current_open_version(session, project.id)
         if open_version is None:
@@ -461,7 +465,7 @@ async def replace_directions(
             except (TypeError, ValueError):
                 raise HTTPException(
                     status_code=400, detail="cost_budget_usd must be a number or null"
-                )
+                ) from None
             if entry["cost_budget_usd"] < 0:
                 raise HTTPException(
                     status_code=400, detail="cost_budget_usd must be non-negative"
@@ -650,23 +654,30 @@ async def update_direction(
         or not all(isinstance(p, str) for p in payload["paths"])
     ):
         raise HTTPException(status_code=400, detail="paths must be a list of strings")
-    if "completion_criteria" in payload and payload["completion_criteria"] is not None:
-        if (
+    if (
+        "completion_criteria" in payload
+        and payload["completion_criteria"] is not None
+        and (
             not isinstance(payload["completion_criteria"], str)
             or len(payload["completion_criteria"]) > COMPLETION_CRITERIA_MAX
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail=f"completion_criteria must be a string of at most {COMPLETION_CRITERIA_MAX} characters",
-            )
-    if "conflicts_with" in payload and payload["conflicts_with"] is not None:
-        if not isinstance(payload["conflicts_with"], list) or not all(
-            isinstance(c, str) for c in payload["conflicts_with"]
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="conflicts_with must be a list of direction ID strings",
-            )
+        )
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"completion_criteria must be a string of at most {COMPLETION_CRITERIA_MAX} characters",
+        )
+    if (
+        "conflicts_with" in payload
+        and payload["conflicts_with"] is not None
+        and (
+            not isinstance(payload["conflicts_with"], list)
+            or not all(isinstance(c, str) for c in payload["conflicts_with"])
+        )
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="conflicts_with must be a list of direction ID strings",
+        )
     if (
         "category" in payload
         and payload["category"] is not None
@@ -711,24 +722,33 @@ async def update_direction(
             status_code=400,
             detail=f"retirement_condition must be a string of at most {DIRECTION_CONTEXT_FIELD_MAX} characters",
         )
-    from app.strategic_completion import (  # noqa: PLC0415
+    from app.strategic_completion import (
         _VALID_RECOMMENDED_MODES,
         _normalize_recommended_mode,
         _reset_scaffolding_state_on_outcome_change,
     )
 
-    if "recommended_mode" in payload and payload["recommended_mode"] is not None:
-        if _normalize_recommended_mode(payload["recommended_mode"]) is None:
-            raise HTTPException(
-                status_code=400,
-                detail=f"recommended_mode must be one of: {sorted(_VALID_RECOMMENDED_MODES)}",
-            )
-    if "system_id" in payload and payload["system_id"] is not None:
-        if not isinstance(payload["system_id"], str) or len(payload["system_id"]) > 100:
-            raise HTTPException(
-                status_code=400,
-                detail="system_id must be a string of at most 100 characters",
-            )
+    if (
+        "recommended_mode" in payload
+        and payload["recommended_mode"] is not None
+        and _normalize_recommended_mode(payload["recommended_mode"]) is None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"recommended_mode must be one of: {sorted(_VALID_RECOMMENDED_MODES)}",
+        )
+    if (
+        "system_id" in payload
+        and payload["system_id"] is not None
+        and (
+            not isinstance(payload["system_id"], str)
+            or len(payload["system_id"]) > 100
+        )
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="system_id must be a string of at most 100 characters",
+        )
 
     # Resolve and validate the staging TARGET version. Triggered both when a
     # direction transitions to ``staged`` AND when an already-staged direction is
@@ -739,7 +759,7 @@ async def update_direction(
     staged_for_version: int | None = None
     _wants_staging = payload.get("status") == "staged" or "staged_for_version" in payload
     if _wants_staging:
-        from app.release_version import current_open_version  # noqa: PLC0415
+        from app.release_version import current_open_version
 
         open_version = await current_open_version(session, project.id)
         if open_version is None:
@@ -771,7 +791,7 @@ async def update_direction(
     def _mutate_update(directions: list) -> None:
         # Cap check (needs locked data): if reactivating, ensure cap won't be exceeded
         if payload.get("status") == "active":
-            from app.shared_state import runtime_config as _runtime_config  # noqa: PLC0415
+            from app.shared_state import runtime_config as _runtime_config
 
             max_active = _runtime_config.get("max_active_directions", 5)
             active_count = sum(
@@ -846,18 +866,19 @@ async def update_direction(
                         d["research_context"] = payload["research_context"]
                         # Re-evaluation of research context indicates the direction was reviewed —
                         # clear any existing hold so new tasks can dispatch again.
-                        import app.shared_state as _ss  # noqa: PLC0415
+                        import app.shared_state as _ss
 
                         _ss.clear_direction_hold(direction_id)
-                if "research_history" in payload:
-                    if payload["research_history"] is None or (
+                if "research_history" in payload and (
+                    payload["research_history"] is None
+                    or (
                         isinstance(payload["research_history"], list)
                         and len(payload["research_history"]) == 0
-                    ):
-                        d["research_history"] = []
-                if "notes" in payload:
-                    if isinstance(payload["notes"], list):
-                        d["notes"] = payload["notes"]
+                    )
+                ):
+                    d["research_history"] = []
+                if "notes" in payload and isinstance(payload["notes"], list):
+                    d["notes"] = payload["notes"]
                 if "completion_criteria" in payload:
                     if payload["completion_criteria"] is None:
                         d.pop("completion_criteria", None)
@@ -1061,16 +1082,14 @@ async def create_direction_research_task(
         },
         "directions:research",
     )
-    # Shared, direction-scoped idempotency key (same scheme the autonomous loop
-    # stamps). The in-app active_research scan above is the fast path / friendly
-    # 409, but the partial unique index ux_task_active_idempotency_key is the
-    # authoritative guard: it forces the DB to coalesce a concurrent duplicate —
-    # manual-vs-manual OR manual-vs-autonomous — that fired in the narrow window
-    # between that scan and this insert. Lazy import to avoid a router→service
-    # import cycle.
-    from app.autonomous_research import research_idempotency_key
+    # Atomic per-direction claim — the SAME key the autonomous loop stamps, so
+    # a manual spawn and a concurrent autonomous tick (or a double-click) can
+    # never BOTH create an active research cycle on this direction. The in-app
+    # scan above is only the friendly fast path; the partial unique index
+    # ux_task_active_idempotency_key is the concurrency-safe backstop.
+    from app.autonomous_research import research_direction_claim_key
 
-    idempotency_key = research_idempotency_key(project.id, direction_id)
+    idempotency_key = research_direction_claim_key(project.id, direction_id)
     new_task = Task(
         project_id=project.id,
         title=f"Research: {direction_text[:200]}",
@@ -1160,7 +1179,7 @@ async def unhold_direction(
     if not direction:
         raise HTTPException(status_code=404, detail="Direction not found")
 
-    import app.shared_state as _ss  # noqa: PLC0415
+    import app.shared_state as _ss
 
     was_held, _ = _ss.is_direction_held(direction_id)
     _ss.clear_direction_hold(direction_id)
@@ -1254,7 +1273,7 @@ class CreateMessage(BaseModel):
     # submit / network retry of the same steering instruction) converges to the
     # single already-stored message and a single arming, mirroring the live-chat
     # endpoint (admin_notifications.create_message).
-    idempotency_key: Optional[str] = None
+    idempotency_key: str | None = None
 
 
 @router.post("/projects/{project_id}/messages")
@@ -1279,7 +1298,7 @@ async def create_message(
     except ValueError:
         raise HTTPException(
             status_code=400, detail=f"Invalid message type: {payload.message_type}"
-        )
+        ) from None
 
     # Idempotency: if this send carries a client key and a message with that
     # key already exists for the project, return the existing row instead of
@@ -1388,7 +1407,7 @@ async def create_message(
 @router.get("/projects/{project_id}/messages")
 async def list_messages(
     project_id: str,
-    status: Optional[str] = "open",
+    status: str | None = "open",
     session: AsyncSession = Depends(get_session),
     user: dict = Depends(get_current_user),
 ):
