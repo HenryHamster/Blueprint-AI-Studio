@@ -40,7 +40,11 @@ from app.models import (
     TaskStatus,
 )
 from app.time_utils import _utcnow
-from app.vm_cost_rates import get_compute_rate_per_second, validate_compute_request
+from app.vm_cost_rates import (
+    get_compute_rate_per_second,
+    resolve_compute_machine_type,
+    validate_compute_request,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +116,7 @@ async def create_compute_job(
     task: Task,
     *,
     command: str,
-    machine_type: str,
+    machine_type: str | None = None,
     spend_cap_usd: float,
     deadline_seconds: int,
     cwd: str | None = None,
@@ -124,12 +128,16 @@ async def create_compute_job(
 ) -> ComputeJob:
     if not command.strip():
         raise ValueError("command must be non-empty")
+    resolved_machine_type = resolve_compute_machine_type(
+        accelerator=accelerator,
+        machine_type=machine_type,
+    )
     # Single gate for CPU and GPU shapes: a GPU machine type is accepted ONLY when
     # paired with a supported single-GPU accelerator (rejects A100/over-quota,
     # count != 1, unknown accelerators, and GPU/machine-family mismatch); a CPU
     # request still requires an explicitly priced e2 machine type, unchanged.
     accel_spec, reject_reason = validate_compute_request(
-        accelerator, machine_type, accelerator_count
+        accelerator, resolved_machine_type, accelerator_count
     )
     if reject_reason is not None:
         raise ValueError(reject_reason)
@@ -153,7 +161,7 @@ async def create_compute_job(
     persisted_accelerator_count = accelerator_count if accel_spec is not None else None
     launch_request_fingerprint = _build_launch_request_fingerprint(
         command=command,
-        machine_type=machine_type,
+        machine_type=resolved_machine_type,
         spend_cap_usd=capped_spend,
         deadline_seconds=capped_deadline,
         cwd=cwd,
@@ -177,7 +185,7 @@ async def create_compute_job(
     # Accelerator-aware rate: base machine + GPU surcharge (N1+T4/V100) or the
     # bundled G2 rate (L4); falls through to the plain VM rate for CPU jobs.
     rate = get_compute_rate_per_second(
-        machine_type=machine_type,
+        machine_type=resolved_machine_type,
         accelerator=persisted_accelerator,
         count=accelerator_count,
         spot=normalized_provisioning == "SPOT",
@@ -187,7 +195,7 @@ async def create_compute_job(
         project_id=locked_task.project_id,
         backend=normalized_backend,
         status=ComputeJobStatus.QUEUED,
-        machine_type=machine_type,
+        machine_type=resolved_machine_type,
         accelerator_type=persisted_accelerator,
         accelerator_count=persisted_accelerator_count,
         spend_cap_usd=capped_spend,

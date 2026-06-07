@@ -1341,6 +1341,61 @@ async def test_create_compute_job_accepts_prices_persists_and_forwards_gpu(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("accelerator", "expected_machine_type"),
+    [
+        ("T4", "n1-standard-1"),
+        ("L4", "g2-standard-4"),
+        ("V100", "n1-standard-1"),
+    ],
+)
+async def test_accelerator_only_resolves_canonical_machine_type(
+    db_session, monkeypatch, accelerator, expected_machine_type
+):
+    """An accelerator-only request persists and prices the canonical GPU shape."""
+    from app.routers.agent_compute_jobs import LaunchComputeJobRequest
+    from app.vm_cost_rates import get_compute_rate_per_second
+
+    request = LaunchComputeJobRequest(
+        command="python train.py",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        backend_name="gcp",
+        accelerator=accelerator,
+    )
+    assert request.machine_type is None
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    task = await _make_compute_task(db_session)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        backend_name="gcp",
+        accelerator=accelerator,
+    )
+
+    assert job.machine_type == expected_machine_type
+    assert job.accelerator_type == accelerator
+    assert job.accelerator_count == 1
+    expected_rate = get_compute_rate_per_second(
+        machine_type=None,
+        accelerator=accelerator,
+        count=1,
+        spot=False,
+    )
+    assert job.polling_metadata["cost_rate_per_second"] == pytest.approx(expected_rate)
+
+    spec = compute_jobs._build_launch_spec(job)
+    assert spec.machine_type == expected_machine_type
+    assert spec.accelerator == accelerator
+    assert spec.accelerator_count == 1
+
+
+@pytest.mark.asyncio
 async def test_create_compute_job_rejects_a100(db_session, monkeypatch):
     """An A100 (over-quota, count=0) request is rejected loudly at create time."""
     monkeypatch.setattr(compute, "LOCAL_MODE", False)
@@ -1359,10 +1414,17 @@ async def test_create_compute_job_rejects_a100(db_session, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("accelerator", "machine_type"),
+    [
+        ("T4", "g2-standard-4"),
+        ("L4", "n1-standard-1"),
+    ],
+)
 async def test_create_compute_job_rejects_gpu_machine_family_mismatch(
-    db_session, monkeypatch
+    db_session, monkeypatch, accelerator, machine_type
 ):
-    """A GPU paired with a mismatched machine family (T4 + g2) is rejected."""
+    """A GPU paired with a mismatched explicit machine family is rejected."""
     monkeypatch.setattr(compute, "LOCAL_MODE", False)
     task = await _make_compute_task(db_session)
     with pytest.raises(ValueError, match="not a valid single-GPU shape"):
@@ -1370,11 +1432,11 @@ async def test_create_compute_job_rejects_gpu_machine_family_mismatch(
             db_session,
             task,
             command="python train.py",
-            machine_type="g2-standard-4",
+            machine_type=machine_type,
             spend_cap_usd=5.0,
             deadline_seconds=600,
             backend_name="gcp",
-            accelerator="T4",
+            accelerator=accelerator,
         )
 
 

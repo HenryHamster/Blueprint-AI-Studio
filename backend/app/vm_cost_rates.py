@@ -234,10 +234,15 @@ def validate_compute_request(
         accelerator like A100, count != 1, unknown accelerator, or a
         GPU/machine-family mismatch).
 
-    This does NOT loosen the CPU gate: when ``accelerator`` is ``None`` it still
-    requires an explicitly priced (e2) machine type, exactly as before.
+    This does NOT loosen the CPU gate: when ``accelerator`` is ``None`` it uses
+    the default machine type only when absent, and still requires the resolved
+    CPU machine type to be explicitly priced.
     """
     if accelerator is None:
+        machine_type = resolve_compute_machine_type(
+            accelerator=accelerator,
+            machine_type=machine_type,
+        )
         if not is_supported_machine_type(machine_type):
             return None, f"unsupported machine_type: {machine_type}"
         return None, None
@@ -252,6 +257,10 @@ def validate_compute_request(
     # GPU_BASE_MACHINE_RATES holds only N1 (guest-accelerator T4/V100) shapes — so
     # this single membership check rejects a GPU/machine-family mismatch (e.g. T4
     # with g2-standard-4, or L4 with n1-standard-1) as well as an unpriced shape.
+    machine_type = resolve_compute_machine_type(
+        accelerator=accelerator,
+        machine_type=machine_type,
+    )
     if spec.bundled:
         if machine_type not in GPU_BUNDLED_MACHINE_RATES:
             return None, (
@@ -265,6 +274,26 @@ def validate_compute_request(
                 f"{spec.name}; expected one of {sorted(GPU_BASE_MACHINE_RATES)}"
             )
     return spec, None
+
+
+def resolve_compute_machine_type(
+    *,
+    accelerator: str | None,
+    machine_type: str | None,
+) -> str:
+    """Return the machine type that should be validated, priced, and persisted.
+
+    CPU requests with no explicit machine type keep the historical default. A
+    supported accelerator with no explicit machine type resolves to that
+    accelerator's canonical single-GPU shape. Explicit machine types are returned
+    unchanged so a family mismatch is rejected by validation, never overwritten.
+    """
+    if machine_type is not None:
+        return machine_type
+    spec = resolve_accelerator_spec(accelerator)
+    if spec is not None:
+        return spec.machine_type
+    return DEFAULT_MACHINE_TYPE
 
 
 def get_compute_rate_per_second(
@@ -286,20 +315,31 @@ def get_compute_rate_per_second(
     other than 1, or unknown names.
     """
     if accelerator is None:
-        return get_vm_rate_per_second(machine_type, spot=spot)
+        resolved_machine_type = resolve_compute_machine_type(
+            accelerator=None,
+            machine_type=machine_type,
+        )
+        return get_vm_rate_per_second(resolved_machine_type, spot=spot)
 
-    spec, reason = validate_accelerator_request(accelerator, count)
+    resolved_machine_type = resolve_compute_machine_type(
+        accelerator=accelerator,
+        machine_type=machine_type,
+    )
+    spec, reason = validate_compute_request(
+        accelerator,
+        resolved_machine_type,
+        count,
+    )
     if reason is not None:
         raise AcceleratorRejection(reason)
-    assert spec is not None  # narrowed by validate_accelerator_request
+    assert spec is not None
 
     if spec.bundled:
         hourly = GPU_BUNDLED_MACHINE_RATES[spec.machine_type]
         rate = hourly[1] if spot else hourly[0]
         return rate / 3600
 
-    base_machine = machine_type or spec.machine_type
-    base_hourly = GPU_BASE_MACHINE_RATES[base_machine]
+    base_hourly = GPU_BASE_MACHINE_RATES[resolved_machine_type]
     surcharge_hourly = GPU_ACCELERATOR_SURCHARGE_RATES[spec.gcp_type]
     base_rate = base_hourly[1] if spot else base_hourly[0]
     surcharge_rate = surcharge_hourly[1] if spot else surcharge_hourly[0]

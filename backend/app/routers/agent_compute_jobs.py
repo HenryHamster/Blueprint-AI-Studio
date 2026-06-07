@@ -14,7 +14,7 @@ from app.routers.agent import verify_agent_token
 from app.schemas import serialize_compute_job_response
 from app.shared_state import limiter
 from app.task_capabilities import COMPUTE_JOB_LAUNCH_TASK_TYPES
-from app.vm_cost_rates import DEFAULT_MACHINE_TYPE, supported_machine_types
+from app.vm_cost_rates import resolve_compute_machine_type, supported_machine_types
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
@@ -23,7 +23,7 @@ class LaunchComputeJobRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     command: str = Field(..., min_length=1, max_length=10000)
-    machine_type: str = Field(default=DEFAULT_MACHINE_TYPE, min_length=1, max_length=64)
+    machine_type: str | None = Field(default=None, min_length=1, max_length=64)
     spend_cap_usd: float = Field(..., gt=0)
     deadline_seconds: int = Field(..., gt=0)
     cwd: str | None = Field(default=None, max_length=1000)
@@ -31,8 +31,9 @@ class LaunchComputeJobRequest(BaseModel):
     backend_name: str | None = Field(default=None, max_length=32)
     provisioning_model: str | None = Field(default=None, max_length=16)
     # Optional single-GPU accelerator. Omission = CPU job (existing clients
-    # unaffected); when set, a matching GPU machine_type is required and
-    # create_compute_job rejects A100/over-quota, count!=1, and mismatches.
+    # unaffected); when set without a machine_type, create_compute_job resolves
+    # the accelerator's canonical single-GPU shape and still rejects
+    # A100/over-quota, count!=1, local backend, and explicit mismatches.
     accelerator: str | None = Field(default=None, max_length=32)
 
 
@@ -56,7 +57,14 @@ async def launch_compute_job(
     # NOT rejected here — it is accepted only when create_compute_job confirms it
     # is paired with a valid single-GPU accelerator (which also rejects
     # A100/over-quota, count!=1, the local backend, and family mismatches).
-    if req.accelerator is None and req.machine_type not in supported_machine_types():
+    resolved_machine_type = resolve_compute_machine_type(
+        accelerator=req.accelerator,
+        machine_type=req.machine_type,
+    )
+    if (
+        req.accelerator is None
+        and resolved_machine_type not in supported_machine_types()
+    ):
         raise HTTPException(
             status_code=422,
             detail={
