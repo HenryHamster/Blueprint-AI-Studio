@@ -2020,6 +2020,7 @@ async def _persist_compute_experiment_knowledge_best_effort(
             criterion=criterion,
             result_reference=_extract_compute_result_reference(logs),
             session=session,
+            logs=logs,
         )
     except Exception:  # noqa: BLE001 — knowledge persistence must never break completion
         logger.warning(

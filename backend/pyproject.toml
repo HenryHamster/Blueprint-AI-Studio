@@ -155,6 +155,11 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # single project's reconcile / a single member's teardown must be logged and
 # skipped, never crash the maintainer tick or the reaper cycle.
 "app/warm_pool_maintainer.py" = ["BLE001"]
+# knowledge_completion.py hosts the compute-experiment LLM analysis pass, which
+# uses a try/except inside a range(2) retry loop — the same intentional parse-error
+# retry pattern as review_learning.categorize_review_issues_llm. PERF203 is
+# suppressed because the try/except is the retry mechanism, not a performance issue.
+"app/knowledge_completion.py" = ["PERF203"]
 
 [tool.mypy]
 python_version = "3.11"

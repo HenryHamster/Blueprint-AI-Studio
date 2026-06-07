@@ -38,7 +38,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import uuid
 from typing import Any
 
 from sqlalchemy import select
@@ -46,7 +48,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.broadcast import broadcast_to_project
-from app.models import KnowledgeDocument, SourceKind, Task, TaskStatus
+from app.models import (
+    Artifact,
+    ComputeJob,
+    KnowledgeDocument,
+    SourceKind,
+    Task,
+    TaskStatus,
+)
 from app.task_evaluators import (
     QUALITY_GRADER_VERDICT_KEY,
     EvaluationVerdict,
@@ -864,41 +873,41 @@ async def _handle_knowledge_document_completion(
     await _persist_document(task, document, verdict_record, session, kind)
 
 
-async def persist_compute_experiment_knowledge(
+# ---------------------------------------------------------------------------
+# Compute-experiment knowledge: a cited LLM analysis over the durable artifacts
+# is the PRIMARY producer; the deterministic verdict template is the fallback.
+# ---------------------------------------------------------------------------
+
+# LLM analysis call shape — mirrors review_learning.categorize_review_issues_llm:
+# a locally-instantiated AsyncAnthropic client, an explicit model + timeout, a
+# small JSON-parse retry, gated behind ANTHROPIC_API_KEY and an opt-out flag.
+_COMPUTE_LLM_ANALYSIS_MODEL = "claude-haiku-4-5-20251001"
+_COMPUTE_LLM_ANALYSIS_TIMEOUT = 30.0
+_COMPUTE_LLM_ANALYSIS_MAX_TOKENS = 2000
+# Opt-out switch in the same spirit as DISABLE_LLM_REVIEW_CATEGORIZATION.
+_DISABLE_LLM_COMPUTE_ANALYSIS_ENV = "DISABLE_LLM_COMPUTE_ANALYSIS"
+# Bound any free text (log excerpt) folded into the prompt so a runaway command
+# log can never blow up the analysis prompt.
+_COMPUTE_LOG_TEXT_CAP = 4000
+_COMPUTE_MAX_CITATIONS = 20
+
+
+def _build_compute_experiment_document(
     task: Task,
     *,
     outcome: str,
     cost: float | None,
     criterion: dict[str, Any] | None,
     result_reference: str | None,
-    session: AsyncSession,
-) -> KnowledgeDocument | None:
-    """Persist a ``compute_experiment`` verdict as a durable KnowledgeDocument.
+) -> dict[str, Any]:
+    """Build the DETERMINISTIC compute-experiment knowledge document.
 
-    A ``compute_experiment`` runs a budgeted compute job and completes with a
-    measured verdict — a terminal ``outcome``, the measured metric value, whether
-    a declared success criterion was met, and the ``cost``. ``web_research`` and
-    ``design`` results become first-class :class:`KnowledgeDocument` rows that are
-    indexed, delivered to dependents, and injected as prior knowledge into future
-    research/design/strategist prompts; this seam gives a compute_experiment's
-    answer the SAME durable home, so a later cycle asking the same measurable
-    question can discover that the experiment already ran and what it found.
-
-    Unlike the web_research/design lane this synthesizes the document from the
-    measured verdict rather than from agent-emitted prose, so it bypasses the
-    citation/topic forward-quality gates — the metric gate already ran in
-    ``task_completion._handle_compute_experiment_completion`` and is what admits
-    (or fails) the experiment. It is invoked for BOTH the met-criterion success
-    path AND the unmet-criterion fail path, so the system durably learns "we
-    tried X and it did NOT meet the bar" rather than silently dropping a negative
-    result.
-
-    This is a strictly ADDITIVE, best-effort post-completion step: it persists
-    one row, mirrors a compact ``plan_output["knowledge_document"]``, and reuses
-    :func:`_deliver_knowledge_to_dependents`. It NEVER mutates ``task.status``,
-    ``latest_status_message``, or ``plan_output["compute_result"]`` — the compute
-    handler owns those — and any failure is the caller's to swallow so durable
-    knowledge can never break task completion.
+    This is the historic hardcoded outcome/cost/criterion template, lifted into a
+    helper so it can be (a) persisted directly as the fallback when no LLM
+    analysis is possible and (b) handed to the LLM analysis pass as the structured
+    facts to ground its prose in. Returns a dict of
+    ``title``/``summary``/``body``/``topic``/``tags``/``citations`` plus the
+    metric ``verdict_record`` so the persisted shape is identical to before.
     """
     payload = task.first_payload or {}
     experiment = str(payload.get("experiment") or "").strip()
@@ -965,9 +974,7 @@ async def persist_compute_experiment_knowledge(
     base_tags = [str(t) for t in raw_tags[:28]] if isinstance(raw_tags, list) else []
     tags = list(dict.fromkeys([*base_tags, "compute_experiment", outcome]))[:30]
 
-    topic = (
-        payload.get("topic") or experiment or benchmark or payload.get("metric")
-    )
+    topic = payload.get("topic") or experiment or benchmark or payload.get("metric")
     topic = str(topic)[:200] if topic else None
 
     citations = (
@@ -975,9 +982,6 @@ async def persist_compute_experiment_knowledge(
         if result_reference and _is_usable_citation(result_reference)
         else []
     )
-
-    direction_id = (task.context or {}).get("direction_id")
-    direction_id = str(direction_id) if direction_id else None
 
     verdict_record = {
         "strategy": "metric",
@@ -987,6 +991,411 @@ async def persist_compute_experiment_knowledge(
         "criterion_met": crit_met,
     }
 
+    return {
+        "title": title,
+        "summary": summary,
+        "body": body,
+        "topic": topic,
+        "tags": tags,
+        "citations": citations,
+        "verdict_record": verdict_record,
+    }
+
+
+async def _load_compute_job_from_logs(
+    logs: str | None, session: AsyncSession
+) -> ComputeJob | None:
+    """Load the ComputeJob referenced by the terminal COMPUTE_RESULT ``logs``.
+
+    The agent's terminal artifact carries the originating ``job_id``; we parse it
+    and load the row so the analysis pass can reach the preserved metrics and the
+    durable artifact linkage. Returns ``None`` for unparseable logs, a missing /
+    non-UUID ``job_id``, or a row that no longer exists — every such case simply
+    falls the caller back to the deterministic document.
+    """
+    try:
+        payload = json.loads(logs) if logs else None
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("job_id")
+    if raw is None:
+        return None
+    try:
+        job_id = uuid.UUID(str(raw))
+    except (TypeError, ValueError):
+        return None
+    try:
+        return await session.get(ComputeJob, job_id)
+    except Exception:  # noqa: BLE001 — analysis must never break completion
+        return None
+
+
+async def _gather_compute_evidence(
+    task: Task,
+    *,
+    logs: str | None,
+    result_reference: str | None,
+    criterion: dict[str, Any] | None,
+    session: AsyncSession,
+) -> dict[str, Any] | None:
+    """Assemble the durable analysis inputs that already exist on disk.
+
+    Loads the ComputeJob from the terminal logs, reads its preserved numeric
+    metrics (``polling_metadata['result_metrics']``) and durable-artifact linkage
+    (the auto-populated COMPUTE_RESULT :class:`Artifact` row whose ``.logs`` JSON
+    carries ``artifact_uri``/``file_count``), and builds the candidate citation
+    set the LLM is allowed to ground its analysis in: the artifact bundle
+    ``gs://`` URI, an optional signed download URL, a per-metric reference, and
+    the ``result_reference``.
+
+    Returns ``None`` (caller falls back to the deterministic document) whenever
+    there are no usable durable artifacts — an empty prefix, a failed job with
+    nothing durable, or no parseable job linkage at all. ``real_evidence`` is the
+    subset of citations that point at the artifact/metric — i.e. everything BUT a
+    bare ``result_reference`` — so the caller can require the analysis to cite at
+    least one piece of real evidence rather than only re-stating the reference.
+    """
+    job = await _load_compute_job_from_logs(logs, session)
+    if job is None:
+        return None
+
+    metrics: dict[str, Any] = {}
+    raw_metrics = (job.polling_metadata or {}).get("result_metrics")
+    if isinstance(raw_metrics, dict):
+        metrics = {
+            str(k): v
+            for k, v in raw_metrics.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        }
+
+    artifact_uri: str | None = None
+    storage_uri: str | None = None
+    file_count = 0
+    if job.artifact_id is not None:
+        try:
+            artifact = await session.get(Artifact, job.artifact_id)
+        except Exception:  # noqa: BLE001
+            artifact = None
+        if artifact is not None:
+            storage_uri = (artifact.storage_uri or "").strip() or None
+            try:
+                art_logs = json.loads(artifact.logs) if artifact.logs else None
+            except (json.JSONDecodeError, ValueError):
+                art_logs = None
+            if isinstance(art_logs, dict):
+                uri = str(art_logs.get("artifact_uri") or "").strip()
+                artifact_uri = uri or None
+                try:
+                    file_count = int(art_logs.get("file_count") or 0)
+                except (TypeError, ValueError):
+                    file_count = 0
+
+    # The durable artifact location is the canonical evidence pointer. Prefer the
+    # job's own result_reference, then the artifact rows. No durable artifact
+    # location at all (empty / failed job) ⇒ nothing to analyse; fall back.
+    job_reference = (job.result_reference or "").strip() or None
+    artifact_uri = artifact_uri or job_reference or storage_uri
+    if artifact_uri is None or not _is_usable_citation(artifact_uri):
+        return None
+    if file_count <= 0 and not metrics:
+        # No durable files survived AND no preserved metric — nothing the LLM can
+        # honestly analyse beyond the bare verdict; fall back.
+        return None
+
+    # Candidate citations the analysis is allowed to cite. Membership is enforced
+    # after the LLM responds so the document can only cite real, durable evidence.
+    real_evidence: list[str] = []
+    seen: set[str] = set()
+
+    def _add_real(value: str | None) -> None:
+        if value and _is_usable_citation(value) and value not in seen:
+            seen.add(value)
+            real_evidence.append(value)
+
+    _add_real(artifact_uri)
+    if storage_uri and storage_uri != artifact_uri:
+        _add_real(storage_uri)
+
+    # Best-effort signed download URL for the artifact bundle — a directly usable
+    # http(s) pointer. Never blocks: any storage/credential error is swallowed.
+    try:
+        from app import storage as _storage
+
+        signed = await _storage.generate_download_signed_url(artifact_uri)
+        _add_real(signed)
+    except Exception:  # noqa: BLE001, S110 — signing is optional, nothing to log
+        pass
+
+    # Per-metric references: each preserved numeric metric, pinned to the durable
+    # artifact bundle, is a citation resolving to durable measured evidence.
+    for name, value in metrics.items():
+        _add_real(f"{artifact_uri}#metric:{name}={value}")
+    if isinstance(criterion, dict):
+        c_metric = criterion.get("metric")
+        c_value = criterion.get("value")
+        if c_metric and c_value is not None:
+            _add_real(f"{artifact_uri}#metric:{c_metric}={c_value}")
+
+    if not real_evidence:
+        return None
+
+    citations = list(real_evidence)
+    if result_reference and _is_usable_citation(result_reference) and result_reference not in seen:
+        citations.append(result_reference)
+
+    log_excerpt = (logs or "")[:_COMPUTE_LOG_TEXT_CAP]
+
+    return {
+        "job_id": str(job.id),
+        "artifact_uri": artifact_uri,
+        "file_count": file_count,
+        "metrics": metrics,
+        "citations": citations,
+        "real_evidence": real_evidence,
+        "log_excerpt": log_excerpt,
+    }
+
+
+def _build_compute_analysis_prompt(
+    task: Task,
+    *,
+    outcome: str,
+    cost: float | None,
+    criterion: dict[str, Any] | None,
+    evidence: dict[str, Any],
+    fallback: dict[str, Any],
+) -> str:
+    """Build a compact, bounded analysis prompt grounded in the durable inputs."""
+    payload = task.first_payload or {}
+    identity = (
+        str(payload.get("experiment") or "").strip()
+        or str(payload.get("benchmark") or "").strip()
+        or "compute experiment"
+    )
+    allowed = "\n".join(f"  - {c}" for c in evidence["citations"])
+    metrics_lines = (
+        "\n".join(f"  - {k} = {v}" for k, v in evidence["metrics"].items())
+        or "  (no command-reported numeric metrics)"
+    )
+    criterion_line = (
+        json.dumps(criterion, sort_keys=True) if criterion is not None else "(none declared)"
+    )
+    return (
+        "You are analysing the durable outputs of a finished compute experiment. "
+        "Write a grounded, factual knowledge document about what the experiment "
+        "found, citing the durable evidence below. Do NOT invent results — every "
+        "claim must rest on the provided outcome, metrics, cost, or artifacts.\n\n"
+        f"Experiment: {identity}\n"
+        f"Terminal outcome: {outcome}\n"
+        f"Cost (USD): {cost}\n"
+        f"Durable artifact bundle: {evidence['artifact_uri']} "
+        f"({evidence['file_count']} file(s))\n"
+        f"Declared success criterion: {criterion_line}\n"
+        "Preserved numeric metrics:\n"
+        f"{metrics_lines}\n"
+        f"Terminal result log (truncated):\n{evidence['log_excerpt']}\n\n"
+        "You MUST choose source_citations ONLY from this allowed evidence list "
+        "(copy the strings verbatim); cite at least one artifact or metric "
+        "reference, not only the result reference:\n"
+        f"{allowed}\n\n"
+        "Respond with ONLY valid JSON in this exact shape (no markdown, no "
+        "commentary):\n"
+        '{"title": "...", "summary": "...", "body": "...(markdown)...", '
+        '"source_citations": ["...", "..."]}\n'
+    )
+
+
+def _parse_compute_analysis_json(raw: str) -> dict[str, Any] | None:
+    """Best-effort parse of the LLM's JSON analysis (tolerates fenced output)."""
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        # Strip a leading ```json / ``` fence and trailing fence.
+        text = re.sub(r"^```[a-zA-Z0-9]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text).strip()
+    try:
+        obj = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end <= start:
+            return None
+        try:
+            obj = json.loads(text[start : end + 1])
+        except (json.JSONDecodeError, ValueError):
+            return None
+    return obj if isinstance(obj, dict) else None
+
+
+async def _call_compute_analysis_llm(api_key: str, prompt: str) -> dict[str, Any] | None:
+    """Call the Anthropic API for the analysis, with a single JSON-parse retry.
+
+    Returns the parsed JSON object on success, or ``None`` on a persistent parse
+    error or any API failure — the caller then falls back to the deterministic
+    document. Mirrors ``review_learning.categorize_review_issues_llm`` exactly.
+    """
+    for attempt in range(2):
+        try:
+            import anthropic as _anthropic
+
+            client = _anthropic.AsyncAnthropic(api_key=api_key)
+            resp = await client.messages.create(
+                model=_COMPUTE_LLM_ANALYSIS_MODEL,
+                max_tokens=_COMPUTE_LLM_ANALYSIS_MAX_TOKENS,
+                timeout=_COMPUTE_LLM_ANALYSIS_TIMEOUT,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = resp.content[0].text.strip()
+            data = _parse_compute_analysis_json(raw)
+            if not isinstance(data, dict) or not all(
+                k in data for k in ("title", "summary", "body")
+            ):
+                raise ValueError("analysis missing required keys")
+            return data
+        except (json.JSONDecodeError, KeyError, ValueError, IndexError) as exc:
+            if attempt == 0:
+                logger.info(
+                    "[COMPUTE] analysis parse error %s, retrying once", exc
+                )
+                continue
+            logger.info(
+                "[COMPUTE] analysis parse error on retry, using deterministic fallback"
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001 — any API error ⇒ fallback
+            logger.info(
+                "[COMPUTE] analysis LLM call failed (%s), using deterministic fallback",
+                exc,
+            )
+            return None
+    return None
+
+
+async def _analyze_compute_experiment_with_llm(
+    task: Task,
+    *,
+    outcome: str,
+    cost: float | None,
+    criterion: dict[str, Any] | None,
+    result_reference: str | None,
+    logs: str | None,
+    session: AsyncSession,
+    fallback: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Produce a cited LLM analysis over the durable artifacts, or ``None``.
+
+    Returns ``None`` — signalling the caller to persist the deterministic
+    fallback — when the analysis is opted out, the API key is absent, there are
+    no usable durable artifacts, the LLM call fails/times out, the output is
+    unparseable, or the produced document does not clear the SAME citation gate
+    the web_research/design lanes use (``_usable_citations``) AND ground itself in
+    at least one real artifact/metric citation rather than only the bare result
+    reference.
+    """
+    if os.environ.get(_DISABLE_LLM_COMPUTE_ANALYSIS_ENV, "").strip() == "1":
+        return None
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    evidence = await _gather_compute_evidence(
+        task,
+        logs=logs,
+        result_reference=result_reference,
+        criterion=criterion,
+        session=session,
+    )
+    if evidence is None:
+        return None
+
+    prompt = _build_compute_analysis_prompt(
+        task,
+        outcome=outcome,
+        cost=cost,
+        criterion=criterion,
+        evidence=evidence,
+        fallback=fallback,
+    )
+    document = await _call_compute_analysis_llm(api_key, prompt)
+    if document is None:
+        return None
+
+    # Citation grounding: keep only citations that are members of the durable
+    # candidate set (the LLM cannot fabricate evidence), then run them through the
+    # SAME shape gate the other knowledge lanes use.
+    allowed = set(evidence["citations"])
+    real_evidence = set(evidence["real_evidence"])
+    raw_citations = document.get("source_citations")
+    if not isinstance(raw_citations, list):
+        return None
+    grounded = [
+        c.strip()
+        for c in raw_citations
+        if isinstance(c, str) and c.strip() in allowed
+    ]
+    usable = [c for c in grounded if _is_usable_citation(c)]
+    # Defence-in-depth: require at least one usable citation AND that at least one
+    # resolves to real artifact/metric evidence — not only the result_reference.
+    if not usable or not any(c in real_evidence for c in usable):
+        logger.info(
+            "[COMPUTE] analysis for task %s lacked grounded artifact citations; "
+            "using deterministic fallback",
+            task.id,
+        )
+        return None
+
+    summary = str(document.get("summary") or "")
+    body = str(document.get("body") or "")
+    if not summary.strip() or not body.strip():
+        return None
+    title = (
+        str(document.get("title"))[:500]
+        if document.get("title")
+        else fallback["title"]
+    )
+
+    verdict_record = dict(fallback["verdict_record"])
+    verdict_record["analysis_mode"] = "llm"
+    verdict_record["analysis_model"] = _COMPUTE_LLM_ANALYSIS_MODEL
+
+    return {
+        "title": title,
+        "summary": summary,
+        "body": body,
+        "topic": fallback["topic"],
+        "tags": fallback["tags"],
+        "citations": usable[:_COMPUTE_MAX_CITATIONS],
+        "verdict_record": verdict_record,
+    }
+
+
+async def _persist_compute_knowledge_document(
+    task: Task,
+    document: dict[str, Any],
+    mode: str,
+    session: AsyncSession,
+) -> KnowledgeDocument:
+    """Persist one compute-experiment KnowledgeDocument, mirror a compact copy.
+
+    Shared by the LLM-analysis and deterministic-fallback paths so the persisted
+    shape is identical either way; ``mode`` (``"llm"``/``"fallback"``) is stamped
+    on the verdict and the mirrored plan_output so consumers can tell which path
+    produced the document. NEVER mutates ``task.status``,
+    ``latest_status_message``, or ``plan_output['compute_result']``.
+    """
+    direction_id = (task.context or {}).get("direction_id")
+    direction_id = str(direction_id) if direction_id else None
+
+    title = document["title"]
+    summary = document["summary"]
+    topic = document["topic"]
+    tags = document["tags"]
+    citations = document["citations"][:100]
+
+    verdict_record = dict(document["verdict_record"])
+    verdict_record.setdefault("analysis_mode", mode)
+
     doc = KnowledgeDocument(
         project_id=task.project_id,
         source_task_id=task.id,
@@ -994,7 +1403,7 @@ async def persist_compute_experiment_knowledge(
         source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
         title=title,
         summary=summary,
-        body=body,
+        body=document["body"],
         topic=topic,
         tags=tags,
         source_citations=citations,
@@ -1015,6 +1424,7 @@ async def persist_compute_experiment_knowledge(
         "direction_id": direction_id,
         "citation_count": len(citations),
         "source_kind": SourceKind.COMPUTE_EXPERIMENT.value,
+        "analysis_mode": verdict_record.get("analysis_mode", mode),
     }
     task.plan_output = plan_output
     flag_modified(task, "plan_output")
@@ -1029,11 +1439,95 @@ async def persist_compute_experiment_knowledge(
     )
 
     logger.info(
-        "[COMPUTE] Persisted compute-experiment knowledge document %s for task %s",
+        "[COMPUTE] Persisted compute-experiment knowledge document %s for task %s "
+        "(analysis_mode=%s)",
         doc.id,
         task.id,
+        verdict_record.get("analysis_mode", mode),
     )
     return doc
+
+
+async def persist_compute_experiment_knowledge(
+    task: Task,
+    *,
+    outcome: str,
+    cost: float | None,
+    criterion: dict[str, Any] | None,
+    result_reference: str | None,
+    session: AsyncSession,
+    logs: str | None = None,
+) -> KnowledgeDocument | None:
+    """Persist a ``compute_experiment`` verdict as a durable KnowledgeDocument.
+
+    A ``compute_experiment`` runs a budgeted compute job and completes with a
+    measured verdict — a terminal ``outcome``, the measured metric value, whether
+    a declared success criterion was met, and the ``cost``. ``web_research`` and
+    ``design`` results become first-class :class:`KnowledgeDocument` rows that are
+    indexed, delivered to dependents, and injected as prior knowledge into future
+    research/design/strategist prompts; this seam gives a compute_experiment's
+    answer the SAME durable home, so a later cycle asking the same measurable
+    question can discover that the experiment already ran and what it found.
+
+    The PRIMARY producer is now a cited LLM analysis pass
+    (:func:`_analyze_compute_experiment_with_llm`) that reads the job's durable
+    artifacts, preserved numeric metrics, and bounded command log and writes a
+    grounded document whose ``source_citations`` resolve to that durable evidence
+    — qualifying as acceptance evidence in the d-2dc81008 sense. It runs through
+    the SAME citation gate the web_research/design lanes use; when the LLM is
+    opted out / unavailable, the call errors or times out, the output is
+    unparseable, there are no usable durable artifacts, or the document fails the
+    citation gate, it falls back to the historic deterministic outcome/cost/
+    criterion template — preserving today's behaviour exactly, including the
+    honest negative-result document when the criterion was NOT met. The verdict
+    and mirrored plan_output record which mode (``llm`` vs ``fallback``) produced
+    the document.
+
+    Invoked for BOTH the met-criterion success path AND the unmet-criterion fail
+    path, so the system durably learns "we tried X and it did NOT meet the bar"
+    rather than silently dropping a negative result.
+
+    This is a strictly ADDITIVE, best-effort post-completion step: it persists one
+    row, mirrors a compact ``plan_output["knowledge_document"]``, and reuses
+    :func:`_deliver_knowledge_to_dependents`. It NEVER mutates ``task.status``,
+    ``latest_status_message``, or ``plan_output["compute_result"]`` — the compute
+    handler owns those — and any failure is the caller's to swallow so durable
+    knowledge can never break task completion.
+    """
+    fallback = _build_compute_experiment_document(
+        task,
+        outcome=outcome,
+        cost=cost,
+        criterion=criterion,
+        result_reference=result_reference,
+    )
+
+    document = fallback
+    mode = "fallback"
+    try:
+        analysis = await _analyze_compute_experiment_with_llm(
+            task,
+            outcome=outcome,
+            cost=cost,
+            criterion=criterion,
+            result_reference=result_reference,
+            logs=logs,
+            session=session,
+            fallback=fallback,
+        )
+    except Exception:  # noqa: BLE001 — analysis must never break completion
+        logger.warning(
+            "[COMPUTE] LLM analysis pass raised for task %s; "
+            "using deterministic fallback",
+            task.id,
+            exc_info=True,
+        )
+        analysis = None
+    if analysis is not None:
+        document = analysis
+        mode = "llm"
+
+    return await _persist_compute_knowledge_document(task, document, mode, session)
 
 
 async def _handle_web_research_completion(
