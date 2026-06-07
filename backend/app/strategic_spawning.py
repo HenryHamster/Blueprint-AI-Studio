@@ -3907,7 +3907,7 @@ async def _spawn_strategic_review(
     _deployment_state_block: dict | None = None
     if _integration_branch != _promotion_target:
         try:
-            from app.models import DeploymentState
+            from app.models import DeploymentState, DeploymentStatus
             from app.release_version import (
                 recent_closed_versions as _recent_closed_for_deploy,
             )
@@ -3936,6 +3936,14 @@ async def _spawn_strategic_review(
             _deployed_sha: str | None = None
             _deployed_revision: str | None = None
             _deploy_status: str | None = None
+            # Rollback provenance — only meaningful for the self-repo's own
+            # DeploymentState. Surfaced so the strategist sees WHY the pipeline
+            # rolled back (which SHA, how many consecutive rollbacks, the
+            # reason) and can prioritize stabilization rather than spawn more
+            # risky feature work right after a rollback / halt.
+            _rolled_back_from_sha: str | None = None
+            _rollback_count: int = 0
+            _rollback_reason: str | None = None
             if getattr(project, "is_self_repo", False):
                 try:
                     _ds = await session.get(DeploymentState, 1)
@@ -3943,6 +3951,9 @@ async def _spawn_strategic_review(
                         _deployed_sha = _ds.current_sha or None
                         _deployed_revision = _ds.current_revision or None
                         _deploy_status = _ds.status
+                        _rolled_back_from_sha = _ds.rolled_back_from_sha or None
+                        _rollback_count = _ds.rollback_count or 0
+                        _rollback_reason = _ds.rollback_reason or None
                 except Exception:
                     logger.exception(
                         "[STRATEGIC] DeploymentState read failed; continuing"
@@ -3972,6 +3983,12 @@ async def _spawn_strategic_review(
                 "deployed_sha": (_deployed_sha or "")[:12] or None,
                 "deployed_revision": _deployed_revision,
                 "deploy_status": _deploy_status,
+                # Rollback provenance (self-repo only; None/0 otherwise) — the
+                # same truth operators already see in the deploy panel.
+                "rolled_back_from_sha": (_rolled_back_from_sha or "")[:12]
+                or None,
+                "rollback_count": _rollback_count,
+                "rollback_reason": _rollback_reason,
                 "promoted_version": (
                     _promoted_v.version_number if _promoted_v else None
                 ),
@@ -4029,6 +4046,62 @@ async def _spawn_strategic_review(
                     f"{prompt_suffix}\n{_deploy_line}"
                     if prompt_suffix
                     else _deploy_line
+                )
+            # Stabilization directive — symmetric to the deploy_failed /
+            # unconfirmed recovery directives, but driven by the orchestrator's
+            # OWN deploy status (self-repo only). When the pipeline has
+            # ROLLED_BACK (reverted to last-known-good) or HALTED (repeated
+            # rollbacks → manual-intervention needed), stabilization is the
+            # priority for the cycle: scrutinize the rolled-back-from change
+            # rather than spawn more risky feature work, and (for HALTED)
+            # recognize the repeated-rollback halt. Best-effort and naturally
+            # scoped to self-repo since _deploy_status is only read there.
+            if _deploy_status in (
+                DeploymentStatus.ROLLED_BACK,
+                DeploymentStatus.HALTED,
+            ):
+                _from_txt = (
+                    f" The rolled-back-from SHA is "
+                    f"{(_rolled_back_from_sha or '')[:12]}."
+                    if _rolled_back_from_sha
+                    else ""
+                )
+                _reason_txt = (
+                    f" Rollback reason: {_rollback_reason}."
+                    if _rollback_reason
+                    else ""
+                )
+                _count_txt = (
+                    f" Consecutive rollbacks: {_rollback_count}."
+                    if _rollback_count
+                    else ""
+                )
+                if _deploy_status == DeploymentStatus.HALTED:
+                    _stabilize_directive = (
+                        f"Deployment HALTED (see `deployment_state.deploy_status` "
+                        f"= 'HALTED') — the pipeline has rolled back repeatedly and "
+                        f"now needs manual intervention.{_count_txt}{_from_txt}"
+                        f"{_reason_txt} Treat STABILIZATION as the TOP priority for "
+                        f"this cycle: scrutinize the rolled-back-from change and the "
+                        f"repeated-rollback cause, do NOT advance focus or spawn more "
+                        f"risky feature work as if the milestone shipped. Recognize "
+                        f"this is a repeated-rollback halt, not a one-off."
+                    )
+                else:
+                    _stabilize_directive = (
+                        f"Deployment ROLLED BACK (see "
+                        f"`deployment_state.deploy_status` = 'ROLLED_BACK') — the "
+                        f"orchestrator reverted its own live deploy to the last "
+                        f"known good.{_count_txt}{_from_txt}{_reason_txt} Treat "
+                        f"STABILIZATION as the priority for this cycle: scrutinize "
+                        f"the rolled-back-from change rather than spawn more risky "
+                        f"feature work, and do NOT advance focus as if the milestone "
+                        f"shipped."
+                    )
+                prompt_suffix = (
+                    f"{prompt_suffix}\n{_stabilize_directive}"
+                    if prompt_suffix
+                    else _stabilize_directive
                 )
         except Exception:
             logger.exception(

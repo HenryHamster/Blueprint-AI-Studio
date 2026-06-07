@@ -6823,6 +6823,132 @@ async def test_deployment_state_absent_without_lts_split(db_session, mocker):
     assert "deployment_state" not in payload
 
 
+async def _spawn_self_repo_with_deployment_state(
+    db_session, mocker, *, status, rolled_back_from_sha=None,
+    rollback_count=0, rollback_reason=None,
+):
+    """Spawn a self-repo strategic review under an LTS split with a seeded
+    DeploymentState row. Returns (deployment_state block, prompt_suffix)."""
+    from datetime import datetime, timedelta
+    from app.models import ReleaseVersion, DeploymentState
+
+    await _ensure_releaseversion_table(db_session)
+    _patch_spawning_deps(mocker)
+
+    project = _make_project(
+        is_self_repo=True,
+        integration_branch="automain",
+        promotion_target="main",
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    db_session.add(
+        ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="build",
+            status="open",
+            opened_at=now - timedelta(hours=1),
+        )
+    )
+    db_session.add(
+        DeploymentState(
+            id=1,
+            current_sha="deadbeefcafe9999",
+            current_revision="rev-123",
+            status=status,
+            rolled_back_from_sha=rolled_back_from_sha,
+            rollback_count=rollback_count,
+            rollback_reason=rollback_reason,
+        )
+    )
+    await db_session.commit()
+
+    assert await _spawn_strategic_review(project, db_session) is True
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    )
+    return payload.get("deployment_state"), payload.get("prompt_suffix", "")
+
+
+@pytest.mark.asyncio
+async def test_deployment_state_block_carries_rollback_provenance(
+    db_session, mocker
+):
+    """The deployment_state block surfaces the rollback provenance the operator
+    UI already shows: rolled-back-from SHA (12-char), count, and reason."""
+    ds, _suffix = await _spawn_self_repo_with_deployment_state(
+        db_session,
+        mocker,
+        status="ROLLED_BACK",
+        rolled_back_from_sha="badc0ffee0ddf00d",
+        rollback_count=2,
+        rollback_reason="health check failed after deploy",
+    )
+    assert ds is not None, "deployment_state block missing under an LTS split"
+    assert ds["rolled_back_from_sha"] == "badc0ffee0dd"  # 12-char, like deployed_sha
+    assert ds["rollback_count"] == 2
+    assert ds["rollback_reason"] == "health check failed after deploy"
+
+
+@pytest.mark.asyncio
+async def test_stabilization_directive_fires_on_rolled_back(db_session, mocker):
+    """A ROLLED_BACK deploy status injects a stabilization directive naming the
+    reason + count and steering the strategist away from advancing focus."""
+    _ds, suffix = await _spawn_self_repo_with_deployment_state(
+        db_session,
+        mocker,
+        status="ROLLED_BACK",
+        rolled_back_from_sha="badc0ffee0ddf00d",
+        rollback_count=1,
+        rollback_reason="health check failed after deploy",
+    )
+    assert "ROLLED_BACK" in suffix
+    assert "STABILIZATION" in suffix
+    assert "health check failed after deploy" in suffix
+    assert "Consecutive rollbacks: 1" in suffix
+    assert "badc0ffee0dd" in suffix
+    assert "do NOT advance focus" in suffix
+
+
+@pytest.mark.asyncio
+async def test_stabilization_directive_fires_on_halted(db_session, mocker):
+    """A HALTED deploy status injects the repeated-rollback-halt directive."""
+    _ds, suffix = await _spawn_self_repo_with_deployment_state(
+        db_session,
+        mocker,
+        status="HALTED",
+        rolled_back_from_sha="badc0ffee0ddf00d",
+        rollback_count=3,
+        rollback_reason="repeated boot crash",
+    )
+    assert "HALTED" in suffix
+    assert "STABILIZATION" in suffix
+    assert "manual intervention" in suffix
+    assert "Consecutive rollbacks: 3" in suffix
+    assert "repeated-rollback halt" in suffix
+
+
+@pytest.mark.asyncio
+async def test_stabilization_directive_absent_when_stable(db_session, mocker):
+    """A healthy (STABLE) deploy status emits no stabilization directive."""
+    _ds, suffix = await _spawn_self_repo_with_deployment_state(
+        db_session, mocker, status="STABLE",
+    )
+    assert "STABILIZATION" not in suffix
+    assert "ROLLED_BACK" not in suffix
+    assert "HALTED" not in suffix
+
+
 @pytest.mark.asyncio
 async def test_rolling_rates_exclude_rollup_children(db_session):
     """Rollup children (parent_task_id set) are not counted as merged in rolling_rates.

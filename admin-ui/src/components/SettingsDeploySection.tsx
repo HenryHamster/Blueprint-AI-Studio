@@ -223,18 +223,18 @@ export function DeploySection({
 
             {/* Action buttons */}
             <div className="flex gap-2 flex-wrap">
-              {deployState.status === 'PAUSED' || deployState.status === 'HALTED' || deployState.status === 'ROLLED_BACK' ? (
+              {deployState.status === 'PAUSED' || deployState.status === 'ROLLED_BACK' ? (
                 <button onClick={onResumePipeline}
                   className="bg-emerald-950/30 hover:bg-emerald-900/40 text-emerald-400 text-xs min-h-[44px] py-2 px-4 rounded-lg transition-colors border border-emerald-900/50 flex items-center gap-1.5">
                   <Play className="w-3.5 h-3.5" /> Resume
                 </button>
-              ) : (
+              ) : deployState.status === 'STABLE' || deployState.status === 'MONITORING' ? (
                 <button onClick={onPausePipeline}
                   className="bg-amber-950/30 hover:bg-amber-900/40 text-amber-400 text-xs min-h-[44px] py-2 px-4 rounded-lg transition-colors border border-amber-900/50 flex items-center gap-1.5">
                   <Pause className="w-3.5 h-3.5" /> Pause
                 </button>
-              )}
-              {(deployState.status === 'MONITORING' || deployState.status === 'ROLLED_BACK') && (
+              ) : null}
+              {(deployState.status === 'MONITORING' || deployState.status === 'ROLLED_BACK' || deployState.status === 'HALTED') && (
                 <button onClick={onMarkStable}
                   className="bg-neutral-800 hover:bg-neutral-700 text-emerald-400 text-xs min-h-[44px] py-2 px-4 rounded-lg transition-colors border border-neutral-700 flex items-center gap-1.5">
                   <CheckCircle className="w-3.5 h-3.5" /> Mark Stable

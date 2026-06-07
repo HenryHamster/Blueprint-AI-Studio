@@ -286,6 +286,74 @@ describe('SettingsDeploySection — viewport regression', () => {
     expect((rollbackBtn as HTMLButtonElement).disabled).toBe(true);
   });
 
+  test('halted state offers Mark Stable, hides Resume and Pause', async () => {
+    const deployState: DeployState = {
+      ...baseDeployState,
+      status: 'HALTED',
+      rollback_reason: 'Pipeline halted after 5 consecutive rollbacks',
+      rollback_count: 5,
+      failure_rate: 0.6,
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => {
+      root?.render(
+        <DeploySection
+          deployState={deployState}
+          onPausePipeline={noop}
+          onResumePipeline={noop}
+          onResetHealth={noop}
+          onRollback={noop}
+          onMarkStable={noop}
+          onRepairState={noop}
+          zoneHealth={null}
+        />
+      );
+    });
+    const buttons = Array.from(host.querySelectorAll('button'));
+    const labels = buttons.map((b) => b.textContent?.trim() ?? '');
+    // HALTED is cleared via mark-stable (resets the consecutive-rollback count);
+    // the backend resume endpoint rejects a HALTED resume with HTTP 400, so the
+    // panel must surface Mark Stable and must NOT offer Resume.
+    expect(labels.some((l) => l.includes('Mark Stable'))).toBe(true);
+    expect(labels.some((l) => l.includes('Resume'))).toBe(false);
+    // Pausing an already-halted pipeline is meaningless — no Pause control.
+    expect(labels.some((l) => l.includes('Pause'))).toBe(false);
+    // Repair remains available as a generic recovery affordance.
+    expect(labels.some((l) => l.includes('Repair'))).toBe(true);
+  });
+
+  test('renders without horizontal overflow at 375px with halted state', async () => {
+    const deployState: DeployState = {
+      ...baseDeployState,
+      status: 'HALTED',
+      rollback_reason: 'Pipeline halted after 5 consecutive rollbacks; mark stable to recover',
+      rollback_count: 5,
+      failure_rate: 0.6,
+    };
+
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => {
+        root?.render(
+          <DeploySection
+            deployState={deployState}
+            onPausePipeline={noop}
+            onResumePipeline={noop}
+            onResetHealth={noop}
+            onRollback={noop}
+            onMarkStable={noop}
+            onRepairState={noop}
+            zoneHealth={null}
+          />
+        );
+      });
+    });
+  });
+
   test('surfaces rolled-back-from provenance and live-SHA labeling on rollback', async () => {
     const deployState: DeployState = {
       ...baseDeployState,
