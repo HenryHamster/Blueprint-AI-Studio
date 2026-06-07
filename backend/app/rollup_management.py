@@ -1083,9 +1083,23 @@ async def _check_and_trigger_rollup(
             TaskStatus.PROVISIONING,
             TaskStatus.IN_PROGRESS,
             TaskStatus.EVALUATING,
+            # A BLOCKED review/fix child is non-terminal work parked on a
+            # precondition (file_conflict, blocked-precondition halt, …); it must
+            # keep the rollup waiting, mirroring the subtask tally below. Pre-fix
+            # it was invisible here, so the completion/resume pass ran with a
+            # still-active fix child and rebuilt review_loop from scratch — that
+            # re-armed ci_waiting and discarded ci_fix_spawned, FAILing the parent
+            # on the 1h CI-wait backstop (PR #8746, research 5b250ecd).
+            TaskStatus.BLOCKED,
         ):
             continue
-        if _is_pipeline_task_stale(c):
+        # The staleness skip exists to stop a silently-dead VM (no heartbeat for
+        # 15+ min) from permanently wedging rollup. A BLOCKED child never
+        # heartbeats by design, so it would be falsely skipped as stale — bypass
+        # the check for BLOCKED. Its lifetime is bounded instead by the
+        # blocked-escalation machinery in reaper_sweeps, so it cannot wedge
+        # rollup permanently.
+        if c.status != TaskStatus.BLOCKED and _is_pipeline_task_stale(c):
             logger.warning(
                 f"[ROLLUP] Ignoring stale pipeline task {str(c.id)[:8]} "
                 f"(status={c.status}, last_heartbeat={c.last_heartbeat}) — not blocking rollup"
@@ -3693,25 +3707,110 @@ async def _check_and_trigger_rollup(
                     #     verdict==APPROVE branch falls through to the direct
                     #     merge path, and the next rollup sweep marks this parent
                     #     COMPLETED when it sees the PR merged.
-                    # Do NOT pre-seed review_approved here — the spawned review task
-                    # writes it back to this parent's review_loop on APPROVE.
-                    review_loop_seed = {
-                        "pr_number": rollup_pr_number,
-                        "branch": staging_branch,
-                        "base_branch": target_branch,
-                        "original_task_id": str(parent.id),
-                    }
-                    if not is_target_intermediate:
-                        review_loop_seed["ci_waiting"] = True
-                        review_loop_seed["ci_wait_started"] = _utcnow().isoformat()
-                    parent.latest_status_message = f"All {completed_count} subtasks merged, rollup PR #{rollup_pr_number} awaiting review"
-                    parent.context = {
-                        **parent_ctx,
-                        "rollup_pr_url": rollup_pr_url,
-                        "rollup_pr_number": rollup_pr_number,
-                        "_is_rollup_review": True,
-                        "review_loop": review_loop_seed,
-                    }
+                    # State-regression guard (PR #8746, research 5b250ecd): when
+                    # RESUMING with an existing rollup PR, the prior review_loop may
+                    # already record real CI/fix progress — ci_passed=False (a fix
+                    # is needed), ci_fix_spawned (a fix is in flight), or a
+                    # non-terminal (incl. BLOCKED) fix child on this PR. Rebuilding
+                    # the seed unconditionally re-arms ci_waiting=True / a fresh
+                    # ci_wait_started and discards that progress, so the 1h CI-wait
+                    # backstop later FAILs the parent and cascade-cancels the fix.
+                    # Detect that regression and PRESERVE the existing review_loop
+                    # instead of overwriting it. (Changes A+B keep a BLOCKED fix
+                    # visible so this resume path is rarely reached in the incident
+                    # scenario; this is the direct backstop.)
+                    existing_loop = parent_ctx.get("review_loop") or {}
+                    # Only trust prior loop state that belongs to THIS PR — a
+                    # recreated rollup PR must not inherit a stale loop (and its
+                    # ci_fix_spawned/ci_passed) from its predecessor's number.
+                    _loop_pr = existing_loop.get("pr_number")
+                    same_pr_loop = _loop_pr is not None and str(_loop_pr) == str(
+                        rollup_pr_number
+                    )
+                    has_ci_progress = same_pr_loop and (
+                        existing_loop.get("ci_passed") is False
+                        or bool(existing_loop.get("ci_fix_spawned"))
+                    )
+                    active_fix_exists = False
+                    if not has_ci_progress:
+                        from app.ci_completion import _pr_number_match
+
+                        _active_pr_tasks = (
+                            (
+                                await session.execute(
+                                    select(Task).where(
+                                        Task.project_id == parent.project_id,
+                                        # Includes BLOCKED: a fix parked on a
+                                        # precondition is still in flight and must
+                                        # not have its loop state wiped on resume.
+                                        Task.status.in_(
+                                            [
+                                                TaskStatus.QUEUED,
+                                                TaskStatus.PROVISIONING,
+                                                TaskStatus.IN_PROGRESS,
+                                                TaskStatus.EVALUATING,
+                                                TaskStatus.BLOCKED,
+                                            ]
+                                        ),
+                                        Task.archived.is_(False),
+                                        _pr_number_match(session, rollup_pr_number),
+                                    )
+                                )
+                            )
+                            .scalars()
+                            .all()
+                        )
+                        active_fix_exists = any(
+                            t.id != parent.id and t.first_payload.get("type") == "fix"
+                            for t in _active_pr_tasks
+                        )
+                    if has_ci_progress or (same_pr_loop and active_fix_exists):
+                        logger.info(
+                            f"[ROLLUP] Resuming rollup PR #{rollup_pr_number} with "
+                            f"in-flight CI/fix state (ci_passed={existing_loop.get('ci_passed')}, "
+                            f"ci_fix_spawned={bool(existing_loop.get('ci_fix_spawned'))}, "
+                            f"active_fix={active_fix_exists}) — preserving review_loop, "
+                            f"not re-arming ci_waiting"
+                        )
+                        review_loop_seed = existing_loop
+                        parent.latest_status_message = (
+                            f"Rollup PR #{rollup_pr_number} resuming with in-flight "
+                            f"fix/CI state — review_loop preserved"
+                        )
+                        parent.context = {
+                            **parent_ctx,
+                            "rollup_pr_url": rollup_pr_url,
+                            "rollup_pr_number": rollup_pr_number,
+                            "_is_rollup_review": True,
+                            "review_loop": review_loop_seed,
+                        }
+                    else:
+                        # Do NOT pre-seed review_approved here — the spawned review
+                        # task writes it back to this parent's review_loop on APPROVE.
+                        review_loop_seed = {
+                            "pr_number": rollup_pr_number,
+                            "branch": staging_branch,
+                            "base_branch": target_branch,
+                            "original_task_id": str(parent.id),
+                        }
+                        if active_fix_exists:
+                            # A non-terminal fix exists for this PR but the prior
+                            # loop belongs to a different (recreated) PR number:
+                            # rebuild the seed for the current PR, record that a
+                            # fix is needed, and do NOT arm the CI wait — the
+                            # in-flight fix child drives the next transition.
+                            review_loop_seed["ci_passed"] = False
+                        elif not is_target_intermediate:
+                            review_loop_seed["ci_waiting"] = True
+                            review_loop_seed["ci_wait_started"] = _utcnow().isoformat()
+                        parent.latest_status_message = f"All {completed_count} subtasks merged, rollup PR #{rollup_pr_number} awaiting review"
+                        parent.context = {
+                            **parent_ctx,
+                            "rollup_pr_url": rollup_pr_url,
+                            "rollup_pr_number": rollup_pr_number,
+                            "_is_rollup_review": True,
+                            "review_loop": review_loop_seed,
+                        }
                     review_task, _ = await _spawn_pipeline_task(
                         parent,
                         "review",

@@ -475,6 +475,13 @@ _PIPELINE_ACTIVE_STATUSES = (
     TaskStatus.PROVISIONING,
     TaskStatus.IN_PROGRESS,
     TaskStatus.EVALUATING,
+    # A BLOCKED pipeline task still holds its active-idempotency slot at the DB
+    # level (alembic 0138 / ux_task_active_idempotency_key counts BLOCKED), so
+    # the liveness/dedup logic here must treat it as live too — otherwise a
+    # BLOCKED fix is invisible to dedup while the index reserves its key,
+    # producing duplicate re-spawns against an unchanged head (PR #8742) and
+    # missed cross-type defers (PR #8746).
+    TaskStatus.BLOCKED,
 )
 
 SCOPE_OVERFLOW_PR_SIGNAL_EMITTED_KEY = "scope_overflow_pr_signal_emitted"
@@ -1173,14 +1180,11 @@ async def _spawn_pipeline_task(
             await session.execute(
                 select(Task).where(
                     Task.project_id == source_task.project_id,
-                    Task.status.in_(
-                        [
-                            TaskStatus.QUEUED,
-                            TaskStatus.PROVISIONING,
-                            TaskStatus.IN_PROGRESS,
-                            TaskStatus.EVALUATING,
-                        ]
-                    ),
+                    # Shared with _get_active_pipeline_task_by_key / verify_tests
+                    # dedup so cross-type liveness can never diverge from key-level
+                    # dedup. Includes BLOCKED — a same-PR fix parked on a
+                    # precondition must defer a review spawn, not be invisible.
+                    Task.status.in_(_PIPELINE_ACTIVE_STATUSES),
                 )
             )
         )
@@ -1198,7 +1202,12 @@ async def _spawn_pipeline_task(
         if not is_rollup_source and t_orig != resolved_original_id:
             continue
 
-        if _is_pipeline_task_stale(t):
+        # A BLOCKED task is a deliberate precondition park, not a dying VM, so
+        # its stale (no-heartbeat) signal is expected and must NOT supersede it —
+        # otherwise a legitimately parked same-PR fix gets cancelled and the
+        # cross-type defer below is skipped. The blocked-escalation machinery in
+        # reaper_sweeps bounds its lifetime instead.
+        if t.status != TaskStatus.BLOCKED and _is_pipeline_task_stale(t):
             from app.failure_classification import (
                 AGENT_TIMEOUT,
                 persist_failure_category,

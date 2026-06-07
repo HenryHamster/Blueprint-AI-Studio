@@ -373,6 +373,63 @@ async def test_eligibility_skips_dependency_and_file_conflict(db_session):
 
 
 @pytest.mark.asyncio
+async def test_eligibility_read_only_conflict_semantics_match_dispatch(db_session):
+    """Warm pickup must mirror filter_file_conflicts' read-only isolation:
+
+      - an IN_PROGRESS REVIEW (inherits the PR's full related_files but pushes no
+        diff) must NOT block a warm candidate that overlaps its files;
+      - an IN_PROGRESS WRITE task on the same files STILL blocks; and
+      - a read-only CANDIDATE (e.g. a review) is exempt from the overlap defer
+        even against an in-flight write (it produces no diff to collide).
+    """
+    import app.warm_backlog_reuse as wbr
+
+    project = await _make_project(db_session, name="ReadOnly Conflict")
+    vm_id = "agent-vm-readonly-conflict"
+
+    # 1) IN_PROGRESS review editing src/app.py — must NOT count as a claim.
+    review_ip = await _make_backlog_task(
+        db_session,
+        project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review"}],
+        context={"related_files": ["src/app.py"]},
+    )
+    write_candidate = await _make_backlog_task(
+        db_session,
+        project.id,
+        payloads=[{"type": "fix"}],
+        context={"related_files": ["src/app.py"]},
+    )
+    # The review contributes nothing to the in-progress claim set, so the
+    # overlapping write candidate is eligible.
+    assert await has_eligible_backlog_task(db_session, project.id, vm_id) is True
+    picked = await select_backlog_reuse_candidate(db_session, project.id, vm_id)
+    assert picked is not None and picked.id == write_candidate.id
+
+    # 2) Flip the in-flight task to a WRITE type: now the same overlap DOES block.
+    review_ip.payloads = [{"type": "fix"}]
+    db_session.add(review_ip)
+    await db_session.commit()
+    # Re-fetch eligibility: the only candidate now conflicts with an in-flight
+    # write on src/app.py, so it is ineligible.
+    eligible = await wbr._eligible_backlog_ids(db_session, project.id, vm_id)
+    assert write_candidate.id not in eligible
+
+    # 3) A read-only CANDIDATE overlapping the in-flight write is still exempt
+    #    from the overlap defer (it pushes no diff), so it is eligible.
+    review_candidate = await _make_backlog_task(
+        db_session,
+        project.id,
+        payloads=[{"type": "review"}],
+        context={"related_files": ["src/app.py"]},
+    )
+    eligible = await wbr._eligible_backlog_ids(db_session, project.id, vm_id)
+    assert review_candidate.id in eligible
+    assert write_candidate.id not in eligible
+
+
+@pytest.mark.asyncio
 async def test_paused_project_has_no_warm_claimable_backlog(db_session):
     """A paused project's QUEUED backlog must not be warm-claimable on the
     idle-VM next-role reuse path; resuming restores eligibility."""

@@ -23,6 +23,7 @@ from sqlalchemy import or_, select
 from app.models import Project, Task, TaskStatus
 from app.orchestrator_filters import _prod_files
 from app.shared_state import runtime_config as _runtime_config
+from app.task_capabilities import READ_ONLY_TASK_TYPES
 from app.time_utils import _utcnow
 
 logger = logging.getLogger("blueprint")
@@ -33,6 +34,20 @@ def _norm(value) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip().lower()
     return None
+
+
+def _is_read_only_payloads(payloads) -> bool:
+    """True if a task's payloads describe a read-only task type.
+
+    Read-only types (review/plan/research/...) push no branch and open no PR, so
+    they cannot collide at merge time. They must be excluded from BOTH halves of
+    the warm-path file-conflict check — never counted in the IN_PROGRESS claim
+    set and never deferred as a candidate — to match
+    ``filter_file_conflicts``'s isolation guarantee on the cold dispatch path.
+    Mirrors ``Task.first_payload``: the first payload's ``type`` field.
+    """
+    first = (payloads or [{}])[0]
+    return (first or {}).get("type", "") in READ_ONLY_TASK_TYPES
 
 
 def _task_pinned_providers(task_provider, ctx) -> set[str]:
@@ -212,14 +227,19 @@ async def _project_in_progress_files(session, project_id) -> set[str]:
     """
     rows = (
         await session.execute(
-            select(Task.context).where(
+            select(Task.context, Task.payloads).where(
                 Task.project_id == project_id,
                 Task.status == TaskStatus.IN_PROGRESS,
             )
         )
     ).all()
     files: set[str] = set()
-    for (ctx,) in rows:
+    for ctx, payloads in rows:
+        # Read-only IN_PROGRESS tasks (e.g. a review that inherited the PR's full
+        # related_files) push no diff, so they can't collide — never let them
+        # claim files. Matches the cold path's exemption in filter_file_conflicts.
+        if _is_read_only_payloads(payloads):
+            continue
         files |= _prod_files((ctx or {}).get("related_files", []))
     return files
 
@@ -280,6 +300,7 @@ async def _eligible_backlog_ids(
                 Task.provider,
                 Task.account_id,
                 Task.model,
+                Task.payloads,
             )
             .join(Project, Task.project_id == Project.id)
             .where(
@@ -320,7 +341,7 @@ async def _eligible_backlog_ids(
     skipped_file_conflict = 0
     skipped_provider_mismatch = 0
 
-    for task_id, depends_on, ctx, t_provider, t_account_id, t_model in rows:
+    for task_id, depends_on, ctx, t_provider, t_account_id, t_model, payloads in rows:
         ctx = ctx or {}
         # Dependency-bearing tasks are claimable warm ONLY once the
         # orchestrator's authoritative dep resolution has marked them ready
@@ -344,7 +365,12 @@ async def _eligible_backlog_ids(
         if ctx.get("warm_pool_pin"):
             skipped_pinned_vm += 1
             continue
-        if in_progress_files:
+        # Read-only candidates (review/plan/research/...) produce no diff, so a
+        # file overlap with in-flight work is never a real conflict — exempt them
+        # from the overlap defer entirely, matching the cold path's candidate-side
+        # exemption in filter_file_conflicts (the warm check was stricter, gating
+        # on ANY single-file overlap with no read-only carve-out at all).
+        if in_progress_files and not _is_read_only_payloads(payloads):
             cfiles = _prod_files(ctx.get("related_files", []))
             if cfiles & in_progress_files:
                 skipped_file_conflict += 1

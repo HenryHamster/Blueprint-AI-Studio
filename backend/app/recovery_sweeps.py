@@ -56,6 +56,28 @@ from app.time_utils import _utcnow
 logger = logging.getLogger(__name__)
 
 
+def _last_status_transition_at(t: Task) -> datetime | None:
+    """Timestamp of the task's most recent real STATUS transition, if logged.
+
+    Reads the ``status_log`` entries appended by the ``_on_status_set`` model
+    listener (``{"t": iso, "msg": "Status changed: X → Y"}``). Message-only
+    entries (latest_status_message updates) are ignored — they record activity,
+    not state transitions. Returns None when no transition entry exists (e.g. a
+    row still parked in its initial status, or the best-effort append was
+    skipped) so callers can fall back to ``created_at``.
+    """
+    for entry in reversed(t.status_log or []):
+        if not isinstance(entry, dict):
+            continue
+        if not str(entry.get("msg") or "").startswith("Status changed:"):
+            continue
+        try:
+            return datetime.fromisoformat(str(entry.get("t")))
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
 async def _chain_has_active_pipeline_work(
     parent: Task,
     session,
@@ -113,12 +135,28 @@ async def _chain_has_active_pipeline_work(
             if t.last_heartbeat and t.last_heartbeat > cutoff:
                 return True
             # QUEUED/PROVISIONING tasks have no heartbeat yet but count as live
-            # work only if recently created — beyond queued_max_age_seconds they
-            # are likely stuck (slot caps, direction holds) and must not suppress
-            # the parent's hard timeout.
+            # work only if their last STATUS TRANSITION was recent — beyond
+            # queued_max_age_seconds they are likely stuck (slot caps, direction
+            # holds) and must not suppress the parent's hard timeout.
+            #
+            # Key "recent" on the last real status transition, NOT created_at:
+            # a child that ran 50 min IN_PROGRESS then hit a transient
+            # blocked-precondition and was optimistically requeued to QUEUED
+            # (reaper_sweeps._BLOCKED_OPTIMISTIC_RETRY_CAP path) reads as an
+            # HOUR-old row by created_at and would be (wrongly) treated as
+            # stuck — that is exactly how the recently-requeued, fully-recoverable
+            # fix child 53a75ed5 was cascade-cancelled (incident 2026-06-07).
+            # The transition timestamp comes from the status_log entries the
+            # _on_status_set model listener appends on every real status change
+            # — deliberately NOT updated_at, which any incidental row write
+            # (message updates, counters) refreshes; keying on updated_at would
+            # let a genuinely-stuck-but-touched child defer the hard timeout
+            # indefinitely. Fall back to created_at when no transition was ever
+            # logged (a row parked in its initial status).
             if t.status in (TaskStatus.QUEUED, TaskStatus.PROVISIONING):
                 queued_cutoff = _utcnow() - timedelta(seconds=queued_max_age_seconds)
-                if t.created_at and t.created_at > queued_cutoff:
+                last_transition = _last_status_transition_at(t) or t.created_at
+                if last_transition and last_transition > queued_cutoff:
                     return True
             # On-row last_heartbeat reads dead. Before giving up on this child,
             # remember its VM so we can corroborate with the uncontended
@@ -221,6 +259,66 @@ async def _chain_has_recoverable_failed_work(parent: Task, session) -> bool:
     except Exception:
         logger.debug(
             f"[EVAL TIMEOUT] Failed to check chain recoverability for task {str(parent.id)[:8]}",
+            exc_info=True,
+        )
+    return False
+
+
+async def _chain_has_unexhausted_optimistic_retry_work(parent: Task, session) -> bool:
+    """True if a chain review/fix task is QUEUED with optimistic-retry budget left.
+
+    The CI-wait backstop's stale-liveness guard (``_chain_has_active_pipeline_work``)
+    now keys QUEUED children on ``updated_at`` so a freshly-requeued child counts
+    as live. But a child can sit QUEUED past ``queued_max_age_seconds`` between
+    optimistic-retry episodes (slot caps stall its re-dispatch) and read as stale
+    — even though the reaper will optimistically requeue it again the moment a slot
+    frees, because its ``_blocked_optimistic_retries`` budget is not yet spent.
+    Cascade-cancelling such a child at the backstop destroys recoverable work
+    (incident 2026-06-07, fix child 53a75ed5).
+
+    Returns True only while a chain review/fix task in QUEUED/PROVISIONING still
+    has ``_blocked_optimistic_retries`` BELOW the reaper's cap — an exhausted
+    child (``>= cap``) no longer re-arms, so it stops deferring the backstop and
+    the system cannot wedge forever. Best-effort: a lookup error never blocks the
+    kill path.
+    """
+    from app.reaper_sweeps import _BLOCKED_OPTIMISTIC_RETRY_CAP
+
+    rl = (parent.context or {}).get("review_loop", {})
+    pr_number = rl.get("pr_number")
+    original_id = rl.get("original_task_id") or str(parent.id)
+    if not pr_number:
+        return False
+    try:
+        candidates = (
+            (
+                await session.execute(
+                    select(Task).where(
+                        Task.project_id == parent.project_id,
+                        Task.status.in_(
+                            [TaskStatus.QUEUED, TaskStatus.PROVISIONING]
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for t in candidates:
+            fp = t.first_payload
+            if fp.get("type") not in ("review", "fix"):
+                continue
+            if fp.get("pr_number") != pr_number:
+                continue
+            if (fp.get("original_task_id") or "") != original_id:
+                continue
+            used = int((t.context or {}).get("_blocked_optimistic_retries", 0))
+            if used < _BLOCKED_OPTIMISTIC_RETRY_CAP:
+                return True
+    except Exception:
+        logger.debug(
+            f"[EVAL TIMEOUT] Failed to check optimistic-retry budget for task "
+            f"{str(parent.id)[:8]}",
             exc_info=True,
         )
     return False
@@ -476,6 +574,106 @@ async def _attempt_ci_backstop_recovery(
         return False
 
 
+async def _verify_ci_before_backstop(
+    parent: Task, review_loop: dict, head_sha: str, session
+) -> bool:
+    """Read the PR's LIVE check-run conclusion before the backstop fails a parent.
+
+    The CI-wait backstop fires on a wall-clock that can outlast a CI conclusion
+    that actually landed before the wait window even started — e.g. when
+    ``review_loop.ci_wait_started`` is re-armed after CI already concluded
+    (incident 2026-06-07). This reads the real check-run state and routes on the
+    truth instead of timing out blindly:
+
+      - concluded FAILURE → delegate to ``handle_ci_completion`` so the existing
+        CI-failure handling (fix-spawn path, ci_passed=False) runs;
+      - concluded SUCCESS → record the pass and reset/clear the CI-wait clock so
+        the parent stops counting toward the backstop;
+      - still pending / GitHub error → return False (fail OPEN: fall through to
+        the existing timeout behaviour — never kill on an outage, never block).
+
+    ALL GitHub I/O is performed here, strictly OUTSIDE the caller's FOR-UPDATE
+    re-validate window. ``handle_ci_completion`` re-locks the row itself.
+
+    Returns True iff CI had genuinely concluded and was handled (the caller must
+    then skip the kill); False to fall through to the existing timeout path.
+    """
+    from app.routers.agent import get_github_token_for_task
+    from app.github_checks import get_check_runs_cached
+    from app.ci_completion import handle_ci_completion
+
+    pr_number = review_loop.get("pr_number")
+    try:
+        _gh, _owner, _repo = await services._bounded(
+            get_github_token_for_task(parent.id, session),
+            services._GH_CALL_TIMEOUT_S,
+            what=f"ci-backstop token {str(parent.id)[:8]}",
+        )
+        ci_result = await services._bounded(
+            get_check_runs_cached(
+                _gh,
+                _owner,
+                _repo,
+                head_sha,
+                project_id=str(parent.project_id) if parent.project_id else None,
+            ),
+            services._GH_CALL_TIMEOUT_S,
+            what=f"ci-backstop check-runs PR #{pr_number}",
+        )
+    except Exception as e:
+        # Fail OPEN: a GitHub error / timeout must never block the backstop —
+        # fall through to the existing timeout behaviour.
+        logger.warning(
+            f"[EVAL TIMEOUT] CI re-verify before backstop failed for task "
+            f"{str(parent.id)[:8]} (PR #{pr_number}): {e} — falling through to timeout"
+        )
+        return False
+
+    # API-error results are tagged so the caller doesn't cache a fake-pending —
+    # treat them as 'no signal' and fail open.
+    if ci_result.get("_from_api_error"):
+        logger.info(
+            f"[EVAL TIMEOUT] CI re-verify for task {str(parent.id)[:8]} (PR "
+            f"#{pr_number}) hit a GitHub API error — falling through to timeout"
+        )
+        return False
+
+    if ci_result.get("status") != "completed":
+        # CI genuinely still pending — the backstop's wall-clock is the only
+        # signal left; fall through.
+        return False
+
+    # CI has actually concluded. Delegate to the shared completion handler, which
+    # re-locks the row, records the gate signal, and runs the fix-spawn (failure)
+    # or merge/approval (success) path exactly as the orchestrator poll loop does.
+    logger.warning(
+        f"[EVAL TIMEOUT] Task {str(parent.id)[:8]} CI re-verify: PR #{pr_number} "
+        f"actually concluded ({ci_result.get('conclusion')}) before backstop — "
+        f"routing to CI-completion handler instead of failing the parent"
+    )
+    try:
+        await handle_ci_completion(
+            parent,
+            ci_result,
+            _gh,
+            _owner,
+            _repo,
+            session,
+            source="ci_backstop_verify",
+        )
+    except Exception as e:
+        logger.warning(
+            f"[EVAL TIMEOUT] handle_ci_completion failed during CI backstop "
+            f"re-verify for task {str(parent.id)[:8]} (PR #{pr_number}): {e} — "
+            f"falling through to timeout",
+            exc_info=True,
+        )
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        return False
+    return True
+
+
 def _dispatch_spend_hold_notification(
     task: Task,
     event_type: str,
@@ -590,6 +788,15 @@ async def _check_evaluating_timeouts(progress_cb=None):
     CI_BACKSTOP_SECONDS = (
         int(_runtime_config.get("ci_backstop_timeout_minutes", 60)) * 60
     )
+    # Bounded defer window for the CI-wait backstop when the chain still holds
+    # recoverable (infra-class FAILED / freshly-requeued) work — mirrors the 6h
+    # hard-timeout path's ``EVAL_DEFER_WINDOW_HOURS``. A parent must not be
+    # FAILED (nor its children cascade-cancelled) while salvageable work exists,
+    # but a truly stuck case must still terminate eventually. Shorter than the
+    # 6h path's 24h window: the CI-wait backstop guards a much tighter loop
+    # (rollup PR CI + review iteration), and the optimistic-retry cap bounds how
+    # long a recoverable child can keep re-arming anyway.
+    CI_BACKSTOP_DEFER_WINDOW_HOURS = 6
     # Approval-gate companion timeout: parents flagged requires_approval can
     # otherwise stall indefinitely when _chain_has_active_pipeline_work defers
     # the EVALUATING_FAIL backstop. 2h gives operators a reasonable window
@@ -1469,6 +1676,103 @@ async def _check_evaluating_timeouts(progress_cb=None):
                             f"has fresh review/fix heartbeat — skipping kill"
                         )
                         continue
+
+                    # Gap C: verify REAL CI state before declaring a timeout.
+                    # The backstop fires on a wall-clock that can outlast a CI
+                    # conclusion that actually landed before the wait window even
+                    # started (incident 2026-06-07: review_loop.ci_wait_started
+                    # was re-armed AFTER CI had concluded, so the backstop "waited
+                    # 1h for a conclusion that was already in"). Before failing a
+                    # parent whose PR still has a head_sha to check, read the PR's
+                    # live check-run conclusion and route on the truth:
+                    #   concluded FAILURE → existing CI-failure handling
+                    #       (handle_ci_completion fix-spawn path / ci_passed=False)
+                    #   concluded SUCCESS → record the pass + clear the wait
+                    #   pending / GitHub error → fall through to the timeout
+                    #       (fail-OPEN: never kill, but never block on an outage).
+                    # ALL GitHub I/O is strictly OUTSIDE the FOR-UPDATE window
+                    # below — handle_ci_completion re-locks the row itself.
+                    _ci_head_sha = rl.get("head_sha")
+                    if _ci_head_sha and rl.get("pr_number"):
+                        _ci_resolved = await _verify_ci_before_backstop(
+                            task, rl, _ci_head_sha, session
+                        )
+                        if _ci_resolved:
+                            # CI had actually concluded — handled (fix-spawn /
+                            # pass recorded / wait cleared). Skip the kill.
+                            continue
+
+                    # Gap A: recoverable / freshly-requeuing work guard. Mirror
+                    # the 6h hard-timeout path: a child / chain pipeline task that
+                    # is FAILED with an infra-class category (resurrection-sweep
+                    # or operator-requeue eligible) OR is QUEUED with optimistic-
+                    # retry budget still left must NOT be cascade-cancelled while
+                    # it can still come back. Defer for a bounded window so a truly
+                    # stuck case still terminates, and respect the optimistic-retry
+                    # cap so an exhausted child stops deferring the backstop.
+                    _has_recoverable = await _chain_has_recoverable_failed_work(
+                        task, session
+                    )
+                    _has_retrying = (
+                        await _chain_has_unexhausted_optimistic_retry_work(
+                            task, session
+                        )
+                    )
+                    if _has_recoverable or _has_retrying:
+                        from sqlalchemy.orm.attributes import flag_modified
+
+                        _ci_first_defer_at = rl.get("_ci_backstop_first_defer_at")
+                        # A defer marker older than this CI-wait episode is stale
+                        # (left from a prior ci_wait_started) — discard it so the
+                        # window measures from the current wait.
+                        if _ci_first_defer_at and ci_ws_valid and evaluating_since:
+                            try:
+                                _cfd = datetime.fromisoformat(_ci_first_defer_at)
+                                if _cfd < evaluating_since:
+                                    _ci_first_defer_at = None
+                            except (ValueError, TypeError):
+                                _ci_first_defer_at = None
+                        if _ci_first_defer_at:
+                            try:
+                                _cfd = datetime.fromisoformat(_ci_first_defer_at)
+                                _ci_defer_elapsed = (now - _cfd).total_seconds()
+                            except (ValueError, TypeError):
+                                _ci_defer_elapsed = 0.0
+                            if (
+                                _ci_defer_elapsed
+                                <= CI_BACKSTOP_DEFER_WINDOW_HOURS * 3600
+                            ):
+                                logger.info(
+                                    f"[EVAL TIMEOUT] Task {str(task.id)[:8]} past CI "
+                                    f"backstop but chain has recoverable/requeuing work "
+                                    f"— deferring ({round(_ci_defer_elapsed / 3600, 1)}h "
+                                    f"into {CI_BACKSTOP_DEFER_WINDOW_HOURS}h window)"
+                                )
+                                continue
+                            logger.warning(
+                                f"[EVAL TIMEOUT] Task {str(task.id)[:8]} exhausted "
+                                f"{CI_BACKSTOP_DEFER_WINDOW_HOURS}h CI-backstop defer "
+                                f"window despite recoverable work — proceeding to kill"
+                            )
+                            # fall through to existing kill
+                        else:
+                            new_rl = dict(rl)
+                            new_rl["_ci_backstop_first_defer_at"] = now.isoformat()
+                            task.context = {
+                                **(task.context or {}),
+                                "review_loop": new_rl,
+                            }
+                            flag_modified(task, "context")
+                            session.add(task)
+                            logger.warning(
+                                f"[EVAL TIMEOUT] Task {str(task.id)[:8]} past CI backstop "
+                                f"with recoverable/requeuing chain work — deferring "
+                                f"cascade-cancel for up to "
+                                f"{CI_BACKSTOP_DEFER_WINDOW_HOURS}h"
+                            )
+                            await session.commit()
+                            continue
+
                     hours = round(elapsed / 3600, 1)
                     ci_passed = bool(rl.get("ci_passed"))
                     review_approved = (

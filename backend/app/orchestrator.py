@@ -696,6 +696,12 @@ BLOCKED_CONFLICT_LIGHT_COLUMNS = (
     Task.blocker_kind,
     Task.parent_task_id,
     Task.title,
+    # filter_file_conflicts now reads ``first_payload`` (payloads) on these
+    # parked holders via _is_read_only_task when building the seniority set, so
+    # payloads MUST be loaded — deferring it makes that access a sync lazy-load
+    # from async context → MissingGreenlet that crashes the whole dispatch cycle
+    # (same trap as parent_task_id above; see reference_load_only_lazy_load_trap).
+    Task.payloads,
 )
 
 
