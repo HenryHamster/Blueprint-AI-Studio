@@ -55,10 +55,21 @@ vi.mock('child_process', () => ({
   ),
 }));
 
+vi.mock('../telemetry.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../telemetry.js')>();
+  return {
+    ...actual,
+    recordFormatMiss: vi.fn(),
+    recordFormatRepairAttempt: vi.fn(),
+    recordFormatRepairSuccess: vi.fn(),
+  };
+});
+
 // ── Imports under test ────────────────────────────────────────────────────────
 import fs from 'fs';
 import { handleDesign, groundDesignCitations } from './design.js';
 import { runClaudeCode, persistAndPostStatus, readHandlerOutput, apiGet } from '../index.js';
+import { recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 import { configureAgentPermissions } from '../prompt.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
@@ -245,6 +256,51 @@ describe('handleDesign', () => {
     const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(prompt).not.toContain('## Prior Knowledge');
     expect(lastPostedPayload().status).toBe('COMPLETED');
+  });
+
+  it('recovers design document via bounded re-ask on clean-exit parse failure', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    // First run: clean exit but unparseable output.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: 'Analysis complete but forgot to emit JSON.', lastResultText: '',
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    // Repair run: good document JSON.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0,
+      allOutput: JSON.stringify(VALID_DOCUMENT),
+      lastResultText: JSON.stringify(VALID_DOCUMENT),
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design how X should work' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    const payload = lastPostedPayload();
+    expect(payload.status).toBe('COMPLETED');
+    const parsed = JSON.parse(payload.logs as string) as typeof VALID_DOCUMENT;
+    expect(parsed.title).toBe(VALID_DOCUMENT.title);
+    expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairSuccess).toHaveBeenCalledTimes(1);
+  });
+
+  it('posts COMPLETED even when repair fails to recover the design document', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    // Both runs return unparseable output on clean exit.
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '', lastResultText: '',
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design how X should work' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    // Still COMPLETED — design handler is lenient even on parse failure.
+    const payload = lastPostedPayload();
+    expect(payload.status).toBe('COMPLETED');
+    expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairSuccess).not.toHaveBeenCalled();
   });
 
   it('surfaces a citation-less / empty output for the gate to reject (FAILED on non-zero exit)', async () => {

@@ -17,10 +17,8 @@ import {
 import {
   writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS,
 } from './strategic-helpers.js';
-import {
-  extractJsonObjectDetailed, describeJsonExtractionResult,
-} from '../json-extract.js';
 import { fetchPriorKnowledge, buildPriorKnowledgeSection } from './prior-knowledge.js';
+import { repairStructuredOutput } from './structured-output-repair.js';
 import { buildAvailableCapabilitiesSection, CAPABILITY_DECLARATION_DOC } from './research-plan.js';
 
 // Reads the design progress markdown the agent writes for retry context.
@@ -241,12 +239,20 @@ ${designFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
     sendLog(ws, `Read design document from ${documentPath}\n`);
   }
   if (!document) {
-    const source = (lastResultText && lastResultText.includes('"title"')) ? lastResultText : allOutput;
-    const docObj = extractJsonObjectDetailed(source, 'title', 'summary', 'body');
-    if (!docObj.ok) {
-      sendLog(ws, `[WARNING] Could not extract design document JSON: ${describeJsonExtractionResult(docObj)}\n`);
-    } else {
-      document = docObj.value;
+    const repair = await repairStructuredOutput<Record<string, unknown>>({
+      mode: 'object',
+      requiredKeys: ['title', 'summary', 'body'],
+      first: { exitCode, allOutput, lastResultText },
+      reopenPrompt: `You did not emit the design document JSON in the required schema. Output ONLY the JSON object now — no markdown, no explanation. Required fields: title, summary, body. Schema:\n\n{"title":"Concise design title","summary":"1-3 sentence summary.","body":"Full design in markdown.","source_citations":["file:backend/app/example.py"],"tags":["tag"],"topic":"slug"}\n\nOutput ONLY the JSON object.`,
+      ws,
+      statusRef,
+      model,
+      effort,
+      disallowedTools,
+      retryStatus: 'Retrying design document extraction...',
+    });
+    if (repair.value !== null) {
+      document = repair.value;
     }
   }
   // Embed branch/HEAD provenance INTO the document before serializing — the

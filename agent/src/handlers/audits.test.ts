@@ -51,6 +51,16 @@ vi.mock('../build-config.js', () => ({
   resolveBuildConfig: vi.fn().mockReturnValue(undefined),
 }));
 
+vi.mock('../telemetry.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../telemetry.js')>();
+  return {
+    ...actual,
+    recordFormatMiss: vi.fn(),
+    recordFormatRepairAttempt: vi.fn(),
+    recordFormatRepairSuccess: vi.fn(),
+  };
+});
+
 // fs is consumed by both default + namespace imports across the modules under
 // test. Mock both shapes so vitest doesn't reject either access pattern.
 vi.mock('fs', () => {
@@ -88,6 +98,9 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports under test ────────────────────────────────────────────────────────
+// Import handlers/index.ts first so audits.ts and structured-output-repair.ts
+// bind to the mocked ../index.js path consistently during circular import setup.
+import './index.js';
 import {
   handleSecurityAudit,
   handleSelfAudit,
@@ -97,6 +110,7 @@ import {
 import {
   persistAndPostStatus, readHandlerOutput, runClaudeCode, git,
 } from '../index.js';
+import { recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 import { execFileSync } from 'child_process';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 
@@ -177,6 +191,24 @@ describe('handleSecurityAudit — JSON extraction fallback', () => {
 
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.logs).toBe('no json content');
+  });
+
+  it('repairs clean-exit unparseable output once and stores the repaired findings array', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    const repaired = [{ title: 'XSS', severity: 'high', fix_prompt: 'Escape output' }];
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'plain text', lastResultText: 'no json' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: JSON.stringify(repaired) });
+
+    await handleSecurityAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBe('SECURITY_REPORT');
+    expect(call.logs).toBe(JSON.stringify(repaired));
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairSuccess).toHaveBeenCalledTimes(1);
   });
 
   it('sets status COMPLETED and artifact_type SECURITY_REPORT on exitCode 0', async () => {
@@ -261,6 +293,24 @@ describe('handleSelfAudit — findings ingestion', () => {
     expect(stored.findings[0].system_id).toBe('sys-y');
   });
 
+  it('repairs self-audit object output and preserves bare-array wrapping after the retry', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    const repaired = [{ system_id: 'sys-z', score: 60, recommended_mode: 'fundamentals' }];
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'not json', lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: JSON.stringify(repaired) });
+
+    await handleSelfAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    const stored = JSON.parse(call.logs as string) as { findings: Array<{ system_id: string }> };
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBe('SELF_AUDIT_REPORT');
+    expect(stored.findings[0].system_id).toBe('sys-z');
+    expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairSuccess).not.toHaveBeenCalled();
+  });
+
   it('sets status FAILED and ERROR_LOG on non-zero exitCode', async () => {
     vi.mocked(readHandlerOutput).mockReturnValue(null);
     vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 1, allOutput: 'crash', lastResultText: '' });
@@ -311,7 +361,11 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
     vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
     // git() mock returns '' (success) by default — rev-parse + rev-list pass.
     vi.mocked(git).mockReturnValue('');
-    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      audit_score: 1,
+      test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+      findings: [],
+    });
     // execFileSync (child_process) — git fetch succeeds by default.
     vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
   });
@@ -519,11 +573,17 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
 
   it('fails loudly with release_audit_report_unparseable when the report cannot be parsed', async () => {
     vi.mocked(readHandlerOutput).mockReturnValue(null);
-    vi.mocked(runClaudeCode).mockResolvedValue({
-      exitCode: 0,
-      allOutput: 'no json object here',
-      lastResultText: 'raw tail fallback text',
-    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: 'no json object here',
+        lastResultText: 'raw tail fallback text',
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: 'still no json object',
+        lastResultText: 'still raw text',
+      });
 
     await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
@@ -532,6 +592,49 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
     expect(call.artifact_type).toBe('ERROR_LOG');
     expect(call.failure_category).toBe('release_audit_report_unparseable');
     expect(call.logs).toContain('raw tail fallback text');
+    expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairSuccess).not.toHaveBeenCalled();
+  });
+
+  it('release audit recovers from clean-exit parse failure via bounded re-ask instead of failing', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (Array.isArray(a) && a[0] === 'diff' && a[1] === '--name-status') return '';
+      if (Array.isArray(a) && a[0] === 'diff') return '+ expect(value).toBe(true)\n';
+      return Buffer.from('');
+    });
+    const repaired = {
+      audit_score: 0.91,
+      test_erosion: { deleted_test_files: [], assertion_delta: 4, test_count_delta: 1 },
+      findings: [],
+    };
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: 'release audit complete but prose only',
+        lastResultText: 'raw tail fallback text',
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify(repaired),
+      });
+
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    const stored = JSON.parse(call.logs as string) as typeof repaired & { computed_test_erosion?: unknown };
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBe('RELEASE_AUDIT_REPORT');
+    expect(call.failure_category).toBeUndefined();
+    expect(stored.audit_score).toBe(0.91);
+    expect(stored.findings).toEqual([]);
+    expect(stored.computed_test_erosion).toBeDefined();
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(runClaudeCode).mock.calls[1][0]).toContain('Return ONLY the JSON object');
+    expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairSuccess).toHaveBeenCalledTimes(1);
   });
 
   it('prompt includes verification_note in the findings JSON schema', async () => {
@@ -644,7 +747,11 @@ describe('handleReleaseAudit — JSON schema field name contract', () => {
     vi.clearAllMocks();
     vi.mocked(git).mockReturnValue('');
     vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
-    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      audit_score: 1,
+      test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+      findings: [],
+    });
   });
 
   /** Capture the prompt string passed to runClaudeCode by handleReleaseAudit. */

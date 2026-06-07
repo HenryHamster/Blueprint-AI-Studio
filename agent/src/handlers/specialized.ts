@@ -9,7 +9,6 @@ import {
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
-import { describeJsonExtractionResult, extractJsonArrayDetailed, extractJsonObjectDetailed, JsonExtractionError } from '../json-extract.js';
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE,
   buildCodeChangeHelperGuidance, codeChangeGuidanceVariant,
@@ -25,6 +24,7 @@ import { runCodeChangeTask } from './code-change.js';
 import { isParallelAuditEnabled, resolveCandidateSha } from './audits.js';
 import { extractReservedMigrationRevision, buildReservedRevisionGuidance } from './review-fix-migration.js';
 import { writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS } from './strategic-helpers.js';
+import { repairStructuredOutput } from './structured-output-repair.js';
 export { resolveCandidateSha, handleSecurityAudit, handleSelfAudit, handleReleaseAudit } from './audits.js';
 
 // Provision the read-only ./fetch helper (direction|section|playbook) so a
@@ -658,14 +658,23 @@ Rules:
   const perfFindings = readHandlerOutput(taskId, 'perf_report', ws);
   let logs = perfFindings !== null ? sanitize(JSON.stringify(perfFindings)) : '';
   if (!logs) {
-    if (lastResultText && lastResultText.includes('"severity"')) {
-      logs = sanitize(lastResultText);
+    const repaired = await repairStructuredOutput<unknown[]>({
+      mode: 'array',
+      requiredKeys: ['severity'],
+      first: { exitCode, allOutput, lastResultText },
+      reopenPrompt: `Your prior performance analysis response did not end with a parseable JSON findings array.
+Return ONLY the JSON array for /tmp/perf_report_${taskId}.json. Each finding object must include at least "severity" plus area, title, description, fix_prompt, and related_files. Use [] if there are no findings. No markdown, prose, or code fences.`,
+      ws,
+      statusRef,
+      model,
+      effort,
+      disallowedTools,
+      retryStatus: 'Repairing performance report JSON...',
+    });
+    if (repaired.value !== null) {
+      logs = sanitize(JSON.stringify(repaired.value));
     } else {
-      const findingsArr = extractJsonArrayDetailed(allOutput, 'severity');
-      if (!findingsArr.ok) {
-        sendLog(ws, `[WARNING] Could not extract performance findings JSON: ${describeJsonExtractionResult(findingsArr)}\n`);
-      }
-      logs = sanitize(findingsArr.ok ? JSON.stringify(findingsArr.value) : (lastResultText || allOutput.slice(-50_000)));
+      logs = sanitize(lastResultText || allOutput.slice(-50_000));
     }
   }
 
@@ -788,34 +797,23 @@ IMPORTANT:
   let investigationResult = readHandlerOutput(taskId, 'investigation_report', ws);
   if (investigationResult === null) {
     const requiredFields = ['summary', 'root_cause', 'affected_files', 'recommended_fix', 'severity', 'confidence'];
-
-    // Try lastResultText first (cheaper — usually the final message)
-    if (lastResultText && lastResultText.includes('"root_cause"')) {
-      try {
-        const res = extractJsonObjectDetailed(lastResultText, 'root_cause', 'recommended_fix');
-        if (res.ok && requiredFields.every(k => k in (res.value))) {
-          investigationResult = res.value;
-          sendLog(ws, `[WARNING] Investigation JSON recovered from lastResultText transcript rather than file.\n`);
-        }
-      } catch (e) {
-        // JsonExtractionError: candidate found but JSON.parse failed (e.g. malformed output).
-        // Fall through to allOutput scan below.
-        sendLog(ws, `[WARNING] lastResultText JSON extraction failed: ${e instanceof JsonExtractionError ? e.message : String(e)}\n`);
-      }
-    }
-
-    // Fall back to full transcript
-    if (investigationResult === null) {
-      try {
-        const res = extractJsonObjectDetailed(allOutput, 'root_cause', 'recommended_fix');
-        if (res.ok && requiredFields.every(k => k in (res.value))) {
-          investigationResult = res.value;
-          sendLog(ws, `[WARNING] Investigation JSON recovered from allOutput transcript rather than file.\n`);
-        }
-      } catch (e) {
-        // JsonExtractionError: malformed JSON candidate found in transcript — treat as not found.
-        sendLog(ws, `[WARNING] allOutput JSON extraction failed: ${e instanceof JsonExtractionError ? e.message : String(e)}\n`);
-      }
+    const repaired = await repairStructuredOutput<Record<string, unknown>>({
+      mode: 'object',
+      requiredKeys: ['root_cause', 'recommended_fix'],
+      first: { exitCode, allOutput, lastResultText },
+      reopenPrompt: `Your prior investigation response did not end with a parseable JSON diagnosis object.
+Return ONLY the JSON object for /tmp/investigation_report_${taskId}.json with top-level "summary", "root_cause", "affected_files", "recommended_fix", "severity", and "confidence". Include verdict fields when relevant. No markdown, prose, or code fences.`,
+      ws,
+      statusRef,
+      model,
+      effort,
+      disallowedTools,
+      retryStatus: 'Repairing investigation report JSON...',
+    });
+    const repairedValue = repaired.value;
+    if (repairedValue !== null && requiredFields.every(k => k in repairedValue)) {
+      investigationResult = repairedValue;
+      sendLog(ws, `[WARNING] Investigation JSON recovered from transcript or focused retry rather than file.\n`);
     }
 
     if (investigationResult === null) {

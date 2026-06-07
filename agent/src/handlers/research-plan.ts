@@ -31,6 +31,7 @@ import {
   writeFetchHelper, buildFetchGuidance, RESEARCH_FETCH_VERBS, PLAN_FETCH_VERBS,
 } from './strategic-helpers.js';
 import { fetchPriorKnowledge, buildPriorKnowledgeSection } from './prior-knowledge.js';
+import { repairStructuredOutput } from './structured-output-repair.js';
 export {
   formatCochangeHints,
   formatDecompositionOutcomes,
@@ -1449,14 +1450,22 @@ ${planFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
     sendLog(ws, `Failed to read ${planPath}, falling back to output parsing\n`);
   }
   if (!logs) {
-    if (lastResultText && lastResultText.includes('"subtasks"')) {
-      logs = sanitize(lastResultText);
+    const repair = await repairStructuredOutput<Record<string, unknown>>({
+      mode: 'object',
+      requiredKeys: ['subtasks'],
+      first: { exitCode, allOutput, lastResultText },
+      reopenPrompt: `You did not emit the plan JSON in the required schema. Output ONLY the JSON object now — no markdown, no explanation. Required field: subtasks (array). Schema:\n\n{"subtasks":[{"title":"...","prompt":"...","type":"create","scope":"medium","related_files":["path/to/file.ts"],"depends_on_indices":[]}]}\n\nOutput ONLY the JSON object.`,
+      ws,
+      statusRef,
+      model,
+      effort,
+      disallowedTools,
+      retryStatus: 'Retrying plan JSON extraction...',
+    });
+    if (repair.value !== null) {
+      logs = sanitize(JSON.stringify(repair.value));
     } else {
-      const planObj = extractJsonObjectDetailed(allOutput, 'subtasks');
-      if (!planObj.ok) {
-        sendLog(ws, `[WARNING] Could not extract plan JSON: ${describeJsonExtractionResult(planObj)}\n`);
-      }
-      logs = sanitize(planObj.ok ? JSON.stringify(planObj.value) : (lastResultText || allOutput.slice(-50_000)));
+      logs = sanitize(lastResultText || allOutput.slice(-50_000));
     }
   }
 

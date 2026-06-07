@@ -41,11 +41,22 @@ vi.mock('child_process', () => ({
   ),
 }));
 
+vi.mock('../telemetry.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../telemetry.js')>();
+  return {
+    ...actual,
+    recordFormatMiss: vi.fn(),
+    recordFormatRepairAttempt: vi.fn(),
+    recordFormatRepairSuccess: vi.fn(),
+  };
+});
+
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleWebResearch, groundWebCitations } from './web-research.js';
 import { runClaudeCode, persistAndPostStatus, readHandlerOutput, apiGet } from '../index.js';
 import { configureAgentPermissions } from '../prompt.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
+import { recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 
 const TASK_ID = 'task-web-research-1';
 const WS = null;
@@ -284,6 +295,51 @@ describe('handleWebResearch', () => {
     expect(payload.status).toBe('COMPLETED');
     const parsed = JSON.parse(payload.logs as string) as typeof VALID_DOCUMENT;
     expect(parsed.title).toBe(VALID_DOCUMENT.title);
+  });
+
+  it('recovers knowledge document via bounded re-ask on clean-exit parse failure', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    // First run: clean exit but unparseable output.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: 'Research complete but forgot to emit JSON.', lastResultText: '',
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    // Repair run: good document JSON.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0,
+      allOutput: JSON.stringify(VALID_DOCUMENT),
+      lastResultText: JSON.stringify(VALID_DOCUMENT),
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+
+    await handleWebResearch(
+      TASK_ID, { prompt: 'Research the state of WebAssembly' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    const payload = lastPostedPayload();
+    expect(payload.status).toBe('COMPLETED');
+    const parsed = JSON.parse(payload.logs as string) as typeof VALID_DOCUMENT;
+    expect(parsed.title).toBe(VALID_DOCUMENT.title);
+    expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairSuccess).toHaveBeenCalledTimes(1);
+  });
+
+  it('posts COMPLETED even when repair fails to recover the knowledge document', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    // Both runs return unparseable output on clean exit.
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '', lastResultText: '',
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+
+    await handleWebResearch(
+      TASK_ID, { prompt: 'Research the state of WebAssembly' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    // Still COMPLETED — web-research handler is lenient even on parse failure.
+    const payload = lastPostedPayload();
+    expect(payload.status).toBe('COMPLETED');
+    expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairSuccess).not.toHaveBeenCalled();
   });
 
   it('marks the task FAILED when the inner session exits non-zero', async () => {

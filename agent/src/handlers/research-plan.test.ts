@@ -50,6 +50,16 @@ vi.mock('../workspacePrep.js', () => ({
   prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock('../telemetry.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../telemetry.js')>();
+  return {
+    ...actual,
+    recordFormatMiss: vi.fn(),
+    recordFormatRepairAttempt: vi.fn(),
+    recordFormatRepairSuccess: vi.fn(),
+  };
+});
+
 vi.mock('../prompt.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../prompt.js')>();
   return {
@@ -71,6 +81,7 @@ import fs from 'fs';
 import { runClaudeCode, persistAndPostStatus, getProviderRunner, apiGet } from '../index.js';
 import { execFileSync } from 'child_process';
 import { handlePlan, handleResearch } from './research-plan.js';
+import { recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 import { handleStrategic } from './strategic.js';
 import { writeDesignDocHelper } from '../prompt.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
@@ -2799,5 +2810,66 @@ describe('handlePlan / handleResearch prompt determinism', () => {
     await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
     const prompt2 = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(prompt1).toBe(prompt2);
+  });
+});
+
+// ── handlePlan structured-output self-repair ──────────────────────────────────
+describe('handlePlan structured-output self-repair', () => {
+  const TASK_ID = 'plan-repair-001';
+  const GH_TOKEN = 'gh-token';
+  const OWNER = 'owner';
+  const REPO = 'repo';
+  const WS = null;
+  const STATUS_REF = () => ({ value: '' });
+  const TASK = { title: 'Plan task', description: 'Decompose the feature', context: {}, project_context: {} };
+  const PAYLOAD = { base_branch: 'main', prompt: 'decompose the new feature' };
+
+  const VALID_PLAN = JSON.stringify({
+    subtasks: [
+      { title: 'Add feature', prompt: 'Implement the feature.', type: 'create', scope: 'medium', related_files: ['agent/src/index.ts'], depends_on_indices: [] },
+    ],
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+  });
+
+  it('triggers repair when plan file absent and subtasks extraction fails on clean exit', async () => {
+    // First run: clean exit but no parseable subtasks JSON.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: 'I analyzed the codebase extensively.', lastResultText: '',
+    });
+    // Repair run: valid plan JSON.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: VALID_PLAN, lastResultText: VALID_PLAN,
+    });
+
+    await handlePlan(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const payload = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(payload.status).toBe('COMPLETED');
+    const logs = JSON.parse(payload.logs as string) as { subtasks: unknown[] };
+    expect(Array.isArray(logs.subtasks)).toBe(true);
+    expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairSuccess).toHaveBeenCalledTimes(1);
+  });
+
+  it('posts COMPLETED even when plan repair fails to recover subtasks', async () => {
+    // Both runs return unparseable output on clean exit.
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '', lastResultText: '',
+    });
+
+    await handlePlan(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // Still COMPLETED — plan handler is lenient even when repair fails.
+    const payload = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(payload.status).toBe('COMPLETED');
+    expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairSuccess).not.toHaveBeenCalled();
   });
 });

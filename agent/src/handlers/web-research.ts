@@ -11,10 +11,8 @@ import {
   DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, buildContextPrefix, buildRetryContext, readClaudeMd,
   formatPlaybook, type PlaybookEntry,
 } from '../prompt.js';
-import {
-  extractJsonObjectDetailed, describeJsonExtractionResult,
-} from '../json-extract.js';
 import { fetchPriorKnowledge, buildPriorKnowledgeSection } from './prior-knowledge.js';
+import { repairStructuredOutput } from './structured-output-repair.js';
 
 // Reads the web-research progress markdown the agent writes for retry context.
 // Mirrors readProgressArtifact in research-plan.ts but for the web_research kind
@@ -308,12 +306,20 @@ ${DEFAULT_TOOL_GUIDANCE}`;
     sendLog(ws, `Read web research document from ${documentPath}\n`);
   }
   if (!document) {
-    const source = (lastResultText && lastResultText.includes('"title"')) ? lastResultText : allOutput;
-    const docObj = extractJsonObjectDetailed(source, 'title', 'summary', 'body');
-    if (!docObj.ok) {
-      sendLog(ws, `[WARNING] Could not extract knowledge document JSON: ${describeJsonExtractionResult(docObj)}\n`);
-    } else {
-      document = docObj.value;
+    const repair = await repairStructuredOutput<Record<string, unknown>>({
+      mode: 'object',
+      requiredKeys: ['title', 'summary', 'body'],
+      first: { exitCode, allOutput, lastResultText },
+      reopenPrompt: `You did not emit the knowledge document JSON in the required schema. Output ONLY the JSON object now — no markdown, no explanation. Required fields: title, summary, body. Schema:\n\n{"title":"Concise document title","summary":"1-3 sentence summary.","body":"Full document in markdown.","source_citations":["https://example.com/source"],"tags":["tag"],"topic":"slug"}\n\nOutput ONLY the JSON object.`,
+      ws,
+      statusRef,
+      model,
+      effort,
+      disallowedTools,
+      retryStatus: 'Retrying knowledge document extraction...',
+    });
+    if (repair.value !== null) {
+      document = repair.value;
     }
   }
 
