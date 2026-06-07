@@ -2026,6 +2026,66 @@ async def sweep_merge_gate_verification_degradation(session) -> int:
     return created
 
 
+async def sweep_migration_slot_contention(session) -> int:
+    """Alert per-project when a migration task has held the serialization slot too
+    long while schema-touching tasks are parked waiting on it.
+
+    Computes fleet-wide migration-slot contention
+    (:func:`digest_metrics.compute_migration_slot_contention`) and, for each
+    project whose holder has held the slot beyond
+    ``migration_slot_hold_alert_seconds`` while at least
+    ``migration_slot_min_waiters`` tasks are deferred, raises a deduplicated
+    operator alert. A multi-hour hold parking the schema queue (the recent
+    incident: ~2h holding, 5+ tasks parked) is invisible to the throughput-only
+    migration-health summary and to the escalated-only parked-blocker signal —
+    the deferred siblings are QUEUED, not BLOCKED. This raises the proactive
+    signal every other contention/degradation surface already has. Alerting only —
+    it never influences serialization. Returns the number of NEW alerts created.
+    """
+    import uuid as _uuid
+
+    from app.alert_dispatch import _maybe_create_migration_slot_contention_alert
+    from app.digest_metrics import compute_migration_slot_contention
+    from app.shared_state import runtime_config
+
+    hold_alert_seconds = float(
+        runtime_config.get("migration_slot_hold_alert_seconds", 3600)
+    )
+    min_waiters = int(runtime_config.get("migration_slot_min_waiters", 1))
+
+    contention = await compute_migration_slot_contention(session)
+    created = 0
+    for proj in contention.get("projects", []):
+        if not proj.get("slot_held"):
+            continue
+        held = proj.get("holder_held_seconds")
+        waiting = proj.get("waiting_count", 0)
+        if held is None or held < hold_alert_seconds or waiting < min_waiters:
+            continue
+        pid_raw = proj.get("project_id")
+        if not pid_raw:
+            continue
+        try:
+            pid = _uuid.UUID(str(pid_raw))
+        except (ValueError, TypeError):
+            continue
+        created += await _maybe_create_migration_slot_contention_alert(
+            session,
+            pid,
+            holder_task_id=proj.get("holder_task_id"),
+            held_seconds=held,
+            waiting_count=waiting,
+            longest_wait_seconds=proj.get("longest_wait_seconds"),
+        )
+    if created:
+        await session.commit()
+        logger.info(
+            "[REAPER] raised migration-slot-contention alert on %d project(s)",
+            created,
+        )
+    return created
+
+
 # ── Step 15: linked bug-class message convergence / resurfacing sweep ────────
 #
 # A BUG_REPORT or BLOCKER message placed in 'linked' state has a durable forward

@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import type { JSX } from 'react';
 import {
   clearDeployFailed,
   cutVersion,
@@ -386,14 +387,43 @@ function AuditFindingsList({ audit }: { audit: LatestAudit }) {
   );
 }
 
-function HistoricalAuditContext({ audit }: { audit: LatestAudit }) {
+// Stale-audit view: the newest scoped audit ran against an older candidate than
+// the one now under evaluation. When the active candidate SHA is known, contrast
+// it explicitly against the audited commit so an operator can see exactly which
+// commit is waiting for a fresh audit and which one the stale findings describe.
+function HistoricalAuditContext({
+  audit,
+  activeCandidateSha,
+}: {
+  audit: LatestAudit;
+  activeCandidateSha?: string | null;
+}) {
+  const auditedShort = audit.candidate_sha ? `@${audit.candidate_sha.slice(0, 7)}` : null;
   return (
-    <div className="space-y-0.5">
+    <div data-testid="historical-audit-context" className="space-y-0.5">
       <p className="text-[10px] text-neutral-500 uppercase tracking-wide">Historical Audit Context</p>
       <span className="text-[10px] px-1.5 py-0.5 rounded border bg-amber-500/10 text-amber-400 border-amber-500/20">
         no current audit for this candidate
       </span>
-      <AuditProvenance audit={audit} />
+      {activeCandidateSha ? (
+        <div className="flex flex-wrap items-center gap-1.5 text-[10px]">
+          <span className="text-neutral-400">active</span>
+          <span className="font-mono text-neutral-300" title={activeCandidateSha}>
+            @{activeCandidateSha.slice(0, 7)}
+          </span>
+          <span className="text-neutral-600">waiting for a fresh audit · audited</span>
+          {auditedShort && (
+            <span className="font-mono text-neutral-500" title={audit.candidate_sha ?? undefined}>
+              {auditedShort}
+            </span>
+          )}
+          {audit.created_at && (
+            <span className="text-neutral-600">ran {timeAgo(audit.created_at)}</span>
+          )}
+        </div>
+      ) : (
+        <AuditProvenance audit={audit} />
+      )}
     </div>
   );
 }
@@ -423,6 +453,144 @@ function AuditReconciliationRow({ rec }: { rec: AuditReconciliation }) {
           {rec.excluded_findings_count} finding{rec.excluded_findings_count !== 1 ? 's' : ''} excluded
         </span>
       )}
+    </div>
+  );
+}
+
+type DurableQualificationEvidence = {
+  audit_findings?: AuditFinding[] | null;
+  excluded_audit_findings?: AuditFinding[] | null;
+  migration_safety?: string | null;
+  migration_safety_detail?: string | null;
+  migration_apply_safety?: string | null;
+  migration_apply_safety_detail?: string | null;
+  test_erosion_detail?: Record<string, unknown> | null;
+  smoketest_detail?: Record<string, unknown> | null;
+  promotion_pr_url?: string | null;
+  promotion_conflict?: boolean | null;
+  promotion_error_detail?: string | null;
+};
+
+function formatCompactDetail(value: unknown): string {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  try {
+    const text = JSON.stringify(value);
+    return text.length > 180 ? `${text.slice(0, 177)}…` : text;
+  } catch {
+    return String(value);
+  }
+}
+
+function DurableQualificationEvidenceRow({ q }: { q: DurableQualificationEvidence }) {
+  const findings = q.audit_findings ?? [];
+  const excludedFindings = q.excluded_audit_findings ?? [];
+  const chips: JSX.Element[] = [];
+
+  if (q.migration_safety || q.migration_safety_detail) {
+    chips.push(
+      <span
+        key="migration-safety"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700"
+        title={q.migration_safety_detail ?? undefined}
+      >
+        migration {q.migration_safety ?? 'unknown'}
+      </span>,
+    );
+  }
+  if (q.migration_apply_safety || q.migration_apply_safety_detail) {
+    chips.push(
+      <span
+        key="migration-apply-safety"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700"
+        title={q.migration_apply_safety_detail ?? undefined}
+      >
+        apply {q.migration_apply_safety ?? 'unknown'}
+      </span>,
+    );
+  }
+  if (findings.length > 0) {
+    chips.push(
+      <span
+        key="audit-findings"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-sky-500/10 text-sky-300 border-sky-500/20"
+        title={findings.map((f) => `${f.severity}: ${f.summary}`).join(' | ')}
+      >
+        {findings.length} audit finding{findings.length !== 1 ? 's' : ''}
+      </span>,
+    );
+  }
+  if (excludedFindings.length > 0) {
+    chips.push(
+      <span
+        key="excluded-audit-findings"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-500 border-neutral-700"
+        title={excludedFindings.map((f) => `${f.severity}: ${f.summary}`).join(' | ')}
+      >
+        {excludedFindings.length} excluded finding{excludedFindings.length !== 1 ? 's' : ''}
+      </span>,
+    );
+  }
+  if (q.test_erosion_detail) {
+    chips.push(
+      <span
+        key="test-erosion-detail"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700"
+        title={formatCompactDetail(q.test_erosion_detail)}
+      >
+        erosion {formatCompactDetail(q.test_erosion_detail)}
+      </span>,
+    );
+  }
+  if (q.smoketest_detail) {
+    chips.push(
+      <span
+        key="smoketest-detail"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700"
+        title={formatCompactDetail(q.smoketest_detail)}
+      >
+        smoke {formatCompactDetail(q.smoketest_detail)}
+      </span>,
+    );
+  }
+  if (q.promotion_pr_url) {
+    chips.push(
+      <span
+        key="promotion-pr-url"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-500 border-neutral-700"
+        title={q.promotion_pr_url}
+      >
+        promotion PR
+      </span>,
+    );
+  }
+  if (q.promotion_conflict) {
+    chips.push(
+      <span
+        key="promotion-conflict"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20"
+        title={q.promotion_error_detail ?? 'promotion conflict'}
+      >
+        promotion conflict
+      </span>,
+    );
+  } else if (q.promotion_error_detail) {
+    chips.push(
+      <span
+        key="promotion-error-detail"
+        className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20"
+        title={q.promotion_error_detail}
+      >
+        {q.promotion_error_detail}
+      </span>,
+    );
+  }
+
+  if (chips.length === 0) return null;
+
+  return (
+    <div data-testid="durable-qualification-evidence" className="flex flex-wrap gap-1.5 pt-0.5">
+      {chips}
     </div>
   );
 }
@@ -891,6 +1059,15 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
               {cv.phase_changed_at && <span className="text-[10px] text-neutral-500">{timeAgo(cv.phase_changed_at)}</span>}
               <span className="text-[10px] text-neutral-500">{cv.merged_task_count} tasks merged</span>
               {cv.qualification_attempts > 0 && <span className="text-[10px] text-neutral-500">{cv.qualification_attempts} qual{cv.qualification_attempts !== 1 ? 's' : ''}</span>}
+              {cv.active_candidate_sha && (
+                <span
+                  data-testid="active-candidate-sha"
+                  className="text-[10px] text-neutral-500 font-mono"
+                  title={`candidate under evaluation: ${cv.active_candidate_sha}`}
+                >
+                  candidate @{cv.active_candidate_sha.slice(0, 7)}
+                </span>
+              )}
             </div>
             {editingGoal && projectId ? (
               <div className="flex flex-col gap-1.5">
@@ -1069,6 +1246,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 {cv.last_qualification.audit_reconciliation && (
                   <AuditReconciliationRow rec={cv.last_qualification.audit_reconciliation} />
                 )}
+                <DurableQualificationEvidenceRow q={cv.last_qualification} />
               </div>
             )}
             {auditEvidenceState === 'current' && cv.latest_audit && (
@@ -1078,7 +1256,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
             )}
             {auditEvidenceState === 'stale' && cv.stale_audit && (
               <div className="pl-2 border-l border-neutral-700/50">
-                <HistoricalAuditContext audit={cv.stale_audit} />
+                <HistoricalAuditContext audit={cv.stale_audit} activeCandidateSha={cv.active_candidate_sha} />
               </div>
             )}
             {projectId && (
@@ -1193,33 +1371,36 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
             <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Verdict History</p>
             <div className="space-y-1">
               {verdicts.slice(0, 8).map(v => (
-                <div key={v.id} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] pl-2 border-l-2 border-neutral-700/40">
-                  <span className={`font-mono font-semibold ${v.would_promote ? 'text-emerald-400' : 'text-amber-400'}`}>{v.confidence != null ? `${Math.round(v.confidence * 100)}%` : '—'}</span>
-                  <span className={QUAL_VERDICT_COLOR[v.terminal_status ?? ''] ?? 'text-neutral-400'}>{v.terminal_status?.replace(/_/g, '-') ?? '?'}</span>
-                  {v.promotion_enabled && <span className="text-[9px] font-mono text-emerald-600">LIVE</span>}
-                  {v.sub_scores && <span className="text-neutral-600 font-mono text-[9px]">a:{Math.round(v.sub_scores.audit * 100)} e:{Math.round(v.sub_scores.test_erosion * 100)} s:{Math.round(v.sub_scores.smoketest * 100)}</span>}
-                  {v.sub_scores?.ci_resolution && <CiBadge ci={v.sub_scores.ci_resolution} />}
-                  {v.blocker && <span className="text-red-400 truncate max-w-[120px]" title={v.blocker}>{v.blocker}</span>}
-                  {v.post_promotion_outcome && (
-                    <span
-                      className={`font-mono text-[9px] px-1 py-0.5 rounded border ${
-                        v.post_promotion_outcome === 'serving_confirmed'
-                          ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                <div key={v.id} className="space-y-0.5 pl-2 border-l-2 border-neutral-700/40">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px]">
+                    <span className={`font-mono font-semibold ${v.would_promote ? 'text-emerald-400' : 'text-amber-400'}`}>{v.confidence != null ? `${Math.round(v.confidence * 100)}%` : '—'}</span>
+                    <span className={QUAL_VERDICT_COLOR[v.terminal_status ?? ''] ?? 'text-neutral-400'}>{v.terminal_status?.replace(/_/g, '-') ?? '?'}</span>
+                    {v.promotion_enabled && <span className="text-[9px] font-mono text-emerald-600">LIVE</span>}
+                    {v.sub_scores && <span className="text-neutral-600 font-mono text-[9px]">a:{Math.round(v.sub_scores.audit * 100)} e:{Math.round(v.sub_scores.test_erosion * 100)} s:{Math.round(v.sub_scores.smoketest * 100)}</span>}
+                    {v.sub_scores?.ci_resolution && <CiBadge ci={v.sub_scores.ci_resolution} />}
+                    {v.blocker && <span className="text-red-400 truncate max-w-[120px]" title={v.blocker}>{v.blocker}</span>}
+                    {v.post_promotion_outcome && (
+                      <span
+                        className={`font-mono text-[9px] px-1 py-0.5 rounded border ${
+                          v.post_promotion_outcome === 'serving_confirmed'
+                            ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                            : v.post_promotion_outcome === 'deploy_failed'
+                              ? 'bg-red-500/10 border-red-500/40 text-red-400'
+                              : 'bg-amber-500/10 border-amber-500/30 text-amber-400'
+                        }`}
+                        title={`post-promotion outcome: ${v.post_promotion_outcome.replace(/_/g, ' ')}`}
+                      >
+                        {v.post_promotion_outcome === 'serving_confirmed'
+                          ? '✓ serving'
                           : v.post_promotion_outcome === 'deploy_failed'
-                            ? 'bg-red-500/10 border-red-500/40 text-red-400'
-                            : 'bg-amber-500/10 border-amber-500/30 text-amber-400'
-                      }`}
-                      title={`post-promotion outcome: ${v.post_promotion_outcome.replace(/_/g, ' ')}`}
-                    >
-                      {v.post_promotion_outcome === 'serving_confirmed'
-                        ? '✓ serving'
-                        : v.post_promotion_outcome === 'deploy_failed'
-                          ? '⚠ deploy failed'
-                          : 'unconfirmed'}
-                    </span>
-                  )}
-                  <span className="text-neutral-700 font-mono">{v.candidate_sha.slice(0, 7)}</span>
-                  {v.finalized_at && <span className="text-neutral-600">{timeAgo(v.finalized_at)}</span>}
+                            ? '⚠ deploy failed'
+                            : 'unconfirmed'}
+                      </span>
+                    )}
+                    <span className="text-neutral-700 font-mono">{v.candidate_sha.slice(0, 7)}</span>
+                    {v.finalized_at && <span className="text-neutral-600">{timeAgo(v.finalized_at)}</span>}
+                  </div>
+                  <DurableQualificationEvidenceRow q={v} />
                 </div>
               ))}
             </div>

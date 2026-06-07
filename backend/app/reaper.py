@@ -895,6 +895,7 @@ from app.reaper_sweeps import (  # noqa: E402
     sweep_activate_staged_directions,
     sweep_stale_staged_directions,
     sweep_merge_gate_verification_degradation,
+    sweep_migration_slot_contention,
     sweep_converge_linked_bug_messages,
     sweep_converge_duplicate_foundations,
     sweep_resolve_open_owned_bug_messages,
@@ -3902,6 +3903,22 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Merge-gate degradation sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Migration-serialization-slot contention alerting — surface a
+                # prolonged per-project migration slot hold that is parking
+                # schema-touching tasks (invisible to the throughput-only
+                # migration-health summary and the escalated-only parked-blocker
+                # signal). Alerting only — never influences serialization.
+                _mark_reaper_progress()
+                try:
+                    await sweep_migration_slot_contention(session)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Migration-slot-contention sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

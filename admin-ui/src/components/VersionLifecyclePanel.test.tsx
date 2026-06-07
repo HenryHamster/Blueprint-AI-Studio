@@ -4,6 +4,12 @@ import { VersionLifecyclePanel } from './VersionLifecyclePanel';
 import * as api from '../api';
 import type { VersionLifecycleResponse } from '../api';
 
+vi.mock('../firebase', () => ({
+  auth: { currentUser: null, onAuthStateChanged: () => () => {} },
+  signInWithGoogle: vi.fn(),
+  signOut: vi.fn(),
+  getIdToken: vi.fn().mockResolvedValue('test-token'),
+}));
 vi.mock('../api');
 
 // Mock window.confirm for cut version tests
@@ -23,6 +29,7 @@ function makeCurrentVersion(overrides: Partial<api.CurrentVersion> = {}): api.Cu
     merged_task_count: 0,
     qualification_state: null,
     last_qualification: null,
+    active_candidate_sha: null,
     latest_audit: null,
     audit_evidence_state: 'none',
     stale_audit: null,
@@ -845,12 +852,13 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.getByText(/^ran /)).toBeInTheDocument();
     });
 
-    it('renders stale audit provenance as historical context only and says there is no current audit', () => {
+    it('renders stale audit provenance as historical context and contrasts the active candidate with the audited one', () => {
       render(
         <VersionLifecyclePanel
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
               last_qualification: makeQualification({ candidate_sha: 'fed9876543210000' }),
+              active_candidate_sha: 'fed9876543210000',
               audit_evidence_state: 'stale',
               latest_audit: null,
               stale_audit: makeLatestAudit({ candidate_sha: 'abcdef1234567890' }),
@@ -863,10 +871,30 @@ describe('VersionLifecyclePanel', () => {
       );
       expect(screen.getByText('Historical Audit Context')).toBeInTheDocument();
       expect(screen.getByText(/no current audit for this candidate/i)).toBeInTheDocument();
-      expect(screen.getByText('@abcdef1')).toBeInTheDocument();
       expect(screen.getByText(/^ran /)).toBeInTheDocument();
       expect(screen.queryByText('unverified finding')).not.toBeInTheDocument();
       expect(screen.queryByText('Audit Findings')).not.toBeInTheDocument();
+      // The historical-context block explicitly contrasts the active candidate
+      // SHA (awaiting a fresh audit) with the older audited candidate SHA.
+      const ctx = screen.getByTestId('historical-audit-context');
+      expect(within(ctx).getByText('@fed9876')).toBeInTheDocument();
+      expect(within(ctx).getByText('@abcdef1')).toBeInTheDocument();
+    });
+
+    it('shows the candidate SHA currently under evaluation on the open version', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              active_candidate_sha: 'abcdef1234567890',
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByTestId('active-candidate-sha')).toHaveTextContent('@abcdef1');
     });
 
     it('does not display inherited findings when the current candidate has no audit evidence', () => {
@@ -1012,6 +1040,97 @@ describe('VersionLifecyclePanel', () => {
         />
       );
       expect(screen.getByText(/^as of /)).toBeInTheDocument();
+    });
+
+    it('renders durable qualification evidence on the open version', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                migration_safety: 'block',
+                migration_safety_detail: 'open version needs a schema migration',
+                migration_apply_safety: 'warn',
+                migration_apply_safety_detail: 'apply path still diverges',
+                audit_findings: [{ severity: 'high', summary: 'unverified audit finding' }],
+                excluded_audit_findings: [{ severity: 'low', summary: 'stale noise' }],
+                test_erosion_detail: { deleted_test_files: 1 },
+                smoketest_detail: { passed: false, suite: 'release' },
+                promotion_pr_url: 'https://example.com/pr/open',
+                promotion_conflict: true,
+                promotion_error_detail: 'merge conflict',
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      expect(within(evidence).getByText(/1 audit finding/)).toBeInTheDocument();
+      expect(within(evidence).getByText(/1 excluded finding/)).toBeInTheDocument();
+      expect(within(evidence).getByText(/migration block/)).toBeInTheDocument();
+      expect(within(evidence).getByText(/apply warn/)).toBeInTheDocument();
+      expect(within(evidence).getByText(/promotion conflict/)).toBeInTheDocument();
+      expect(within(evidence).getByTitle('open version needs a schema migration')).toBeInTheDocument();
+      expect(within(evidence).getByTitle('apply path still diverges')).toBeInTheDocument();
+    });
+
+    it('renders durable qualification evidence in verdict history', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [
+          {
+            id: 'v1',
+            release_version_id: 'rv1',
+            candidate_sha: 'deadbeef1234',
+            confidence: 0.95,
+            sub_scores: null,
+            blocker: null,
+            audit_missing_reason: null,
+            audit_findings: [{ severity: 'high', summary: 'durable finding' }],
+            excluded_audit_findings: [{ severity: 'low', summary: 'excluded noise' }],
+            migration_safety: 'pass',
+            migration_safety_detail: 'schema migration verified',
+            migration_apply_safety: 'pass',
+            migration_apply_safety_detail: 'apply path verified',
+            test_erosion_detail: { deleted_test_files: 0 },
+            smoketest_detail: { passed: true },
+            audit_reconciliation: null,
+            promotion_pr_url: 'https://example.com/pr/123',
+            promotion_conflict: false,
+            promotion_error_detail: null,
+            would_promote: true,
+            promotion_enabled: true,
+            terminal_status: 'promoted',
+            threshold: 0.9,
+            started_at: null,
+            finalized_at: '2026-01-02T00:00:00Z',
+            created_at: '2026-01-02T00:00:00Z',
+            post_promotion_outcome: 'deploy_failed',
+          },
+        ],
+        total: 1,
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const history = await screen.findByTestId('verdict-history');
+      const evidence = within(history).getByTestId('durable-qualification-evidence');
+      expect(within(evidence).getByText(/1 audit finding/)).toBeInTheDocument();
+      expect(within(evidence).getByText(/migration pass/)).toBeInTheDocument();
+      expect(within(evidence).getByText(/apply pass/)).toBeInTheDocument();
+      expect(within(evidence).getByText(/promotion PR/)).toBeInTheDocument();
+      expect(within(evidence).getByTitle('schema migration verified')).toBeInTheDocument();
+      expect(within(evidence).getByTitle('apply path verified')).toBeInTheDocument();
     });
   });
 

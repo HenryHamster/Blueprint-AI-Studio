@@ -11109,3 +11109,115 @@ async def test_merge_gate_degradation_sweep_ignores_tiny_sample(reaper_db, mocke
 
     created = await _rs.sweep_merge_gate_verification_degradation(reaper_db)
     assert created == 0
+
+
+# ── sweep_migration_slot_contention (per-project alert) ──────────────────────
+
+
+def _mk_migration_inprogress(project_id, *, started_delta, title="mig-holder"):
+    from app.time_utils import _utcnow
+    return Task(
+        project_id=project_id,
+        title=title,
+        description="m",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="t",
+        requires_approval=False,
+        payloads=[{"type": "migrate"}],
+        context={},
+        status_log=[],
+        started_at=_utcnow() - started_delta,
+    )
+
+
+def _mk_migration_waiter(project_id, *, status=TaskStatus.QUEUED, updated_delta=None):
+    from app.time_utils import _utcnow
+    kwargs = {}
+    if updated_delta is not None:
+        kwargs["updated_at"] = _utcnow() - updated_delta
+    return Task(
+        project_id=project_id,
+        title="mig-waiter",
+        description="w",
+        status=status,
+        created_by="t",
+        requires_approval=False,
+        payloads=[{"type": "migrate"}],
+        context={},
+        status_log=[],
+        **kwargs,
+    )
+
+
+@pytest.mark.asyncio
+async def test_migration_slot_contention_sweep_alerts_past_threshold(reaper_db, mocker):
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = Project(name="slot-unit", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    holder = _mk_migration_inprogress(project.id, started_delta=timedelta(hours=2))
+    waiter = _mk_migration_waiter(project.id, updated_delta=timedelta(minutes=45))
+    reaper_db.add_all([holder, waiter])
+    await reaper_db.commit()
+
+    created = await _rs.sweep_migration_slot_contention(reaper_db)
+    assert created == 1
+
+    from app.alert_dispatch import _MIGRATION_SLOT_CONTENTION_ALERT_TITLE
+
+    alerts = (
+        (
+            await reaper_db.execute(
+                _select(Alert).where(
+                    Alert.title == _MIGRATION_SLOT_CONTENTION_ALERT_TITLE
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].project_id == project.id
+    assert alerts[0].task_id == holder.id
+    assert "parked waiting" in alerts[0].message
+
+    # Dedups on the stable title — a second sweep raises no new alert.
+    again = await _rs.sweep_migration_slot_contention(reaper_db)
+    assert again == 0
+
+
+@pytest.mark.asyncio
+async def test_migration_slot_contention_sweep_silent_below_threshold(reaper_db, mocker):
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = Project(name="slot-fresh", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    # Fresh holder (5m) with a waiter — contended but under the 1h threshold.
+    holder = _mk_migration_inprogress(project.id, started_delta=timedelta(minutes=5))
+    waiter = _mk_migration_waiter(project.id, updated_delta=timedelta(minutes=3))
+    reaper_db.add_all([holder, waiter])
+    await reaper_db.commit()
+
+    created = await _rs.sweep_migration_slot_contention(reaper_db)
+    assert created == 0
+
+
+@pytest.mark.asyncio
+async def test_migration_slot_contention_sweep_silent_with_no_waiters(reaper_db, mocker):
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = Project(name="slot-solo", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    # Long-held solo migration, nobody parked -> not a contention event.
+    holder = _mk_migration_inprogress(project.id, started_delta=timedelta(hours=4))
+    reaper_db.add(holder)
+    await reaper_db.commit()
+
+    created = await _rs.sweep_migration_slot_contention(reaper_db)
+    assert created == 0

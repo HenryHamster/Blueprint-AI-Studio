@@ -183,6 +183,21 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         "blocker": qual.get("blocker"),
         "started_at": qual.get("started_at"),
         "finalized_at": qual.get("finalized_at"),
+        # Durable per-attempt evidence fields mirror the immutable verdict row
+        # so the current open version keeps the same evidence trail even after
+        # later re-qualifications overwrite mutable state.
+        "migration_safety": qual.get("migration_safety"),
+        "migration_safety_detail": qual.get("migration_safety_detail"),
+        "migration_apply_safety": qual.get("migration_apply_safety"),
+        "migration_apply_safety_detail": qual.get("migration_apply_safety_detail"),
+        "audit_findings": qual.get("audit_findings"),
+        "excluded_audit_findings": qual.get("excluded_audit_findings"),
+        "test_erosion_detail": qual.get("test_erosion_detail"),
+        "smoketest_detail": qual.get("smoketest_detail"),
+        "audit_reconciliation": qual.get("audit_reconciliation"),
+        "promotion_pr_url": qual.get("promotion_pr_url"),
+        "promotion_conflict": qual.get("promotion_conflict"),
+        "promotion_error_detail": qual.get("promotion_error_detail"),
     }
 
 

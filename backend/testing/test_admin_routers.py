@@ -11,7 +11,7 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -8520,6 +8520,9 @@ class TestVersionLifecycleAuditEvidence:
         assert current["latest_audit"]["candidate_sha"] == candidate
         assert current["latest_audit"]["report"] == report
         assert current["stale_audit"] is None
+        # The active candidate under evaluation is surfaced first-class and
+        # equals the version's last_qualification candidate SHA.
+        assert current["active_candidate_sha"] == candidate
 
     @pytest.mark.asyncio
     async def test_stale_prior_candidate_audit(self, client: AsyncClient, db_session):
@@ -8555,6 +8558,10 @@ class TestVersionLifecycleAuditEvidence:
         assert current["stale_audit"] is not None
         assert current["stale_audit"]["candidate_sha"] == "0ld0" * 10
         assert current["stale_audit"]["report"] == report
+        # Active candidate is the evaluated (newer) SHA, distinct from the older
+        # audited candidate — letting the UI contrast the two.
+        assert current["active_candidate_sha"] == "newc" * 10
+        assert current["active_candidate_sha"] != current["stale_audit"]["candidate_sha"]
 
     @pytest.mark.asyncio
     async def test_no_matching_audit_is_none(self, client: AsyncClient, db_session):
@@ -8590,6 +8597,8 @@ class TestVersionLifecycleAuditEvidence:
         assert current["audit_evidence_state"] == "none"
         assert current["latest_audit"] is None
         assert current["stale_audit"] is None
+        # Active candidate is surfaced even when no scoped audit evidence exists.
+        assert current["active_candidate_sha"] == "feed" * 10
 
     @pytest.mark.asyncio
     async def test_current_audit_without_artifact(
@@ -8623,6 +8632,111 @@ class TestVersionLifecycleAuditEvidence:
         assert current["audit_evidence_state"] == "current"
         assert current["latest_audit"] is not None
         assert current["latest_audit"]["report"] is None
+
+
+class TestVersionLifecycleQualificationEvidence:
+    """GET /version-lifecycle surfaces durable qualification evidence on open and recent versions."""
+
+    @pytest.mark.asyncio
+    async def test_surfaces_durable_evidence_in_current_and_recent_versions(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        open_opened_at = datetime(2026, 5, 27, 12, 0, tzinfo=timezone.utc)
+        recent_opened_at = datetime(2026, 5, 26, 12, 0, tzinfo=timezone.utc)
+        open_version = ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="stabilize",
+            status="open",
+            opened_at=open_opened_at,
+            last_qualification={
+                "status": "not_promoted",
+                "confidence": 0.42,
+                "threshold": 0.9,
+                "sub_scores": {"audit": 0.1, "test_erosion": 0.2, "smoketest": 0.3},
+                "blocker": "migration_unsafe",
+                "finalized_at": "2026-05-27T12:00:00",
+                "migration_safety": "block",
+                "migration_safety_detail": "open version needs a schema migration",
+                "migration_apply_safety": "warn",
+                "migration_apply_safety_detail": "apply path still diverges",
+                "audit_findings": [{"severity": "high", "summary": "unverified audit finding"}],
+                "excluded_audit_findings": [{"severity": "low", "summary": "stale noise"}],
+                "test_erosion_detail": {"deleted_test_files": 1},
+                "smoketest_detail": {"passed": False, "suite": "release"},
+                "audit_reconciliation": {"excluded_findings_count": 1},
+                "promotion_pr_url": "https://example.com/pr/open",
+                "promotion_conflict": True,
+                "promotion_error_detail": "merge conflict",
+            },
+        )
+        recent_version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="promoted",
+            opened_at=recent_opened_at,
+            promoted_at=open_opened_at,
+            last_qualification={
+                "status": "promoted",
+                "confidence": 0.91,
+                "threshold": 0.9,
+                "sub_scores": {"audit": 0.8, "test_erosion": 0.9, "smoketest": 0.95},
+                "blocker": None,
+                "finalized_at": "2026-05-26T12:00:00",
+                "migration_safety": "pass",
+                "migration_safety_detail": "migration dry-run matched",
+                "audit_findings": [{"severity": "low", "summary": "reviewed"}],
+                "promotion_pr_url": "https://example.com/pr/recent",
+            },
+        )
+        db_session.add_all([open_version, recent_version])
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch("app.release_version.count_merged_since", new=AsyncMock(return_value=0)),
+            patch("app.release_version.count_in_flight_tasks", new=AsyncMock(return_value=0)),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["last_qualification"]["migration_safety"] == "block"
+        assert current["last_qualification"]["migration_apply_safety"] == "warn"
+        assert current["last_qualification"]["audit_findings"] == [
+            {"severity": "high", "summary": "unverified audit finding"}
+        ]
+        assert current["last_qualification"]["excluded_audit_findings"] == [
+            {"severity": "low", "summary": "stale noise"}
+        ]
+        assert current["last_qualification"]["test_erosion_detail"] == {"deleted_test_files": 1}
+        assert current["last_qualification"]["smoketest_detail"] == {"passed": False, "suite": "release"}
+        assert current["last_qualification"]["promotion_conflict"] is True
+        assert current["last_qualification"]["promotion_pr_url"] == "https://example.com/pr/open"
+
+        recent = resp.json()["recent_versions"][0]
+        assert recent["last_qualification"]["migration_safety"] == "pass"
+        assert recent["last_qualification"]["audit_findings"] == [
+            {"severity": "low", "summary": "reviewed"}
+        ]
+        assert recent["last_qualification"]["promotion_pr_url"] == "https://example.com/pr/recent"
 
 
 class TestVersionLifecycleStagedDirections:

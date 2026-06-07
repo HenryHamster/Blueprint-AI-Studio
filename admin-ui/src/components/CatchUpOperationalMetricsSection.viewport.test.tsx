@@ -69,6 +69,16 @@ describe('CatchUpOperationalMetricsSection — viewport regression', () => {
                 },
               },
             }}
+            migrationSlotContention={{
+              slot_held: true,
+              holder_task_id: 't-9',
+              holder_title: 'add index on task.project_id',
+              holder_project_id: 'p-1',
+              holder_held_seconds: 2 * 3600 + 12 * 60,
+              waiting_count: 5,
+              longest_wait_seconds: 51 * 60,
+              threshold_exceeded: true,
+            }}
             preventionEfficacy={{
               preventive_tasks_created: 10,
               preventive_tasks_merged: 7,

@@ -58,6 +58,7 @@ from app.digest_metrics import (
     compute_failure_grouping,  # noqa: F401  re-exported for external importers
     _CPM_RETIREMENT_MULTIPLIER,  # noqa: F401  re-exported for external importers
     compute_migration_health,  # noqa: F401  re-exported for external importers
+    compute_migration_slot_contention,
     compute_narrative_summary,
     compute_outer_loop_convergence,  # noqa: F401  re-exported for external importers
     compute_recurring_error_clusters,
@@ -1310,11 +1311,22 @@ async def _compute_digest(
         completed_tasks + failed_tasks
     )
 
+    # Migration-serialization-slot contention (read-only) — surfaces whether a
+    # migration task currently holds the per-project slot and for how long, how
+    # many schema-touching tasks are deferred waiting, and the longest current
+    # wait. Counts QUEUED/BLOCKED migration-deferred siblings that neither the
+    # throughput-only migration_health nor the escalated-only parked-blocker
+    # signal can see. Never influences serialization.
+    migration_slot_contention = await compute_migration_slot_contention(
+        session, project_id
+    )
+
     migration_health = compute_migration_health(
         completed_tasks,
         failed_tasks,
         error_log_map=error_log_map,
         active_tasks=active_tasks_all,
+        migration_slot_contention=migration_slot_contention,
     )
 
     return {
@@ -1425,6 +1437,7 @@ async def _compute_digest(
         "dependency_health_signals": dependency_health_signals,
         "merge_gate_fleet_health": merge_gate_fleet_health,
         "migration_health": migration_health,
+        "migration_slot_contention": migration_slot_contention,
         "prediction_calibration_factor": prediction_calibration["factor"]
         if prediction_calibration
         else None,

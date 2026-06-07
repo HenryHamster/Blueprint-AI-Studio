@@ -1056,6 +1056,7 @@ export interface VersionQualification {
   sub_scores: VersionQualificationSubScores | null;
   ci_resolution: CiResolution | null;
   blocker: string | null;
+  started_at?: string | null;
   finalized_at: string | null;
   // The candidate commit this qualification was evaluated against. Used to detect
   // when the latest audit's findings were computed against a different commit.
@@ -1069,6 +1070,16 @@ export interface VersionQualification {
   audit_reconciliation?: AuditReconciliation | null;
   // Audit findings carried from the qualification run (severity + summary per finding).
   audit_findings?: AuditFinding[] | null;
+  excluded_audit_findings?: AuditFinding[] | null;
+  migration_safety?: string | null;
+  migration_safety_detail?: string | null;
+  migration_apply_safety?: string | null;
+  migration_apply_safety_detail?: string | null;
+  test_erosion_detail?: Record<string, unknown> | null;
+  smoketest_detail?: Record<string, unknown> | null;
+  promotion_pr_url?: string | null;
+  promotion_conflict?: boolean | null;
+  promotion_error_detail?: string | null;
 }
 
 /** Per-artifact serving evidence for a release version. One entry per registered
@@ -1131,6 +1142,11 @@ export interface CurrentVersion {
   in_flight_task_count?: number;
   qualification_state?: QualificationState | null;
   last_qualification: VersionQualification | null;
+  // The candidate commit currently under evaluation for this open version
+  // (mirror of last_qualification.candidate_sha / the resolver's evaluated SHA).
+  // Surfaced so the UI can show what is being qualified and, when audit evidence
+  // is stale, contrast it against the historical audited candidate.
+  active_candidate_sha?: string | null;
   latest_audit?: LatestAudit | null;
   // Version-scoped audit evidence for the open candidate. `latest_audit` is
   // current only when audit_evidence_state='current'; `stale_audit` carries
@@ -1426,6 +1442,15 @@ export interface QualificationVerdictRecord {
   sub_scores: VersionQualificationSubScores | null;
   blocker: string | null;
   audit_missing_reason: string | null;
+  audit_findings?: AuditFinding[] | null;
+  excluded_audit_findings?: AuditFinding[] | null;
+  migration_safety?: string | null;
+  migration_safety_detail?: string | null;
+  migration_apply_safety?: string | null;
+  migration_apply_safety_detail?: string | null;
+  test_erosion_detail?: Record<string, unknown> | null;
+  smoketest_detail?: Record<string, unknown> | null;
+  audit_reconciliation?: AuditReconciliation | null;
   would_promote: boolean | null;
   promotion_enabled: boolean | null;
   terminal_status: string | null;
@@ -1437,6 +1462,9 @@ export interface QualificationVerdictRecord {
   // 'serving_confirmed' | 'deploy_failed' | 'unconfirmed' (null until recorded).
   post_promotion_outcome?: string | null;
   post_promotion_outcome_at?: string | null;
+  promotion_pr_url?: string | null;
+  promotion_conflict?: boolean | null;
+  promotion_error_detail?: string | null;
 }
 
 export interface QualificationVerdictsInfraContext {

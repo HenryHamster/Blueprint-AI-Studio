@@ -483,6 +483,27 @@ export interface DigestData<DP = unknown> {
       } | null;
     };
   } | null;
+  migration_slot_contention?: {
+    slot_held: boolean;
+    holder_task_id: string | null;
+    holder_title: string | null;
+    holder_project_id: string | null;
+    holder_held_seconds: number | null;
+    waiting_count: number;
+    longest_wait_seconds: number | null;
+    threshold_exceeded: boolean;
+    projects: {
+      project_id: string | null;
+      slot_held: boolean;
+      holder_task_id: string | null;
+      holder_title: string | null;
+      holder_held_seconds: number | null;
+      holder_count: number;
+      waiting_count: number;
+      longest_wait_seconds: number | null;
+      threshold_exceeded: boolean;
+    }[];
+  } | null;
   prevention_efficacy?: {
     preventive_tasks_created: number;
     preventive_tasks_merged: number;

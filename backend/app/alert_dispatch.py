@@ -540,6 +540,105 @@ async def _maybe_create_merge_gate_degradation_alerts(
     return created
 
 
+# Stable title for the per-project migration-slot-contention alert. Kept CONSTANT
+# (the drifting hold age / waiter count / longest wait live in the message) so a
+# hold that persists across reaper ticks dedups to exactly ONE alert per project.
+_MIGRATION_SLOT_CONTENTION_ALERT_TITLE = (
+    "Migration-serialization slot held — schema tasks parked"
+)
+
+
+def _fmt_duration_seconds(seconds: "float | int | None") -> str:
+    """Human-readable compact duration ('2h 5m', '45m', '30s', 'n/a')."""
+    if seconds is None:
+        return "n/a"
+    total = int(seconds)
+    if total < 60:
+        return f"{total}s"
+    minutes, _sec = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    return f"{minutes}m"
+
+
+async def _maybe_create_migration_slot_contention_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    *,
+    holder_task_id: "str | None",
+    held_seconds: "float | int | None",
+    waiting_count: int,
+    longest_wait_seconds: "float | int | None",
+    severity: AlertSeverity = AlertSeverity.WARNING,
+) -> int:
+    """Raise a deduplicated alert when a migration task has held the per-project
+    serialization slot too long while schema-touching tasks are parked waiting.
+
+    A migration-producing task that is IN_PROGRESS holds the per-project
+    migration-serialization slot; siblings defer to QUEUED/BLOCKED while it holds.
+    A multi-hour hold (the recent incident: ~2h holding, 5+ tasks parked) is
+    invisible to the throughput-only migration-health summary and to the
+    escalated-only parked-blocker signal — the deferred siblings are QUEUED, not
+    BLOCKED. This raises the proactive operator signal so a prolonged hold
+    self-surfaces. Alerting only — it never changes serialization behavior.
+
+    Computed from the per-project entry of
+    :func:`digest_metrics.compute_migration_slot_contention`. Deduplicated on a
+    STABLE title so a hold that persists across reaper ticks raises exactly ONE
+    alert per project; the drifting hold age / waiter count / longest wait live in
+    the MESSAGE so a moving metric never defeats dedup. Task-linked to the holder
+    so the alert renders a "View task" button. Caller owns the commit.
+
+    Returns 1 when a NEW alert was created, else 0.
+    """
+    title = _MIGRATION_SLOT_CONTENTION_ALERT_TITLE
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return 0
+
+    msg = (
+        f"A migration-producing task has held the migration-serialization slot "
+        f"for {_fmt_duration_seconds(held_seconds)} while {waiting_count} "
+        f"schema-touching task{'s' if waiting_count != 1 else ''} are parked "
+        f"waiting (longest wait {_fmt_duration_seconds(longest_wait_seconds)}). "
+        f"Migration work is the throughput bottleneck — review the holder "
+        f"(task {holder_task_id}) for a stuck author/test loop."
+    )[:1000]
+
+    holder_uuid: "uuid.UUID | None" = None
+    if holder_task_id:
+        try:
+            holder_uuid = uuid.UUID(str(holder_task_id))
+        except (ValueError, TypeError):
+            holder_uuid = None
+
+    alert = Alert(
+        project_id=project_id,
+        severity=severity,
+        title=title,
+        message=msg,
+        task_id=holder_uuid,
+    )
+    session.add(alert)
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": severity.value,
+            "title": alert.title,
+        },
+    )
+    return 1
+
+
 async def _maybe_create_unverified_merge_alert(
     task: "Task",
     session: AsyncSession,

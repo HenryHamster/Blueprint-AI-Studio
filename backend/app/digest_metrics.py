@@ -88,7 +88,6 @@ from app.failure_classification import (
 logger = logging.getLogger(__name__)
 
 _CPM_RETIREMENT_MULTIPLIER = 3.0  # cost_per_merge > median × this → retirement signal
-_MIGRATION_SLOT_CONTENTION_ELEVATION_THRESHOLD = timedelta(hours=2)
 
 _FAILURE_CLASS_LABELS = {
     CODE_ERROR: "Code Error",
@@ -2163,6 +2162,7 @@ def compute_migration_health(
     *,
     error_log_map: Dict[str, Any],
     active_tasks: List[Task] | None = None,
+    migration_slot_contention: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Summarize migration-task throughput and migration-error incidence.
 
@@ -2189,38 +2189,6 @@ def compute_migration_health(
             for f in payload_files
         )
 
-    def _is_migration_producing(t: Task) -> bool:
-        if _task_type(t) == "migrate":
-            return True
-        ctx = t.context or {}
-        files = ctx.get("related_files") or []
-        if isinstance(files, list) and any(
-            isinstance(f, str)
-            and (
-                f.startswith("backend/alembic/versions/")
-                or f == "backend/app/models.py"
-                or f.endswith("/backend/app/models.py")
-            )
-            for f in files
-        ):
-            return True
-        payload_files = (t.first_payload or {}).get("related_files") or []
-        return isinstance(payload_files, list) and any(
-            isinstance(f, str)
-            and (
-                f.startswith("backend/alembic/versions/")
-                or f == "backend/app/models.py"
-                or f.endswith("/backend/app/models.py")
-            )
-            for f in payload_files
-        )
-
-    def _task_age_seconds(t: Task, *, field: str) -> int | None:
-        ts = getattr(t, field, None)
-        if ts is None:
-            return None
-        return max(0, int((_utcnow() - ts).total_seconds()))
-
     _migrate_completed = [t for t in completed_tasks if _task_type(t) == "migrate"]
     _migrate_failed = [t for t in failed_tasks if _task_type(t) == "migrate"]
     _migration_errors = sum(
@@ -2235,70 +2203,35 @@ def compute_migration_health(
         if _task_type(t) != "migrate" and _touched_migration(t)
     )
 
-    active_migration_tasks = [
-        t for t in (active_tasks or []) if _is_migration_producing(t)
-    ]
-    migration_slot_holder = min(
-        (
-            t
-            for t in active_migration_tasks
-            if t.status == TaskStatus.IN_PROGRESS
-        ),
-        key=lambda t: (
-            t.started_at or t.created_at or _utcnow(),
-            str(t.id),
-        ),
-        default=None,
-    )
-    holder_hold_seconds = (
-        _task_age_seconds(migration_slot_holder, field="started_at")
-        if migration_slot_holder is not None
-        else None
-    )
-    if holder_hold_seconds is None and migration_slot_holder is not None:
-        holder_hold_seconds = _task_age_seconds(
-            migration_slot_holder, field="created_at"
+    contention_summary = migration_slot_contention
+    if contention_summary is None:
+        from app.orchestrator_filters import _is_migration_task  # noqa: PLC0415
+
+        active_migration_tasks = [
+            t for t in (active_tasks or []) if _is_migration_task(t)
+        ]
+        contention_summary = compute_migration_slot_contention_summary(
+            [t for t in active_migration_tasks if t.status == TaskStatus.IN_PROGRESS],
+            [
+                t
+                for t in active_migration_tasks
+                if t.status in (TaskStatus.QUEUED, TaskStatus.BLOCKED)
+            ],
         )
-    serializing_waiters = [
-        t
-        for t in active_migration_tasks
-        if t.status == TaskStatus.QUEUED
-        and (t.latest_status_message or "").startswith(
-            "Waiting: serializing migration"
-        )
-    ]
-    longest_wait = min(
-        serializing_waiters,
-        key=lambda t: (
-            t.updated_at or t.created_at or t.started_at or _utcnow(),
-            str(t.id),
-        ),
-        default=None,
-    )
-    longest_wait_seconds = (
-        _task_age_seconds(longest_wait, field="updated_at")
-        if longest_wait is not None
-        else None
-    )
-    if longest_wait_seconds is None and longest_wait is not None:
-        longest_wait_seconds = _task_age_seconds(longest_wait, field="created_at")
-    deferred_count = len(serializing_waiters)
-    if migration_slot_holder is None and deferred_count == 0:
+
+    deferred_count = int(contention_summary.get("waiting_count") or 0)
+    if not contention_summary.get("slot_held") and deferred_count == 0:
         contention_status = "idle"
         contention_severity = "info"
     elif deferred_count == 0:
         contention_status = "held"
         contention_severity = "info"
+    elif contention_summary.get("threshold_exceeded"):
+        contention_status = "elevated"
+        contention_severity = "critical"
     else:
-        hold_threshold_seconds = int(
-            _MIGRATION_SLOT_CONTENTION_ELEVATION_THRESHOLD.total_seconds()
-        )
-        if holder_hold_seconds is not None and holder_hold_seconds >= hold_threshold_seconds:
-            contention_status = "elevated"
-            contention_severity = "critical"
-        else:
-            contention_status = "contention"
-            contention_severity = "warning"
+        contention_status = "contention"
+        contention_severity = "warning"
 
     return {
         "current_schema_revision": EXPECTED_SCHEMA_REVISION,
@@ -2311,28 +2244,262 @@ def compute_migration_health(
             "status": contention_status,
             "severity": contention_severity,
             "holder": {
-                "task_id": str(migration_slot_holder.id),
-                "title": migration_slot_holder.title,
-                "started_at": migration_slot_holder.started_at.isoformat()
-                if migration_slot_holder.started_at
-                else None,
-                "hold_seconds": holder_hold_seconds,
+                "task_id": contention_summary.get("holder_task_id"),
+                "title": contention_summary.get("holder_title"),
+                "started_at": contention_summary.get("holder_started_at"),
+                "hold_seconds": contention_summary.get("holder_held_seconds"),
             }
-            if migration_slot_holder is not None
+            if contention_summary.get("holder_task_id") is not None
             else None,
             "deferred_count": deferred_count,
             "longest_wait": {
-                "task_id": str(longest_wait.id),
-                "title": longest_wait.title,
-                "waiting_since": longest_wait.updated_at.isoformat()
-                if longest_wait.updated_at
-                else None,
-                "wait_seconds": longest_wait_seconds,
+                "task_id": contention_summary.get("longest_wait_task_id"),
+                "title": contention_summary.get("longest_wait_title"),
+                "waiting_since": contention_summary.get("longest_wait_since"),
+                "wait_seconds": contention_summary.get("longest_wait_seconds"),
             }
-            if longest_wait is not None
+            if contention_summary.get("longest_wait_task_id") is not None
             else None,
         },
     }
+
+
+# ── Migration-serialization slot contention (read-only observability) ────────
+#
+# A migration-producing task (``migrate`` type, or one touching
+# ``backend/app/models.py`` / ``backend/alembic/versions/``) that is IN_PROGRESS
+# holds the per-project migration-serialization slot; while it is held, sibling
+# schema-touching tasks defer to QUEUED/BLOCKED ("Waiting: serializing migration
+# …"). The existing ``compute_migration_health`` summary reports migration
+# throughput and error counts but NOT this contention, and the parked-blocker
+# signal counts ONLY BLOCKED tasks past escalation — migration-deferred siblings
+# are QUEUED, so neither metric sees a multi-hour hold parking the schema queue
+# (the recent incident: one holder held the slot ~2h and parked 5+ tasks before a
+# human noticed). This pair surfaces it: per project, the current holder and how
+# long it has held, how many migration-producing tasks are deferred waiting, and
+# the longest current wait. Read-only — it never changes serialization behavior.
+
+# A slot held at least this long WHILE tasks are waiting marks the per-project
+# entry ``threshold_exceeded`` (the loud self-surfacing signal the UI highlights
+# and the reaper alert sweep can escalate on). One hour: well below the ~2h
+# incident, well above a normal migration author+test run.
+_MIGRATION_SLOT_HOLD_ALERT_SECONDS = 3600
+# Defensive cap on the surfaced per-project list so a large fleet never bloats
+# the digest payload.
+_MIGRATION_SLOT_PROJECT_LIST_LIMIT = 100
+
+
+def _migration_slot_hold_seconds(holder: "Task", now: "datetime") -> "float | None":
+    """Seconds the holder has been IN_PROGRESS (its slot-hold age).
+
+    Anchored on ``started_at`` (stamped at dispatch) and falling back to
+    ``created_at`` so a holder that somehow lacks ``started_at`` still yields a
+    non-null age. ``None`` only when neither timestamp is present.
+    """
+    anchor = getattr(holder, "started_at", None) or getattr(holder, "created_at", None)
+    if anchor is None:
+        return None
+    return max(0.0, (now - anchor).total_seconds())
+
+
+def compute_migration_slot_contention_summary(
+    holders: List["Task"],
+    waiters: List["Task"],
+) -> Dict[str, Any]:
+    """Reduce migration-slot holders and waiters into a contention summary.
+
+    Pure function — no database calls; duration math only. ``holders`` are the
+    IN_PROGRESS migration-producing tasks; ``waiters`` are the QUEUED/BLOCKED
+    migration-producing tasks deferred on the slot. Both are grouped by project.
+
+    For each project the representative holder is the LONGEST-held IN_PROGRESS
+    migration task (the likeliest bottleneck — under the reservation scheme more
+    than one may be in flight, so ``holder_count`` is reported alongside). A
+    waiter's wait age is derived from ``updated_at`` (which advances when the task
+    is re-stamped with its "Waiting: serializing migration …" deferral status).
+    ``threshold_exceeded`` fires only when the slot is held, the hold age reaches
+    ``_MIGRATION_SLOT_HOLD_ALERT_SECONDS``, AND at least one task is waiting — so a
+    long solo migration with no waiters never raises the loud signal.
+
+    Returns a flat AGGREGATE view (max hold age / total waiters / max wait across
+    the scoped projects, plus the representative holder) and a per-project
+    ``projects`` list for fleet-wide consumers (e.g. the reaper alert sweep).
+    Non-zero exactly when migration tasks are actually deferred on the slot.
+    """
+    now = _utcnow()
+
+    def _proj(t: "Task") -> "str | None":
+        pid = getattr(t, "project_id", None)
+        return str(pid) if pid is not None else None
+
+    holders_by_project: Dict[Any, List["Task"]] = defaultdict(list)
+    for t in holders:
+        holders_by_project[_proj(t)].append(t)
+    waiters_by_project: Dict[Any, List["Task"]] = defaultdict(list)
+    for t in waiters:
+        waiters_by_project[_proj(t)].append(t)
+
+    projects: List[Dict[str, Any]] = []
+    for pkey in set(holders_by_project) | set(waiters_by_project):
+        p_holders = holders_by_project.get(pkey, [])
+        p_waiters = waiters_by_project.get(pkey, [])
+
+        holder = None
+        holder_held_seconds: "float | None" = None
+        for h in p_holders:
+            held = _migration_slot_hold_seconds(h, now)
+            if holder is None or (
+                held is not None
+                and (holder_held_seconds is None or held > holder_held_seconds)
+            ):
+                holder = h
+                holder_held_seconds = held
+
+        wait_ages = [
+            max(0.0, (now - w.updated_at).total_seconds())
+            for w in p_waiters
+            if getattr(w, "updated_at", None) is not None
+        ]
+        longest_wait_seconds = max(wait_ages) if wait_ages else None
+        longest_waiter = max(
+            (w for w in p_waiters if getattr(w, "updated_at", None) is not None),
+            key=lambda w: max(0.0, (now - w.updated_at).total_seconds()),
+            default=None,
+        )
+
+        slot_held = holder is not None
+        waiting_count = len(p_waiters)
+        threshold_exceeded = bool(
+            slot_held
+            and waiting_count > 0
+            and holder_held_seconds is not None
+            and holder_held_seconds >= _MIGRATION_SLOT_HOLD_ALERT_SECONDS
+        )
+
+        projects.append(
+            {
+                "project_id": pkey,
+                "slot_held": slot_held,
+                "holder_task_id": str(holder.id) if holder is not None else None,
+                "holder_title": (holder.title or str(holder.id)[:8])
+                if holder is not None
+                else None,
+                "holder_started_at": holder.started_at.isoformat()
+                if holder is not None and holder.started_at is not None
+                else None,
+                "holder_held_seconds": round(holder_held_seconds)
+                if holder_held_seconds is not None
+                else None,
+                "holder_count": len(p_holders),
+                "waiting_count": waiting_count,
+                "longest_wait_task_id": str(longest_waiter.id)
+                if longest_waiter is not None
+                else None,
+                "longest_wait_title": longest_waiter.title
+                if longest_waiter is not None
+                else None,
+                "longest_wait_since": longest_waiter.updated_at.isoformat()
+                if longest_waiter is not None and longest_waiter.updated_at is not None
+                else None,
+                "longest_wait_seconds": round(longest_wait_seconds)
+                if longest_wait_seconds is not None
+                else None,
+                "threshold_exceeded": threshold_exceeded,
+            }
+        )
+
+    # Newest-incident-first: most-contended projects (threshold breaches, then
+    # longest holds) lead the capped list.
+    projects.sort(
+        key=lambda p: (
+            p["threshold_exceeded"],
+            p["holder_held_seconds"] or 0,
+            p["waiting_count"],
+        ),
+        reverse=True,
+    )
+    projects = projects[:_MIGRATION_SLOT_PROJECT_LIST_LIMIT]
+
+    # Aggregate roll-up — the representative (longest-held) holder across scope.
+    rep = projects[0] if projects else None
+    aggregate_longest_wait = max(
+        (p for p in projects if p.get("longest_wait_task_id") is not None),
+        key=lambda p: p["longest_wait_seconds"] or 0,
+        default=None,
+    )
+    return {
+        "slot_held": any(p["slot_held"] for p in projects),
+        "holder_task_id": rep["holder_task_id"] if rep else None,
+        "holder_title": rep["holder_title"] if rep else None,
+        "holder_project_id": rep["project_id"] if rep else None,
+        "holder_started_at": rep["holder_started_at"] if rep else None,
+        "holder_held_seconds": max(
+            (p["holder_held_seconds"] or 0 for p in projects), default=0
+        )
+        if projects
+        else None,
+        "waiting_count": sum(p["waiting_count"] for p in projects),
+        "longest_wait_task_id": aggregate_longest_wait["longest_wait_task_id"]
+        if aggregate_longest_wait
+        else None,
+        "longest_wait_title": aggregate_longest_wait["longest_wait_title"]
+        if aggregate_longest_wait
+        else None,
+        "longest_wait_since": aggregate_longest_wait["longest_wait_since"]
+        if aggregate_longest_wait
+        else None,
+        "longest_wait_seconds": max(
+            (p["longest_wait_seconds"] or 0 for p in projects), default=0
+        )
+        if projects
+        else None,
+        "threshold_exceeded": any(p["threshold_exceeded"] for p in projects),
+        "projects": projects,
+    }
+
+
+async def compute_migration_slot_contention(
+    session: AsyncSession,
+    project_id: "uuid.UUID | None" = None,
+) -> Dict[str, Any]:
+    """Surface migration-serialization-slot contention (read-only observability).
+
+    Runs two small self-contained queries — IN_PROGRESS tasks (potential slot
+    holders) and QUEUED/BLOCKED tasks (potential waiters) — filters each to the
+    migration-producing subset via the canonical
+    :func:`orchestrator_filters._is_migration_task` detector, and delegates the
+    grouping/duration math to :func:`compute_migration_slot_contention_summary`.
+    Never mutates state. Scoped to ``project_id`` when provided, else fleet-wide.
+
+    ``_is_migration_task`` is deferred-imported to keep
+    ``app.orchestrator_filters`` off this module's import path at load time (its
+    own imports are leaf: migration_path, models, shared_state, time_utils,
+    task_capabilities).
+    """
+    from app.orchestrator_filters import _is_migration_task  # noqa: PLC0415
+
+    holder_filters = [Task.status == TaskStatus.IN_PROGRESS]
+    if project_id is not None:
+        holder_filters.append(Task.project_id == project_id)
+    in_progress = (
+        (await session.execute(select(Task).where(*holder_filters).limit(1000)))
+        .scalars()
+        .all()
+    )
+
+    waiter_filters = [Task.status.in_([TaskStatus.QUEUED, TaskStatus.BLOCKED])]
+    if project_id is not None:
+        waiter_filters.append(Task.project_id == project_id)
+    waiting = (
+        (await session.execute(select(Task).where(*waiter_filters).limit(2000)))
+        .scalars()
+        .all()
+    )
+
+    return compute_migration_slot_contention_summary(
+        [t for t in in_progress if _is_migration_task(t)],
+        [t for t in waiting if _is_migration_task(t)],
+    )
 
 
 def compute_digest_trend_history(

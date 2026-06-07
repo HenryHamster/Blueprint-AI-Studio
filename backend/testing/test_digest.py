@@ -6638,6 +6638,7 @@ async def test_digest_top_level_schema_keys(client: AsyncClient):
         "direction_portfolio",
         "total_estimated_cost_usd",
         "migration_health",
+        "migration_slot_contention",
         "merge_gate_fleet_health",
         "failure_groups",
         "recurring_error_clusters",
@@ -6677,15 +6678,15 @@ async def test_digest_migration_health_includes_slot_contention(client: AsyncCli
     )
     waiter = make_task(
         project_id=project.id,
-        title="Queued migration waiter",
-        status=TaskStatus.QUEUED,
+        title="Blocked migration waiter",
+        status=TaskStatus.BLOCKED,
         payloads=[
             {
                 "type": "create",
                 "related_files": ["backend/app/models.py"],
             }
         ],
-        latest_status_message="Waiting: serializing migration — task abc12345 holds the chain",
+        context={"related_files": ["backend/app/models.py"]},
         created_at=now - timedelta(hours=1, minutes=45),
         updated_at=now - timedelta(hours=1, minutes=30),
     )
@@ -6698,11 +6699,15 @@ async def test_digest_migration_health_includes_slot_contention(client: AsyncCli
     data = response.json()
 
     contention = data["migration_health"]["migration_slot_contention"]
+    slot_summary = data["migration_slot_contention"]
     assert contention["status"] == "elevated"
     assert contention["severity"] == "critical"
     assert contention["deferred_count"] == 1
     assert contention["holder"]["task_id"] == str(holder.id)
     assert contention["longest_wait"]["task_id"] == str(waiter.id)
+    assert slot_summary["waiting_count"] == contention["deferred_count"]
+    assert slot_summary["holder_task_id"] == contention["holder"]["task_id"]
+    assert slot_summary["threshold_exceeded"] is True
 
 
 @pytest.mark.asyncio

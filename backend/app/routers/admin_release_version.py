@@ -96,7 +96,10 @@ async def get_retirement_critiques(
 
 def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
     """Extract operator-facing fields from a last_qualification record."""
-    return {
+    from app.release_readiness import format_qualification_for_api  # noqa: PLC0415
+
+    out = format_qualification_for_api(qual)
+    out.update({
         "status": qual.get("status"),
         "confidence": qual.get("confidence"),
         "threshold": qual.get("threshold"),
@@ -116,7 +119,8 @@ def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
         # Audit reconciliation: model-reported vs findings-derived score delta
         # and excluded findings count (populated by _compute_audit_reconciliation).
         "audit_reconciliation": qual.get("audit_reconciliation"),
-    }
+    })
+    return out
 
 
 def _version_serving_summary(version: ReleaseVersion) -> tuple[dict[str, Any], list[dict]]:
@@ -305,6 +309,13 @@ async def get_version_lifecycle(
             "in_flight_task_count": in_flight_count,
             "qualification_state": qual_state,
             "last_qualification": _format_qualification(qual) if qual else None,
+            # The candidate commit currently under evaluation for this open
+            # version, surfaced as a first-class field (not buried in
+            # last_qualification) so the UI can show what is being qualified and,
+            # when audit evidence is stale, contrast it against the historical
+            # audited candidate. Identical to the resolver's ``evaluated_sha``
+            # (``last_qualification['candidate_sha']``) — same single source.
+            "active_candidate_sha": qual.get("candidate_sha"),
             "latest_audit": latest_audit,
             # Provenance for version-scoped audit evidence (additive). When the
             # newest scoped audit was run against an OLDER candidate than the one

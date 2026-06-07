@@ -75,6 +75,48 @@ describe('CatchUpOperationalMetricsSection', () => {
     expect(screen.queryByText('Provisioning overhead')).not.toBeInTheDocument();
   });
 
+  it('renders the migration slot strip with prolonged-hold highlight when threshold exceeded', () => {
+    render(
+      <CatchUpOperationalMetricsSection
+        directionProgress={[]}
+        migrationSlotContention={{
+          slot_held: true,
+          holder_task_id: 't-1',
+          holder_title: 'add column',
+          holder_project_id: 'p-1',
+          holder_held_seconds: 2 * 3600 + 5 * 60,
+          waiting_count: 5,
+          longest_wait_seconds: 45 * 60,
+          threshold_exceeded: true,
+        }}
+      />
+    );
+    expect(screen.getByText('Migration slot')).toBeInTheDocument();
+    expect(screen.getByText(/held 2h 5m by add column/)).toBeInTheDocument();
+    expect(screen.getByText(/5 waiting/)).toBeInTheDocument();
+    expect(screen.getByText(/longest wait 45m/)).toBeInTheDocument();
+    expect(screen.getByText(/prolonged hold/)).toBeInTheDocument();
+  });
+
+  it('hides the migration slot strip when the slot is free with no waiters', () => {
+    render(
+      <CatchUpOperationalMetricsSection
+        directionProgress={[]}
+        migrationSlotContention={{
+          slot_held: false,
+          holder_task_id: null,
+          holder_title: null,
+          holder_project_id: null,
+          holder_held_seconds: null,
+          waiting_count: 0,
+          longest_wait_seconds: null,
+          threshold_exceeded: false,
+        }}
+      />
+    );
+    expect(screen.queryByText('Migration slot')).not.toBeInTheDocument();
+  });
+
   it('renders migration slot contention with an elevated highlight when waiters are stalled', () => {
     render(
       <CatchUpOperationalMetricsSection

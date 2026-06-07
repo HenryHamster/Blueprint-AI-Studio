@@ -50,6 +50,17 @@ interface MigrationHealth {
   };
 }
 
+interface MigrationSlotContention {
+  slot_held: boolean;
+  holder_task_id: string | null;
+  holder_title: string | null;
+  holder_project_id: string | null;
+  holder_held_seconds: number | null;
+  waiting_count: number;
+  longest_wait_seconds: number | null;
+  threshold_exceeded: boolean;
+}
+
 interface PreventionEfficacy {
   preventive_tasks_created: number;
   preventive_tasks_merged: number;
@@ -109,6 +120,7 @@ interface CatchUpOperationalMetricsSectionProps {
   retryRecoveryCostUsd?: number | null;
   resurrectionOutcomeSummary?: ResurrectionOutcomeSummary | null;
   migrationHealth?: MigrationHealth | null;
+  migrationSlotContention?: MigrationSlotContention | null;
   preventionEfficacy?: PreventionEfficacy | null;
   releaseQualifierInfraMetrics?: ReleaseQualifierInfraMetrics | null;
   retryPatternSummary?: RetryPatternSummary | null;
@@ -134,6 +146,7 @@ export function CatchUpOperationalMetricsSection({
   retryRecoveryCostUsd,
   resurrectionOutcomeSummary,
   migrationHealth,
+  migrationSlotContention,
   preventionEfficacy,
   releaseQualifierInfraMetrics,
   retryPatternSummary,
@@ -337,6 +350,41 @@ export function CatchUpOperationalMetricsSection({
                   </span>
                 )}
               </>
+            )}
+          </div>
+        );
+      })()}
+
+      {/* Migration-serialization slot contention */}
+      {migrationSlotContention && (migrationSlotContention.slot_held || migrationSlotContention.waiting_count > 0) && (() => {
+        const sc = migrationSlotContention;
+        const fmtDur = (s: number | null): string => {
+          if (s == null) return 'n/a';
+          const total = Math.floor(s);
+          if (total < 60) return `${total}s`;
+          const m = Math.floor(total / 60);
+          const h = Math.floor(m / 60);
+          if (h) return m % 60 ? `${h}h ${m % 60}m` : `${h}h`;
+          return `${m}m`;
+        };
+        return (
+          <div className={`flex flex-wrap items-center gap-1.5 ${sc.threshold_exceeded ? 'rounded px-1.5 py-1 ring-1 ring-red-500/40 bg-red-500/5' : ''}`}>
+            <span className={`text-[10px] font-bold uppercase tracking-widest ${sc.threshold_exceeded ? 'text-red-400' : 'text-neutral-500'}`}>Migration slot</span>
+            {sc.slot_held ? (
+              <span className={`text-[10px] ${sc.threshold_exceeded ? 'text-red-400' : 'text-neutral-400'}`}>
+                held {fmtDur(sc.holder_held_seconds)}{sc.holder_title ? ` by ${sc.holder_title}` : ''}
+              </span>
+            ) : (
+              <span className="text-[10px] text-neutral-500">free</span>
+            )}
+            <span className={`text-[10px] ${sc.waiting_count > 0 ? 'text-amber-400' : 'text-neutral-500'}`}>
+              · {sc.waiting_count} waiting
+            </span>
+            {sc.longest_wait_seconds != null && sc.waiting_count > 0 && (
+              <span className="text-[10px] text-neutral-500">· longest wait {fmtDur(sc.longest_wait_seconds)}</span>
+            )}
+            {sc.threshold_exceeded && (
+              <span className="text-[10px] text-red-400 font-semibold">· ⚠ prolonged hold</span>
             )}
           </div>
         );

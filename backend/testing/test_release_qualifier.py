@@ -11332,6 +11332,9 @@ class TestFormatQualificationForApi:
         assert out["blocker"] is None
         assert out["started_at"] is None
         assert out["finalized_at"] is None
+        assert out["migration_safety"] is None
+        assert out["audit_findings"] is None
+        assert out["promotion_conflict"] is None
 
     def test_all_fields_passed_through(self):
         qual = {
@@ -11342,6 +11345,18 @@ class TestFormatQualificationForApi:
             "blocker": "ci_not_green",
             "started_at": "2026-05-21T10:00:00",
             "finalized_at": "2026-05-21T10:30:00",
+            "migration_safety": "block",
+            "migration_safety_detail": "table rename pending",
+            "migration_apply_safety": "warn",
+            "migration_apply_safety_detail": "apply path has drift",
+            "audit_findings": [{"severity": "high", "summary": "stale report"}],
+            "excluded_audit_findings": [{"severity": "low", "summary": "ignored"}],
+            "test_erosion_detail": {"deleted_test_files": 1},
+            "smoketest_detail": {"passed": False},
+            "audit_reconciliation": {"excluded_findings_count": 1},
+            "promotion_pr_url": "https://example.com/pr/123",
+            "promotion_conflict": True,
+            "promotion_error_detail": "merge conflict",
         }
         out = rq.format_qualification_for_api(qual)
         assert out["confidence"] == 0.82
@@ -11350,6 +11365,18 @@ class TestFormatQualificationForApi:
         assert out["blocker"] == "ci_not_green"
         assert out["started_at"] == "2026-05-21T10:00:00"
         assert out["finalized_at"] == "2026-05-21T10:30:00"
+        assert out["migration_safety"] == "block"
+        assert out["migration_safety_detail"] == "table rename pending"
+        assert out["migration_apply_safety"] == "warn"
+        assert out["migration_apply_safety_detail"] == "apply path has drift"
+        assert out["audit_findings"] == qual["audit_findings"]
+        assert out["excluded_audit_findings"] == qual["excluded_audit_findings"]
+        assert out["test_erosion_detail"] == {"deleted_test_files": 1}
+        assert out["smoketest_detail"] == {"passed": False}
+        assert out["audit_reconciliation"] == {"excluded_findings_count": 1}
+        assert out["promotion_pr_url"] == "https://example.com/pr/123"
+        assert out["promotion_conflict"] is True
+        assert out["promotion_error_detail"] == "merge conflict"
 
 
 # ===========================================================================
