@@ -27,6 +27,7 @@ from app.services import (
     _check_evaluating_timeouts,
     _chain_has_active_pipeline_work,
     _chain_has_recoverable_failed_work,
+    _chain_has_unexhausted_optimistic_retry_work,
     _supersede_long_queued_pipeline_tasks,
 )
 from app.rollup_management import _check_and_trigger_rollup
@@ -3294,3 +3295,456 @@ async def test_rollup_blocked_fix_child_keeps_parent_evaluating_no_completion_pa
     await eval_db.refresh(blocked_fix)
     assert blocked_fix.status == TaskStatus.BLOCKED
     assert (blocked_fix.context or {}).get("sentinel") == "untouched"
+
+
+# ── CI-backstop robustness: recoverability guard, requeue-keyed liveness,
+#    real-CI verify, fail-open, and the no-permanent-wedge regression guard ─────
+
+
+@pytest.mark.asyncio
+async def test_ci_backstop_defers_when_chain_has_recoverable_requeuing_child(
+    eval_db, mocker
+):
+    """Gap A: a CI-waiting parent past the backstop must NOT be FAILED (and its
+    children must NOT be cascade-cancelled) while the chain holds recoverable,
+    still-requeuing work — it defers within a bounded window instead.
+
+    Incident 2026-06-07 (research 5b250ecd): the backstop FAILED the parent and
+    cascade-cancelled a freshly-requeued, fully-recoverable fix child (53a75ed5).
+    Here the requeued fix child sits QUEUED, last touched >30min ago (so the
+    updated_at-keyed liveness guard does NOT catch it) but with optimistic-retry
+    budget still left — the reaper will requeue it again the moment a slot frees.
+    MUST FAIL pre-fix (the backstop unconditionally FAILs the parent and
+    cascade-cancels this non-terminal QUEUED child).
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+
+    project = Project(name="CI Backstop Recoverable Defer", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        status=TaskStatus.EVALUATING,
+        # ci_passed=False so it falls straight to the FAILED block; NO head_sha
+        # so the Gap-C real-CI verify is skipped and we exercise Gap A directly.
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "ci_wait_started": _naive_utc_ago(minutes=90).isoformat(),
+                "pr_number": 88001,
+                "original_task_id": "chain-recov",
+            }
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    # Recoverable requeuing fix child: QUEUED, last touched 50 min ago (past the
+    # 30-min liveness window) but optimistic-retry budget not yet spent. Must NOT
+    # be cascade-cancelled — it will be optimistically requeued again.
+    requeuing_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 88001,
+                "original_task_id": "chain-recov",
+                "prompt": "requeuing fix child",
+            }
+        ],
+        status=TaskStatus.QUEUED,
+        context={"_blocked_optimistic_retries": 1},
+        created_at=_naive_utc_ago(hours=2),
+        updated_at=_naive_utc_ago(minutes=50),
+    )
+    eval_db.add(requeuing_child)
+    await eval_db.commit()
+    await eval_db.refresh(requeuing_child)
+    child_id = requeuing_child.id
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    await eval_db.refresh(requeuing_child)
+    assert parent.status == TaskStatus.EVALUATING, (
+        f"Backstop must DEFER while a recoverable requeuing child exists, got "
+        f"{parent.status}: {parent.latest_status_message!r}"
+    )
+    assert requeuing_child.status == TaskStatus.QUEUED, (
+        f"Recoverable requeuing child must NOT be cascade-cancelled, got "
+        f"{requeuing_child.status}"
+    )
+    rl = (parent.context or {}).get("review_loop", {})
+    assert rl.get("_ci_backstop_first_defer_at"), (
+        "Backstop should stamp _ci_backstop_first_defer_at on first defer"
+    )
+    assert child_id == requeuing_child.id  # sanity
+
+
+@pytest.mark.asyncio
+async def test_chain_active_queued_child_keyed_on_last_transition_not_created_at(
+    eval_db,
+):
+    """Gap B: a QUEUED child created 2h ago whose last STATUS TRANSITION (the
+    optimistic BLOCKED → QUEUED requeue) was 2 min ago must count as live work —
+    keyed on the status_log transition timestamp, not created_at.
+
+    This is the 53a75ed5 shape: a fix child ran ~50 min, hit a transient blocked
+    precondition, and was optimistically requeued to QUEUED. created_at reads old
+    while the requeue transition is fresh. MUST FAIL pre-fix (the old code keyed
+    on created_at, so a 2h-old created_at → not-live → unprotected). Deliberately
+    NOT keyed on updated_at: any incidental row write refreshes updated_at, which
+    would let a genuinely-stuck-but-touched child defer the hard timeout forever
+    (see test_chain_active_stale_provisioning_does_not_count).
+    """
+    project = Project(name="Chain Queued Keyed Last Transition", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        status=TaskStatus.EVALUATING,
+        context={"review_loop": {"pr_number": 88002, "original_task_id": "chain-req"}},
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    requeued_child = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 88002,
+                "original_task_id": "chain-req",
+            }
+        ],
+        status=TaskStatus.QUEUED,
+        last_heartbeat=None,
+        # Created 2 hours ago (well past the 30-min queued_max_age threshold)…
+        created_at=_naive_utc_ago(hours=2),
+        # …but its last real status transition (the optimistic requeue, as the
+        # _on_status_set model listener records it) was 2 min ago.
+        status_log=[
+            {
+                "t": _naive_utc_ago(minutes=50).isoformat(),
+                "msg": "Status changed: IN_PROGRESS → BLOCKED",
+            },
+            {
+                "t": _naive_utc_ago(minutes=30).isoformat(),
+                "msg": "Optimistic infra-precondition retry 1/3",
+            },
+            {
+                "t": _naive_utc_ago(minutes=2).isoformat(),
+                "msg": "Status changed: BLOCKED → QUEUED",
+            },
+        ],
+    )
+    eval_db.add(requeued_child)
+    await eval_db.commit()
+
+    assert await _chain_has_active_pipeline_work(parent, eval_db) is True
+
+
+@pytest.mark.asyncio
+async def test_ci_backstop_routes_concluded_failure_to_ci_completion(eval_db, mocker):
+    """Gap C: when the PR's check-runs have actually CONCLUDED in failure before
+    the backstop fires, the parent must NOT be FAILED — the concluded result is
+    routed to handle_ci_completion (the CI-failure fix-spawn path) instead.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github_checks.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [],
+                "failed_logs": "boom",
+            }
+        ),
+    )
+    mock_handle = mocker.patch(
+        "app.ci_completion.handle_ci_completion",
+        new=AsyncMock(return_value=True),
+    )
+
+    project = Project(name="CI Backstop Concluded Failure", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "prompt": "concluded-fail task"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "ci_wait_started": _naive_utc_ago(minutes=90).isoformat(),
+                "pr_number": 88003,
+                "head_sha": "deadbeef",
+            }
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    mock_handle.assert_awaited()
+    assert parent.status != TaskStatus.FAILED, (
+        f"Parent must not be FAILED when CI concluded (routed to handler), got "
+        f"{parent.status}: {parent.latest_status_message!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ci_backstop_routes_concluded_success_to_ci_completion(eval_db, mocker):
+    """Gap C: when the PR's check-runs CONCLUDED in success before the backstop
+    fires, the parent must NOT be FAILED — the pass is recorded / wait cleared
+    via handle_ci_completion instead of timing out."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github_checks.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "success",
+                "details": [],
+                "failed_logs": "",
+            }
+        ),
+    )
+    mock_handle = mocker.patch(
+        "app.ci_completion.handle_ci_completion",
+        new=AsyncMock(return_value=True),
+    )
+
+    project = Project(name="CI Backstop Concluded Success", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "prompt": "concluded-pass task"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "ci_wait_started": _naive_utc_ago(minutes=90).isoformat(),
+                "pr_number": 88004,
+                "head_sha": "cafebabe",
+            }
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    mock_handle.assert_awaited()
+    assert parent.status != TaskStatus.FAILED, (
+        f"Parent must not be FAILED when CI concluded success, got {parent.status}: "
+        f"{parent.latest_status_message!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ci_backstop_fails_open_on_github_error(eval_db, mocker):
+    """Gap C fail-OPEN: a GitHub error during the real-CI re-verify must NOT block
+    the backstop — with no recoverable chain work, the parent still times out
+    (existing behaviour preserved)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    # GitHub returns an API-error-tagged result → fail open (no signal).
+    mocker.patch(
+        "app.github_checks.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "pending",
+                "conclusion": None,
+                "details": [],
+                "failed_logs": "",
+                "_from_api_error": True,
+            }
+        ),
+    )
+    mock_handle = mocker.patch(
+        "app.ci_completion.handle_ci_completion",
+        new=AsyncMock(return_value=True),
+    )
+
+    project = Project(name="CI Backstop Fail Open", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "prompt": "gh-error task"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "ci_wait_started": _naive_utc_ago(minutes=90).isoformat(),
+                "pr_number": 88005,
+                "head_sha": "f00ba12",
+            }
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    mock_handle.assert_not_awaited()
+    assert parent.status == TaskStatus.FAILED, (
+        f"Backstop must fail OPEN (still time out) on a GitHub error, got "
+        f"{parent.status}: {parent.latest_status_message!r}"
+    )
+    assert "backstop" in (parent.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_ci_backstop_fires_after_defer_window_and_exhausted_retries(
+    eval_db, mocker
+):
+    """Regression guard (no permanent wedge): once the optimistic-retry budget is
+    spent AND the bounded CI-backstop defer window has elapsed, the backstop must
+    still fire — the recoverability guard cannot wedge a parent forever."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+
+    from app.reaper_sweeps import _BLOCKED_OPTIMISTIC_RETRY_CAP
+
+    project = Project(name="CI Backstop Window Elapsed", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    # Defer marker set 7h ago — past the 6h CI_BACKSTOP_DEFER_WINDOW_HOURS — and
+    # an EVALUATING transition older still so the marker is not treated as stale.
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "wedge-guard parent"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "ci_wait_started": _naive_utc_ago(hours=9).isoformat(),
+                "pr_number": 88006,
+                "_ci_backstop_first_defer_at": _naive_utc_ago(hours=7).isoformat(),
+            }
+        },
+        status_log=[
+            {
+                "t": _naive_utc_ago(hours=10).isoformat(),
+                "msg": "Status changed: COMPLETED → EVALUATING",
+            }
+        ],
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    # A recoverable FAILED child still present, AND a QUEUED child whose optimistic
+    # retry budget is EXHAUSTED — neither may keep the backstop deferring once the
+    # window has elapsed.
+    recoverable_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "infra-failed child"}],
+        status=TaskStatus.FAILED,
+        context={"failure_category": "PROVISION_FAILURE"},
+    )
+    eval_db.add(recoverable_child)
+    exhausted_child = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 88006,
+                "original_task_id": str(parent.id),
+            }
+        ],
+        status=TaskStatus.QUEUED,
+        context={"_blocked_optimistic_retries": _BLOCKED_OPTIMISTIC_RETRY_CAP},
+        created_at=_naive_utc_ago(hours=2),
+        updated_at=_naive_utc_ago(hours=2),
+    )
+    eval_db.add(exhausted_child)
+    await eval_db.commit()
+
+    # The exhausted child must NOT count as unexhausted-optimistic-retry work.
+    assert (
+        await _chain_has_unexhausted_optimistic_retry_work(parent, eval_db) is False
+    )
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED, (
+        f"Backstop must still fire after the defer window elapses with exhausted "
+        f"retries (no permanent wedge), got {parent.status}: "
+        f"{parent.latest_status_message!r}"
+    )
