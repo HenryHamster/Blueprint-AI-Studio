@@ -1492,12 +1492,26 @@ async def get_research_actionability(
     research_task_ids: set[uuid.UUID] = {t.id for t in research_tasks}
 
     # Fetch follow-on tasks (same project, after oldest_cycle_at). We pull
-    # payloads so we can exclude research-type tasks below.
+    # payloads so we can exclude research-type tasks below. The generalized
+    # outcome walk (research_actionability -> task_outcomes.is_successful_outcome)
+    # additionally classifies CANCELLED follow-ons through
+    # direction_outcomes._is_cascade_cancelled, which reads
+    # latest_status_message — left deferred, that read lazy-loads inside the
+    # async session and raises MissingGreenlet (prod 2026-06-07). plan_output
+    # backs the read-only types' honest success signals (audit findings, memo
+    # artifact, verify-tests verdict), so without it a non-code follow-on
+    # silently scores neutral and grade_succeeded under-counts.
     followon_result = await session.execute(
         select(Task)
         .options(
             load_only(
-                Task.id, Task.status, Task.context, Task.created_at, Task.payloads
+                Task.id,
+                Task.status,
+                Task.context,
+                Task.created_at,
+                Task.payloads,
+                Task.latest_status_message,
+                Task.plan_output,
             )
         )
         .where(
