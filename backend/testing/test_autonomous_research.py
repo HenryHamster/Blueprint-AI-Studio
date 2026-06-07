@@ -2926,6 +2926,101 @@ async def test_all_findings_deduplicated_auto_completes_task(db_session, mocker)
 
 
 @pytest.mark.asyncio
+async def test_retry_with_preexisting_children_stays_evaluating_not_completed(
+    db_session, mocker
+):
+    """Retry false-complete guard: a research that already spawned children on a
+    prior attempt must NOT auto-complete when the current pass yields zero NEW
+    children (all findings deduped against those existing children).
+
+    Failure mode this guards against: on a retry, the research re-derives the same
+    findings, which hash-dedup against the children it already spawned, so the
+    current pass's ``child_tasks`` is empty. The zero-children COMPLETED branch
+    would orphan the live children — rollup machinery (_check_and_trigger_rollup)
+    early-returns unless the parent is EVALUATING, so the research/<id> -> automain
+    rollup PR would never open and all descendant work would strand on the
+    research branch. The task must instead end EVALUATING so rollup owns the
+    existing children.
+    """
+    direction = _active_direction("d-retrydup1", "Retry-dedup direction")
+    project = Project(
+        name="Retry Preexisting Children Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    dup_title = "Refactor authentication middleware"
+    dup_desc = "Middleware needs cleanup"
+    fhash = hashlib.sha256((dup_title + dup_desc).encode()).hexdigest()[:16]
+
+    # Child the research already spawned on attempt 1 — a live (EVALUATING)
+    # implementation task parented to this research, carrying the finding hash so
+    # the re-derived finding on the retry hash-dedups against it. This is the
+    # pre-existing child the rollup machinery still owns.
+    existing_child = Task(
+        project_id=project.id,
+        parent_task_id=task.id,
+        title=dup_title,
+        payloads=[{"type": "create", "prompt": "refactor it", "base_branch": "main"}],
+        context={"finding_hash": fhash, "direction_id": direction["id"]},
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(existing_child)
+    await db_session.commit()
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[
+            {
+                "title": dup_title,
+                "description": dup_desc,
+                "prompt": "Refactor auth middleware",
+                "priority": "medium",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction["id"],
+            }
+        ],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING, (
+        "Research that already owns children must stay EVALUATING (so rollup opens "
+        "its PR) even when the retry pass produces zero new children — it must NOT "
+        "false-complete to COMPLETED"
+    )
+    # The "auto-completed (no actionable tasks)" / "created 0 tasks" messaging must
+    # not be emitted: it would falsely claim the research produced nothing.
+    assert "auto-completed" not in (task.latest_status_message or "")
+    assert "0 tasks" not in (task.latest_status_message or "")
+
+    # No NEW children were spawned this pass; the single pre-existing child remains.
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    children = result.scalars().all()
+    assert len(children) == 1, (
+        "No new child should be spawned (finding deduped), and the pre-existing "
+        "child must remain owned by the still-EVALUATING research"
+    )
+    assert children[0].id == existing_child.id
+
+
+@pytest.mark.asyncio
 async def test_ghost_completion_does_not_block_rededup(db_session, mocker):
     """A COMPLETED task without pr_merged=True (ghost completion) must NOT block re-proposal."""
     direction = _active_direction("d-ghost01", "Ghost completion direction")

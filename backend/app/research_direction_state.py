@@ -883,7 +883,28 @@ async def _apply_terminal_transition(
     ``ux_task_active_idempotency_key`` when a peer already holds the task's
     idempotency key in an active status — the caller treats that as benign.
     """
+    # Retry/dedup false-complete guard: ``child_tasks`` is only the children
+    # spawned in THIS execution pass. A research task whose first attempt spawned
+    # children but did not durably finish gets retried; on the retry it re-derives
+    # the same findings, which now HASH-DEDUP against the children it already
+    # spawned, leaving this-pass ``child_tasks`` empty. Taking the zero-children
+    # COMPLETED branch here would orphan those live children: rollup machinery
+    # (_check_and_trigger_rollup) early-returns unless the parent is EVALUATING,
+    # so the research/<id> -> automain rollup PR never opens and all descendant
+    # work is stranded on the research branch. Before treating this as a genuine
+    # zero-children cycle, check for children created on a PRIOR pass.
+    has_existing_children = False
     if not child_tasks:
+        has_existing_children = bool(
+            (
+                await session.execute(
+                    select(Task.id).where(Task.parent_task_id == task.id).limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+    if not child_tasks and not has_existing_children:
         # findings_documented: research produced only metadata findings (direction_notes,
         # direction_proposals, or design_doc_observations counted in type_filtered_count)
         # with no implementation children — record as a successful documentation outcome.
@@ -968,7 +989,18 @@ async def _apply_terminal_transition(
         )
     else:
         task.status = TaskStatus.EVALUATING
-        task.latest_status_message = status_msg
+        if not child_tasks and has_existing_children:
+            # Routed here despite a zero-new-children pass because this research
+            # already owns children from a prior attempt (all of this pass's
+            # findings deduped against them). Do NOT emit the "created 0 tasks /
+            # no actionable tasks" messaging — it would falsely claim the
+            # research produced nothing. Rollup machinery owns the live children.
+            task.latest_status_message = (
+                f"Research re-derived already-spawned findings ({skipped_duplicates} "
+                "deduped against existing children) — awaiting rollup of existing children"
+            )
+        else:
+            task.latest_status_message = status_msg
         task.context = {
             **(task.context or {}),
             "research_branch": research_branch,
