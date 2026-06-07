@@ -1147,10 +1147,23 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
                     if member.leased_task_id is not None
                     else None
                 )
+                # EVALUATING counts as lease-fulfilled: a parent in EVALUATING
+                # is only waiting on children (which run on their own VMs) —
+                # its VM-side work is done and guard (b) above already proved
+                # the VM is dead. Without it, every EVALUATING parent that ran
+                # on a pool member left a LEASED row no cleanup path could
+                # touch (completion release fires only on terminal statuses,
+                # _ensure_vm_deleted skips governed members, the generic orphan
+                # sweep exempts LIVE_POOL_STATES, drain only takes IDLE) — the
+                # powered-off VM sat TERMINATED holding its 50GB SSD disk until
+                # the parent eventually completed. Five such zombies exhausted
+                # the region SSD_TOTAL_GB quota and halted all provisioning on
+                # 2026-06-07.
                 if leased_task is None or leased_task.status in (
                     TaskStatus.COMPLETED,
                     TaskStatus.FAILED,
                     TaskStatus.CANCELLED,
+                    TaskStatus.EVALUATING,
                 ):
                     reason = "pool_lease_orphaned"
         elif is_pool_vm_image_stale(member, stale_vm_ids):
