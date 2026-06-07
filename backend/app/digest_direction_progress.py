@@ -80,6 +80,7 @@ async def compute_direction_progress(
         _fallback_outcome_kind_breakdown,
         _merge_outcome_kind_breakdown,
     )
+    from app.digest_metrics import compute_format_compliance_metrics  # noqa: PLC0415
     from app.direction_outcomes import synthesize_prompt_quality_patterns
     from app.notification_dispatch import dispatch_external_notification
     from app.routers.admin_analytics import (
@@ -636,6 +637,10 @@ async def compute_direction_progress(
             for _ts, _t in _dir_rejections[:3]
         ]
 
+        _dir_fc = compute_format_compliance_metrics(tasks_for_dir)["overall"]
+        dir_format_compliance_rate = _dir_fc["format_compliance_rate"]
+        dir_self_repair_success_rate = _dir_fc["self_repair_success_rate"]
+
         cost_budget_usd = d.get("cost_budget_usd")
         budget_utilization_pct = None
         budget_exceeded = False
@@ -727,6 +732,8 @@ async def compute_direction_progress(
                     "decomposition_summary": decomposition_summary,
                     "first_attempt_success_rate": dir_fa_rate,
                     "first_attempt_sample_size": dir_fa_sample_size,
+                    "format_compliance_rate": dir_format_compliance_rate,
+                    "self_repair_success_rate": dir_self_repair_success_rate,
                     "quality_score": round(_compute_direction_quality_score(d), 3),
                     "lifetime_cycles": lifetime_cycles,
                     "lifetime_prs_merged": lifetime_prs_merged,

@@ -71,6 +71,36 @@ export interface RepairStructuredOutputResult<T> {
   retry: RunResult | null;
 }
 
+// Composes a re-ask prompt that leads with a reason-specific preamble so the
+// agent knows exactly what was wrong, then appends the caller's schema
+// restatement. When missReason is null (shouldn't happen on the repair path but
+// defensive), returns the caller's prompt unchanged.
+function buildMissAwarePrompt(
+  missReason: FormatMissReason | null,
+  requiredKeys: string[],
+  callerPrompt: string,
+): string {
+  let preamble: string;
+  switch (missReason) {
+    case 'no_json_start':
+      preamble = 'Your previous response contained no JSON object or array — output ONLY the JSON.';
+      break;
+    case 'unbalanced_json':
+    case 'malformed_json':
+      preamble = 'Your previous response contained incomplete or malformed JSON — emit the COMPLETE valid JSON.';
+      break;
+    case 'missing_required_key':
+    case 'no_matching_candidate':
+    case 'parsed_object_missing_key':
+    case 'parsed_array_missing_key':
+      preamble = `Your previous response was missing required keys: ${requiredKeys.map(k => `"${k}"`).join(', ')} — include all required keys.`;
+      break;
+    default:
+      return callerPrompt;
+  }
+  return `${preamble}\n\n${callerPrompt}`;
+}
+
 function buildSources(
   lastResultText: string,
   allOutput: string,
@@ -149,8 +179,9 @@ export async function repairStructuredOutput<T = unknown>(
     sendLog(ws, `[INFO] First structured-output attempt produced no parseable ${mode} (allOutput=${(first.allOutput || '').length}b, lastResultText=${(first.lastResultText || '').length}b). Reopening with focused continuation.\n`);
     if (retryStatus) statusRef.value = retryStatus;
 
+    const missAwarePrompt = buildMissAwarePrompt(firstAttempt.missReason, requiredKeys, reopenPrompt);
     const retryRun = await runClaudeCode(
-      reopenPrompt, ws, statusRef, model, effort, disallowedTools,
+      missAwarePrompt, ws, statusRef, model, effort, disallowedTools,
     );
     retry = {
       exitCode: retryRun.exitCode,

@@ -337,6 +337,34 @@ describe('handleStrategic executor prompt: atomic staged create-direction', () =
     // Steers AWAY from the old create-then-stage sequence for new ideas.
     expect(executorPrompt).toContain('Do NOT create-then-stage');
   });
+
+  it('treats problem_model reconstruction as the last resort after bounded repair', async () => {
+    vi.mocked(runClaudeCode).mockClear();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+    } as unknown as { ok: boolean; analysisText: string });
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '',
+    });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-last-resort',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    expect(executorPrompt).toContain('if the file is still missing, empty, or the JSON is malformed after the bounded repair reopen');
+  });
 });
 
 describe('handleStrategic operator_overrides wiring', () => {

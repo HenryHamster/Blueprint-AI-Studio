@@ -1,10 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+const fsMockState = vi.hoisted(() => ({
+  presentFiles: new Set<string>(),
+}));
+
 vi.mock('fs', () => ({
   default: {
     readFileSync: vi.fn().mockReturnValue(''),
-    writeFileSync: vi.fn(),
-    existsSync: vi.fn().mockReturnValue(false),
+    writeFileSync: vi.fn((path: string) => {
+      if (typeof path === 'string') fsMockState.presentFiles.add(path);
+    }),
+    existsSync: vi.fn((path: string) => fsMockState.presentFiles.has(path)),
     appendFileSync: vi.fn(),
   },
 }));
@@ -468,83 +474,79 @@ describe('runThinkerWithGate', () => {
   const mockExistsSync = vi.mocked(fs.existsSync as (p: string) => boolean);
 
   const taskId = 'test-task-123';
+  const problemModelPath = `/tmp/problem_model_${taskId}.json`;
+  const runningUpdatePath = `/tmp/running_update_${taskId}.md`;
   const ws = null;
   const statusRef = { value: '' };
 
-  const okThinkerResult = { exitCode: 0, allOutput: 'analysis output', lastResultText: 'analysis text' };
+  const okThinkerResult = {
+    exitCode: 0,
+    allOutput: '{"intent":{"purpose":"ok"},"gaps":[]}',
+    lastResultText: '{"intent":{"purpose":"ok"},"gaps":[]}',
+  };
   const failThinkerResult = { exitCode: 1, allOutput: 'crash output', lastResultText: '' };
 
   beforeEach(() => {
     // resetAllMocks clears queued mockReturnValueOnce values too, preventing
     // bleed-over between tests. Re-setup defaults after the reset.
     vi.resetAllMocks();
+    fsMockState.presentFiles.clear();
     mockRunClaudeCode.mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
     mockPersistAndPostStatus.mockResolvedValue(undefined);
-    mockExistsSync.mockReturnValue(false); // default: files absent
+    mockExistsSync.mockImplementation((path: string) => fsMockState.presentFiles.has(path));
   });
 
   it('(a) thinker exits 0 + both files present → returns ok with analysisText, executor eligible', async () => {
     mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
-    mockExistsSync.mockReturnValue(true); // both files present
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.presentFiles.add(runningUpdatePath);
 
     const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
 
-    expect(result).toEqual({ ok: true, analysisText: 'analysis text' });
+    expect(result).toEqual({ ok: true, analysisText: '{"intent":{"purpose":"ok"},"gaps":[]}' });
     expect(mockRunClaudeCode).toHaveBeenCalledTimes(1);
     expect(mockPersistAndPostStatus).not.toHaveBeenCalled();
   });
 
-  it('(b) thinker exits 0 + files missing → focused retry runs and creates them, returns ok', async () => {
+  it('(b) clean exit with unparseable problem_model reopens once, writes the recovered model, and skips manual fallback', async () => {
     mockRunClaudeCode
-      .mockResolvedValueOnce(okThinkerResult)           // pass-1 thinker
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'retry output', lastResultText: '' }); // focused retry
-
-    // filesPresent() uses short-circuit: only problemModelPath is checked when it returns false.
-    // Sequence: outer filesPresent(problem→false), missing[](problem→false, running→false),
-    //           inner filesPresent(problem→true, running→true).
-    mockExistsSync
-      .mockReturnValueOnce(false) // outer filesPresent: problem_model (short-circuits)
-      .mockReturnValueOnce(false) // missing[] check: problem_model
-      .mockReturnValueOnce(false) // missing[] check: running_update
-      .mockReturnValueOnce(true)  // inner filesPresent: problem_model
-      .mockReturnValueOnce(true); // inner filesPresent: running_update
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'analysis output without JSON', lastResultText: '' })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '{"intent":{"purpose":"repaired"},"gaps":[]}',
+        lastResultText: '{"intent":{"purpose":"repaired"},"gaps":[]}',
+      });
+    fsMockState.presentFiles.add(runningUpdatePath);
 
     const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
 
-    expect(result.ok).toBe(true);
+    expect(result).toEqual({ ok: true, analysisText: 'analysis output without JSON' });
     expect(mockRunClaudeCode).toHaveBeenCalledTimes(2);
-    // The focused retry is a fresh session — it must embed the thinker's PRIOR
-    // OUTPUT verbatim so it has real content to extract, instead of asking it to
-    // recall "your prior analysis" it cannot see (regression for the 2026-06-03
-    // "I can't manufacture that completeness from an empty context" refusal that
-    // failed every strategic_review with strategic_thinker_artifacts_missing).
-    const retryPrompt = mockRunClaudeCode.mock.calls[1][0];
-    expect(retryPrompt).toContain('were not written to disk');
-    expect(retryPrompt).toContain('FRESH session');
-    expect(retryPrompt).toContain('YOUR PREVIOUS ANALYSIS OUTPUT');
-    expect(retryPrompt).toContain('analysis output'); // okThinkerResult.allOutput, embedded verbatim
+    const reopenPrompt = mockRunClaudeCode.mock.calls[1][0];
+    expect(reopenPrompt).toContain('Output ONLY the problem_model JSON object now');
+    expect(reopenPrompt).toContain(problemModelPath);
+    expect(fsMockState.presentFiles.has(problemModelPath)).toBe(true);
     expect(mockPersistAndPostStatus).not.toHaveBeenCalled();
   });
 
-  it('(c) retry still misses files → executor never runs, persistAndPostStatus called with FAILED + failure_category', async () => {
+  it('(c) repair still fails, so the legacy focused retry remains the last resort for missing files', async () => {
     mockRunClaudeCode
-      .mockResolvedValueOnce(okThinkerResult)           // pass-1 thinker
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'retry output', lastResultText: '' }); // focused retry
-    // mockExistsSync default (from beforeEach): always false
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'analysis output without JSON', lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'still not parseable', lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'retry output', lastResultText: '' });
 
     const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
 
     expect(result).toEqual({ ok: false });
-    expect(mockRunClaudeCode).toHaveBeenCalledTimes(2);
+    expect(mockRunClaudeCode).toHaveBeenCalledTimes(3);
     expect(mockPersistAndPostStatus).toHaveBeenCalledOnce();
     const statusArg = mockPersistAndPostStatus.mock.calls[0][1];
     expect(statusArg.status).toBe('FAILED');
     expect(statusArg.failure_category).toBe('strategic_thinker_artifacts_missing');
   });
 
-  it('(d) thinker exits non-zero → FAILED posted, no retry, returns ok: false', async () => {
+  it('(d) thinker exits non-zero → FAILED posted, no repair reopen, returns ok: false', async () => {
     mockRunClaudeCode.mockResolvedValueOnce(failThinkerResult);
-    // mockExistsSync default (from beforeEach): always false
 
     const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
 

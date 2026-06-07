@@ -5217,3 +5217,93 @@ async def test_unproven_merge_details_capped_at_five(
     await db_session.refresh(project)
     entry = project.directions[0]["research_history"][0]
     assert len(entry["unproven_merge_details"]) == 5
+
+
+@pytest.mark.asyncio
+async def test_per_direction_format_metrics_have_a_consumer_or_are_retired(
+    db_session: AsyncSession,
+):
+    """format_compliance_rate and self_repair_success_rate are emitted with named consumers.
+
+    Exercises _update_direction_research_outcomes to verify these fields are
+    computed from child-task format_compliance_summary telemetry and stored in
+    the research_history entry. The manifest entries must have a named consumer
+    (not pending), confirming d-e0800012's requirement that every decision-critical
+    metric has a named reader.
+    """
+    from app.direction_outcomes import RESEARCH_HISTORY_METRIC_MANIFEST
+
+    # Verify manifest entries have been promoted from pending to consumer.
+    fc_entry = RESEARCH_HISTORY_METRIC_MANIFEST["format_compliance_rate"]
+    sr_entry = RESEARCH_HISTORY_METRIC_MANIFEST["self_repair_success_rate"]
+    assert "consumer" in fc_entry, (
+        "format_compliance_rate must have a named consumer in RESEARCH_HISTORY_METRIC_MANIFEST"
+    )
+    assert "consumer" in sr_entry, (
+        "self_repair_success_rate must have a named consumer in RESEARCH_HISTORY_METRIC_MANIFEST"
+    )
+
+    # Functional check: verify the fields are correctly computed and stored.
+    direction_id = "d-format-consumer-check"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
+    await db_session.flush()
+
+    # Well-formed task: format_error_total == 0.
+    well_formed = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="well-formed",
+    )
+    well_formed.format_compliance_summary = {
+        "format_error_total": 0,
+        "format_repair_attempts": 0,
+        "format_repair_successes": 0,
+    }
+
+    # Malformed task: had one error, attempted repair (succeeded).
+    malformed = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="malformed-repaired",
+    )
+    malformed.format_compliance_summary = {
+        "format_error_total": 1,
+        "format_repair_attempts": 1,
+        "format_repair_successes": 1,
+    }
+
+    # Task without telemetry — must be excluded from measurement.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="no-telemetry",
+    )
+
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+
+    # 2 measured tasks: 1 well-formed → 50% compliance rate.
+    assert entry["format_compliance_rate"] == 0.5
+    # 1 repair attempt, 1 success → 100% repair success rate.
+    assert entry["self_repair_success_rate"] == 1.0

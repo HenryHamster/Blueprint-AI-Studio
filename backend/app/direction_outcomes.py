@@ -531,14 +531,10 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     # per-direction copies are emitted for a future strategic/operator reader and
     # carry no consumer yet, so they are declared pending (not consumer).
     "format_compliance_rate": {
-        "status": "pending",
-        "reason": "per-cycle well-formed-output rate over child tasks' format_compliance_summary; live decision surface is the windowed digest measure compute_format_compliance_metrics (digest_metrics.py -> routers/admin_digest.py 'format_compliance'). Per-direction copy awaits a strategic/operator reader",
-        "date": "2026-06-07",
+        "consumer": "digest_direction_progress.py, DirectionProgressSection.tsx (per-direction expanded panel)"
     },
     "self_repair_success_rate": {
-        "status": "pending",
-        "reason": "per-cycle self-repair success rate (Σ successes / Σ attempts) over child tasks' format_compliance_summary; live decision surface is the windowed digest measure compute_format_compliance_metrics (digest_metrics.py -> routers/admin_digest.py 'format_compliance'). Per-direction copy awaits a strategic/operator reader",
-        "date": "2026-06-07",
+        "consumer": "digest_direction_progress.py, DirectionProgressSection.tsx (per-direction expanded panel)"
     },
     # --- Review-quality signals ---
     "reviews_dismissed": {

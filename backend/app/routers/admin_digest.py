@@ -1334,7 +1334,8 @@ async def _compute_digest(
         completed_tasks + failed_tasks
     )
     _format_compliance = compute_format_compliance_metrics(
-        completed_tasks + failed_tasks
+        completed_tasks + failed_tasks,
+        prev_terminal_tasks=prev_completed_tasks + prev_failed_tasks,
     )
 
     # Migration-serialization-slot contention (read-only) — surfaces whether a

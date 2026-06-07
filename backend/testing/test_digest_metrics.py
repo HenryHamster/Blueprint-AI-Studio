@@ -4570,3 +4570,125 @@ def test_format_compliance_metrics_empty_list():
     assert result["overall"]["format_compliance_rate"] is None
     assert result["overall"]["self_repair_success_rate"] is None
     assert result["by_type"] == {}
+
+
+def _fc_clean(task_type="create"):
+    """Task with a clean (well-formed) format_compliance_summary."""
+    return _fc_task(
+        task_type,
+        {
+            "format_error_total": 0,
+            "format_repair_attempts": 0,
+            "format_repair_successes": 0,
+        },
+    )
+
+
+def _fc_miss(task_type="create"):
+    """Task with one format miss, one repair attempt, one success."""
+    return _fc_task(
+        task_type,
+        {
+            "format_error_total": 1,
+            "format_repair_attempts": 1,
+            "format_repair_successes": 1,
+        },
+    )
+
+
+def test_format_compliance_reports_prior_window_and_trend():
+    """Acceptance test: prior-window rate + trend appear in overall and by_type.
+
+    Current window: 8 clean / 10 measured → compliance_rate = 0.8
+    Prior window:   4 clean / 10 measured → compliance_rate = 0.4
+    Delta = 0.4 > 0.05 → trend = "improving"
+    """
+    curr_tasks = [_fc_clean() for _ in range(8)] + [_fc_miss() for _ in range(2)]
+    prev_tasks = [_fc_clean() for _ in range(4)] + [_fc_miss() for _ in range(6)]
+
+    result = compute_format_compliance_metrics(curr_tasks, prev_terminal_tasks=prev_tasks)
+    overall = result["overall"]
+
+    assert overall["format_compliance_rate"] == pytest.approx(0.8)
+    assert overall["prev_format_compliance_rate"] == pytest.approx(0.4)
+    assert overall["trend"] == "improving"
+    # Self-repair: curr has 2 attempts/successes → 1.0; prev has 6 attempts/successes → 1.0.
+    assert overall["self_repair_success_rate"] == 1.0
+    assert overall["prev_self_repair_success_rate"] == 1.0
+
+    # by_type "create" block also carries the comparison fields.
+    create = result["by_type"]["create"]
+    assert "prev_format_compliance_rate" in create
+    assert "prev_self_repair_success_rate" in create
+    assert "trend" in create
+
+
+def test_compute_format_compliance_metrics_trend_stable():
+    """Delta ≤ 0.05 in either direction produces trend = 'stable'."""
+    # curr = 0.7, prev = 0.72 → delta = -0.02 → stable
+    curr = [_fc_clean() for _ in range(7)] + [_fc_miss() for _ in range(3)]
+    prev = [_fc_clean() for _ in range(72)] + [_fc_miss() for _ in range(28)]
+
+    result = compute_format_compliance_metrics(curr, prev_terminal_tasks=prev)
+    assert result["overall"]["trend"] == "stable"
+
+
+def test_compute_format_compliance_metrics_trend_declining():
+    """Delta < -0.05 produces trend = 'declining'."""
+    # curr = 0.4, prev = 0.8 → delta = -0.4 → declining
+    curr = [_fc_clean() for _ in range(4)] + [_fc_miss() for _ in range(6)]
+    prev = [_fc_clean() for _ in range(8)] + [_fc_miss() for _ in range(2)]
+
+    result = compute_format_compliance_metrics(curr, prev_terminal_tasks=prev)
+    assert result["overall"]["trend"] == "declining"
+    assert result["overall"]["prev_format_compliance_rate"] == pytest.approx(0.8)
+
+
+def test_compute_format_compliance_metrics_no_prev():
+    """Without prev_terminal_tasks the snapshot keys are absent (backward-compat)."""
+    tasks = [_fc_clean()]
+    result = compute_format_compliance_metrics(tasks)
+    overall = result["overall"]
+    assert "trend" not in overall
+    assert "prev_format_compliance_rate" not in overall
+    assert "prev_self_repair_success_rate" not in overall
+
+
+def test_compute_format_compliance_metrics_prev_empty_denominator():
+    """Prev window with no measured tasks yields None prev rates and None trend."""
+    curr = [_fc_clean()]
+    prev = [_fc_task("create", None)]  # NULL summary → not measured
+
+    result = compute_format_compliance_metrics(curr, prev_terminal_tasks=prev)
+    overall = result["overall"]
+    assert overall["prev_format_compliance_rate"] is None
+    assert overall["trend"] is None
+
+
+def test_compute_format_compliance_metrics_by_type_trend():
+    """Per-type blocks carry prev/trend; types absent in curr but present in prev appear."""
+    curr_tasks = [
+        _fc_clean("create"),
+        _fc_clean("create"),
+        # No "fix" tasks in current window
+    ]
+    prev_tasks = [
+        _fc_miss("create"),
+        _fc_miss("create"),
+        _fc_clean("fix"),  # "fix" only in prev
+    ]
+
+    result = compute_format_compliance_metrics(curr_tasks, prev_terminal_tasks=prev_tasks)
+
+    # "create": curr=1.0, prev=0.0 → improving
+    create = result["by_type"]["create"]
+    assert create["format_compliance_rate"] == 1.0
+    assert create["prev_format_compliance_rate"] == 0.0
+    assert create["trend"] == "improving"
+
+    # "fix": absent in curr → 0 tasks measured, rate None; prev=1.0 → trend None
+    fix = result["by_type"]["fix"]
+    assert fix["tasks_measured"] == 0
+    assert fix["format_compliance_rate"] is None
+    assert fix["prev_format_compliance_rate"] == 1.0
+    assert fix["trend"] is None

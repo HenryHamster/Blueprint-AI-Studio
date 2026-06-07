@@ -275,7 +275,22 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
     }
 
 
-def compute_format_compliance_metrics(terminal_tasks: List[Task]) -> Dict[str, Any]:
+def _format_compliance_trend(curr_rate: float | None, prev_rate: float | None) -> str | None:
+    """Compute improving/declining/stable trend using ±0.05 threshold (mirrors _compute_first_attempt_breakdowns)."""
+    if curr_rate is None or prev_rate is None:
+        return None
+    delta = curr_rate - prev_rate
+    if delta > 0.05:
+        return "improving"
+    if delta < -0.05:
+        return "declining"
+    return "stable"
+
+
+def compute_format_compliance_metrics(
+    terminal_tasks: List[Task],
+    prev_terminal_tasks: List[Task] | None = None,
+) -> Dict[str, Any]:
     """Windowed structured-output format-compliance + self-repair-success measure.
 
     Pure function — no database calls. Aggregates the per-task
@@ -299,6 +314,12 @@ def compute_format_compliance_metrics(terminal_tasks: List[Task]) -> Dict[str, A
     (ground truth), so neither rate is gameable by the agent's self-report.
     Tasks with a NULL/missing ``format_compliance_summary`` are not counted.
 
+    When ``prev_terminal_tasks`` is supplied (the immediately prior window),
+    each block gains ``trend`` (improving / declining / stable / None),
+    ``prev_format_compliance_rate``, and ``prev_self_repair_success_rate``
+    alongside the existing snapshot keys, mirroring the before/after shape of
+    ``_compute_first_attempt_breakdowns``.
+
     Returns ``{"overall": <block>, "by_type": {<task type>: <block>}}`` where
     each block is the dict produced by ``_accumulate_format_compliance``.
     """
@@ -313,6 +334,32 @@ def compute_format_compliance_metrics(terminal_tasks: List[Task]) -> Dict[str, A
         task_type: _accumulate_format_compliance(tasks)
         for task_type, tasks in by_type_groups.items()
     }
+
+    if prev_terminal_tasks is not None:
+        prev_overall = _accumulate_format_compliance(prev_terminal_tasks)
+        overall["prev_format_compliance_rate"] = prev_overall["format_compliance_rate"]
+        overall["prev_self_repair_success_rate"] = prev_overall["self_repair_success_rate"]
+        overall["trend"] = _format_compliance_trend(
+            overall["format_compliance_rate"], prev_overall["format_compliance_rate"]
+        )
+
+        prev_by_type_groups: Dict[str, list] = {}
+        for t in prev_terminal_tasks:
+            if not isinstance(getattr(t, "format_compliance_summary", None), dict):
+                continue
+            task_type = (t.first_payload or {}).get("type", "create")
+            prev_by_type_groups.setdefault(task_type, []).append(t)
+
+        for task_type in set(by_type) | set(prev_by_type_groups):
+            curr_block = by_type.get(task_type) or _accumulate_format_compliance([])
+            prev_block = _accumulate_format_compliance(prev_by_type_groups.get(task_type) or [])
+            curr_block["prev_format_compliance_rate"] = prev_block["format_compliance_rate"]
+            curr_block["prev_self_repair_success_rate"] = prev_block["self_repair_success_rate"]
+            curr_block["trend"] = _format_compliance_trend(
+                curr_block["format_compliance_rate"], prev_block["format_compliance_rate"]
+            )
+            by_type[task_type] = curr_block
+
     return {"overall": overall, "by_type": by_type}
 
 

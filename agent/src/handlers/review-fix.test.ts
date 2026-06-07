@@ -135,6 +135,7 @@ import { resolveBuildConfig } from '../build-config.js';
 import { shouldFanOutReview, shouldFanOutFix } from '../constants.js';
 import { computePromptFingerprint, buildScopedLintOneliner } from '../prompt.js';
 import { writeFetchHelper, PLAN_FETCH_VERBS } from './strategic-helpers.js';
+import { getFormatComplianceTelemetry, resetFormatComplianceTelemetry } from '../telemetry.js';
 
 const BLUEPRINT_CONFIG = {
   directories: [
@@ -169,6 +170,7 @@ function capturedFixOpts(): Parameters<typeof runCodeChangeTask>[0] {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  resetFormatComplianceTelemetry();
   vi.mocked(fs.existsSync).mockReturnValue(false);
   vi.mocked(fs.readFileSync).mockReturnValue('');
   // Default: ls-remote returns a ref line (branch exists) so handleReview tests
@@ -930,39 +932,121 @@ describe('handleReview — verdict file parsing', () => {
     ]);
   });
 
-  it('falls back to output parsing when verdict file contains malformed JSON', async () => {
+  it('repairs a clean-exit review verdict when the temp file is malformed and preserves augmentation', async () => {
     vi.mocked(fs.existsSync).mockReturnValue(true);
     vi.mocked(fs.readFileSync).mockReturnValue('not json at all');
-    vi.mocked(indexMod.runClaudeCode).mockResolvedValue({
-      exitCode: 0, allOutput: 'some claude output', lastResultText: 'last text',
-    });
+    vi.mocked(indexMod.runClaudeCode)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '{"verdict":"REQUEST_CHANGES","feedback":"incomplete",}',
+        lastResultText: '{"verdict":"REQUEST_CHANGES","feedback":"incomplete",}',
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '{"verdict":"REQUEST_CHANGES","feedback":"repair succeeded"}',
+        lastResultText: '{"verdict":"REQUEST_CHANGES","feedback":"repair succeeded"}',
+      });
+    vi.mocked(indexMod.extractInvestigatedFiles).mockReturnValueOnce([
+      'agent/src/handlers/review-fix.ts',
+    ]);
 
     await handleReview(
       'task-2', basePayload, { context: { scope: 'medium' } },
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
+    expect(vi.mocked(indexMod.runClaudeCode)).toHaveBeenCalledTimes(2);
+    const repairPrompt = vi.mocked(indexMod.runClaudeCode).mock.calls[1][0];
+    expect(repairPrompt).toContain('ONLY the JSON object');
+    expect(repairPrompt).toContain('/tmp/review_verdict_task-2.json');
+
     const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1];
     expect(status.status).toBe('COMPLETED');
-    expect(status.verdict_json).toBeUndefined();
-    expect(String(status.logs)).toBe('last text');
+    const verdictJson = JSON.parse(String(status.verdict_json)) as { verdict: string; feedback: string; investigated_files: string[] };
+    expect(verdictJson.verdict).toBe('REQUEST_CHANGES');
+    expect(verdictJson.feedback).toBe('repair succeeded');
+    expect(verdictJson.investigated_files).toEqual(['agent/src/handlers/review-fix.ts']);
+    expect(String(status.logs)).toContain('"verdict":"REQUEST_CHANGES"');
+
+    expect(getFormatComplianceTelemetry()).toEqual({
+      format_miss_by_reason: { malformed_json: 1 },
+      format_error_total: 1,
+      format_repair_attempts: 1,
+      format_repair_successes: 1,
+    });
   });
 
-  it('falls back to output parsing when verdict file contains JSON without verdict field', async () => {
+  it('repairs a clean-exit review verdict when the temp file is absent and preserves augmentation', async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(indexMod.runClaudeCode)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: 'plain review output with no JSON',
+        lastResultText: 'plain review output with no JSON',
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '{"verdict":"APPROVE","feedback":"repaired verdict"}',
+        lastResultText: '{"verdict":"APPROVE","feedback":"repaired verdict"}',
+      });
+    vi.mocked(indexMod.extractInvestigatedFiles).mockReturnValueOnce([
+      'agent/src/handlers/review-fix.ts',
+      'agent/src/prompts/review-prompt.ts',
+    ]);
+
+    await handleReview(
+      'task-2b', basePayload, { context: { scope: 'medium' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(vi.mocked(indexMod.runClaudeCode)).toHaveBeenCalledTimes(2);
+    const repairPrompt = vi.mocked(indexMod.runClaudeCode).mock.calls[1][0];
+    expect(repairPrompt).toContain('ONLY the JSON object');
+    expect(repairPrompt).toContain('/tmp/review_verdict_task-2b.json');
+
+    const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1];
+    const verdictJson = JSON.parse(String(status.verdict_json)) as { verdict: string; feedback: string; investigated_files: string[] };
+    expect(verdictJson.verdict).toBe('APPROVE');
+    expect(verdictJson.feedback).toBe('repaired verdict');
+    expect(verdictJson.investigated_files).toEqual([
+      'agent/src/handlers/review-fix.ts',
+      'agent/src/prompts/review-prompt.ts',
+    ]);
+    expect(String(status.logs)).toContain('"verdict":"APPROVE"');
+
+    expect(getFormatComplianceTelemetry()).toEqual({
+      format_miss_by_reason: { missing_required_key: 1 },
+      format_error_total: 1,
+      format_repair_attempts: 1,
+      format_repair_successes: 1,
+    });
+  });
+
+  it('repairs a clean-exit review verdict when the temp file has JSON without verdict field', async () => {
     vi.mocked(fs.existsSync).mockReturnValue(true);
     vi.mocked(fs.readFileSync).mockReturnValue('{"feedback":"orphan"}');
-    vi.mocked(indexMod.runClaudeCode).mockResolvedValue({
-      exitCode: 0, allOutput: 'out', lastResultText: 'last',
-    });
+    vi.mocked(indexMod.runClaudeCode)
+      .mockResolvedValueOnce({
+        exitCode: 0, allOutput: 'no verdict in the first pass', lastResultText: 'no verdict in the first pass',
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '{"verdict":"APPROVE","feedback":"repaired verdict"}',
+        lastResultText: '{"verdict":"APPROVE","feedback":"repaired verdict"}',
+      });
 
     await handleReview(
       'task-3', basePayload, { context: { scope: 'medium' } },
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
+    expect(vi.mocked(indexMod.runClaudeCode)).toHaveBeenCalledTimes(2);
     const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1];
-    expect(status.verdict_json).toBeUndefined();
-    expect(String(status.logs)).toBe('last');
+    const verdictJson = JSON.parse(String(status.verdict_json)) as { verdict: string; feedback: string };
+    expect(verdictJson.verdict).toBe('APPROVE');
+    expect(verdictJson.feedback).toBe('repaired verdict');
+    expect(status.verdict_json).toBeDefined();
+    expect(String(status.logs)).toContain('"verdict":"APPROVE"');
   });
 
   it('passes review taskType, scope, and direction_id to formatProjectContext', async () => {
@@ -1004,6 +1088,7 @@ describe('handleReview — verdict file parsing', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
+    expect(vi.mocked(indexMod.runClaudeCode)).toHaveBeenCalledTimes(1);
     const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1];
     expect(status.status).toBe('FAILED');
     expect(status.failure_category).toBe('claude_code_failed');
@@ -2306,7 +2391,7 @@ describe('handleReview structural prompt invariants', () => {
     await handleReview('task-rev', REVIEW_PAYLOAD, REVIEW_TASK, 'token', 'owner', 'repo', null, statusRef());
     const calls = vi.mocked(indexMod.runClaudeCode).mock.calls;
     if (calls.length === 0) throw new Error('runClaudeCode was not invoked');
-    return calls[calls.length - 1][0];
+    return calls[0][0];
   }
 
   it('handleReview prompt includes DEFAULT_TOOL_GUIDANCE', async () => {
@@ -2433,7 +2518,7 @@ describe('handleReview — rollup-PR guidance staging prefixes', () => {
   function lastReviewPrompt(): string {
     const calls = vi.mocked(indexMod.runClaudeCode).mock.calls;
     if (calls.length === 0) throw new Error('runClaudeCode was not invoked');
-    return calls[calls.length - 1][0];
+    return calls[0][0];
   }
 
   it('injects rollup guidance when a custom staging prefix matches the head branch', async () => {
@@ -2544,7 +2629,7 @@ describe('handleReview — delta-focus guidance (iteration ≥2)', () => {
   function lastReviewPrompt(): string {
     const calls = vi.mocked(indexMod.runClaudeCode).mock.calls;
     if (calls.length === 0) throw new Error('runClaudeCode was not invoked');
-    return calls[calls.length - 1][0];
+    return calls[0][0];
   }
 
   it('does NOT emit delta-focus guidance on iteration 1 (full-rigor first pass preserved)', async () => {
@@ -2700,7 +2785,7 @@ describe('handleReview — parallel-review fan-out gating', () => {
   function lastReviewPrompt(): string {
     const calls = vi.mocked(indexMod.runClaudeCode).mock.calls;
     if (calls.length === 0) throw new Error('runClaudeCode was not invoked');
-    return calls[calls.length - 1][0];
+    return calls[0][0];
   }
 
   it('injects PARALLEL_REVIEW_GUIDANCE when the project flag is on and threshold is met', async () => {

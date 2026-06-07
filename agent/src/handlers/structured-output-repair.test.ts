@@ -110,15 +110,20 @@ describe('repairStructuredOutput', () => {
       })),
     );
 
-    // Exactly ONE reopen, and the continuation prompt re-states the schema.
+    // Exactly ONE reopen, and the continuation prompt contains the caller's schema restatement.
     expect(vi.mocked(runClaudeCode).mock.calls.length).toBe(1);
-    expect(vi.mocked(runClaudeCode).mock.calls[0][0]).toBe(REOPEN_PROMPT);
+    const sentPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(sentPrompt).toContain(REOPEN_PROMPT);
+    // The miss reason for text without the required key substrings is missing_required_key,
+    // and the preamble names the specific missing keys.
+    expect(sentPrompt).toContain('missing required keys');
+    expect(sentPrompt).toContain('"summary"');
     // Telemetry: one miss (bucketed by the verdict reason), one attempt, one
     // success — in that order.
     expect(recordFormatMiss).toHaveBeenCalledTimes(1);
     expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
     expect(recordFormatRepairSuccess).toHaveBeenCalledTimes(1);
-    // The miss is bucketed by the extraction verdict (no JSON markers present →
+    // The miss is bucketed by the extraction verdict (no quoted key substrings →
     // missing_required_key), NOT a re-derived label.
     expect(vi.mocked(recordFormatMiss).mock.calls[0][0]).toBe('missing_required_key');
     // The repaired value is returned, with the retry run surfaced for the caller.
@@ -212,5 +217,65 @@ describe('repairStructuredOutput', () => {
     });
 
     expect(statusRef.value).toBe('Repairing structured output...');
+  });
+
+  // ── reopen prompt is tailored to the extraction miss reason ──────────────────
+
+  it('no_json_start: preamble tells agent it emitted no JSON', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,
+      codexTurnCompleted: true, stderrTail: '',
+    });
+    // Text contains the required keys as quoted substrings (so extractor passes
+    // the key-presence check) but has no `{` → no_json_start.
+    const noJsonText = 'Please provide values for "summary" and "reasoning" fields.';
+
+    await repairStructuredOutput(
+      baseOpts(makeFirst({ exitCode: 0, lastResultText: noJsonText, allOutput: '' })),
+    );
+
+    const sentPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(sentPrompt).toContain('no JSON object or array');
+    expect(sentPrompt).toContain(REOPEN_PROMPT);
+    expect(vi.mocked(recordFormatMiss).mock.calls[0][0]).toBe('no_json_start');
+  });
+
+  it('missing_required_key: preamble names the specific unmet required keys', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,
+      codexTurnCompleted: true, stderrTail: '',
+    });
+    // Text has no quoted key substrings → missing_required_key.
+    const missingKeyText = 'Here is some output without the required fields.';
+
+    await repairStructuredOutput(
+      baseOpts(makeFirst({ exitCode: 0, lastResultText: missingKeyText, allOutput: '' })),
+    );
+
+    const sentPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(sentPrompt).toContain('missing required keys');
+    expect(sentPrompt).toContain('"summary"');
+    expect(sentPrompt).toContain('"reasoning"');
+    expect(sentPrompt).toContain(REOPEN_PROMPT);
+    expect(vi.mocked(recordFormatMiss).mock.calls[0][0]).toBe('missing_required_key');
+  });
+
+  it('malformed_json: preamble tells agent the JSON was incomplete or malformed', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,
+      codexTurnCompleted: true, stderrTail: '',
+    });
+    // Contains both keys and `{}`  but JSON.parse throws (bareword value) →
+    // JsonExtractionError → bucketed as malformed_json.
+    const malformedText = '{"summary": "ok", "reasoning": notquoted}';
+
+    await repairStructuredOutput(
+      baseOpts(makeFirst({ exitCode: 0, lastResultText: malformedText, allOutput: '' })),
+    );
+
+    const sentPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(sentPrompt).toContain('incomplete or malformed JSON');
+    expect(sentPrompt).toContain(REOPEN_PROMPT);
+    expect(vi.mocked(recordFormatMiss).mock.calls[0][0]).toBe('malformed_json');
   });
 });
