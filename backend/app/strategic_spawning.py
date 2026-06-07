@@ -17,7 +17,11 @@ from sqlmodel import select
 
 from app import strategic_cycle
 from app.direction_metrics import _compute_direction_quality_score
-from app.direction_outcomes import verified_merged_count
+from app.direction_outcomes import (
+    declared_merged_count,
+    proven_merged_count,
+    verified_merged_count,
+)
 from app.direction_mode import mode_prompt_hint, normalized_recommended_mode
 from app.knowledge_query import build_knowledge_index
 from app.models import (
@@ -3459,6 +3463,26 @@ async def _spawn_strategic_review(
         ) + (
             agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
         )
+        # Proven lifetime merge total — STRICTER than verified: only merges with
+        # machine-checked named-test proof (proven_merged_count), legacy entries
+        # degrade to 0. Always <= total_verified_merged for the same window, so a
+        # direction that shipped many merges but proved few is visibly distinct.
+        total_proven_merged = sum(
+            proven_merged_count(h) for h in history
+        ) + (agg.get("total_acceptance_proven_merged", 0) or 0)
+        # Declaration coverage = declared / merged-write, recomputed from summed
+        # counts (not averaged per-cycle fractions) so it survives eviction.
+        total_declared_merged = sum(
+            declared_merged_count(h) for h in history
+        ) + (agg.get("total_acceptance_declared_merged", 0) or 0)
+        total_merged_write = sum(
+            h.get("acceptance_merged_write_total", 0) for h in history
+        ) + (agg.get("total_acceptance_merged_write_total", 0) or 0)
+        acceptance_declaration_coverage = (
+            round(total_declared_merged / total_merged_write, 3)
+            if total_merged_write > 0
+            else None
+        )
         total_rejected = sum(h.get("prs_rejected", 0) for h in history) + (
             agg.get("total_prs_rejected") or 0
         )
@@ -3517,6 +3541,12 @@ async def _spawn_strategic_review(
             "total_cycles": total_cycles,
             "prs_merged": total_merged,
             "verified_prs_merged": total_verified_merged,
+            # Proven count + declaration coverage: the honest, machine-checked
+            # subset of verified merges (proven <= verified) plus how much merged
+            # code even committed to forward evidence. Lets the strategist
+            # prioritize closing the proof gap, not just delivery.
+            "proven_prs_merged": total_proven_merged,
+            "acceptance_declaration_coverage": acceptance_declaration_coverage,
             "tasks_failed": total_failed,
             "possibly_saturated": d.get("possibly_saturated", False),
         }

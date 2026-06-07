@@ -877,6 +877,75 @@ async def test_gap_id_absent_when_not_set(db_session):
 
 
 @pytest.mark.asyncio
+async def test_direction_stat_surfaces_proven_and_declaration_coverage(db_session):
+    """The per-direction strategic stat surfaces proven_prs_merged (the
+    machine-checked subset of verified merges) and acceptance_declaration_coverage
+    (declared / merged-write) alongside verified_prs_merged. Proven is STRICTER
+    than verified — it must be <= verified for the same window — so a direction
+    that shipped many merges but proved few is visibly distinguished. A legacy
+    entry that predates the acceptance aggregates degrades proven to 0 and
+    coverage to None, exactly like the verified fallback."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-proven01",
+                "status": "active",
+                "text": "Direction with a proof gap",
+                "priority": "medium",
+                # 4 verified merges, but only 1 PROVEN; 3 of 4 merged WRITE tasks
+                # declared forward acceptance evidence at plan time.
+                "research_history": [
+                    {
+                        "prs_merged": 4,
+                        "prs_rejected": 0,
+                        "verified_prs_merged": 4,
+                        "acceptance_proven_merged": 1,
+                        "acceptance_declared_merged": 3,
+                        "acceptance_merged_write_total": 4,
+                    }
+                ],
+            },
+            {
+                "id": "d-legacy01",
+                "status": "active",
+                "text": "Direction with a legacy entry",
+                "priority": "medium",
+                # Predates the acceptance aggregates — no acceptance_* fields.
+                "research_history": [{"prs_merged": 2, "prs_rejected": 0}],
+            },
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+
+    proven = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-proven01"
+    )
+    assert proven["verified_prs_merged"] == 4
+    assert proven["proven_prs_merged"] == 1
+    # Proven is the strict subset of verified for the same window.
+    assert proven["proven_prs_merged"] <= proven["verified_prs_merged"]
+    assert proven["acceptance_declaration_coverage"] == round(3 / 4, 3)
+
+    legacy = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-legacy01"
+    )
+    # Legacy fallback: nothing retroactively claimed proven, no coverage denom.
+    assert legacy["proven_prs_merged"] == 0
+    assert legacy["acceptance_declaration_coverage"] is None
+
+
+@pytest.mark.asyncio
 async def test_cumulative_confirmed_finding_count_and_trend_in_direction_stats(
     db_session,
 ):

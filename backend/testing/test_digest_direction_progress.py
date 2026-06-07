@@ -351,6 +351,84 @@ async def test_digest_direction_progress_verified_prs_merged(
 
 
 @pytest.mark.asyncio
+async def test_digest_direction_progress_proven_prs_merged(
+    client: AsyncClient, db_session
+):
+    """The per-direction output dict exposes proven_prs_merged (machine-checked
+    named-test proof, summed via proven_merged_count) and the declaration
+    coverage (declared / merged-write), STRICTER than verified_prs_merged. A
+    legacy entry that predates the acceptance aggregates degrades to 0 / None."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-proven",
+                "text": "Direction with proven subset",
+                "status": "active",
+                "research_history": [
+                    # 3 verified merges this window, but only 1 PROVEN; 2 of 3
+                    # merged WRITE tasks declared forward acceptance evidence.
+                    {
+                        "timestamp": recent_ts,
+                        "prs_merged": 3,
+                        "verified_prs_merged": 3,
+                        "acceptance_proven_merged": 1,
+                        "acceptance_declared_merged": 2,
+                        "acceptance_merged_write_total": 3,
+                    },
+                ],
+            },
+            {
+                "id": "dir-legacy",
+                "text": "Direction with legacy entry (no acceptance fields)",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts,
+                        "prs_merged": 2,
+                        "verified_prs_merged": 2,
+                    },
+                ],
+            },
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for did in ("dir-proven", "dir-legacy"):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Research task {did}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "research"}],
+                context={"direction_id": did},
+            )
+        )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    by_id = {dp["direction_id"]: dp for dp in data["direction_progress"]}
+    proven = by_id["dir-proven"]
+    # proven is the strict subset of verified — always <= verified for the window.
+    assert proven["verified_prs_merged"] == 3
+    assert proven["proven_prs_merged"] == 1
+    assert proven["proven_prs_merged"] <= proven["verified_prs_merged"]
+    assert proven["acceptance_declaration_coverage"] == round(2 / 3, 3)
+
+    legacy = by_id["dir-legacy"]
+    # Legacy entries claim nothing proven and have no coverage denominator.
+    assert legacy["verified_prs_merged"] == 2
+    assert legacy["proven_prs_merged"] == 0
+    assert legacy["acceptance_declaration_coverage"] is None
+
+
+@pytest.mark.asyncio
 async def test_digest_direction_progress_generalized_success_metrics(
     client: AsyncClient, db_session
 ):

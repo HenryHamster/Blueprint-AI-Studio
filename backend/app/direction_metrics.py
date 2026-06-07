@@ -30,6 +30,16 @@ _HISTORY_AGG_DEFAULTS = {
     # _compute_lifetime_burn_metrics reads this so a degraded merge does not
     # suppress lifetime non-merge burn even after its cycle is evicted.
     "total_verified_prs_merged": 0,
+    # Acceptance-evidence lifetime aggregates — folded so directions past the
+    # 10-cycle eviction window keep an honest proven/declared signal. Distinct
+    # from (and never larger than) total_verified_prs_merged: proven counts only
+    # machine-checked named-test proof, declared counts merges that committed to
+    # forward evidence at plan time, and merged_write_total is the coverage
+    # denominator (merged WRITE tasks) so lifetime coverage = declared /
+    # merged_write_total without lossy per-cycle fraction-averaging.
+    "total_acceptance_proven_merged": 0,
+    "total_acceptance_declared_merged": 0,
+    "total_acceptance_merged_write_total": 0,
     "total_prs_rejected": 0,
     "total_tasks_failed": 0,
     "total_tasks_failed_infra": 0,
@@ -328,6 +338,18 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
         # treat all merges as verified so lifetime burn is unchanged for old data.
         agg["total_verified_prs_merged"] += ev.get(
             "verified_prs_merged", ev.get("prs_merged", 0)
+        )
+        # Acceptance-evidence aggregates — legacy-0 fallback: pre-aggregate
+        # entries claim nothing proven/declared and contribute no denominator,
+        # matching proven_merged_count / declared_merged_count semantics.
+        agg["total_acceptance_proven_merged"] += ev.get(
+            "acceptance_proven_merged", 0
+        )
+        agg["total_acceptance_declared_merged"] += ev.get(
+            "acceptance_declared_merged", 0
+        )
+        agg["total_acceptance_merged_write_total"] += ev.get(
+            "acceptance_merged_write_total", 0
         )
         agg["total_prs_rejected"] += ev.get("prs_rejected", 0)
         agg["total_tasks_failed"] += ev.get("tasks_failed", 0)

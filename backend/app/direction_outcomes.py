@@ -166,6 +166,21 @@ def proven_merged_count(entry: dict) -> int:
     return int(entry.get("acceptance_proven_merged") or 0)
 
 
+def declared_merged_count(entry: dict) -> int:
+    """Plan-time-declared merged-PR count for a research_history entry.
+
+    Counts merged WRITE tasks that DECLARED forward acceptance evidence at plan
+    time (a verdict was stamped), as recorded in the additive
+    ``acceptance_declared_merged`` field by ``_update_direction_research_outcomes``.
+    The numerator of declaration coverage; pair it with
+    ``acceptance_merged_write_total`` (the coverage denominator) to recompute
+    ``declared / merged_write_total`` across cycles without lossy per-cycle
+    fraction-averaging. Legacy entries written before the field existed degrade to
+    ``0`` (nothing retroactively claimed as declared).
+    """
+    return int(entry.get("acceptance_declared_merged") or 0)
+
+
 _AUTONOMY_RETIREMENT_THRESHOLD = 10
 
 
@@ -296,6 +311,222 @@ def _update_cochange_index(
     flag_modified(project, "design_doc")
 
 
+# ---------------------------------------------------------------------------
+# Durable metric-governance manifest.
+#
+# Single source of truth for every metric field written into a direction's
+# research_history entry by ``_update_direction_research_outcomes``. This
+# replaces the ad-hoc inline ``Retired: …`` comments that used to be the only
+# record of a metric's meaning and disposition (a comment disappears silently
+# when the code is touched; this manifest is queryable and test-enforced).
+#
+# Each key is an emitted (or formerly-emitted) ``entry["<field>"]`` field.
+# Each value declares ONE of:
+#   * {"consumer": "<module/surface that reads it>"} — an active field with a
+#     named reader. The consumer string names where the field is read (NOT the
+#     write site here); it is documentation, not test-enforced for accuracy.
+#   * {"status": "pending", "reason": "...", "date": "YYYY-MM-DD"} — a field
+#     that is computed every cycle but currently has NO named consumer. This is
+#     the exact recurrence-class the manifest exists to surface: a new metric
+#     cannot land without either naming a consumer or being recorded here, and
+#     the guard test fails on any emitted field absent from this manifest.
+#   * {"status": "retired", "reason": "...", "date": "YYYY-MM-DD"} — a field
+#     the computation NO LONGER writes. Kept as an auditable trail of what the
+#     metric meant and why it was dropped (replaces a deleted inline comment).
+#
+# The guard test ``backend/testing/test_direction_outcome_metric_manifest.py``
+# AST-extracts every ``entry["..."]`` Store target from the function below and
+# asserts: (a) every emitted field is present here (no undeclared metric), and
+# (b) every manifest key carrying a "consumer" is still emitted (no stale
+# consumer record). "pending"/"retired" keys are exempt from (b) by design.
+RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
+    # --- Cost ---
+    "cost_by_provider_model": {
+        "consumer": "direction_lifecycle.py (cost evidence), digest_direction_progress.py"
+    },
+    "estimated_cost_usd": {
+        "consumer": "direction_lifecycle.py / admin.py (cumulative spend), strategic_analysis.py"
+    },
+    # --- Terminal task counts ---
+    "tasks_completed": {
+        "consumer": "direction_metrics.py, strategic_completion.py, research_completion.py"
+    },
+    "tasks_failed": {
+        "consumer": "anomaly_detection.py, direction_lifecycle.py, strategic_spawning.py, digest_direction_progress.py"
+    },
+    "tasks_cancelled": {"consumer": "direction_metrics.py (terminal-outcome tracking)"},
+    "tasks_completed_no_pr": {
+        "consumer": "direction_metrics.py, strategic_completion.py (no-PR completions)"
+    },
+    # --- PR / merge counts ---
+    "prs_merged": {
+        "consumer": "digest_direction_progress.py, direction_lifecycle.py, strategic_spawning.py, DirectionCard.tsx (+ many)"
+    },
+    "prs_rejected": {
+        "consumer": "review_pipeline.py, pipeline_health.py, strategic_spawning.py"
+    },
+    "autonomous_prs_merged": {
+        "consumer": "compute_direction_autonomy_state (this module), strategic_spawning.py, DirectionCard.tsx"
+    },
+    "assisted_prs_merged": {
+        "consumer": "digest_direction_progress.py, direction_metrics.py"
+    },
+    "verified_prs_merged": {
+        "consumer": "verified_merged_count (this module), digest_metrics.py, strategic_spawning.py"
+    },
+    # --- Acceptance aggregates: now wired to decision + digest consumers. ---
+    # These expose proven-by-evidence and declaration-coverage truth distinct
+    # from "merely merged". As of 2026-06-07 they are folded into the lifetime
+    # rollups consumed by the digest and by strategic spawning's direction
+    # scoring (and summed in direction_metrics.py's aggregate).
+    "acceptance_proven_merged": {
+        "consumer": "digest_direction_progress.py (lifetime proven rollup), strategic_spawning.py, direction_metrics.py (total_acceptance_proven_merged)"
+    },
+    "acceptance_declared_merged": {
+        "consumer": "digest_direction_progress.py (declaration coverage), strategic_spawning.py, direction_metrics.py (total_acceptance_declared_merged)"
+    },
+    "acceptance_merged_write_total": {
+        "consumer": "digest_direction_progress.py + strategic_spawning.py (coverage denominator), direction_metrics.py (total_acceptance_merged_write_total)"
+    },
+    "acceptance_declaration_coverage": {
+        "consumer": "digest_direction_progress.py (per-cycle + lifetime coverage surface), strategic_spawning.py"
+    },
+    # --- Operator / autonomy ---
+    "operator_action_count": {
+        "consumer": "compute_direction_autonomy_state (this module), strategic_spawning.py, digest_direction_progress.py"
+    },
+    # --- Preventive-context cohort ---
+    "preventive_context_tasks_created": {
+        "consumer": "routers/admin_digest.py (digest reporting)"
+    },
+    "preventive_context_tasks_merged": {
+        "consumer": "routers/admin_digest.py (digest reporting)"
+    },
+    "preventive_context_tasks_failed": {
+        "consumer": "routers/admin_digest.py (digest reporting)"
+    },
+    # --- Conversion: stored copy is unread. ---
+    # Every conversion surface RECOMPUTES conversion from merged/created rather
+    # than reading this field (digest_direction_progress.py:466, pipeline_health,
+    # the UI/agent direction-level conversion_rate is the recomputed digest
+    # value, not this entry key). Pending: retire or make this the single source.
+    "conversion_rate": {
+        "status": "pending",
+        "reason": "stored entry copy is never read; conversion surfaces recompute it (digest_direction_progress.py:466). Candidate for retirement or for becoming the single source",
+        "date": "2026-06-07",
+    },
+    # --- Generalized (all-task-type) outcomes ---
+    "generalized_successes": {
+        "consumer": "digest_direction_progress.py, direction_metrics.py, strategic_analysis.py, DirectionCard.tsx"
+    },
+    "generalized_health_rate": {
+        "consumer": "digest_direction_progress.py, direction_metrics.py, routers/directions.py, DirectionCard.tsx"
+    },
+    "outcome_kind_breakdown": {
+        "consumer": "digest_direction_progress.py, direction_metrics.py, DirectionCard.tsx"
+    },
+    # --- Review-quality signals ---
+    "reviews_dismissed": {
+        "consumer": "digest_direction_progress.py, DirectionProgressSection.tsx"
+    },
+    "reviews_overridden": {
+        "consumer": "digest_direction_progress.py, DirectionProgressSection.tsx"
+    },
+    "user_issues_caught": {
+        "consumer": "digest_direction_progress.py, DirectionProgressSection.tsx"
+    },
+    # --- Timing / iteration ---
+    "avg_time_to_merge_hours": {
+        "consumer": "digest_direction_progress.py, routers/agent.py, strategic_analysis.py"
+    },
+    "median_review_iterations": {
+        "consumer": "autonomous_research.py, efficiency_snapshot.py, direction_metrics.py, routers/agent.py"
+    },
+    "avg_review_iterations": {
+        "consumer": "autonomous_research.py (rolling review-iteration guidance)"
+    },
+    # --- Failure detail / taxonomy ---
+    "failed_task_details": {
+        "consumer": "research_context.py, strategic_spawning.py, agent/research-plan.ts"
+    },
+    "tasks_failed_infra": {
+        "consumer": "direction_lifecycle.py, strategic_spawning.py, strategic_completion.py"
+    },
+    "taxonomy_summary": {
+        "consumer": "digest_direction_progress.py, digest_metrics.py, strategic_spawning.py"
+    },
+    "no_op_task_details": {
+        "consumer": "research_context.py (stale-finding retagging)"
+    },
+    "stage_dropout": {
+        "consumer": "digest_direction_progress.py, pipeline_health.py, claim_task_helpers.py"
+    },
+    # --- Type / scope distribution ---
+    "type_distribution": {
+        "consumer": "digest_direction_progress.py, digest_metrics.py, strategic_analysis.py"
+    },
+    "type_breakdown": {
+        "consumer": "digest_direction_progress.py, DirectionProgressSection.tsx"
+    },
+    "product_ratio": {
+        "consumer": "digest_direction_progress.py, digest_metrics.py, strategic_analysis.py"
+    },
+    "scope_breakdown": {
+        "consumer": "digest_direction_progress.py, pipeline_health.py, spawn_calibration.py, agent/research-plan.ts"
+    },
+    "escalation_outcomes": {
+        "consumer": "research_completion.py, routers/admin_digest.py, strategic_analysis.py"
+    },
+    # --- Prompt quality / decomposition ---
+    "prompt_telemetry": {
+        "consumer": "synthesize_prompt_quality_patterns (this module) -> digest_direction_progress.py, routers/agent.py"
+    },
+    "decomposition_quality": {
+        "consumer": "digest_direction_progress.py, playbook_learning.py, spawn_calibration.py"
+    },
+    "cochange_decomposition": {
+        "consumer": "research_completion.py (co-change split outcomes)"
+    },
+    # --- Retired: no longer emitted by the computation. ---
+    # Auditable trail replacing the deleted inline ``Retired: …`` comments.
+    "tasks_blocked": {
+        "status": "retired",
+        "reason": "claimed operator/analytics visibility but had no named consumer (no backend module, analytics, or UI read it)",
+        "date": "2026-06-05",
+    },
+    "remediation_tasks_created": {
+        "status": "retired",
+        "reason": "intended to track remediation burden but had no named consumer",
+        "date": "2026-06-05",
+    },
+    "remediation_tasks_merged": {
+        "status": "retired",
+        "reason": "intended to track remediation burden but had no named consumer",
+        "date": "2026-06-05",
+    },
+    "remediation_tasks_failed": {
+        "status": "retired",
+        "reason": "intended to track remediation burden but had no named consumer",
+        "date": "2026-06-05",
+    },
+    "avg_implementation_hours": {
+        "status": "retired",
+        "reason": "split of avg_time_to_merge_hours into implementation vs review time; no named consumer",
+        "date": "2026-06-05",
+    },
+    "avg_review_hours": {
+        "status": "retired",
+        "reason": "split of avg_time_to_merge_hours into implementation vs review time; no named consumer",
+        "date": "2026-06-05",
+    },
+    "structural_count": {
+        "status": "retired",
+        "reason": "raw structural-task count was stored but never read; the derived product_ratio is what digest_direction_progress.py consumes",
+        "date": "2026-06-05",
+    },
+}
+
+
 async def _update_direction_research_outcomes(
     project_id: uuid.UUID,
     direction_id: str,
@@ -413,9 +644,7 @@ async def _update_direction_research_outcomes(
     # BLOCKED tasks are counted separately from FAILED — they are parked on an
     # absent precondition, not failures, and the auto-unblock sweep is expected
     # to return them to QUEUED.
-    # Retired: tasks_blocked. Was claimed to be visible to operators/analytics
-    # but has no named consumer (grep: no backend module, analytics, or admin-ui
-    # component reads it). Retired 2026-06-05.
+    # tasks_blocked retired 2026-06-05 — see RESEARCH_HISTORY_METRIC_MANIFEST.
     entry["prs_merged"] = sum(
         1
         for ct in child_tasks_rows
@@ -509,6 +738,10 @@ async def _update_direction_research_outcomes(
         if acceptance_was_declared((ct.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY))
     )
     _merged_write_count = len(_merged_write_rows)
+    # Persist the coverage denominator so lifetime/window coverage can be
+    # recomputed as declared / merged_write_total (summing counts) rather than
+    # averaging per-cycle fractions — the latter is lossy across cycles.
+    entry["acceptance_merged_write_total"] = _merged_write_count
     entry["acceptance_declaration_coverage"] = (
         round(entry["acceptance_declared_merged"] / _merged_write_count, 3)
         if _merged_write_count > 0
@@ -536,9 +769,8 @@ async def _update_direction_research_outcomes(
     entry["preventive_context_tasks_failed"] = sum(
         1 for ct in _prev_rows if _counts_as_failure(ct)
     )
-    # Retired: remediation_tasks_created, remediation_tasks_merged, remediation_tasks_failed.
-    # Were intended to track remediation burden but have no named consumer (grep: no backend
-    # module, analytics, or admin-ui component reads them). Retired 2026-06-05.
+    # remediation_tasks_{created,merged,failed} retired 2026-06-05 —
+    # see RESEARCH_HISTORY_METRIC_MANIFEST.
     # Collect changed files from merged PRs for co-change index update
     merged_files_lists = [
         (ct.context or {}).get("_pr_changed_files", [])
@@ -626,10 +858,8 @@ async def _update_direction_research_outcomes(
         if merge_durations
         else None
     )
-    # Retired: avg_implementation_hours, avg_review_hours. These split avg_time_to_merge_hours
-    # into implementation vs review-pipeline time for research-agent consumption, but have
-    # no named consumer (grep: no backend module, analytics, or admin-ui component reads them).
-    # Retired 2026-06-05.
+    # avg_implementation_hours, avg_review_hours retired 2026-06-05 —
+    # see RESEARCH_HISTORY_METRIC_MANIFEST.
     # Review iteration counts per child task — lets research agents see
     # prompt-quality outcomes (fewer iterations = clearer prompt).
     review_iters = [
@@ -772,8 +1002,7 @@ async def _update_direction_research_outcomes(
     entry["product_ratio"] = (
         round(product_count / total_typed, 2) if total_typed > 0 else 0.0
     )
-    # Retired: structural_count. Raw count stored but never read; product_ratio (derived
-    # from this) IS consumed by digest_direction_progress.py. Retired 2026-06-05.
+    # structural_count retired 2026-06-05 — see RESEARCH_HISTORY_METRIC_MANIFEST.
 
     # Track per-scope merge rates so research agents can calibrate scope assignments.
     # calibrated_in: tasks calibrated INTO this scope from a larger one (counted at the

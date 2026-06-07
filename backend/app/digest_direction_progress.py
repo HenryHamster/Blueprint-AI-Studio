@@ -12,7 +12,11 @@ from typing import Any, Dict, List
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.direction_outcomes import verified_merged_count
+from app.direction_outcomes import (
+    declared_merged_count,
+    proven_merged_count,
+    verified_merged_count,
+)
 from app.models import Project, Task, TaskStatus
 from app.time_utils import _to_naive_utc, _coerce_naive_utc
 
@@ -138,6 +142,13 @@ async def compute_direction_progress(
         # degraded-unverified) — drives conversion_rate so a merge that never
         # actually verified does not inflate the operator-read rate.
         verified_prs_merged = 0
+        # Proven (machine-checked named-test) merge count + declaration-coverage
+        # numerator/denominator — STRICTER than verified_prs_merged: proven counts
+        # only named-test proof, declared counts merges that committed to forward
+        # evidence at plan time, merged_write_total is the coverage denominator.
+        proven_prs_merged = 0
+        declared_prs_merged = 0
+        merged_write_total = 0
         autonomous_prs_merged = 0
         assisted_prs_merged = 0
         operator_action_count = 0
@@ -177,6 +188,9 @@ async def compute_direction_progress(
             if entry_ts >= window_start:
                 prs_merged += entry.get("prs_merged") or 0
                 verified_prs_merged += verified_merged_count(entry)
+                proven_prs_merged += proven_merged_count(entry)
+                declared_prs_merged += declared_merged_count(entry)
+                merged_write_total += entry.get("acceptance_merged_write_total", 0) or 0
                 # Legacy fallback: pre-attribution entries lack autonomous_prs_merged.
                 autonomous_prs_merged += (
                     entry.get("autonomous_prs_merged", entry.get("prs_merged")) or 0
@@ -413,6 +427,23 @@ async def compute_direction_progress(
         lifetime_verified_prs_merged = sum(
             verified_merged_count(h) for h in _history_all
         ) + (_agg.get("total_verified_prs_merged", _agg.get("total_prs_merged")) or 0)
+        # Proven/declared lifetime totals — STRICTER than verified; legacy entries
+        # and pre-aggregate folds contribute 0 (proven_merged_count /
+        # declared_merged_count / 0-fallback), matching the strategic stat surface.
+        lifetime_proven_prs_merged = sum(
+            proven_merged_count(h) for h in _history_all
+        ) + (_agg.get("total_acceptance_proven_merged", 0) or 0)
+        lifetime_declared_prs_merged = sum(
+            declared_merged_count(h) for h in _history_all
+        ) + (_agg.get("total_acceptance_declared_merged", 0) or 0)
+        lifetime_merged_write_total = sum(
+            h.get("acceptance_merged_write_total", 0) for h in _history_all
+        ) + (_agg.get("total_acceptance_merged_write_total", 0) or 0)
+        lifetime_acceptance_declaration_coverage = (
+            round(lifetime_declared_prs_merged / lifetime_merged_write_total, 3)
+            if lifetime_merged_write_total > 0
+            else None
+        )
         lifetime_prs_rejected = sum(h.get("prs_rejected", 0) for h in _history_all) + (
             _agg.get("total_prs_rejected") or 0
         )
@@ -466,6 +497,14 @@ async def compute_direction_progress(
         conversion_rate = (
             round(verified_prs_merged / pr_eligible_tasks, 3)
             if pr_eligible_tasks > 0
+            else None
+        )
+        # Window declaration coverage = declared / merged-write, recomputed from
+        # summed counts (not averaged per-cycle fractions). None when no merged
+        # write task exists in the window — never retro-failing legacy rows.
+        acceptance_declaration_coverage = (
+            round(declared_prs_merged / merged_write_total, 3)
+            if merged_write_total > 0
             else None
         )
         generalized_health_rate = (
@@ -634,6 +673,12 @@ async def compute_direction_progress(
                     "tasks_created": tasks_created_in_window,
                     "prs_merged": prs_merged,
                     "verified_prs_merged": verified_prs_merged,
+                    # Proven count + declaration coverage: machine-checked subset
+                    # of verified merges (proven <= verified) and how much merged
+                    # code committed to forward evidence. Lifetime counterparts
+                    # surfaced below alongside lifetime_verified_prs_merged.
+                    "proven_prs_merged": proven_prs_merged,
+                    "acceptance_declaration_coverage": acceptance_declaration_coverage,
                     "autonomous_prs_merged": autonomous_prs_merged,
                     "assisted_prs_merged": assisted_prs_merged,
                     "operator_action_count": operator_action_count,
@@ -685,6 +730,10 @@ async def compute_direction_progress(
                     "quality_score": round(_compute_direction_quality_score(d), 3),
                     "lifetime_cycles": lifetime_cycles,
                     "lifetime_prs_merged": lifetime_prs_merged,
+                    "lifetime_proven_prs_merged": lifetime_proven_prs_merged,
+                    "lifetime_acceptance_declaration_coverage": (
+                        lifetime_acceptance_declaration_coverage
+                    ),
                     "lifetime_prs_rejected": lifetime_prs_rejected,
                     "lifetime_tasks_failed": lifetime_tasks_failed,
                     "lifetime_conversion_rate": lifetime_conversion_rate,

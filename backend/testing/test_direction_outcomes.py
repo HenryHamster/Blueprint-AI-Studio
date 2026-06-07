@@ -561,6 +561,16 @@ def test_proven_merged_count_helper():
     assert proven_merged_count({}) == 0
 
 
+def test_declared_merged_count_helper():
+    """declared_merged_count reads acceptance_declared_merged, 0 for legacy."""
+    from app.direction_outcomes import declared_merged_count
+
+    assert declared_merged_count({"acceptance_declared_merged": 2}) == 2
+    # Legacy entry (no field) degrades to 0 — never claims raw merges as declared.
+    assert declared_merged_count({"prs_merged": 4, "verified_prs_merged": 4}) == 0
+    assert declared_merged_count({}) == 0
+
+
 @pytest.mark.asyncio
 async def test_conversion_rate_excludes_degraded_unverified_merge(
     db_session: AsyncSession,
@@ -3691,6 +3701,58 @@ def test_fold_evicted_attribution_accumulates_on_prior_agg():
     assert agg["total_operator_actions"] == 2  # 1 + 1
 
 
+def test_fold_evicted_acceptance_aggregates_survive_eviction():
+    """proven/declared/merged-write totals roll into history_aggregate so a
+    direction past the 10-cycle window keeps an honest proof signal; legacy
+    entries (no acceptance fields) contribute 0 to every aggregate."""
+    from app.direction_metrics import _fold_evicted_into_aggregate
+
+    evicted = [
+        # Legacy entry — no acceptance_* fields → contributes 0 (not raw merges).
+        {"timestamp": "2025-01-01T00:00:00", "tasks_created": 3, "prs_merged": 3},
+        {
+            "timestamp": "2025-02-01T00:00:00",
+            "tasks_created": 5,
+            "prs_merged": 4,
+            "acceptance_proven_merged": 1,
+            "acceptance_declared_merged": 3,
+            "acceptance_merged_write_total": 4,
+        },
+    ]
+    agg = _fold_evicted_into_aggregate(None, evicted)
+
+    assert agg["total_acceptance_proven_merged"] == 1
+    assert agg["total_acceptance_declared_merged"] == 3
+    assert agg["total_acceptance_merged_write_total"] == 4
+
+
+def test_fold_evicted_acceptance_aggregates_accumulate_on_prior_agg():
+    """New acceptance evictions accumulate on an existing aggregate; a prior agg
+    written before the keys existed backfills from the defaults (legacy 0)."""
+    from app.direction_metrics import _fold_evicted_into_aggregate
+
+    prior = {
+        "total_cycles": 2,
+        # Pre-acceptance aggregate: no total_acceptance_* keys at all.
+        "total_verified_prs_merged": 6,
+    }
+    evicted = [
+        {
+            "timestamp": "2025-03-01T00:00:00",
+            "tasks_created": 2,
+            "prs_merged": 2,
+            "acceptance_proven_merged": 2,
+            "acceptance_declared_merged": 2,
+            "acceptance_merged_write_total": 2,
+        }
+    ]
+    agg = _fold_evicted_into_aggregate(prior, evicted)
+
+    assert agg["total_acceptance_proven_merged"] == 2
+    assert agg["total_acceptance_declared_merged"] == 2
+    assert agg["total_acceptance_merged_write_total"] == 2
+
+
 def test_fold_evicted_generalized_fields_survive_eviction():
     """Generalized successes and outcome-kind counts persist in history_aggregate."""
     from app.direction_metrics import _fold_evicted_into_aggregate
@@ -4618,6 +4680,9 @@ async def test_proven_by_evidence_excludes_undeclared_and_soft_merges(
     # (behavior, proven named_test, unsatisfied named_test), 1 undeclared.
     assert entry["acceptance_declared_merged"] == 3
     assert entry["acceptance_declaration_coverage"] == round(3 / 4, 3)
+    # The coverage denominator is persisted so lifetime/window coverage can be
+    # recomputed from summed counts rather than averaging per-cycle fractions.
+    assert entry["acceptance_merged_write_total"] == 4
 
 
 @pytest.mark.asyncio
@@ -4659,3 +4724,4 @@ async def test_declaration_coverage_none_when_no_merged_write_tasks(
     assert entry["acceptance_proven_merged"] == 0
     assert entry["acceptance_declared_merged"] == 0
     assert entry["acceptance_declaration_coverage"] is None
+    assert entry["acceptance_merged_write_total"] == 0
