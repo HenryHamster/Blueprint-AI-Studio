@@ -42,9 +42,14 @@ from app.provision_error_scope import (
     QUOTA_SCOPE_GLOBAL,
     QUOTA_SCOPE_REGIONAL,
     _GLOBAL_QUOTA_MARKERS,
+    _clear_gpu_quota_cooldowns_after_success,
     _clear_quota_cooldowns_after_success,
     _global_quota_state,
+    _gpu_global_quota_state,
+    _gpu_region_quota_state,
     _record_global_quota_exhaustion,
+    _record_gpu_global_quota_exhaustion,
+    _record_gpu_region_quota_exhaustion,
     _record_region_quota_exhaustion,
     _region_quota_state,
     _zone_region,
@@ -202,36 +207,46 @@ _zone_health: dict[str, dict] = {}
 #   }
 # }
 
+# GPU-specific zone health — isolated from CPU fleet state so GPU stockouts
+# never contaminate CPU zone selection (and vice versa).
+_gpu_zone_health: dict[str, dict] = {}
+_gpu_zone_failures: dict[str, datetime] = {}
 
-def _zone_success_rate(zone: str) -> float:
+
+def _zone_success_rate(zone: str, *, gpu: bool = False) -> float:
     """Return the recent success rate for a zone (0.0-1.0).
 
-    Reads the rolling ``recent_outcomes`` deque stored in ``_zone_health``.
+    When ``gpu=True`` reads from the GPU-isolated health state so GPU zone
+    selection is informed by GPU-specific history, not CPU fleet history.
     Returns the neutral rate (0.5) when no history exists so unknown zones
     sort in the middle, neither preferred nor penalised.
     Caller is responsible for holding ``_zone_lock`` when thread safety matters.
     """
-    outcomes = _zone_health.get(zone, {}).get("recent_outcomes")
+    h = _gpu_zone_health if gpu else _zone_health
+    outcomes = h.get(zone, {}).get("recent_outcomes")
     if not outcomes:
         return _ZONE_NEUTRAL_RATE
     return sum(outcomes) / len(outcomes)
 
 
-def _zone_blocked_until(zone: str, now: datetime) -> datetime | None:
+def _zone_blocked_until(zone: str, now: datetime, *, gpu: bool = False) -> datetime | None:
     """Effective blocking expiry for a zone: the latest of its own cooldown,
     its region's quota cooldown, and the project-global quota cooldown.
+    When ``gpu=True`` uses the GPU-isolated health/quota state so GPU failures
+    cannot block CPU provisioning (and CPU failures cannot block GPU jobs).
     Returns ``None`` when the zone is not blocked. Caller must hold
     ``_zone_lock`` when thread safety matters."""
     candidates = []
-    zone_cd = _zone_health.get(zone, {}).get("cooldown_expires_at")
+    zh = _gpu_zone_health if gpu else _zone_health
+    zone_cd = zh.get(zone, {}).get("cooldown_expires_at")
     if zone_cd and now < zone_cd:
         candidates.append(zone_cd)
-    region_cd = _region_quota_state.get(_zone_region(zone), {}).get(
-        "cooldown_expires_at"
-    )
+    rqs = _gpu_region_quota_state if gpu else _region_quota_state
+    region_cd = rqs.get(_zone_region(zone), {}).get("cooldown_expires_at")
     if region_cd and now < region_cd:
         candidates.append(region_cd)
-    global_cd = _global_quota_state.get("cooldown_expires_at")
+    gqs = _gpu_global_quota_state if gpu else _global_quota_state
+    global_cd = gqs.get("cooldown_expires_at")
     if global_cd and now < global_cd:
         candidates.append(global_cd)
     return max(candidates) if candidates else None
@@ -1852,18 +1867,36 @@ async def _provision_gcp(
         skipped_cooldown = []
 
         now_pre = datetime.now(timezone.utc)
-        # Project-global quota cooldown: a CPUS_ALL_REGIONS-style exhaustion
+        # Project-global quota cooldown: a CPUS/GPUS_ALL_REGIONS-style exhaustion
         # blocks EVERY zone identically, so cycling zones would only burn time
         # and re-trip the quota. Fail fast; the message contains "quota" so the
         # orchestrator/reaper INFRA_PROVISION_PATTERNS classify it infra-wide
-        # (requeue without burning task retry budget).
-        global_quota_cd = _global_quota_state.get("cooldown_expires_at")
+        # (requeue without burning task retry budget). GPU jobs use the isolated
+        # GPU quota state so a GPUS_ALL_REGIONS event never blocks CPU provisions.
+        _active_global_quota = _gpu_global_quota_state if is_gpu else _global_quota_state
+        global_quota_cd = _active_global_quota.get("cooldown_expires_at")
         if global_quota_cd and now_pre < global_quota_cd:
             remaining = (global_quota_cd - now_pre).total_seconds()
             raise Exception(
                 f"Global quota cooldown active — project-wide quota exhausted "
-                f"(e.g. CPUS_ALL_REGIONS); retry in {remaining:.0f}s"
+                f"(e.g. {'GPUS' if is_gpu else 'CPUS'}_ALL_REGIONS); retry in {remaining:.0f}s"
             )
+        # Local aliases for zone health/failure state — GPU jobs use isolated
+        # dicts so failures never cross-contaminate CPU and GPU provisioning lanes.
+        _active_zone_health = _gpu_zone_health if is_gpu else _zone_health
+        _active_zone_failures = _gpu_zone_failures if is_gpu else _zone_failures
+        _record_global_quota = (
+            _record_gpu_global_quota_exhaustion if is_gpu
+            else _record_global_quota_exhaustion
+        )
+        _record_region_quota = (
+            _record_gpu_region_quota_exhaustion if is_gpu
+            else _record_region_quota_exhaustion
+        )
+        _clear_quota_success = (
+            _clear_gpu_quota_cooldowns_after_success if is_gpu
+            else _clear_quota_cooldowns_after_success
+        )
         # GPU jobs draw from the per-accelerator GPU-availability (zone, subnet)
         # ring (GPU zones differ per accelerator and from the fleet ring); CPU
         # jobs use the fleet ring. Either way admin-disabled regions (no subnet)
@@ -1879,7 +1912,8 @@ async def _provision_gcp(
         else:
             active_zones = _active_fallback_zones()
         healthy_zones = [
-            (z, s) for z, s in active_zones if _zone_blocked_until(z, now_pre) is None
+            (z, s) for z, s in active_zones
+            if _zone_blocked_until(z, now_pre, gpu=is_gpu) is None
         ]
         cooled_zones = [(z, s) for z, s in active_zones if (z, s) not in healthy_zones]
         # Sort healthy zones by recent success rate (descending) so well-performing
@@ -1887,7 +1921,8 @@ async def _provision_gcp(
         # Use stable sort with a small random tiebreak to distribute load across
         # equal-rate zones (e.g. all-new zones with 0.5 default).
         healthy_zones.sort(
-            key=lambda zs: (_zone_success_rate(zs[0]), random.random()), reverse=True
+            key=lambda zs: (_zone_success_rate(zs[0], gpu=is_gpu), random.random()),
+            reverse=True,
         )
         zones_to_try = healthy_zones + cooled_zones
 
@@ -1904,7 +1939,7 @@ async def _provision_gcp(
             # cooldown, or the project-global quota cooldown (a regional/global
             # quota event earlier in THIS loop must skip the remaining zones it
             # covers instead of burning a 240s insert on each).
-            if _zone_blocked_until(zone, now) is not None:
+            if _zone_blocked_until(zone, now, gpu=is_gpu) is not None:
                 skipped_cooldown.append(zone)
                 continue
 
@@ -1962,7 +1997,7 @@ async def _provision_gcp(
 
                 with _zone_lock:
                     _vm_zones[vm_instance_id] = zone
-                    health = _zone_health.setdefault(zone, {})
+                    health = _active_zone_health.setdefault(zone, {})
                     health["last_success"] = datetime.now(timezone.utc)
                     prev_failures = health.get("consecutive_failures", 0)
                     health["consecutive_failures"] = 0
@@ -1971,9 +2006,9 @@ async def _provision_gcp(
                         "recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW)
                     )
                     outcomes.append(True)
-                    _clear_quota_cooldowns_after_success(zone)
-                    was_in_cooldown = zone in _zone_failures
-                    cooldown_since = _zone_failures.pop(zone, None)
+                    _clear_quota_success(zone)
+                    was_in_cooldown = zone in _active_zone_failures
+                    cooldown_since = _active_zone_failures.pop(zone, None)
 
                 if was_in_cooldown and prev_failures > 0:
                     cooldown_duration = (
@@ -2006,7 +2041,7 @@ async def _provision_gcp(
                             )
                             with _zone_lock:
                                 _vm_zones[vm_instance_id] = zone
-                                health = _zone_health.setdefault(zone, {})
+                                health = _active_zone_health.setdefault(zone, {})
                                 health["last_success"] = datetime.now(timezone.utc)
                                 health["consecutive_failures"] = 0
                                 health.pop("cooldown_expires_at", None)
@@ -2015,7 +2050,7 @@ async def _provision_gcp(
                                     _deque(maxlen=ZONE_HISTORY_WINDOW),
                                 )
                                 outcomes.append(True)
-                                _zone_failures.pop(zone, None)
+                                _active_zone_failures.pop(zone, None)
                             return f"adopted-{vm_instance_id}-in-{zone}"
                         logger.warning(
                             f"[PROVISION] {vm_instance_id} exists in {zone} but status={existing_status} — "
@@ -2051,9 +2086,9 @@ async def _provision_gcp(
                     # cooldowns that outlive the quota event.
                     scope = classify_provision_error_scope(err_str)
                     if scope == QUOTA_SCOPE_GLOBAL:
-                        # _record_global_quota_exhaustion carries the deduped
-                        # ERROR-level operator alert; this is the per-attempt log.
-                        cooldown_secs = _record_global_quota_exhaustion(err_str)
+                        # _record_{gpu_}global_quota_exhaustion carries deduped
+                        # ERROR-level operator alert for CPU; this is the per-attempt log.
+                        cooldown_secs = _record_global_quota(err_str)
                         logger.warning(
                             f"[PROVISION] Project-global quota exhausted while provisioning "
                             f"{vm_instance_id} in {zone} — project-level cooldown "
@@ -2063,7 +2098,7 @@ async def _provision_gcp(
                         raise
                     if scope == QUOTA_SCOPE_REGIONAL:
                         region = _zone_region(zone)
-                        cooldown_secs = _record_region_quota_exhaustion(region, err_str)
+                        cooldown_secs = _record_region_quota(region, err_str)
                         logger.warning(
                             f"Region {region} quota exhausted for {vm_instance_id} — "
                             f"region cooldown {cooldown_secs}s, no zone marked; "
@@ -2083,9 +2118,9 @@ async def _provision_gcp(
 
                     with _zone_lock:
                         now_fail = datetime.now(timezone.utc)
-                        entering_cooldown = zone not in _zone_failures
-                        _zone_failures[zone] = now_fail
-                        health = _zone_health.setdefault(zone, {})
+                        entering_cooldown = zone not in _active_zone_failures
+                        _active_zone_failures[zone] = now_fail
+                        health = _active_zone_health.setdefault(zone, {})
                         old_cf = health.get("consecutive_failures", 0)
                         last_fail_time = health.get("last_failure")
                         # Debounce parallel failures: with N concurrent slots, a single zone
@@ -2136,7 +2171,7 @@ async def _provision_gcp(
             soonest_wait = float("inf")
             for z, sn in active_zones:
                 # Effective block = zone cooldown OR region/global quota cooldown
-                expires = _zone_blocked_until(z, now_check)
+                expires = _zone_blocked_until(z, now_check, gpu=is_gpu)
                 if expires:
                     remaining = (expires - now_check).total_seconds()
                     if remaining < soonest_wait:
@@ -2183,7 +2218,7 @@ async def _provision_gcp(
                     operation.result(timeout=240)
                     with _zone_lock:
                         _vm_zones[vm_instance_id] = wait_zone
-                        health = _zone_health.setdefault(wait_zone, {})
+                        health = _active_zone_health.setdefault(wait_zone, {})
                         health["last_success"] = datetime.now(timezone.utc)
                         health["consecutive_failures"] = 0
                         health.pop("cooldown_expires_at", None)
@@ -2191,8 +2226,8 @@ async def _provision_gcp(
                             "recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW)
                         )
                         outcomes.append(True)
-                        _clear_quota_cooldowns_after_success(wait_zone)
-                        _zone_failures.pop(wait_zone, None)
+                        _clear_quota_success(wait_zone)
+                        _active_zone_failures.pop(wait_zone, None)
                     logger.info(
                         f"Successfully provisioned VM {vm_instance_id} in {wait_zone} (after cooldown wait)"
                     )

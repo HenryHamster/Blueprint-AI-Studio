@@ -594,6 +594,235 @@ async def test_gpu_compute_job_builds_accelerator_instance_config(
     assert instance.scheduling.automatic_restart is True
 
 
+# ─── GPU provision isolation tests ──────────────────────────────────────────
+
+
+def _make_gpu_failure_provision_monkeypatch(monkeypatch, error_msg: str):
+    """Set up monkeypatches for a GPU provision that always fails with error_msg.
+
+    Returns (acquire_called, insert_called) mutable lists so callers can assert
+    that the provision actually ran and hit the expected code path.
+    """
+    from google.cloud import compute_v1
+
+    gpu_zone = "us-east4-c"
+    monkeypatch.setattr(
+        compute,
+        "gpu_zone_candidates",
+        lambda accel: [(gpu_zone, "agent-sandbox-subnet-us-east4")],
+    )
+    monkeypatch.setattr(
+        compute, "_active_fallback_zones",
+        lambda: [(gpu_zone, "agent-sandbox-subnet-us-east4")],
+    )
+
+    async def _ok_slot(_vm):
+        return True
+
+    async def _noop_release(_vm):
+        return None
+
+    monkeypatch.setattr(compute, "_acquire_provision_slot", _ok_slot)
+    monkeypatch.setattr(compute, "_release_provision_slot", _noop_release)
+    # On any provision failure, _provision_gcp's cleanup path calls
+    # _delete_agent_secret, which constructs a real SecretManagerServiceClient
+    # (needs GCP ADC, absent in CI) → DefaultCredentialsError before the test
+    # ever reaches its isolation assertion. Stub it, matching the existing
+    # provision-failure tests elsewhere in this file.
+    monkeypatch.setattr(compute, "_delete_agent_secret", lambda vm_id: None)
+
+    class _FailingInstancesClient:
+        def get(self, project, zone, instance):
+            raise Exception("was not found: 404")
+
+        def insert(self, project, zone, instance_resource):
+            raise Exception(error_msg)
+
+        def delete(self, project, zone, instance):
+            class _FakeOp:
+                def result(self, timeout=None):
+                    return None
+            return _FakeOp()
+
+    monkeypatch.setattr(compute_v1, "InstancesClient", lambda: _FailingInstancesClient())
+
+
+@pytest.mark.asyncio
+async def test_gpu_provision_failure_does_not_block_cpu_fleet(
+    monkeypatch, clean_zone_health
+):
+    """GPU provisioning failures (zone stockout and GPUS_ALL_REGIONS) must NOT
+    arm or modify the CPU fleet's zone health or global quota cooldown state.
+
+    This is the primary acceptance evidence for the GPU/CPU isolation work:
+    injecting each GPU failure mode leaves the CPU fleet's zone selection and
+    global-quota gate completely unaffected. Proven by asserting that CPU
+    state dicts are empty after a GPU failure, and GPU state dicts carry the
+    failure evidence.
+    """
+    # --- Phase 1: GPU zone stockout (ZONE_RESOURCE_POOL_EXHAUSTED) ---
+    _make_gpu_failure_provision_monkeypatch(
+        monkeypatch, "ZONE_RESOURCE_POOL_EXHAUSTED: GPU capacity unavailable"
+    )
+
+    ok = await compute._provision_gcp(
+        vm_instance_id="compute-job-vm-gpu-isolation-test",
+        task_id=None,
+        startup_script_override="#!/bin/bash\ntrue\n",
+        accelerator="T4",
+        accelerator_count=1,
+    )
+    assert ok is False  # provision failed (expected)
+
+    # CPU zone health must be completely clean.
+    assert compute._zone_health == {}, "GPU stockout must not write CPU _zone_health"
+    assert compute._zone_failures == {}, "GPU stockout must not write CPU _zone_failures"
+    assert provision_error_scope._global_quota_state == {}, (
+        "GPU stockout must not arm CPU global quota cooldown"
+    )
+    assert provision_error_scope._region_quota_state == {}, (
+        "GPU stockout must not arm CPU region quota cooldown"
+    )
+
+    # GPU zone health carries the failure evidence.
+    assert len(compute._gpu_zone_health) > 0, (
+        "GPU stockout must record evidence in GPU zone health"
+    )
+
+    # Clean GPU state for next phase.
+    compute._gpu_zone_health.clear()
+    compute._gpu_zone_failures.clear()
+    provision_error_scope._gpu_global_quota_state.clear()
+    provision_error_scope._gpu_region_quota_state.clear()
+
+    # --- Phase 2: GPUS_ALL_REGIONS (project-wide GPU quota exhaustion) ---
+    _make_gpu_failure_provision_monkeypatch(
+        monkeypatch,
+        "Quota 'GPUS_ALL_REGIONS' exceeded. Limit: 1.0 globally.",
+    )
+
+    ok = await compute._provision_gcp(
+        vm_instance_id="compute-job-vm-gpu-isolation-test-2",
+        task_id=None,
+        startup_script_override="#!/bin/bash\ntrue\n",
+        accelerator="T4",
+        accelerator_count=1,
+    )
+    assert ok is False
+
+    # CPU state must still be clean.
+    assert compute._zone_health == {}, "GPUS_ALL_REGIONS must not write CPU _zone_health"
+    assert compute._zone_failures == {}, (
+        "GPUS_ALL_REGIONS must not write CPU _zone_failures"
+    )
+    assert provision_error_scope._global_quota_state == {}, (
+        "GPUS_ALL_REGIONS must not arm CPU global quota cooldown"
+    )
+    assert provision_error_scope._region_quota_state == {}, (
+        "GPUS_ALL_REGIONS must not arm CPU region quota cooldown"
+    )
+
+    # GPU global quota cooldown is armed.
+    assert provision_error_scope._gpu_global_quota_state.get("cooldown_expires_at") is not None, (
+        "GPUS_ALL_REGIONS must arm GPU global quota cooldown"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gpu_zone_stockout_does_not_cool_cpu_zones(monkeypatch, clean_zone_health):
+    """A GPU zone stockout (ZONE_RESOURCE_POOL_EXHAUSTED) writes only to
+    _gpu_zone_health / _gpu_zone_failures, leaving CPU _zone_health untouched."""
+    _make_gpu_failure_provision_monkeypatch(
+        monkeypatch, "ZONE_RESOURCE_POOL_EXHAUSTED: no GPU capacity in zone"
+    )
+
+    await compute._provision_gcp(
+        vm_instance_id="compute-job-vm-gpu-zonal-test",
+        task_id=None,
+        startup_script_override="#!/bin/bash\ntrue\n",
+        accelerator="T4",
+    )
+
+    assert compute._zone_health == {}, "GPU stockout wrote to CPU _zone_health"
+    assert compute._zone_failures == {}, "GPU stockout wrote to CPU _zone_failures"
+    assert len(compute._gpu_zone_health) > 0, "GPU stockout did not record GPU zone health"
+
+
+@pytest.mark.asyncio
+async def test_gpus_all_regions_does_not_arm_cpu_global_cooldown(
+    monkeypatch, clean_zone_health
+):
+    """GPUS_ALL_REGIONS exhaustion arms the GPU global cooldown but must not
+    touch the CPU fleet's _global_quota_state."""
+    _make_gpu_failure_provision_monkeypatch(
+        monkeypatch,
+        "Quota 'GPUS_ALL_REGIONS' exceeded. Limit: 1.0 globally.",
+    )
+
+    await compute._provision_gcp(
+        vm_instance_id="compute-job-vm-gpu-global-quota-test",
+        task_id=None,
+        startup_script_override="#!/bin/bash\ntrue\n",
+        accelerator="T4",
+    )
+
+    assert provision_error_scope._global_quota_state == {}, (
+        "GPUS_ALL_REGIONS armed CPU global quota state"
+    )
+    assert provision_error_scope._gpu_global_quota_state.get("cooldown_expires_at") is not None, (
+        "GPUS_ALL_REGIONS did not arm GPU global quota state"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cpu_zone_stockout_does_not_cool_gpu_zones(monkeypatch, clean_zone_health):
+    """A CPU zone stockout writes only to CPU _zone_health / _zone_failures,
+    leaving _gpu_zone_health untouched."""
+    from google.cloud import compute_v1
+
+    async def _ok_slot(_vm):
+        return True
+
+    async def _noop_release(_vm):
+        return None
+
+    monkeypatch.setattr(compute, "_acquire_provision_slot", _ok_slot)
+    monkeypatch.setattr(compute, "_release_provision_slot", _noop_release)
+    # See _make_gpu_failure_provision_monkeypatch: the provision-failure cleanup
+    # path constructs a real SecretManagerServiceClient absent GCP ADC.
+    monkeypatch.setattr(compute, "_delete_agent_secret", lambda vm_id: None)
+
+    class _FailingCPUInstancesClient:
+        def get(self, project, zone, instance):
+            raise Exception("was not found: 404")
+
+        def insert(self, project, zone, instance_resource):
+            raise Exception("ZONE_RESOURCE_POOL_EXHAUSTED: no e2 capacity in zone")
+
+        def delete(self, project, zone, instance):
+            class _FakeOp:
+                def result(self, timeout=None):
+                    return None
+            return _FakeOp()
+
+    monkeypatch.setattr(compute_v1, "InstancesClient", lambda: _FailingCPUInstancesClient())
+    monkeypatch.setattr(
+        compute,
+        "_active_fallback_zones",
+        lambda: [("us-central1-f", "agent-sandbox-subnet")],
+    )
+
+    await compute._provision_gcp(
+        vm_instance_id="agent-vm-cpu-stockout-test",
+        task_id=None,
+        startup_script_override="#!/bin/bash\ntrue\n",
+    )
+
+    assert compute._gpu_zone_health == {}, "CPU stockout wrote to GPU _gpu_zone_health"
+    assert compute._gpu_zone_failures == {}, "CPU stockout wrote to GPU _gpu_zone_failures"
+    assert len(compute._zone_health) > 0, "CPU stockout did not record CPU zone health"
+
+
 def _metrics_marker(payload: object) -> str:
     return base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
 
@@ -1938,6 +2167,11 @@ def clean_zone_health():
         provision_error_scope._global_quota_state.clear()
         provision_error_scope._region_quota_state.clear()
         compute._zone_suspect_events.clear()
+        # GPU-isolated state
+        compute._gpu_zone_health.clear()
+        compute._gpu_zone_failures.clear()
+        provision_error_scope._gpu_global_quota_state.clear()
+        provision_error_scope._gpu_region_quota_state.clear()
 
     _reset()
     yield

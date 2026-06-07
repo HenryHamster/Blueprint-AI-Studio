@@ -1969,6 +1969,9 @@ export interface ComputeJob {
   accrued_cost_usd: number | null;
   final_cost_usd: number | null;
   result_reference: string | null;
+  accelerator_type: string | null;
+  accelerator_count: number | null;
+  polling_metadata?: Record<string, unknown>;
   // Augmented by the admin list endpoint from the launching Task.
   task_title: string | null;
   task_type: string | null;

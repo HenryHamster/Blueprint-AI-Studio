@@ -134,6 +134,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask }: ComputeJobsPan
                   <div className="text-[10px] text-neutral-500 font-mono mt-0.5 break-words">
                     {job.backend}
                     {job.machine_type ? ` · ${job.machine_type}` : ''}
+                    {job.accelerator_type ? ` · ${job.accelerator_type} x${job.accelerator_count ?? 1}` : ''}
                   </div>
                 </div>
                 <span
@@ -192,6 +193,21 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask }: ComputeJobsPan
                   </ResolvedReferenceLink>
                 </div>
               )}
+              {!isComputeJobActive(job) && job.accelerator_type && (() => {
+                const metrics = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
+                if (!metrics) return null;
+                const entries = Object.entries(metrics);
+                if (entries.length === 0) return null;
+                return (
+                  <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-neutral-400 font-mono">
+                    {entries.map(([k, v]) => (
+                      <span key={k}>
+                        <span className="text-neutral-500">{k}:</span> {String(v)}
+                      </span>
+                    ))}
+                  </div>
+                );
+              })()}
             </div>
           );
         })}

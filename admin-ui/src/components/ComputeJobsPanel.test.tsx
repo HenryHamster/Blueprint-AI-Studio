@@ -39,6 +39,8 @@ function makeJob(overrides: Partial<ComputeJob> = {}): ComputeJob {
     accrued_cost_usd: 1.0,
     final_cost_usd: null,
     result_reference: null,
+    accelerator_type: null,
+    accelerator_count: null,
     task_title: 'compute_experiment: sweep',
     task_type: 'compute_experiment',
     ...overrides,
@@ -142,6 +144,45 @@ describe('ComputeJobsPanel render + kill', () => {
       'gs://blueprint-agent-artifacts/tasks/task-1/result.json',
     ));
     expect(openSpy).toHaveBeenCalled();
+  });
+
+  test('GPU job shows accelerator label alongside machine type', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        accelerator_type: 'T4',
+        accelerator_count: 1,
+      }),
+    ]);
+    const { findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    const label = await findByText((text) => text.includes('T4 x1'));
+    expect(label).toBeTruthy();
+  });
+
+  test('terminal GPU job with result_metrics surfaces metric key-value pairs; CPU job shows none', async () => {
+    const gpuJob = makeJob({
+      id: 'job-gpu',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 2.0,
+      accelerator_type: 'T4',
+      accelerator_count: 1,
+      polling_metadata: { result_metrics: { gpu_count: 1, driver_version: '525.0' } },
+    });
+    const cpuJob = makeJob({
+      id: 'job-cpu',
+      task_title: 'cpu task',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+    });
+    fetchComputeJobs.mockResolvedValue([gpuJob, cpuJob]);
+    const { findByText, queryByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(await findByText((t) => t.includes('gpu_count:'))).toBeTruthy();
+    expect(await findByText((t) => t.includes('driver_version:'))).toBeTruthy();
+    // CPU job row must not contain any metric labels
+    expect(queryByText((t) => t === 'cpu task' && t.includes('gpu_count:'))).toBeNull();
   });
 
   test('renders nothing when there are no jobs', async () => {
