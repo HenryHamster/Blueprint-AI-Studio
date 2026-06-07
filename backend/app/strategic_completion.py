@@ -700,6 +700,44 @@ def _build_retirement_metrics(direction: dict) -> Dict[str, Any]:
     }
 
 
+_SNAPSHOT_MAX_RECENT_CYCLES = 3
+_SNAPSHOT_FIELD_MAX = 300
+
+
+def _build_retirement_snapshot(direction: dict, rationale: str) -> Dict[str, Any]:
+    """Build a compact snapshot of a retired direction for memo context.
+
+    Reads success_evidence and retirement_condition from direction["context"]
+    (read-only — never writes back). Handles absent context dict gracefully.
+    Bounds string lengths and recent history size to keep payloads small.
+    """
+    ctx = direction.get("context") or {}
+    success_evidence = (ctx.get("success_evidence") or "")[:_SNAPSHOT_FIELD_MAX]
+    retirement_condition = (ctx.get("retirement_condition") or "")[:_SNAPSHOT_FIELD_MAX]
+    direction_text = (direction.get("text") or "")[:_SNAPSHOT_FIELD_MAX]
+
+    history = direction.get("research_history") or []
+    recent = history[-_SNAPSHOT_MAX_RECENT_CYCLES:] if history else []
+    recent_history_summary = [
+        {
+            "cycles": h.get("cycles", 1),
+            "prs_merged": h.get("prs_merged", 0),
+            "tasks_completed": h.get("tasks_completed", 0),
+            "tasks_failed": h.get("tasks_failed", 0),
+        }
+        for h in recent
+    ]
+
+    return {
+        "direction_text": direction_text,
+        "success_evidence": success_evidence,
+        "retirement_condition": retirement_condition,
+        "rationale": rationale[:_SNAPSHOT_FIELD_MAX],
+        "recent_history_summary": recent_history_summary,
+        "retirement_metrics": _build_retirement_metrics(direction),
+    }
+
+
 def _collect_creation_predictions(
     project: Project, direction_ids: list
 ) -> Dict[str, Dict[str, Any]]:
@@ -782,28 +820,35 @@ async def _spawn_retirement_memos(
         direction_text = (direction.get("text") or "") if direction else ""
         rationale = rationales.get(did) or ""
         topic = direction_text[:120] or f"Direction {did}"
+        snapshot = _build_retirement_snapshot(direction or {}, rationale)
+        success_evidence = snapshot.get("success_evidence") or ""
+        retirement_condition = snapshot.get("retirement_condition") or ""
         memo_payload = validate_internal_payload(
             {
                 "type": "memo",
                 "topic": f"Direction retired: {topic}",
                 "reasoning_kind": "direction_retirement",
                 "direction_id": did,
+                "source_finding": snapshot,
                 **({"retirement_rationale": rationale} if rationale else {}),
             },
             "strategic_completion:memo:direction_retirement",
         )
+        context: Dict[str, Any] = {
+            "memo_reasoning_kind": "direction_retirement",
+            "memo_source_direction_id": did,
+            "memo_source_task_id": str(task.id),
+            **({"retirement_rationale": rationale} if rationale else {}),
+            **({"success_evidence": success_evidence} if success_evidence else {}),
+            **({"retirement_condition": retirement_condition} if retirement_condition else {}),
+        }
         memo_task = Task(
             project_id=project.id,
             title=f"Memo: direction retired — {topic[:100]}",
             description="Reasoning memo for retired direction",
             parent_task_id=task.id,
             payloads=[memo_payload],
-            context={
-                "memo_reasoning_kind": "direction_retirement",
-                "memo_source_direction_id": did,
-                "memo_source_task_id": str(task.id),
-                **({"retirement_rationale": rationale} if rationale else {}),
-            },
+            context=context,
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
@@ -814,14 +859,29 @@ async def _spawn_retirement_memos(
         # so the task is immediately COMPLETED and citable without provisioning a VM.
         synthesized = False
         if rationale:
-            parts = [f"Retirement rationale: {rationale}"]
+            parts = []
             if direction_text:
-                parts.insert(0, f"Direction: {direction_text}")
+                parts.append(f"Direction: {direction_text}")
+            parts.append(f"Retirement rationale: {rationale}")
+            if success_evidence:
+                parts.append(f"Success evidence: {success_evidence}")
+            if retirement_condition:
+                parts.append(f"Retirement condition: {retirement_condition}")
+            metrics = snapshot.get("retirement_metrics") or {}
+            if metrics:
+                metrics_str = ", ".join(f"{k}={v}" for k, v in metrics.items())
+                parts.append(f"Final metrics: {metrics_str}")
+            tags = ["direction-retirement"]
+            if success_evidence:
+                tags.append("success-evidence")
+            if retirement_condition:
+                tags.append("retirement-condition")
+            citations = [f"direction:{did}", f"task:{task.id}"]
             synth_memo = {
                 "summary": rationale[:200],
                 "reasoning": "\n\n".join(parts),
-                "citations": [f"direction:{did}", f"task:{task.id}"],
-                "tags": ["direction-retirement"],
+                "citations": citations,
+                "tags": tags,
             }
             _apply_synthesized_memo(memo_task, synth_memo, session)
             synthesized = True

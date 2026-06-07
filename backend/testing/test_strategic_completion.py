@@ -29,6 +29,7 @@ from app.strategic_completion import (
     _build_direction_failure_summary,
     _build_creation_prediction,
     _build_retirement_metrics,
+    _build_retirement_snapshot,
     _collect_creation_predictions,
     _collect_retirement_metrics,
     _collect_rationales,
@@ -50,6 +51,7 @@ from app.strategic_completion import (
     _RETIRED_NOTE_PREFIX,
     spawn_budget_status,
     spawn_title_is_redundant,
+    _spawn_retirement_memos,
 )
 from app.strategic_spawning import (
     _build_previous_decision_outcomes,
@@ -10270,3 +10272,211 @@ class TestProofAwarePause:
         m = _compute_churn_metrics(legacy)
         assert m["merged"] == 0
         assert m["merge_rate"] == 0.0
+
+
+# ── _build_retirement_snapshot unit tests ─────────────────────────────────────
+
+
+class TestBuildRetirementSnapshot:
+    """Unit tests for the _build_retirement_snapshot helper."""
+
+    def _direction_with_context(self, **ctx_fields):
+        return {
+            "id": "d-snap-test",
+            "text": "Build the end-to-end pipeline",
+            "context": ctx_fields,
+            "research_history": [
+                {"cycles": 1, "prs_merged": 2, "tasks_completed": 3, "tasks_failed": 0},
+                {"cycles": 1, "prs_merged": 1, "tasks_completed": 2, "tasks_failed": 1},
+                {"cycles": 1, "prs_merged": 0, "tasks_completed": 1, "tasks_failed": 0},
+                {"cycles": 1, "prs_merged": 3, "tasks_completed": 4, "tasks_failed": 0},
+            ],
+        }
+
+    def test_snapshot_contains_expected_keys(self):
+        direction = self._direction_with_context(
+            success_evidence="CI passes on main", retirement_condition="90% coverage"
+        )
+        snap = _build_retirement_snapshot(direction, "Goal met")
+        assert "direction_text" in snap
+        assert "success_evidence" in snap
+        assert "retirement_condition" in snap
+        assert "rationale" in snap
+        assert "recent_history_summary" in snap
+        assert "retirement_metrics" in snap
+
+    def test_snapshot_reads_context_fields(self):
+        direction = self._direction_with_context(
+            success_evidence="CI passes on main", retirement_condition="90% coverage"
+        )
+        snap = _build_retirement_snapshot(direction, "Goal fully met")
+        assert snap["success_evidence"] == "CI passes on main"
+        assert snap["retirement_condition"] == "90% coverage"
+        assert snap["direction_text"] == "Build the end-to-end pipeline"
+        assert snap["rationale"] == "Goal fully met"
+
+    def test_snapshot_bounds_recent_history_to_three_cycles(self):
+        direction = self._direction_with_context()
+        snap = _build_retirement_snapshot(direction, "done")
+        # history has 4 entries; snapshot should only include the last 3
+        assert len(snap["recent_history_summary"]) == 3
+        # Most recent entry is last in history (prs_merged=3)
+        assert snap["recent_history_summary"][-1]["prs_merged"] == 3
+
+    def test_snapshot_recent_history_fields(self):
+        direction = self._direction_with_context()
+        snap = _build_retirement_snapshot(direction, "done")
+        for entry in snap["recent_history_summary"]:
+            assert "cycles" in entry
+            assert "prs_merged" in entry
+            assert "tasks_completed" in entry
+            assert "tasks_failed" in entry
+
+    def test_snapshot_includes_retirement_metrics(self):
+        direction = self._direction_with_context()
+        snap = _build_retirement_snapshot(direction, "done")
+        metrics = snap["retirement_metrics"]
+        assert "final_quality_score" in metrics
+        assert "final_prs_merged" in metrics
+        assert "final_cycles_active" in metrics
+
+    def test_snapshot_handles_absent_context_gracefully(self):
+        direction = {
+            "id": "d-no-ctx",
+            "text": "Direction without context",
+            "research_history": [],
+        }
+        snap = _build_retirement_snapshot(direction, "retired")
+        assert snap["success_evidence"] == ""
+        assert snap["retirement_condition"] == ""
+        assert snap["recent_history_summary"] == []
+
+    def test_snapshot_handles_empty_direction(self):
+        snap = _build_retirement_snapshot({}, "rationale text")
+        assert snap["direction_text"] == ""
+        assert snap["success_evidence"] == ""
+        assert snap["rationale"] == "rationale text"
+        assert snap["recent_history_summary"] == []
+
+    def test_snapshot_truncates_long_strings(self):
+        long_text = "x" * 500
+        direction = {
+            "text": long_text,
+            "context": {"success_evidence": long_text, "retirement_condition": long_text},
+            "research_history": [],
+        }
+        snap = _build_retirement_snapshot(direction, long_text)
+        assert len(snap["direction_text"]) <= 300
+        assert len(snap["success_evidence"]) <= 300
+        assert len(snap["retirement_condition"]) <= 300
+        assert len(snap["rationale"]) <= 300
+
+
+# ── Retirement memo snapshot integration tests ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_retirement_memo_carries_direction_snapshot(db_session):
+    """Spawned retirement memo payload carries source_finding with direction snapshot.
+
+    Verifies: direction_text, success_evidence, retirement_condition, rationale,
+    recent_history_summary, and retirement_metrics are present in source_finding.
+    Also verifies that the memo task context carries mirrored success_evidence
+    and retirement_condition.
+    """
+    from app.models import TaskStatus
+
+    direction_id = str(uuid.uuid4())
+    project = Project(
+        name="SnapshotTest",
+        user_id="u-snapshot-test",
+        directions=[
+            {
+                "id": direction_id,
+                "text": "Build the pipeline end-to-end",
+                "status": "retired",
+                "priority": "medium",
+                "notes": [],
+                "context": {
+                    "success_evidence": "CI passes on main for 7 days",
+                    "retirement_condition": "All acceptance criteria verified",
+                },
+                "research_history": [
+                    {"cycles": 1, "prs_merged": 2, "tasks_completed": 3, "tasks_failed": 0},
+                    {"cycles": 1, "prs_merged": 1, "tasks_completed": 2, "tasks_failed": 1},
+                ],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent_task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(parent_task)
+    await db_session.commit()
+    await db_session.refresh(parent_task)
+
+    from app.models import Task as TaskModel
+    from sqlmodel import select
+
+    rationale = "Pipeline is complete and all criteria met."
+    spawned = await _spawn_retirement_memos(
+        db_session,
+        project,
+        parent_task,
+        retired_ids=[direction_id],
+        rationales={direction_id: rationale},
+    )
+    assert spawned == 1
+
+    await db_session.commit()
+
+    memo_tasks = (
+        (
+            await db_session.execute(
+                select(TaskModel).where(
+                    TaskModel.project_id == project.id,
+                    TaskModel.created_by == "ORCHESTRATOR",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    retirement_memos = [
+        t
+        for t in memo_tasks
+        if isinstance(t.context, dict)
+        and t.context.get("memo_reasoning_kind") == "direction_retirement"
+    ]
+    assert len(retirement_memos) == 1, f"expected 1 retirement memo, got {len(retirement_memos)}"
+    memo = retirement_memos[0]
+
+    # Verify source_finding in payload
+    payload = memo.payloads[0]
+    source_finding = payload.get("source_finding")
+    assert source_finding is not None, "memo payload must carry source_finding"
+    assert source_finding["direction_text"] == "Build the pipeline end-to-end"
+    assert source_finding["success_evidence"] == "CI passes on main for 7 days"
+    assert source_finding["retirement_condition"] == "All acceptance criteria verified"
+    assert source_finding["rationale"] == rationale
+    assert len(source_finding["recent_history_summary"]) == 2
+    assert "retirement_metrics" in source_finding
+
+    # Verify context carries mirrored fields
+    assert memo.context.get("success_evidence") == "CI passes on main for 7 days"
+    assert memo.context.get("retirement_condition") == "All acceptance criteria verified"
+
+    # Verify synthesized reasoning references the evidence
+    assert isinstance(memo.plan_output, dict) and "memo" in memo.plan_output
+    reasoning = memo.plan_output["memo"].get("reasoning", "")
+    assert "CI passes on main for 7 days" in reasoning
+    assert "All acceptance criteria verified" in reasoning
+    assert rationale in reasoning
