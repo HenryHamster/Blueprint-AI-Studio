@@ -555,7 +555,7 @@ def _author_compute_launch_contract(finding: Dict[str, Any]) -> Dict[str, Any]:
     success = _pick("success_criterion")
     if success is not None:
         contract["success_criterion"] = success
-    for opt_key in ("machine_type", "experiment", "benchmark", "metric", "cwd", "env"):
+    for opt_key in ("machine_type", "experiment", "benchmark", "metric", "cwd", "env", "accelerator", "provisioning_model"):
         val = _pick(opt_key)
         if val is not None:
             contract[opt_key] = val
@@ -3185,6 +3185,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                             "metric",
                             "cwd",
                             "env",
+                            "accelerator",
+                            "provisioning_model",
                         )
                         if _cc.get(k) is not None
                     },

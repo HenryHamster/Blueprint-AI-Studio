@@ -93,6 +93,64 @@ def test_author_contract_tolerates_non_dict_nested():
     assert contract["command"] == "run"
 
 
+def test_author_contract_forwards_accelerator():
+    # GPU accelerator and provisioning_model are forwarded when flat on finding
+    finding = {
+        "command": "python train.py",
+        "spend_cap_usd": 5.0,
+        "deadline_seconds": 900,
+        "machine_type": "g2-standard-4",
+        "accelerator": "T4",
+    }
+    contract = _author_compute_launch_contract(finding)
+    assert contract["accelerator"] == "T4"
+    assert contract["machine_type"] == "g2-standard-4"
+
+
+def test_author_contract_forwards_provisioning_model():
+    # provisioning_model is forwarded when present
+    finding = {
+        "command": "python eval.py",
+        "spend_cap_usd": 3.0,
+        "deadline_seconds": 600,
+        "accelerator": "L4",
+        "provisioning_model": "on_demand",
+    }
+    contract = _author_compute_launch_contract(finding)
+    assert contract["accelerator"] == "L4"
+    assert contract["provisioning_model"] == "on_demand"
+
+
+def test_author_contract_forwards_accelerator_nested():
+    # Nested accelerator overrides flat, both forwarded through contract
+    finding = {
+        "command": "flat-cmd",
+        "accelerator": "T4",
+        "compute_experiment": {
+            "command": "nested-cmd",
+            "spend_cap_usd": 2.5,
+            "deadline_seconds": 300,
+            "accelerator": "V100",
+            "provisioning_model": "spot",
+        },
+    }
+    contract = _author_compute_launch_contract(finding)
+    assert contract["accelerator"] == "V100"
+    assert contract["provisioning_model"] == "spot"
+
+
+def test_author_contract_omits_absent_gpu_fields():
+    # When GPU fields are absent, they are not included in the contract
+    finding = {
+        "command": "python test.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 120,
+    }
+    contract = _author_compute_launch_contract(finding)
+    assert "accelerator" not in contract
+    assert "provisioning_model" not in contract
+
+
 # --- contract validation --------------------------------------------------
 
 
