@@ -82,6 +82,13 @@ from app.failure_classification import (
     REASSIGNED,
     SCOPE_EMPTY,
     SCOPE_OVERFLOW,
+    TIMEOUT_CASCADE,
+    TIMEOUT_EXECUTION,
+    TIMEOUT_HEARTBEAT_LOST,
+    TIMEOUT_ITERATION_LIMIT,
+    TIMEOUT_OOM,
+    TIMEOUT_PROCESS_CRASH,
+    TIMEOUT_UNKNOWN,
     VIEWPORT_REGRESSION,
 )
 
@@ -2884,6 +2891,282 @@ def compute_churn_direction(buckets: List[Dict[str, Any]]) -> str:
     return "flat"
 
 
+# ---------------------------------------------------------------------------
+# Durable, windowed AGENT_TIMEOUT-rate measure (direction d-46468a41).
+#
+# The equipping lane needs a VALIDATED pipeline measure to cite a real
+# before/after delta on. AGENT_TIMEOUT is the most-flagged failure class, so the
+# headline measure is its windowed RATE, decomposed by the seven persisted
+# subtypes. The dominant subtype routes the operator failure-guidance line to a
+# known OSS countermeasure (oom -> memory/footprint; execution_timeout ->
+# long-command/tool budgets a la SWE-agent; heartbeat_lost/process_crash ->
+# liveness/checkpoint a la OpenHands; iteration_limit -> scope/condensation a la
+# Aider).
+#
+# GROUND-TRUTH RULE: this measure reads ONLY persisted per-task ground truth —
+# ``ctx['failure_category']`` (the numerator class) and ``ctx['timeout_subtype']``
+# (the subtype) — both stamped at terminal-FAILED time by
+# ``failure_classification.persist_failure_category``. It NEVER calls
+# ``classify_timeout_subtype`` / ``classify_failure`` (which DERIVE from
+# log/status text), so the rate is stable against later status-message rewrites
+# and is not gameable by re-derivation.
+# ---------------------------------------------------------------------------
+
+# The seven persisted AGENT_TIMEOUT subtypes, in a fixed order so every emitted
+# rate block carries all seven keys (zero-filled) and the manifest can enumerate
+# them deterministically.
+TIMEOUT_SUBTYPES: tuple[str, ...] = (
+    TIMEOUT_HEARTBEAT_LOST,
+    TIMEOUT_OOM,
+    TIMEOUT_EXECUTION,
+    TIMEOUT_CASCADE,
+    TIMEOUT_ITERATION_LIMIT,
+    TIMEOUT_PROCESS_CRASH,
+    TIMEOUT_UNKNOWN,
+)
+
+# Window for the rate measure — same length as the efficiency axes so the daily
+# snapshot it folds into reads apples-to-apples with the other axes.
+_TIMEOUT_RATE_WINDOW_DAYS = 7
+
+# Confident-dominance gate for the operator guidance line: a subtype is reported
+# as the dominant cause only when it covers >=2 timeouts AND >=60% of them, and
+# is not the catch-all "unknown" bucket. Mirrors the long-standing narrative gate
+# in :func:`_compute_dominant_timeout_subtype` so switching the narrative to
+# persisted ground truth does not change WHEN advice is refined, only its source.
+_TIMEOUT_DOMINANT_MIN_COUNT = 2
+_TIMEOUT_DOMINANT_MIN_SHARE = 0.6
+
+
+def _persisted_timeout_subtype(task: Task) -> str | None:
+    """Return a task's persisted timeout subtype, or None if it is not a timeout.
+
+    Reads ONLY the durable ground truth ``ctx['failure_category']`` /
+    ``ctx['timeout_subtype']`` — never re-derives from logs. A task whose
+    persisted ``failure_category`` is not AGENT_TIMEOUT returns None; an
+    AGENT_TIMEOUT task with no recorded subtype collapses to ``unknown`` (the
+    same fallback the writer uses), so it is still counted in the numerator.
+    """
+    ctx = task.context or {}
+    if not isinstance(ctx, dict):
+        return None
+    if ctx.get("failure_category") != AGENT_TIMEOUT:
+        return None
+    subtype = ctx.get("timeout_subtype") or TIMEOUT_UNKNOWN
+    return subtype if subtype in TIMEOUT_SUBTYPES else TIMEOUT_UNKNOWN
+
+
+def _dominant_persisted_timeout(
+    tasks: List[Task],
+) -> tuple[str | None, float | None, int]:
+    """Return ``(dominant_subtype, dominant_share, timeout_count)`` from ground truth.
+
+    ``dominant_subtype`` is the most common persisted subtype among the timeout
+    tasks (None when there are no timeouts); ``dominant_share`` is its fraction of
+    all timeouts. No confidence gate is applied here — that is the consumer's job
+    (see :func:`confident_dominant_timeout_subtype`).
+    """
+    counts: Dict[str, int] = {}
+    total = 0
+    for t in tasks:
+        subtype = _persisted_timeout_subtype(t)
+        if subtype is None:
+            continue
+        total += 1
+        counts[subtype] = counts.get(subtype, 0) + 1
+    if not counts:
+        return None, None, 0
+    dominant, dominant_count = max(counts.items(), key=lambda kv: kv[1])
+    return dominant, round(dominant_count / total, 4), total
+
+
+def confident_dominant_timeout_subtype(tasks: List[Task]) -> str | None:
+    """Persisted dominant timeout subtype, gated for the operator guidance line.
+
+    Returns the subtype only when it covers >=2 timeouts AND >=60% of them and is
+    not ``unknown`` — otherwise None (no confident single cause to route advice
+    to). Reads persisted ground truth via :func:`_persisted_timeout_subtype`, so
+    the digest AGENT_TIMEOUT guidance is driven by the same durable signal the
+    snapshot measure persists, not by log re-derivation.
+    """
+    dominant, share, count = _dominant_persisted_timeout(tasks)
+    if dominant is None or share is None:
+        return None
+    dominant_count = round(share * count)
+    if (
+        dominant_count >= _TIMEOUT_DOMINANT_MIN_COUNT
+        and share >= _TIMEOUT_DOMINANT_MIN_SHARE
+        and dominant != TIMEOUT_UNKNOWN
+    ):
+        return dominant
+    return None
+
+
+def compute_timeout_rate(
+    tasks: List[Task], *, window_days: int = _TIMEOUT_RATE_WINDOW_DAYS
+) -> Dict[str, Any]:
+    """Windowed AGENT_TIMEOUT rate, decomposed by persisted subtype.
+
+    DENOMINATOR — ``execution_reached``: terminal tasks in the window that
+    actually reached execution, i.e. carry a ``started_at`` timestamp. This makes
+    the rate a fraction over tasks that COULD have timed out (a task that never
+    started cannot time out), so it is comparable over time and not inflated or
+    deflated by queued/never-dispatched volume. Callers pass the already-windowed
+    terminal task set (e.g. efficiency_snapshot._load_recent_tasks); ``tasks`` is
+    not re-filtered by time here.
+
+    NUMERATOR — ``timeout_count``: tasks whose persisted
+    ``ctx['failure_category']`` is AGENT_TIMEOUT. Read from durable ground truth
+    only — never re-derived from logs.
+
+    Returns a block with the overall rate, a per-subtype ``{count, rate}`` map
+    covering all seven subtypes (rate over the SAME execution-reached denominator,
+    so the per-subtype rates sum to the overall rate), and the dominant subtype +
+    its share among timeouts. ``overall_rate`` / per-subtype ``rate`` are None
+    only when the denominator is 0 (no tasks reached execution — rate undefined,
+    distinct from a real 0.0). ``window_days`` is echoed for provenance.
+    """
+    denominator = sum(1 for t in tasks if getattr(t, "started_at", None) is not None)
+    subtype_counts: Dict[str, int] = {s: 0 for s in TIMEOUT_SUBTYPES}
+    timeout_count = 0
+    for t in tasks:
+        subtype = _persisted_timeout_subtype(t)
+        if subtype is None:
+            continue
+        timeout_count += 1
+        subtype_counts[subtype] += 1
+
+    def _rate(n: int) -> float | None:
+        if denominator <= 0:
+            return None
+        return round(n / denominator, 4)
+
+    dominant, dominant_share, _ = _dominant_persisted_timeout(tasks)
+
+    return {
+        "window_days": window_days,
+        "denominator": denominator,
+        "denominator_definition": (
+            "terminal tasks in the window that reached execution (started_at "
+            "present); a task that never started cannot time out"
+        ),
+        "timeout_count": timeout_count,
+        "overall_rate": _rate(timeout_count),
+        "by_subtype": {
+            subtype: {"count": subtype_counts[subtype], "rate": _rate(subtype_counts[subtype])}
+            for subtype in TIMEOUT_SUBTYPES
+        },
+        "dominant_subtype": dominant,
+        "dominant_share": dominant_share,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Metric-governance manifest for the AGENT_TIMEOUT-rate measure.
+#
+# Mirrors RESEARCH_HISTORY_METRIC_MANIFEST in direction_outcomes.py: every field
+# the measure emits declares EITHER a named ground-truth source + named consumer,
+# OR a dated pending/retired reason. The guard test
+# ``backend/testing/test_timeout_rate_metric_manifest.py`` AST-extracts the dict
+# keys ``compute_timeout_rate`` actually returns and asserts they all appear here
+# (and that no manifest "consumer" key has stopped being emitted), so the measure
+# cannot silently rot — a new emitted field cannot land without declaring who
+# reads it and where its ground truth comes from.
+#
+# ``ground_truth`` names the durable source each field is computed from (so the
+# manifest documents that the measure reads persisted per-task truth, not logs).
+# The per-subtype rates live under the ``by_subtype`` key, which is declared once
+# here (its inner shape is fixed: one ``{count, rate}`` entry per TIMEOUT_SUBTYPES
+# member).
+# ---------------------------------------------------------------------------
+TIMEOUT_RATE_METRIC_MANIFEST: dict[str, dict] = {
+    "window_days": {
+        "ground_truth": "constant _TIMEOUT_RATE_WINDOW_DAYS (provenance, not measured)",
+        "consumer": "efficiency_snapshot.read_baseline_with_drift (agent_timeout_rate block provenance)",
+    },
+    "denominator": {
+        "ground_truth": "Task.started_at presence over the windowed terminal task set",
+        "consumer": "efficiency-axes response (agent_timeout_rate.current denominator), strategic layer",
+    },
+    "denominator_definition": {
+        "ground_truth": "static documentation string (no measured input)",
+        "consumer": "efficiency-axes response (operator-facing denominator definition)",
+    },
+    "timeout_count": {
+        "ground_truth": "persisted ctx['failure_category'] == AGENT_TIMEOUT",
+        "consumer": "efficiency-axes response (agent_timeout_rate numerator)",
+    },
+    "overall_rate": {
+        "ground_truth": "timeout_count / execution-reached denominator (both persisted ground truth)",
+        "consumer": "digest narrative AGENT_TIMEOUT before/after sentence (admin_digest.py), efficiency-axes agent_timeout_rate.overall drift",
+    },
+    "by_subtype": {
+        "ground_truth": "persisted ctx['timeout_subtype'] per AGENT_TIMEOUT task, over the execution-reached denominator",
+        "consumer": "efficiency-axes agent_timeout_rate.by_subtype drift (per-subtype current-vs-baseline)",
+    },
+    "dominant_subtype": {
+        "ground_truth": "most common persisted ctx['timeout_subtype'] among window timeouts",
+        "consumer": "digest narrative AGENT_TIMEOUT guidance line via confident_dominant_timeout_subtype (admin_digest.py / compute_narrative_summary)",
+    },
+    "dominant_share": {
+        "ground_truth": "dominant subtype count / timeout_count (persisted ground truth)",
+        "consumer": "efficiency-axes agent_timeout_rate.dominant_share (operator + strategic context)",
+    },
+}
+
+
+def _format_timeout_rate_drift(drift: Dict[str, Any] | None) -> str | None:
+    """Render the AGENT_TIMEOUT-rate before/after sentence from the overall block.
+
+    ``drift`` is the ``{current, baseline, drift_pct}`` overall block from the
+    persisted measure (efficiency_snapshot.read_baseline_with_drift). Returns a
+    sentence like ``"Agent-timeout rate 8%, down from a baseline of 12%."`` when
+    both current and baseline are present, or None when there is nothing durable
+    to report yet (no snapshot/baseline). Rates are stored as fractions (0..1)
+    and rendered as whole-number percentages.
+    """
+    if not isinstance(drift, dict):
+        return None
+    current = drift.get("current")
+    baseline = drift.get("baseline")
+    if not isinstance(current, (int, float)) or not isinstance(baseline, (int, float)):
+        return None
+    cur_pct = round(current * 100)
+    base_pct = round(baseline * 100)
+    if cur_pct < base_pct:
+        direction = "down"
+    elif cur_pct > base_pct:
+        direction = "up"
+    else:
+        direction = "unchanged"
+    if direction == "unchanged":
+        return f"Agent-timeout rate {cur_pct}%, unchanged from baseline."
+    return (
+        f"Agent-timeout rate {cur_pct}%, {direction} from a baseline of {base_pct}%."
+    )
+
+
+def _compute_dominant_timeout_subtype(timeout_tasks: List[Dict[str, Any]]) -> str | None:
+    """Compute the dominant timeout subtype from a list of timeout failure entries.
+
+    Returns the subtype string if one clearly dominates (present in >=2 tasks and
+    >= 60% of timeout tasks), else None.
+    """
+    if not timeout_tasks:
+        return None
+    subtype_counts: Dict[str, int] = {}
+    for task_entry in timeout_tasks:
+        subtype = task_entry.get("timeout_subtype") or "unknown"
+        subtype_counts[subtype] = subtype_counts.get(subtype, 0) + 1
+    if not subtype_counts:
+        return None
+    dominant_subtype, dominant_count = max(subtype_counts.items(), key=lambda kv: kv[1])
+    total = len(timeout_tasks)
+    if dominant_count >= 2 and dominant_count / total >= 0.6:
+        return dominant_subtype if dominant_subtype != "unknown" else None
+    return None
+
+
 def compute_narrative_summary(
     *,
     hours: int,
@@ -2907,8 +3190,17 @@ def compute_narrative_summary(
     failed_tasks: List[Task],
     outer_loop_convergence_summary: Dict[str, Any] | None = None,
     outer_loop_convergence_trend: Dict[str, Any] | None = None,
+    timeout_rate_drift: Dict[str, Any] | None = None,
 ) -> str:
-    """Build the human-readable digest narrative from precomputed metrics."""
+    """Build the human-readable digest narrative from precomputed metrics.
+
+    ``timeout_rate_drift`` is the durable AGENT_TIMEOUT-rate overall block
+    (``{current, baseline, drift_pct}``) read off the efficiency snapshot via
+    ``read_baseline_with_drift``. When the dominant failure class is
+    AGENT_TIMEOUT and this block carries a current+baseline, a before/after
+    sentence is appended reporting the rate's drift from baseline so the operator
+    sees whether the measure moved, not just the in-window count.
+    """
     from app.failure_classification import (
         classify_failure as _classify_failure,
         classify_failure_taxonomy as _classify_taxonomy,
@@ -2954,6 +3246,24 @@ def compute_narrative_summary(
                 "CODE_ERROR": f"Most failures ({cnt}/{failed_count}) are code errors in agent-written code.",
                 "SCOPE_OVERFLOW": f"Most failures ({cnt}/{failed_count}) exceeded scope budget (touched more files than scope allows) — consider task decomposition or scope escalation.",
             }
+            if cls == "AGENT_TIMEOUT":
+                # Drive the refined guidance line from PERSISTED ground truth
+                # (ctx['failure_category'] / ctx['timeout_subtype']) via the same
+                # durable signal the snapshot measure persists — not from the
+                # log-derived subtype on the failure-grouping entries.
+                _timeout_subtype = confident_dominant_timeout_subtype(failed_tasks)
+                if _timeout_subtype:
+                    _timeout_msgs = {
+                        "oom": f"Most failures ({cnt}/{failed_count}) are out-of-memory timeouts — check task memory usage and consider memory/footprint optimization.",
+                        "heartbeat_lost": f"Most failures ({cnt}/{failed_count}) are heartbeat-timeout errors — may indicate hangs or liveness issues.",
+                        "process_crash": f"Most failures ({cnt}/{failed_count}) are process crashes — may indicate hangs or liveness issues.",
+                        "execution_timeout": f"Most failures ({cnt}/{failed_count}) are execution timeouts — tasks may need complexity reduction or scope adjustment.",
+                        "iteration_limit": f"Most failures ({cnt}/{failed_count}) hit iteration limits — tasks may need complexity reduction or scope adjustment.",
+                        "cascade_cancellation": f"Most failures ({cnt}/{failed_count}) are cascade cancellations — check upstream dependencies and parent task status.",
+                    }
+                    _refined_msg = _timeout_msgs.get(_timeout_subtype)
+                    if _refined_msg:
+                        _root_cause_msgs["AGENT_TIMEOUT"] = _refined_msg
             if cls == "CODE_ERROR":
                 _ce_tax: Dict[str, int] = {}
                 for _t in failed_tasks:
@@ -2975,6 +3285,14 @@ def compute_narrative_summary(
                         if _refined:
                             _root_cause_msgs["CODE_ERROR"] = _refined
             dominant_msg = _root_cause_msgs.get(cls)
+            # Before/after sentence: when agent-timeouts dominate, report the
+            # durable AGENT_TIMEOUT-rate measure's current-vs-baseline drift so
+            # the operator sees whether the validated pipeline measure actually
+            # moved, not just the in-window absolute count.
+            if cls == "AGENT_TIMEOUT" and dominant_msg:
+                _drift_sentence = _format_timeout_rate_drift(timeout_rate_drift)
+                if _drift_sentence:
+                    dominant_msg = f"{dominant_msg} {_drift_sentence}"
         if dominant_msg:
             narrative_parts.append(dominant_msg)
         else:

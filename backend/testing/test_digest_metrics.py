@@ -185,6 +185,366 @@ def test_compute_narrative_summary_no_dominant_failure_class():
     )
 
 
+def test_timeout_advice_reflects_dominant_subtype():
+    """Timeout advice is driven by the actual dominant timeout subtype, not generic complexity."""
+    from app.failure_classification import (
+        AGENT_TIMEOUT,
+    )
+
+    # OOM-dominant timeouts → memory/footprint advice
+    oom_tasks = [
+        make_task(
+            title=f"OOM Timeout {i}",
+            status=TaskStatus.FAILED,
+            context={"failure_category": AGENT_TIMEOUT, "timeout_subtype": "oom"},
+            latest_status_message="OutOfMemory",
+        )
+        for i in range(3)
+    ]
+    oom_narrative = _build_narrative_summary(
+        failed_count=3,
+        failure_groups=[
+            {
+                "failure_class": AGENT_TIMEOUT,
+                "count": 3,
+                "label": "Agent Timeout",
+                "tasks": [
+                    {
+                        "task_id": str(t.id),
+                        "title": t.title,
+                        "timeout_subtype": "oom",
+                    }
+                    for t in oom_tasks
+                ],
+            }
+        ],
+        failed_tasks=oom_tasks,
+        error_log_map={},
+    )
+    assert "memory" in oom_narrative.lower() or "footprint" in oom_narrative.lower()
+    assert "complexity" not in oom_narrative.lower()
+
+    # Heartbeat-lost-dominant timeouts → hangs/liveness advice
+    hb_tasks = [
+        make_task(
+            title=f"Heartbeat Timeout {i}",
+            status=TaskStatus.FAILED,
+            context={
+                "failure_category": AGENT_TIMEOUT,
+                "timeout_subtype": "heartbeat_lost",
+            },
+            latest_status_message="No heartbeat",
+        )
+        for i in range(3)
+    ]
+    hb_narrative = _build_narrative_summary(
+        failed_count=3,
+        failure_groups=[
+            {
+                "failure_class": AGENT_TIMEOUT,
+                "count": 3,
+                "label": "Agent Timeout",
+                "tasks": [
+                    {
+                        "task_id": str(t.id),
+                        "title": t.title,
+                        "timeout_subtype": "heartbeat_lost",
+                    }
+                    for t in hb_tasks
+                ],
+            }
+        ],
+        failed_tasks=hb_tasks,
+        error_log_map={},
+    )
+    assert "hangs" in hb_narrative.lower() or "liveness" in hb_narrative.lower()
+    assert "complexity" not in hb_narrative.lower()
+
+    # Execution-timeout-dominant timeouts → complexity/scope advice
+    exec_tasks = [
+        make_task(
+            title=f"Execution Timeout {i}",
+            status=TaskStatus.FAILED,
+            context={
+                "failure_category": AGENT_TIMEOUT,
+                "timeout_subtype": "execution_timeout",
+            },
+            latest_status_message="Task timeout",
+        )
+        for i in range(3)
+    ]
+    exec_narrative = _build_narrative_summary(
+        failed_count=3,
+        failure_groups=[
+            {
+                "failure_class": AGENT_TIMEOUT,
+                "count": 3,
+                "label": "Agent Timeout",
+                "tasks": [
+                    {
+                        "task_id": str(t.id),
+                        "title": t.title,
+                        "timeout_subtype": "execution_timeout",
+                    }
+                    for t in exec_tasks
+                ],
+            }
+        ],
+        failed_tasks=exec_tasks,
+        error_log_map={},
+    )
+    assert "complexity" in exec_narrative.lower() or "scope" in exec_narrative.lower()
+
+    # Cascade-cancellation-dominant timeouts → upstream advice
+    cascade_tasks = [
+        make_task(
+            title=f"Cascade Cancel {i}",
+            status=TaskStatus.FAILED,
+            context={
+                "failure_category": AGENT_TIMEOUT,
+                "timeout_subtype": "cascade_cancellation",
+            },
+            latest_status_message="Cascade cancel",
+        )
+        for i in range(3)
+    ]
+    cascade_narrative = _build_narrative_summary(
+        failed_count=3,
+        failure_groups=[
+            {
+                "failure_class": AGENT_TIMEOUT,
+                "count": 3,
+                "label": "Agent Timeout",
+                "tasks": [
+                    {
+                        "task_id": str(t.id),
+                        "title": t.title,
+                        "timeout_subtype": "cascade_cancellation",
+                    }
+                    for t in cascade_tasks
+                ],
+            }
+        ],
+        failed_tasks=cascade_tasks,
+        error_log_map={},
+    )
+    assert "upstream" in cascade_narrative.lower() or "dependencies" in cascade_narrative.lower()
+
+
+# ---------------------------------------------------------------------------
+# Durable windowed AGENT_TIMEOUT-rate measure (compute_timeout_rate)
+# ---------------------------------------------------------------------------
+
+
+def _timeout_task(subtype: str, *, started: bool = True):
+    """A terminal task with PERSISTED AGENT_TIMEOUT ground truth for the measure."""
+    from app.failure_classification import AGENT_TIMEOUT
+
+    return make_task(
+        status=TaskStatus.FAILED,
+        started_at=_utcnow() if started else None,
+        context={"failure_category": AGENT_TIMEOUT, "timeout_subtype": subtype},
+    )
+
+
+def _nontimeout_terminal_task(failure_category: str | None = None):
+    """A terminal task that reached execution but is NOT an AGENT_TIMEOUT."""
+    ctx = {"failure_category": failure_category} if failure_category else {}
+    return make_task(
+        status=TaskStatus.COMPLETED if failure_category is None else TaskStatus.FAILED,
+        started_at=_utcnow(),
+        context=ctx,
+    )
+
+
+def test_compute_timeout_rate_empty_window_zero_rate():
+    """Empty window: rate undefined (None) when nothing reached execution."""
+    from app.digest_metrics import compute_timeout_rate
+
+    block = compute_timeout_rate([])
+    assert block["denominator"] == 0
+    assert block["timeout_count"] == 0
+    assert block["overall_rate"] is None
+    assert block["dominant_subtype"] is None
+    # All seven subtypes are present and zero-filled.
+    assert set(block["by_subtype"]) == {
+        "heartbeat_lost",
+        "oom",
+        "execution_timeout",
+        "cascade_cancellation",
+        "iteration_limit",
+        "process_crash",
+        "unknown",
+    }
+    assert all(v["count"] == 0 for v in block["by_subtype"].values())
+
+
+def test_compute_timeout_rate_zero_timeouts_real_zero():
+    """A window with execution but no timeouts: real 0.0 rate, not None."""
+    from app.digest_metrics import compute_timeout_rate
+
+    tasks = [_nontimeout_terminal_task() for _ in range(5)]
+    tasks += [_nontimeout_terminal_task("CODE_ERROR") for _ in range(3)]
+    block = compute_timeout_rate(tasks)
+    assert block["denominator"] == 8
+    assert block["timeout_count"] == 0
+    assert block["overall_rate"] == 0.0
+    assert block["dominant_subtype"] is None
+
+
+def test_compute_timeout_rate_exact_rate_and_dominant_subtype():
+    """Known persisted subtypes yield the EXACT expected rate and dominant subtype."""
+    from app.digest_metrics import compute_timeout_rate
+
+    # 4 oom + 1 heartbeat_lost timeouts among 10 execution-reached tasks.
+    tasks = [_timeout_task("oom") for _ in range(4)]
+    tasks.append(_timeout_task("heartbeat_lost"))
+    tasks += [_nontimeout_terminal_task() for _ in range(5)]
+
+    block = compute_timeout_rate(tasks)
+    assert block["denominator"] == 10
+    assert block["timeout_count"] == 5
+    # 5 timeouts / 10 execution-reached = exactly 0.5.
+    assert block["overall_rate"] == 0.5
+    assert block["by_subtype"]["oom"]["count"] == 4
+    assert block["by_subtype"]["oom"]["rate"] == 0.4
+    assert block["by_subtype"]["heartbeat_lost"]["rate"] == 0.1
+    # Per-subtype rates sum to the overall rate (same denominator).
+    assert round(sum(v["rate"] for v in block["by_subtype"].values()), 4) == 0.5
+    assert block["dominant_subtype"] == "oom"
+    assert block["dominant_share"] == 0.8  # 4/5
+
+
+def test_compute_timeout_rate_not_gameable_by_raw_volume():
+    """Raw volume alone does not move the rate when the denominator scales with it."""
+    from app.digest_metrics import compute_timeout_rate
+
+    # 2 timeouts among 10 execution-reached -> 0.2.
+    small = [_timeout_task("oom") for _ in range(2)] + [
+        _nontimeout_terminal_task() for _ in range(8)
+    ]
+    small_rate = compute_timeout_rate(small)["overall_rate"]
+
+    # Scale BOTH numerator and denominator by 5x: 10 timeouts among 50 -> still 0.2.
+    big = [_timeout_task("oom") for _ in range(10)] + [
+        _nontimeout_terminal_task() for _ in range(40)
+    ]
+    big_block = compute_timeout_rate(big)
+    assert small_rate == 0.2
+    assert big_block["overall_rate"] == 0.2  # raw volume 5x but rate unchanged
+    assert big_block["timeout_count"] == 10
+    assert big_block["denominator"] == 50
+
+
+def test_compute_timeout_rate_denominator_excludes_never_started():
+    """Tasks that never reached execution (no started_at) are out of the denominator."""
+    from app.digest_metrics import compute_timeout_rate
+
+    tasks = [_timeout_task("oom") for _ in range(2)]
+    tasks += [_nontimeout_terminal_task() for _ in range(2)]
+    # Two terminal tasks that never started — excluded from the denominator so a
+    # task that could not have timed out does not deflate the rate.
+    tasks += [_timeout_task("oom", started=False)]
+    tasks += [
+        make_task(status=TaskStatus.CANCELLED, started_at=None, context={})
+    ]
+    block = compute_timeout_rate(tasks)
+    # Denominator = 4 started tasks (the 2 timeouts + 2 non-timeouts). The
+    # never-started timeout still counts in timeout_count (it has persisted
+    # ground truth) but not in the denominator.
+    assert block["denominator"] == 4
+    assert block["timeout_count"] == 3
+    assert block["by_subtype"]["oom"]["count"] == 3
+
+
+def test_compute_timeout_rate_reads_persisted_not_derived():
+    """The measure ignores log/status text and reads only persisted ground truth."""
+    from app.digest_metrics import compute_timeout_rate
+    from app.failure_classification import AGENT_TIMEOUT
+
+    # Status/log text screams OOM, but persisted ground truth says heartbeat_lost.
+    # The measure MUST honour the persisted subtype, not re-derive from the text.
+    t = make_task(
+        status=TaskStatus.FAILED,
+        started_at=_utcnow(),
+        latest_status_message="OutOfMemory killed the worker, oom oom oom",
+        context={
+            "failure_category": AGENT_TIMEOUT,
+            "timeout_subtype": "heartbeat_lost",
+        },
+    )
+    block = compute_timeout_rate([t])
+    assert block["by_subtype"]["heartbeat_lost"]["count"] == 1
+    assert block["by_subtype"]["oom"]["count"] == 0
+
+    # A task whose status text looks like a timeout but has NO persisted
+    # AGENT_TIMEOUT category is NOT counted as a timeout.
+    not_persisted = make_task(
+        status=TaskStatus.FAILED,
+        started_at=_utcnow(),
+        latest_status_message="execution timeout after 1h",
+        context={"failure_category": "CODE_ERROR"},
+    )
+    block2 = compute_timeout_rate([not_persisted])
+    assert block2["timeout_count"] == 0
+
+
+def test_confident_dominant_timeout_subtype_gate():
+    """Dominant subtype is gated: needs >=2 and >=60%, and excludes 'unknown'."""
+    from app.digest_metrics import confident_dominant_timeout_subtype
+
+    # 3 oom of 4 timeouts -> 75% -> confident "oom".
+    tasks = [_timeout_task("oom") for _ in range(3)] + [_timeout_task("execution_timeout")]
+    assert confident_dominant_timeout_subtype(tasks) == "oom"
+
+    # 1 oom of 1 -> count < 2 -> not confident.
+    assert confident_dominant_timeout_subtype([_timeout_task("oom")]) is None
+
+    # 2-2 split -> 50% -> not confident.
+    split = [_timeout_task("oom") for _ in range(2)] + [
+        _timeout_task("heartbeat_lost") for _ in range(2)
+    ]
+    assert confident_dominant_timeout_subtype(split) is None
+
+    # 3 unknown of 3 -> dominant but 'unknown' is suppressed.
+    unknowns = [_timeout_task("unknown") for _ in range(3)]
+    assert confident_dominant_timeout_subtype(unknowns) is None
+
+
+def test_format_timeout_rate_drift_sentence():
+    """The before/after sentence renders fractions as whole-percent and direction."""
+    from app.digest_metrics import _format_timeout_rate_drift
+
+    down = _format_timeout_rate_drift({"current": 0.08, "baseline": 0.12})
+    assert down == "Agent-timeout rate 8%, down from a baseline of 12%."
+    up = _format_timeout_rate_drift({"current": 0.20, "baseline": 0.10})
+    assert up == "Agent-timeout rate 20%, up from a baseline of 10%."
+    same = _format_timeout_rate_drift({"current": 0.10, "baseline": 0.10})
+    assert same == "Agent-timeout rate 10%, unchanged from baseline."
+    # Missing baseline -> no sentence (nothing durable to report yet).
+    assert _format_timeout_rate_drift({"current": 0.08, "baseline": None}) is None
+    assert _format_timeout_rate_drift(None) is None
+
+
+def test_narrative_timeout_before_after_sentence_appended():
+    """When timeouts dominate AND a drift block is supplied, the narrative reports drift."""
+    oom_tasks = [_timeout_task("oom") for _ in range(3)]
+    from app.failure_classification import AGENT_TIMEOUT
+
+    narrative = _build_narrative_summary(
+        failed_count=3,
+        failure_groups=[
+            {"failure_class": AGENT_TIMEOUT, "count": 3, "label": "Agent Timeout"}
+        ],
+        failed_tasks=oom_tasks,
+        timeout_rate_drift={"current": 0.05, "baseline": 0.12},
+    )
+    # Persisted-ground-truth dominant subtype still routes the advice (oom).
+    assert "memory" in narrative.lower() or "footprint" in narrative.lower()
+    # Before/after sentence appended.
+    assert "Agent-timeout rate 5%, down from a baseline of 12%." in narrative
+
+
 def test_compute_narrative_summary_completion_trend_prefix():
     completed = [
         make_task(title="Completed Alpha", status=TaskStatus.COMPLETED),

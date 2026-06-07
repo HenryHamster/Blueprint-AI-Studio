@@ -922,6 +922,19 @@ async def _compute_digest(
         days=7, project_id=project_id, session=session
     )
 
+    # Durable AGENT_TIMEOUT-rate measure: read the overall current-vs-baseline
+    # drift off the efficiency snapshot so the narrative can append a real
+    # before/after sentence when agent-timeouts dominate (direction d-46468a41).
+    # Best-effort — a missing/empty snapshot yields no sentence, never an error.
+    _timeout_rate_drift: dict | None = None
+    try:
+        from app.efficiency_snapshot import read_baseline_with_drift
+
+        _eff = await read_baseline_with_drift(session, project_id)
+        _timeout_rate_drift = (_eff.get("agent_timeout_rate") or {}).get("overall")
+    except Exception:
+        _timeout_rate_drift = None
+
     narrative_summary = compute_narrative_summary(
         hours=hours,
         project_id=project_id,
@@ -944,6 +957,7 @@ async def _compute_digest(
         failed_tasks=failed_tasks,
         outer_loop_convergence_summary=outer_loop_convergence_summary,
         outer_loop_convergence_trend=outer_loop_convergence_trend,
+        timeout_rate_drift=_timeout_rate_drift,
     )
 
     # Today's settled off-VM compute-job spend so daily_cost_usd reflects total

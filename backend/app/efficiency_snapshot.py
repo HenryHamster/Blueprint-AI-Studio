@@ -210,6 +210,9 @@ async def _load_recent_tasks(
                 Task.id,
                 Task.status,
                 Task.context,
+                # started_at: presence marks a task that actually reached
+                # execution — the AGENT_TIMEOUT-rate measure's denominator.
+                Task.started_at,
                 Task.vm_spot,
                 Task.vm_machine_type,
                 Task.vm_provisioned_at,
@@ -1753,6 +1756,7 @@ async def compute_current_axes(
     session: AsyncSession, project_id: uuid.UUID
 ) -> Dict[str, Any]:
     """Compute all efficiency axes (plus cold-start breakdown) from recent terminal tasks."""
+    from app.digest_metrics import compute_timeout_rate  # noqa: PLC0415
     from app.warm_backlog_reuse import (  # noqa: PLC0415
         compute_dominant_pool_miss,
         compute_dominant_reuse_dropout,
@@ -1806,6 +1810,17 @@ async def compute_current_axes(
         # vs no compatible member vs lost-lease race) — the answer that drives the
         # next tuning action. Surfaced via read_baseline_with_drift -> warm-VM view.
         "pool_dispatch_funnel": compute_dominant_pool_miss(),
+        # Durable, windowed AGENT_TIMEOUT-rate measure (direction d-46468a41):
+        # overall rate + per-subtype decomposition + dominant subtype, all read
+        # from PERSISTED per-task ground truth (ctx['failure_category'] /
+        # ctx['timeout_subtype']), never re-derived from logs. Folded into the
+        # daily snapshot so it inherits the first-snapshot-becomes-immutable-
+        # baseline semantics for free; current-vs-baseline drift is surfaced by
+        # read_baseline_with_drift -> the efficiency-axes response and the digest
+        # AGENT_TIMEOUT before/after sentence. The denominator is execution-
+        # reached tasks (started_at present) so the rate is not gameable by raw
+        # volume. See app.digest_metrics.compute_timeout_rate.
+        "agent_timeout_rate": compute_timeout_rate(tasks),
     }
 
 
@@ -1878,6 +1893,16 @@ async def write_snapshot(
             for axis in ALL_AXES:
                 if baseline.get(axis) is None and snapshot.get(axis) is not None:
                     baseline[axis] = snapshot[axis]
+            # agent_timeout_rate is a nested block, not a member of ALL_AXES, so
+            # the re-seed loop above never reaches it. Backfill it for baselines
+            # that predate this measure (the live, daily-snapshotted Blueprint
+            # project among them) so read_baseline_with_drift can report a real
+            # current-vs-baseline drift instead of baseline=None / drift_pct=None.
+            if (
+                baseline.get("agent_timeout_rate") is None
+                and snapshot.get("agent_timeout_rate") is not None
+            ):
+                baseline["agent_timeout_rate"] = snapshot["agent_timeout_rate"]
             container["baseline"] = baseline
 
         snapshots = list(container.get("snapshots") or [])
@@ -2051,8 +2076,68 @@ async def read_baseline_with_drift(
         ],
     }
 
+    # Durable AGENT_TIMEOUT-rate measure (direction d-46468a41): surface the
+    # latest snapshot's rate block against the immutable first-snapshot baseline
+    # as current-vs-baseline drift, for the OVERALL rate AND each persisted
+    # subtype. The block was computed from PERSISTED per-task ground truth in
+    # compute_current_axes (see app.digest_metrics.compute_timeout_rate); here we
+    # only diff latest vs baseline so an operator / the strategic layer can read a
+    # real before/after delta. Rates are fractions; drift_pct is the relative
+    # percentage change from baseline (None when either side is missing/zero).
+    latest_timeout = latest.get("agent_timeout_rate") or {}
+    baseline_timeout = baseline.get("agent_timeout_rate") or {}
+
+    def _rate_drift_pct(cur: Any, base: Any) -> Optional[float]:
+        if (
+            not isinstance(cur, (int, float))
+            or not isinstance(base, (int, float))
+            or base == 0
+        ):
+            return None
+        return round(((cur - base) / base) * 100.0, 2)
+
+    timeout_overall = {
+        "current": latest_timeout.get("overall_rate"),
+        "baseline": baseline_timeout.get("overall_rate"),
+        "drift_pct": _rate_drift_pct(
+            latest_timeout.get("overall_rate"), baseline_timeout.get("overall_rate")
+        ),
+        "history": [
+            {
+                "captured_at": snap.get("captured_at"),
+                "value": (snap.get("agent_timeout_rate") or {}).get("overall_rate"),
+            }
+            for snap in snapshots
+            if snap.get("agent_timeout_rate")
+        ],
+    }
+    latest_by_subtype = latest_timeout.get("by_subtype") or {}
+    baseline_by_subtype = baseline_timeout.get("by_subtype") or {}
+    timeout_by_subtype = {
+        subtype: {
+            "current": (latest_by_subtype.get(subtype) or {}).get("rate"),
+            "baseline": (baseline_by_subtype.get(subtype) or {}).get("rate"),
+            "drift_pct": _rate_drift_pct(
+                (latest_by_subtype.get(subtype) or {}).get("rate"),
+                (baseline_by_subtype.get(subtype) or {}).get("rate"),
+            ),
+        }
+        for subtype in set(latest_by_subtype) | set(baseline_by_subtype)
+    }
+    agent_timeout_rate = {
+        "overall": timeout_overall,
+        "by_subtype": timeout_by_subtype,
+        "dominant_subtype": latest_timeout.get("dominant_subtype"),
+        "dominant_share": latest_timeout.get("dominant_share"),
+        "denominator": latest_timeout.get("denominator"),
+        "denominator_definition": latest_timeout.get("denominator_definition"),
+        "timeout_count": latest_timeout.get("timeout_count"),
+        "window_days": latest_timeout.get("window_days"),
+    }
+
     return {
         "axes": axes,
+        "agent_timeout_rate": agent_timeout_rate,
         "baseline_captured_at": baseline.get("captured_at"),
         "last_snapshot_at": container.get("last_run_at") or latest.get("captured_at"),
         "vm_cold_start_breakdown": latest.get("vm_cold_start_breakdown"),
