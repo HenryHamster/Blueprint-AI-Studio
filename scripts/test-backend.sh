@@ -177,6 +177,73 @@ ensure_image() {
   return 1
 }
 
+# --- Prebuilt deps image fast path -----------------------------------------
+# CI publishes a deps-only image (the apt + pip layers — everything that only
+# changes when requirements.txt / Dockerfile changes) to GHCR, keyed by a hash
+# of those two files (see .github/workflows/ci.yml: the `backend-deps` job and
+# the shards' "Resolve backend deps image" step). On agent VMs a full
+# `docker build` (base pull + pip install of ~37 packages) costs 1–19 min and
+# runs ~2×/task — the dominant pre-PR gate cost. Pulling the cached deps image
+# and bind-mounting the source over /app (mirroring CI exactly) skips that
+# build entirely, saving ~15–18 min per invocation.
+#
+# Auth: the GHCR package is public, so an ANONYMOUS `docker pull` is the primary
+# path — no token plumbing required. An optional GHCR_TOKEN env enables a
+# private-package fallback (login before pull) without changing the happy path.
+#
+# Safety: this is strictly a speedup. If the pull fails or the tag doesn't exist
+# (e.g. a same-PR requirements.txt change whose deps tag CI hasn't pushed yet),
+# we WARN loudly and fall back to the exact `docker build` behavior below — so
+# this path is never worse than today. The pull is wrapped in `timeout` so a
+# slow-but-not-failing pull can't eat the test-runner budget before we decide to
+# fall back. Set BLUEPRINT_NO_DEPS_IMAGE=1 to force the old local-build path.
+DEPS_IMAGE=""          # non-empty ⇒ fast path: bind-mount source onto this image
+IMAGE_PATH_TAKEN=""    # "pulled-deps-image" | "local-build" (logged for fleet observability)
+GHCR_DEPS_REPO="ghcr.io/henryhamster/backend-test-deps"  # owner lowercased, mirrors CI
+DEPS_PULL_TIMEOUT="${BLUEPRINT_DEPS_PULL_TIMEOUT:-180}"   # seconds; cap a slow pull
+
+# Try to pull the prebuilt deps image. On success sets DEPS_IMAGE and returns 0;
+# on any failure leaves DEPS_IMAGE empty and returns 1 so the caller falls back
+# to a local build. Never exits the script (callers handle the fallback).
+resolve_deps_image() {
+  if [ -n "${BLUEPRINT_NO_DEPS_IMAGE:-}" ]; then
+    echo "=== BLUEPRINT_NO_DEPS_IMAGE set — using local docker build ===" >&2
+    return 1
+  fi
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    echo "WARN: sha256sum unavailable — cannot key the deps image, using local docker build" >&2
+    return 1
+  fi
+  # reqhash = sha256(requirements.txt + Dockerfile)[:16] — must match CI's
+  # `cat backend/requirements.txt backend/Dockerfile | sha256sum | cut -c1-16`.
+  # We run from the backend dir, so the files are alongside us.
+  local reqhash
+  reqhash="$(cat requirements.txt Dockerfile | sha256sum | cut -c1-16)"
+  if [ -z "$reqhash" ]; then
+    echo "WARN: could not compute deps hash — using local docker build" >&2
+    return 1
+  fi
+  local img="$GHCR_DEPS_REPO:$reqhash"
+
+  # Optional private-package fallback: log in if a token is provided. The
+  # primary (public-package) path needs no login. A failed login is non-fatal —
+  # the anonymous pull below may still succeed, and if not we fall back.
+  if [ -n "${GHCR_TOKEN:-}" ]; then
+    echo "${GHCR_TOKEN}" | docker login ghcr.io \
+      -u "${GHCR_USER:-blueprint-ci}" --password-stdin >/dev/null 2>&1 \
+      || echo "WARN: ghcr login failed — trying anonymous pull" >&2
+  fi
+
+  echo "=== Pulling prebuilt deps image $img (timeout ${DEPS_PULL_TIMEOUT}s) ===" >&2
+  if timeout "$DEPS_PULL_TIMEOUT" docker pull "$img" >/dev/null 2>&1; then
+    DEPS_IMAGE="$img"
+    return 0
+  fi
+  echo "WARN: deps image $img unavailable (pull failed, missing tag, or timeout)" >&2
+  echo "WARN: falling back to local docker build — slower but identical result" >&2
+  return 1
+}
+
 # --- Configure DATABASE_URL / ENV_ARGS based on --postgres ---
 if [ "$USE_POSTGRES" = "1" ]; then
   PG_NETWORK="blueprint-test-net-$$"
@@ -241,7 +308,16 @@ _run() {
     # the host path in `-v /d/path:/admin-ui/src` to a Windows-style
     # path before passing it to docker.exe (the colon + leading slash
     # look like a Windows drive ref to MSYS).
-    MSYS_NO_PATHCONV=1 docker run --rm $ENV_ARGS blueprint-backend-test "$@"
+    if [ -n "$DEPS_IMAGE" ]; then
+      # Fast path: the deps image has no source baked in (it's the `deps`
+      # stage), so bind-mount the backend source over /app — exactly as the
+      # CI shards do. $PWD is the backend dir here (we cd'd at the top), so
+      # /app/CLAUDE.md (cp'd above), the agent/admin-ui mounts in $ENV_ARGS,
+      # alembic, and `app.*` all resolve identically to the built image.
+      MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/app" $ENV_ARGS "$DEPS_IMAGE" "$@"
+    else
+      MSYS_NO_PATHCONV=1 docker run --rm $ENV_ARGS blueprint-backend-test "$@"
+    fi
   else
     # Replace leading "python3" with $PYTHON if set (venv interpreter)
     if [ -n "${PYTHON:-}" ] && [ "$1" = "python3" ]; then
@@ -253,9 +329,19 @@ _run() {
 }
 
 if [ "$USE_DOCKER" = "1" ]; then
-  echo "=== Building backend image ==="
-  ensure_image python:3.11-slim
-  docker build -t blueprint-backend-test . -q
+  # Fast path: pull CI's prebuilt deps image and bind-mount the source (set in
+  # _run). Falls back loudly to the local build on any failure — never worse
+  # than today. The chosen path is logged so fleet fallback-rate is observable.
+  if resolve_deps_image; then
+    IMAGE_PATH_TAKEN="pulled-deps-image"
+    echo "=== Using prebuilt deps image (skipping local build): $DEPS_IMAGE ==="
+  else
+    IMAGE_PATH_TAKEN="local-build"
+    echo "=== Building backend image ==="
+    ensure_image python:3.11-slim
+    docker build -t blueprint-backend-test . -q
+  fi
+  echo "=== test-backend image path: ${IMAGE_PATH_TAKEN} ==="
 fi
 
 # --- Postgres needs migrations applied before tests ---
