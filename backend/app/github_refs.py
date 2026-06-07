@@ -254,7 +254,13 @@ async def create_tag(
     return ref_resp.json()
 
 
-async def get_branch_sha(token: str, owner: str, repo: str, branch: str) -> str:
+async def get_branch_sha(
+    token: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    project_id: str | None = None,
+) -> str:
     """Gets the latest commit SHA of a branch."""
     headers = {
         "Authorization": f"Bearer {token}",
@@ -265,6 +271,7 @@ async def get_branch_sha(token: str, owner: str, repo: str, branch: str) -> str:
         "GET",
         f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch}",
         headers,
+        project_id=project_id,
     )
     if response.status_code == 404:
         logger.warning(f"Branch '{branch}' not found (404)")

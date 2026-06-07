@@ -1223,7 +1223,19 @@ async def promote(
             session, version, lock_released=True
         )
         if locked is not None and locked.status == "open":
+            # The live last_qualification here is the SPAWN-TIME "pending" record
+            # (written before the audit/composite children finished), so it has
+            # NO confidence / sub_scores / threshold.  Merge the finalize-time
+            # base_record (which carries the computed composite) in FIRST, then
+            # graft the promotion_pending sub-state on top.  Without this merge a
+            # later reconcile path — which records the promotion from
+            # base_record stripped of promotion_pending — would announce the
+            # promotion at "confidence 0.00" even though the candidate qualified
+            # at its real composite (the v6 prod regression).  base_record has no
+            # "status" key, so q's "pending" status is preserved.
             q = dict(locked.last_qualification or {})
+            q.update(base_record)
+            q["status"] = "pending"
             q["promotion_pending"] = {
                 "pr_number": pr_number,
                 "pr_url": pr_url,

@@ -258,6 +258,9 @@ async def test_reconcile_promotion_failed_records_promotion_custom_branches(
     await db_session.refresh(version)
     assert version.status == "promoted"
     assert version.last_qualification["status"] == "promoted"
+    # The qualifier's composite confidence must survive into the reconcile-
+    # recorded promotion so the announcement / verdict report the true score.
+    assert version.last_qualification["confidence"] == 0.95
 
 
 @pytest.mark.asyncio
@@ -311,6 +314,70 @@ async def test_reconcile_pending_auto_merge_records_promotion_custom_branches(
     await db_session.refresh(version)
     assert version.status == "promoted"
     assert version.last_qualification["status"] == "promoted"
+    # Confidence carried from the pending qualifier record into the promotion.
+    assert version.last_qualification["confidence"] == 0.95
+
+
+@pytest.mark.asyncio
+async def test_reconcile_pending_auto_merge_calls_get_branch_sha_valid_signature(
+    db_session, mocker
+):
+    """Regression: the reconcile path must call ``github.get_branch_sha`` with a
+    signature the real function accepts.  Both reconcile sites pass
+    ``project_id=...``; before ``get_branch_sha`` grew that kwarg every call
+    raised ``TypeError`` (swallowed by the broad ``except`` as a warning) so the
+    promotion target's HEAD was never resolved and ``promoted_sha`` silently fell
+    back to ``candidate_sha``.  An ``autospec`` mock binds the REAL signature, so
+    a bad call here raises just as it would in production."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[{"filename": "backend/app/foo.py"}]),
+    )
+    # autospec binds the real get_branch_sha signature: passing project_id is now
+    # valid; the pre-fix signature (no project_id param) would raise TypeError.
+    branch_sha = mocker.patch(
+        "app.github.get_branch_sha", autospec=True, return_value="release0" * 5
+    )
+    mocker.patch("app.github.create_tag", new=AsyncMock(return_value={}))
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="trunk", promotion_target="release"
+    )
+    candidate_sha = "abcd" * 10
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": candidate_sha,
+        "confidence": 0.9657,
+        "promotion_pending": {
+            "pr_number": 42,
+            "pr_url": "https://github.com/acme/widget/pull/42",
+            "auto_merge_enabled": True,
+            "enabled_at": _utcnow().isoformat(),
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_pending_auto_merge_landed(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True
+    # get_branch_sha was actually called (not swallowed as a TypeError) and with
+    # the project_id kwarg threaded through.
+    branch_sha.assert_awaited()
+    assert branch_sha.await_args.kwargs.get("project_id") == str(version.project_id)
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    # promoted_sha resolved from the promotion target HEAD, not candidate_sha.
+    assert version.promoted_sha == "release0" * 5
+    assert version.last_qualification["confidence"] == 0.9657
 
 
 @pytest.mark.asyncio

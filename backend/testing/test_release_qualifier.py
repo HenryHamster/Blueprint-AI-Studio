@@ -9279,7 +9279,11 @@ async def test_promote_pending_ci_enables_auto_merge_no_failure(db_session, mock
     mocker.patch("app.github.delete_branch", new=AsyncMock(return_value=True))
 
     result = await rq.promote(
-        db_session, version, candidate, composite={"confidence": 0.9}
+        db_session,
+        version,
+        candidate,
+        composite={"confidence": 0.9657},
+        base_record={"confidence": 0.9657, "sub_scores": {"ci": 1.0}},
     )
     await db_session.commit()
 
@@ -9301,6 +9305,15 @@ async def test_promote_pending_ci_enables_auto_merge_no_failure(db_session, mock
     assert pending.get("pr_url") == "http://pr/99"
     assert pending.get("auto_merge_enabled") is True
     assert "enabled_at" in pending
+
+    # The spawn-time "pending" record carried NO confidence (the composite is
+    # only computed at finalize), so promote() must merge base_record's composite
+    # into the durable promotion_pending record.  Otherwise the later reconcile
+    # path records the promotion at "confidence 0.00" (the v6 prod regression).
+    assert lq.get("confidence") == 0.9657
+    assert lq.get("sub_scores") == {"ci": 1.0}
+    # The merge must NOT clobber the "pending" status the substate relies on.
+    assert lq.get("status") == "pending"
 
 
 @pytest.mark.asyncio
