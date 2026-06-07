@@ -37,6 +37,13 @@ from app.models import (
     with_task_attempt_banking,
 )
 from app.schemas import AgentStatusPayload
+from app.task_pr_linkage import (
+    PR_INPUT_TASK_TYPES,
+    find_review_task_id_for_pr,
+    parse_pr_number_from_url,
+    persist_task_pr_linkage,
+    standalone_pr_completion_message,
+)
 from app.shared_state import limiter
 from app.shared_state import (
     get_project_integration_branch as _get_project_integration_branch,
@@ -1255,6 +1262,12 @@ async def update_agent_status(
                     logs=payload.logs,
                 )
                 session.add(artifact)
+                # Persist PR linkage onto the task row, not just the artifact, so
+                # the task itself stays queryable (parentless tasks otherwise lose
+                # pr_number entirely — see app.task_pr_linkage).
+                persist_task_pr_linkage(
+                    task, pr_number=parse_pr_number_from_url(payload.pr_url)
+                )
                 try:
                     await session.flush()  # surface IntegrityError now, not at commit
                 except IntegrityError as ie:
@@ -1354,6 +1367,29 @@ async def update_agent_status(
                 "storage_uri": payload.storage_uri,
             },
         )
+
+    # 3a. Standalone (parentless) tasks flip COMPLETED at PR-open while a
+    # separate review task owns the merge. Cite that evidence in the terminal
+    # status message — the PR number and the review task id — instead of leaving
+    # a generic heartbeat remnant that reads as "COMPLETED, no PR". The PR
+    # linkage was just written onto the leading payload above (or by the github
+    # proxy on an earlier call); fall back to the reported pr_url.
+    if (
+        payload.status == TaskStatus.COMPLETED
+        and task.parent_task_id is None
+        and (task.first_payload or {}).get("type") not in PR_INPUT_TASK_TYPES
+    ):
+        _linked_pr_number = (task.first_payload or {}).get(
+            "pr_number"
+        ) or parse_pr_number_from_url(payload.pr_url)
+        if _linked_pr_number is not None:
+            _review_task_id = await find_review_task_id_for_pr(
+                session, task.project_id, _linked_pr_number
+            )
+            task.latest_status_message = standalone_pr_completion_message(
+                _linked_pr_number, _review_task_id
+            )
+            session.add(task)
 
     # 3b+3c. Smoketest / debug spawn blocks — extracted to agent_status_spawn.py
     await maybe_spawn_smoketest_fix(task, payload, session, _task_id_str)

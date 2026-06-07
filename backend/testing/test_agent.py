@@ -10648,6 +10648,235 @@ async def test_agent_create_pr_returns_cached_when_open(
 
 
 @pytest.mark.asyncio
+async def test_agent_create_pr_persists_pr_linkage_on_task(
+    client: AsyncClient, db_session, mocker
+):
+    """Opening a PR via the github proxy must persist pr_number/branch onto the
+    task's leading payload, not just the saved artifact. Regression for task
+    67cedea6: standalone tasks lost their PR linkage to an artifact-only save."""
+    project = Project(name="PR Linkage Persist", user_id="test-user-linkage")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do thing"}],
+        vm_instance_id="agent-vm-linkage",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "foo", "bar")),
+    )
+    mocker.patch(
+        "app.routers.agent_github.create_pull_request",
+        new=AsyncMock(
+            return_value={
+                "html_url": "https://github.com/foo/bar/pull/8618",
+                "number": 8618,
+            }
+        ),
+    )
+
+    token = create_agent_token(str(task.id), "agent-vm-linkage")
+    resp = await client.post(
+        "/api/agent/github/pull-requests",
+        json={
+            "task_id": str(task.id),
+            "owner": "foo",
+            "repo": "bar",
+            "title": "feat: thing",
+            "head": "blueprint/task-67cedea6",
+            "base": "main",
+            "body": "body",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.first_payload.get("pr_number") == 8618
+    assert task.first_payload.get("branch") == "blueprint/task-67cedea6"
+
+
+@pytest.mark.asyncio
+async def test_standalone_completion_cites_pr_and_review(
+    client: AsyncClient, db_session, mocker
+):
+    """A standalone (parentless) task that completes with a PR linkage gets a
+    terminal status message citing the PR number and the review task that owns
+    the merge, instead of a generic heartbeat remnant."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    project = Project(
+        name="Standalone PR Completion",
+        user_id="test-user-standalone",
+        autonomous_enabled=False,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "create", "prompt": "do thing", "pr_number": 8618},
+        ],
+        vm_instance_id="agent-vm-standalone",
+        status=TaskStatus.IN_PROGRESS,
+        latest_status_message="heartbeat: still working",
+    )
+    db_session.add(task)
+    # The review task spawned by the auto-review webhook for the same PR.
+    review_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 8618, "branch": "b"}],
+        status=TaskStatus.QUEUED,
+        created_by="SYSTEM_AUTO_REVIEW",
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    await db_session.refresh(review_task)
+
+    token = create_agent_token(str(task.id), "agent-vm-standalone")
+    resp = await client.post(
+        "/api/agent/status",
+        json={"task_id": str(task.id), "status": "COMPLETED"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    expected = f"PR #8618 opened — review {str(review_task.id)[:8]} owns merge"
+    assert task.latest_status_message == expected
+
+
+@pytest.mark.asyncio
+async def test_standalone_completion_review_pending_when_no_review(
+    client: AsyncClient, db_session, mocker
+):
+    """When no review task exists yet for the PR, the terminal message still
+    cites the PR but marks the review as pending."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    project = Project(
+        name="Standalone PR Pending",
+        user_id="test-user-pending",
+        autonomous_enabled=False,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "x", "pr_number": 999}],
+        vm_instance_id="agent-vm-pending",
+        status=TaskStatus.IN_PROGRESS,
+        latest_status_message="heartbeat remnant",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-pending")
+    resp = await client.post(
+        "/api/agent/status",
+        json={"task_id": str(task.id), "status": "COMPLETED"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.latest_status_message == "PR #999 opened — review pending"
+
+
+@pytest.mark.asyncio
+async def test_review_task_completion_message_not_clobbered(
+    client: AsyncClient, db_session, mocker
+):
+    """A parentless review task (pr_number is an INPUT, not a PR it opened) must
+    NOT get the 'PR opened — review owns merge' message."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    project = Project(
+        name="Review Not Clobbered",
+        user_id="test-user-review-clobber",
+        autonomous_enabled=False,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 8618, "branch": "b"}],
+        vm_instance_id="agent-vm-review-clobber",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="SYSTEM_AUTO_REVIEW",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-review-clobber")
+    resp = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "status": "COMPLETED",
+            "logs": "review posted: APPROVE",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert "owns merge" not in (task.latest_status_message or "")
+
+
+def test_pr_linkage_helpers():
+    """Unit coverage for the PR-linkage helpers (no DB)."""
+    from app.task_pr_linkage import (
+        parse_pr_number_from_url,
+        persist_task_pr_linkage,
+        standalone_pr_completion_message,
+    )
+
+    assert parse_pr_number_from_url("https://github.com/o/r/pull/8618") == 8618
+    assert parse_pr_number_from_url("https://github.com/o/r/pull/8618/") == 8618
+    assert parse_pr_number_from_url(None) is None
+    assert parse_pr_number_from_url("https://github.com/o/r/issues/3") is None
+
+    t = Task(project_id=uuid.uuid4(), payloads=[{"type": "create"}])
+    assert persist_task_pr_linkage(t, pr_number=7, branch="feat/x") is True
+    assert t.first_payload["pr_number"] == 7
+    assert t.first_payload["branch"] == "feat/x"
+    # Idempotent: re-applying the same values is a no-op.
+    assert persist_task_pr_linkage(t, pr_number=7, branch="feat/x") is False
+    # Empty payloads list seeds a leading payload.
+    t2 = Task(project_id=uuid.uuid4(), payloads=[])
+    assert persist_task_pr_linkage(t2, pr_number=3) is True
+    assert t2.first_payload["pr_number"] == 3
+
+    rid = uuid.UUID("c7bf6da8-0000-0000-0000-000000000000")
+    assert (
+        standalone_pr_completion_message(8618, rid)
+        == "PR #8618 opened — review c7bf6da8 owns merge"
+    )
+    assert (
+        standalone_pr_completion_message(8618, None)
+        == "PR #8618 opened — review pending"
+    )
+
+
+@pytest.mark.asyncio
 async def test_agent_github_check_runs_rejects_invalid_token(client: AsyncClient):
     resp = await client.get(
         "/api/agent/github/check-runs",
