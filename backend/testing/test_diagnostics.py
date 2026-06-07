@@ -1190,3 +1190,133 @@ def test_portfolio_summary_skips_inactive_and_empty():
         {"id": "dir-empty", "text": "New", "status": "active", "research_history": []},
     ]
     assert _build_direction_portfolio_summary(project) == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Section 6 — QUEUED-row deferred-column regression (health-overview 500)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestQueuedScanDeferredColumns:
+    """Regression for the 2026-06-04..07 health-overview MissingGreenlet 500s.
+
+    _compute_health_overview loads QUEUED rows with
+    load_only(*QUEUED_SCAN_COLUMNS) — heavy JSONB deferred. A QUEUED task that
+    trips a stuck branch then reaches the shared stuck-entry tail, which reads
+    attempt_count and runs _classify_stuck_failure (latest_status_message +
+    heavy JSONB). Any of those being deferred sync-lazy-loads under the async
+    session → MissingGreenlet → the endpoint AND every digest-precompute health
+    tick 500 for as long as any task sits queued >30 min — i.e. exactly during
+    a rate-limit pause, when the operator most needs the panel.
+
+    NB the expunge_all() below is load-bearing: with the freshly-committed
+    instance still in the identity map, the re-query returns the fully-loaded
+    object and deferral never happens — which is precisely why CI never caught
+    the prod 500.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stuck_queued_row_via_scan_columns_builds_without_lazy_load(
+        self, db_session
+    ):
+        from sqlalchemy.orm import load_only
+        from sqlmodel import select
+
+        from app.routers.admin_health import QUEUED_SCAN_COLUMNS
+
+        project = Project(name="diag-queued-deferred", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = _make_task(
+            project.id,
+            TaskStatus.QUEUED,
+            created_ago_secs=31 * 60,  # > long_queued threshold (30 min)
+            status_message="Rate limit hit — requeued without burning retry",
+        )
+        task.attempt_count = 2
+        db_session.add(task)
+        await db_session.commit()
+        task_id = task.id
+        db_session.expunge_all()
+
+        row = (
+            (
+                await db_session.execute(
+                    select(Task)
+                    .where(Task.id == task_id)
+                    .options(load_only(*QUEUED_SCAN_COLUMNS))
+                )
+            )
+            .scalars()
+            .one()
+        )
+
+        result = await _build_stuck_tasks([row], _utc_now(), db_session)
+
+        assert len(result) == 1
+        entry = result[0]
+        assert entry["stuck_reason"] == "long_queued"
+        assert entry["attempt_count"] == 2
+        # Heavy JSONB stays deferred for QUEUED rows → classification is
+        # suppressed (None / "unclassified"), never lazy-loaded.
+        assert entry["failure_class"] is None
+
+    @pytest.mark.asyncio
+    async def test_classify_skips_persistent_row_with_deferred_jsonb(
+        self, db_session
+    ):
+        """A DB-loaded row missing the heavy JSONB must return None, not load it.
+
+        The message used here WOULD classify as RATE_LIMIT on a fully-loaded
+        row (it is a verbatim RATE_LIMIT_PATTERNS string, same as
+        test_rate_limit_keywords) — proving the early-out fires on deferral,
+        not on message content.
+        """
+        from sqlalchemy.orm import load_only
+        from sqlmodel import select
+
+        project = Project(name="diag-classify-deferred", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = _make_task(
+            project.id,
+            TaskStatus.QUEUED,
+            status_message="API Error: Rate limit reached",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        task_id = task.id
+        db_session.expunge_all()
+
+        row = (
+            (
+                await db_session.execute(
+                    select(Task)
+                    .where(Task.id == task_id)
+                    .options(
+                        load_only(
+                            Task.id, Task.status, Task.latest_status_message
+                        )
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+
+        assert _classify_stuck_failure(row) is None
+
+    def test_classify_still_works_on_transient_and_mock_instances(self):
+        """The deferral guard must not regress in-memory classification paths.
+
+        Mocks are not sqlalchemy-inspectable (NoInspectionAvailable) — the
+        guard must skip them, and classification of a verbatim
+        RATE_LIMIT_PATTERNS message must still succeed.
+        """
+        t = MagicMock(spec=Task)
+        t.latest_status_message = "API Error: Rate limit reached"
+        assert _classify_stuck_failure(t) == "RATE_LIMIT"

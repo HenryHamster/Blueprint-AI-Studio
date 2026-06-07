@@ -1789,6 +1789,22 @@ async def orchestrator_worker():
                         # Run account re-enablement before sleeping so rate-limited accounts
                         # can recover even while dispatch is throttled
                         await recheck_disabled_accounts()
+                        # Same anti-latch treatment as the external health gate
+                        # below: this `continue` skips the bottom-of-loop
+                        # monitoring block, freezing consecutive_failures and the
+                        # cycle-completion marker while throttled. The failure-rate
+                        # input itself self-ages (15-min task_results window), but
+                        # external-dep state and the dashboard's last-cycle gauge
+                        # must keep refreshing through the throttle.
+                        _orchestrator_last_cycle = _utcnow()
+                        try:
+                            await _check_monitoring_window()
+                            await _check_external_health()
+                            await _check_pause_mode()
+                        except Exception:
+                            logger.exception(
+                                "[ORCHESTRATOR] Monitoring checks failed during throttled cycle"
+                            )
                         await asyncio.sleep(ORCHESTRATOR_THROTTLE_SECONDS)
                         continue
                     else:
@@ -1890,6 +1906,27 @@ async def orchestrator_worker():
                     except Exception:
                         logger.exception(
                             "[ORCHESTRATOR] Failed to broadcast health_gate_throttle"
+                        )
+                    # The gate decision above reads consecutive_failures, which
+                    # ONLY _check_external_health updates — and this `continue`
+                    # skips the monitoring block at the bottom of the loop. Without
+                    # re-running the checks here the gate latches shut forever on
+                    # the last pre-gate snapshot, even after every account cooldown
+                    # has expired (prod 2026-06-07: all-accounts rate-limit closed
+                    # the gate at 11:42Z and only a coincidental instance restart
+                    # at 16:33Z reopened it — 5h of zero dispatch). Same sticky
+                    # pattern as the idle-cycle fix above. Stamp the cycle marker
+                    # too so a gated-but-healthy loop doesn't render as a dead
+                    # orchestrator in the dashboard (it read "last cycle 299min
+                    # ago" during that outage).
+                    _orchestrator_last_cycle = _utcnow()
+                    try:
+                        await _check_monitoring_window()
+                        await _check_external_health()
+                        await _check_pause_mode()
+                    except Exception:
+                        logger.exception(
+                            "[ORCHESTRATOR] Monitoring checks failed during gated cycle"
                         )
                     # Sleep before retrying so we don't tight-loop the gate check
                     # at ~50 cycles/sec, which spams logs and trips the cycle-hung
