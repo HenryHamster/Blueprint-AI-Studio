@@ -264,6 +264,11 @@ def clear_blocker_metadata(task: Task) -> None:
     task carries no residual ``BLOCKED_PRECONDITION`` classification (which the
     failure classifier short-circuits on, exempting the work from the retry
     budget) into its next run.
+
+    Also clears reaper escalation markers (``_blocked_escalated``,
+    ``_precondition_escalated_key``) so a requeued task never immediately
+    re-parks on its next block episode — the escalation was earned by the
+    prior run, not the fresh attempt.
     """
     task.blocker_kind = None
     task.blocked_reason = None
@@ -273,10 +278,18 @@ def clear_blocker_metadata(task: Task) -> None:
     has_blocker = BLOCKER_CONTEXT_KEY in ctx_src
     stale_class = ctx_src.get("failure_class") == BLOCKED_PRECONDITION
     stale_category = ctx_src.get("failure_category") == BLOCKED_PRECONDITION
-    if not (has_blocker or stale_class or stale_category):
+    has_escalation_markers = (
+        "_blocked_escalated" in ctx_src or "_precondition_escalated_key" in ctx_src
+    )
+    if not (has_blocker or stale_class or stale_category or has_escalation_markers):
         return
     ctx = dict(ctx_src)
     ctx.pop(BLOCKER_CONTEXT_KEY, None)
+    # Clear reaper escalation markers: a requeued task must not carry the prior
+    # episode's escalation state into the next attempt (whack-a-mole bug where
+    # operator requeues a file_conflict blocker and it re-parks within seconds).
+    ctx.pop("_blocked_escalated", None)
+    ctx.pop("_precondition_escalated_key", None)
     if stale_class:
         ctx.pop("failure_class", None)
     if stale_category:

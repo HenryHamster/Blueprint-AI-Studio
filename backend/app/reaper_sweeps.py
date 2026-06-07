@@ -1505,11 +1505,17 @@ async def sweep_unblock_blocked_tasks(
         flag_modified(task, "context")
         # A parked blocker that still carries a machine-resolvable need is parked
         # at the LOW re-evaluation cadence (so it comes back due and resumes when
-        # its foundation lands), not the multi-year horizon. A need-less blocker
-        # keeps the far-future park and stays for the operator exactly as today.
+        # its foundation lands), not the multi-year horizon.  Transient blockers
+        # (file_conflict, pending_rollup) are also parked at the LOW cadence so
+        # they self-heal when the overlapping in-flight task merges — hard-parking
+        # them at +10y caused operator-requeue whack-a-mole (incident 2026-06-07).
+        # A need-less non-transient blocker keeps the far-future park.
         has_need = isinstance(get_blocker_metadata(task).get("need"), dict)
+        is_transient = task.blocker_kind in {"file_conflict", "pending_rollup"}
         task.recheck_after = now + (
-            _BLOCKED_PARKED_REEVAL_INTERVAL if has_need else _BLOCKED_ESCALATED_PARK
+            _BLOCKED_PARKED_REEVAL_INTERVAL
+            if (has_need or is_transient)
+            else _BLOCKED_ESCALATED_PARK
         )
         session.add(task)
 
@@ -1559,8 +1565,43 @@ async def sweep_unblock_blocked_tasks(
                 if outcome in ("cancelled", "held"):
                     changed = True
                     continue
-            # Need-less parked blocker — re-park without re-alerting, keeping the
-            # multi-year horizon so it stays for the operator exactly as today.
+            # Need-less parked blocker — handle transient vs durable separately.
+            # Transient blockers (file_conflict, pending_rollup) clear when the
+            # overlapping in-flight task merges; re-evaluate their precondition
+            # state so they requeue automatically when the conflict lifts, or
+            # re-arm with bounded backoff while it persists.  A need-less
+            # NON-transient blocker keeps the far-future park and stays for
+            # the operator.
+            is_transient = task.blocker_kind in {"file_conflict", "pending_rollup"}
+            if is_transient:
+                state = await _blocked_precondition_state(
+                    task, session, verify_pr_merged
+                )
+                if state == "clear":
+                    _clear_blocked_fields(task, preserve_first_blocked=False)
+                    task.status = TaskStatus.QUEUED
+                    task.latest_status_message = (
+                        "Unblocked — transient conflict cleared, requeued"
+                    )
+                    flag_modified(task, "context")
+                    session.add(task)
+                    requeued += 1
+                    changed = True
+                    pending_broadcasts.append(
+                        (
+                            str(task.project_id),
+                            {
+                                "task_id": str(task.id),
+                                "status": "QUEUED",
+                                "message": task.latest_status_message,
+                            },
+                        )
+                    )
+                else:
+                    task.recheck_after = now + _BLOCKED_PARKED_REEVAL_INTERVAL
+                    session.add(task)
+                    changed = True
+                continue
             if task.recheck_after is None or task.recheck_after <= now:
                 task.recheck_after = now + _BLOCKED_ESCALATED_PARK
                 session.add(task)
@@ -3000,3 +3041,82 @@ async def sweep_resolve_stale_open_bug_messages(
         )
 
     return resolved
+
+
+# ── Recovery: stranded transient-blocker self-heal sweep ─────────────────────
+#
+# A file_conflict or pending_rollup blocker that was escalated before Fix 2
+# landed was hard-parked at ``_BLOCKED_ESCALATED_PARK`` (+10 years).  These
+# rows never appear in the normal Step-12 due query (``recheck_after <= now``)
+# and would stay stranded forever without this targeted recovery pass.  The
+# fix: find them, reset ``recheck_after`` to the bounded cadence, and let the
+# next Step-12 cycle re-evaluate and requeue them when the conflict lifts.
+#
+# The recovery touch is the minimal safe change: it preserves ``_blocked_escalated``
+# (so the alert is not re-fired) and just gives the row a near-future due date
+# so Step 12 picks it up.  Step 12's updated "need-less parked transient" path
+# (Fix 2) then actually decides whether to requeue or re-arm.
+
+# A recheck_after more than this far in the future is considered "hard-parked"
+# by the old +10y sentinel path; any legitimate bounded recheck will be shorter.
+_TRANSIENT_BLOCKER_PARK_SENTINEL = timedelta(days=365)
+
+
+async def sweep_recover_stranded_transient_blockers(
+    session, now: datetime, *, batch_size: int = 200
+) -> int:
+    """Self-healing recovery for transient blockers previously hard-parked at +10y.
+
+    Finds BLOCKED tasks whose ``blocker_kind`` is a transient kind
+    (``file_conflict`` or ``pending_rollup``) and whose ``recheck_after`` is
+    more than ``_TRANSIENT_BLOCKER_PARK_SENTINEL`` (365 days) in the future —
+    the signature of the old hard-park sentinel — and resets ``recheck_after``
+    to ``now + _BLOCKED_PARKED_REEVAL_INTERVAL`` so the Step-12 sweep picks them
+    up on the next cycle.  Idempotent and safe to run repeatedly.
+
+    Returns the number of rows recovered.
+    """
+    sentinel_cutoff = now + _TRANSIENT_BLOCKER_PARK_SENTINEL
+    rows = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.status == TaskStatus.BLOCKED,
+                    Task.blocker_kind.in_(["file_conflict", "pending_rollup"]),
+                    Task.recheck_after > sentinel_cutoff,
+                )
+                .limit(batch_size)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return 0
+
+    recovered = 0
+    for task in rows:
+        ctx = task.context or {}
+        if not ctx.get("_blocked_escalated"):
+            # Unexpected: far-future recheck on a non-escalated transient blocker
+            # (shouldn't happen but guard defensively; don't touch it).
+            continue
+        task.recheck_after = now + _BLOCKED_PARKED_REEVAL_INTERVAL
+        session.add(task)
+        recovered += 1
+        logger.info(
+            "[REAPER] Recovery: reset hard-parked transient blocker %s "
+            "(kind=%s) to bounded re-eval",
+            task.id,
+            task.blocker_kind,
+        )
+
+    if recovered:
+        await session.commit()
+        logger.info(
+            "[REAPER] Recovery: un-stranded %d hard-parked transient blocker(s)",
+            recovered,
+        )
+    return recovered

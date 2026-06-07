@@ -892,6 +892,7 @@ from app.reaper_sweeps import (  # noqa: E402
     sweep_stuck_qualifications,
     sweep_routine_message_retention,
     sweep_unblock_blocked_tasks,
+    sweep_recover_stranded_transient_blockers,
     sweep_activate_staged_directions,
     sweep_stale_staged_directions,
     sweep_merge_gate_verification_degradation,
@@ -3860,6 +3861,20 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Unblock sweep error: {e}", exc_info=True
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 12b: Recovery — un-strand transient blockers previously
+                # hard-parked at the +10y sentinel so they self-heal when the
+                # overlapping in-flight task merges.
+                _mark_reaper_progress()
+                try:
+                    await sweep_recover_stranded_transient_blockers(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Transient-blocker recovery sweep error: {e}",
+                        exc_info=True,
                     )
                     with contextlib.suppress(Exception):
                         await session.rollback()

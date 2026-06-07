@@ -9646,9 +9646,13 @@ async def test_park_horizon_is_never_silent_invariant(reaper_db, mocker):
     project = await _make_project(reaper_db)
     now = _utcnow()
 
-    # (a) Past-deadline conflict blocker → escalates terminally and parks.
+    # (a) Past-deadline upstream-dependency blocker → escalates terminally and parks
+    # at the far-future horizon.  Use a non-transient blocker_kind (upstream_dependency)
+    # so it gets _BLOCKED_ESCALATED_PARK rather than the bounded cadence that
+    # transient blockers (file_conflict, pending_rollup) now use.
     escalated = await _blocked_task(
         reaper_db, project, depends_on=[],
+        blocker_kind="upstream_dependency",
         blocked_at=now - _BLOCKED_ESCALATE_AFTER - timedelta(minutes=5),
         recheck_after=now - timedelta(minutes=1),
     )
@@ -9712,8 +9716,13 @@ async def test_unblock_sweep_evicts_legacy_escalated_none_recheck(reaper_db, moc
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
     now = _utcnow()
+    # Use a non-transient blocker_kind: transient ones (file_conflict, pending_rollup)
+    # now re-evaluate and requeue when their conflict has cleared; the eviction
+    # behavior (stay BLOCKED, push recheck_after forward) applies only to durable
+    # non-transient escalated blockers with no machine-resolvable need.
     t = await _blocked_task(
         reaper_db, project, depends_on=[],
+        blocker_kind="upstream_dependency",
         context={"_blocked_escalated": True},
         recheck_after=None,  # legacy: escalated rows used to be left NULL
     )
@@ -9856,8 +9865,11 @@ async def test_parked_blocker_stays_parked_when_need_unsatisfiable(
         now=now,
     )
     # (b) No structured need at all — must keep the far-future park.
+    # Use a non-transient blocker_kind: transient blockers (file_conflict,
+    # pending_rollup) now re-evaluate when due instead of hard-parking at +10y.
     needless = await _blocked_task(
         reaper_db, project, depends_on=[],
+        blocker_kind="upstream_dependency",
         context={"_blocked_escalated": True, "blocker": {"source": "agent"}},
         recheck_after=now - timedelta(minutes=1),
     )
@@ -11722,3 +11734,291 @@ async def test_event_driven_unblock_fail_open(reaper_db, mocker, monkeypatch):
     # Must not raise; must return 0.
     result = await event_driven_unblock_dependents(foundation, reaper_db)
     assert result == 0
+
+
+# ── Fix: file_conflict blockers must not hard-park or survive requeue ──────────
+#
+# Regression tests for the three-part fix:
+#   Fix 1: clear_blocker_metadata clears _blocked_escalated / _precondition_escalated_key
+#   Fix 2: transient blockers (file_conflict) never hard-park at +10y;
+#           need-less parked transient blockers re-evaluate and requeue when cleared
+#   Fix 3: recovery sweep resets already-parked transient blockers to bounded re-eval
+
+from app.reaper_sweeps import (  # noqa: E402
+    sweep_recover_stranded_transient_blockers,
+    _BLOCKED_PARKED_REEVAL_INTERVAL,
+    _TRANSIENT_BLOCKER_PARK_SENTINEL,
+)
+# _BLOCKED_ESCALATED_PARK already imported in the Step-12 import block above.
+
+
+# ── Fix 1: clear_blocker_metadata wipes escalation markers ────────────────────
+
+
+def test_clear_blocker_metadata_clears_escalation_markers():
+    """clear_blocker_metadata must wipe _blocked_escalated and _precondition_escalated_key
+    so a requeued task never immediately re-parks on its next block episode."""
+    from app.task_blocked import clear_blocker_metadata
+    from testing.factories import make_task
+
+    t = make_task(
+        status=TaskStatus.BLOCKED,
+        blocker_kind="file_conflict",
+        blocked_reason="Waiting: file conflict on a.py",
+        blocked_at=_utcnow(),
+        recheck_after=_utcnow() + timedelta(days=3650),
+        context={
+            "blocker": {"source": "filter", "waiting_on": "a.py"},
+            "failure_class": "BLOCKED_PRECONDITION",
+            "failure_category": "BLOCKED_PRECONDITION",
+            "_blocked_escalated": True,
+            "_precondition_escalated_key": "file conflict on a.py",
+        },
+    )
+
+    clear_blocker_metadata(t)
+
+    ctx = t.context or {}
+    assert "_blocked_escalated" not in ctx
+    assert "_precondition_escalated_key" not in ctx
+    assert "blocker" not in ctx
+    assert "failure_class" not in ctx
+    assert "failure_category" not in ctx
+    assert t.recheck_after is None
+    assert t.blocker_kind is None
+
+
+@pytest.mark.asyncio
+async def test_file_conflict_requeue_does_not_re_park(reaper_db, mocker):
+    """The key regression: a file_conflict blocker whose context carries
+    _blocked_escalated=True is requeued by the operator → on the next reblock
+    and sweep cycle the task must NOT immediately re-park at +10y.
+
+    Concrete shape: task has _blocked_escalated=True (operator requeued it),
+    becomes BLOCKED again (conflict still live when it runs), and the sweep
+    is called.  With the fix, the sweep rechecks state and requeues (clear)
+    instead of re-parking at the +10y sentinel."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    # Simulate a file_conflict blocker that was re-blocked AFTER a requeue:
+    # the requeue cleared the escalation markers (Fix 1), but here we test
+    # the sweep path directly — task has _blocked_escalated=True and is due.
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="file_conflict",
+        blocked_reason="Waiting: file conflict on a.py",
+        blocked_at=now - timedelta(hours=7),
+        depends_on=[],
+        context={
+            "blocker": {"source": "filter", "waiting_on": "a.py"},
+            "_blocked_escalated": True,
+            "_blocked_first_at": {
+                "key": "file conflict on a.py",
+                "at": (now - timedelta(hours=7)).isoformat(),
+            },
+        },
+        recheck_after=now - timedelta(minutes=1),  # due
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    # Transient blocker with _blocked_escalated=True should be requeued
+    # (conflict clears since there are no in-flight tasks holding it),
+    # NOT re-parked at +10y.
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    # Must NOT have a far-future recheck_after (the +10y sentinel).
+    far_future = now + _BLOCKED_ESCALATED_PARK - timedelta(days=1)
+    assert t.recheck_after is None or t.recheck_after < far_future
+
+
+@pytest.mark.asyncio
+async def test_file_conflict_escalation_uses_bounded_recheck_not_10y(
+    reaper_db, mocker
+):
+    """When a file_conflict blocker crosses the 6h escalation deadline, it must be
+    parked at _BLOCKED_PARKED_REEVAL_INTERVAL (bounded) not _BLOCKED_ESCALATED_PARK
+    (+10y), so it self-heals when the overlapping in-flight task merges."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_blocked_escalation_alert",
+        new_callable=AsyncMock,
+    )
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    # A file_conflict blocker past the 6h escalation deadline, not yet escalated.
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="file_conflict",
+        blocked_reason="Waiting: file conflict on a.py",
+        blocked_at=now - timedelta(hours=7),  # 7h > 6h threshold
+        depends_on=[],
+        context={
+            "blocker": {"source": "filter", "waiting_on": "a.py"},
+            "_blocked_first_at": {
+                "key": "file conflict on a.py",
+                "at": (now - timedelta(hours=7)).isoformat(),
+            },
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    # Escalation fires; task stays BLOCKED.
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    assert t.context.get("_blocked_escalated") is True
+
+    # recheck_after must be bounded (PARKED_REEVAL_INTERVAL) NOT the +10y sentinel.
+    assert t.recheck_after is not None
+    far_future = now + _BLOCKED_ESCALATED_PARK - timedelta(days=1)
+    assert t.recheck_after < far_future
+    # Specifically within a few minutes of _BLOCKED_PARKED_REEVAL_INTERVAL from now.
+    expected_max = now + _BLOCKED_PARKED_REEVAL_INTERVAL + timedelta(minutes=5)
+    assert t.recheck_after <= expected_max
+
+
+@pytest.mark.asyncio
+async def test_parked_file_conflict_re_evaluates_on_next_cycle(reaper_db, mocker):
+    """A file_conflict blocker with _blocked_escalated=True and a due
+    recheck_after re-evaluates its precondition state instead of re-parking at
+    +10y.  When the conflict has cleared (no in-flight tasks holding it), the
+    task is requeued and the escalated marker is cleared."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="file_conflict",
+        blocked_reason="Waiting: file conflict on a.py",
+        blocked_at=now - timedelta(hours=8),
+        depends_on=[],
+        context={
+            "blocker": {"source": "filter", "waiting_on": "a.py"},
+            "_blocked_escalated": True,
+        },
+        recheck_after=now - timedelta(minutes=1),  # due
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    ctx = t.context or {}
+    # Escalation marker cleared on the unblock transition.
+    assert "_blocked_escalated" not in ctx
+
+
+# ── Fix 3: recovery sweep un-strands hard-parked transient blockers ────────────
+
+
+@pytest.mark.asyncio
+async def test_recovery_sweep_resets_hard_parked_file_conflict(reaper_db, mocker):
+    """The recovery sweep finds a file_conflict blocker hard-parked at +10y and
+    resets its recheck_after to the bounded re-eval cadence so it self-heals."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="file_conflict",
+        blocked_reason="Waiting: file conflict on a.py",
+        blocked_at=now - timedelta(hours=8),
+        depends_on=[],
+        context={
+            "blocker": {"source": "filter", "waiting_on": "a.py"},
+            "_blocked_escalated": True,
+        },
+        # Hard-parked at the +10y sentinel.
+        recheck_after=now + timedelta(days=3650),
+    )
+
+    recovered = await sweep_recover_stranded_transient_blockers(reaper_db, now)
+
+    assert recovered == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED  # still BLOCKED
+    # recheck_after reset to bounded re-eval (within 2× PARKED_REEVAL_INTERVAL).
+    assert t.recheck_after is not None
+    far_future = now + _TRANSIENT_BLOCKER_PARK_SENTINEL
+    assert t.recheck_after < far_future
+    expected_max = now + _BLOCKED_PARKED_REEVAL_INTERVAL + timedelta(minutes=5)
+    assert t.recheck_after <= expected_max
+
+
+@pytest.mark.asyncio
+async def test_recovery_sweep_ignores_non_transient_blockers(reaper_db, mocker):
+    """The recovery sweep must not touch hard-parked blockers that are NOT
+    transient kinds (e.g. upstream_dependency) — those stay for the operator."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    far = now + timedelta(days=3650)
+
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="Waiting: upstream dependency",
+        blocked_at=now - timedelta(hours=8),
+        depends_on=[],
+        context={"blocker": {"source": "agent"}, "_blocked_escalated": True},
+        recheck_after=far,
+    )
+
+    recovered = await sweep_recover_stranded_transient_blockers(reaper_db, now)
+
+    assert recovered == 0
+    await reaper_db.refresh(t)
+    # recheck_after must be unchanged.
+    assert t.recheck_after is not None
+    assert abs((t.recheck_after - far).total_seconds()) < 5
+
+
+@pytest.mark.asyncio
+async def test_recovery_sweep_then_unblock_sweep_requeues(reaper_db, mocker):
+    """End-to-end: recovery sweep resets a hard-parked transient blocker,
+    then the unblock sweep requeues it when the conflict has cleared."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="file_conflict",
+        blocked_reason="Waiting: file conflict on a.py",
+        blocked_at=now - timedelta(hours=8),
+        depends_on=[],
+        context={
+            "blocker": {"source": "filter", "waiting_on": "a.py"},
+            "_blocked_escalated": True,
+        },
+        recheck_after=now + timedelta(days=3650),
+    )
+
+    # Step 1: recovery sweep moves the row back into the due window
+    # (recheck_after → now + _BLOCKED_PARKED_REEVAL_INTERVAL).
+    recovered = await sweep_recover_stranded_transient_blockers(reaper_db, now)
+    assert recovered == 1
+
+    # Step 2: unblock sweep re-evaluates when the reset recheck_after is due.
+    # Advance "now" past the new recheck_after so the row is due.
+    future_now = now + _BLOCKED_PARKED_REEVAL_INTERVAL + timedelta(minutes=1)
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, future_now)
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
