@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { apiFetch } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
+import { WarmStartOriginRow } from './WarmStartOriginRow';
 
 interface ProviderCostRow {
   provider: string;
@@ -52,6 +53,7 @@ export function ProviderCostPanel({
           <span className="text-neutral-500 font-bold uppercase tracking-widest w-full">Pipeline Efficiency</span>
           <EffMetric label="cold-start p50" value={fmtEffSecs(w24?.setup_p50_secs)} delta={w24?.vs_prior_setup_p50_delta} lowerIsBetter />
           <EffMetric label="reuse rate" value={fmtEffRate(w24?.warm_reuse_rate)} delta={w24?.vs_prior_warm_reuse_rate_delta} lowerIsBetter={false} />
+          <WarmStartOriginRow breakdown={w24?.warm_start_origin_breakdown} />
           <EffMetric label="review cycles" value={fmtEffIter(w7?.review_iter_median)} delta={w7?.vs_prior_review_iter_median_delta} lowerIsBetter />
         </div>
       )}

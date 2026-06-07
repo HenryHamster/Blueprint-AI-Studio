@@ -1,4 +1,5 @@
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
+import { WarmStartOriginRow } from './WarmStartOriginRow';
 
 function EffDelta({ delta, lowerIsBetter }: { delta: number | null | undefined; lowerIsBetter: boolean }) {
   if (delta === null || delta === undefined || delta === 0) return null;
@@ -27,6 +28,7 @@ export function PipelineEfficiencyPanel({ projectId }: { projectId: string | nul
           <span className="font-mono text-neutral-300">{fmtEffRate(w24?.warm_reuse_rate)}</span>
           <EffDelta delta={w24?.vs_prior_warm_reuse_rate_delta} lowerIsBetter={false} />
         </span>
+        <WarmStartOriginRow breakdown={w24?.warm_start_origin_breakdown} />
         <span>
           <span className="text-neutral-500">review cycles p50</span>{': '}
           <span className="font-mono text-neutral-300">{fmtEffIter(w7?.review_iter_median)}</span>

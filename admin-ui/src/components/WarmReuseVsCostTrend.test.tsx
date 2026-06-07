@@ -71,6 +71,14 @@ const POPULATED = {
       { captured_at: '2026-05-03T00:00:00', value: 3.9 },
     ],
   },
+  // Truthful per-origin companion to the contaminated aggregate reuse line.
+  warm_start_origin_breakdown: {
+    warm_pool: 8,
+    backlog_reuse: 2,
+    chain_continuity: 6,
+    warm_total: 16,
+    pool_origin_share: 0.5,
+  },
   baseline_captured_at: '2026-04-24T00:00:00',
   last_snapshot_at: '2026-05-03T00:00:00',
 };
@@ -182,6 +190,25 @@ describe('WarmReuseVsCostTrend', () => {
     };
     ({ root, host } = await renderWidget());
     expect(host.textContent).toContain('Baseline pending');
+  });
+
+  test('renders the warm-start origin breakdown and pool share beside the trend', async () => {
+    axesPayload = POPULATED;
+    ({ root, host } = await renderWidget());
+
+    const row = host.querySelector('[data-testid="warm-start-origin-breakdown"]');
+    expect(row).not.toBeNull();
+    const share = host.querySelector('[data-testid="warm-start-pool-share"]');
+    expect(share?.textContent).toContain('50%');
+  });
+
+  test('omits the origin breakdown when the response lacks it', async () => {
+    axesPayload = { ...POPULATED, warm_start_origin_breakdown: undefined };
+    ({ root, host } = await renderWidget());
+
+    expect(host.querySelector('[data-testid="warm-start-origin-breakdown"]')).toBeNull();
+    // The aggregate reuse trend still renders — only the companion is omitted.
+    expect(lineProps.find((p) => p.dataKey === 'reuse')).toBeDefined();
   });
 
   test('renders nothing without a selected project', async () => {

@@ -58,6 +58,13 @@ const { apiFetch } = vi.hoisted(() => ({
       },
       baseline_captured_at: '2026-05-01T00:00:00Z',
       last_snapshot_at: '2026-05-08T00:00:00Z',
+      warm_start_origin_breakdown: {
+        warm_pool: 9,
+        backlog_reuse: 3,
+        chain_continuity: 4,
+        warm_total: 16,
+        pool_origin_share: 0.5625,
+      },
     }), { status: 200 });
   }),
 }));
@@ -217,5 +224,70 @@ describe('MetricsDashboard', () => {
     expect(screen.getAllByText('dir-123').length).toBeGreaterThan(0);
     expect(screen.getByText('Research expensive thing')).toBeInTheDocument();
     expect(screen.getByText('$24.50 across 3 tasks')).toBeInTheDocument();
+  });
+
+  it('renders the warm-start origin breakdown and pool share beside the vm_reuse_rate axis', async () => {
+    render(
+      <MetricsDashboard
+        metricsHistory={[]}
+        cumulativeCost={0}
+        cumulativeVmHours={0}
+        maxConcurrentVMs={4}
+        tasks={[]}
+        metricsWindow="6h"
+        onWindowChange={vi.fn()}
+        projectId="project-1"
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // The truthful per-origin companion renders inside the Efficiency Axes
+    // widget, subordinating the contaminated aggregate reuse rate.
+    expect(screen.getByTestId('warm-start-origin-breakdown')).toBeInTheDocument();
+    const share = screen.getByTestId('warm-start-pool-share');
+    expect(share).toHaveTextContent('56%'); // round(0.5625 * 100)
+  });
+
+  it('omits the origin breakdown when the axes response lacks it', async () => {
+    const original = apiFetch.getMockImplementation();
+    if (!original) throw new Error('apiFetch mock implementation missing');
+    apiFetch.mockImplementation(async (url: string) => {
+      if (url.includes('/efficiency-axes')) {
+        return new Response(JSON.stringify({
+          axes: {
+            vm_reuse_rate: { current: 72, baseline: 68, drift_pct: 5.9, history: [] },
+          },
+          baseline_captured_at: '2026-05-01T00:00:00Z',
+          last_snapshot_at: '2026-05-08T00:00:00Z',
+        }), { status: 200 });
+      }
+      return original(url);
+    });
+
+    try {
+      render(
+        <MetricsDashboard
+          metricsHistory={[]}
+          cumulativeCost={0}
+          cumulativeVmHours={0}
+          maxConcurrentVMs={4}
+          tasks={[]}
+          metricsWindow="6h"
+          onWindowChange={vi.fn()}
+          projectId="project-1"
+        />,
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      expect(screen.queryByTestId('warm-start-origin-breakdown')).toBeNull();
+    } finally {
+      apiFetch.mockImplementation(original);
+    }
   });
 });

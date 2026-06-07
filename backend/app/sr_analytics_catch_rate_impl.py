@@ -401,8 +401,6 @@ async def _compute_sr_catch_rate_trends_impl(
             "previous_hit_rate": previous_hit_rate,
             "current_reviewer_finding_count": curr_findings,
             "previous_reviewer_finding_count": prev_findings,
-            "current_human_count": int(curr.get("human_count") or 0),
-            "previous_human_count": int(prev.get("human_count") or 0),
             "low_confidence_finding_count": curr_findings < _MIN_SR_FINDINGS,
             "sr_alone_hit_count": int(curr.get("sr_alone_hit_count") or 0),
             "reviewer_save_hit_count": int(curr.get("reviewer_save_hit_count") or 0),

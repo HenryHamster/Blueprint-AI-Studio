@@ -3,6 +3,7 @@ import type { SrMissedTask } from './components/SrRetrospectiveShared';
 import type { WarmPoolTargets, WarmPoolTargetSetResponse } from './types/warmVm';
 import type { ProblemModelPatch } from './types';
 import type { BuildConfig, MergeGateRuntime, MergeVerificationVerdict } from './types/project';
+import type { WarmStartOriginBreakdown } from './hooks/useEfficiencySnapshot';
 
 /** Base URL for API requests to the Blueprint backend. Defaults to empty string for same-origin requests. */
 export const API_BASE_URL = import.meta.env.VITE_API_URL || '';
@@ -924,6 +925,13 @@ export interface EfficiencyAxesResponse {
   // Synthesized warm-pool payoff verdict (see PoolPayoffVerdict). Optional so
   // older backends that omit it degrade silently.
   pool_payoff_verdict?: PoolPayoffVerdict;
+  // Per-origin warm-start breakdown (pool vs chain-continuity vs backlog-reuse)
+  // + the pool-origin share, from the latest snapshot. Backend emits it at the
+  // top level of the efficiency-axes response; surfaces render it beside the
+  // contaminated aggregate vm_reuse_rate so the aggregate is never the sole
+  // reuse number read. Optional/nullable — older backends omit it, and the
+  // backend returns null when there were no warm starts to attribute.
+  warm_start_origin_breakdown?: WarmStartOriginBreakdown | null;
 }
 
 export async function fetchEfficiencyAxes(projectId: string): Promise<EfficiencyAxesResponse> {

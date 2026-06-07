@@ -3,6 +3,8 @@ import { parseTimestamp } from '../utils/time';
 import { downloadText, escapeCsv } from '../utils/taskCsv';
 import type { Task } from './TaskCard';
 import { apiFetch } from '../api';
+import { WarmStartOriginRow } from './WarmStartOriginRow';
+import type { WarmStartOriginBreakdown } from '../hooks/useEfficiencySnapshot';
 import {
   ResponsiveContainer,
   AreaChart,
@@ -236,6 +238,11 @@ interface EfficiencyAxesLocal {
   baseline_captured_at: string | null;
   last_snapshot_at: string | null;
   vm_cold_start_breakdown?: Record<string, number | null> | null;
+  // Per-origin warm-start split (pool/backlog/chain) + pool-origin share,
+  // rendered beneath the aggregate vm_reuse_rate axis so the contaminated
+  // aggregate is never the sole reuse number. Optional/nullable — older
+  // backends omit it; null when there were no warm starts to attribute.
+  warm_start_origin_breakdown?: WarmStartOriginBreakdown | null;
 }
 
 interface TaskCostBreakdownEntry {
@@ -408,6 +415,11 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
             )}
             {axisDef.key === 'vm_cold_start_p50_ms' && data.vm_cold_start_breakdown && (
               <ColdStartBreakdown breakdown={data.vm_cold_start_breakdown} />
+            )}
+            {axisDef.key === 'vm_reuse_rate' && data.warm_start_origin_breakdown && (
+              <div className="mt-2 pt-2 border-t border-neutral-700/50 text-[10px]">
+                <WarmStartOriginRow breakdown={data.warm_start_origin_breakdown} />
+              </div>
             )}
           </div>
         );
