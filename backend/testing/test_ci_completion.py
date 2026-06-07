@@ -1815,6 +1815,64 @@ async def test_orig_task_gets_pr_merged_flag_on_success(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_self_orig_merge_sets_pr_merged_without_lock_conflict(
+    db_session, mocker
+):
+    """Direct merge where original_task_id == the merge task's OWN id.
+
+    This is the common lane (research/plan/create tasks merging their own PR).
+    The dedicated ``_orig_session`` writes to the SAME tasks row the caller's
+    session holds FOR UPDATE from ``_relock_merge_task``; without the early
+    commit-and-release, its autoflush UPDATE blocked for the full lock_timeout
+    and died with LockNotAvailableError — silently dropping pr_merged, the
+    direction-outcome refresh, and the reservation finalize on every direct
+    merge (prod 2026-06-01..06-07, 144 drops).
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True},
+    )
+
+    project = Project(name="Self-orig merge", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Point original_task_id back at the task itself — the direct-merge shape.
+    loop = dict((task.context or {}).get("review_loop", {}))
+    loop["original_task_id"] = str(task.id)
+    task.context = {**(task.context or {}), "review_loop": loop}
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+
+    # Both the terminal status AND the orig-side flag must be durable. Read
+    # back from the DB: the orig write runs in its own AsyncSessionLocal
+    # session, so the in-memory instance can be stale.
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert (task.context or {}).get("pr_merged") is True, (
+        "self-orig merge must set pr_merged on the task itself — a lock "
+        "conflict between the caller's FOR UPDATE and the dedicated orig "
+        "session must not silently drop it"
+    )
+
+
+@pytest.mark.asyncio
 async def test_integration_landing_triggers_build_config_refresh(db_session, mocker):
     """When a feature task's PR lands on the integration branch, the empty
     build_config auto-refresh runs against the landed project."""

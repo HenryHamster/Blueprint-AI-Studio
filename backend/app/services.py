@@ -154,10 +154,17 @@ async def gcp_cleanup_service():
                     | await active_compute_job_vm_ids(session)
                 )
 
-                # Run cleanup with hard timeout (2 minutes)
+                # Run cleanup with a hard timeout. 270s, not 120: deleting a
+                # RUNNING/STOPPING orphan blocks through the guest shutdown
+                # (~90-150s each), so a cycle with 2-3 such orphans routinely
+                # overran the old 120s budget — the deletes still landed
+                # server-side, but every overrun logged a full traceback and
+                # left the _last_gcp_vm_count cache stale (prod 2026-06-07,
+                # 4 cycles in one morning). 270s still fits inside the 300s
+                # cycle cadence.
                 try:
                     cleanup_result = await asyncio.wait_for(
-                        cleanup_orphaned_vms(active_vm_ids), timeout=120
+                        cleanup_orphaned_vms(active_vm_ids), timeout=270
                     )
                     # Log divergence and partial failures from structured result
                     if hasattr(cleanup_result, "failed") and cleanup_result.failed:
@@ -172,7 +179,7 @@ async def gcp_cleanup_service():
                         _vm_lifecycle._last_gcp_vm_count = cleanup_result.total_gcp_vms
                         _vm_lifecycle._last_gcp_vm_check = time.time()
                 except asyncio.TimeoutError:
-                    logger.exception("[GCP CLEANUP] Cycle timed out after 120s")
+                    logger.exception("[GCP CLEANUP] Cycle timed out after 270s")
 
         except asyncio.CancelledError:
             logger.info("[GCP CLEANUP] Service shutting down.")
